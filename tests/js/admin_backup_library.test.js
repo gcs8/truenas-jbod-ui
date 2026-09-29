@@ -1,0 +1,1300 @@
+"use strict";
+
+// Backups library page (#398) against a fake of the /api/admin/backups API.
+// Synthetic data only: example.test names, no real paths or credentials.
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const test = require("node:test");
+const vm = require("node:vm");
+const { loadAdminFunctions, transportNames, restoreNames, restoreResult, jsonResponse } = require("./helpers/admin_transport");
+
+const ROOT = path.resolve(__dirname, "../..");
+const { createBackupLibrary, model } = require(path.join(ROOT, "admin_service/static/admin_backups.js"));
+const ADMIN_SOURCE = fs.readFileSync(path.join(ROOT, "admin_service/static/admin.js"), "utf8");
+const TEMPLATE = fs.readFileSync(path.join(ROOT, "admin_service/templates/index.html"), "utf8");
+const BASE = fs.readFileSync(path.join(ROOT, "admin_service/templates/base.html"), "utf8");
+const STYLES = fs.readFileSync(path.join(ROOT, "admin_service/static/admin.css"), "utf8");
+const LIBRARY_SOURCE = fs.readFileSync(path.join(ROOT, "admin_service/static/admin_backups.js"), "utf8");
+
+// ------------------------------------------------------------ fake DOM --
+
+class FakeNode {
+  constructor(doc, tag) {
+    this.ownerDocument = doc;
+    this.tagName = tag ? tag.toUpperCase() : "#text";
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = {};
+    this.dataset = {};
+    this.listeners = {};
+    this.className = "";
+    this.value = "";
+    this.checked = false;
+    this.disabled = false;
+    this.open = false;
+    this._text = "";
+  }
+  get isConnected() {
+    let node = this;
+    while (node.parentNode) node = node.parentNode;
+    return node === this.ownerDocument.body;
+  }
+  get id() {
+    return this.attributes.id || "";
+  }
+  get textContent() {
+    if (this.tagName === "#text") return this._text;
+    return this.children.map((child) => child.textContent).join("");
+  }
+  set textContent(value) {
+    this.children.forEach((child) => { child.parentNode = null; });
+    this.children = [];
+    if (this.tagName === "#text") this._text = String(value);
+    else if (value !== "") this.append(String(value));
+  }
+  setAttribute(name, value) {
+    this.attributes[name] = String(value);
+    if (name === "open") this.open = true;
+  }
+  getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+  }
+  hasAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, name);
+  }
+  removeAttribute(name) {
+    delete this.attributes[name];
+    if (name === "open") this.open = false;
+  }
+  get href() {
+    return this.attributes.href || "";
+  }
+  get type() {
+    return this.attributes.type || "";
+  }
+  append(...nodes) {
+    nodes.forEach((node) => {
+      const child = typeof node === "string" ? this.ownerDocument.createTextNode(node) : node;
+      if (child.parentNode) child.parentNode.children = child.parentNode.children.filter((c) => c !== child);
+      child.parentNode = this;
+      this.children.push(child);
+    });
+  }
+  appendChild(node) {
+    this.append(node);
+    return node;
+  }
+  replaceChildren(...nodes) {
+    this.children.forEach((child) => { child.parentNode = null; });
+    this.children = [];
+    this.append(...nodes.filter((node) => node !== "" && node !== null && node !== undefined));
+  }
+  addEventListener(type, listener) {
+    (this.listeners[type] ||= []).push(listener);
+  }
+  dispatch(type, extra = {}) {
+    let node = this;
+    const event = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra };
+    while (node) {
+      (node.listeners[type] || []).forEach((listener) => listener({ ...event, currentTarget: node }));
+      node = node.parentNode;
+    }
+    return event;
+  }
+  click() {
+    return this.dispatch("click");
+  }
+  focus() {
+    this.ownerDocument.activeElement = this;
+  }
+  showModal() {
+    this.open = true;
+  }
+  close() {
+    this.open = false;
+  }
+  matches(selector) {
+    return selector.split(",").some((part) => matchesSimple(this, part.trim()));
+  }
+  closest(selector) {
+    let node = this;
+    while (node && node.tagName !== "#text") {
+      if (node.matches(selector)) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  querySelectorAll(selector) {
+    const found = [];
+    const walk = (node) => {
+      node.children.forEach((child) => {
+        if (child.tagName !== "#text" && child.matches(selector)) found.push(child);
+        walk(child);
+      });
+    };
+    walk(this);
+    return found;
+  }
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+}
+
+function matchesSimple(node, selector) {
+  const match = selector.match(/^([a-z0-9]*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]+\])*)$/i);
+  if (!match) throw new Error(`unsupported selector ${selector}`);
+  const [, tag, id, classes, attrs] = match;
+  if (tag && node.tagName !== tag.toUpperCase()) return false;
+  if (id && node.id !== id.slice(1)) return false;
+  const own = String(node.className || "").split(/\s+/);
+  if (classes && !classes.split(".").filter(Boolean).every((cls) => own.includes(cls))) return false;
+  for (const attr of attrs.match(/\[[^\]]+\]/g) || []) {
+    const [, name, value] = attr.match(/^\[([\w-]+)(?:=["']?([^"'\]]*)["']?)?\]$/);
+    let actual;
+    if (name.startsWith("data-")) {
+      const key = name.slice(5).replace(/-([a-z])/g, (_m, c) => c.toUpperCase());
+      actual = node.dataset[key];
+    } else {
+      actual = node.getAttribute(name);
+    }
+    if (actual === undefined || actual === null) return false;
+    if (value !== undefined && String(actual) !== value) return false;
+  }
+  return true;
+}
+
+function fakeDocument() {
+  const doc = {
+    activeElement: null,
+    createElement: (tag) => new FakeNode(doc, tag),
+    createTextNode: (text) => {
+      const node = new FakeNode(doc, "");
+      node._text = String(text);
+      return node;
+    },
+  };
+  doc.body = new FakeNode(doc, "body");
+  return doc;
+}
+
+// ------------------------------------------------------------ fake API --
+
+const SHA = "a".repeat(64);
+
+function syntheticLibrary() {
+  return {
+    classes: {
+      config: { enabled: true, debounce_seconds: 60, max_delay_seconds: 900, local_keep: 10, remote_keep: 20, remote_max_age_days: null, pending_changes: 0, last_run: { at: "2026-09-21T10:00:00Z", ok: true, detail: "", artifact_id: "cfg-new" }, passphrase_file: "/run/secrets/backup-passphrase" },
+      full: { enabled: true, schedule: "0 3 * * *", next_run_at: "2026-09-25T03:00:00Z", local_keep: 3, remote_keep: 5, remote_max_age_days: 90, last_run: null, retention: { "offsite-sftp": { keep_count: 5, max_age_days: 90 } }, output_dir: "/data/backups" },
+    },
+    targets: [
+      { id: "offsite-sftp", label: "Offsite SFTP", provider: "sftp", transport_encrypted: true, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: true, detail: "" } },
+      { id: "legacy-ftp", label: "Old FTP box", provider: "ftp", transport_encrypted: false, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: false, detail: "login failed for ftp://backup:hunter2@ftp.example.test/srv/backups/jbod" } },
+    ],
+    artifacts: [
+      { id: "cfg-new", backup_class: "config", location: "local", created_at: "2026-09-21T10:00:00Z", size: 2048, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: false, preserve_reason: null, preserved_by: null, change_count: 2, app_version: "0.23.0" },
+      { id: "cfg-old", backup_class: "config", location: "offsite-sftp", created_at: "2026-09-01T10:00:00Z", size: 1024, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: true, preserve_reason: "before upgrade", preserved_by: "admin", change_count: 1, app_version: "0.22.0" },
+      { id: "full-part", backup_class: "full", location: "local", created_at: "2026-09-22T03:00:00Z", size: 4096, sha256: null, verified: false, restorable: false, state: "incomplete", preserved: false, change_count: 0, app_version: null },
+      { id: "full-new", backup_class: "full", location: "local", created_at: "2026-09-21T03:00:00Z", size: 1048576, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: false, change_count: 0, app_version: "0.23.0" },
+      { id: "full-odd", backup_class: "full", location: "legacy-ftp", created_at: "2026-08-01T03:00:00Z", size: 8192, sha256: SHA, verified: true, restorable: false, state: "unsupported", preserved: false, change_count: 0, app_version: "0.9.0" },
+    ],
+    storage: {
+      local: { config_bytes: 2048, full_bytes: 1052672, count: 3 },
+      "offsite-sftp": { config_bytes: 1024, full_bytes: 0, count: 1 },
+    },
+    available: true,
+    detail: null,
+    running: null,
+  };
+}
+
+function fakeApi(overrides = {}) {
+  const calls = [];
+  const data = syntheticLibrary();
+  const routes = {
+    "GET /api/admin/backups": () => data,
+    "GET /api/admin/backups/cfg-new": () => ({ ...data.artifacts[0], changes: [
+      { change_id: "c1", at: "2026-09-21T09:58:00Z", action: "system saved", subject: "nas-a.example.test" },
+      { change_id: "c2", at: "2026-09-21T09:59:00Z", action: "key file changed", subject: "/srv/app/keys/id_ed25519" },
+      { change_id: "c3", at: null, action: null, subject: null },
+    ], inspect: { encrypted: true, schema_version: 3, app_version: "0.23.0", packaging: "7z", groups: ["config", "profiles"] }, last_verify: { at: "2026-09-21T10:05:00Z", ok: true, detail: "" } }),
+    "POST /api/admin/backups/cfg-new/verify": () => ({ ok: true, artifact: { ...data.artifacts[0], verified: true } }),
+    "POST /api/admin/backups/cfg-new/preserve": () => ({ ok: true }),
+    "DELETE /api/admin/backups/cfg-old/preserve": () => ({ ok: true }),
+    "POST /api/admin/backups/run": () => ({ ok: true, backup_class: "config", state: "started" }),
+    "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "ftp archive destination is writable", duration_ms: 42, provider: "ftp", transport_encrypted: false }),
+    "POST /api/admin/backups/targets/offsite-sftp/test": () => ({ ok: false, detail: "connect to sftp://svc:pw@sftp.example.test/srv/x failed" }),
+    "POST /api/admin/backups/full-new/restore/inspect": () => ({ ok: true, encryption_mode: "plaintext", inspection_receipt: "receipt-1", aggregate_counts: { systems: 2, profiles: 1 }, exported_at: "2026-09-21T03:00:00Z" }),
+    "POST /api/admin/backups/full-new/restore/import": () => restoreResult({ stopped_containers: ["ui"], restarted_containers: ["ui"] }),
+    "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "plan-token-1", expires_at: "2026-09-24T12:00:00Z", items: [
+      { id: "cfg-old", location: "offsite-sftp", backup_class: "config", reason: "beyond keep_count 1 (newest #2)", kind: "retention" },
+      { id: "full-part", location: "local", backup_class: "full", reason: "unverified for longer than grace 1d (age 2d)", kind: "unverified" },
+    ], guarded: [{ id: "full-new", location: "local", backup_class: "full", reason: "beyond keep_count 0 (newest #1)" }] }),
+    "POST /api/admin/backups/lifecycle/apply": () => ({ ok: true, deleted: ["cfg-old"], already_missing: ["full-part"], failed: null, not_attempted: [] }),
+    ...overrides,
+  };
+  async function fetchJson(url, options = {}) {
+    const method = String(options.method || "GET").toUpperCase();
+    const [pathname] = url.split("?");
+    calls.push({ method, url, options });
+    const handler = routes[`${method} ${pathname}`];
+    if (!handler) {
+      const error = new Error(`no route ${method} ${pathname}`);
+      error.status = 404;
+      throw error;
+    }
+    const result = await handler({ url, options });
+    if (result instanceof Error) throw result;
+    return result;
+  }
+  return { fetchJson, calls, data };
+}
+
+function mount({ api = fakeApi(), confirm = () => true, stopped = false, deps = {} } = {}) {
+  const doc = fakeDocument();
+  const ids = ["root", "heading", "status", "policies", "targets", "storage", "artifacts", "refreshButton", "cleanupButton", "editButton"];
+  const elements = {};
+  const root = doc.createElement("section");
+  doc.body.append(root);
+  ids.forEach((key) => {
+    if (key === "root") return;
+    elements[key] = doc.createElement(key.endsWith("Button") ? "button" : "div");
+    root.append(elements[key]);
+  });
+  elements.root = root;
+  elements.dialog = doc.createElement("dialog");
+  root.append(elements.dialog); // nested in the section, as the template does
+  const banners = [];
+  const refreshes = [];
+  const restoreTransport = loadAdminFunctions(restoreNames, { fetchJson: api.fetchJson });
+  const library = createBackupLibrary({
+    document: doc,
+    elements,
+    fetchJson: api.fetchJson,
+    fetchBackupRestore: restoreTransport.fetchBackupRestore,
+    describeBackupRestoreFailure: restoreTransport.describeBackupRestoreFailure,
+    formatBytes: (value) => `${value}B`,
+    formatLocalTimestamp: (value) => (value ? `T(${value})` : "-"),
+    setBanner: (message, tone) => banners.push([message, tone]),
+    confirm,
+    encodeUtf8Base64: (value) => Buffer.from(String(value), "utf8").toString("base64"),
+    describeBackupRestoreConfirmation: (inspection) => `This backup contains stuff (${inspection.encryption_mode}).\n\nRestoring replaces all current settings, mappings and history with this backup. Continue?`,
+    describeMaintenanceOutcome: () => ({ ok: true, sentence: "", startKeys: [] }),
+    renderMaintenanceResult: (node, lead) => { node.textContent = `${lead}.`; },
+    refreshAdminState: async () => { refreshes.push(true); },
+    isStopped: () => stopped,
+    ...deps,
+  });
+  library.bind();
+  return { doc, elements, library, api, banners, refreshes };
+}
+
+function rowFor(elements, id) {
+  return elements.artifacts.querySelector(`tr[data-artifact-id="${id}"]`);
+}
+
+function action(scope, name, id) {
+  return scope.querySelectorAll(`[data-backup-action="${name}"]`).find((node) => !id || node.dataset.backupId === id);
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+// ---------------------------------------------------------------- tests --
+
+test("page lists policies, targets, storage and artifacts grouped by class, newest first", async () => {
+  const { elements, library } = mount();
+  await library.load();
+
+  const policyText = elements.policies.textContent;
+  assert.match(policyText, /Settings backups/);
+  assert.match(policyText, /Full backups/);
+  assert.match(policyText, /Copies kept here10/);
+  assert.match(policyText, /Copies kept on targets20/);
+  assert.match(policyText, /Oldest copy kept on targets \(days\)No limit/);
+  assert.match(policyText, /Last backupWorked \(T\(2026-09-21T10:00:00Z\)\)/);
+  assert.match(policyText, /Last backupNot used yet/);
+  assert.match(policyText, /Next runT\(2026-09-25T03:00:00Z\)/);
+  assert.match(policyText, /Keeps: Offsite SFTPcopies kept 5, oldest copy kept \(days\) 90/i);
+  assert.equal(action(elements.policies, "run").textContent, "Back up now");
+
+  const configRows = elements.artifacts.querySelector('section[data-backup-class="config"]').querySelectorAll("tr[data-artifact-id]");
+  assert.deepEqual(configRows.map((row) => row.dataset.artifactId), ["cfg-new", "cfg-old"]);
+  const fullRows = elements.artifacts.querySelector('section[data-backup-class="full"]').querySelectorAll("tr[data-artifact-id]");
+  assert.deepEqual(fullRows.map((row) => row.dataset.artifactId), ["full-part", "full-new", "full-odd"]);
+
+  assert.match(elements.storage.textContent, /This server2048B1052672B3/);
+  assert.match(elements.storage.textContent, /Offsite SFTP1024B0B1/);
+  assert.match(elements.status.textContent, /5 backup copies/);
+});
+
+test("incomplete and unsupported copies are shown but cannot be restored", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  for (const id of ["full-part", "full-odd"]) {
+    const row = rowFor(elements, id);
+    assert.ok(row, `${id} must be listed, not hidden`);
+    assert.equal(row.dataset.restorable, "false");
+    assert.equal(action(row, "restore").disabled, true);
+    assert.match(row.textContent, /can't restore/i);
+  }
+  assert.match(rowFor(elements, "full-part").textContent, /Incomplete, can't restore/);
+  assert.match(rowFor(elements, "full-odd").textContent, /Unsupported, can't restore/);
+  assert.equal(action(rowFor(elements, "full-new"), "restore").disabled, false);
+});
+
+test("kept copies show a badge with the reason and a Stop keeping action", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  const row = rowFor(elements, "cfg-old");
+  assert.match(row.textContent, /Kept before upgrade/);
+  assert.ok(action(row, "unpreserve"));
+  assert.equal(action(row, "preserve"), undefined);
+  assert.ok(action(rowFor(elements, "cfg-new"), "preserve"));
+});
+
+test("plain FTP is labelled unencrypted without warning styling", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  const ftp = elements.targets.querySelector('tr[data-target-id="legacy-ftp"]');
+  const sftp = elements.targets.querySelector('tr[data-target-id="offsite-sftp"]');
+  const badge = ftp.querySelector(".backup-plain-badge");
+  assert.equal(badge.textContent, "Unencrypted");
+  assert.doesNotMatch(badge.className, /warn|danger|error/);
+  assert.equal(sftp.querySelector(".backup-plain-badge"), null);
+  assert.match(sftp.textContent, /SFTP/);
+  assert.match(sftp.textContent, /Worked/);
+  assert.match(ftp.textContent, /Failed: login failed/);
+  const block = STYLES.slice(STYLES.indexOf(".backup-plain-badge {"), STYLES.indexOf("}", STYLES.indexOf(".backup-plain-badge {")));
+  assert.doesNotMatch(block, /--warning|--danger/);
+});
+
+test("no filesystem path or credential reaches the page", async () => {
+  const { elements, library, doc } = mount();
+  await library.load();
+  await library.actions.testTarget("offsite-sftp");
+  await library.actions.showDetails("cfg-new");
+  await settle();
+  const everything = [elements.root.textContent, elements.dialog.textContent].join("\n");
+  assert.doesNotMatch(everything, /hunter2|svc:pw|\/srv\/|\/run\/secrets|\/data\/backups|passphrase_file|output_dir/);
+  assert.match(everything, /login failed for ftp:\/\/ftp\.example\.test \(/);
+  assert.ok(doc);
+});
+
+test("scrubText removes userinfo and absolute paths but keeps plain words", () => {
+  assert.equal(model.scrubText("ok"), "ok");
+  assert.equal(model.scrubText("sftp://u:p@h.example.test/x"), "sftp://h.example.test");
+  assert.equal(model.scrubText("see https://docs.example.test/a/b."), "see https://docs.example.test");
+  assert.equal(model.scrubText("cannot open /var/lib/app/backups/x.7z"), "cannot open [path]");
+  assert.equal(model.scrubText(["D", ":\\", "backups\\a.zip missing"].join("")), "[path] missing");
+  assert.equal(model.scrubText("1/2 done"), "1/2 done");
+});
+
+test("artifact ids are validated before any URL is built", () => {
+  assert.equal(model.artifactUrl("abc123", "/verify"), "/api/admin/backups/abc123/verify");
+  for (const bad of ["../etc", "a/b", "", "%2e%2e", " x"]) {
+    assert.throws(() => model.artifactUrl(bad), /not valid/);
+  }
+  assert.throws(() => model.targetUrl("../x"), /not valid/);
+});
+
+test("details shows the changes captured in a settings backup", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  const trigger = action(rowFor(elements, "cfg-new"), "details");
+  trigger.click();
+  await settle();
+  assert.equal(elements.dialog.open, true);
+  const text = elements.dialog.textContent;
+  assert.match(text, /Changes in this backup/);
+  assert.match(text, /system saved: nas-a\.example\.test/);
+  assert.match(text, /key file changed: \[path\]/);
+  assert.match(text, /EncryptionEncrypted/);
+  assert.match(text, /File format7z/);
+  assert.match(text, /Containsconfig, profiles/);
+  assert.match(text, /Last checkWorked \(T\(2026-09-21T10:05:00Z\)\)/);
+  assert.match(text, /A change whose details are no longer kept/);
+  action(elements.dialog, "dialog-cancel").click();
+  assert.equal(elements.dialog.open, false);
+});
+
+test("a slow details response never lands in a dialog opened after it", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const base = fakeApi();
+  const slow = fakeApi({ "GET /api/admin/backups/cfg-new": async () => { await gate; return base.data.artifacts[0]; } });
+  const { elements, library } = mount({ api: slow });
+  await library.load();
+  const pending = library.actions.showDetails("cfg-new");
+  library.actions.closeDialog();
+  library.actions.openPreserve("cfg-old");
+  release();
+  await pending;
+  await settle();
+  assert.match(elements.dialog.textContent, /Keep this backup/);
+  assert.ok(elements.dialog.querySelector("#backup-preserve-reason"), "Keep keeps its reason field");
+  assert.doesNotMatch(elements.dialog.textContent, /Checksum|Changes in this backup/);
+});
+
+test("a clean-up plan that arrives after the dialog closed is dropped", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const base = fakeApi();
+  const slow = fakeApi({ "GET /api/admin/backups/lifecycle/plan": async () => { await gate; return base.fetchJson("/api/admin/backups/lifecycle/plan"); } });
+  const { elements, library, api } = mount({ api: slow });
+  await library.load();
+  const pending = library.actions.openCleanup();
+  library.actions.closeDialog();
+  release();
+  await pending;
+  assert.equal(elements.dialog.open, false);
+  await library.actions.applyCleanup();
+  assert.equal(api.calls.some((call) => call.url.endsWith("/lifecycle/apply")), false);
+});
+
+test("closing a dialog returns focus to the button that opened it, including Escape", async () => {
+  const { elements, library, doc } = mount();
+  await library.load();
+  const trigger = action(rowFor(elements, "cfg-new"), "preserve");
+  trigger.click();
+  assert.equal(elements.dialog.open, true);
+  assert.equal(doc.activeElement.id, "backup-preserve-reason");
+  elements.dialog.dispatch("cancel");
+  assert.equal(elements.dialog.open, false);
+  assert.equal(doc.activeElement, trigger);
+});
+
+test("keep asks for a reason and sends it", async () => {
+  const { elements, library, api, banners } = mount();
+  await library.load();
+  action(rowFor(elements, "cfg-new"), "preserve").click();
+  action(elements.dialog, "preserve-confirm").click();
+  await settle();
+  assert.match(elements.dialog.textContent, /Add a short reason first/);
+  assert.equal(api.calls.filter((call) => call.method === "POST").length, 0);
+
+  elements.dialog.querySelector("#backup-preserve-reason").value = "  known good  ";
+  await library.actions.submitPreserve();
+  const post = api.calls.find((call) => call.method === "POST");
+  assert.equal(post.url, "/api/admin/backups/cfg-new/preserve");
+  assert.deepEqual(JSON.parse(post.options.body), { reason: "known good" });
+  assert.equal(elements.dialog.open, false);
+  assert.deepEqual(banners.at(-1), ["Backup kept.", "success"]);
+});
+
+test("stop keeping confirms first and a cancel sends nothing", async () => {
+  let answer = false;
+  const { elements, library, api } = mount({ confirm: () => answer });
+  await library.load();
+  await library.actions.unpreserve("cfg-old");
+  assert.equal(api.calls.filter((call) => call.method === "DELETE").length, 0);
+  answer = true;
+  await library.actions.unpreserve("cfg-old");
+  assert.equal(api.calls.filter((call) => call.method === "DELETE")[0].url, "/api/admin/backups/cfg-old/preserve");
+  assert.ok(elements);
+});
+
+test("verify posts once even when clicked twice and reloads the list", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const api = fakeApi({ "POST /api/admin/backups/cfg-new/verify": async () => { await gate; return { ok: true, verified: true }; } });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  action(rowFor(elements, "cfg-new"), "verify").click();
+  await settle();
+  const busy = action(rowFor(elements, "cfg-new"), "verify");
+  assert.equal(busy.disabled, true);
+  assert.equal(busy.textContent, "Verifying...");
+  const again = library.actions.verify("cfg-new");
+  release();
+  await again;
+  assert.equal(api.calls.filter((call) => call.url.endsWith("/verify")).length, 1);
+  assert.deepEqual(banners.at(-1), ["Backup verified.", "success"]);
+  assert.equal(api.calls.filter((call) => call.url === "/api/admin/backups").length, 2);
+});
+
+test("download is a plain link to the streaming route, absent for missing copies", async () => {
+  const api = fakeApi();
+  api.data.artifacts.push({ id: "gone", backup_class: "full", location: "offsite-sftp", created_at: "2026-07-01T00:00:00Z", size: 1, verified: true, restorable: false, state: "missing", preserved: false });
+  const { elements, library } = mount({ api });
+  await library.load();
+  const link = action(rowFor(elements, "full-new"), "download");
+  assert.equal(link.tagName, "A");
+  assert.equal(link.href, "/api/admin/backups/full-new/download");
+  assert.equal(action(rowFor(elements, "gone"), "download"), undefined);
+  assert.equal(action(rowFor(elements, "gone"), "verify").disabled, true);
+});
+
+test("back up now starts a run, shows it running, and polls until it finishes", async () => {
+  const api = fakeApi();
+  const timers = [];
+  let running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  api.data.running = running;
+  const origin = api.fetchJson;
+  const doc = mount({ api });
+  // Reach in: the mount helper has no timer hook, so rebuild with one.
+  const { createBackupLibrary: create } = require(path.join(ROOT, "admin_service/static/admin_backups.js"));
+  const library = create({
+    document: doc.doc, elements: doc.elements, fetchJson: origin, formatBytes: String, formatLocalTimestamp: String,
+    setBanner: () => {}, setTimeout: (callback) => timers.push(callback), isVisible: () => true, isStopped: () => false,
+  });
+  await library.load();
+  assert.match(doc.elements.status.textContent, /A full backup is running/);
+  const runButtons = doc.elements.policies.querySelectorAll('[data-backup-action="run"]');
+  assert.ok(runButtons.every((node) => node.disabled), "no second run while one is going");
+  assert.equal(runButtons[1].textContent, "Backing up...");
+  assert.equal(timers.length, 1);
+  api.data.running = null;
+  running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0, "polling stops once nothing runs");
+  assert.ok(doc.elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
+function pollingLibrary(api, { visible = () => true } = {}) {
+  const timers = [];
+  const doc = mount({ api });
+  const library = createBackupLibrary({
+    document: doc.doc, elements: doc.elements, fetchJson: api.fetchJson, formatBytes: String, formatLocalTimestamp: String,
+    setBanner: () => {}, setTimeout: (callback) => timers.push(callback), isVisible: visible, isStopped: () => false,
+  });
+  return { timers, library, elements: doc.elements };
+}
+
+test("a poll tick while the tab is hidden keeps polling so the run result shows on return", async () => {
+  const api = fakeApi();
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  let visible = true;
+  const { timers, library, elements } = pollingLibrary(api, { visible: () => visible });
+  await library.load();
+  assert.equal(timers.length, 1);
+
+  visible = false;
+  timers.shift()();
+  await settle();
+  assert.equal(timers.length, 1, "a hidden tick reschedules instead of dropping the poll");
+
+  visible = true;
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.doesNotMatch(elements.status.textContent, /is running/);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
+test("one failed poll during a run keeps the error visible and polls again", async () => {
+  let fail = false;
+  const api = fakeApi({
+    "GET /api/admin/backups": () => {
+      if (fail) {
+        fail = false;
+        return Object.assign(new Error("HTTP 502"), { status: 502 });
+      }
+      return api.data;
+    },
+  });
+  api.data.running = { backup_class: "full", started_at: "2026-09-24T10:00:00Z" };
+  const { timers, library, elements } = pollingLibrary(api);
+  await library.load();
+
+  fail = true;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.match(elements.status.textContent, /^Couldn't load backups/);
+  assert.equal(timers.length, 1, "a failed poll schedules another one");
+
+  api.data.running = null;
+  timers.shift()();
+  await settle();
+  await settle();
+  assert.equal(timers.length, 0);
+  assert.equal(library.state.data.running, null);
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => !node.disabled));
+});
+
+test("an unavailable backup service says so and offers nothing to run", async () => {
+  const api = fakeApi({ "GET /api/admin/backups": () => ({ available: false, detail: "The backup scheduler is not running.", classes: { config: { enabled: false }, full: { enabled: false } }, targets: [], artifacts: [], storage: {}, running: null }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.textContent, "Backups aren't available: The backup scheduler is not running.");
+  assert.ok(elements.policies.querySelectorAll('[data-backup-action="run"]').every((node) => node.disabled));
+  assert.equal(elements.cleanupButton.disabled, true);
+});
+
+test("the status line shows the last clean-up, and a warning naming each place it failed", async () => {
+  const okApi = fakeApi();
+  okApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 3, detail: null, failed_locations: {} };
+  const ok = mount({ api: okApi });
+  await ok.library.load();
+  assert.match(ok.elements.status.textContent, /5 backup copies\. Last clean-up: T\(2026-09-24T12:00:00Z\), 3 removed\.$/);
+  assert.equal(ok.elements.status.querySelector("span.backup-run-status.is-ok").textContent, "Last clean-up: T(2026-09-24T12:00:00Z), 3 removed.");
+
+  const badApi = fakeApi();
+  badApi.data.grooming = { at: "2026-09-24T12:00:00Z", ok: false, deleted: 1, detail: "ConnectionRefusedError: refused",
+    failed_locations: { "offsite-sftp": "connect to sftp://svc:pw@sftp.example.test/srv/x failed", local: "PermissionError: denied" } };
+  const bad = mount({ api: badApi });
+  await bad.library.load();
+  const warning = bad.elements.status.querySelector("span.backup-run-status.is-bad");
+  assert.ok(warning, "a failed clean-up renders a warning span");
+  assert.equal(warning.textContent,
+    "Last clean-up T(2026-09-24T12:00:00Z) didn't finish: Offsite SFTP: connect to sftp://sftp.example.test failed; This server: PermissionError: denied.");
+  assert.equal(bad.elements.status.querySelector("span.backup-run-status.is-ok"), null);
+
+  const none = mount();
+  await none.library.load();
+  assert.equal(none.elements.status.textContent, "5 backup copies.");
+});
+
+test("back up now reports that the run started", async () => {
+  const { library, banners } = mount();
+  await library.load();
+  await library.actions.runNow("config");
+  assert.deepEqual(banners.at(-1), ["Settings backup started. This list updates when it finishes.", "success"]);
+});
+
+test("back up now posts the class and explains a 409 plainly", async () => {
+  const busy = Object.assign(new Error("already running"), { status: 409 });
+  const api = fakeApi({ "POST /api/admin/backups/run": () => busy });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  const run = action(elements.policies, "run");
+  assert.equal(run.dataset.backupClass, "config");
+  await library.actions.runNow("config");
+  const post = api.calls.find((call) => call.url === "/api/admin/backups/run");
+  assert.deepEqual(JSON.parse(post.options.body), { backup_class: "config" });
+  assert.deepEqual(banners.at(-1), ["A backup or clean up is already running. Try again when it finishes.", "info"]);
+  await library.actions.runNow("bogus");
+  assert.equal(api.calls.filter((call) => call.url === "/api/admin/backups/run").length, 1);
+});
+
+test("a 503 from an action says the backup scheduler isn't running", async () => {
+  const missing = Object.assign(new Error("Service Unavailable"), { status: 503 });
+  const api = fakeApi({ "POST /api/admin/backups/run": () => missing });
+  const { library, banners } = mount({ api });
+  await library.load();
+  await library.actions.runNow("full");
+  assert.deepEqual(banners.at(-1), ["Backup failed: The backup scheduler isn't running on this server.", "error"]);
+});
+
+test("target test shows the result next to the target, scrubbed", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  await library.actions.testTarget("legacy-ftp");
+  await library.actions.testTarget("offsite-sftp");
+  assert.match(elements.targets.querySelector('tr[data-target-id="legacy-ftp"]').textContent, /Works \(42 ms\)/);
+  const failed = elements.targets.querySelector('tr[data-target-id="offsite-sftp"]').textContent;
+  assert.match(failed, /Failed: connect to sftp:\/\/sftp\.example\.test/);
+  assert.doesNotMatch(failed, /svc:pw|\/srv\//);
+});
+
+test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
+  const { elements, library, api, banners, refreshes } = mount();
+  await library.load();
+  action(rowFor(elements, "full-new"), "restore").click();
+  assert.equal(elements.dialog.open, true);
+  elements.dialog.querySelector("#backup-restore-passphrase").value = " two words ";
+  await library.actions.restoreInspect();
+
+  const inspect = api.calls.find((call) => call.url.endsWith("/restore/inspect"));
+  assert.equal(inspect.method, "POST");
+  assert.equal(inspect.options.body, undefined, "no archive bytes are uploaded");
+  assert.equal(Buffer.from(inspect.options.headers["X-Backup-Passphrase-Base64"], "base64").toString("utf8"), " two words ");
+  assert.match(elements.dialog.textContent, /Restoring replaces all current settings, mappings and history with this backup\. Continue\?/);
+  assert.equal(api.calls.some((call) => call.url.includes("/restore/import")), false, "nothing is imported before confirming");
+
+  const restoreButton = action(elements.dialog, "restore-import");
+  assert.equal(restoreButton.textContent, "Restore");
+  await library.actions.restoreImport();
+  const imported = api.calls.find((call) => call.url.includes("/restore/import"));
+  assert.equal(imported.url, "/api/admin/backups/full-new/restore/import?stop_services=true&restart_services=true");
+  assert.equal(imported.options.headers["X-Backup-Expected-Encryption"], "plaintext");
+  assert.equal(imported.options.headers["X-Backup-Inspection-Receipt"], "receipt-1");
+  assert.equal(imported.options.body, undefined);
+  assert.deepEqual(banners.at(-1), ["Backup restored.", "success"]);
+  assert.equal(refreshes.length, 1);
+  assert.equal(elements.dialog.querySelector("#backup-restore-passphrase").value, "");
+});
+
+test("restore refuses an inspection without an observed mode and receipt", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/full-new/restore/inspect": () => ({ ok: true, encryption_mode: "unknown" }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  library.actions.openRestore("full-new");
+  await library.actions.restoreInspect();
+  assert.match(elements.dialog.textContent, /Check failed: The backup check did not finish/);
+  assert.equal(action(elements.dialog, "restore-import"), undefined);
+  await library.actions.restoreImport();
+  assert.equal(api.calls.some((call) => call.url.includes("/restore/import")), false);
+});
+
+test("restore is not offered for a non-restorable copy even if called directly", async () => {
+  const { elements, library } = mount();
+  await library.load();
+  library.actions.openRestore("full-part");
+  assert.equal(elements.dialog.open, false);
+});
+
+test("clean up shows the dry-run plan and applies exactly its token", async () => {
+  const { elements, library, api, banners } = mount();
+  await library.load();
+  await library.actions.openCleanup();
+  const items = elements.dialog.querySelectorAll("li[data-artifact-id]");
+  assert.deepEqual(items.map((item) => item.dataset.artifactId), ["cfg-old", "full-part"]);
+  const text = elements.dialog.textContent;
+  assert.match(text, /These 2 copies will be deleted/);
+  assert.match(text, /only 1 copies are kept and this is number 2/);
+  assert.match(text, /never verified, and older than 1 day \(it is 2 days old\)/);
+  assert.match(text, /1 more is over a limit but kept, because it is the newest verified copy in its place/);
+  assert.equal(action(elements.dialog, "cleanup-apply").textContent, "Delete 2");
+  await library.actions.applyCleanup();
+  const apply = api.calls.find((call) => call.url.endsWith("/lifecycle/apply"));
+  assert.deepEqual(JSON.parse(apply.options.body), { plan_token: "plan-token-1" });
+  assert.deepEqual(banners.at(-1), ["Deleted 2 copies.", "success"]);
+  await library.actions.applyCleanup();
+  assert.equal(api.calls.filter((call) => call.url.endsWith("/lifecycle/apply")).length, 1, "a used plan is not re-applied");
+});
+
+test("clean up reports a partial run and a stale plan plainly", async () => {
+  const partial = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ ok: false, deleted: ["cfg-old"], already_missing: [], failed: { id: "full-part", error: "permission denied at /srv/app/backups/x" }, not_attempted: [] }) });
+  let mounted = mount({ api: partial });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  await mounted.library.actions.applyCleanup();
+  assert.match(mounted.elements.dialog.textContent, /Clean up stopped after 1 of 2: permission denied at \[path\]/);
+
+  const stale = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(new Error("gone"), { status: 409 }) });
+  mounted = mount({ api: stale });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  await mounted.library.actions.applyCleanup();
+  assert.match(mounted.elements.dialog.textContent, /The list changed since this plan was made, so nothing was deleted/);
+});
+
+test("clean up with nothing to do, or without a token, never applies", async () => {
+  const empty = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t", items: [] }) });
+  let mounted = mount({ api: empty });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  assert.match(mounted.elements.dialog.textContent, /Nothing to clean up/);
+  assert.equal(action(mounted.elements.dialog, "cleanup-apply"), undefined);
+
+  const tokenless = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => [{ id: "cfg-old", location: "local", reason: "x" }] });
+  mounted = mount({ api: tokenless });
+  await mounted.library.load();
+  await mounted.library.actions.openCleanup();
+  assert.match(mounted.elements.dialog.textContent, /without a token/);
+  await mounted.library.actions.applyCleanup();
+  assert.equal(tokenless.calls.some((call) => call.url.endsWith("/lifecycle/apply")), false);
+});
+
+test("a missing backend reads as plain words, not an error dump", async () => {
+  const api = fakeApi({ "GET /api/admin/backups": () => Object.assign(new Error("Not Found"), { status: 404 }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.textContent, "This admin version has no backup list.");
+  assert.equal(elements.cleanupButton.disabled, true);
+});
+
+test("a stopped admin session disables every library action", async () => {
+  const { elements, library } = mount({ stopped: true });
+  await library.load();
+  const buttons = elements.root.querySelectorAll("button");
+  assert.ok(buttons.length > 5);
+  assert.ok(buttons.every((node) => node.disabled));
+});
+
+test("admin.js mounts the library as a Backups view and base.html loads it first", () => {
+  assert.match(TEMPLATE, /data-admin-view-button="backups"[^>]*>Backups</);
+  assert.match(TEMPLATE, /data-admin-view-panel="backups"/);
+  assert.match(TEMPLATE, /<dialog id="backup-library-dialog"/);
+  assert.ok(BASE.indexOf("admin_backups.js") > 0 && BASE.indexOf("admin_backups.js") < BASE.indexOf("path='admin.js'"));
+  assert.match(ADMIN_SOURCE, /return value === "builder" \|\| value === "backups" \? value : "operations";/);
+  assert.match(ADMIN_SOURCE, /window\.AdminBackupLibrary\?\.createBackupLibrary\(/);
+  assert.match(ADMIN_SOURCE, /describeBackupRestoreConfirmation,\n/);
+  // the upload path for off-server files stays
+  assert.match(TEMPLATE, /id="backup-import-file"/);
+  assert.match(ADMIN_SOURCE, /\/api\/admin\/backup\/inspect/);
+});
+
+test("library copy stays plain and the module has no framework or innerHTML", () => {
+  const panel = TEMPLATE.slice(TEMPLATE.indexOf('id="backup-library"'), TEMPLATE.indexOf('data-admin-view-panel="builder"'));
+  const words = panel.replace(/<code>[^<]*<\/code>/g, "").replace(/<[^>]+>/g, " ");
+  for (const word of [/sidecar/i, /artifact/i, /catalog/i, /lifecycle/i, /grooming/i, /tombstone/i]) {
+    assert.doesNotMatch(words, word);
+  }
+  // Operator-facing literals: text: "..." and template strings that start with a capital.
+  const strings = (LIBRARY_SOURCE.match(/text: "[^"]*"|`[A-Z][^`]*`/g) || [])
+    .join("\n")
+    .replace(/\$\{[^}]*\}/g, "");
+  for (const word of [/artifact/i, /tombstone/i, /grooming/i, /lifecycle/i, /catalog/i]) {
+    assert.doesNotMatch(strings, word);
+  }
+  assert.doesNotMatch(LIBRARY_SOURCE, /innerHTML|insertAdjacentHTML|\beval\(|new Function/);
+  assert.doesNotMatch(LIBRARY_SOURCE, /require\(|import /);
+});
+
+// Restore acceptance uses the actual controller and complete production transport.
+function restoreFixture({ imported = () => jsonResponse(200, restoreResult()), refreshError = false, listError = false, signal } = {}) {
+  const calls = [];
+  const timers = new Map();
+  const navigator = { onLine: true };
+  let timerId = 0;
+  let inspections = 0;
+  let refreshes = 0;
+  let mounted;
+  const receiptAtDispatch = [];
+  const transport = loadAdminFunctions([
+    ...transportNames, ...restoreNames,
+    "describeMaintenanceOutcome", "maintenanceKeys", "describeServices", "serviceName",
+  ], {
+    navigator,
+    setTimeout(callback, ms) { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: (id) => timers.delete(id),
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/restore/inspect")) {
+        return jsonResponse(200, { ok: true, encryption_mode: "plaintext", inspection_receipt: `receipt-${++inspections}` });
+      }
+      if (url.includes("/restore/import")) {
+        receiptAtDispatch.push(mounted.library.state.restoreInspection);
+        return imported(url, options);
+      }
+      assert.equal(url, "/api/admin/backups");
+      return listError && refreshes ? jsonResponse(503, { detail: "Synthetic list refresh failed" }) : jsonResponse(200, syntheticLibrary());
+    },
+  });
+  // Caller-signal injection exercises cancellation without replacing transport.
+  const withSignal = (fn) => (url, options = {}) => fn(url, { ...options, signal });
+  mounted = mount({ deps: {
+    fetchJson: withSignal(transport.fetchJson),
+    fetchBackupRestore: withSignal(transport.fetchBackupRestore),
+    describeBackupRestoreFailure: transport.describeBackupRestoreFailure,
+    describeMaintenanceOutcome: transport.describeMaintenanceOutcome,
+    renderMaintenanceResult: (node, lead, outcome) => { node.textContent = `${lead}${outcome.ok ? "." : `, but ${outcome.sentence}`}`; },
+    refreshAdminState: async () => { refreshes++; if (refreshError) throw new Error("Synthetic refresh failed"); },
+  } });
+  return { ...mounted, calls, timers, navigator, receiptAtDispatch,
+    get refreshCount() { return refreshes; },
+    applies: () => calls.filter(({ url }) => url.includes("/restore/import")),
+    expire() { for (const { callback } of [...timers.values()]) callback(); },
+    async prepare(id = "full-new") {
+      if (!mounted.library.state.data) await mounted.library.load();
+      mounted.library.actions.openRestore(id);
+      mounted.elements.dialog.querySelector("#backup-restore-passphrase").value = " synthetic phrase ";
+      await mounted.library.actions.restoreInspect();
+    },
+  };
+}
+
+for (const [name, imported] of [
+  ["transport loss", () => { throw new TypeError("Failed to fetch"); }],
+  ["bad JSON", () => ({ ...jsonResponse(200), json: async () => { throw new SyntaxError("private raw body"); } })],
+  ["wrong-shaped 2xx", () => jsonResponse(200, { unexpected: "value" })],
+  ["ok-only 2xx", () => jsonResponse(200, { ok: true })],
+  ["refused 2xx", () => jsonResponse(200, { ok: false, detail: "No decided restore result" })],
+  ["undecided 5xx", () => jsonResponse(503, { detail: "Service unavailable" })],
+  ["body deadline", () => ({ ...jsonResponse(200), json: () => new Promise(() => {}) })],
+  ["body abort", () => ({ ...jsonResponse(200), json: () => new Promise(() => {}) })],
+]) {
+  test(`library restore preserves unknown outcome after ${name}`, async () => {
+    const controller = new AbortController();
+    const fixture = restoreFixture({ imported, signal: controller.signal });
+    await fixture.prepare();
+    let done = false;
+    const pending = fixture.library.actions.restoreImport().then(() => { done = true; });
+    await settle();
+    if (name === "body deadline") {
+      assert.deepEqual([...fixture.timers.values()].map(({ ms }) => ms), [15 * 60 * 1000]);
+      fixture.expire();
+    }
+    if (name === "body abort") controller.abort();
+    await settle();
+    assert.equal(done, true, "body readers ignoring abort must not retain the restore owner");
+    await pending;
+    const message = fixture.elements.dialog.querySelector(".backup-dialog-result").textContent;
+    assert.match(message, /unknown whether the restore/i);
+    assert.match(message, /check.*before.*restor/i);
+    assert.match(message, /new inspection receipt/i);
+    assert.doesNotMatch(message, /Import failed|Restore failed|private raw body|scheduler isn't running/i);
+    assert.equal(fixture.banners.at(-1)[0], message);
+    assert.equal(fixture.banners.at(-1)[1], "error");
+    assert.equal(fixture.applies().length, 1);
+    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.library.state.restoreInspection, null);
+    assert.deepEqual(fixture.receiptAtDispatch, [null], "receipt retired before transport dispatch");
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, " synthetic phrase ");
+    assert.equal(action(fixture.elements.dialog, "restore-import"), undefined);
+    assert.ok(action(fixture.elements.dialog, "restore-inspect"), "manual retry starts with inspection");
+    await fixture.library.actions.restoreImport();
+    assert.equal(fixture.applies().length, 1, "no direct replay with the consumed receipt");
+    assert.equal(fixture.timers.size, 0);
+    assert.equal(fixture.library.state.pending.size, 0);
+  });
+}
+
+for (const status of [400, 403, 409, 422]) {
+  test(`library restore preserves definite HTTP ${status} refusal and scrubs detail`, async () => {
+    const fixture = restoreFixture({ imported: () => jsonResponse(status, { detail: "Synthetic admission refused at /srv/synthetic/archive" }) });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    const message = fixture.banners.at(-1)[0];
+    assert.match(message, /Import failed:.*Synthetic admission refused.*\[path\]/);
+    assert.doesNotMatch(message, /unknown|may or may not|\/srv\//);
+    assert.equal(fixture.refreshCount, 0);
+    assert.equal(fixture.library.state.restoreInspection, null);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("library restore attempts reachable local apply despite offline hint", async () => {
+  const fixture = restoreFixture();
+  await fixture.prepare();
+  fixture.navigator.onLine = false;
+  await fixture.library.actions.restoreImport();
+  assert.equal(fixture.applies().length, 1);
+  assert.equal(fixture.refreshCount, 1);
+  assert.match(fixture.banners.at(-1)[0], /Backup restored/i);
+  assert.doesNotMatch(fixture.banners.at(-1)[0], /unknown|may or may not/i);
+  assert.equal(fixture.library.state.restoreInspection, null);
+});
+
+test("library restore deliberate retry requires a fresh inspection and confirmation", async () => {
+  const fixture = restoreFixture({ imported: () => { throw new TypeError("Failed to fetch"); } });
+  await fixture.prepare();
+  await fixture.library.actions.restoreImport();
+  await fixture.library.actions.restoreImport();
+  assert.equal(fixture.applies().length, 1);
+  action(fixture.elements.dialog, "restore-inspect").click();
+  await settle();
+  assert.equal(fixture.applies().length, 1, "inspection does not automatically replay apply");
+  assert.match(fixture.elements.dialog.textContent, /Continue\?/);
+  action(fixture.elements.dialog, "restore-import").click();
+  await settle();
+  assert.deepEqual(fixture.applies().map(({ options }) => options.headers["X-Backup-Inspection-Receipt"]), ["receipt-1", "receipt-2"]);
+});
+
+for (const failures of [{}, { ui: "Synthetic start failure" }]) {
+  test(`library restore accepts decided success with restart failures ${JSON.stringify(failures)}`, async () => {
+    const fixture = restoreFixture({ imported: () => jsonResponse(200, restoreResult({ systems: [], default_system_id: null, stopped_containers: ["ui"], restarted_containers: Object.keys(failures).length ? [] : ["ui"], restart_failures: failures })) });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    assert.match(fixture.banners.at(-1)[0], /^Backup restored/);
+    assert.equal(fixture.banners.at(-1)[1], Object.keys(failures).length ? "error" : "success");
+    assert.match(fixture.elements.dialog.querySelector(".backup-dialog-result").textContent, /^Restored/);
+    assert.equal(fixture.refreshCount, 1);
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, "");
+    assert.deepEqual(fixture.receiptAtDispatch, [null]);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+for (const failure of ["refreshError", "listError"]) {
+  test(`library decided restore survives ${failure}`, async () => {
+    const fixture = restoreFixture({ [failure]: true });
+    await fixture.prepare();
+    await fixture.library.actions.restoreImport();
+    assert.match(fixture.elements.dialog.querySelector(".backup-dialog-result").textContent, /^Restored/);
+    assert.match(fixture.banners.at(-1)[0], /^Backup restored/);
+    assert.doesNotMatch(fixture.banners.at(-1)[0], /Restore failed|Import failed|unknown whether/i);
+    if (failure === "refreshError") assert.match(fixture.banners.at(-1)[0], /refresh/i);
+    else assert.match(fixture.elements.status.textContent, /unavailable|running/i);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("library restore holds duplicate requests to one admitted apply and retires receipt first", async () => {
+  let release;
+  const fixture = restoreFixture({ imported: () => new Promise((resolve) => { release = resolve; }) });
+  await fixture.prepare();
+  const first = fixture.library.actions.restoreImport();
+  const second = fixture.library.actions.restoreImport();
+  assert.equal(first, second);
+  await settle();
+  assert.equal(fixture.applies().length, 1);
+  assert.equal(fixture.library.state.restoreInspection, null);
+  assert.deepEqual(fixture.receiptAtDispatch, [null]);
+  const third = fixture.library.actions.restoreImport();
+  assert.equal(first, third, "pending ownership remains after receipt retirement");
+  release(jsonResponse(200, restoreResult()));
+  await first;
+  assert.equal(fixture.refreshCount, 1);
+});
+
+for (const timing of ["before queuing", "after queuing"]) {
+  test(`library restore cancelled ${timing} cannot dispatch from a closed dialog`, async () => {
+    const fixture = restoreFixture();
+    await fixture.prepare();
+    if (timing === "before queuing") fixture.library.actions.closeDialog();
+    const pending = fixture.library.actions.restoreImport();
+    if (timing === "after queuing") fixture.library.actions.closeDialog();
+    await pending;
+    assert.equal(fixture.applies().length, 0);
+    assert.equal(fixture.banners.length, 0);
+  });
+}
+
+for (const success of [true, false]) {
+  test(`library stale restore ${success ? "success" : "failure"} cannot overwrite a successor dialog`, async () => {
+    let release;
+    const fixture = restoreFixture({ imported: () => new Promise((resolve) => { release = resolve; }) });
+    await fixture.prepare();
+    const pending = fixture.library.actions.restoreImport();
+    await settle();
+    fixture.library.actions.closeDialog();
+    await fixture.prepare("cfg-new");
+    const successorInspection = fixture.library.state.restoreInspection;
+    const successorText = fixture.elements.dialog.textContent;
+    release(success ? jsonResponse(200, restoreResult()) : jsonResponse(503, { detail: "Service unavailable" }));
+    await pending;
+    assert.equal(fixture.library.state.restoreInspection, successorInspection);
+    assert.equal(fixture.elements.dialog.textContent, successorText);
+    assert.equal(fixture.elements.dialog.querySelector("#backup-restore-passphrase").value, " synthetic phrase ");
+    assert.equal(fixture.banners.length, 0, "stale dialog does not publish banners into a successor operation");
+    assert.equal(fixture.refreshCount, success ? 1 : 0);
+    assert.equal(fixture.calls.filter(({ url }) => url === "/api/admin/backups").length, success ? 2 : 1);
+    assert.equal(fixture.applies().length, 1);
+  });
+}
+
+test("admin library mount injects the production restore transport and outcome formatter", () => {
+  const context = loadAdminFunctions([...transportNames, ...restoreNames], {
+    document: { getElementById: () => null },
+    formatBytes() {}, formatLocalTimestamp() {}, setBanner() {}, encodeUtf8Base64() {},
+    describeBackupRestoreConfirmation() {}, describeMaintenanceOutcome() {}, renderMaintenanceResult() {},
+    window: { AdminBackupLibrary: { createBackupLibrary(deps) { context.captured = deps; return null; } } },
+  });
+  const start = ADMIN_SOURCE.indexOf("  const backupLibrary = window.AdminBackupLibrary");
+  const end = ADMIN_SOURCE.indexOf("  backupLibrary?.bind();", start);
+  assert.ok(start > 0 && end > start);
+  vm.runInContext(ADMIN_SOURCE.slice(start, end), context);
+  assert.equal(context.captured.fetchBackupRestore, context.fetchBackupRestore);
+  assert.equal(context.captured.describeBackupRestoreFailure, context.describeBackupRestoreFailure);
+});
+
+// ------------------------------------------------ settings editor (#573) --
+
+function syntheticPolicyView(overrides = {}) {
+  return {
+    revision: "rev-1",
+    classes: {
+      config: { values: { enabled: true, local_keep: 30, remote_keep: null, remote_max_age_days: null, debounce_seconds: 30, max_delay_seconds: 600 }, locked: {} },
+      full: { values: { enabled: false, local_keep: 7, remote_keep: null, remote_max_age_days: 90, schedule: "0 3 * * *", archive_format: "tar.zst" }, locked: { schedule: "BACKUP_FULL_SCHEDULE" } },
+    },
+    archive_formats: ["7z", "tar.zst"],
+    targets: [{
+      values: { target_id: "office-nas", label: "Office NAS", enabled: true, provider: "sftp", root: "/srv/backups/jbod", hostname: "nas.example.test", username: "backup", known_hosts_path: "/run/backup-secrets/archive_known_hosts" },
+      original_target_id: "office-nas",
+      secrets: {
+        password_file: { configured: true, present: false },
+        private_key_file: { configured: true, present: true },
+        private_key_passphrase_file: { configured: false, present: null },
+        access_key_id_file: { configured: false, present: null },
+        secret_access_key_file: { configured: false, present: null },
+      },
+    }],
+    targets_locked_by: null,
+    providers: ["filesystem", "ftp", "sftp", "smb", "nfs", "s3"],
+    target_fields: ["target_id", "provider", "root", "hostname", "port", "username", "timeout_seconds", "use_tls", "known_hosts_path", "trust_on_first_use"],
+    secret_fields: ["password_file", "private_key_file", "private_key_passphrase_file", "access_key_id_file", "secret_access_key_file"],
+    problems: [],
+    restart_command: "docker compose --profile backup-scheduler restart enclosure-backup-scheduler",
+    ...overrides,
+  };
+}
+
+test("settings editor shows secret state only and locks environment values", async () => {
+  const api = fakeApi({ "GET /api/admin/backups/policy": () => syntheticPolicyView() });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const text = elements.dialog.textContent;
+  assert.match(text, /Password file: Secret file missing or not private/);
+  assert.match(text, /Private key file: Secret file present/);
+  assert.match(text, /Set by BACKUP_FULL_SCHEDULE in the environment/);
+  assert.equal(elements.dialog.querySelector("#backup-edit-full-schedule").disabled, true);
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-password_file").value, "", "secret inputs start empty");
+  assert.doesNotMatch(text, /hunter2|BEGIN .*PRIVATE KEY/);
+});
+
+test("saving sends edits, file-path secret changes and clears, never locked values", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-config-local_keep").value = "12";
+  elements.dialog.querySelector("#backup-edit-config-remote_keep").value = "";
+  elements.dialog.querySelector("#backup-edit-target-0-label").value = "Office NAS 2";
+  elements.dialog.querySelector("#backup-edit-target-0-password_file").value = " /run/backup-secrets/new_password ";
+  elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked = true;
+  await library.actions.savePolicy();
+  assert.equal(sent.revision, "rev-1");
+  assert.equal(sent.classes.config.local_keep, 12);
+  assert.equal(sent.classes.config.remote_keep, null);
+  assert.equal("schedule" in sent.classes.full, false, "a locked value is never sent");
+  assert.equal(sent.targets[0].values.label, "Office NAS 2");
+  assert.deepEqual(sent.targets[0].secrets, { password_file: "/run/backup-secrets/new_password", private_key_file: null });
+  for (const key of Object.keys(sent.targets[0].values)) {
+    assert.doesNotMatch(key, /_file$|password|secret/);
+  }
+  assert.match(elements.dialog.textContent, /Restart the backup scheduler/);
+  assert.match(banners.at(-1)[0], /Backup settings saved/);
+});
+
+test("the archive format is a choice of the allowed values and saves as a string", async () => {
+  const sent = [];
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent.push(JSON.parse(options.body));
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const select = elements.dialog.querySelector("#backup-edit-full-archive_format");
+  assert.equal(select.tagName, "SELECT");
+  assert.deepEqual(select.querySelectorAll("option").map((option) => option.getAttribute("value")), ["7z", "tar.zst"]);
+  assert.equal(select.value, "tar.zst");
+  await library.actions.savePolicy();
+  assert.equal(sent[0].classes.full.archive_format, "tar.zst", "an untouched format round-trips as the string, not null");
+  elements.dialog.querySelector("#backup-edit-full-archive_format").value = "7z";
+  await library.actions.savePolicy();
+  assert.equal(sent[1].classes.full.archive_format, "7z");
+});
+
+test("an archive format set in the environment renders disabled and is never sent", async () => {
+  let sent = null;
+  const locked = syntheticPolicyView();
+  locked.classes.full.locked.archive_format = "BACKUP_FULL_ARCHIVE_FORMAT";
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => locked,
+    "PUT /api/admin/backups/policy": ({ options }) => { sent = JSON.parse(options.body); return syntheticPolicyView(); },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  assert.equal(elements.dialog.querySelector("#backup-edit-full-archive_format").disabled, true);
+  assert.match(elements.dialog.textContent, /Set by BACKUP_FULL_ARCHIVE_FORMAT in the environment/);
+  await library.actions.savePolicy();
+  assert.equal("archive_format" in sent.classes.full, false);
+});
+
+test("one click on Add a target or Remove this target acts once, with the dialog inside the section", async () => {
+  const base = syntheticPolicyView();
+  const three = ["alpha", "bravo", "charlie"].map((name) => ({
+    ...base.targets[0],
+    values: { ...base.targets[0].values, target_id: name, label: name },
+    original_target_id: name,
+  }));
+  const api = fakeApi({ "GET /api/admin/backups/policy": () => syntheticPolicyView({ targets: three }) });
+  const { elements, library } = mount({ api });
+  assert.match(TEMPLATE, /<section id="backup-library"(?:(?!<\/section>)[\s\S])*<dialog id="backup-library-dialog"/, "the template nests the dialog in the section");
+  assert.equal(elements.dialog.parentNode, elements.root, "the harness nests the dialog as the template does");
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  const targetIds = () => elements.dialog.querySelectorAll("[data-target-key]")
+    .filter((input) => input.dataset.targetKey === "target_id")
+    .map((input) => input.value);
+  action(elements.dialog, "policy-remove-target", "0").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie"]);
+  action(elements.dialog, "policy-add-target").click();
+  assert.deepEqual(targetIds(), ["bravo", "charlie", ""]);
+});
+
+test("adding and removing targets keeps what was typed; a stale revision says reload", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return Object.assign(new Error("config.yaml changed"), { status: 409 });
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-target-0-label").value = "Typed label";
+  library.actions.addPolicyTarget();
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-label").value, "Typed label");
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "usb-disk";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  library.actions.removePolicyTarget(0);
+  await library.actions.savePolicy();
+  assert.deepEqual(sent.targets.map((target) => target.values.target_id), ["usb-disk"]);
+  assert.match(elements.dialog.textContent, /changed since this editor opened/);
+});
+
+test("pending secret edits survive adding or removing a target; saved rows keep their identity", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView(),
+    "PUT /api/admin/backups/policy": ({ options }) => {
+      sent = JSON.parse(options.body);
+      return { ...syntheticPolicyView({ revision: "rev-2" }), ok: true, restart_required: true };
+    },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  elements.dialog.querySelector("#backup-edit-target-0-target_id").value = "office-nas-renamed";
+  elements.dialog.querySelector("#backup-edit-target-0-password_file").value = "/run/backup-secrets/new_password";
+  elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked = true;
+  library.actions.addPolicyTarget();
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-password_file").value, "/run/backup-secrets/new_password");
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-private_key_file-clear").checked, true);
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "usb-disk";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  library.actions.removePolicyTarget(1);
+  library.actions.addPolicyTarget();
+  elements.dialog.querySelector("#backup-edit-target-1-target_id").value = "office-nas";
+  elements.dialog.querySelector("#backup-edit-target-1-root").value = "/srv/usb/jbod";
+  await library.actions.savePolicy();
+  assert.deepEqual(sent.targets[0].secrets, { password_file: "/run/backup-secrets/new_password", private_key_file: null });
+  assert.equal(sent.targets[0].values.target_id, "office-nas-renamed");
+  assert.equal(sent.targets[0].original_target_id, "office-nas", "a renamed row keeps its saved identity");
+  assert.equal("original_target_id" in sent.targets[1], false, "a new row reusing an old ID inherits nothing");
+});
+
+test("environment-managed targets are read-only in the editor", async () => {
+  let sent = null;
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => syntheticPolicyView({ targets_locked_by: "BACKUP_TARGETS_JSON" }),
+    "PUT /api/admin/backups/policy": ({ options }) => { sent = JSON.parse(options.body); return syntheticPolicyView(); },
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openPolicyEditor(elements.editButton);
+  await settle();
+  assert.match(elements.dialog.textContent, /Targets are set by BACKUP_TARGETS_JSON/);
+  assert.equal(action(elements.dialog, "policy-add-target"), undefined);
+  assert.equal(elements.dialog.querySelector("#backup-edit-target-0-label").disabled, true);
+  await library.actions.savePolicy();
+  assert.equal("targets" in sent, false);
+});
+
+test("the panel offers Edit settings and no longer calls the settings read-only", () => {
+  assert.match(TEMPLATE, /id="backup-library-edit-button"[^>]*>Edit settings</);
+  assert.doesNotMatch(TEMPLATE, /shown here read-only/);
+  assert.match(ADMIN_SOURCE, /editButton: document\.getElementById\("backup-library-edit-button"\)/);
+});

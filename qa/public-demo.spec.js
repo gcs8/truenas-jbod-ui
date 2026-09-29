@@ -78,6 +78,16 @@ async function startPagesServer(artifactPath) {
   };
 }
 
+// #439: a saved copy hides controls it cannot use instead of showing them
+// disabled. Controls inside a closed <details> or a hidden ancestor count as
+// hidden, so this lists only what a visitor can actually see.
+async function visibleDisabledControls(page) {
+  return page.evaluate(() => Array.from(document.querySelectorAll("button, input, select, textarea"))
+    .filter((control) => control.disabled || control.getAttribute("aria-disabled") === "true")
+    .filter((control) => control.checkVisibility({ visibilityProperty: true }))
+    .map((control) => control.id || control.name || control.textContent.trim()));
+}
+
 test("public demo static artifact is explorable without a live backend", async ({ page }) => {
   const demoPath = resolvePublicDemoArtifact();
   const consoleErrors = [];
@@ -96,16 +106,22 @@ test("public demo static artifact is explorable without a live backend", async (
   await page.goto(pathToFileURL(demoPath).href, { waitUntil: "load" });
 
   const selector = page.locator("#enclosure-select");
-  await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("Artifact app v");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Capture time");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("60 bays in artifact");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("2 saved/virtual views");
-  await expect(page.locator(".snapshot-banner-facts")).toContainText("1 event");
-  await expect(page.locator(".snapshot-banner-facts")).not.toContainText("1 events");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Synthetic IDs");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Source revision");
-  await expect(page.locator(".snapshot-banner-meta")).toContainText("Build ID");
+  await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
+  await expect(page.locator("#header-summary")).toContainText("A 60-bay JBOD with made-up disks.");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("Captured");
+  await expect(page.locator(".snapshot-banner-meta")).toContainText("60 bays, 2 views");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("1 event");
+  await expect(page.locator(".snapshot-banner-about")).not.toContainText("1 events");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Synthetic IDs");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Source revision");
+  await expect(page.locator(".snapshot-banner-about")).toContainText("Build ID");
+  await expect(page.locator(".snapshot-banner-about > summary")).toContainText("About this demo");
+  await expect(page.locator(".snapshot-banner-about")).not.toHaveAttribute("open", "");
+  await expect(page.locator("#refresh-button")).toBeHidden();
+  await expect(page.locator("#auto-refresh-field")).toBeHidden();
+  await expect(page.locator("#refresh-interval-field")).toBeHidden();
+  await expect(page.locator("#inventory-evidence-disclosure")).toBeHidden();
+  expect(await visibleDisabledControls(page)).toEqual([]);
   await expect(page.locator(".public-demo-identity")).toHaveCount(2);
   const identities = await page.locator(".public-demo-identity").allTextContents();
   expect(identities[0]).toMatch(/^[0-9a-f]{40}$/);
@@ -113,26 +129,82 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator(".snapshot-banner-meta")).toContainText("7d");
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
-  await expect(selector.locator("option:checked")).toContainText("Snapshot · Demo 60-Bay Top Loader");
-  await expect(page.locator("#api-status-chip")).toHaveText("API AT CAPTURE");
-  await expect(page.locator("#ssh-status-chip")).toHaveText("SSH OFF AT CAPTURE");
-  await expect(page.locator("#history-status-chip")).toHaveText("HIST PRELOADED");
+  await expect(selector.locator("option:checked")).toContainText("Saved copy · Demo 60-Bay Top Loader");
+  await expect(page.locator("#api-status-chip")).toHaveText("TrueNAS API: OK at capture");
+  await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: off at capture");
+  await expect(page.locator("#history-status-chip")).toHaveText("History: included");
   await expect(page.locator("#last-updated").locator("xpath=.." )).toContainText("Snapshot time");
-  await expect(page.locator("#status-text")).toContainText("Frozen offline snapshot loaded");
+  await expect(page.locator("#status-text")).toContainText("Offline copy. Live actions are off.");
+
+  // Ordinary PRs exercise a disposable current-source build. The manual
+  // publication workflow deliberately re-tests the reviewed checked-in bytes,
+  // which may predate this source until the next release candidate rebuild.
+  if (path.resolve(demoPath) !== path.resolve(path.join(repoRoot, "public-demo", "index.html"))) {
+    const capabilitiesPanel = page.locator("#capabilities-panel");
+    await expect(capabilitiesPanel).toBeVisible();
+    await expect(capabilitiesPanel.locator("h2")).toHaveText("What this system supports");
+    await expect(capabilitiesPanel.locator(".capability-card")).toHaveCount(3);
+    await expect(capabilitiesPanel.locator(".capability-card strong")).toHaveText([
+      "Bay layout",
+      "SMART details",
+      "Locate light",
+    ]);
+    const capabilityTextSizes = await capabilitiesPanel.locator(".capability-card").evaluateAll((cards) =>
+      cards.flatMap((card) => Array.from(card.querySelectorAll("strong, span, p")))
+        .map((node) => Number.parseFloat(getComputedStyle(node).fontSize))
+    );
+    expect(Math.min(...capabilityTextSizes)).toBeGreaterThanOrEqual(12);
+  }
 
   await expect(page.locator("#sas-fabric-view-link")).toHaveCount(0);
   await page.locator("#sas-fabric-toggle-button").click();
   await expect(page.locator("#sas-fabric-panel")).toBeVisible();
   await expect(page.locator("#sas-fabric-status")).toContainText(
-    "This offline snapshot does not include Storage Fabric data or live refresh capability."
+    "This offline copy shows a saved connection map. It cannot refresh."
   );
-  await expect(page.locator("#sas-fabric-inspector-body")).toContainText(
-    "No Storage Fabric payload is included in this snapshot."
-  );
-  await expect(page.locator("#sas-fabric-lanes")).toContainText(
-    "No Storage Fabric payload is included in this snapshot."
+  await expect(page.locator("#sas-fabric-lanes")).not.toContainText(
+    "This offline copy does not include the connection map."
   );
   await expect(page.locator("#sas-fabric-lanes")).not.toContainText("yet");
+
+  // The bay grid must be the enclosure, not a flat wrapped chip list: one
+  // layout per controller lane, four rows each, the 6 | 6 | 3 column groups
+  // the CSE-946 profile declares, and the same edge cue the chassis prints.
+  const fabricLayouts = page.locator("#sas-fabric-lanes .sas-fabric-bay-layout");
+  await expect(fabricLayouts).toHaveCount(2);
+  const firstLayout = fabricLayouts.first();
+  await expect(firstLayout.locator(".sas-fabric-bay-row")).toHaveCount(4);
+  await expect(firstLayout.locator(".sas-fabric-bay-row").first().locator(".sas-fabric-bay-group")).toHaveCount(3);
+  await expect(firstLayout.locator(".sas-fabric-bay-chip")).toHaveCount(60);
+  await expect(firstLayout.locator(".sas-fabric-bay-edge-label")).toHaveText("System front / latch edge");
+  await expect(page.locator("#sas-fabric-lanes .sas-fabric-bay-overflow")).toHaveCount(0);
+
+  // Lane one owns bays 0-44: those are selectable chips, and the bays it does
+  // not own are placeholders - dim where the fixture has a disk, empty where
+  // it does not.
+  await expect(firstLayout.locator('button.sas-fabric-bay-chip[data-sas-fabric-slot="0"]')).toHaveCount(1);
+  await expect(firstLayout.locator('button.sas-fabric-bay-chip[data-sas-fabric-slot="57"]')).toHaveCount(0);
+  await expect(firstLayout.locator("span.sas-fabric-bay-chip.is-outside")).not.toHaveCount(0);
+  await expect(firstLayout.locator("span.sas-fabric-bay-chip.is-empty")).not.toHaveCount(0);
+
+  // Bay 00 is the bottom-left tile on the Enclosure tab; it must also be the
+  // bottom-left cell of the fabric grid.
+  const lastRowFirstChip = firstLayout
+    .locator(".sas-fabric-bay-row")
+    .last()
+    .locator(".sas-fabric-bay-chip")
+    .first();
+  await expect(lastRowFirstChip).toHaveText("00");
+  const firstRowFirstChip = firstLayout
+    .locator(".sas-fabric-bay-row")
+    .first()
+    .locator(".sas-fabric-bay-chip")
+    .first();
+  await expect(firstRowFirstChip).toHaveText("45");
+
+  await expect(page.locator("#sas-fabric-inspector-body")).not.toContainText(
+    "No Storage Fabric payload is included in this snapshot."
+  );
 
   await expect(selector).toBeEnabled();
   await expect(page.locator("#chassis-shell")).toHaveAttribute("data-face-style", "top-loader");
@@ -143,7 +215,7 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#detail-kv-grid")).toContainText("Demo Flash SSD 4TB");
   await expect(page.locator("#detail-kv-grid")).toContainText("DEMO-SN-CORE-0057");
   await expect(page.locator("#detail-kv-grid")).toContainText("mirror-8");
-  await expect(page.locator("#multipath-context")).toContainText("at capture");
+  await expect(page.locator("#multipath-context")).toContainText("when the copy was saved");
   await expect(page.locator("#multipath-context")).not.toContainText("currently");
   await page.locator("#history-toggle-button").click();
   await expect(page.locator("#history-metric-grid")).toContainText("Temperature");
@@ -176,8 +248,13 @@ test("public demo static artifact is explorable without a live backend", async (
 
   await expect(page.locator("#refresh-button")).toBeDisabled();
   await expect(page.locator("#disk-inventory-sync-controls")).toHaveClass(/hidden/);
-  await expect(page.locator("#export-mappings-button")).toBeDisabled();
-  await expect(page.locator("#import-mappings-button")).toBeDisabled();
+  await expect(page.locator("#mapping-panel")).toBeHidden();
+  await expect(page.locator("#export-mappings-button")).toBeHidden();
+  await expect(page.locator("#import-mappings-button")).toBeHidden();
+  await expect(page.locator("#sas-fabric-refresh-button")).toBeHidden();
+  await expect(page.locator("#system-select")).toBeHidden();
+  await expect(page.locator("#system-select-static")).toHaveText("Demo Storage Host");
+  expect(await visibleDisabledControls(page)).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(outboundRequests).toEqual([]);
 });
@@ -195,7 +272,7 @@ test("public demo works from a Pages subpath through reload and history navigati
   });
   try {
     await page.goto(fixture.baseURL, { waitUntil: "load" });
-    await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
+    await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
     const probeResponse = await page.request.get(
       new URL(CHROME_LOCALHOST_DEVTOOLS_PROBE, fixture.baseURL).href,
     );
@@ -371,9 +448,9 @@ if (process.env.PUBLIC_DEMO_URL) {
       }
     });
     await page.goto(publishedURL, { waitUntil: "load" });
-    await expect(page.locator(".snapshot-banner-badge")).toContainText("Frozen Sanitized Snapshot");
-    await expect(page.locator(".snapshot-banner-meta")).toContainText("Source revision");
-    await expect(page.locator(".snapshot-banner-meta")).toContainText("Build ID");
+    await expect(page.locator(".snapshot-banner-badge")).toContainText("Demo data");
+    await expect(page.locator(".snapshot-banner-about")).toContainText("Source revision");
+    await expect(page.locator(".snapshot-banner-about")).toContainText("Build ID");
     await page.reload({ waitUntil: "load" });
     await expect(page.locator("#slot-grid .slot-tile")).toHaveCount(60);
     expect(unexpected).toEqual([]);
@@ -484,7 +561,7 @@ test("enclosure selector keeps its quoted option, focus, and node across a norma
     sameOption: true,
     selected: true,
     value: "enclosure:synthetic-enclosure",
-    text: 'Snapshot · Synthetic "Enclosure"',
+    text: 'Saved copy · Synthetic "Enclosure"',
   });
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);

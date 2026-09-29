@@ -20,6 +20,114 @@ from history_service.scheduled_backup import (
 from history_service.system_backup import FileBackupArtifact
 
 
+class HistoryBackupAccessContractTests(unittest.TestCase):
+    """Real local file operations plus source-projected POSIX identities, not Docker."""
+
+    @staticmethod
+    def services(overlay=False):
+        import yaml
+
+        root = Path(__file__).resolve().parents[1]
+        base = yaml.safe_load((root / "docker-compose.yml").read_text())["services"]
+        if overlay:
+            hardened = yaml.safe_load((root / "docker-compose.nonroot.yml").read_text())["services"]
+            for name, values in hardened.items():
+                base[name].update(values)
+        return base
+
+    @staticmethod
+    def resolve(value, environment):
+        # Only the ${NAME:-default} identity syntax used in these Compose files.
+        return re.sub(r"\$\{(\w+):-([^}]+)\}",
+                      lambda match: environment.get(match[1]) or match[2], value)
+
+    @classmethod
+    def identity(cls, service, environment):
+        uid, gid = map(int, cls.resolve(service["user"], environment).split(":"))
+        groups = {gid, *(int(cls.resolve(group, environment))
+                         for group in service.get("group_add", []))}
+        return uid, gid, groups
+
+    @staticmethod
+    def permissions(mode, owner, reader):
+        # No root bypass: backup drops ALL capabilities. Owner bits still apply.
+        uid, _, groups = reader
+        shift = 6 if uid == owner[0] else 3 if owner[1] in groups else 0
+        return (mode >> shift) & 7
+
+    def test_default_backup_can_open_fresh_and_legacy_root_history(self):
+        from history_service.store import HistoryStore
+
+        services = self.services()
+        root = Path(__file__).resolve().parents[1]
+        example = dict(line.split("=", 1) for line in (root / ".env.example").read_text().splitlines()
+                       if line and not line.startswith("#") and "=" in line)
+        for environment in ({}, example):
+            producer = self.identity(services["enclosure-history"], environment)
+            reader = self.identity(services["enclosure-backup"], environment)
+            for legacy in (False, True):
+                for parent_mode in (0o700, 0o770, 0o2770):
+                    with self.subTest(example=bool(environment), legacy=legacy, parent=oct(parent_mode)):
+                        with tempfile.TemporaryDirectory() as temp:
+                            parent = Path(temp) / "history"
+                            parent.mkdir(mode=parent_mode)
+                            parent.chmod(parent_mode)
+                            path = parent / "history.db"
+                            if legacy:
+                                path.write_bytes(b"synthetic legacy state")
+                                path.chmod(0o660)
+                            before = path.stat() if legacy else None
+                            store = object.__new__(HistoryStore)
+                            store.file_path = path
+                            store.shared_file_mode = 0o660
+                            store._create_database_file_for_shared_access()
+                            metadata = path.stat()
+                            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o660)
+                            self.assertEqual(metadata.st_uid, os.geteuid())
+                            self.assertEqual(metadata.st_gid, os.getegid())
+                            if before:
+                                self.assertEqual(metadata, before)
+                                self.assertEqual(path.read_bytes(), b"synthetic legacy state")
+                            # Actual kernel access as the local owner, not a claim of UID 0 execution.
+                            fd = os.open(path, os.O_RDWR)
+                            os.close(fd)
+                            # Project that observed creation onto the source's root-owned mount.
+                            owner = (0, 0) if legacy else producer[:2]
+                            self.assertEqual(self.permissions(parent_mode, (0, 0), reader) & 3, 3,
+                                             "backup needs parent traversal and SQLite sidecar creation")
+                            self.assertEqual(self.permissions(metadata.st_mode, owner, reader) & 6, 6,
+                                             "backup needs database read/write without ownership repair")
+
+    def test_hardened_backup_defaults_and_explicit_identities_remain_usable(self):
+        for environment in ({}, {"APP_UID": "12001", "APP_GID": "12002",
+                                 "BACKUP_UID": "12003", "BACKUP_GID": "12004"}):
+            services = self.services(overlay=True)
+            producer = self.identity(services["enclosure-history"], environment)
+            reader = self.identity(services["enclosure-backup"], environment)
+            self.assertEqual(reader[0], int(environment.get("BACKUP_UID", "1000")))
+            self.assertEqual(reader[1], int(environment.get("BACKUP_GID", "1000")))
+            self.assertEqual(self.permissions(0o770, producer[:2], reader) & 3, 3)
+            self.assertEqual(self.permissions(0o660, producer[:2], reader) & 6, 6)
+            self.assertEqual(self.permissions(0o750, producer[:2], reader) & 5, 5)
+            self.assertEqual(self.permissions(0o640, producer[:2], reader), 4)
+            self.assertEqual(self.permissions(0o700, producer[:2], reader), 0)
+            base_reader = self.identity(self.services()["enclosure-backup"], environment)
+            if environment:
+                self.assertEqual(base_reader, reader, "explicit backup IDs must not be overridden")
+
+    def test_owner_access_projection_does_not_assume_root_capability_bypass(self):
+        reader = self.identity(self.services()["enclosure-backup"], {})
+        self.assertEqual(self.permissions(0o700, (12345, 12345), reader), 0)
+        self.assertEqual(self.permissions(0o600, (12345, 12345), reader), 0)
+        self.assertEqual(self.permissions(0o000, (reader[0], reader[1]), reader), 0)
+        service = self.services()["enclosure-backup"]
+        self.assertEqual(service["cap_drop"], ["ALL"])
+        self.assertNotIn("cap_add", service)
+        self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
+        self.assertTrue(service["read_only"])
+        self.assertEqual(service["network_mode"], "none")
+
+
 class ScheduledBackupSettingsTests(unittest.TestCase):
     def test_schedule_is_disabled_by_default_and_independent_of_admin_settings(self) -> None:
         settings = ScheduledBackupSettings()
@@ -35,8 +143,9 @@ class ScheduledBackupSettingsTests(unittest.TestCase):
         admin_config = (Path(__file__).resolve().parents[1] / "admin_service/config.py").read_text(
             encoding="utf-8"
         )
-        admin_main = (Path(__file__).resolve().parents[1] / "admin_service/main.py").read_text(
-            encoding="utf-8"
+        admin_main = "".join(
+            (Path(__file__).resolve().parents[1] / relative).read_text(encoding="utf-8")
+            for relative in ("admin_service/main.py", "admin_service/route_support.py")
         )
         self.assertNotIn("scheduled_backup", admin_config)
         self.assertNotIn("ScheduledBackup", admin_main)
@@ -198,6 +307,22 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_runner_defaults_to_the_fast_full_format_and_keeps_7z_choice(self) -> None:
+        # #397: tar.zst is the default FULL format; 7z is passed when chosen.
+        self._runner().run_once()
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs["archive_format"],
+            "tar.zst",
+        )
+        self.backup_service.export_scheduled_bundle_to_file.reset_mock()
+        self.workspace.mkdir(exist_ok=True)  # the first run's artifact cleanup removed it
+        self.artifact_path.write_bytes(b"authenticated-encrypted-archive")
+        self._runner(archive_format="7z").run_once()
+        self.assertEqual(
+            self.backup_service.export_scheduled_bundle_to_file.call_args.kwargs["archive_format"],
+            "7z",
+        )
+
     def _runner(self, **overrides: object) -> ScheduledBackupRunner:
         payload: dict[str, object] = {
             "backup_service": self.backup_service,
@@ -234,6 +359,7 @@ class ScheduledBackupRunnerTests(unittest.TestCase):
         self.backup_service.export_scheduled_bundle_to_file.assert_called_once_with(
             passphrase="correct horse battery staple",
             included_paths=["config_file", "mapping_file", "profile_file"],
+            archive_format="tar.zst",
         )
         preflight_path = self.backup_service.preflight_scheduled_bundle_file.call_args.args[0]
         self.assertEqual(Path(preflight_path).parent, self.destination)
@@ -623,6 +749,18 @@ class ScheduledBackupDeploymentContractTests(unittest.TestCase):
             segment_catalog_path="/tmp/segments/catalog.json",
         )
         self.assertEqual(runner_factory.call_args.kwargs["app_gid"], 10001)
+        # #397: the one-shot job defaults to the fast FULL format.
+        self.assertEqual(runner_factory.call_args.kwargs["archive_format"], "tar.zst")
+
+    def test_one_shot_archive_format_defaults_to_tar_zst_and_reads_the_env_switch(self) -> None:
+        self.assertEqual(ScheduledBackupSettings().archive_format, "tar.zst")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": ""}, clear=False):
+            self.assertEqual(ScheduledBackupSettings.from_environment().archive_format, "tar.zst")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": " 7Z "}, clear=False):
+            self.assertEqual(ScheduledBackupSettings.from_environment().archive_format, "7z")
+        with patch.dict(os.environ, {"BACKUP_FULL_ARCHIVE_FORMAT": "zip"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "BACKUP_FULL_ARCHIVE_FORMAT must be 7z or tar.zst"):
+                ScheduledBackupSettings.from_environment()
 
     def test_runner_module_has_no_network_server_or_docker_control_dependency(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "history_service/scheduled_backup_main.py").read_text(

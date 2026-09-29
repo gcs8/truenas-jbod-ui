@@ -16,8 +16,8 @@ Current ESXi support is the exception to that pattern: it is SSH-only,
 read-only, and intentionally skips the Linux bootstrap/sudo flow. On the
 validated ESXi host the saved SSH user stays `root`, and the app uses direct
 read-only runtime commands instead of trying to synthesize Linux sudo rules.
-If the host is using password auth, leave `key_path` blank and use the admin
-sidecar's `Password Only / No Key` mode instead of forcing a fake key path.
+If the host is using password auth, leave `key_path` blank and use Admin's
+`Password Only / No Key` mode instead of forcing a fake key path.
 
 ## Recommended SSH user pattern
 
@@ -33,27 +33,36 @@ On the Docker host:
 - private key in `./config/ssh/id_truenas`
 - pinned host keys in `./data/known_hosts` by default
 
-The known-hosts location is derived from the runtime layout. Do not add
-`known_hosts_path` to YAML; configured values are discarded. Inside the default
-container layout the derived file is `/app/data/known_hosts`.
+By default the known-hosts location is derived from the runtime layout. Inside
+the default container layout the derived file is `/app/data/known_hosts`. To
+keep pinned keys in a host bind mount instead, set `ssh.known_hosts_path` (top
+level or per system) or `SSH_KNOWN_HOSTS_PATH`; the folder must exist and be
+writable by the app user, or the UI reports it at startup. The examples below
+use the default `data/known_hosts`; substitute your host path if you set one.
 
 Strict checking rejects an unknown key, so preload and verify every SSH target
 before enabling the system. Get each fingerprint through a trusted channel, then
 compare it with the scan before installation. This example preserves the
 configured non-root service ownership and group readability. Run it from the
 deployment directory. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values in this shell first:
+same values in this shell first. Set `ssh_host` to the exact configured `ssh.host`
+and `ssh_port` to its configured `ssh.port`, default `22`. Use the bare address
+for IPv6, without brackets. Do not use a different hostname alias or scan port 22
+when the app connects to a custom port.
 
 ```bash
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
 ssh_host="storage-host.example.test"
+ssh_port=22  # Replace with the configured port, for example 2222.
 known_hosts_scan="$(mktemp)"
 known_hosts_merged="$(mktemp)"
 trap 'rm -f "$known_hosts_scan" "$known_hosts_merged"' EXIT
-ssh-keyscan -H "$ssh_host" > "$known_hosts_scan"
+ssh-keyscan -H -p "$ssh_port" "$ssh_host" > "$known_hosts_scan"
 ssh-keygen -lf "$known_hosts_scan"
-# Compare the fingerprint out of band before installing the file.
+# Compare every fingerprint with the trusted-channel value before approval.
+read -r -p 'Fingerprints verified through a trusted channel? Type yes: ' verified
+[ "$verified" = yes ] || exit 1
 if sudo test -f data/known_hosts; then
   sudo cat data/known_hosts > "$known_hosts_merged"
 fi
@@ -63,10 +72,17 @@ rm -f "$known_hosts_scan" "$known_hosts_merged"
 trap - EXIT
 ```
 
-Repeat the block for every configured host and HA node. Each run copies the
-existing pinned keys into the merged temporary file before appending the newly
-verified scan. Do not use a root-owned `0600` file; the non-root UI process
-cannot read it.
+Repeat the block for every configured host, port, and HA node. Port 22 uses the
+host name as the known-hosts identity; a non-default port uses `[host]:port`,
+including `[2001:db8::1]:2222` for IPv6. `ssh-keyscan -H -p` hashes that same
+identity; the app's SSH client looks it up using its configured host and port.
+The scan is not trusted by itself. Never automate the approval or install keys
+whose fingerprints have not been verified through a trusted channel.
+
+Each run copies the existing pinned keys into the merged temporary file before
+appending the newly verified scan. Install into the application's effective
+known-hosts file, not the shell user's `~/.ssh/known_hosts`. Do not use a
+root-owned `0600` file; the non-root UI process cannot read it.
 
 In app config:
 
@@ -171,7 +187,7 @@ esxcli storage san sas list
 
 On validated Broadcom / AVAGO MegaRAID hosts, `lsi_mr3` and
 `lsuv2-lsiv2-drivers-plugin` alone are not enough for the richer member-detail
-path. If StorCLI is missing, the admin sidecar's `Host Prep / Vendor Tool
+path. If StorCLI is missing, the Admin's `Host Prep / Vendor Tool
 Upload` panel is the intended place to stage and install an operator-supplied
 Broadcom bundle or VIB. The project does not ship that vendor package itself.
 
@@ -197,7 +213,7 @@ with ESXi added later only as optional enrichment.
 
 ## Generated bootstrap permission previews
 
-The admin sidecar's Sudoers Preview is the canonical copy/paste source. The
+The Admin's Sudoers Preview is the canonical copy/paste source. The
 blocks below match the policy used by the one-time bootstrap. Do not split them
 into partial SMART and SES files or add command
 wildcards. Linux-like policies must pass `visudo -cf` before installation.

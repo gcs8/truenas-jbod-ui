@@ -9,7 +9,9 @@ history databases, caches, logs, or live systems.
 
 ## Build
 
-If a generator input changed, commit that source first and pass its full commit:
+The demo is rebuilt when a release is cut, not in ordinary pull requests (see
+`docs/RELEASE_CHECKLIST.md`, "Public demo rebuild"). Commit the release source
+first and pass its full commit:
 
 ```bash
 SOURCE_COMMIT="$(git rev-parse HEAD)"

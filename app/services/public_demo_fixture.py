@@ -23,6 +23,10 @@ from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
     InventorySummary,
+    PlatformCapability,
+    SasFabricNode,
+    SasFabricSnapshot,
+    SasFabricTrace,
     SlotState,
     SlotView,
     SmartSummaryView,
@@ -94,7 +98,11 @@ class PublicDemoSlot(FixtureModel):
     size_bytes: int | None = Field(default=None, ge=1)
     size_human: str | None = Field(default=None, max_length=32)
     pool_name: str | None = Field(default=None, pattern=r"^demo-[a-z0-9-]+$", max_length=64)
-    vdev_name: str | None = Field(default=None, pattern=r"^(?:raidz2|mirror|spare)-[0-9]+$", max_length=32)
+    vdev_name: str | None = Field(
+        default=None,
+        pattern=r"^(?:(?:raidz2|mirror|spare)-[0-9]+|spares)$",
+        max_length=32,
+    )
     vdev_class: Literal["data", "special", "spare"] | None = None
     health: Literal["ONLINE", "AVAILABLE"] | None = None
     temperature_c: int | None = Field(default=None, ge=15, le=60)
@@ -148,6 +156,56 @@ class PublicDemoStorageView(FixtureModel):
     slots: list[PublicDemoStorageSlot] = Field(min_length=1, max_length=16)
 
 
+class PublicDemoFabricPath(FixtureModel):
+    id: str = Field(pattern=r"^demo-[a-z0-9-]+$", max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    state: Literal["active", "degraded", "fail"]
+    slot_range: tuple[int, int]
+
+    @field_validator("slot_range")
+    @classmethod
+    def validate_slot_range(cls, value: tuple[int, int]) -> tuple[int, int]:
+        first, last = value
+        if not 0 <= first <= last <= 59:
+            raise ValueError("storage fabric slot ranges must stay inside bays 0-59 and ascend")
+        return value
+
+    @property
+    def slot_numbers(self) -> list[int]:
+        return list(range(self.slot_range[0], self.slot_range[1] + 1))
+
+
+class PublicDemoFabricController(FixtureModel):
+    id: str = Field(pattern=r"^demo-[a-z0-9-]+$", max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    device: str = Field(pattern=r"^demo-[a-z0-9]+$", max_length=32)
+    firmware: str = Field(pattern=r"^[0-9]{2}(?:\.[0-9]{2}){3}$")
+    temperature_c: int = Field(ge=0, le=120)
+    enclosure_label: str = Field(min_length=1, max_length=64)
+    paths: list[PublicDemoFabricPath] = Field(min_length=1, max_length=4)
+
+    @property
+    def slot_numbers(self) -> list[int]:
+        return [slot_number for path in self.paths for slot_number in path.slot_numbers]
+
+
+class PublicDemoStorageFabric(FixtureModel):
+    controllers: list[PublicDemoFabricController] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_bay_coverage(self) -> "PublicDemoStorageFabric":
+        covered = [
+            slot_number
+            for controller in self.controllers
+            for slot_number in controller.slot_numbers
+        ]
+        if sorted(covered) != list(range(60)) or len(covered) != len(set(covered)):
+            raise ValueError("storage fabric paths must cover bays 0-59 exactly once")
+        if not any(path.state != "active" for controller in self.controllers for path in controller.paths):
+            raise ValueError("storage fabric must declare at least one non-active path")
+        return self
+
+
 class PublicDemoFixture(FixtureModel):
     schema_version: Literal[1]
     provenance: Literal["synthetic"]
@@ -157,6 +215,7 @@ class PublicDemoFixture(FixtureModel):
     system: PublicDemoSystem
     enclosure: PublicDemoEnclosure
     slots: list[PublicDemoSlot] = Field(min_length=60, max_length=60)
+    storage_fabric: PublicDemoStorageFabric
     storage_views: list[PublicDemoStorageView] = Field(min_length=2, max_length=2)
 
     @field_validator("generated_at")
@@ -210,6 +269,7 @@ class PublicDemoSnapshotBundle:
     live_enclosure_smart_summary_cache: dict[str, dict[str, dict[str, Any]]]
     storage_view_runtime: StorageViewRuntimePayload
     storage_view_smart_summary_cache: dict[str, dict[str, dict[str, Any]]]
+    sas_fabric: SasFabricSnapshot
 
 
 class PublicDemoHistoryBackend:
@@ -278,6 +338,188 @@ def validate_public_demo_fixture_privacy(fixture: PublicDemoFixture) -> None:
         raise ValueError("public demo fixture contains a non-synthetic serial")
 
 
+def build_public_demo_sas_fabric(
+    *,
+    fixture: PublicDemoFixture | None = None,
+) -> SasFabricSnapshot:
+    """
+    Build the frozen synthetic Storage Fabric payload the public demo embeds.
+
+    Every value comes from the checked-in fixture seed or is derived from it,
+    so the payload is deterministic and carries no real controller, expander,
+    enclosure or address identifier. Two controllers each own a disjoint half
+    of the enclosure, so each lane's bay grid lights its own bays and shows the
+    other lane's populated and empty bays as placeholders.
+    """
+
+    source = fixture or load_public_demo_fixture()
+    seed = source.storage_fabric
+    slot_states = {slot.slot: slot.state for slot in source.slots}
+
+    nodes: list[SasFabricNode] = [
+        SasFabricNode(
+            id="host",
+            kind="host",
+            label=source.system.label,
+            status="online",
+            metrics={"slot_count": len(source.slots), "controller_count": len(seed.controllers)},
+            evidence=["Synthetic public demo fixture"],
+        )
+    ]
+    controllers: list[dict[str, Any]] = []
+    expanders: list[dict[str, Any]] = []
+    enclosures: list[dict[str, Any]] = []
+    paths: list[dict[str, Any]] = []
+    traces: list[SasFabricTrace] = []
+
+    for controller in seed.controllers:
+        controller_id = f"controller:{controller.id}"
+        controller_slots = sorted(controller.slot_numbers)
+        path_counts = {
+            "active": sum(len(path.slot_numbers) for path in controller.paths if path.state == "active"),
+            "fail": sum(len(path.slot_numbers) for path in controller.paths if path.state == "fail"),
+            "degraded": sum(len(path.slot_numbers) for path in controller.paths if path.state == "degraded"),
+            "total": len(controller_slots),
+        }
+        degraded = path_counts["fail"] > 0 or path_counts["degraded"] > 0
+        nodes.append(
+            SasFabricNode(
+                id=controller_id,
+                kind="controller",
+                label=controller.id,
+                display_label=controller.label,
+                raw_id=controller.device,
+                status="degraded" if degraded else "online",
+                related_slots=controller_slots,
+                metrics={
+                    "temperature": controller.temperature_c,
+                    "firmware": controller.firmware,
+                    "path_counts": path_counts,
+                },
+                evidence=["Synthetic public demo fixture"],
+            )
+        )
+        controllers.append(
+            {
+                "id": controller_id,
+                "name": controller.id,
+                "display_label": controller.label,
+                "device": controller.device,
+                "firmware": controller.firmware,
+                "temperature": controller.temperature_c,
+                "related_slots": controller_slots,
+                "path_counts": path_counts,
+            }
+        )
+        enclosure_id = f"ses-enclosure:{controller.id}"
+        nodes.append(
+            SasFabricNode(
+                id=enclosure_id,
+                kind="ses-enclosure",
+                label=controller.enclosure_label,
+                display_label=controller.enclosure_label,
+                status="degraded" if degraded else "online",
+                controller_id=controller_id,
+                related_slots=controller_slots,
+                metrics={"slot_count": len(controller_slots)},
+                evidence=["Synthetic public demo fixture"],
+            )
+        )
+        enclosures.append(
+            {
+                "id": enclosure_id,
+                "label": controller.enclosure_label,
+                "controller_id": controller_id,
+                "related_slots": controller_slots,
+            }
+        )
+        for path in controller.paths:
+            path_id = f"path:{controller.id}:{path.id}"
+            path_slots = path.slot_numbers
+            expander_id = f"expander:{path.id}"
+            nodes.append(
+                SasFabricNode(
+                    id=expander_id,
+                    kind="expander",
+                    label=path.label,
+                    display_label=path.label,
+                    status="degraded" if path.state != "active" else "online",
+                    controller_id=controller_id,
+                    related_slots=path_slots,
+                    metrics={"num_phys": 36, "linked_phys": 24 if path.state == "active" else 12},
+                    evidence=["Synthetic public demo fixture"],
+                )
+            )
+            expanders.append(
+                {
+                    "id": expander_id,
+                    "label": path.label,
+                    "controller_id": controller_id,
+                    "related_slots": path_slots,
+                }
+            )
+            paths.append(
+                {
+                    "id": path_id,
+                    "controller": controller.id,
+                    "display_label": f"{controller.label} / {path.label}",
+                    "state": path.state,
+                    "count": len(path_slots),
+                    "slots": path_slots,
+                }
+            )
+            traces.append(
+                SasFabricTrace(
+                    id=path_id,
+                    label=f"{controller.label} / {path.label}",
+                    display_label=f"{controller.label} / {path.label}",
+                    kind="path",
+                    node_ids=[controller_id, expander_id, enclosure_id],
+                    slots=path_slots,
+                    metrics={"state": path.state, "count": len(path_slots)},
+                    evidence=["Synthetic public demo fixture"],
+                )
+            )
+            for slot_number in path_slots:
+                traces.append(
+                    SasFabricTrace(
+                        id=f"bay:{slot_number}",
+                        label=f"Bay {slot_number:02d}",
+                        kind="bay",
+                        node_ids=[controller_id, expander_id, enclosure_id],
+                        slots=[slot_number],
+                        metrics={
+                            "state": path.state,
+                            "occupied": slot_states.get(slot_number) != SlotState.empty,
+                        },
+                        evidence=["Synthetic public demo fixture"],
+                    )
+                )
+
+    traces.sort(key=lambda trace: (trace.kind != "path", trace.id))
+    return SasFabricSnapshot(
+        available=True,
+        system_id=source.system.id,
+        system_label=source.system.label,
+        platform=source.system.platform,
+        selected_enclosure_id=source.enclosure.id,
+        selected_enclosure_label=source.enclosure.label,
+        generated_at=source.generated_at,
+        snapshot_cache_state="hit",
+        source_cache_state="hit",
+        nodes=nodes,
+        traces=traces,
+        controllers=controllers,
+        expanders=expanders,
+        enclosures=enclosures,
+        paths=paths,
+        warnings=[
+            "This Storage Fabric map is deterministic synthetic demo data; no appliance was probed.",
+        ],
+        raw={"fabric_domain": "sas_fabric", "fabric_kind": "core_mpr"},
+    )
+
+
 def build_public_demo_snapshot_bundle(
     *,
     fixture: PublicDemoFixture | None = None,
@@ -290,8 +532,8 @@ def build_public_demo_snapshot_bundle(
         raise RuntimeError(f"Built-in public demo profile is missing: {source.enclosure.profile_id}")
     profile = profile.model_copy(
         update={
-            "eyebrow": "Synthetic public demo / 60-bay top-loader",
-            "summary": "Invented deterministic disks demonstrate enclosure, pool, history, and saved-view workflows.",
+            "eyebrow": "Demo",
+            "summary": "A 60-bay JBOD with made-up disks. Click any bay to see the disk in it, its pool, temperature and history.",
             "panel_title": source.enclosure.label,
         }
     )
@@ -336,6 +578,26 @@ def build_public_demo_snapshot_bundle(
             "api": SourceStatus(enabled=False, ok=True, message="Static synthetic fixture; no API is configured."),
             "ssh": SourceStatus(enabled=False, ok=True, message="Static synthetic fixture; no SSH is configured."),
         },
+        capabilities={
+            "physical_slots": PlatformCapability(
+                label="Physical Slots",
+                status="available",
+                summary="The physical 60-bay layout is included in this demo.",
+                sources=["synthetic fixture"],
+            ),
+            "smart_detail": PlatformCapability(
+                label="SMART Detail",
+                status="available",
+                summary="Saved SMART details are included for occupied demo bays.",
+                sources=["synthetic fixture"],
+            ),
+            "identify": PlatformCapability(
+                label="Identify LEDs",
+                status="unsupported",
+                summary="Locate lights are unavailable in an offline copy.",
+                sources=["offline snapshot"],
+            ),
+        },
         summary=InventorySummary(
             disk_count=sum(slot.state != SlotState.empty for slot in slots),
             pool_count=len({slot.pool_name for slot in slots if slot.pool_name}),
@@ -345,8 +607,8 @@ def build_public_demo_snapshot_bundle(
             ssh_slot_hint_count=0,
         ),
         warnings=[
-            "All displayed systems, disks, metrics, events, and identifiers are deterministic synthetic demo data.",
-            "No appliance, credentials, local history, or LED actions are connected to this static artifact.",
+            "Everything on this page is made-up demo data.",
+            "No storage system, credentials, history service or LED controls are connected to this page.",
         ],
     )
     smart = {
@@ -370,6 +632,7 @@ def build_public_demo_snapshot_bundle(
         live_enclosure_smart_summary_cache={source.enclosure.id: smart},
         storage_view_runtime=runtime,
         storage_view_smart_summary_cache=storage_smart,
+        sas_fabric=build_public_demo_sas_fabric(fixture=source),
     )
 
 
@@ -387,6 +650,7 @@ async def build_public_demo_html(
         resolved_settings,
         PublicDemoHistoryBackend(fixture),
         templates,
+        embed_all_images=True,
     )
     rendered = await exporter.build_enclosure_snapshot_html(
         request=build_static_demo_request(),
@@ -396,13 +660,14 @@ async def build_public_demo_html(
         live_enclosure_smart_summary_cache=bundle.live_enclosure_smart_summary_cache,
         storage_view_runtime=bundle.storage_view_runtime,
         storage_view_smart_summary_cache=bundle.storage_view_smart_summary_cache,
+        sas_fabric=bundle.sas_fabric,
         selected_slot=None,
         history_window_hours=fixture.history_window_hours,
         history_panel_open=True,
         io_chart_mode="total",
         generated_at=fixture.generated_at,
         identifier_policy_label="Synthetic IDs",
-        identifier_policy_note="Generated only from schema-validated, deterministic, checked-in synthetic values.",
+        identifier_policy_note="Made-up disks, serials and hosts. Nothing here comes from a real system.",
     )
     return rendered.html
 
@@ -467,7 +732,11 @@ def _slot_view(
         pool_name=source.pool_name,
         vdev_name=source.vdev_name,
         vdev_class=source.vdev_class,
-        topology_label=(f"{source.pool_name} > {source.vdev_name} > demo disk" if source.pool_name else None),
+        topology_label=(
+            f"{source.pool_name} > {source.vdev_name} > {source.vdev_class}"
+            if source.pool_name and source.vdev_name and source.vdev_class
+            else None
+        ),
         health=source.health,
         temperature_c=source.temperature_c,
         logical_unit_id=f"demo-lun-core-{source.slot:04d}" if occupied else None,

@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import inspect
 import json
@@ -6,9 +7,10 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from app.config import SystemConfig, TrueNASConfig
+from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     InventorySnapshot,
     MultipathMember,
@@ -18,8 +20,8 @@ from app.models.domain import (
     SlotState,
     SlotView,
 )
-from app.services.inventory import InventoryService
-from app.services.parsers import canonicalize_ssh_command
+from app.services.inventory import InventoryService, InventorySourceBundle
+from app.services.parsers import ParsedSSHData, canonicalize_ssh_command
 from app.services.sas_diagnostics.decoder import (
     MAX_DIAGNOSTIC_COLLECTION_ITEMS,
     MAX_DIAGNOSTIC_NUMERIC_TOKEN_LENGTH,
@@ -66,11 +68,14 @@ from app.services.sas_fabric import (
     parse_mpr_adapter_summary,
     parse_mpr_devices,
     parse_mpr_dmesg_events,
+    parse_mpr_enclosures,
     parse_mpr_expanders,
     parse_mpr_sysctl_locations,
     parse_pciconf_sas_controllers,
 )
 from app.services.ssh_probe import SSHCommandResult
+from app.services.truenas_ws import TrueNASRawData
+from tests.test_inventory import build_inventory_service
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "sas_fabric"
@@ -669,7 +674,7 @@ Adapter     Chip           Board Name        Firmware
         self.assertEqual(len(diagnostics["event_table"]["rows"]), 25)
         self.assertEqual(serialized_text.count('"event_id": "mpr-dmesg-0040"'), 1)
 
-    def test_slot_location_candidates_try_exact_bay_before_shifted_alias(self) -> None:
+    def test_slot_location_candidates_do_not_guess_shifted_alias(self) -> None:
         slot = SlotView(
             slot=5,
             slot_label="05",
@@ -681,7 +686,7 @@ Adapter     Chip           Board Name        Firmware
             raw_status={"enclosure_id": "50030480090c4f7f", "ses_slot_number": 5},
         )
 
-        self.assertEqual(_slot_location_number_candidates(slot), [5, 4])
+        self.assertEqual(_slot_location_number_candidates(slot), [5])
 
     def test_mpr_location_lookup_returns_the_exact_bay_not_its_neighbour(self) -> None:
         enclosure_key = _identifier_lookup_key("50030480090c4f7f")
@@ -835,6 +840,133 @@ May 19 21:16:03 The-Archive (da44:mpr0:0:180:0): CAM status: CCB request complet
         self.assertEqual(rows[1]["timestamp_raw"], "May 19 21:14:06")
         self.assertEqual(rows[2]["timestamp_raw"], "May 19 21:16:03")
         self.assertEqual(rows[3]["timestamp_raw"], "[12345.678901]")
+
+    # Pin application severity independently of the decoder's label/code tables.
+    SCSI_STATUS_CASES = (
+        (0x00, "GOOD", "info"),
+        (0x02, "CHECK CONDITION", "warning"),
+        (0x04, "CONDITION MET", "info"),
+        (0x08, "BUSY", "warning"),
+        (0x18, "RESERVATION CONFLICT", "warning"),
+        (0x28, "TASK SET FULL", "warning"),
+        (0x30, "ACA ACTIVE", "warning"),
+        (0x40, "TASK ABORTED", "error"),
+    )
+
+    def test_scsi_status_rows_have_canonical_severity_for_all_supported_forms(self) -> None:
+        self.assertEqual(dict((code, text) for code, text, _ in self.SCSI_STATUS_CASES), scsi_module.SCSI_STATUS_CODES)
+        self.assertEqual({text for _, text, _ in self.SCSI_STATUS_CASES}, set(scsi_module.SCSI_STATUS_LABELS))
+        for code, text, severity in self.SCSI_STATUS_CASES:
+            forms = (text, text.lower(), text.replace(" ", "_"), text.replace(" ", "-"),
+                     f"0x{code:02x}", f"{code:02x}", f"{code:02x}h", f"{code:x}")
+            for form in forms:
+                for prefix in ("(da60:mpr0:0:180:0):", "mpr0:"):
+                    with self.subTest(status=text, form=form, prefix=prefix):
+                        events = parse_mpr_dmesg_events(f"{prefix} SCSI status: {form}")
+                        row = events["by_controller"]["mpr0"]["event_table"]["rows"][0]
+                        self.assertEqual(row["severity"], severity)
+                        self.assertEqual(events["recent_events"][0]["severity"], severity)
+                        self.assertEqual(row["family"], "aborted_command" if code == 0x40 else "scsi_status")
+                        self.assertEqual(row["scsi_status"].upper(), text)
+                        self.assertEqual(row["decode_confidence"], "standard")
+                        self.assertEqual(row["decode_source"], "t10_scsi_status")
+
+    def test_scsi_status_summaries_use_canonical_severity_before_aggregation(self) -> None:
+        for code, text, severity in self.SCSI_STATUS_CASES:
+            for form in (text, f"0x{code:02x}", f"{code:02x}", f"{code:02x}h"):
+                events = parse_mpr_dmesg_events(f"(da60:mpr0:0:180:0): SCSI status: {form}")
+                for scope, key in (("by_controller", "mpr0"), ("by_device", "da60"),
+                                   ("by_controller_target", "mpr0:180")):
+                    with self.subTest(status=text, form=form, scope=scope):
+                        summary = events[scope][key]
+                        self.assertEqual(summary["event_count"], 1)
+                        self.assertEqual(summary["error_count"], int(severity == "error"))
+                        self.assertEqual(summary["primary_fault"]["severity"], severity)
+                        self.assertEqual(summary["top_findings"][0]["severity"], severity)
+                        self.assertEqual(summary["top_findings"][0]["count"], 1)
+                        self.assertEqual(summary["recent_events"][0]["severity"], severity)
+                        self.assertEqual(summary["event_table"]["rows"][0]["severity"], severity)
+                        family = "aborted_command" if code == 0x40 else "scsi_status"
+                        self.assertEqual(summary["fault_family_counts"], {family: 1})
+                        self.assertIn(f"{int(severity == 'error')} errors, 0 retries", summary["operator_summary"])
+
+    def test_scsi_status_full_snapshot_preserves_numeric_text_severity_parity(self) -> None:
+        system = SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core"))
+        snapshot = InventorySnapshot(
+            slots=[SlotView(
+                slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                state=SlotState.healthy, device_name="da60",
+                raw_status={
+                    "enclosure_id": parse_mpr_enclosures(MPR0_ENCLOSURES)[0]["logical_id"],
+                    "ses_slot_number": 1,
+                },
+                multipath=MultipathView(
+                    name="mpath0", device_name="multipath/disk0",
+                    members=[MultipathMember(device_name="da60", state="ACTIVE", controller_label="mpr0")],
+                ),
+            )],
+            refresh_interval_seconds=30,
+        )
+        expected_severities = [severity for _, _, severity in self.SCSI_STATUS_CASES]
+        expected_labels = [f"SCSI status: {text.title()}".replace("Aca", "ACA") for _, text, _ in self.SCSI_STATUS_CASES]
+        for form_kind in ("text", "prefixed", "bare", "suffixed", "mixed"):
+            statuses = []
+            for index, (code, text, _) in enumerate(self.SCSI_STATUS_CASES):
+                forms = {"text": text, "prefixed": f"0x{code:02x}", "bare": f"{code:02x}",
+                         "suffixed": f"{code:02x}h", "mixed": text if index % 2 else f"0x{code:02x}"}
+                statuses.append(forms[form_kind])
+            event_output = "\n".join(f"(da60:mpr0:0:180:0): SCSI status: {value}" for value in statuses)
+            fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={
+                "sudo -n /usr/sbin/mprutil show adapters": MPR_ADAPTERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show adapter": MPR0_ADAPTER,
+                "sudo -n /usr/sbin/mprutil -u 0 show expanders": MPR0_EXPANDERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show enclosures": MPR0_ENCLOSURES,
+                "sudo -n /usr/sbin/mprutil -u 0 show devices": MPR0_DEVICES,
+                CORE_MPR_DMESG_EVENTS_COMMAND: event_output,
+            })
+            serialized = json.loads(fabric.model_dump_json())
+            summaries = [(node["id"], node["metrics"]["kernel_diagnostics"])
+                         for node in serialized["nodes"] if node.get("metrics", {}).get("kernel_diagnostics")]
+            bay_trace = next(trace for trace in serialized["traces"] if trace["id"] == "bay:0")
+            members = bay_trace["metrics"]["mpr_devices"]
+            self.assertEqual(len(members), 1)
+            self.assertEqual(members[0]["member_device_name"], "da60")
+            summaries.append(("bay:0/da60", members[0]["diagnostics"]))
+            self.assertEqual(len(summaries), 2)  # Controller and mapped member, not helper-only output.
+            self.assertIn("controller:mpr0", [node_id for node_id, _ in summaries])
+            for node_id, summary in summaries:
+                with self.subTest(form=form_kind, node=node_id):
+                    self.assertEqual(summary["event_count"], 8)
+                    self.assertEqual(summary["error_count"], 1)
+                    self.assertEqual(summary["fault_family_counts"], {"scsi_status": 7, "aborted_command": 1})
+                    table = summary["event_table"]
+                    self.assertEqual(table["total_count"], 8)
+                    self.assertFalse(table["truncated"])
+                    self.assertEqual([row["severity"] for row in table["rows"]], expected_severities)
+                    self.assertEqual([row["label"] for row in table["rows"]], expected_labels)
+                    self.assertEqual(summary["primary_fault"]["label"], "SCSI status: Task Aborted")
+                    self.assertEqual(summary["primary_fault"]["severity"], "error")
+                    self.assertEqual([finding["severity"] for finding in summary["top_findings"]],
+                                     ["error", "warning", "warning", "warning", "warning", "warning"])
+                    self.assertIn("1 errors, 0 retries", summary["operator_summary"])
+
+    def test_scsi_status_unknown_values_preserve_parser_fallback(self) -> None:
+        # Bare numerals remain hexadecimal, not decimal; do not broaden accepted syntax.
+        for value, severity in (("0xff", "info"), ("ffh", "info"), ("64", "info"),
+                                ("0X40", "info"), ("unlisted status", "info"), ("unlisted error", "error")):
+            with self.subTest(value=value):
+                events = parse_mpr_dmesg_events(f"(da60:mpr0:0:180:0): SCSI status: {value}")
+                row = events["by_device"]["da60"]["event_table"]["rows"][0]
+                self.assertEqual(row["severity"], severity)
+                self.assertEqual(row["scsi_status"], value)
+                self.assertEqual(row["decode_confidence"], "observed")
+                self.assertEqual(row["decode_source"], "kernel_message")
+                self.assertIn("not in the current local status-code table", row["decoder_note"])
+                self.assertNotIn("scsi_status_code", row)
+                for scope, key in (("by_controller", "mpr0"), ("by_device", "da60"),
+                                   ("by_controller_target", "mpr0:180")):
+                    self.assertEqual(events[scope][key]["error_count"], int(severity == "error"))
+                    self.assertEqual(events[scope][key]["primary_fault"]["severity"], severity)
 
     def test_parse_mpr_dmesg_events_decodes_cam_and_scsi_status_examples(self) -> None:
         events = parse_mpr_dmesg_events(
@@ -1328,12 +1460,13 @@ class SasFabricAliasStoreTests(unittest.TestCase):
                         label="Legacy label",
                     )
                 )
-                service = object.__new__(InventoryService)
+                service = FabricAliasMutationRegressionTests.make_service(store, [
+                    FabricPathRegressionTests.slot(
+                        device_name="sda", pool_name="Tank Main", vdev_name="Data/Mirror"),
+                ])
                 service.system = SystemConfig(
-                    id="synthetic-system",
-                    truenas=TrueNASConfig(platform="scale"),
+                    id="synthetic-system", truenas=TrueNASConfig(platform="scale"),
                 )
-                service.sas_fabric_alias_store = store
 
                 saved = service.save_sas_fabric_alias(
                     object_id=canonical_id,
@@ -1354,6 +1487,532 @@ class SasFabricAliasStoreTests(unittest.TestCase):
                 )
                 self.assertTrue(cleared["cleared"])
                 self.assertEqual(store.list_aliases("synthetic-system"), [])
+
+
+class FabricAliasMutationRegressionTests(unittest.TestCase):
+    """Real public mutation entry points over disposable observed topology."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "aliases.json"
+        journal = patch("app.services.sas_fabric_alias_store.record_config_change")
+        self.journal = journal.start()
+        self.addCleanup(journal.stop)
+        self.store = SasFabricAliasStore(self.path)
+        self.slots = [FabricPathRegressionTests.slot(
+            device_name="sda", pool_name="Pool", vdev_name="mirror")]
+        self.service = self.make_service(self.store, self.slots)
+
+    @staticmethod
+    def make_service(store, slots):
+        service = object.__new__(InventoryService)
+        service.system = SystemConfig(id="synthetic", truenas=TrueNASConfig(platform="linux"))
+        service.sas_fabric_alias_store = store
+        service._cache = {"synthetic-shelf": InventorySnapshot(
+            slots=slots, refresh_interval_seconds=30, selected_enclosure_id="synthetic-shelf")}
+        service._source_bundle = InventorySourceBundle(
+            raw_data=TrueNASRawData([], [], [], {}, []), ssh_outputs={},
+            ssh_collected=False, warnings=[], sources={},
+            scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData())
+        service._snapshot_invalidated = set()
+        return service
+
+    def fabric(self, slots=None):
+        # A newly opened store proves persistence, not an in-memory projection.
+        return FabricPathRegressionTests.build(
+            self.slots if slots is None else slots,
+            aliases=SasFabricAliasStore(self.path).list_aliases("synthetic"))
+
+    def seed(self, object_id, label="Legacy name", **values):
+        self.store.save_alias(SasFabricAlias(
+            system_id="synthetic", object_id=object_id,
+            object_kind=values.pop("object_kind", "path"), label=label, **values))
+
+    def public_fabric(self):
+        self.service.sas_fabric_alias_store = SasFabricAliasStore(self.path)
+        snapshot = self.service._cache["synthetic-shelf"]
+        self.service._get_snapshot_result = AsyncMock(return_value=SimpleNamespace(
+            value=snapshot, cache_state="fresh"))
+        self.service._get_inventory_source_bundle_result = AsyncMock(return_value=SimpleNamespace(
+            value=self.service._source_bundle, cache_state="fresh"))
+        before = self.path.read_bytes() if self.path.exists() else None
+        with patch("app.services.sas_fabric_alias_store.record_config_change") as journal:
+            result = asyncio.run(self.service.get_sas_fabric_snapshot(
+                selected_enclosure_id="synthetic-shelf"))
+            journal.assert_not_called()
+        self.assertEqual(self.path.read_bytes() if self.path.exists() else None, before)
+        return result
+
+    def public_alias(self, object_id, label, scope="system", kind="path"):
+        with patch.object(self.service, "_get_snapshot_result", create=True) as snapshot_fetch, \
+                patch.object(self.service, "_get_inventory_source_bundle_result", create=True) as source_fetch:
+            result = self.service.save_sas_fabric_alias(
+                object_id=object_id, object_kind=kind, label=label,
+                scope=scope, selected_enclosure_id="synthetic-shelf")
+            snapshot_fetch.assert_not_called()
+            source_fetch.assert_not_called()
+        return result
+
+    def test_public_system_migration_preserves_legacy_enclosure_override(self):
+        legacy_id = "path:linux-block:pool-mirror"
+        self.seed(legacy_id, "System")
+        self.seed(legacy_id, "Shelf", enclosure_id="synthetic-shelf")
+        before = self.public_fabric()
+        self.assertEqual(before.paths[0]["alias"], "Shelf")
+        object_id = before.paths[0]["id"]
+        retained = [a for a in self.store.load_all().values() if a.enclosure_id][0]
+        self.public_alias(object_id, "New system")
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "Shelf")
+        self.assertIn(retained, SasFabricAliasStore(self.path).load_all().values())
+        self.assertTrue(self.public_alias(object_id, None)["cleared"])
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "Shelf")
+        self.assertTrue(self.public_alias(object_id, None, "enclosure")["cleared"])
+        self.assertIsNone(self.public_fabric().paths[0].get("alias"))
+        self.assertEqual(SasFabricAliasStore(self.path).load_all(), {})
+
+    def test_public_canonical_enclosure_override_preserves_legacy_system_fallback(self):
+        self.seed("path:linux-block:pool-mirror", "System")
+        object_id = self.public_fabric().paths[0]["id"]
+        self.public_alias(object_id, "Shelf", "enclosure")
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "Shelf")
+        self.assertTrue(self.public_alias(object_id, None, "enclosure")["cleared"])
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "System")
+        self.public_alias(object_id, "Shelf", "enclosure")
+        self.public_alias(object_id, "New system")
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "Shelf")
+        self.public_alias(object_id, None, "enclosure")
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "New system")
+        # Retain the established clear-through-system-fallback behavior.
+        self.public_alias(object_id, None, "enclosure")
+        self.assertIsNone(self.public_fabric().paths[0].get("alias"))
+        self.assertEqual(SasFabricAliasStore(self.path).load_all(), {})
+
+    def test_public_same_scope_canonical_priority_survives_newer_legacy_row(self):
+        object_id = self.public_fabric().paths[0]["id"]
+        for scope, enclosure in (("system", None), ("enclosure", "synthetic-shelf")):
+            with self.subTest(scope=scope):
+                self.public_alias(object_id, "Canonical", scope)
+                self.seed("path:linux-block:pool-mirror", "Later legacy", enclosure_id=enclosure)
+                self.assertEqual(self.public_fabric().paths[0]["alias"], "Canonical")
+                self.public_alias(object_id, None, scope)
+                self.assertIsNone(self.public_fabric().paths[0].get("alias"))
+                self.assertEqual(SasFabricAliasStore(self.path).load_all(), {})
+
+    def test_public_legacy_ties_and_scope_precedence_are_order_independent(self):
+        slots = [FabricPathRegressionTests.slot(
+            n, device_name=f"sd{chr(97 + n)}", pool_name="Pool", vdev_name="mirror",
+            topology_label=label) for n, label in enumerate(("Route one", "Route two"))]
+        aliases = (("path:linux-block:route-one", "One"), ("path:linux-block:route-two", "Two"))
+        for slot_order in (slots, slots[::-1]):
+            for alias_order in (aliases, aliases[::-1]):
+                with self.subTest(slots=slot_order[0].slot, aliases=alias_order[0][1]):
+                    self.service = self.make_service(self.store, slot_order)
+                    with patch("app.services.sas_fabric_alias_store.datetime") as clock:
+                        clock.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                        for key, label in alias_order:
+                            self.seed(key, label, enclosure_id="synthetic-shelf")
+                    self.seed(aliases[0][0], "Newer system")
+                    view = self.public_fabric()
+                    self.assertEqual(view.paths[0]["alias"], "Two")
+                    object_id = view.paths[0]["id"]
+                    self.public_alias(object_id, None, "enclosure")
+                    self.assertEqual(self.public_fabric().paths[0]["alias"], "Newer system")
+                    self.public_alias(object_id, None)
+                    self.assertEqual(SasFabricAliasStore(self.path).load_all(), {})
+                    with patch("app.services.sas_fabric_alias_store.datetime") as clock:
+                        clock.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                        self.seed(aliases[0][0], "Older shelf", enclosure_id="synthetic-shelf")
+                    self.seed(aliases[1][0], "Newer system")
+                    self.assertEqual(self.public_fabric().paths[0]["alias"], "Older shelf")
+                    self.public_alias(object_id, None, "enclosure")
+                    self.assertEqual(self.public_fabric().paths[0]["alias"], "Newer system")
+                    self.public_alias(object_id, None)
+                    self.assertEqual(SasFabricAliasStore(self.path).load_all(), {})
+
+    def test_public_scoped_canonical_provenance_is_not_another_routes_legacy_alias(self):
+        legacy_id = "path:linux-block:pool-mirror"
+        self.seed(legacy_id, "Different identity", enclosure_id="synthetic-shelf",
+                  source="operator-canonical-v1")
+        retained = list(self.store.load_all().values())
+        view = self.public_fabric()
+        self.assertIsNone(view.paths[0].get("alias"))
+        object_id = view.paths[0]["id"]
+        self.public_alias(object_id, "Own name")
+        self.assertEqual(self.public_fabric().paths[0]["alias"], "Own name")
+        self.public_alias(object_id, None)
+        self.assertIsNone(self.public_fabric().paths[0].get("alias"))
+        self.assertEqual(list(SasFabricAliasStore(self.path).load_all().values()), retained)
+
+    def test_public_clear_legacy_route_alias_uses_observed_topology(self):
+        self.seed("path:linux-block:pool-mirror")
+        before = self.fabric()
+        self.assertEqual(before.paths[0]["alias"], "Legacy name")
+        result = self.service.save_sas_fabric_alias(
+            object_id=before.paths[0]["id"], object_kind="path", label=None)
+        self.assertTrue(result["cleared"])
+        self.assertIsNone(self.fabric().paths[0].get("alias"))
+        self.assertEqual(self.store.load_all(), {})
+
+    def test_public_save_then_clear_never_resurrects_legacy_name(self):
+        self.seed("path:linux-block:pool-mirror")
+        object_id = self.fabric().paths[0]["id"]
+        self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label="New name")
+        self.assertEqual(self.fabric().paths[0]["alias"], "New name")
+        self.assertEqual([a.object_id for a in self.store.list_aliases("synthetic")], [object_id])
+        self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label=None)
+        self.assertIsNone(self.fabric().paths[0].get("alias"))
+
+    def test_all_route_legacy_ids_are_aggregated_and_mutated_in_both_orders(self):
+        slots = [FabricPathRegressionTests.slot(
+            n, device_name=f"sd{chr(97 + n)}", pool_name="Pool", vdev_name="mirror",
+            topology_label=label) for n, label in enumerate(("Route one", "Route two"))]
+        for order in (slots, slots[::-1]):
+            with self.subTest(order=[s.topology_label for s in order]):
+                self.seed("path:linux-block:route-one", "Older name")
+                self.seed("path:linux-block:route-two", "Newest name")
+                service = self.make_service(self.store, order)
+                before = self.fabric(order)
+                self.assertEqual(before.paths[0]["alias"], "Newest name")
+                node = next(n for n in before.nodes if n.kind == "path")
+                self.assertEqual(set(node.raw["legacy_alias_ids"]), {
+                    "path:linux-block:route-one", "path:linux-block:route-two"})
+                service.save_sas_fabric_alias(object_id=node.id, object_kind="path", label=None)
+                self.assertEqual(self.store.load_all(), {})
+                self.assertIsNone(self.fabric(order).paths[0].get("alias"))
+
+    def test_legacy_precedence_is_deterministic_including_timestamp_ties(self):
+        slots = [FabricPathRegressionTests.slot(
+            n, device_name=f"sd{chr(97 + n)}", pool_name="Pool", vdev_name="mirror",
+            topology_label=label) for n, label in enumerate(("Route one", "Route two"))]
+        for tied in (False, True):
+            aliases = [SasFabricAlias(object_id=key, object_kind="path", label=label,
+                       updated_at=datetime(2026, 1, day, tzinfo=timezone.utc))
+                       for key, label, day in (("path:linux-block:route-one", "Older", 1),
+                                              ("path:linux-block:route-two", "Winner", 1 if tied else 2))]
+            for order in (slots, slots[::-1]):
+                for alias_order in (aliases, aliases[::-1]):
+                    with self.subTest(tied=tied, slots=order[0].slot, aliases=alias_order[0].label):
+                        fabric = FabricPathRegressionTests.build(order, aliases=alias_order)
+                        self.assertEqual(fabric.paths[0]["alias"], "Winner")
+                        canonical = SasFabricAlias(object_id=fabric.paths[0]["id"], label="Canonical",
+                                                   source="operator-canonical-v1")
+                        named = FabricPathRegressionTests.build(order, aliases=[canonical, *alias_order])
+                        self.assertEqual(named.paths[0]["alias"], "Canonical")
+
+    def test_case_distinct_canonical_pool_names_survive_both_save_and_clear_orders(self):
+        ids = ["pool:Pool-A", "pool:pool-a"]
+        slots = [FabricPathRegressionTests.slot(n, device_name=f"sd{chr(97+n)}", pool_name=name)
+                 for n, name in enumerate(("Pool-A", "pool-a"))]
+        for save_order in (ids, ids[::-1]):
+            for clear_order in (ids, ids[::-1]):
+                with self.subTest(save_order=save_order, clear_order=clear_order):
+                    service = self.make_service(self.store, slots)
+                    for object_id in save_order:
+                        service.save_sas_fabric_alias(object_id=object_id, object_kind="pool", label=object_id)
+                    reopened = SasFabricAliasStore(self.path)
+                    self.assertEqual({a.object_id for a in reopened.list_aliases("synthetic")}, set(ids))
+                    self.assertTrue(all(a.source == "operator-canonical-v1" for a in reopened.load_all().values()))
+                    nodes = {n.id: n for n in self.fabric(slots).nodes}
+                    self.assertEqual([nodes[i].alias for i in ids], ids)
+                    service.save_sas_fabric_alias(object_id=clear_order[0], object_kind="pool", label=None)
+                    self.assertEqual([a.object_id for a in reopened.list_aliases("synthetic")], [clear_order[1]])
+                    service.save_sas_fabric_alias(object_id=clear_order[1], object_kind="pool", label=None)
+                    self.assertEqual(reopened.load_all(), {})
+
+    def test_ambiguous_legacy_route_mutation_refuses_without_changing_bytes(self):
+        slots = [FabricPathRegressionTests.slot(n, device_name=f"sd{chr(97+n)}",
+                                               pool_name=name, vdev_name="mirror")
+                 for n, name in enumerate(("Pool", "pool"))]
+        self.seed("path:linux-block:pool-mirror")
+        before = self.path.read_bytes()
+        self.journal.reset_mock()
+        for order in (slots, slots[::-1]):
+            service = self.make_service(self.store, order)
+            for route in self.fabric(order).paths:
+                for label in (None, "New name"):
+                    with self.subTest(route=route["id"], label=label):
+                        with self.assertRaisesRegex(ValueError, "ownership|ambiguous"):
+                            service.save_sas_fabric_alias(object_id=route["id"], object_kind="path", label=label)
+                        self.assertEqual(self.path.read_bytes(), before)
+        self.journal.assert_not_called()
+
+    def test_ambiguous_pool_legacy_token_cannot_be_overwritten_as_exact_target(self):
+        slots = [FabricPathRegressionTests.slot(n, device_name=f"sd{chr(97+n)}", pool_name=name)
+                 for n, name in enumerate(("Pool-A", "pool-a"))]
+        self.seed("pool:pool-a", object_kind="pool")
+        before = self.path.read_bytes()
+        service = self.make_service(self.store, slots)
+        for object_id in ("pool:Pool-A", "pool:pool-a"):
+            for label in (None, "New name"):
+                with self.subTest(object_id=object_id, label=label):
+                    with self.assertRaisesRegex(ValueError, "ownership|ambiguous"):
+                        service.save_sas_fabric_alias(object_id=object_id, object_kind="pool", label=label)
+                    self.assertEqual(self.path.read_bytes(), before)
+
+    def test_canonical_provenance_is_not_projected_to_another_route(self):
+        self.seed("path:linux-block:pool-mirror", source="operator-canonical-v1")
+        before = self.path.read_bytes()
+        fabric = self.fabric()
+        self.assertIsNone(fabric.paths[0].get("alias"))
+        route_id = fabric.paths[0]["id"]
+        self.service.save_sas_fabric_alias(object_id=route_id, object_kind="path", label="Own name")
+        self.service.save_sas_fabric_alias(object_id=route_id, object_kind="path", label=None)
+        alias = next(iter(self.store.load_all().values()))
+        self.assertEqual(alias.object_id, "path:linux-block:pool-mirror")
+        self.assertEqual(alias.source, "operator-canonical-v1")
+        self.assertIsNone(self.fabric().paths[0].get("alias"))
+        self.assertTrue(before)
+
+    def test_unknown_topology_refuses_legacy_cleanup(self):
+        self.seed("path:linux-block:pool-mirror")
+        object_id = self.fabric().paths[0]["id"]
+        self.service._cache = {}
+        before = self.path.read_bytes()
+        for label in (None, "New name"):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "topology|ownership"):
+                    self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label=label)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_public_mutations_reject_malformed_authoritative_files(self):
+        for raw in (b"{", b"null", b"[]", b"{}", b'{"sas_fabric_aliases": []}',
+                    b'{"sas_fabric_aliases": {"bad": {"object_id": "", "label": ""}}}', b"\xff"):
+            for label in (None, "New name"):
+                with self.subTest(raw=raw, label=label):
+                    self.path.write_bytes(raw)
+                    self.assertEqual(self.store.list_aliases("synthetic"), [])
+                    self.journal.reset_mock()
+                    with patch.object(self.store, "_write", wraps=self.store._write) as write:
+                        with self.assertRaises(ValueError):
+                            self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label=label)
+                        write.assert_not_called()
+                    self.assertEqual(self.path.read_bytes(), raw)
+                    self.journal.assert_not_called()
+                    self.assertFalse(self.path.with_suffix(".tmp").exists())
+
+    def test_public_mutations_reject_authoritative_oserror(self):
+        self.seed("pool:Other", "Retained name", object_kind="pool")
+        before = self.path.read_bytes()
+        real_open = Path.open
+        def fail_read(path, mode="r", *args, **kwargs):
+            if path == self.path and mode == "r":
+                raise OSError("synthetic read failure")
+            return real_open(path, mode, *args, **kwargs)
+        for label in (None, "New name"):
+            with self.subTest(label=label), patch.object(Path, "open", fail_read):
+                self.assertEqual(self.store.load_all(), {})
+                with patch.object(self.store, "_write", wraps=self.store._write) as write:
+                    with self.assertRaises(ValueError):
+                        self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label=label)
+                    write.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_public_controller_and_storage_enclosure_alias_lifecycle(self):
+        for node in self.fabric().nodes:
+            if node.kind not in {"controller", "storage-enclosure"}:
+                continue
+            for override in (False, True):
+                with self.subTest(kind=node.kind, override=override):
+                    legacy_id = node.raw["legacy_alias_ids"][0]
+                    self.seed(legacy_id, object_kind=node.kind)
+                    before = next(n for n in self.fabric().nodes if n.id == node.id)
+                    self.assertEqual(before.alias, "Legacy name")
+                    if override:
+                        self.service.save_sas_fabric_alias(object_id=node.id, object_kind=node.kind, label="New name")
+                    result = self.service.save_sas_fabric_alias(object_id=node.id, object_kind=node.kind, label=None)
+                    self.assertTrue(result["cleared"])
+                    self.assertEqual(self.store.load_all(), {})
+
+    def test_legacy_mutation_preserves_other_systems_and_scopes(self):
+        legacy_id = "path:linux-block:pool-mirror"
+        for system, enclosure in (("synthetic", None), ("synthetic", "other-shelf"), ("other", None)):
+            self.store.save_alias(SasFabricAlias(system_id=system, enclosure_id=enclosure,
+                                                object_id=legacy_id, label="Retained name"))
+        object_id = self.fabric().paths[0]["id"]
+        # No selected-view override exists: clear retains the established system fallback.
+        result = self.service.save_sas_fabric_alias(
+            object_id=object_id, object_kind="path", label=None,
+            selected_enclosure_id="synthetic-shelf", scope="enclosure")
+        self.assertTrue(result["cleared"])
+        remaining = self.store.load_all()
+        self.assertEqual({(a.system_id, a.enclosure_id) for a in remaining.values()},
+                         {("synthetic", "other-shelf"), ("other", None)})
+
+    def test_collisions_in_other_cached_views_also_refuse_mutation(self):
+        self.seed("path:linux-block:pool-mirror")
+        object_id = self.fabric().paths[0]["id"]
+        other = self.service._cache["synthetic-shelf"].model_copy(update={
+            "selected_enclosure_id": "other-shelf",
+            "slots": [FabricPathRegressionTests.slot(device_name="sdb", pool_name="pool", vdev_name="mirror")],
+        })
+        self.service._cache["other-shelf"] = other
+        before = self.path.read_bytes()
+        for label in (None, "New name"):
+            with self.assertRaisesRegex(ValueError, "ownership|ambiguous"):
+                self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label=label)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_incomplete_or_invalidated_topology_withholds_legacy_ownership(self):
+        self.seed("path:linux-block:pool-mirror")
+        object_id = self.fabric().paths[0]["id"]
+        before = self.path.read_bytes()
+        for incomplete in (True, False):
+            self.service._canonical_enclosure_options = {"other-shelf": None} if incomplete else {}
+            self.service._snapshot_invalidated = set() if incomplete else {"synthetic-shelf"}
+            for label in (None, "New name"):
+                with self.subTest(incomplete=incomplete, label=label):
+                    with self.assertRaisesRegex(ValueError, "ownership|topology"):
+                        self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label=label)
+                    self.assertEqual(self.path.read_bytes(), before)
+
+    def test_unknown_legacy_provenance_is_not_destructively_migrated(self):
+        self.seed("path:linux-block:pool-mirror", source="unknown-future-source")
+        object_id = self.fabric().paths[0]["id"]
+        before = self.path.read_bytes()
+        for label in (None, "New name"):
+            with self.assertRaisesRegex(ValueError, "ownership"):
+                self.service.save_sas_fabric_alias(object_id=object_id, object_kind="path", label=label)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_direct_store_compatibility_requires_ownership_but_protects_canonical_rows(self):
+        self.seed("pool:pool-a", object_kind="pool")
+        before = self.path.read_bytes()
+        for clear in (False, True):
+            with self.subTest(clear=clear):
+                with self.assertRaisesRegex(ValueError, "ownership"):
+                    if clear:
+                        self.store.clear_alias("synthetic", None, "pool:Pool-A", ["pool:pool-a"])
+                    else:
+                        self.store.save_alias(SasFabricAlias(system_id="synthetic", object_id="pool:Pool-A",
+                                              label="New name", source="operator-canonical-v1"), ["pool:pool-a"])
+                self.assertEqual(self.path.read_bytes(), before)
+        self.seed("pool:pool-a", object_kind="pool", source="operator-canonical-v1")
+        self.store.save_alias(SasFabricAlias(system_id="synthetic", object_id="pool:Pool-A",
+                              label="New name", source="operator-canonical-v1"), ["pool:pool-a"])
+        self.assertTrue(self.store.clear_alias("synthetic", None, "pool:Pool-A", ["pool:pool-a"]))
+        self.assertEqual([a.object_id for a in self.store.list_aliases("synthetic")], ["pool:pool-a"])
+
+    def test_file_disappearing_during_read_is_not_valid_first_run(self):
+        self.seed("pool:Other", object_kind="pool")
+        before = self.path.read_bytes()
+        class FailedRead:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                raise FileNotFoundError("synthetic read failure after open")
+        real_open = Path.open
+        def fail_read(path, mode="r", *args, **kwargs):
+            if path == self.path and mode == "r":
+                return FailedRead()
+            return real_open(path, mode, *args, **kwargs)
+        for label in (None, "New name"):
+            with self.subTest(label=label), patch.object(Path, "open", fail_read):
+                with patch.object(self.store, "_write", wraps=self.store._write) as write:
+                    with self.assertRaisesRegex(ValueError, "authoritative"):
+                        self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label=label)
+                    write.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_missing_file_is_valid_first_run_for_save_and_clear(self):
+        result = self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label=None)
+        self.assertFalse(result["cleared"])
+        self.assertFalse(self.path.exists())
+        self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label="First name")
+        self.assertEqual(self.store.list_aliases("synthetic")[0].label, "First name")
+        self.service.save_sas_fabric_alias(object_id="pool:Pool", object_kind="pool", label=None)
+        self.assertEqual(self.store.load_all(), {})
+
+
+class VirtualFabricTests(unittest.TestCase):
+    def snapshot(self, platform):
+        system = SystemConfig(id="synthetic-virtual", truenas=TrueNASConfig(platform=platform))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), AsyncMock(), temp_dir)
+            prefix = "da" if platform == "core" else "sd"
+            service._get_inventory_source_bundle = AsyncMock(return_value=InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[],
+                    disks=[{"name": f"{prefix}{i}", "serial": f"SYNTH-{i}"} for i in range(4)],
+                    pools=[], disk_temperatures={}, smart_test_results=[],
+                ),
+                ssh_outputs={}, ssh_collected=False, warnings=[],
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData(),
+            ))
+            snapshot = asyncio.run(service._build_snapshot())
+        self.assertIsNone(snapshot.selected_profile)
+        self.assertEqual(len(snapshot.slots), 4)
+        self.assertTrue(all(not slot.physical_location_known for slot in snapshot.slots))
+        return system, snapshot
+
+    def test_real_virtual_payload_has_no_profile_backplanes(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                payload = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={}).model_dump(mode="json")
+                self.assertFalse([node for node in payload["nodes"] if node["kind"] == "backplane"])
+                self.assertFalse([link for link in payload["links"] if link["kind"] == "backplane-bay"])
+                self.assertNotIn("profile slot layout", str(payload))
+                self.assertNotIn("profile/storage view", str(payload))
+
+    def test_real_virtual_payload_retains_disk_labels_and_location_provenance(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs={})
+                nodes = {node.id: node for node in fabric.nodes}
+                traces = {trace.id: trace for trace in fabric.traces}
+                self.assertTrue(fabric.available)
+                for slot in snapshot.slots:
+                    node, trace = nodes[f"bay:{slot.slot}"], traces[f"bay:{slot.slot}"]
+                    self.assertEqual(node.label, slot.slot_label)
+                    self.assertEqual(trace.label, slot.slot_label)
+                    self.assertFalse(node.metrics["physical_location_known"])
+                    self.assertFalse(trace.metrics["physical_location_known"])
+                    self.assertTrue(node.raw["virtual_enclosure"])
+                    self.assertIn("physical location unavailable", node.evidence)
+                    self.assertIn("physical location unavailable", trace.evidence)
+                self.assertTrue(any("virtual" in warning and "physical location unavailable" in warning for warning in fabric.warnings))
+                self.assertNotIn("controller:mpr-1", nodes)
+
+    def test_virtual_disks_keep_observed_paths_pools_and_aliases(self):
+        for platform in ("core", "scale"):
+            with self.subTest(platform=platform):
+                system, snapshot = self.snapshot(platform)
+                slot = snapshot.slots[0]
+                slot.pool_name = "Synthetic pool"
+                slot.vdev_name = "mirror-0"
+                outputs = {}
+                if platform == "core":
+                    assert slot.device_name is not None
+                    slot.multipath = MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                        MultipathMember(device_name=slot.device_name, controller_label="mpr0", state="ACTIVE"),
+                    ])
+                    outputs = {"mprutil show adapters": MPR_ADAPTERS}
+                alias = SasFabricAlias(system_id=system.id, object_id="bay:0", object_kind="bay", label="Logical data disk")
+                fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot, ssh_outputs=outputs, aliases=[alias])
+                nodes = {node.id: node for node in fabric.nodes}
+                trace = next(trace for trace in fabric.traces if trace.id == "bay:0")
+                self.assertEqual(nodes["bay:0"].label, "Disk 1")
+                self.assertEqual(nodes["bay:0"].display_label, alias.label)
+                self.assertEqual(trace.display_label, alias.label)
+                self.assertIn("pool:Synthetic%20pool", trace.node_ids)
+                self.assertIn("vdev:Synthetic%20pool/mirror-0", trace.node_ids)
+                if platform == "core":
+                    self.assertIn("path:mpr0:active", trace.node_ids)
+                    self.assertIn("controller:mpr0", trace.node_ids)
+                node_ids = set(nodes)
+                link_ids = {link.id for link in fabric.links}
+                for link in fabric.links:
+                    self.assertIn(link.source, node_ids)
+                    self.assertIn(link.target, node_ids)
+                for trace in fabric.traces:
+                    self.assertTrue(set(trace.node_ids) <= node_ids)
+                    self.assertTrue(set(trace.link_ids) <= link_ids)
+
 
 
 class SasFabricSnapshotTests(unittest.TestCase):
@@ -1454,7 +2113,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         expected = {
             "_INVENTORY_SNAPSHOT_EVIDENCE": ("inventory snapshot",),
             "_PROFILE_SLOT_LAYOUT_EVIDENCE": ("profile slot layout",),
-            "_SLOT_MULTIPATH_EVIDENCE": ("slot.multipath.members",),
+            "_SLOT_MULTIPATH_EVIDENCE": ("multipath members",),
             "_LINUX_SES_PATH_EVIDENCE": (
                 "lsscsi -g",
                 "lsscsi -g -t",
@@ -1732,11 +2391,11 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "node_ids": [
                     "backplane:0",
                     "bay:0",
-                    "controller:quantastor-synthetic-quantastor",
+                    "controller:storage-v2:4ffb4b40f69f088abe6c90de4105cdd636e63fd2d13479ba4e1719c038f33a1d",
                     "host",
-                    "path:quantastor-synthetic-quantastor:tank-main-data-mirror",
+                    "path:storage-v2:b88a2d1f810b8d0475e023d69a19e8bf123536e01c7f2afe60cbdb4dad509595",
                     "pool:Tank%20Main",
-                    "storage-enclosure:quantastor-synthetic-quantastor:synthetic-enclosure",
+                    "storage-enclosure:storage-v2:4ffb4b40f69f088abe6c90de4105cdd636e63fd2d13479ba4e1719c038f33a1d:synthetic-enclosure",
                     "vdev:Tank%20Main/Data%2FMirror",
                 ],
                 "host_metrics": {
@@ -1748,8 +2407,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "host_evidence": ["inventory snapshot"],
                 "bay_evidence": ["inventory snapshot"],
                 "warnings": [
-                    "Quantastor Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk, and optional SES/qs evidence. "
-                    "Low-level controller, path, or expander hops are shown only when those sources prove them."
+                    "Quantastor Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk and "
+                    "optional SES data; controller and expander hops appear only when those sources report them."
                 ],
                 "raw": {
                     "fabric_domain": "storage_fabric",
@@ -2318,7 +2977,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 self.assertEqual(fabric.traces, [])
                 self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
                 self.assertEqual(fabric.raw["fabric_kind"], fabric_kind)
-                self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+                self.assertIn("nothing to map yet", fabric.warnings[0])
 
     def test_scale_snapshot_builds_linux_ses_graph(self) -> None:
         slots = [
@@ -2471,7 +3130,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(fabric.raw["fabric_kind"], "storage_scale")
         self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
         self.assertEqual(fabric.nodes, [])
-        self.assertIn("Storage Fabric evidence", fabric.warnings[0])
+        self.assertIn("nothing to map yet", fabric.warnings[0])
 
     def test_linux_snapshot_without_ses_builds_storage_fabric_graph(self) -> None:
         slot = SlotView(
@@ -2510,8 +3169,8 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(fabric.platform, "linux")
         self.assertEqual(fabric.raw["fabric_kind"], "storage_linux")
         self.assertEqual(fabric.raw["fabric_domain"], "storage_fabric")
-        self.assertIn("controller:linux-nvme", nodes)
-        self.assertIn("storage-enclosure:linux-nvme:right-nvme-2", nodes)
+        self.assertIn("controller:storage-v2:64635a31e5c72fe52f461f1e83c37f134a47b2fa2a9093a84ebf915d265d5ac4", nodes)
+        self.assertIn("storage-enclosure:storage-v2:64635a31e5c72fe52f461f1e83c37f134a47b2fa2a9093a84ebf915d265d5ac4:right-nvme-2", nodes)
         self.assertIn("bay:0", traces)
         self.assertEqual(traces["bay:0"].metrics["path_states"][0]["path_type"], "nvme")
         self.assertNotIn("Linux Linux SES", fabric.warnings[0])
@@ -2563,10 +3222,10 @@ class SasFabricSnapshotTests(unittest.TestCase):
 
         self.assertTrue(fabric.available)
         self.assertEqual(fabric.raw["fabric_kind"], "storage_quantastor")
-        self.assertIn("controller:quantastor-qsosn-right", nodes)
-        self.assertIn("ses-enclosure:quantastor-qsosn-right:qsosn-right", nodes)
+        self.assertIn("controller:storage-v2:7ac57170e136f4cd5a2b423bccf793dafe8562b0b73c1b5f54c4b3503749fe64", nodes)
+        self.assertIn("ses-enclosure:storage-v2:7ac57170e136f4cd5a2b423bccf793dafe8562b0b73c1b5f54c4b3503749fe64:qsosn-right", nodes)
         self.assertEqual(fabric.controllers[0]["board"], "QSOSN-Right")
-        self.assertIn("qs hw-disk-list", nodes["controller:quantastor-qsosn-right"].evidence)
+        self.assertIn("qs hw-disk-list", nodes["controller:storage-v2:7ac57170e136f4cd5a2b423bccf793dafe8562b0b73c1b5f54c4b3503749fe64"].evidence)
         self.assertEqual(traces["bay:12"].metrics["path_states"][0]["source"], "quantastor")
         self.assertIn("Quantastor Storage Fabric", fabric.warnings[0])
 
@@ -2616,10 +3275,10 @@ class SasFabricSnapshotTests(unittest.TestCase):
 
         self.assertTrue(fabric.available)
         self.assertEqual(fabric.raw["fabric_kind"], "storage_esxi")
-        self.assertIn("controller:esxi-c1", nodes)
-        self.assertIn("storage-enclosure:esxi-c1:252", nodes)
+        self.assertIn("controller:storage-v2:2ae1f4742e3d47e48052b1e80e630b8f85442ceabaa39d10b2c400870f885802", nodes)
+        self.assertIn("storage-enclosure:storage-v2:2ae1f4742e3d47e48052b1e80e630b8f85442ceabaa39d10b2c400870f885802:252", nodes)
         self.assertEqual(fabric.controllers[0]["board"], "StorCLI c1")
-        self.assertIn("StorCLI physical drive", nodes["controller:esxi-c1"].evidence)
+        self.assertIn("StorCLI physical drive", nodes["controller:storage-v2:2ae1f4742e3d47e48052b1e80e630b8f85442ceabaa39d10b2c400870f885802"].evidence)
         self.assertEqual(traces["bay:2"].metrics["path_states"][0]["path_type"], "storcli-member")
 
     def test_core_snapshot_carries_structured_command_failures_for_debug_output(self) -> None:
@@ -2649,6 +3308,363 @@ class SasFabricSnapshotTests(unittest.TestCase):
         self.assertEqual(fabric.raw["command_failures"], failure_details)
         self.assertEqual(fabric.raw["commands"], ["mprutil show adapters"])
         self.assertEqual(fabric.controllers[0]["name"], "mpr10")
+
+
+class FabricPathRegressionTests(unittest.TestCase):
+    # Invented numeric identifiers, not copied enclosure or drive identities.
+    CORE_ENCLOSURE = f"{1:016x}"
+    CORE_SAS_PORT = f"{2:016x}"
+
+    @staticmethod
+    def slot(number=0, **values):
+        return SlotView(
+            slot=number, slot_label=str(number), row_index=0, column_index=number,
+            present=True, state=SlotState.healthy, **values,
+        )
+
+    @staticmethod
+    def build(slots, platform="linux", outputs=None, aliases=None):
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic", label="Synthetic", truenas=TrueNASConfig(platform=platform)),
+            snapshot=InventorySnapshot(
+                slots=slots, refresh_interval_seconds=30,
+                selected_enclosure_id="synthetic-shelf", selected_enclosure_label="Synthetic shelf",
+            ),
+            ssh_outputs=outputs or {}, aliases=aliases,
+        )
+
+    def core_build(self, number, ses_number, rows, **values):
+        slot = self.slot(
+            number, device_name="da5",
+            multipath=MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                MultipathMember(device_name="da5", controller_label="mpr0", state="ACTIVE")]),
+            raw_status={"enclosure_id": self.CORE_ENCLOSURE, "ses_slot_number": ses_number},
+            **values,
+        )
+        return self.build([slot], "core", {
+            "mprutil show adapters": MPR_ADAPTERS,
+            "mprutil -u 0 show enclosures": f"36 {self.CORE_ENCLOSURE} 0008 0002 SES",
+            "mprutil -u 0 show devices": rows,
+            CORE_MPR_DMESG_EVENTS_COMMAND: "mpr0: Controller reported scsi ioc terminated tgt 180 SMID 1 loginfo 31120302",
+        })
+
+    @classmethod
+    def mpr_row(cls, location, device="SAS Target", target=180, enclosure="0002"):
+        return f"00 {target} {cls.CORE_SAS_PORT} 000a 0002 {device} 12 {enclosure} {location} 1"
+
+    def test_missing_exact_mpr_location_does_not_attach_neighbor_diagnostics(self):
+        fabric = self.core_build(5, 5, self.mpr_row(4))
+        bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+        self.assertEqual(bay.metrics["mpr_devices"], [])
+
+    def test_mpr_exact_and_zero_based_locations_keep_diagnostics(self):
+        for number in (0, 5):
+            with self.subTest(number=number):
+                fabric = self.core_build(number, number, self.mpr_row(number))
+                bay = next(trace for trace in fabric.traces if trace.id == f"bay:{number}")
+                self.assertEqual([item["mpr_slot"] for item in bay.metrics["mpr_devices"]], [str(number)])
+                self.assertEqual(bay.metrics["mpr_devices"][0]["diagnostics"]["ioc_terminated_count"], 1)
+
+    def test_mpr_named_member_proves_one_based_conversion(self):
+        # The provider names this member at location 4; SES reports 5.
+        # This is independent device evidence, not permission to try every N-1.
+        fabric = self.core_build(5, 5, self.mpr_row(4, "SAS Target da5"))
+        bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+        self.assertEqual([item["mpr_slot"] for item in bay.metrics["mpr_devices"]], ["4"])
+
+    def test_mpr_rejects_named_member_at_contradictory_location_or_enclosure(self):
+        for row in (self.mpr_row(2, "SAS Target da5"), self.mpr_row(5, "SAS Target da5", enclosure="0012")):
+            with self.subTest(row=row):
+                fabric = self.core_build(5, 5, row)
+                bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+                self.assertEqual(bay.metrics["mpr_devices"], [])
+
+    def test_mpr_rejects_other_named_occupant_without_using_sas_address_as_identity(self):
+        fabric = self.core_build(5, 5, self.mpr_row(5, "SAS Target da6"), sas_address=self.CORE_SAS_PORT)
+        bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+        self.assertEqual(bay.metrics["mpr_devices"], [])
+        # A multipath port may have a different SAS address. Location-only
+        # provider rows must not be rejected by generic SAS-address equality.
+        valid = self.core_build(5, 5, self.mpr_row(5), sas_address=f"{3:016x}")
+        bay = next(trace for trace in valid.traces if trace.id == "bay:5")
+        self.assertEqual(len(bay.metrics["mpr_devices"]), 1)
+
+    def test_mpr_conflicting_provider_rows_remain_unknown_in_both_orders(self):
+        cases = (
+            (self.mpr_row(5), self.mpr_row(5, target=181)),
+            (self.mpr_row(5, "SAS Target da5"), self.mpr_row(2, "SAS Target da5", target=181)),
+        )
+        for rows in cases:
+            for order in (rows, rows[::-1]):
+                with self.subTest(rows=order):
+                    fabric = self.core_build(5, 5, "\n".join(order))
+                    bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+                    self.assertEqual(bay.metrics["mpr_devices"], [])
+        duplicate = self.mpr_row(5)
+        fabric = self.core_build(5, 5, f"{duplicate}\n{duplicate}")
+        bay = next(trace for trace in fabric.traces if trace.id == "bay:5")
+        self.assertEqual(len(bay.metrics["mpr_devices"]), 1)
+
+    def test_named_mpr_location_conflicts_reject_exact_and_one_based_matches(self):
+        for location in (5, 4):
+            first = self.mpr_row(location, "SAS Target da5")
+            for distinct_port in (False, True):
+                second = self.mpr_row(location, "SAS Target da6", target=181)
+                if distinct_port:
+                    second = second.replace("000a", "000b").replace(self.CORE_SAS_PORT, f"{4:016x}")
+                for order in ((first, second), (second, first), (first, second, first)):
+                    with self.subTest(location=location, distinct_port=distinct_port, rows=order):
+                        fabric = self.core_build(5, 5, "\n".join(order))
+                        bay = next(t for t in fabric.traces if t.id == "bay:5")
+                        self.assertEqual(bay.metrics["mpr_devices"], [])
+                        self.assertFalse(any(link.kind == "mpr-enclosure-bay" for link in fabric.links))
+
+    def test_named_mpr_valid_duplicates_and_multipath_remain_attached(self):
+        for number, location in ((0, 0), (5, 5), (5, 4)):
+            row = self.mpr_row(location, "SAS Target da5")
+            fabric = self.core_build(number, number, f"{row}\n{row}", sas_address=f"{3:016x}")
+            bay = next(t for t in fabric.traces if t.id == f"bay:{number}")
+            self.assertEqual(len(bay.metrics["mpr_devices"]), 1)
+            self.assertEqual(bay.metrics["mpr_devices"][0]["diagnostics"]["ioc_terminated_count"], 1)
+        # Two controller-local paths to the same observed bay are not a
+        # contradiction. Their member names, handles and SAS ports can differ.
+        slot = self.slot(5, device_name="multipath/synthetic", sas_address=f"{3:016x}",
+            multipath=MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                MultipathMember(device_name="da5", controller_label="mpr0", state="ACTIVE"),
+                MultipathMember(device_name="da6", controller_label="mpr1", state="PASSIVE")]),
+            raw_status={"enclosure_id": self.CORE_ENCLOSURE, "ses_slot_number": 5})
+        outputs = {
+            "mprutil show adapters": MPR_ADAPTERS,
+            "mprutil -u 0 show enclosures": f"36 {self.CORE_ENCLOSURE} 0008 0002 SES",
+            "mprutil -u 1 show enclosures": f"36 {self.CORE_ENCLOSURE} 0008 0002 SES",
+            "mprutil -u 0 show devices": self.mpr_row(5, "SAS Target da5"),
+            "mprutil -u 1 show devices": self.mpr_row(5, "SAS Target da6", target=181).replace(
+                "000a", "000b").replace(self.CORE_SAS_PORT, f"{4:016x}"),
+        }
+        for order in (outputs, dict(reversed(list(outputs.items())))):
+            fabric = self.build([slot], "core", order)
+            bay = next(t for t in fabric.traces if t.id == "bay:5")
+            self.assertEqual({item["controller"] for item in bay.metrics["mpr_devices"]}, {"mpr0", "mpr1"})
+            self.assertEqual({item["member_device_name"] for item in bay.metrics["mpr_devices"]}, {"da5", "da6"})
+
+    def test_platform_canonical_path_alias_wins_with_exact_topology(self):
+        path_id = "path:storage-v2:3a81d3f19a789954b11eb21e39a4556020f65aff43d5e6659280805e546df9ce"
+        controller_id = "controller:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102"
+        enclosure_id = "storage-enclosure:storage-v2:86bacf459e77ffba8cf6d92c42a486bd8c5028ffb675e05ee108ad4b27d5a102:synthetic-shelf"
+        aliases = [
+            SasFabricAlias(object_id="path:linux-block:pool-mirror", object_kind="path", label="Legacy name"),
+            SasFabricAlias(object_id=path_id, object_kind="path", label="Exact name"),
+        ]
+        fabric = self.build([self.slot(device_name="sda", pool_name="Pool", vdev_name="mirror")], aliases=aliases)
+        self.assertEqual(fabric.paths[0]["id"], path_id)
+        self.assertEqual(fabric.paths[0]["alias"], "Exact name")
+        traces = {t.id: t for t in fabric.traces}
+        self.assertEqual(set(traces["bay:0"].node_ids), {
+            "host", controller_id, path_id, enclosure_id, "backplane:0", "bay:0", "pool:Pool", "vdev:Pool/mirror",
+        })
+        self.assertEqual(set(traces[path_id].node_ids), {"host", controller_id, path_id})
+        expected_edges = {("host", controller_id), (controller_id, path_id), (path_id, enclosure_id)}
+        self.assertEqual({(link.source, link.target) for link in fabric.links if link.kind in {
+            "host-controller", "controller-path", "path-storage-enclosure",
+        }}, expected_edges)
+        self.assertEqual(traces[path_id].alias, "Exact name")
+
+    def test_platform_route_identity_preserves_pool_vdev_components_and_raw_devices(self):
+        pairs = (("Pool", "pool", "mirror-0", "mirror-0"),
+                 ("a/b", "a", "c", "b/c"), ("a b", "a-b", "x", "x"),
+                 ("a%2Fb", "a/b", "x", "x"), ("pool", "pool", "Vdev", "vdev"))
+        for pool_a, pool_b, vdev_a, vdev_b in pairs:
+            slots = [self.slot(0, device_name="sda", pool_name=pool_a, vdev_name=vdev_a),
+                     self.slot(1, device_name="sdb", pool_name=pool_b, vdev_name=vdev_b)]
+            identities = []
+            for order in (slots, slots[::-1]):
+                with self.subTest(pools=(pool_a, pool_b), vdevs=(vdev_a, vdev_b), first=order[0].slot):
+                    fabric = self.build(order)
+                    self.assertEqual(len(fabric.paths), 2)
+                    nodes = {node.id: node for node in fabric.nodes}
+                    actual = {}
+                    for path in fabric.paths:
+                        self.assertEqual(path["count"], 1)
+                        number = path["slots"][0]
+                        self.assertEqual(nodes[path["id"]].raw["devices"], ["sda" if number == 0 else "sdb"])
+                        actual[number] = path["id"]
+                    self.assertNotEqual(actual[0], actual[1])
+                    identities.append(actual)
+            if len(identities) == 2:
+                self.assertEqual(identities[0], identities[1])
+                for slot in slots:
+                    self.assertEqual(self.build([slot]).paths[0]["id"], identities[0][slot.slot])
+
+    def test_platform_controller_identity_preserves_case_and_delimiters(self):
+        for platform in ("esxi", "quantastor"):
+            for left, right in (("C1", "c1"), ("C/1", "C-1"), ("C%2F1", "C/1")):
+                slots = [self.slot(i, device_name=f"sd{chr(97 + i)}", pool_name="pool", vdev_name="mirror",
+                                   raw_status={"controller_id": name}, operator_context={"selected_view_label": name})
+                         for i, name in enumerate((left, right))]
+                ids = []
+                for order in (slots, slots[::-1]):
+                    with self.subTest(platform=platform, names=(left, right), first=order[0].slot):
+                        fabric = self.build(order, platform)
+                        self.assertEqual(len(fabric.controllers), 2)
+                        self.assertEqual(len(fabric.paths), 2)
+                        self.assertEqual(sorted(c["related_slots"] for c in fabric.controllers), [[0], [1]])
+                        nodes = {node.id: node for node in fabric.nodes}
+                        links = {link.id: link for link in fabric.links}
+                        for trace in fabric.traces:
+                            self.assertTrue(set(trace.node_ids) <= nodes.keys())
+                            self.assertTrue(set(trace.link_ids) <= links.keys())
+                        ids.append({p["slots"][0]: p["id"] for p in fabric.paths})
+                if len(ids) == 2:
+                    self.assertEqual(ids[0], ids[1])
+
+    def test_platform_source_identity_keeps_same_pool_routes_separate(self):
+        slots = [self.slot(0, device_name="sda", pool_name="pool", vdev_name="mirror"),
+                 self.slot(1, device_name="nvme0n1", pool_name="pool", vdev_name="mirror")]
+        ids = []
+        for order in (slots, slots[::-1]):
+            fabric = self.build(order)
+            self.assertEqual({p["source"] for p in fabric.paths}, {"linux_block", "linux_nvme"})
+            self.assertEqual(sorted(p["slots"] for p in fabric.paths), [[0], [1]])
+            ids.append({p["slots"][0]: p["id"] for p in fabric.paths})
+        self.assertEqual(ids[0], ids[1])
+
+    def test_platform_legacy_path_alias_follows_unique_route_without_store_migration(self):
+        alias = SasFabricAlias(object_id="path:linux-block:pool-mirror", object_kind="path", label="Operator route")
+        slot = self.slot(device_name="sda", pool_name="Pool", vdev_name="mirror")
+        fabric = self.build([slot], aliases=[alias])
+        path = fabric.paths[0]
+        self.assertEqual(path.get("alias"), "Operator route")
+        self.assertEqual(next(n for n in fabric.nodes if n.id == path["id"]).alias, "Operator route")
+        self.assertEqual(next(t for t in fabric.traces if t.id == path["id"]).alias, "Operator route")
+        self.assertEqual(alias.object_id, "path:linux-block:pool-mirror")
+
+    def test_ambiguous_legacy_route_alias_is_retained_with_warning_not_guessed(self):
+        alias = SasFabricAlias(object_id="path:linux-block:pool-mirror", object_kind="path", label="Operator route")
+        slots = [self.slot(0, device_name="sda", pool_name="Pool", vdev_name="mirror"),
+                 self.slot(1, device_name="sdb", pool_name="pool", vdev_name="mirror")]
+        for order in (slots, slots[::-1]):
+            fabric = self.build(order, aliases=[alias])
+            self.assertEqual(len(fabric.paths), 2)
+            self.assertTrue(all(not p.get("alias") for p in fabric.paths))
+            self.assertIn(alias, fabric.aliases)
+            self.assertTrue(any("ambiguous" in warning.lower() and "alias" in warning.lower() for warning in fabric.warnings))
+
+    def test_platform_route_ids_fit_alias_contract_and_controller_name_lookup(self):
+        slot = self.slot(device_name="sda", pool_name="Long pool/" * 30, vdev_name="Long vdev/" * 30)
+        fabric = self.build([slot])
+        path = fabric.paths[0]
+        alias = SasFabricAlias(object_id=path["id"], object_kind="path", label="Long route")
+        self.assertEqual(alias.object_id, path["id"])
+        controller = fabric.controllers[0]
+        self.assertEqual(controller["id"], f"controller:{controller['name']}")
+        named = self.build([slot], aliases=[alias])
+        self.assertEqual(named.paths[0].get("alias"), "Long route")
+
+    def test_platform_legacy_controller_and_enclosure_aliases_remain_visible(self):
+        aliases = [
+            SasFabricAlias(object_id="controller:linux-block", object_kind="controller", label="Source name"),
+            SasFabricAlias(object_id="storage-enclosure:linux-block:synthetic-shelf",
+                           object_kind="storage-enclosure", label="Shelf name"),
+        ]
+        fabric = self.build([self.slot(device_name="sda", pool_name="pool")], aliases=aliases)
+        self.assertEqual(next(n for n in fabric.nodes if n.kind == "controller").alias, "Source name")
+        self.assertEqual(next(n for n in fabric.nodes if n.kind == "storage-enclosure").alias, "Shelf name")
+        # Read compatibility does not remove or mutate the supplied records.
+        for alias in aliases:
+            self.assertIn(alias, fabric.aliases)
+
+    def test_platform_controller_labels_are_separate_from_canonical_joins(self):
+        for platform in ("linux", "scale", "esxi", "quantastor", "ipmi"):
+            with self.subTest(platform=platform):
+                fabric = self.build([self.slot(device_name="sda", health="healthy")], platform)
+                controller = fabric.controllers[0]
+                node = next(n for n in fabric.nodes if n.id == controller["id"])
+                member = next(t for t in fabric.traces if t.id == "bay:0").metrics["path_states"][0]
+                self.assertEqual(controller.get("label"), node.label)
+                self.assertEqual(member.get("controller_label"), node.label)
+                self.assertEqual(fabric.paths[0].get("controller_label"), node.label)
+                self.assertNotIn("storage-v2:", node.label)
+                self.assertEqual(controller["id"], f"controller:{controller['name']}")
+                self.assertEqual(member["controller"], controller["name"])
+                self.assertEqual(fabric.paths[0]["controller"], controller["name"])
+
+    def partial_mpr_build(self, rows, *, enclosures=None, controller="mpr0"):
+        slot = self.slot(5, device_name="da5",
+            multipath=MultipathView(name="synthetic", device_name="multipath/synthetic", members=[
+                MultipathMember(device_name="da5", controller_label=controller, state="ACTIVE")]),
+            raw_status={"enclosure_id": self.CORE_ENCLOSURE, "ses_slot_number": 5})
+        outputs = {
+            "mprutil show adapters": MPR_ADAPTERS,
+            "mprutil -u 0 show devices": rows,
+            CORE_MPR_DMESG_EVENTS_COMMAND: "mpr0: Controller reported scsi ioc terminated tgt 180 SMID 1 loginfo 31120302",
+        }
+        if enclosures is not None:
+            outputs["mprutil -u 0 show enclosures"] = enclosures
+        return self.build([slot], "core", outputs)
+
+    def test_named_mpr_partial_enclosure_evidence_keeps_proven_diagnostics(self):
+        for location in (5, 4):
+            row = self.mpr_row(location, "SAS Target da5")
+            for enclosures in (None, "", f"36 {3:016x} 0008 0012 SES", f"36 {self.CORE_ENCLOSURE} 0008 0002 SES"):
+                with self.subTest(location=location, enclosures=enclosures):
+                    fabric = self.partial_mpr_build(f"{row}\n{row}", enclosures=enclosures)
+                    members = next(t for t in fabric.traces if t.id == "bay:5").metrics["mpr_devices"]
+                    self.assertEqual(len(members), 1)
+                    self.assertEqual(members[0]["diagnostics"]["ioc_terminated_count"], 1)
+                    self.assertEqual(members[0]["mpr_slot"], str(location))
+
+    def test_partial_mpr_evidence_still_rejects_conflicts_and_unproven_offsets(self):
+        cases = [
+            (self.mpr_row(5, "SAS Target da5"), f"36 {3:016x} 0008 0002 SES", "mpr0"),
+            (self.mpr_row(5, "SAS Target da5"), None, "mpr1"),
+            (self.mpr_row(3, "SAS Target da5"), None, "mpr0"),
+            (self.mpr_row(4), None, "mpr0"),
+            (self.mpr_row(5, "SAS Target da6"), None, "mpr0"),
+            (self.mpr_row(4, "SAS Target da5") + "\n" + self.mpr_row(5, "SAS Target da5"), None, "mpr0"),
+            (self.mpr_row(5, "SAS Target da5") + "\n" + self.mpr_row(4, "SAS Target da5"), None, "mpr0"),
+        ]
+        for location in (5, 4):
+            first = self.mpr_row(location, "SAS Target da5")
+            other = self.mpr_row(location, "SAS Target da6", target=181)
+            for rows in ((first, other), (other, first), (first, other, first)):
+                cases.append(("\n".join(rows), None, "mpr0"))
+        for rows, enclosures, controller in cases:
+            with self.subTest(rows=rows, enclosures=enclosures, controller=controller):
+                fabric = self.partial_mpr_build(rows, enclosures=enclosures, controller=controller)
+                self.assertEqual(next(t for t in fabric.traces if t.id == "bay:5").metrics["mpr_devices"], [])
+
+    def test_platform_shared_path_health_is_order_independent_member_evidence(self):
+        from itertools import permutations
+
+        cases = ((["healthy", "fault"], "mixed"), (["healthy", "unknown"], "unknown"),
+                 (["healthy", "healthy"], "healthy"), (["fault", "fault"], "fault"),
+                 (["healthy", "fault", "unknown"], "mixed"), (["unknown", "unknown"], "unknown"))
+        for states, expected in cases:
+            slots = [self.slot(i, device_name=f"sd{chr(97 + i)}", pool_name="pool", vdev_name="mirror", health=state)
+                     for i, state in enumerate(states)]
+            for order in permutations(slots):
+                with self.subTest(states=states, order=[s.slot for s in order]):
+                    fabric = self.build(list(order))
+                    self.assertEqual(len(fabric.paths), 1)
+                    path = fabric.paths[0]
+                    self.assertEqual(path["state"], expected)
+                    self.assertEqual(path.get("state_basis"), "member-health-not-transport")
+                    self.assertEqual(path["member_state_counts"], {s: states.count(s) for s in set(states)})
+                    nodes = {node.id: node for node in fabric.nodes}
+                    self.assertEqual(nodes[path["id"]].status, expected)
+                    self.assertEqual(nodes[path["id"]].metrics["member_state_counts"], path["member_state_counts"])
+                    path_links = [link for link in fabric.links if link.kind in {"controller-path", "path-storage-enclosure"}]
+                    self.assertTrue(path_links)
+                    self.assertEqual({link.status for link in path_links}, {expected})
+                    path_trace = next(t for t in fabric.traces if t.id == path["id"])
+                    self.assertEqual(path_trace.metrics["state"], expected)
+                    for slot in slots:
+                        bay = next(t for t in fabric.traces if t.id == f"bay:{slot.slot}")
+                        self.assertEqual(bay.metrics["path_states"][0]["state"], slot.health)
+                        self.assertEqual(bay.metrics["path_states"][0]["member_state"], slot.health)
+                        self.assertEqual(nodes[f"bay:{slot.slot}"].status, slot.health)
+                    # Member faults do not establish a controller/transport fault.
+                    self.assertEqual({nodes[c["id"]].status for c in fabric.controllers}, {"online"})
 
 
 class SasFabricInventoryProbeTests(unittest.TestCase):

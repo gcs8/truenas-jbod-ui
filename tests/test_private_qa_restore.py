@@ -4,8 +4,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -73,13 +75,74 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertNotIn('`{"encrypt":false,', checklist)
         self.assertIn('`{"encrypt":true,', checklist)
 
+    def test_release_checklist_uses_default_full_format_then_explicit_legacy_7z(self) -> None:
+        checklist = RELEASE_CHECKLIST.read_text(encoding="utf-8")
+        primary_heading = "**Primary default-format round trip:**"
+        legacy_heading = "**Legacy 7z readability round trip:**"
+        primary_start = checklist.index(primary_heading)
+        legacy_start = checklist.index(legacy_heading)
+        legacy_end = checklist.index(
+            "  - keep a separate sanitized receipt for each round trip.",
+            legacy_start,
+        )
+        primary = checklist[primary_start:legacy_start]
+        legacy = checklist[legacy_start:legacy_end]
+
+        self.assertLess(primary_start, legacy_start)
+        self.assertIn("omit `packaging`", primary)
+        self.assertIn("observed `tar.zst`", primary)
+
+        from app.models.domain import SystemBackupExportRequest
+
+        bodies = {}
+        for round_trip, section in (("primary", primary), ("legacy", legacy)):
+            found = re.findall(r"`(\{\"encrypt\".*?\})`", section)
+            self.assertEqual(len(found), 1, f"{round_trip} needs exactly one export body")
+            body = json.loads(found[0])
+            bodies[round_trip] = body
+            with self.subTest(round_trip=round_trip):
+                self.assertIs(body["encrypt"], True)
+                self.assertEqual(body["passphrase"], "<private passphrase, never recorded>")
+                self.assertEqual(set(body["included_paths"]), set(self.module.REQUIRED_FULL_GROUPS))
+                self.assertEqual(len(body["included_paths"]), len(self.module.REQUIRED_FULL_GROUPS))
+                SystemBackupExportRequest.model_validate(body)
+
+        self.assertNotIn("packaging", bodies["primary"])
+        self.assertEqual(
+            SystemBackupExportRequest.model_validate(bodies["primary"]).packaging, "tar.zst"
+        )
+        self.assertEqual(bodies["legacy"]["packaging"], "7z")
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="primary", phase=phase):
+                self.assertIn(phase, primary.lower())
+
+        for phase in ("export", "inspect", "import", "restart", "readback"):
+            with self.subTest(round_trip="legacy", phase=phase):
+                self.assertIn(phase, legacy.lower())
+
+    def test_restore_receipts_bind_format_export_source_and_candidate_provenance(self) -> None:
+        for path in (RELEASE_CHECKLIST, DOC):
+            text = path.read_text(encoding="utf-8")
+            for marker in (
+                "`inspection.packaging`",
+                "`inspection.app_version`",
+                "`source_commit`",
+                "`image_id`",
+            ):
+                with self.subTest(path=path.name, marker=marker):
+                    self.assertIn(marker, text)
+
     def test_inspection_payload_is_exact_and_aggregate_only(self) -> None:
         payload = {
             "ok": True,
             "schema_version": 2,
             "app_version": "0.22.3",
+            "app_version_note": None,
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
+            "encryption_mode": "encrypted",
+            "inspection_receipt": "server-issued-single-use-receipt",
+            "inspection_receipt_expires_at": 1893553500,
             "packaging": "7z",
             "selected_groups": [
                 "config_file",
@@ -132,6 +195,20 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 unsafe = {**payload, unsafe_key: []}
                 with self.assertRaisesRegex(self.module.QaRestoreError, "unexpected fields"):
                     self.module.validate_inspection_payload(unsafe)
+
+        older = {
+            **payload,
+            "app_version_note": "This backup was made by v0.22.2; settings and history will be "
+            "brought up to date during restore.",
+        }
+        self.assertEqual(self.module.validate_inspection_payload(older), older)
+        for bad_note in (7, ["note"], "x" * 513):
+            with self.subTest(bad_note=bad_note):
+                with self.assertRaisesRegex(self.module.QaRestoreError, "app version note"):
+                    self.module.validate_inspection_payload({**payload, "app_version_note": bad_note})
+        missing_note = {key: value for key, value in payload.items() if key != "app_version_note"}
+        with self.assertRaisesRegex(self.module.QaRestoreError, "missing required fields"):
+            self.module.validate_inspection_payload(missing_note)
 
         plaintext = {**payload, "encrypted": False}
         with self.assertRaisesRegex(self.module.QaRestoreError, "encrypted FULL backup"):
@@ -420,6 +497,39 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 0o600,
             )
 
+    def test_segmented_history_flag_sets_the_documented_catalog_path(self) -> None:
+        for segmented, expected in ((False, False), (True, True)):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as raw_root:
+                runtime = Path(raw_root) / "runtime"
+                self.module._write_runtime_files(
+                    ROOT,
+                    runtime,
+                    "sha256:" + "a" * 64,
+                    (28080, 28081, 28082),
+                    "qa-user",
+                    "qa-password",
+                    live_read_only=False,
+                    segmented_history=segmented,
+                )
+                environment = (runtime / ".env").read_text(encoding="utf-8")
+                self.assertEqual(
+                    "HISTORY_SEGMENT_CATALOG_PATH=/app/history/segments/catalog.json" in environment,
+                    expected,
+                )
+
+    def test_history_mode_must_match_the_backup_before_import(self) -> None:
+        self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=True)
+        self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "rerun with --segmented-history"):
+            self.module.require_matching_history_mode({"schema_version": 2}, segmented_history=False)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "single-file history"):
+            self.module.require_matching_history_mode({"schema_version": 1}, segmented_history=True)
+
+    def test_drill_schema_constant_matches_the_app(self) -> None:
+        from history_service.segment_catalog import SEGMENTED_BACKUP_SCHEMA_VERSION
+
+        self.assertEqual(self.module.SEGMENTED_BACKUP_SCHEMA_VERSION, SEGMENTED_BACKUP_SCHEMA_VERSION)
+
     def test_loopback_proxy_forwards_and_releases_listener(self) -> None:
         self.assertTrue(hasattr(self.module, "_LoopbackProxySet"))
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as target:
@@ -526,12 +636,12 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         stop = source.index('phase = "backup-inspection"', start)
         restart = source.index('phase = "restart-survival"', stop)
         browser = source.index('phase = "browser-and-performance"', restart)
-        cleanup = source.index('if not args.keep_running:', stop)
+        cleanup = source.index('original_error = sys.exc_info()[1]', stop)
         self.assertIn("service_access.start()", source[start:stop])
         self.assertIn("service_access.close()", source[restart:browser])
         self.assertIn("service_access = _LoopbackProxySet(", source[restart:browser])
         self.assertIn("service_access.start()", source[restart:browser])
-        self.assertIn("service_access.close()", source[cleanup:])
+        self.assertIn("attempt(service_access.close)", source[cleanup:])
 
     def test_runtime_preflight_rejects_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -607,9 +717,21 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     "passphrase",
                     "username",
                     "password",
+                    extra_headers={
+                        "X-Backup-Expected-Encryption": "encrypted",
+                        "X-Backup-Inspection-Receipt": "server-receipt",
+                    },
                 )
         self.assertIn(
             ("Origin", "http://127.0.0.1:28082"),
+            FakeConnection.instance.headers,
+        )
+        self.assertIn(
+            ("X-Backup-Expected-Encryption", "encrypted"),
+            FakeConnection.instance.headers,
+        )
+        self.assertIn(
+            ("X-Backup-Inspection-Receipt", "server-receipt"),
             FakeConnection.instance.headers,
         )
 
@@ -789,8 +911,11 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     self.module,
                     "get_json",
                     side_effect=[
-                        {"selected_enclosure_id": "synthetic-enclosure"},
-                        {"revision": "a" * 64},
+                        {"selected_enclosure_id": "synthetic-enclosure", "slots": [
+                            {"slot": 0, "mapping_revision": "c" * 64},
+                        ]},
+                        {"revision": "a" * 64, "mappings": []},
+                        {"revision": "d" * 64, "mappings": []},
                     ],
                 ) as get_json,
                 patch.object(
@@ -811,8 +936,252 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             result,
             {"sas_fabric_label": True, "slot_mapping": True},
         )
-        self.assertEqual(get_json.call_count, 2)
+        self.assertEqual(get_json.call_count, 3)
         self.assertIn("expected_revision=" + "b" * 64, delete_json.call_args.args[1])
+
+    def test_live_mapping_cycle_real_store_cas_and_preservation(self) -> None:
+        from app.models.domain import ManualMapping
+        from app.services.mapping_store import MappingRevisionConflict, MappingStore
+        import urllib.parse
+
+        for mode in ("empty", "populated", "legacy", "missing-slot", "missing-token", "blank-token", "conflict"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as raw_root:
+                path = Path(raw_root) / "mappings.json"
+                store = MappingStore(str(path))
+                system, enclosure = "synthetic-system", "synthetic-enclosure"
+                if mode in {"populated", "legacy"}:
+                    store.save_mapping(ManualMapping(
+                        system_id=system, enclosure_id=enclosure if mode == "populated" else None,
+                        slot=0, notes="original must survive", serial="synthetic-original",
+                    ))
+                before = path.read_bytes() if path.exists() else None
+                scope = store.scope_revision(system, enclosure)
+                save = store.save_revision(system, enclosure, 0)
+                self.assertNotEqual(scope, save)
+                tokens = []
+
+                def get_response(_port, url, *_auth):
+                    if "/api/inventory" in url:
+                        return {"selected_enclosure_id": enclosure, "slots": [] if mode == "missing-slot" else [{
+                            "slot": 0, "enclosure_id": enclosure,
+                            "mapping_revision": None if mode == "missing-token" else "" if mode == "blank-token" else save,
+                        }]}
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                    return {"revision": scope, "mappings": [m.model_dump(mode="json") for m in
+                        store.list_mappings(system, query.get("enclosure_id", [None])[0])]}
+
+                def post_response(_port, url, payload, *_auth):
+                    if "aliases" in url:
+                        return {"ok": True, "cleared": payload["label"] is None,
+                                "alias": {"label": payload["label"]} if payload["label"] else None}
+                    tokens.append(payload["expected_revision"])
+                    if mode == "conflict":
+                        store.save_mapping(ManualMapping(system_id=system, enclosure_id=enclosure,
+                                                         slot=0, notes="concurrent owner"))
+                    saved = store.save_mapping(ManualMapping(system_id=system, enclosure_id=enclosure,
+                                                             slot=0, notes=payload["notes"]),
+                                               expected_revision=payload["expected_revision"])
+                    clear = store.clear_revision(system, enclosure, 0)
+                    self.assertNotIn(clear, (scope, save))
+                    return {"ok": True, "mapping": saved.model_dump(mode="json"),
+                            "snapshot": {"slots": [{"slot": 0, "mapping_clear_revision": clear}]}}
+
+                def delete_response(_port, url, *_auth):
+                    token = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["expected_revision"][0]
+                    tokens.append(token)
+                    return {"ok": store.clear_mapping(system, enclosure, 0, expected_revision=token)}
+
+                with (patch.object(self.module, "get_json", side_effect=get_response),
+                      patch.object(self.module, "post_json", side_effect=post_response),
+                      patch.object(self.module, "delete_json", side_effect=delete_response)):
+                    def invoke():
+                        return self.module._exercise_pencil_writes(
+                            Path(raw_root), 28080, "qa-user", "qa-password", system, live_read_only=True)
+                    if mode == "empty":
+                        self.assertTrue(invoke()["slot_mapping"])
+                        self.assertEqual(tokens[0], save)
+                        self.assertEqual(len(tokens), 2)
+                        self.assertIsNone(store.get_mapping(system, enclosure, 0))
+                    elif mode == "conflict":
+                        with self.assertRaises(MappingRevisionConflict):
+                            invoke()
+                        self.assertEqual(tokens, [save])
+                        self.assertEqual(store.get_mapping(system, enclosure, 0).notes, "concurrent owner")
+                    else:
+                        with self.assertRaises(self.module.QaRestoreError):
+                            invoke()
+                        self.assertEqual(tokens, [])
+                        self.assertEqual(path.read_bytes() if path.exists() else None, before)
+
+    def test_live_mapping_guard_scopes_real_store_without_losing_legacy_safety(self) -> None:
+        import urllib.parse
+
+        from app.models.domain import ManualMapping
+        from app.services.mapping_store import (
+            MappingRevisionConflict,
+            MappingScopeConflict,
+            MappingStore,
+        )
+
+        system = "synthetic-system"
+        physical = "synthetic-enclosure"
+        drawer = physical + "::dell-md1280-drawer-top-42"
+        cases = (
+            ("other-enclosure", physical, "synthetic-other", system, "success"),
+            ("drawer-other-enclosure", drawer, "synthetic-other", system, "success"),
+            ("other-enclosure-legacy", physical, "synthetic-other", None, "success"),
+            ("unknown-suffix-distinct", physical + "::unknown", physical, system, "success"),
+            ("selected-populated", physical, physical, system, "occupied"),
+            ("drawer-physical-populated", drawer, physical, system, "occupied"),
+            ("physical-drawer-populated", physical, drawer, system, "occupied"),
+            ("system-enclosureless", physical, None, system, "occupied"),
+            ("global-enclosureless", drawer, None, None, "occupied"),
+            ("global-selected", drawer, physical, None, "occupied"),
+            ("ambiguous-legacy", drawer, physical, system, "ambiguous"),
+            ("clear-conflict", physical, "synthetic-other", system, "conflict"),
+        )
+        for name, selected, existing_enclosure, existing_system, outcome in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as raw_root:
+                path = Path(raw_root) / "mappings.json"
+                store = MappingStore(str(path))
+                original = ManualMapping(
+                    system_id=existing_system, enclosure_id=existing_enclosure,
+                    slot=0, notes="original must survive", serial="SANITIZED-ORIGINAL",
+                )
+                if outcome == "ambiguous":
+                    alias = original.model_copy(update={
+                        "system_id": None, "enclosure_id": drawer,
+                        "notes": "conflicting legacy owner",
+                    })
+                    path.write_text(json.dumps({"version": 1, "slot_mappings": {
+                        f"{system}:{physical}:0": original.model_dump(mode="json"),
+                        f"{drawer}:0": alias.model_dump(mode="json"),
+                    }}), encoding="utf-8")
+                else:
+                    original = store.save_mapping(original)
+                before = path.read_bytes()
+                requests = []
+                mutations = []
+                revisions = {}
+                conflict_bytes = None
+
+                def request_query(url):
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                    self.assertEqual(query["system_id"], [system])
+                    return query
+
+                def get_response(_port, url, *_auth):
+                    requests.append(url)
+                    query = request_query(url)
+                    if url.startswith("/api/inventory?"):
+                        revisions["save"] = store.save_revision(system, selected, 0)
+                        return {"selected_enclosure_id": selected, "slots": [{
+                            "slot": 0, "enclosure_id": selected,
+                            "mapping_revision": revisions["save"],
+                        }]}
+                    self.assertTrue(url.startswith("/api/mappings/export?"))
+                    scope = query.get("enclosure_id", [None])[0]
+                    mappings = store.list_mappings(system, scope)
+                    preview = store.preview_replace_mappings(system, scope, mappings)
+                    return {"revision": preview["revision"], "mappings": [
+                        mapping.model_dump(mode="json") for mapping in mappings
+                    ]}
+
+                def post_response(_port, url, payload, *_auth):
+                    if url == "/api/sas-fabric/aliases":
+                        return {"ok": True, "cleared": payload["label"] is None,
+                                "alias": payload if payload["label"] else None}
+                    self.assertTrue(url.startswith("/api/slots/0/mapping?"))
+                    self.assertEqual(request_query(url)["enclosure_id"], [selected])
+                    self.assertEqual(payload["expected_revision"], revisions["save"])
+                    self.assertFalse(payload["clear_identify_after_save"])
+                    mutations.append("save")
+                    saved = store.save_mapping(ManualMapping(
+                        system_id=system, enclosure_id=selected, slot=0, notes=payload["notes"],
+                    ), expected_revision=payload["expected_revision"])
+                    revisions["clear"] = store.clear_revision(system, selected, 0)
+                    self.assertNotEqual(revisions["save"], revisions["clear"])
+                    return {"ok": True, "mapping": saved.model_dump(mode="json"),
+                            "snapshot": {"slots": [{
+                                "slot": 0, "mapping_clear_revision": revisions["clear"],
+                            }]}}
+
+                def delete_response(_port, url, *_auth):
+                    nonlocal conflict_bytes
+                    self.assertTrue(url.startswith("/api/slots/0/mapping?"))
+                    query = request_query(url)
+                    self.assertEqual(query["enclosure_id"], [selected])
+                    self.assertEqual(query["expected_revision"], [revisions["clear"]])
+                    mutations.append("clear")
+                    if outcome == "conflict":
+                        store.save_mapping(ManualMapping(
+                            system_id=system, enclosure_id=selected, slot=0,
+                            notes="concurrent owner must survive",
+                        ))
+                        conflict_bytes = path.read_bytes()
+                    return {"ok": store.clear_mapping(
+                        system, selected, 0, expected_revision=query["expected_revision"][0],
+                    )}
+
+                with (patch.object(self.module, "get_json", side_effect=get_response),
+                      patch.object(self.module, "post_json", side_effect=post_response),
+                      patch.object(self.module, "delete_json", side_effect=delete_response)):
+                    def invoke():
+                        return self.module._exercise_pencil_writes(
+                            Path(raw_root), 28080, "qa-user", "qa-password", system,
+                            live_read_only=True,
+                        )
+                    if outcome == "success":
+                        self.assertTrue(invoke()["slot_mapping"])
+                        self.assertEqual(mutations, ["save", "clear"])
+                        reopened = MappingStore(str(path))
+                        self.assertIsNone(reopened.get_mapping(system, selected, 0))
+                        self.assertEqual(reopened.get_mapping(existing_system, existing_enclosure, 0), original)
+                        # A real save/clear updates the document timestamp, but no retained row.
+                        self.assertEqual(json.loads(path.read_bytes())["slot_mappings"],
+                                         json.loads(before)["slot_mappings"])
+                        self.assertEqual(json.loads(path.read_bytes())["version"], json.loads(before)["version"])
+                    elif outcome == "conflict":
+                        with self.assertRaises(MappingRevisionConflict):
+                            invoke()
+                        self.assertEqual(mutations, ["save", "clear"])
+                        self.assertEqual(path.read_bytes(), conflict_bytes)
+                        self.assertEqual(store.get_mapping(system, "synthetic-other", 0), original)
+                    else:
+                        if outcome == "occupied":
+                            with self.assertRaisesRegex(self.module.QaRestoreError, "unpopulated target"):
+                                invoke()
+                        else:
+                            with self.assertRaises(MappingScopeConflict):
+                                invoke()
+                        self.assertEqual(mutations, [])
+                        self.assertEqual(path.read_bytes(), before)
+                    if outcome != "ambiguous":
+                        self.assertIn("/api/mappings/export?system_id=" + system, requests)
+
+    def test_live_mapping_guard_rejects_invalid_selected_export_before_slot_writes(self) -> None:
+        for invalid in (None, {}, [None]):
+            with self.subTest(mappings=invalid), tempfile.TemporaryDirectory() as raw_root:
+                def post_response(_port, url, payload, *_auth):
+                    self.assertEqual(url, "/api/sas-fabric/aliases")
+                    return {"ok": True, "cleared": payload["label"] is None,
+                            "alias": payload if payload["label"] else None}
+
+                with (patch.object(self.module, "get_json", side_effect=[
+                    {"selected_enclosure_id": "synthetic-enclosure", "slots": [
+                        {"slot": 0, "mapping_revision": "c" * 64},
+                    ]},
+                    {"mappings": []},
+                    {"mappings": invalid},
+                ]), patch.object(self.module, "post_json", side_effect=post_response) as post,
+                      patch.object(self.module, "delete_json") as delete):
+                    with self.assertRaisesRegex(self.module.QaRestoreError, "mapping export"):
+                        self.module._exercise_pencil_writes(
+                            Path(raw_root), 28080, "qa-user", "qa-password", "synthetic-system",
+                            live_read_only=True,
+                        )
+                    self.assertEqual(post.call_count, 2)
+                    delete.assert_not_called()
 
     def test_partial_temporary_credential_creation_is_cleaned_up(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -834,12 +1203,14 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
 
     def test_browser_uses_private_file_credentials_and_private_artifact_mode(self) -> None:
         observed_env: dict[str, str] = {}
+        observed_umasks: list[object] = []
         with tempfile.TemporaryDirectory() as raw_root:
             raw_dir = Path(raw_root)
 
             def record_run(command, **kwargs):
                 if command[:3] == ["npx", "playwright", "test"]:
                     observed_env.update(kwargs["env"])
+                    observed_umasks.append(kwargs.get("umask"))
 
             with patch.object(self.module, "_run", side_effect=record_run):
                 self.module._run_browser_and_perf(
@@ -861,10 +1232,25 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", observed_env)
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", observed_env)
+        # Playwright recreates the output folder, so it must run with a private umask.
+        self.assertEqual(observed_umasks, [0o077])
         config = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
         self.assertIn("PLAYWRIGHT_PRIVATE_OUTPUT_DIR", config)
         self.assertIn("PLAYWRIGHT_HTTP_USERNAME_FILE", config)
         self.assertIn("PLAYWRIGHT_HTTP_PASSWORD_FILE", config)
+
+    def test_run_applies_the_requested_umask_to_the_child(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            raw_dir = Path(raw_root)
+            target = raw_dir / "made-by-child"
+            self.module._run(
+                [sys.executable, "-c", f"import os; os.mkdir({str(target)!r})"],
+                cwd=raw_dir,
+                log_path=raw_dir / "logs" / "child.log",
+                timeout=60,
+                umask=0o077,
+            )
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
 
     def test_private_runtime_root_removal_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -899,35 +1285,171 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 self.module._remove_runtime_root(root)
 
     def test_cleanup_readback_requires_fixed_names_and_project_network_absent(self) -> None:
-        absent = Mock(returncode=1)
         environment = {"PATH": "/safe/bin"}
-        with patch.object(self.module.subprocess, "run", return_value=absent) as run:
-            self.module._assert_compose_resources_removed(
-                "tjuiqa123",
-                env=environment,
-            )
-        inspected = [call.args[0] for call in run.call_args_list]
-        for name in self.module.APP_CONTAINER_NAMES:
-            self.assertIn(["docker", "container", "inspect", name], inspected)
-        self.assertIn(
-            ["docker", "network", "inspect", "tjuiqa123_default"],
-            inspected,
-        )
-        self.assertTrue(
-            all(call.kwargs.get("env") == environment for call in run.call_args_list)
-        )
-        with (
-            patch.object(
-                self.module.subprocess,
-                "run",
-                return_value=Mock(returncode=0),
-            ),
-            self.assertRaisesRegex(self.module.QaRestoreError, "cleanup readback"),
-        ):
-            self.module._assert_compose_resources_removed(
-                "tjuiqa123",
-                env=environment,
-            )
+        with patch.object(self.module.subprocess, "run", return_value=Mock(returncode=0, stdout="")) as run:
+            self.module._assert_compose_resources_removed("tjuiqa123", env=environment)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual([command[1] for command in commands], ["container", "container", "network", "volume"])
+        self.assertTrue(all("label=com.docker.compose.project=tjuiqa123" in c for c in commands[1:]))
+        self.assertTrue(all(call.kwargs["env"] == environment for call in run.call_args_list))
+        for result in (Mock(returncode=1, stdout=""), Mock(returncode=0, stdout="truenas-jbod-ui running")):
+            with patch.object(self.module.subprocess, "run", return_value=result):
+                with self.assertRaisesRegex(self.module.QaRestoreError, "cleanup readback"):
+                    self.module._assert_compose_resources_removed("tjuiqa123", env=environment)
+
+    def test_main_finalizes_cleanup_after_partial_start_and_failed_teardown(self) -> None:
+        import shutil
+        from types import SimpleNamespace
+
+        for startup_fails in (True, False):
+            for cleanup in ("absent", "down-failed", "down-failed-absent", "residual", "unknown", "volume", "proxy-close"):
+                with self.subTest(startup_fails=startup_fails, cleanup=cleanup), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    runtime = root / "runtime"
+                    backup, key = root / "backup", root / "key"
+                    for path in (backup, key):
+                        path.write_text("synthetic")
+                        path.chmod(0o600)
+                    args = SimpleNamespace(
+                        approval=self.module.APPROVAL, live_read_only=False,
+                        skip_browser_and_performance=False, target_handle="run-" + "a" * 32,
+                        source_commit="b" * 40, image="sha256:" + "c" * 64,
+                        backup=backup, passphrase_file=key, app_port=28080, history_port=28081,
+                        admin_port=28082, scratch_root=root, runtime_root=runtime,
+                        minimum_available_memory_mib=1, minimum_free_disk_gib=1,
+                        evidence_dir=root / "evidence", segmented_history=False, keep_running=False,
+                    )
+                    original = self.module.QaRestoreError("original startup" if startup_fails else "original post-start")
+                    events = []
+
+                    def run(command, **kwargs):
+                        if "up" in command:
+                            events.append("up")
+                            if startup_fails:
+                                raise original
+                        if "down" in command:
+                            events.append("down")
+                            if cleanup in {"down-failed", "down-failed-absent"}:
+                                raise RuntimeError("synthetic down failure")
+
+                    def transport(command, **kwargs):
+                        # Real absence/state reader, invented Docker list responses only.
+                        events.append("readback")
+                        if cleanup == "unknown":
+                            return Mock(returncode=1, stdout="", stderr="synthetic unavailable")
+                        if "container" in command and cleanup in {"residual", "down-failed"}:
+                            return Mock(returncode=0, stdout="truenas-jbod-ui running\n")
+                        if "volume" in command and cleanup == "volume":
+                            return Mock(returncode=0, stdout="synthetic-volume")
+                        return Mock(returncode=0, stdout="")
+
+                    def remove(path):
+                        events.append("remove")
+                        shutil.rmtree(path)
+
+                    with contextlib.ExitStack() as stack:
+                        for name in ("_validate_exact_source", "_validate_exact_image", "_validate_runtime_preflight",
+                                     "_validate_container_names_available", "_capture_compose_logs"):
+                            stack.enter_context(patch.object(self.module, name))
+                        stack.enter_context(patch.object(self.module, "parse_args", return_value=args))
+                        stack.enter_context(patch.object(self.module, "_run", side_effect=run))
+                        stack.enter_context(patch.object(self.module.subprocess, "run", side_effect=transport))
+                        stack.enter_context(patch.object(self.module, "_resolve_service_access", return_value=SimpleNamespace(proxy_required=False)))
+                        proxy = Mock()
+                        if cleanup == "proxy-close":
+                            proxy.close.side_effect = RuntimeError("synthetic proxy close failure")
+                        stack.enter_context(patch.object(self.module, "_LoopbackProxySet", return_value=proxy))
+                        stack.enter_context(patch.object(self.module, "_wait_json"))
+                        stack.enter_context(patch.object(self.module, "post_archive", side_effect=original))
+                        stack.enter_context(patch.object(self.module, "_remove_runtime_root", side_effect=remove))
+                        stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                        with self.assertRaises(self.module.QaRestoreError) as raised:
+                            self.module.main()
+                    self.assertIs(raised.exception, original)
+                    self.assertIn("down", events)
+                    self.assertIn("readback", events)
+                    receipt = json.loads((args.evidence_dir / "sanitized-receipt.json").read_text())
+                    self.assertEqual(receipt["status"], "FAIL")
+                    self.assertEqual(receipt["backup_sha256"], self.module.sha256_file(backup))
+                    self.assertEqual(receipt["failed_phase"], "compose-start" if startup_fails else "backup-inspection")
+                    expected = "verified-stopped" if cleanup in {"absent", "down-failed-absent", "proxy-close"} else "unknown" if cleanup in {"unknown", "volume"} else "running"
+                    self.assertEqual(receipt["stack_state"], expected)
+                    self.assertIs(receipt["stack_running"], {"verified-stopped": False, "unknown": None, "running": True}[expected])
+                    self.assertEqual(runtime.exists(), cleanup not in {"absent", "proxy-close"})
+                    if runtime.exists():
+                        self.assertTrue((runtime / "docker-compose.yml").is_file())
+                    else:
+                        self.assertLess(events.index("readback"), events.index("remove"))
+
+    def test_main_success_is_finalized_after_cleanup_or_running_readback(self) -> None:
+        import shutil
+        from types import SimpleNamespace
+
+        for mode in ("stopped", "keep-running", "down-failed", "readback-unknown"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                backup, key = root / "backup", root / "key"
+                for path in (backup, key):
+                    path.write_text("synthetic")
+                    path.chmod(0o600)
+                args = SimpleNamespace(
+                    approval=self.module.APPROVAL, live_read_only=False, skip_browser_and_performance=False,
+                    target_handle="run-" + "a" * 32, source_commit="b" * 40, image="sha256:" + "c" * 64,
+                    backup=backup, passphrase_file=key, app_port=28080, history_port=28081, admin_port=28082,
+                    scratch_root=root, runtime_root=root / "runtime", evidence_dir=root / "evidence",
+                    minimum_available_memory_mib=1, minimum_free_disk_gib=1, segmented_history=False,
+                    keep_running=mode == "keep-running",
+                )
+                inspection = {"schema_version": 1, "app_version": "synthetic", "encrypted": True,
+                              "encryption_mode": "encrypted", "inspection_receipt": "synthetic-receipt",
+                              "packaging": "7z", "selected_groups": [], "present_groups": [], "absent_groups": [],
+                              "member_count": 0, "total_uncompressed_bytes": 0, "aggregate_counts": {}}
+                events = []
+                def run(command, **kwargs):
+                    if "down" in command:
+                        events.append("down")
+                        if mode == "down-failed":
+                            raise RuntimeError("synthetic down failed")
+                def transport(command, **kwargs):
+                    events.append("readback")
+                    return Mock(returncode=1 if mode == "readback-unknown" else 0,
+                                stdout="truenas-jbod-ui running" if "container" in command and mode in {"keep-running", "down-failed"} else "")
+                write = self.module.write_private_json
+                def receipt_writer(path, receipt):
+                    events.append("receipt")
+                    write(path, receipt)
+                with contextlib.ExitStack() as stack:
+                    for name in ("_validate_exact_source", "_validate_exact_image", "_validate_runtime_preflight",
+                                 "_validate_container_names_available", "_capture_compose_logs", "_wait_json",
+                                 "_wait_history_idle", "reconcile_counts", "post_archive"):
+                        stack.enter_context(patch.object(self.module, name))
+                    stack.enter_context(patch.object(self.module, "parse_args", return_value=args))
+                    stack.enter_context(patch.object(self.module, "_run", side_effect=run))
+                    stack.enter_context(patch.object(self.module.subprocess, "run", side_effect=transport))
+                    stack.enter_context(patch.object(self.module, "_resolve_service_access", return_value=SimpleNamespace(proxy_required=False)))
+                    stack.enter_context(patch.object(self.module, "_LoopbackProxySet", return_value=Mock()))
+                    stack.enter_context(patch.object(self.module, "validate_inspection_payload", return_value=inspection))
+                    stack.enter_context(patch.object(self.module, "_safe_import_summary", return_value={}))
+                    stack.enter_context(patch.object(self.module, "_observed_counts", return_value=({}, "synthetic-system")))
+                    stack.enter_context(patch.object(self.module, "_exercise_pencil_writes", return_value={"sas_fabric_label": True}))
+                    stack.enter_context(patch.object(self.module, "_run_browser_and_perf", return_value={"offline_browser": True}))
+                    stack.enter_context(patch.object(self.module, "_remove_runtime_root", side_effect=shutil.rmtree))
+                    stack.enter_context(patch.object(self.module, "write_private_json", side_effect=receipt_writer))
+                    output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    if mode in {"down-failed", "readback-unknown"}:
+                        with self.assertRaises(RuntimeError):
+                            self.module.main()
+                        self.assertNotIn("private_qa_restore=PASS", output.getvalue())
+                    else:
+                        self.assertEqual(self.module.main(), 0)
+                receipt = json.loads((args.evidence_dir / "sanitized-receipt.json").read_text())
+                self.assertEqual(receipt["status"], "PASS" if mode in {"stopped", "keep-running"} else "FAIL")
+                self.assertEqual(receipt["stack_state"], "verified-stopped" if mode == "stopped" else "unknown" if mode == "readback-unknown" else "running")
+                self.assertEqual(events[-1], "receipt")
+                self.assertLess(events.index("readback"), events.index("receipt"))
+                self.assertEqual("down" in events, mode != "keep-running")
+                self.assertEqual(args.runtime_root.exists(), mode != "stopped")
 
     def test_mandatory_gates_and_opaque_target_handle_fail_closed(self) -> None:
         self.assertEqual(
@@ -975,6 +1497,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             '"internal": True',
             "/api/admin/backup/inspect",
             "/api/admin/backup/import?stop_services=true&restart_services=true",
+            "X-Backup-Expected-Encryption",
+            "X-Backup-Inspection-Receipt",
             "/api/history/overview?exact_counts=true",
             "/api/sas-fabric/aliases",
             "/api/mappings",
@@ -1048,6 +1572,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             "ssh_keys",
             "tls_trust",
             "known_hosts",
+            "single-use inspection receipt",
+            "observed encryption mode",
             "Request correlation gap",
             "scripts/run_private_qa_restore.py",
         ):

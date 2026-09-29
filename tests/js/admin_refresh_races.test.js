@@ -98,7 +98,6 @@ async function flushPromises() {
 
 function baseRefreshState() {
   return {
-    refreshInFlight: false,
     refreshPromise: null,
     refreshQueued: null,
     refreshQueuedQuiet: true,
@@ -169,21 +168,20 @@ test("refreshState coalesces overlapping calls into one queued follow-up instead
     secondSettled = true;
   });
 
-  requests[0].resolve({ systems: [{ id: "old" }] });
+  requests[0].resolve({ profiles: [], systems: [{ id: "old" }] });
   await first;
   await flushPromises();
   assert.equal(requests.length, 2, "queued follow-up starts after the first refresh settles");
   assert.equal(secondSettled, false, "queued callers wait for the follow-up, not the first refresh");
   assert.deepEqual(state.systems, [{ id: "old" }]);
 
-  requests[1].resolve({ systems: [{ id: "new" }] });
+  requests[1].resolve({ profiles: [], systems: [{ id: "new" }] });
   await second;
   await third;
   assert.equal(secondSettled, true);
   assert.deepEqual(state.systems, [{ id: "new" }], "post-save callers observe the newer state");
   assert.equal(state.refreshPromise, null);
   assert.equal(state.refreshQueued, null);
-  assert.equal(state.refreshInFlight, false);
   assert.ok(
     banners.some(([message, tone]) => tone === "success" && /refreshed/i.test(message)),
     "a non-quiet queued caller still gets the completion banner"
@@ -192,7 +190,7 @@ test("refreshState coalesces overlapping calls into one queued follow-up instead
   const fourth = refreshState({ quiet: true });
   await flushPromises();
   assert.equal(requests.length, 3, "after everything settles a new refresh starts immediately");
-  requests[2].resolve({ systems: [] });
+  requests[2].resolve({ profiles: [], systems: [] });
   await fourth;
 });
 
@@ -232,7 +230,7 @@ test("refreshState follow-up still runs when the in-flight refresh fails", async
   await first;
   await flushPromises();
   assert.equal(requests.length, 2, "a failed first refresh must not strand the queued follow-up");
-  requests[1].resolve({ systems: [{ id: "recovered" }] });
+  requests[1].resolve({ profiles: [], systems: [{ id: "recovered" }] });
   await queued;
   assert.deepEqual(state.systems, [{ id: "recovered" }]);
 });
@@ -337,7 +335,7 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
     storageViewCandidatesSystemId: null,
     storageViewCandidates: [],
   };
-  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates"], {
+  const { fetchStorageViewCandidates } = loadFunctions(["fetchStorageViewCandidates", "currentStorageViewCandidateScope"], {
     state,
     currentStorageViewSystemId() {
       return systemId;
@@ -345,7 +343,7 @@ test("fetchStorageViewCandidates ignores a slow response for a system the operat
     currentStorageViewTargetSystemId() {
       return "";
     },
-    renderStorageViewCandidates() {},
+    scheduleStorageViewRender() {},
     setBanner(message, tone) {
       banners.push([message, tone]);
     },
@@ -388,7 +386,7 @@ test("clearing the selected system invalidates in-flight live-enclosure and cand
     storageViewCandidates: [],
   };
   const { fetchLiveEnclosures, fetchStorageViewCandidates, resetLiveEnclosureState, resetStorageViewCandidateState } = loadFunctions(
-    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates"],
+    ["resetLiveEnclosureState", "resetStorageViewCandidateState", "fetchLiveEnclosures", "fetchStorageViewCandidates", "currentStorageViewCandidateScope"],
     {
       state,
       currentStorageViewSystemId() {
@@ -398,7 +396,7 @@ test("clearing the selected system invalidates in-flight live-enclosure and cand
         return "";
       },
       renderStorageViews() {},
-      renderStorageViewCandidates() {},
+      scheduleStorageViewRender() {},
       setBanner(message, tone) {
         banners.push([message, tone]);
       },
@@ -438,7 +436,7 @@ test("backup export, debug export, and import errors are described instead of st
   const described = describeApiError(validationDetail);
   assert.equal(
     described,
-    "body.included_paths.0: value is not a valid path; body.packaging: unexpected value"
+    "Included items > item 1: value is not a valid path; File format: unexpected value"
   );
   assert.doesNotMatch(described, /\[object Object\]/);
 
@@ -447,13 +445,17 @@ test("backup export, debug export, and import errors are described instead of st
     /throw new Error\(payload\?\.detail \|\|/,
     "every raw payload?.detail throw must route through describeApiError"
   );
-  for (const name of ["exportBackup", "exportDebugBundle", "importBackup"]) {
-    assert.match(functionSource(name), /describeApiError\(payload\?\.detail\)/, `${name} must describe API errors`);
+  for (const name of ["runExportBackup", "runExportDebugBundle"]) {
+    assert.match(functionSource(name), /describeApiError\((?:payload|download)\?\.detail\)/, `${name} must describe API errors`);
   }
+  assert.match(functionSource("runImportBackup"), /fetchBackupRestore\(/);
+  assert.match(functionSource("fetchBackupRestore"), /fetchJson\(/);
+  assert.match(functionSource("fetchJson"), /describeRequestFailure\(payload, response\)/);
+  assert.match(functionSource("describeRequestFailure"), /describeApiError\(payload\?\.detail\)/);
 });
 
 test("backup import reports source-absent groups whose live data was preserved", () => {
-  const source = functionSource("importBackup");
+  const source = functionSource("runImportBackup");
 
   assert.match(source, /payload\.preserved_absent_groups/);
   assert.match(source, /Preserved live data/);
@@ -463,4 +465,107 @@ test("backup import reports source-absent groups whose live data was preserved",
 test("backup encryption remains enabled after JavaScript startup state sync", () => {
   assert.match(SOURCE, /backupManualEncrypt:\s*true/);
   assert.match(functionSource("syncSingleBundleControls"), /encryptToggle\.checked = encryptEnabled/);
+});
+
+test("loadOrphanedHistory shares one scan between overlapping callers", async () => {
+  const requests = [];
+  const state = { orphanedHistory: [], orphanedHistoryPromise: null, orphanedHistoryQueued: null };
+  const elements = { historyAdoptResult: { textContent: "" } };
+  const { loadOrphanedHistory } = loadFunctions(
+    ["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"],
+    {
+      state,
+      elements,
+      setBanner() {},
+      renderHistoryMaintenance() {},
+      fetchJson() {
+        const request = deferred();
+        requests.push(request);
+        return request.promise;
+      },
+      Array,
+      Boolean,
+    }
+  );
+
+  const first = loadOrphanedHistory({ quiet: true });
+  const second = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  assert.equal(first, second, "an overlapping caller joins the scan in flight");
+  assert.equal(requests.length, 1);
+  assert.match(elements.historyAdoptResult.textContent, /Scanning/, "the section says it is scanning even when quiet");
+
+  requests[0].resolve({ orphaned_systems: [{ system_id: "old" }] });
+  await first;
+  assert.deepEqual(state.orphanedHistory, [{ system_id: "old" }]);
+  assert.equal(state.orphanedHistoryPromise, null);
+
+  const next = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  assert.equal(requests.length, 2, "a finished scan is not reused");
+  requests[1].resolve({ orphaned_systems: [] });
+  await next;
+});
+
+test("loadOrphanedHistory after a change queues one fresh scan instead of joining an older one", async () => {
+  const requests = [];
+  const state = { orphanedHistory: [], orphanedHistoryPromise: null, orphanedHistoryQueued: null };
+  const { loadOrphanedHistory } = loadFunctions(
+    ["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"],
+    {
+      state,
+      elements: {},
+      setBanner() {},
+      renderHistoryMaintenance() {},
+      fetchJson() {
+        const request = deferred();
+        requests.push(request);
+        return request.promise;
+      },
+      Array,
+      Boolean,
+    }
+  );
+
+  const stale = loadOrphanedHistory({ quiet: true });
+  await flushPromises();
+  const freshA = loadOrphanedHistory({ quiet: true, fresh: true });
+  const freshB = loadOrphanedHistory({ quiet: true, fresh: true });
+  assert.notEqual(freshA, stale);
+  assert.equal(freshA, freshB, "fresh callers share the single queued follow-up");
+  assert.equal(requests.length, 1, "the follow-up waits for the older scan");
+
+  requests[0].resolve({ orphaned_systems: [{ system_id: "before-change" }] });
+  await stale;
+  await flushPromises();
+  assert.equal(requests.length, 2, "the fresh scan starts once the older one settles");
+  requests[1].resolve({ orphaned_systems: [] });
+  await freshA;
+  assert.deepEqual(state.orphanedHistory, [], "the caller sees history from after its change");
+});
+
+test("runRefreshState reports Refreshed. without waiting for the history scan", async () => {
+  const banners = [];
+  const scan = deferred();
+  const state = baseRefreshState();
+  const { runRefreshState } = loadFunctions(["runRefreshState"], {
+    state,
+    elements: {},
+    setBanner(message, tone) {
+      banners.push([message, tone]);
+    },
+    fetchJson: async () => ({ systems: [], profiles: [] }),
+    currentStagedEsxiHostPrepPackages: () => [],
+    renderAll() {},
+    loadOrphanedHistory() {
+      return scan.promise;
+    },
+    fetchLiveEnclosures: () => Promise.resolve(),
+    fetchStorageViewCandidates: () => Promise.resolve(),
+    Array,
+    Boolean,
+  });
+  await runRefreshState({ quiet: false });
+  assert.ok(banners.some(([message]) => message === "Refreshed."), "the banner does not wait on a slow scan");
+  scan.resolve();
 });

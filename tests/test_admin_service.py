@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import inspect
 import json
+import re
 import secrets
 import shlex
 import stat
@@ -15,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi import Request
@@ -25,6 +28,7 @@ from app import __version__
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
 from admin_service.config import AdminSettings
+from admin_service.services.backup_receipts import BackupInspectionReceiptStore
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
 from admin_service.services.esxi_host_prep import (
     ESXiHostPrepService,
@@ -33,16 +37,17 @@ from admin_service.services.esxi_host_prep import (
 )
 from admin_service.services.runtime_control import DockerRuntimeService
 from admin_service.main import app as admin_app
-from admin_service.main import annotate_runtime_versions
-from admin_service.main import build_admin_state_payload
+from admin_service.route_support import annotate_runtime_versions
+from admin_service.route_support import build_admin_state_payload
 from admin_service.main import create_app
-from admin_service.main import decode_optional_secret_header
-from admin_service.main import enrich_quantastor_nodes_from_ssh
+from admin_service.route_support import decode_optional_secret_header
+from admin_service.route_support import enrich_quantastor_nodes_from_ssh
 from admin_service.main import get_esxi_host_prep_service
-from admin_service.main import get_history_store
-from admin_service.main import observe_backup_route
-from admin_service.main import stream_limited_request_body_to_file
-from admin_service.main import templates as admin_templates
+from admin_service.route_support import get_history_store
+from admin_service.route_support import observe_backup_route
+from admin_service.route_support import resolve_public_origin
+from admin_service.route_support import stream_limited_request_body_to_file
+from admin_service.route_support import templates as admin_templates
 from app.config import (
     AdminSurfaceConfig,
     BMCConfig,
@@ -54,13 +59,17 @@ from app.config import (
     TrueNASConfig,
 )
 from app.main import app as main_app
-from app.main import resolve_admin_launch_url
-from app.main import snapshot_state_busy_exception_handler
-from app.main import _clear_snapshot_export_source_cache_for_tests
+from app.route_support import ADMIN_PROBE_CACHE
+from app.route_support import AdminLaunchState
+from app.route_support import resolve_admin_launch_url
+from app.main import EXCEPTION_RESPONSES, mapped_exception_handler
+from app.route_support import SNAPSHOT_EXPORT_SOURCE_CACHE
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.models.domain import EnclosureOption
 from app.models.domain import EnclosureProfileRequest
 from app.models.domain import HistoryAdoptRequest
+from app.models.domain import InventorySnapshot
+from app.models.domain import SourceStatus
 from app.models.domain import QuantastorNodeDiscoveryRequest
 from app.models.domain import SnapshotExportRequest
 from app.models.domain import SystemSetupBootstrapRequest
@@ -139,13 +148,797 @@ def make_streaming_request(
     return request, receive_probe
 
 
+class AdminLifecycleOwnershipTests(unittest.TestCase):
+    """Real public handlers and maintenance, with bounded, socket-free workers."""
+
+    @staticmethod
+    def _endpoint(path):
+        return next(route.endpoint for route in admin_app.routes if route.path == path)
+
+    async def _turn(self):
+        turn = asyncio.Event()
+        asyncio.get_running_loop().call_soon(turn.set)
+        await turn.wait()
+
+    def _fixture(self, directory):
+        from admin_service.services.maintenance import AdminMaintenanceService
+        from tests.test_admin_maintenance import FakeRuntimeService
+
+        case = self
+
+        class Runtime(FakeRuntimeService):
+            def __init__(self):
+                super().__init__(["ui", "history"])
+                self.samples = []
+                self.managed_containers = {"ui": {}, "history": {}}
+                self.hook = lambda phase, key: None
+
+            def running_container_keys(self, keys=None):
+                self.hook("sample", None)
+                result = super().running_container_keys(keys)
+                self.samples.append(list(result))
+                return result
+
+            def start_container(self, key):
+                self.hook("start", key)
+                if key not in self.running or key in self.start_failures:
+                    super().start_container(key)
+
+            def stop_container(self, key):
+                self.hook("stop", key)
+                if key in self.running or key in self.stop_failures:
+                    super().stop_container(key)
+
+            def restart_container(self, key):
+                self.hook("restart", key)
+                self.calls.append(("restart", key))
+                if key not in self.running:
+                    self.running.append(key)
+
+            def clear_restart_required(self, keys):
+                pass
+
+            def mark_restart_required(self, keys):
+                pass
+
+        runtime = Runtime()
+
+        class Backup:
+            def __init__(self):
+                self.operations = []
+                self.hook = lambda kind: None
+                self.artifacts = []
+
+            def inspect_bundle_file(self, path, **kwargs):
+                case.assertEqual(path.read_bytes(), b"synthetic lifecycle archive")
+                callback = kwargs.get("identity_callback")
+                if callback:
+                    callback(hashlib.sha256(path.read_bytes()).hexdigest(), "plaintext")
+                return {"ok": True, "encrypted": False}
+
+            preflight_import_bundle_file = inspect_bundle_file
+
+            def _operation(self, kind):
+                self.operations.append((kind, list(runtime.running)))
+                self.hook(kind)
+                case.assertEqual(runtime.running, [], "runtime started during owned operation")
+
+            def export_bundle_to_file(self, **kwargs):
+                self._operation("export")
+                workspace = Path(tempfile.mkdtemp(dir=directory))
+                path = workspace / "bundle.archive"
+                path.write_bytes(b"synthetic lifecycle archive")
+                artifact = FileBackupArtifact(
+                    filename="bundle.archive", path=path, manifest={},
+                    media_type="application/octet-stream", cleanup_root=workspace,
+                )
+                self.artifacts.append(artifact)
+                return artifact
+
+            def export_debug_bundle_to_file(self, **kwargs):
+                return self.export_bundle_to_file(**kwargs)
+
+            def import_bundle_from_file(self, path, **kwargs):
+                self._operation("import")
+                return {"ok": True}
+
+        backup = Backup()
+        service = AdminMaintenanceService(backup, runtime, clean_backup_targets=("ui", "history"))
+        receipts = BackupInspectionReceiptStore(signing_key=b"s" * 32)
+        return runtime, backup, service, receipts
+
+    def _patches(self, runtime, backup, service, receipts):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        for name, value in (
+            ("get_runtime_service", runtime), ("get_backup_service", backup),
+            ("get_maintenance_service", service), ("get_backup_receipt_store", receipts),
+            ("reload_app_settings", Settings()),
+        ):
+            stack.enter_context(patch(f"admin_service.routes.{name}", return_value=value))
+        stack.enter_context(patch("admin_service.routes.record_config_change"))
+        stack.enter_context(patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})))
+        return stack
+
+    async def _maintenance(self, kind, receipts, *, stop=True):
+        if kind in ("export", "debug"):
+            from app.models.domain import DebugBundleExportRequest
+            payload = (DebugBundleExportRequest() if kind == "debug" else
+                       SystemBackupExportRequest(encrypt=True, passphrase="synthetic-passphrase"))
+            path = "/api/admin/debug/export" if kind == "debug" else "/api/admin/backup/export"
+            return await self._endpoint(path)(payload, stop_services=stop, restart_services=True)
+        request, _ = make_streaming_request([b"synthetic lifecycle archive"])
+        issued = receipts.issue_digest(
+            hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+            observed_encryption_mode="plaintext",
+        )
+        request.scope["headers"].extend([
+            (b"x-backup-expected-encryption", b"plaintext"),
+            (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+        ])
+        return await self._endpoint("/api/admin/backup/import")(
+            request, stop_services=stop, restart_services=True,
+        )
+
+    async def _busy(self, operation):
+        with self.assertRaises(HTTPException) as raised:
+            await asyncio.wait_for(operation, 2)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("busy", raised.exception.detail.lower())
+
+    def test_public_maintenance_rejects_overlap_then_resamples_its_own_interval(self):
+        async def exercise(first, second, contender_stop):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5), "owner release timed out")
+                backup.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance(first, receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        samples = list(runtime.samples)
+                        await self._busy(self._maintenance(second, receipts, stop=contender_stop))
+                        self.assertEqual(runtime.samples, samples, "busy contender sampled runtime")
+                        self.assertEqual(len(backup.operations), 1)
+                        self.assertEqual(runtime.running, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                    self.assertEqual(runtime.running, ["ui", "history"])
+                    backup.hook = lambda kind: None
+                    before = len(runtime.calls)
+                    response = await self._maintenance(second, receipts)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(runtime.calls[before:], [
+                        ("stop", "ui"), ("stop", "history"), ("start", "ui"), ("start", "history"),
+                    ])
+                    self.assertEqual(backup.operations[-1][1], [])
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for first, second in (("export", "export"), ("export", "import"), ("import", "export"),
+                              ("import", "import"), ("debug", "export"), ("export", "debug")):
+            for stop in (True, False):
+                with self.subTest(first=first, second=second, contender_stop=stop):
+                    asyncio.run(exercise(first, second, stop))
+
+    def test_public_maintenance_reserves_before_initial_state_sampling(self):
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == "sample" and not entered.is_set():
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        await self._busy(self._maintenance("export", receipts))
+                        self.assertEqual(runtime.calls, [])
+                        self.assertEqual(backup.operations, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        asyncio.run(exercise())
+
+    def test_public_direct_controls_cannot_start_a_maintenance_owned_runtime(self):
+        async def exercise(action, key):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                backup.hook = hold
+                control = self._endpoint(f"/api/admin/runtime/containers/{{container_key}}/{action}")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        calls = list(runtime.calls)
+                        await self._busy(control(key))
+                        self.assertEqual(runtime.calls, calls)
+                        self.assertEqual(runtime.running, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+                    self.assertEqual((await control(key)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for action in ("start", "restart", "stop"):
+            for key in ("ui", "history"):
+                with self.subTest(action=action, key=key):
+                    asyncio.run(exercise(action, key))
+
+    def test_cancelled_direct_control_retains_runtime_until_worker_settles(self):
+        async def exercise(action):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == action:
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                control = self._endpoint(f"/api/admin/runtime/containers/{{container_key}}/{action}")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(control("ui"))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done(), "direct worker abandoned on cancellation")
+                            await self._busy(self._maintenance("export", receipts))
+                        self.assertEqual(backup.operations, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertTrue(owner.cancelled())
+                    runtime.hook = lambda phase, key: None
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for action in ("start", "restart"):
+            with self.subTest(action=action):
+                asyncio.run(exercise(action))
+
+    def test_cancelled_maintenance_retains_runtime_until_operation_and_restore_finish(self):
+        async def exercise(kind):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(kind):
+                    if entered.is_set():
+                        return
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                backup.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance(kind, receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done())
+                            await self._busy(self._maintenance("export", receipts))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertTrue(owner.cancelled())
+                    self.assertEqual(runtime.running, ["ui", "history"])
+                    backup.hook = lambda kind: None
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for kind in ("export", "import"):
+            with self.subTest(kind=kind):
+                asyncio.run(exercise(kind))
+
+    def test_failed_stop_or_operation_keeps_gate_through_failed_restoration(self):
+        from admin_service.services.runtime_control import DockerRuntimeError
+        async def exercise(failure):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                if failure == "stop":
+                    runtime.stop_failures["history"] = "synthetic stop failure"
+                if failure == "operation":
+                    def fail(kind):
+                        raise DockerRuntimeError("synthetic operation failure")
+                    backup.hook = fail
+                runtime.start_failures["ui"] = "synthetic restart failure"
+                def hold(phase, key):
+                    if phase == "start" and key == "ui" and not entered.is_set():
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(self._maintenance("export", receipts))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        await self._busy(self._maintenance("import", receipts))
+                        await self._busy(self._endpoint(
+                            "/api/admin/runtime/containers/{container_key}/start")("ui"))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    if failure in ("stop", "operation"):
+                        error = owner.exception()
+                        self.assertIsInstance(error, HTTPException)
+                        self.assertEqual(error.status_code, 400)
+                        self.assertIn("synthetic restart failure", error.detail)
+                    else:
+                        self.assertEqual(owner.result().headers["X-Admin-Restart-Failures"], "ui")
+                    self.assertEqual(runtime.running, ["history"])
+                    if failure == "stop":
+                        self.assertEqual(backup.operations, [])
+                    runtime.hook = lambda phase, key: None
+                    runtime.stop_failures.clear()
+                    runtime.start_failures.clear()
+                    backup.hook = lambda kind: None
+                    await self._endpoint("/api/admin/runtime/containers/{container_key}/start")("ui")
+                    self.assertEqual((await self._maintenance("export", receipts)).status_code, 200)
+                for artifact in backup.artifacts:
+                    artifact.cleanup()
+        for failure in ("stop", "operation", "restore"):
+            with self.subTest(failure=failure):
+                asyncio.run(exercise(failure))
+
+    def test_disjoint_direct_control_is_available_while_another_target_is_owned(self):
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release = threading.Event(), threading.Event()
+                def hold(phase, key):
+                    if phase == "restart" and key == "ui":
+                        entered.set()
+                        self.assertTrue(release.wait(5))
+                runtime.hook = hold
+                control = self._endpoint("/api/admin/runtime/containers/{container_key}/restart")
+                with self._patches(runtime, backup, service, receipts):
+                    owner = asyncio.create_task(control("ui"))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertEqual((await asyncio.wait_for(control("history"), 2)).status_code, 200)
+                        await self._busy(self._endpoint(
+                            "/api/admin/runtime/containers/{container_key}/start")("ui"))
+                        await self._busy(self._maintenance("import", receipts))
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                    self.assertIsNone(owner.exception())
+        asyncio.run(exercise())
+
+    def test_catalog_inspect_import_preserves_receipts_and_acquisition_error_cleanup(self):
+        from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                handles, workspaces = [], []
+                outcome = "ok"
+                def download(artifact_id, handle):
+                    handles.append(handle)
+                    # The production handle is fd-backed; the acquisition prefix
+                    # is private and this test redirects only that workspace.
+                    handle.write(b"synthetic lifecycle archive")
+                    if outcome == "unavailable":
+                        raise SchedulerUnavailableError("synthetic acquisition failure")
+                    return SimpleNamespace(status=404 if outcome == "missing" else 200, payload={})
+                original_mkdtemp = tempfile.mkdtemp
+                def make_workspace(*args, **kwargs):
+                    if kwargs.get("prefix") == "truenas-jbod-ui-admin-catalog-":
+                        path = original_mkdtemp(dir=directory, prefix="catalog-")
+                        workspaces.append(Path(path))
+                        return path
+                    return original_mkdtemp(*args, **kwargs)
+                with self._patches(runtime, backup, service, receipts), patch(
+                    "admin_service.routes.get_backup_scheduler_client",
+                    return_value=SimpleNamespace(download_to=download),
+                ), patch("admin_service.routes.tempfile.mkdtemp", side_effect=make_workspace):
+                    inspect_route = self._endpoint("/api/admin/backups/{artifact_id}/restore/inspect")
+                    import_route = self._endpoint("/api/admin/backups/{artifact_id}/restore/import")
+                    response = await inspect_route("a" * 32, make_request())
+                    inspection = json.loads(response.body)
+                    self.assertEqual(inspection["encryption_mode"], "plaintext")
+                    request, _ = make_streaming_request([])
+                    request.scope["headers"].extend([
+                        (b"x-backup-expected-encryption", b"plaintext"),
+                        (b"x-backup-inspection-receipt", inspection["inspection_receipt"].encode()),
+                    ])
+                    response = await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                    self.assertEqual(json.loads(response.body)["restarted_containers"], ["ui", "history"])
+                    with self.assertRaises(HTTPException) as rejected:
+                        await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                    self.assertEqual(rejected.exception.status_code, 400)
+                    self.assertEqual(len(handles), 2, "receipt replay reached catalog acquisition")
+                    for outcome, status in (("missing", 404), ("unavailable", 503)):
+                        for kind in ("inspect", "import"):
+                            request, _ = make_streaming_request([])
+                            issued = receipts.issue_digest(
+                                hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+                                observed_encryption_mode="plaintext",
+                            )
+                            request.scope["headers"].extend([
+                                (b"x-backup-expected-encryption", b"plaintext"),
+                                (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+                            ])
+                            with self.assertRaises(HTTPException) as rejected:
+                                if kind == "inspect":
+                                    await inspect_route("a" * 32, request)
+                                else:
+                                    await import_route("a" * 32, request, stop_services=True, restart_services=True)
+                            self.assertEqual(rejected.exception.status_code, status)
+                            admission = receipts.begin_admission(issued["receipt"], expected_encryption_mode="plaintext")
+                            receipts.release_admission(admission)
+                            self.assertTrue(all(handle.closed for handle in handles))
+                            self.assertTrue(all(not path.exists() for path in workspaces))
+                    self.assertEqual(backup.operations, [("import", [])])
+        asyncio.run(exercise())
+
+    def test_catalog_restore_cancellation_drains_acquisition_before_cleanup(self):
+        import os
+        from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+
+        async def exercise(kind, phase, late_error):
+            with tempfile.TemporaryDirectory() as directory:
+                runtime, backup, service, receipts = self._fixture(directory)
+                entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+                paths, handles, errors = [], [], []
+                original_open = os.open
+                original_mkdtemp = tempfile.mkdtemp
+                workspace = Path(directory) / "catalog"
+                def make_workspace(*args, **kwargs):
+                    if kwargs.get("prefix") == "truenas-jbod-ui-admin-catalog-":
+                        workspace.mkdir(mode=0o700)
+                        return str(workspace)
+                    return original_mkdtemp(*args, **kwargs)
+                def open_archive(path, flags, *args, **kwargs):
+                    if Path(path) == workspace / "bundle.archive":
+                        paths.append(Path(path))
+                        if phase == "before-open":
+                            entered.set()
+                            if not release.wait(5):
+                                raise AssertionError("catalog open release timed out")
+                    return original_open(path, flags, *args, **kwargs)
+                def download(artifact_id, handle):
+                    handles.append(handle)
+                    try:
+                        if phase == "download":
+                            entered.set()
+                            self.assertTrue(release.wait(5))
+                        self.assertEqual(os.fstat(handle.fileno()).st_nlink, 1)
+                        handle.write(b"synthetic lifecycle archive")
+                        if late_error:
+                            raise SchedulerUnavailableError("synthetic late failure")
+                        return SimpleNamespace(status=200, payload={})
+                    finally:
+                        finished.set()
+                scheduler = SimpleNamespace(download_to=download)
+                request, _ = make_streaming_request([])
+                issued = receipts.issue_digest(
+                    hashlib.sha256(b"synthetic lifecycle archive").hexdigest(),
+                    observed_encryption_mode="plaintext",
+                )
+                request.scope["headers"].extend([
+                    (b"x-backup-expected-encryption", b"plaintext"),
+                    (b"x-backup-inspection-receipt", issued["receipt"].encode()),
+                ])
+                loop = asyncio.get_running_loop()
+                old_handler = loop.get_exception_handler()
+                loop.set_exception_handler(lambda loop, context: errors.append(context))
+                tasks_before = asyncio.all_tasks()
+                with self._patches(runtime, backup, service, receipts), patch(
+                    "admin_service.routes.get_backup_scheduler_client", return_value=scheduler,
+                ), patch("admin_service.routes.tempfile.mkdtemp", side_effect=make_workspace), patch(
+                    "admin_service.routes.os.open", side_effect=open_archive,
+                ):
+                    endpoint = self._endpoint(f"/api/admin/backups/{{artifact_id}}/restore/{kind}")
+                    kwargs = {"stop_services": True, "restart_services": True} if kind == "import" else {}
+                    owner = asyncio.create_task(endpoint("a" * 32, request, **kwargs))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        for _ in range(2):
+                            owner.cancel()
+                            await self._turn()
+                            self.assertFalse(owner.done(), "catalog request returned before acquisition settled")
+                            self.assertTrue(workspace.exists())
+                            self.assertFalse(finished.is_set())
+                            if phase == "download":
+                                self.assertFalse(handles[0].closed)
+                                self.assertEqual(os.fstat(handles[0].fileno()).st_nlink, 1)
+                    finally:
+                        release.set()
+                        await asyncio.gather(owner, return_exceptions=True)
+                        at_return = (finished.is_set(), bool(handles) and handles[0].closed,
+                                     workspace.exists(), asyncio.all_tasks() - tasks_before)
+                        # Teardown also drains broken-baseline workers; acceptance
+                        # uses the snapshot at request return, never this later wait.
+                        await asyncio.to_thread(finished.wait, 2)
+                    self.assertTrue(owner.cancelled())
+                    self.assertEqual(at_return, (True, True, False, set()))
+                    admission = receipts.begin_admission(issued["receipt"], expected_encryption_mode="plaintext")
+                    receipts.release_admission(admission)
+                    self.assertEqual(backup.operations, [])
+                    self.assertEqual(runtime.calls, [])
+                    await self._turn()
+                    self.assertEqual(asyncio.all_tasks() - tasks_before, set())
+                    loop.set_exception_handler(old_handler)
+                    self.assertEqual(errors, [])
+        for kind in ("inspect", "import"):
+            for phase in ("before-open", "download"):
+                for late_error in (False, True):
+                    with self.subTest(kind=kind, phase=phase, late_error=late_error):
+                        asyncio.run(exercise(kind, phase, late_error))
+
+
+class BackupInspectionReceiptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.archive = Path(self.temp_dir.name) / "backup.archive"
+        self.archive.write_bytes(b"synthetic archive bytes")
+        self.store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: bytes.fromhex("12" * 16),
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def _forge_receipt(receipt: str, **replacements: object) -> str:
+        encoded_payload, encoded_signature = receipt.split(".", 1)
+        padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        payload.update(replacements)
+        forged_payload = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).rstrip(b"=").decode("ascii")
+        return f"{forged_payload}.{encoded_signature}"
+
+    def test_receipt_binds_server_digest_mode_times_and_nonce(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        encoded_payload = issued["receipt"].split(".", 1)[0]
+        padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+
+        self.assertEqual(payload["archive_sha256"], hashlib.sha256(self.archive.read_bytes()).hexdigest())
+        self.assertEqual(payload["encryption_mode"], "encrypted")
+        self.assertEqual(payload["issued_at"], 100)
+        self.assertEqual(payload["expires_at"], 130)
+        self.assertEqual(payload["nonce"], "12" * 16)
+
+    def test_forged_digest_or_mode_is_rejected_without_consuming_receipt(self) -> None:
+        for replacement in (
+            {"archive_sha256": "0" * 64},
+            {"encryption_mode": "plaintext"},
+        ):
+            with self.subTest(replacement=replacement):
+                store = BackupInspectionReceiptStore(
+                    signing_key=b"k" * 32,
+                    ttl_seconds=30,
+                    nonce_factory=lambda: bytes.fromhex("34" * 16),
+                )
+                issued = store.issue(
+                    self.archive,
+                    observed_encryption_mode="encrypted",
+                    now=100,
+                )
+                forged = self._forge_receipt(issued["receipt"], **replacement)
+                with self.assertRaisesRegex(ValueError, "invalid"):
+                    store.consume(
+                        forged,
+                        self.archive,
+                        expected_encryption_mode="encrypted",
+                        now=101,
+                    )
+                store.consume(
+                    issued["receipt"],
+                    self.archive,
+                    expected_encryption_mode="encrypted",
+                    now=101,
+                )
+
+    def test_archive_swap_after_inspection_is_rejected_without_consuming_receipt(self) -> None:
+        original = self.archive.read_bytes()
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        self.archive.write_bytes(b"substituted archive bytes")
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="encrypted",
+                now=101,
+            )
+
+        self.archive.write_bytes(original)
+        self.store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="encrypted",
+            now=102,
+        )
+
+    def test_expired_receipt_is_rejected(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+
+        with self.assertRaisesRegex(ValueError, "expired"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=131,
+            )
+
+    def test_admitted_receipt_survives_later_pruning_and_remains_single_use(self) -> None:
+        nonces = iter((bytes.fromhex("34" * 16), bytes.fromhex("56" * 16)))
+        store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: next(nonces),
+        )
+        issued = store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        admission = store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+
+        store.issue_digest(
+            "0" * 64,
+            observed_encryption_mode="plaintext",
+            now=131,
+        )
+        store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="plaintext",
+            admission=admission,
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already used"):
+            store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=120,
+            )
+
+    def test_receipt_cannot_back_two_concurrent_admissions(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        admission = self.store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="encrypted",
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already being imported"):
+            self.store.begin_admission(
+                issued["receipt"],
+                expected_encryption_mode="encrypted",
+                now=120,
+            )
+
+        self.store.release_admission(admission, now=120)
+        retry_admission = self.store.begin_admission(
+            issued["receipt"],
+            expected_encryption_mode="encrypted",
+            now=120,
+        )
+        self.store.release_admission(retry_admission, now=120)
+
+    def test_active_admission_count_is_bounded(self) -> None:
+        nonces = iter((bytes.fromhex("78" * 16), bytes.fromhex("9a" * 16)))
+        store = BackupInspectionReceiptStore(
+            signing_key=b"k" * 32,
+            ttl_seconds=30,
+            nonce_factory=lambda: next(nonces),
+            max_active_admissions=1,
+        )
+        first = store.issue(
+            self.archive,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        second = store.issue_digest(
+            "0" * 64,
+            observed_encryption_mode="plaintext",
+            now=100,
+        )
+        first_admission = store.begin_admission(
+            first["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "already in progress"):
+            store.begin_admission(
+                second["receipt"],
+                expected_encryption_mode="plaintext",
+                now=120,
+            )
+
+        store.release_admission(first_admission, now=120)
+        second_admission = store.begin_admission(
+            second["receipt"],
+            expected_encryption_mode="plaintext",
+            now=120,
+        )
+        store.release_admission(second_admission, now=120)
+
+    def test_receipt_is_consumed_once_at_successful_import_admission(self) -> None:
+        issued = self.store.issue(
+            self.archive,
+            observed_encryption_mode="encrypted",
+            now=100,
+        )
+        with self.assertRaisesRegex(ValueError, "encryption mode"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="plaintext",
+                now=101,
+            )
+        self.store.consume(
+            issued["receipt"],
+            self.archive,
+            expected_encryption_mode="encrypted",
+            now=102,
+        )
+        with self.assertRaisesRegex(ValueError, "already used"):
+            self.store.consume(
+                issued["receipt"],
+                self.archive,
+                expected_encryption_mode="encrypted",
+                now=103,
+            )
+
+
 class BackupImportRequestLimitTests(unittest.TestCase):
     def test_backup_observer_classifies_http_5xx_as_error(self) -> None:
         @observe_backup_route("inspect")
         async def unavailable() -> None:
             raise HTTPException(status_code=503, detail="synthetic unavailable")
 
-        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+        with patch("admin_service.route_support.observe_backup_operation") as observe_operation:
             with self.assertRaises(HTTPException):
                 asyncio.run(unavailable())
 
@@ -212,7 +1005,7 @@ class BackupImportRequestLimitTests(unittest.TestCase):
                 receive,
             )
 
-            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
+            with patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)):
                 with self.assertRaises(asyncio.CancelledError):
                     asyncio.run(stream_limited_request_body_to_file(request, max_bytes=4))
 
@@ -221,11 +1014,16 @@ class BackupImportRequestLimitTests(unittest.TestCase):
 
 class MainAppBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        _clear_snapshot_export_source_cache_for_tests()
+        SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+        ADMIN_PROBE_CACHE.clear()
+        self.addCleanup(ADMIN_PROBE_CACHE.clear)
 
     @staticmethod
     def _call_main_route(path: str) -> object:
         route = next(route for route in main_app.routes if route.path == path)
+        if path == "/healthz":
+            request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))
+            return asyncio.run(route.endpoint(request))
         return asyncio.run(route.endpoint())
 
     def test_admin_sidecar_exposes_one_time_bootstrap_route(self) -> None:
@@ -250,13 +1048,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         try:
             with (
                 patch(
-                    "admin_service.main.get_history_settings",
+                    "admin_service.route_support.get_history_settings",
                     return_value=SimpleNamespace(
                         sqlite_path="/tmp/admin-history.sqlite3",
                         segment_catalog_path="/tmp/admin-history-segments/catalog.json",
                     ),
                 ),
-                patch("admin_service.main.HistoryStore") as history_store,
+                patch("admin_service.route_support.HistoryStore") as history_store,
             ):
                 get_history_store()
 
@@ -280,9 +1078,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         service = object()
         try:
             with (
-                patch("admin_service.main.get_admin_settings", return_value=settings),
+                patch("admin_service.route_support.get_admin_settings", return_value=settings),
                 patch(
-                    "admin_service.main.ESXiHostPrepService",
+                    "admin_service.route_support.ESXiHostPrepService",
                     return_value=service,
                 ) as service_type,
             ):
@@ -406,7 +1204,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         service.export_bundle.return_value = (artifact, maintenance)
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
-        with patch("admin_service.main.get_maintenance_service", return_value=service):
+        with patch("admin_service.routes.get_maintenance_service", return_value=service):
             response = asyncio.run(
                 route.endpoint(
                     SystemBackupExportRequest(
@@ -442,7 +1240,13 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(workspace.exists())
 
     def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
-        request, _receive_probe = make_streaming_request([b"archive-", b"bytes"])
+        request, receive_probe = make_streaming_request([b"archive-", b"bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
         maintenance = SimpleNamespace(
             stopped_containers=[],
             restarted_containers=[],
@@ -455,6 +1259,9 @@ class MainAppBoundaryTests(unittest.TestCase):
             observed["path"] = path
             observed["content"] = path.read_bytes()
             observed["mode"] = stat.S_IMODE(path.stat().st_mode)
+            admission = kwargs.get("admission_callback")
+            assert callable(admission)
+            admission(hashlib.sha256(observed["content"]).hexdigest(), "plaintext")
             return (
                 {
                     "ok": True,
@@ -470,20 +1277,38 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
         runtime_service = MagicMock()
         runtime_service.managed_containers = {}
+        receipt_store = MagicMock()
+        receipt_store.begin_admission.return_value = "admission-token"
+        request_clock = SimpleNamespace(now=100)
+
+        def receive_after_admission() -> None:
+            receipt_store.begin_admission.assert_called_once_with(
+                "server-receipt",
+                expected_encryption_mode="plaintext",
+                now=100,
+            )
+            request_clock.now = 1000
+
+        receive_probe.side_effect = receive_after_admission
 
         with (
-            patch("admin_service.main.get_maintenance_service", return_value=service),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
             patch(
-                "admin_service.main.reload_app_settings",
+                "admin_service.routes.time.time",
+                side_effect=lambda: request_clock.now,
+            ),
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
+            patch(
+                "admin_service.routes.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
             ),
             patch(
-                "admin_service.main.get_runtime_service",
+                "admin_service.routes.get_runtime_service",
                 return_value=runtime_service,
             ),
-            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
-            patch("admin_service.main.serialize_systems", return_value=[]),
+            patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -501,11 +1326,86 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertFalse(archive_path.exists())
         self.assertFalse(archive_path.parent.exists())
         service.import_bundle_from_file.assert_called_once()
+        receipt_store.consume_digest.assert_called_once_with(
+            "server-receipt",
+            hashlib.sha256(b"archive-bytes").hexdigest(),
+            expected_encryption_mode="plaintext",
+            admission="admission-token",
+            now=100,
+        )
+        receipt_store.release_admission.assert_called_once_with("admission-token")
+        receipt_store.consume.assert_not_called()
         service.import_bundle.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "import")
         self.assertEqual(observed_metric["outcome"], "success")
         self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
+
+    def test_admin_backup_import_consumes_receipt_after_preflight_before_stop(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
+        events: list[str] = []
+        maintenance = SimpleNamespace(
+            stopped_containers=[],
+            restarted_containers=[],
+            restart_failures={},
+            final_running_containers=[],
+        )
+        service = MagicMock()
+
+        def import_from_file(path: Path, **kwargs: object) -> tuple[dict[str, object], object]:
+            events.append("preflight")
+            admission = kwargs.get("admission_callback")
+            if callable(admission):
+                admission(hashlib.sha256(Path(path).read_bytes()).hexdigest(), "plaintext")
+            events.append("stop")
+            return (
+                {
+                    "ok": True,
+                    "systems": [],
+                    "restored_paths": [],
+                    "preserved_absent_groups": [],
+                },
+                maintenance,
+            )
+
+        service.import_bundle_from_file.side_effect = import_from_file
+        receipt_store = MagicMock()
+        receipt_store.consume_digest.side_effect = lambda *_args, **_kwargs: events.append(
+            "consume"
+        )
+        receipt_store.consume.side_effect = lambda *_args, **_kwargs: events.append("consume")
+        runtime_service = MagicMock()
+        runtime_service.managed_containers = {}
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        with (
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation"),
+            patch(
+                "admin_service.routes.reload_app_settings",
+                return_value=SimpleNamespace(default_system_id=None),
+            ),
+            patch("admin_service.routes.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    request,
+                    stop_services=True,
+                    restart_services=False,
+                )
+            )
+
+        self.assertEqual(events, ["preflight", "consume", "stop"])
+        self.assertEqual(json.loads(response.body)["final_running_containers"], [])
 
     def test_admin_backup_inspection_streams_file_and_returns_only_sanitized_metadata(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
@@ -517,6 +1417,10 @@ class MainAppBoundaryTests(unittest.TestCase):
             "ok": True,
             "schema_version": 2,
             "app_version": "0.22.3",
+            "app_version_note": (
+                "This backup was made by v0.22.3; settings and history will be "
+                "brought up to date during restore."
+            ),
             "exported_at": "2030-01-02T03:04:05+00:00",
             "encrypted": True,
             "packaging": "7z",
@@ -530,36 +1434,121 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "history": {"event_count": 42},
             },
         }
+
+        def inspect_with_identity(path: Path, **kwargs: object) -> dict[str, object]:
+            callback = kwargs.get("identity_callback")
+            assert callable(callback)
+            callback(hashlib.sha256(path.read_bytes()).hexdigest(), "encrypted")
+            return service.inspect_bundle_file.return_value
+
+        service.inspect_bundle_file.side_effect = inspect_with_identity
+        receipt_store = MagicMock()
+        receipt_store.issue_digest.return_value = {
+            "receipt": "server-receipt",
+            "expires_at": 123456,
+        }
         route = next(
             route for route in admin_app.routes
             if route.path == "/api/admin/backup/inspect"
         )
 
         with (
-            patch("admin_service.main.get_backup_service", return_value=service),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
+            patch("admin_service.routes.get_backup_service", return_value=service),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
         ):
             response = asyncio.run(route.endpoint(request))
 
         payload = json.loads(response.body)
-        self.assertEqual(payload, service.inspect_bundle_file.return_value)
+        self.assertEqual(
+            payload,
+            {
+                **service.inspect_bundle_file.return_value,
+                "encryption_mode": "encrypted",
+                "inspection_receipt": "server-receipt",
+                "inspection_receipt_expires_at": 123456,
+            },
+        )
+        # The admin page needs the older-version note to show it while the operator confirms.
+        self.assertEqual(
+            payload["app_version_note"],
+            "This backup was made by v0.22.3; settings and history will be "
+            "brought up to date during restore.",
+        )
         inspected_path = service.inspect_bundle_file.call_args.args[0]
         self.assertFalse(inspected_path.exists())
         self.assertFalse(inspected_path.parent.exists())
         self.assertEqual(
             service.inspect_bundle_file.call_args.kwargs,
-            {"passphrase": "synthetic passphrase"},
+            {
+                "passphrase": "synthetic passphrase",
+                "identity_callback": ANY,
+            },
         )
+        receipt_store.issue_digest.assert_called_once_with(
+            hashlib.sha256(b"archive-bytes").hexdigest(),
+            observed_encryption_mode="encrypted",
+        )
+        receipt_store.issue.assert_not_called()
         observed_metric = observe_operation.call_args.kwargs
         self.assertEqual(observed_metric["operation"], "inspect")
         self.assertEqual(observed_metric["outcome"], "success")
         self.assertGreaterEqual(observed_metric["duration_seconds"], 0)
 
+    def test_admin_backup_inspection_cancellation_drains_worker_before_workspace_cleanup(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        observed_path: list[Path] = []
+        service = MagicMock()
+
+        def inspect_from_file(path: Path, **kwargs: object) -> dict[str, object]:
+            observed_path.append(path)
+            worker_started.set()
+            release_worker.wait(5)
+            self.assertTrue(path.exists())
+            callback = kwargs.get("identity_callback")
+            assert callable(callback)
+            callback(hashlib.sha256(path.read_bytes()).hexdigest(), "plaintext")
+            worker_finished.set()
+            return {"ok": True, "encrypted": False}
+
+        service.inspect_bundle_file.side_effect = inspect_from_file
+        receipt_store = MagicMock()
+        receipt_store.issue_digest.return_value = {"receipt": "receipt", "expires_at": 123}
+        route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/backup/inspect"
+        )
+
+        async def exercise() -> None:
+            with (
+                patch("admin_service.routes.get_backup_service", return_value=service),
+                patch("admin_service.routes.get_backup_receipt_store", return_value=receipt_store),
+            ):
+                task = asyncio.create_task(route.endpoint(request))
+                self.assertTrue(await asyncio.to_thread(worker_started.wait, 5))
+                for _ in range(2):
+                    task.cancel()
+                    turn = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(turn.set)
+                    await turn.wait()
+                    self.assertFalse(worker_finished.is_set())
+                    self.assertTrue(observed_path[0].exists())
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise())
+        self.assertTrue(worker_finished.is_set())
+        self.assertFalse(observed_path[0].exists())
+        self.assertFalse(observed_path[0].parent.exists())
+
     def test_admin_backup_import_rejection_records_only_bounded_outcome(self) -> None:
         request, _receive_probe = make_streaming_request([])
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
 
-        with patch("admin_service.main.observe_backup_operation") as observe_operation:
+        with patch("admin_service.route_support.observe_backup_operation") as observe_operation:
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(
                     route.endpoint(
@@ -590,8 +1579,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with (
-            patch("admin_service.main.get_backup_service", return_value=service),
-            patch("admin_service.main.observe_backup_operation") as observe_operation,
+            patch("admin_service.routes.get_backup_service", return_value=service),
+            patch("admin_service.route_support.observe_backup_operation") as observe_operation,
         ):
             with self.assertRaises(RuntimeError):
                 asyncio.run(route.endpoint(request))
@@ -609,6 +1598,12 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_admin_backup_import_without_stops_keeps_impacted_services_needing_restart(self) -> None:
         request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
         maintenance = SimpleNamespace(
             stopped_containers=[],
             restarted_containers=[],
@@ -635,22 +1630,23 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             patch(
-                "admin_service.main.get_maintenance_service",
+                "admin_service.routes.get_maintenance_service",
                 return_value=maintenance_service,
             ),
+            patch("admin_service.routes.get_backup_receipt_store", return_value=MagicMock()),
             patch(
-                "admin_service.main.reload_app_settings",
+                "admin_service.routes.reload_app_settings",
                 return_value=SimpleNamespace(default_system_id=None),
             ),
             patch(
-                "admin_service.main.get_runtime_service",
+                "admin_service.routes.get_runtime_service",
                 return_value=runtime_service,
             ),
             patch(
-                "admin_service.main.build_runtime_payload",
+                "admin_service.routes.build_runtime_payload",
                 new=AsyncMock(return_value={}),
             ),
-            patch("admin_service.main.serialize_systems", return_value=[]),
+            patch("admin_service.routes.serialize_systems", return_value=[]),
         ):
             asyncio.run(
                 route.endpoint(
@@ -661,6 +1657,69 @@ class MainAppBoundaryTests(unittest.TestCase):
             )
 
         self.assertEqual(runtime_service.pending_restart_keys, {"ui", "history"})
+
+    def test_admin_backup_import_cancellation_drains_worker_before_workspace_cleanup(self) -> None:
+        request, _receive_probe = make_streaming_request([b"archive-bytes"])
+        request.scope["headers"].extend(
+            [
+                (b"x-backup-expected-encryption", b"plaintext"),
+                (b"x-backup-inspection-receipt", b"server-receipt"),
+            ]
+        )
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        observed_path: list[Path] = []
+        service = MagicMock()
+
+        def import_from_file(path: Path, **_kwargs: object) -> object:
+            observed_path.append(path)
+            worker_started.set()
+            release_worker.wait(5)
+            self.assertTrue(path.exists())
+            worker_finished.set()
+            return (
+                {"ok": True, "systems": [], "restored_paths": []},
+                SimpleNamespace(
+                    stopped_containers=[],
+                    restarted_containers=[],
+                    restart_failures={},
+                ),
+            )
+
+        service.import_bundle_from_file.side_effect = import_from_file
+        route = next(
+            route for route in admin_app.routes if route.path == "/api/admin/backup/import"
+        )
+
+        async def exercise() -> None:
+            with (
+                patch("admin_service.routes.get_maintenance_service", return_value=service),
+                patch("admin_service.routes.get_backup_receipt_store", return_value=MagicMock()),
+            ):
+                task = asyncio.create_task(
+                    route.endpoint(
+                        request,
+                        stop_services=True,
+                        restart_services=True,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(worker_started.wait, 5))
+                for _ in range(2):
+                    task.cancel()
+                    turn = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(turn.set)
+                    await turn.wait()
+                    self.assertFalse(worker_finished.is_set())
+                    self.assertTrue(observed_path[0].exists())
+                release_worker.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise())
+        self.assertTrue(worker_finished.is_set())
+        self.assertFalse(observed_path[0].exists())
+        self.assertFalse(observed_path[0].parent.exists())
 
     def test_admin_backup_export_cleans_workspace_when_response_setup_fails(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="admin-export-setup-failure-"))
@@ -683,9 +1742,9 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         with (
-            patch("admin_service.main.get_maintenance_service", return_value=service),
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
             patch(
-                "admin_service.main.TemporaryFileResponse",
+                "admin_service.routes.TemporaryFileResponse",
                 side_effect=RuntimeError("response setup failed"),
             ),
         ):
@@ -733,7 +1792,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         async def cancel_export() -> None:
-            with patch("admin_service.main.get_maintenance_service", return_value=service):
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
                 export_task = asyncio.create_task(
                     route.endpoint(
                         SystemBackupExportRequest(
@@ -784,7 +1843,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
         async def cancel_export_twice() -> None:
-            with patch("admin_service.main.get_maintenance_service", return_value=service):
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
                 export_task = asyncio.create_task(
                     route.endpoint(
                         SystemBackupExportRequest(
@@ -810,7 +1869,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
     def test_unhandled_exception_handlers_redact_exception_details(self) -> None:
         for app, port, expected_detail in (
-            (main_app, 8080, "Unhandled application error; see application logs."),
+            (main_app, 8080, "Something went wrong on the server. The application log has details."),
             (admin_app, 8082, "Unhandled admin service error; see admin logs."),
         ):
             handler = app.exception_handlers[Exception]
@@ -831,8 +1890,9 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_snapshot_export_busy_uses_the_retryable_busy_handler(self) -> None:
         self.assertIs(
             main_app.exception_handlers.get(SnapshotExportBusyError),
-            snapshot_state_busy_exception_handler,
+            mapped_exception_handler,
         )
+        self.assertEqual(EXCEPTION_RESPONSES[SnapshotExportBusyError].retry_after_seconds, 5)
 
     def test_main_app_exposes_storage_view_runtime_route(self) -> None:
         paths = {route.path for route in main_app.routes}
@@ -910,7 +1970,7 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         self.assertIn('id="admin-app-version"', template_text)
         self.assertIn('id="admin-release-note"', template_text)
-        self.assertIn('<option value="none">Password Only / No Key</option>', template_text)
+        self.assertIn('<option value="none">Password only (no key)</option>', template_text)
         self.assertIn('id="setup-esxi-host-prep-panel"', template_text)
         self.assertIn('id="setup-esxi-host-prep-package-select"', template_text)
         self.assertIn('id="setup-platform-requirements"', template_text)
@@ -991,7 +2051,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("relatedTracesForNode", script_text)
         self.assertIn("traceIsInSelectionTrail", script_text)
         self.assertIn("data-fabric-breadcrumb", script_text)
-        self.assertIn("data-fabric-trace-disabled", script_text)
+        self.assertNotIn("data-fabric-trace-disabled", script_text)
+        self.assertIn("(visited)", script_text)
         self.assertIn("data-fabric-trace-home", script_text)
         self.assertIn('<span class="fabric-trace-index">1</span>', script_text)
         self.assertIn("renderDiagnosticTableControls", script_text)
@@ -1005,7 +2066,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("data-fabric-alias-edit", script_text)
         self.assertIn("/api/sas-fabric/aliases", script_text)
         self.assertIn("Time / Order", script_text)
-        self.assertIn("Filters apply only to this sample", script_text)
+        self.assertIn("Filters search only these.", script_text)
         self.assertIn("Previous event page", script_text)
         self.assertIn("PCI address", script_text)
         self.assertIn("PCIe slot", script_text)
@@ -1054,8 +2115,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertIn("setupPlatformUsesSshOnlyHost", script_text)
         self.assertIn("renderSetupPlatformRequirements", script_text)
         self.assertIn("setupPlatformRequirements", script_text)
-        self.assertIn("Required", script_text)
-        self.assertIn("Unsupported", script_text)
+        self.assertIn("You will need", script_text)
         self.assertIn("truenas_host: primaryHost", script_text)
         self.assertIn('value === "generate" || value === "manual" || value === "none"', script_text)
         self.assertIn('setupSshSudoPasswordField.classList.toggle("hidden", !savedSudoSupported)', script_text)
@@ -1090,25 +2150,60 @@ class MainAppBoundaryTests(unittest.TestCase):
     def test_history_service_uses_shared_app_version(self) -> None:
         self.assertEqual(history_app.version, __version__)
 
-    def test_main_app_healthz_uses_cached_snapshot_only(self) -> None:
-        fake_service = MagicMock()
-        fake_snapshot = MagicMock()
-        fake_snapshot.sources = {"api": MagicMock(ok=True)}
-        fake_snapshot.last_updated = datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc)
-        fake_snapshot.warnings = ["cached warning"]
-        fake_snapshot.model_dump.return_value = {"sources": {"api": {"enabled": True, "ok": True, "message": "reachable"}}}
-        fake_service.peek_cached_snapshot.return_value = fake_snapshot
-        fake_registry = MagicMock()
-        fake_registry.get_service.return_value = fake_service
+    def test_main_app_healthz_serializes_sources_without_dumping_cached_snapshot(self) -> None:
+        cases = (
+            ("healthy", {"api": {"enabled": True, "ok": True, "message": "reachable"},
+                         "ssh": {"enabled": False, "ok": False, "message": None}}, "ok"),
+            ("degraded", {"api": {"enabled": True, "ok": False, "message": "unavailable"}}, "degraded"),
+            ("missing-api", {"ssh": {"enabled": True, "ok": True, "message": None}}, "degraded"),
+            ("empty-sources", {}, "degraded"),
+        )
+        for name, sources, dependency_status in cases:
+            with self.subTest(name=name):
+                snapshot = InventorySnapshot(
+                    slots=[],
+                    refresh_interval_seconds=30,
+                    last_updated=datetime(2026, 4, 25, 12, 0, tzinfo=timezone.utc),
+                    sources={key: SourceStatus(**value) for key, value in sources.items()},
+                    warnings=["cached warning", "synthetic warning: café"],
+                )
+                # Keep an exact oracle for the previous parent-serialization contract.
+                problems = (
+                    []
+                    if dependency_status == "ok"
+                    else [f"TrueNAS API degraded: {sources.get('api', {}).get('message') or 'no details recorded'}"]
+                )
+                expected = {
+                    "status": "ok" if not problems else "degraded",
+                    "summary": problems[0] if problems else "All sources OK",
+                    "problems": problems,
+                    "dependency_status": dependency_status,
+                    "last_updated": "2026-04-25T12:00:00+00:00",
+                    "sources": snapshot.model_dump(mode="json")["sources"],
+                    "warnings": ["cached warning", "synthetic warning: café"],
+                    "cache_state": "cached",
+                }
+                self.assertEqual(expected["sources"], sources)
+                fake_service = MagicMock()
+                fake_service.peek_cached_snapshot.return_value = snapshot
+                fake_registry = MagicMock()
+                fake_registry.get_service.return_value = fake_service
 
-        with patch("app.main.get_inventory_registry", return_value=fake_registry):
-            response = self._call_main_route("/healthz")
+                with (
+                    patch("app.routes.get_inventory_registry", return_value=fake_registry),
+                    patch.object(
+                        InventorySnapshot, "model_dump",
+                        side_effect=AssertionError("healthz must not serialize the parent snapshot"),
+                    ) as parent_dump,
+                ):
+                    response = self._call_main_route("/healthz")
 
-        self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "ok")
-        self.assertEqual(payload["cache_state"], "cached")
-        fake_service.peek_cached_snapshot.assert_called_once_with()
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.body, JSONResponse(expected).body)
+                parent_dump.assert_not_called()
+                fake_registry.get_service.assert_called_once_with(None)
+                fake_service.peek_cached_snapshot.assert_called_once_with()
+                fake_service.get_snapshot.assert_not_called()
 
     def test_main_app_healthz_reports_unknown_when_cache_is_empty(self) -> None:
         fake_service = MagicMock()
@@ -1116,13 +2211,26 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_registry = MagicMock()
         fake_registry.get_service.return_value = fake_service
 
-        with patch("app.main.get_inventory_registry", return_value=fake_registry):
+        with patch("app.routes.get_inventory_registry", return_value=fake_registry):
             response = self._call_main_route("/healthz")
 
         self.assertEqual(response.status_code, 200)
-        payload = json.loads(response.body)
-        self.assertEqual(payload["dependency_status"], "unknown")
-        self.assertEqual(payload["cache_state"], "empty")
+        self.assertEqual(
+            response.body,
+            JSONResponse({
+                "status": "ok",
+                "summary": "Waiting for the first inventory",
+                "problems": [],
+                "dependency_status": "unknown",
+                "last_updated": None,
+                "sources": {},
+                "warnings": [],
+                "cache_state": "empty",
+            }).body,
+        )
+        fake_registry.get_service.assert_called_once_with(None)
+        fake_service.peek_cached_snapshot.assert_called_once_with()
+        fake_service.get_snapshot.assert_not_called()
 
     def test_snapshot_export_estimate_uses_stale_smart_cache(self) -> None:
         route = next(route for route in main_app.routes if route.path == "/api/export/enclosure-snapshot/estimate")
@@ -1143,8 +2251,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_exporter.estimate_enclosure_snapshot_export = AsyncMock(return_value={"ok": True})
 
         with (
-            patch("app.main.get_inventory_registry", return_value=fake_registry),
-            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+            patch("app.routes.get_inventory_registry", return_value=fake_registry),
+            patch("app.routes.get_snapshot_export_service", return_value=fake_exporter),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -1201,8 +2309,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with (
-            patch("app.main.get_inventory_registry", return_value=fake_registry),
-            patch("app.main.get_snapshot_export_service", return_value=fake_exporter),
+            patch("app.routes.get_inventory_registry", return_value=fake_registry),
+            patch("app.routes.get_snapshot_export_service", return_value=fake_exporter),
         ):
             estimate_response = asyncio.run(
                 estimate_route.endpoint(
@@ -1280,15 +2388,15 @@ class MainAppBoundaryTests(unittest.TestCase):
 
         with (
             request_context("e" * 32),
-            patch("app.main.urllib.request.urlopen", return_value=response) as urlopen,
+            patch("app.route_support.urllib.request.urlopen", return_value=response) as urlopen,
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertEqual(launch_url, "http://127.0.0.1:8082")
+        self.assertEqual(launch_url, AdminLaunchState(url="http://127.0.0.1:8082", stopped=False))
         outbound_request = urlopen.call_args.args[0]
         self.assertEqual(outbound_request.get_header("X-request-id"), "e" * 32)
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_is_down(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_is_down(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1300,14 +2408,14 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with patch(
-            "app.main.urllib.request.urlopen",
+            "app.route_support.urllib.request.urlopen",
             side_effect=urllib.error.URLError("connection refused"),
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
-    def test_resolve_admin_launch_url_hides_button_when_sidecar_times_out(self) -> None:
+    def test_resolve_admin_launch_url_reports_stopped_when_sidecar_times_out(self) -> None:
         request = make_request(port=8080)
         settings = Settings(
             admin=AdminSurfaceConfig(
@@ -1319,12 +2427,12 @@ class MainAppBoundaryTests(unittest.TestCase):
         )
 
         with patch(
-            "app.main.urllib.request.urlopen",
+            "app.route_support.urllib.request.urlopen",
             side_effect=TimeoutError("timed out"),
         ):
             launch_url = resolve_admin_launch_url(request, settings)
 
-        self.assertIsNone(launch_url)
+        self.assertEqual(launch_url, AdminLaunchState(url=None, stopped=True))
 
     def test_admin_runtime_version_probe_propagates_current_server_request_id(self) -> None:
         service = DockerRuntimeService(AdminSettings(docker_socket_path="/nonexistent.sock"))
@@ -1358,13 +2466,102 @@ class AdminHeaderDecodeTests(unittest.TestCase):
 class AdminHistoryStoreTests(unittest.TestCase):
     def test_admin_history_store_is_noninitializing_for_maintenance(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        source = (root / "admin_service" / "main.py").read_text(encoding="utf-8")
+        source = (root / "admin_service" / "route_support.py").read_text(encoding="utf-8")
         start = source.index("def get_history_store()")
         end = source.index("\ndef decode_optional_secret_header", start)
         self.assertIn("initialize=False", source[start:end])
 
 
 class AdminStatePayloadTests(unittest.TestCase):
+    def test_debug_export_bootstrap_defaults_do_not_stop_services(self) -> None:
+        defaults = self._build_minimal_state(Settings())["backup_defaults"]
+        self.assertIs(defaults["debug_stop_services"], False)
+        self.assertIs(defaults["debug_restart_services"], True)
+        self.assertIs(defaults["stop_services"], False)
+        self.assertIs(defaults["restart_services"], True)
+        self.assertIs(defaults["import_stop_services"], True)
+        self.assertIs(defaults["import_restart_services"], True)
+
+    def test_debug_export_template_defaults_do_not_stop_services(self) -> None:
+        from html.parser import HTMLParser
+
+        class Inputs(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inputs: dict[str, dict[str, str | None]] = {}
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                attributes = dict(attrs)
+                if tag == "input" and attributes.get("id"):
+                    self.inputs[str(attributes["id"])] = attributes
+
+        parser = Inputs()
+        template = admin_templates.get_template("index.html")
+        request = make_request()
+        request.scope["router"] = admin_app.router
+        parser.feed(template.render(request=request, admin_bootstrap_json="{}"))
+        for toggle, checked in (
+            ("debug-export-stop-toggle", False),
+            ("debug-export-restart-toggle", True),
+            ("backup-export-stop-toggle", False),
+            ("backup-export-restart-toggle", True),
+            ("backup-import-stop-toggle", True),
+            ("backup-import-restart-toggle", True),
+        ):
+            with self.subTest(toggle=toggle):
+                self.assertEqual("checked" in parser.inputs[toggle], checked)
+
+    def test_debug_export_route_default_reaches_maintenance_without_stopping(self) -> None:
+        self._exercise_debug_export_route(stop_services=None, restart_services=True)
+
+    def test_debug_export_route_preserves_explicit_stop_and_restart_choices(self) -> None:
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self._exercise_debug_export_route(stop_services=True, restart_services=restart)
+
+    def _exercise_debug_export_route(
+        self, *, stop_services: bool | None, restart_services: bool
+    ) -> None:
+        from app.models.domain import DebugBundleExportRequest
+        from tests.test_admin_maintenance import FakeBackupService, FakeRuntimeService, build_service
+
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        defaults = {parameter.name: parameter.default for parameter in route.dependant.query_params}
+        runtime = FakeRuntimeService(["ui", "history"])
+        class DebugBackup(FakeBackupService):
+            def export_debug_bundle_to_file(self, **kwargs: Any) -> Any:
+                super().export_debug_bundle_to_file(**kwargs)
+                return SimpleNamespace(
+                    path="synthetic-debug.tar.zst", filename="synthetic-debug.tar.zst",
+                    manifest={}, media_type="application/octet-stream", cleanup=lambda: None,
+                )
+
+        backup = DebugBackup()
+        service = build_service(runtime, backup)
+        stopped = defaults["stop_services"] if stop_services is None else stop_services
+        with (
+            patch("admin_service.routes.get_maintenance_service", return_value=service),
+        ):
+            response = asyncio.run(route.endpoint(
+                DebugBundleExportRequest(),
+                stop_services=stopped,
+                restart_services=restart_services,
+            ))
+        self.assertEqual(len(backup.debug_calls), 1)
+        expected_stops = ["ui", "history"] if stop_services else []
+        expected_restarts = expected_stops if restart_services else []
+        self.assertEqual(runtime.calls, [("stop", key) for key in expected_stops]
+                         + [("start", key) for key in expected_restarts])
+        headers = response.headers
+        self.assertEqual(headers["X-Admin-Stopped-Containers"], ",".join(expected_stops))
+        self.assertEqual(headers["X-Admin-Restarted-Containers"], ",".join(expected_restarts))
+        self.assertEqual(headers["X-Admin-Restart-Failures"], "")
+        self.assertEqual(backup.debug_calls[0]["maintenance_payload"]["stopped_containers"], expected_stops)
+        self.assertIs(defaults["restart_services"], True)
+        if stop_services is None:
+            self.assertIs(defaults["stop_services"], False)
+            self.assertEqual(runtime.running, ["ui", "history"])
+
     @staticmethod
     def _build_minimal_state(settings: Settings) -> dict[str, Any]:
         request = make_request(port=8082)
@@ -1376,21 +2573,21 @@ class AdminStatePayloadTests(unittest.TestCase):
         release_service = MagicMock()
         release_service.snapshot.return_value = {}
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.get_runtime_service", return_value=runtime_service),
-            patch("admin_service.main.build_runtime_payload", new=AsyncMock(return_value={})),
-            patch("admin_service.main.SSHKeyManager", return_value=key_manager),
-            patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
-            patch("admin_service.main.get_release_status_service", return_value=release_service),
-            patch("admin_service.main.get_admin_settings", return_value=AdminSettings()),
-            patch("admin_service.main.get_history_settings", return_value=HistorySettings()),
+            patch("admin_service.route_support.reload_app_settings", return_value=settings),
+            patch("admin_service.route_support.get_runtime_service", return_value=runtime_service),
+            patch("admin_service.route_support.build_runtime_payload", new=AsyncMock(return_value={})),
+            patch("admin_service.route_support.SSHKeyManager", return_value=key_manager),
+            patch("admin_service.route_support.get_esxi_host_prep_service", return_value=host_prep_service),
+            patch("admin_service.route_support.get_release_status_service", return_value=release_service),
+            patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()),
+            patch("admin_service.route_support.get_history_settings", return_value=HistorySettings()),
         ):
             return asyncio.run(build_admin_state_payload(request))
 
     def test_admin_healthz_shape_remains_minimal_and_backward_compatible(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/healthz")
 
-        with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.routes.get_admin_settings", return_value=AdminSettings()):
             response = asyncio.run(route.endpoint())
 
         self.assertEqual(set(json.loads(response.body)), {"status", "started_at", "expires_at"})
@@ -1452,6 +2649,23 @@ class AdminStatePayloadTests(unittest.TestCase):
         payload = self._build_minimal_state(settings)
 
         self.assertEqual(payload["configuration_warnings"], [])
+
+    def test_build_admin_state_payload_includes_unknown_config_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("histroy:\n  timeout_seconds: 5\n", encoding="utf-8")
+            payload = self._build_minimal_state(Settings(config_file=str(config_path)))
+
+        self.assertEqual(
+            payload["configuration_warnings"],
+            [
+                {
+                    "code": "unknown_config_key",
+                    "key": "histroy",
+                    "message": "config.yaml: unknown key `histroy` is ignored; did you mean `history`?",
+                }
+            ],
+        )
 
     def test_build_admin_state_payload_bounds_missing_profile_warnings(self) -> None:
         settings = Settings(
@@ -1563,7 +2777,7 @@ class AdminStatePayloadTests(unittest.TestCase):
             "containers": [
                 {
                     "key": "ui",
-                    "label": "Read UI",
+                    "label": "Main UI",
                     "status": "running",
                     "status_text": "Up 2 minutes (healthy)",
                     "running": True,
@@ -1594,12 +2808,12 @@ class AdminStatePayloadTests(unittest.TestCase):
             }
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_esxi_host_prep_service", return_value=host_prep_service):
                         with patch(
-                            "admin_service.main.get_admin_settings",
+                            "admin_service.route_support.get_admin_settings",
                             return_value=AdminSettings(
                                 auto_stop_seconds=3600,
                                 host_prep_temp_dir="/tmp/truenas-jbod-ui-host-prep",
@@ -1607,7 +2821,7 @@ class AdminStatePayloadTests(unittest.TestCase):
                             ),
                         ):
                             with patch(
-                                "admin_service.main.get_history_settings",
+                                "admin_service.route_support.get_history_settings",
                                 return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                             ):
                                 payload = asyncio.run(build_admin_state_payload(request))
@@ -1615,7 +2829,9 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["configuration_warnings"], [])
         self.assertEqual(payload["app_version"], __version__)
-        self.assertEqual(payload["admin"]["public_origin"], "http://localhost:8082")
+        self.assertIsNone(payload["admin"]["public_origin"])
+        self.assertFalse(payload["backup_defaults"]["debug_stop_services"])
+        self.assertTrue(payload["backup_defaults"]["debug_restart_services"])
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertEqual(payload["systems"][0]["truenas_host"], "https://archive-core.local")
         self.assertFalse(payload["systems"][0]["verify_ssl"])
@@ -1656,19 +2872,32 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertTrue(
             any("/var/log/messages" in command for command in payload["setup_platform_defaults"]["core"]["ssh_commands"])
         )
+        jargon = re.compile(
+            r"sidecar|runtime|read UI|enrichment|evidence|first.pass|middleware|wildcard|payload|/dev/sg",
+            re.IGNORECASE,
+        )
+        for platform_key, defaults in payload["setup_platform_defaults"].items():
+            requirements = defaults["requirements"]
+            self.assertEqual(
+                set(requirements), {"summary", "required", "optional", "guidance"}, platform_key
+            )
+            self.assertTrue(requirements["summary"], platform_key)
+            self.assertTrue(requirements["required"], platform_key)
+            for text in [requirements["summary"], requirements["guidance"], *requirements["required"], *requirements["optional"]]:
+                self.assertIsNone(jargon.search(text), f"{platform_key}: {text}")
+                self.assertNotIn("Quantastor", text, platform_key)
         scale_requirements = payload["setup_platform_defaults"]["scale"]["requirements"]
-        self.assertIn("/usr/bin/lsscsi -g -t", scale_requirements["required"][1])
-        self.assertIn("/usr/bin/lsblk --json", scale_requirements["required"][1])
-        self.assertTrue(any("/dev/sgN" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("nvme-cli" in item for item in scale_requirements["optional"]))
-        self.assertTrue(any("sesutil" in item for item in scale_requirements["unsupported"]))
-        self.assertTrue(any("mprutil" in item for item in scale_requirements["unsupported"]))
+        self.assertIn("API key", scale_requirements["required"][0])
+        self.assertTrue(any("SSH login" in item for item in scale_requirements["optional"]))
         linux_requirements = payload["setup_platform_defaults"]["linux"]["requirements"]
-        self.assertTrue(any("lsblk --json" in item for item in linux_requirements["required"]))
-        self.assertIn("lsscsi -g -t", linux_requirements["guidance"])
+        self.assertTrue(any("SSH login" in item for item in linux_requirements["required"]))
         esxi_requirements = payload["setup_platform_defaults"]["esxi"]["requirements"]
-        self.assertTrue(any("Linux sudoers/bootstrap" in item for item in esxi_requirements["unsupported"]))
-        self.assertIn("/cN or /call", esxi_requirements["guidance"])
+        self.assertIn("host-managed", esxi_requirements["summary"])
+        self.assertIn("StorCLI", esxi_requirements["summary"])
+        self.assertIn("BMC", esxi_requirements["summary"])
+        self.assertIn("/c0", esxi_requirements["guidance"])
+        quantastor_requirements = payload["setup_platform_defaults"]["quantastor"]["requirements"]
+        self.assertIn("QuantaStor", quantastor_requirements["summary"])
         self.assertIn("esxi", payload["setup_platform_defaults"])
         self.assertIn("ipmi", payload["setup_platform_defaults"])
         self.assertEqual(payload["ssh_keys"][0]["name"], "id_truenas")
@@ -1700,16 +2929,16 @@ class AdminStatePayloadTests(unittest.TestCase):
             "latest_url": "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.14.1",
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=Settings()):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_release_status_service", return_value=release_service):
+        with patch("admin_service.route_support.reload_app_settings", return_value=Settings()):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_release_status_service", return_value=release_service):
                         with patch(
-                            "admin_service.main.get_admin_settings",
+                            "admin_service.route_support.get_admin_settings",
                             return_value=AdminSettings(),
                         ):
                             with patch(
-                                "admin_service.main.get_history_settings",
+                                "admin_service.route_support.get_history_settings",
                                 return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                             ):
                                 payload = asyncio.run(build_admin_state_payload(request))
@@ -1758,12 +2987,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -1872,7 +3101,7 @@ class AdminStatePayloadTests(unittest.TestCase):
         nodes = [{"id": "node-a", "label": "Node A", "host": ""}]
 
         with patch(
-            "admin_service.main.SSHProbe.run_commands",
+            "admin_service.route_support.SSHProbe.run_commands",
             new=AsyncMock(side_effect=RuntimeError("Traceback: password=ssh-secret timed out")),
         ):
             result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
@@ -1911,7 +3140,7 @@ class AdminStatePayloadTests(unittest.TestCase):
             raise RuntimeError("synthetic transport stop")
 
         with patch(
-            "admin_service.main.SSHProbe.run_commands",
+            "admin_service.route_support.SSHProbe.run_commands",
             new=AsyncMock(side_effect=run_commands),
         ):
             result = asyncio.run(enrich_quantastor_nodes_from_ssh(payload, raw_data, nodes))
@@ -2054,12 +3283,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2092,12 +3321,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2135,12 +3364,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2195,12 +3424,12 @@ class AdminStatePayloadTests(unittest.TestCase):
         key_manager = MagicMock()
         key_manager.list_keys.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                with patch("admin_service.main.SSHKeyManager", return_value=key_manager):
-                    with patch("admin_service.main.get_admin_settings", return_value=AdminSettings()):
+        with patch("admin_service.route_support.reload_app_settings", return_value=settings):
+            with patch("admin_service.route_support.get_runtime_service", return_value=runtime_service):
+                with patch("admin_service.route_support.SSHKeyManager", return_value=key_manager):
+                    with patch("admin_service.route_support.get_admin_settings", return_value=AdminSettings()):
                         with patch(
-                            "admin_service.main.get_history_settings",
+                            "admin_service.route_support.get_history_settings",
                             return_value=HistorySettings(sqlite_path="/tmp/history/history.db"),
                         ):
                             payload = asyncio.run(build_admin_state_payload(make_request(port=8082)))
@@ -2211,8 +3440,33 @@ class AdminStatePayloadTests(unittest.TestCase):
         self.assertEqual(views[0]["template_id"], "nvme-carrier-4")
 
 
+    def test_resolve_public_origin_only_offers_a_configured_address(self) -> None:
+        request = make_request(host="192.0.2.10", port=8082)
+
+        self.assertIsNone(resolve_public_origin(AdminSettings(auto_stop_seconds=0), request))
+        self.assertEqual(
+            resolve_public_origin(
+                AdminSettings(auto_stop_seconds=0, public_origin="http://nas.example.test:8082/"),
+                request,
+            ),
+            "http://nas.example.test:8082",
+        )
+
+    def test_debug_export_route_defaults_to_not_pausing_services(self) -> None:
+        debug_route = next(route for route in admin_app.routes if route.path == "/api/admin/debug/export")
+        backup_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+        import_route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/import")
+
+        for route in (debug_route, backup_route):
+            with self.subTest(path=route.path):
+                parameters = inspect.signature(route.endpoint).parameters
+                self.assertIs(parameters["stop_services"].default.default, False)
+                self.assertIs(parameters["restart_services"].default.default, True)
+        self.assertIs(inspect.signature(import_route.endpoint).parameters["stop_services"].default.default, True)
+
+
 class AdminSudoPreviewRouteTests(unittest.TestCase):
-    def test_runtime_behavior_route_marks_read_ui_restart(self) -> None:
+    def test_runtime_behavior_route_applies_without_a_main_ui_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
         settings = Settings(config_file="C:/tmp/config/config.yaml")
         runtime_service = MagicMock()
@@ -2222,16 +3476,16 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "containers": [],
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                 with patch(
-                    "admin_service.main.save_runtime_behavior_overrides",
+                    "admin_service.routes.save_runtime_behavior_overrides",
                     return_value={"fields": [{"key": "source_bundle_cache_ttl_seconds", "owner": "admin"}]},
                 ) as save_overrides:
                     with patch(
-                        "admin_service.main.build_runtime_payload",
+                        "admin_service.routes.build_runtime_payload",
                         new=AsyncMock(return_value={"available": True, "containers": []}),
-                    ):
+                    ), patch("admin_service.routes.record_config_change") as journal:
                         response = asyncio.run(
                             route.endpoint({"values": {"source_bundle_cache_ttl_seconds": 120}})
                         )
@@ -2240,9 +3494,40 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["runtime_behavior"]["fields"][0]["key"], "source_bundle_cache_ttl_seconds")
         save_overrides.assert_called_once_with(settings, {"source_bundle_cache_ttl_seconds": 120})
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertEqual(payload["detail"], "Timing saved. The main UI applies it when it next handles a page or API request; no restart needed.")
+        # A save applied on the main UI's next request is still journalled (#575/#580).
+        journal.assert_called_once_with("runtime_overrides.save", "source_bundle_cache_ttl_seconds")
 
-    def test_create_demo_system_route_accepts_missing_payload_and_marks_ui_restart(self) -> None:
+    def test_config_save_still_marks_restart_for_restart_only_settings(self) -> None:
+        """Public origin, debug docs, perf and paths need a new main UI process (#432/#615)."""
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/runtime-behavior")
+        before = Settings(config_file="/app/config/config.yaml")
+        cases = {
+            "app.public_origin": {"app": before.app.model_copy(update={"public_origin": "https://nas.example.test"})},
+            "app.debug": {"app": before.app.model_copy(update={"debug": True})},
+            "perf": {"perf": before.perf.model_copy(update={"enabled": True})},
+            "paths": {"paths": before.paths.model_copy(update={"log_file": "/app/logs/other.log"})},
+        }
+        for key, update in cases.items():
+            with self.subTest(key=key):
+                after = before.model_copy(update=update)
+                runtime_service = MagicMock()
+                with (
+                    patch("admin_service.routes.reload_app_settings", side_effect=[before, after]),
+                    patch("admin_service.routes.get_runtime_service", return_value=runtime_service),
+                    patch("admin_service.routes.save_runtime_behavior_overrides", return_value={"fields": []}),
+                    patch("admin_service.routes.build_runtime_payload", new=AsyncMock(return_value={"containers": []})),
+                ):
+                    response = asyncio.run(route.endpoint({"values": {"smart_cache_ttl_seconds": 60}}))
+                payload = json.loads(response.body)
+                runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+                self.assertEqual(payload["restart_required"], ["ui"])
+                self.assertEqual(payload["restart_settings"], [key])
+                self.assertEqual(payload["detail"], "Timing saved. The main UI needs a restart to apply this.")
+
+    def test_create_demo_system_route_accepts_missing_payload_and_applies_without_restart(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/demo")
         initial_settings = Settings(
             config_file="C:/tmp/config/config.yaml",
@@ -2296,9 +3581,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.DemoSystemFactory", return_value=demo_factory):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.DemoSystemFactory", return_value=demo_factory):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2307,7 +3592,12 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["system"]["id"], "demo-builder-lab")
         self.assertEqual(payload["profile"]["id"], "demo-builder-lab-chassis")
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertEqual(
+            payload["detail"],
+            "Demo builder system Demo Builder Lab saved. The main UI applies it when it next handles a page or API request; no restart needed.",
+        )
 
     def test_delete_system_route_returns_updated_system_list(self) -> None:
         route = next(
@@ -2353,9 +3643,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint(system_id="qs-cryostorage"))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2367,7 +3657,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["default_system_id"], "archive-core")
         self.assertFalse(payload["history_purge"]["requested"])
         self.assertEqual([system["id"] for system in payload["systems"]], ["archive-core"])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_system_route_can_purge_matching_history(self) -> None:
         route = next(
@@ -2421,10 +3713,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "removed_system_ids": ["qs-cryostorage"],
         }
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                    with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.routes.get_history_store", return_value=history_store):
                         response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2435,7 +3727,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["history_purge"]["ok"])
         self.assertEqual(payload["history_purge"]["summary"]["total_rows"], 6)
         history_store.delete_system_history.assert_called_once_with("qs-cryostorage")
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_system_route_redacts_history_purge_failure_detail(self) -> None:
         route = next(
@@ -2463,10 +3757,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         history_store = MagicMock()
         history_store.delete_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings, refreshed_settings]):
-            with patch("admin_service.main.SystemSetupService", return_value=setup_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
-                    with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings, refreshed_settings]):
+            with patch("admin_service.routes.SystemSetupService", return_value=setup_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
+                    with patch("admin_service.routes.get_history_store", return_value=history_store):
                         response = asyncio.run(route.endpoint(system_id="qs-cryostorage", purge_history=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2494,6 +3788,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             default_system_id="archive-core",
         )
         history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [{"system_id": "qs-cryostorage", "total_rows": 8}]
         history_store.purge_orphaned_history.return_value = {
             "tracked_slots": 1,
             "event_count": 2,
@@ -2502,9 +3797,11 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "removed_system_ids": ["qs-cryostorage"],
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
-                response = asyncio.run(route.endpoint())
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
+                preview_route = next(item for item in admin_app.routes if item.path == "/api/admin/history/orphaned")
+                preview = json.loads(asyncio.run(preview_route.endpoint()).body)
+                response = asyncio.run(route.endpoint({"preview_token": preview["purge_preview_token"], "confirm_irreversible": True}))
 
         payload = json.loads(response.body.decode("utf-8"))
 
@@ -2512,7 +3809,41 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["summary"]["removed_system_ids"], ["qs-cryostorage"])
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
-        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"])
+        history_store.purge_orphaned_history.assert_called_once_with(["archive-core"], expected_summaries=history_store.list_history_system_summaries.return_value)
+
+    def test_list_history_systems_route_returns_row_counts_for_every_system(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.return_value = [
+            {"system_id": "archive-core", "system_label": "Archive CORE", "total_rows": 1240},
+        ]
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            response = asyncio.run(route.endpoint())
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["systems"][0]["system_id"], "archive-core")
+        self.assertEqual(payload["systems"][0]["total_rows"], 1240)
+        history_store.list_history_system_summaries.assert_called_once_with()
+
+    def test_list_history_systems_route_fails_closed_without_leaking_store_errors(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems")
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = RuntimeError("private sqlite path")
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(route.endpoint())
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.detail, "Unable to inspect saved history; see admin logs.")
+
+    def test_container_descriptions_avoid_implementation_words(self) -> None:
+        jargon = re.compile(r"sidecar|read UI|read-mostly|first.pass|surface|collector", re.IGNORECASE)
+        runtime = DockerRuntimeService(AdminSettings())
+        for container in runtime.managed_containers.values():
+            self.assertIsNone(jargon.search(container["description"]), container["description"])
 
     def test_list_orphaned_history_route_returns_history_sources(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
@@ -2541,8 +3872,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             }
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2551,7 +3882,142 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["orphaned_systems"][0]["system_id"], "qs-cryostorage")
         self.assertEqual(payload["valid_system_ids"], ["archive-core"])
-        history_store.list_history_system_summaries.assert_called_once_with(["archive-core"])
+        # One shared unfiltered scan; the route drops the saved systems itself.
+        history_store.list_history_system_summaries.assert_called_once_with()
+
+    def _blocking_summary_store(self, release: "threading.Event", calls: list[int]) -> MagicMock:
+        history_store = MagicMock()
+
+        def slow_scan() -> list[dict[str, object]]:
+            calls.append(1)
+            release.wait(10)
+            return [
+                {"system_id": "archive-core", "total_rows": 3},
+                {"system_id": "qs-cryostorage", "total_rows": 8},
+            ]
+
+        history_store.list_history_system_summaries.side_effect = slow_scan
+        return history_store
+
+    def test_concurrent_history_scans_share_one_worker_and_mint_their_own_tokens(self) -> None:
+        import threading
+
+        preview = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned").endpoint
+        systems = next(route for route in admin_app.routes if route.path == "/api/admin/history/systems").endpoint
+        settings = Settings(
+            systems=[SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(host="https://archive-core.example.test", platform="core"))],
+            default_system_id="archive-core",
+        )
+        release, calls = threading.Event(), []
+        history_store = self._blocking_summary_store(release, calls)
+
+        async def scenario() -> list[object]:
+            tasks = [asyncio.ensure_future(preview()) for _ in range(6)] + [asyncio.ensure_future(systems())]
+            await asyncio.sleep(0.2)
+            release.set()
+            return await asyncio.gather(*tasks)
+
+        with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+            "admin_service.routes.get_history_store", return_value=history_store
+        ):
+            responses = asyncio.run(scenario())
+
+        self.assertEqual(len(calls), 1, "every concurrent caller must join one scan")
+        previews = [json.loads(response.body) for response in responses[:6]]
+        self.assertEqual({item["orphaned_systems"][0]["system_id"] for item in previews}, {"qs-cryostorage"})
+        self.assertEqual(len({item["purge_preview_token"] for item in previews}), 6)
+        self.assertEqual(len(json.loads(responses[6].body)["systems"]), 2)
+
+    def test_a_scan_is_not_reused_after_it_finishes_or_after_history_changes(self) -> None:
+        import threading
+
+        preview = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned").endpoint
+        purge = next(route for route in admin_app.routes if route.path == "/api/admin/history/purge-orphaned").endpoint
+        settings = Settings(systems=[])
+        release, calls = threading.Event(), []
+        history_store = self._blocking_summary_store(release, calls)
+        history_store.purge_orphaned_history.return_value = {"total_rows": 0, "removed_system_ids": []}
+
+        async def scenario() -> None:
+            release.set()
+            first = json.loads((await preview()).body)
+            await preview()
+            self.assertEqual(len(calls), 2, "a finished scan is never served again")
+            release.clear()
+            stale = asyncio.ensure_future(preview())
+            await asyncio.sleep(0.1)
+            await purge({"preview_token": first["purge_preview_token"], "confirm_irreversible": True})
+            fresh = asyncio.ensure_future(preview())
+            await asyncio.sleep(0.1)
+            release.set()
+            await asyncio.gather(stale, fresh)
+
+        with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+            "admin_service.routes.get_history_store", return_value=history_store
+        ):
+            asyncio.run(scenario())
+
+        self.assertEqual(len(calls), 4, "a caller after a purge must not join the scan that predates it")
+
+    def test_history_scans_hold_at_most_two_worker_threads(self) -> None:
+        import threading
+
+        from admin_service import routes as admin_routes
+
+        release = threading.Event()
+        running, peak, lock = [0], [0], threading.Lock()
+        history_store = MagicMock()
+
+        def scan() -> list[dict[str, object]]:
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            release.wait(10)
+            with lock:
+                running[0] -= 1
+            return []
+
+        history_store.list_history_system_summaries.side_effect = scan
+        scans = admin_routes.HistorySummaryScans()
+
+        async def scenario() -> None:
+            tasks = []
+            for _ in range(4):
+                tasks.append(asyncio.ensure_future(scans.scan()))
+                await asyncio.sleep(0.05)
+                scans.history_changed()  # each caller now needs its own scan
+            await asyncio.sleep(0.3)
+            with lock:
+                self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+            release.set()
+            await asyncio.gather(*tasks)
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            asyncio.run(scenario())
+        self.assertEqual(history_store.list_history_system_summaries.call_count, 4)
+        self.assertEqual(peak[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+
+    def test_a_cancelled_waiter_does_not_cancel_the_shared_scan(self) -> None:
+        import threading
+
+        from admin_service import routes as admin_routes
+
+        release = threading.Event()
+        history_store = MagicMock()
+        history_store.list_history_system_summaries.side_effect = lambda: (release.wait(10), [{"system_id": "a"}])[1]
+        scans = admin_routes.HistorySummaryScans()
+
+        async def scenario() -> list[dict[str, object]]:
+            abandoned = asyncio.ensure_future(scans.scan())
+            kept = asyncio.ensure_future(scans.scan())
+            await asyncio.sleep(0.1)
+            abandoned.cancel()
+            release.set()
+            return await kept
+
+        with patch("admin_service.routes.get_history_store", return_value=history_store):
+            self.assertEqual(asyncio.run(scenario()), [{"system_id": "a"}])
+        self.assertEqual(history_store.list_history_system_summaries.call_count, 1)
 
     def test_list_orphaned_history_route_treats_missing_noninitializing_database_as_empty(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
@@ -2565,8 +4031,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 initialize=False,
             )
 
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
-                with patch("admin_service.main.get_history_store", return_value=history_store):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
+                with patch("admin_service.routes.get_history_store", return_value=history_store):
                     response = asyncio.run(route.endpoint())
 
             payload = json.loads(response.body.decode("utf-8"))
@@ -2594,8 +4060,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "Traceback: token=history-secret"
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(
                         route.endpoint(
@@ -2651,8 +4117,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "slot_state_conflicts": 1,
         }
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 response = asyncio.run(
                     route.endpoint(
                         payload=HistoryAdoptRequest(
@@ -2703,8 +4169,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         ]
         history_store.adopt_system_history.side_effect = RuntimeError("Traceback: token=history-secret")
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_history_store", return_value=history_store):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_history_store", return_value=history_store):
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(
                         route.endpoint(
@@ -2756,8 +4222,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.InventoryRegistry", return_value=registry):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.InventoryRegistry", return_value=registry):
                 response = asyncio.run(route.endpoint(system_id="archive-core", force=True))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2792,7 +4258,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             smart_test_results=[],
         )
 
-        with patch("admin_service.main.QuantastorRESTClient", return_value=client):
+        with patch("admin_service.routes.QuantastorRESTClient", return_value=client):
             response = asyncio.run(
                 route.endpoint(
                     QuantastorNodeDiscoveryRequest(
@@ -2861,9 +4327,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client):
-                with patch("admin_service.main.SSHProbe", return_value=probe) as ssh_probe:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client):
+                with patch("admin_service.route_support.SSHProbe", return_value=probe) as ssh_probe:
                     response = asyncio.run(
                         route.endpoint(
                             QuantastorNodeDiscoveryRequest(
@@ -2936,8 +4402,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.InventoryRegistry", return_value=registry):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.InventoryRegistry", return_value=registry):
                 response = asyncio.run(route.endpoint(system_id="archive-core", force=False))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -2989,9 +4455,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(
                         route.endpoint(
                             payload=EnclosureProfileRequest(
@@ -3016,7 +4482,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["profile"]["id"], "custom-front-24")
         self.assertFalse(payload["updated_existing"])
         self.assertIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_delete_profile_route_returns_updated_profile_list(self) -> None:
         route = next(
@@ -3060,9 +4528,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         runtime_service = MagicMock()
         runtime_service.status_payload.return_value = {"available": True, "detail": None, "containers": []}
 
-        with patch("admin_service.main.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
-            with patch("admin_service.main.ProfileBuilderService", return_value=profile_service):
-                with patch("admin_service.main.get_runtime_service", return_value=runtime_service):
+        with patch("admin_service.routes.reload_app_settings", side_effect=[initial_settings, refreshed_settings]):
+            with patch("admin_service.routes.ProfileBuilderService", return_value=profile_service):
+                with patch("admin_service.routes.get_runtime_service", return_value=runtime_service):
                     response = asyncio.run(route.endpoint(profile_id="custom-front-24"))
 
         payload = json.loads(response.body.decode("utf-8"))
@@ -3071,7 +4539,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["deleted_label"], "Custom Front 24")
         self.assertNotIn("custom-front-24", [profile["id"] for profile in payload["profiles"]])
-        runtime_service.mark_restart_required.assert_called_once_with(("ui",))
+        runtime_service.mark_restart_required.assert_not_called()
+        self.assertEqual(payload["restart_required"], [])
+        self.assertTrue(payload["detail"].endswith("The main UI applies it when it next handles a page or API request; no restart needed."))
 
     def test_sudoers_preview_route_returns_exact_rendered_content(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
@@ -3207,7 +4677,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = self._saved_sudo_command_settings(Path(temp_dir) / "config" / "config.yaml")
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 response = asyncio.run(
                     route.endpoint(
                         SystemSetupSudoPreviewRequest(
@@ -3247,7 +4717,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     )
                 ],
             )
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 with self.assertRaises(HTTPException) as context:
                     asyncio.run(
                         route.endpoint(
@@ -3269,7 +4739,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/sudoers-preview")
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = self._saved_sudo_command_settings(Path(temp_dir) / "config" / "config.yaml")
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
                 with self.assertRaises(HTTPException) as context:
                     asyncio.run(
                         route.endpoint(
@@ -3304,16 +4774,16 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                     exit_code=0,
                 )
 
-        def make_service(config_path: str) -> ServiceAccountBootstrapService:
-            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe)
+        def make_service(config_path: str, **kwargs: object) -> ServiceAccountBootstrapService:
+            return ServiceAccountBootstrapService(config_path, probe_factory=RecordingProbe, **kwargs)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / "config" / "config.yaml"
             config_file.parent.mkdir(parents=True)
             settings = self._saved_sudo_command_settings(config_file)
             with (
-                patch("admin_service.main.reload_app_settings", return_value=settings),
-                patch("admin_service.main.ServiceAccountBootstrapService", side_effect=make_service),
+                patch("admin_service.routes.reload_app_settings", return_value=settings),
+                patch("admin_service.routes.ServiceAccountBootstrapService", side_effect=make_service),
             ):
                 response = asyncio.run(
                     route.endpoint(
@@ -3367,7 +4837,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         ).sudo_commands
         self.assertEqual(len(expected_commands[0]), 1024)
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
             from_saved = asyncio.run(
                 preview_route.endpoint(
                     SystemSetupSudoPreviewRequest(
@@ -3397,16 +4867,17 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         received: list[SystemSetupBootstrapRequest] = []
 
         class RecordingBootstrapService:
-            def __init__(self, config_path: str) -> None:
+            def __init__(self, config_path: str, *, known_hosts_path: str | None = None) -> None:
                 self.config_path = config_path
+                self.known_hosts_path = known_hosts_path
 
             def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
                 received.append(payload)
                 return {"ok": True}
 
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.ServiceAccountBootstrapService", RecordingBootstrapService),
+            patch("admin_service.routes.reload_app_settings", return_value=settings),
+            patch("admin_service.routes.ServiceAccountBootstrapService", RecordingBootstrapService),
         ):
             response = asyncio.run(
                 bootstrap_route.endpoint(
@@ -3433,7 +4904,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/bootstrap")
         settings = Settings(config_file="C:/tmp/config/config.yaml")
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
             with self.assertRaises(HTTPException) as context:
                 asyncio.run(
                     route.endpoint(
@@ -3477,8 +4948,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "host-prep-upload"
             workspace.mkdir()
-            with patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)):
-                with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+            with patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)):
+                with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                     response = asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
             self.assertFalse(workspace.exists())
 
@@ -3508,7 +4979,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 max_staged_bytes=7,
             )
             with patch(
-                "admin_service.main.get_esxi_host_prep_service",
+                "admin_service.routes.get_esxi_host_prep_service",
                 return_value=host_prep_service,
             ):
                 response = asyncio.run(
@@ -3551,7 +5022,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                         read_finished.set()
 
                 with (
-                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch("admin_service.routes.get_esxi_host_prep_service", return_value=service),
                     patch.object(Path, "read_bytes", blocking_read),
                 ):
                     task = asyncio.create_task(
@@ -3612,7 +5083,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                         stage_worker_finished.set()
 
                 with (
-                    patch("admin_service.main.get_esxi_host_prep_service", return_value=service),
+                    patch("admin_service.routes.get_esxi_host_prep_service", return_value=service),
                     patch.object(Path, "mkdir", blocking_package_mkdir),
                     patch.object(
                         service,
@@ -3659,8 +5130,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         }
         host_prep_service.list_staged_packages.return_value = []
 
-        with patch("admin_service.main.tempfile.mkdtemp") as make_workspace:
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service) as get_service:
+        with patch("admin_service.route_support.tempfile.mkdtemp") as make_workspace:
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service) as get_service:
                 with self.assertRaises(HTTPException) as raised:
                     asyncio.run(route.endpoint(request=request, filename="BCM-vmware-storcli64.zip"))
 
@@ -3692,8 +5163,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             workspace = Path(temp_dir) / "host-prep-upload"
             workspace.mkdir()
             with (
-                patch("admin_service.main.tempfile.mkdtemp", return_value=str(workspace)),
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.route_support.tempfile.mkdtemp", return_value=str(workspace)),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="vendor.vib"))
@@ -3718,7 +5189,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             )
             host_prep_service.stage_package("existing.vib", b"payload")
             with (
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
@@ -3741,7 +5212,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 max_staged_bytes=7,
             )
             with (
-                patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service),
+                patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service),
                 self.assertRaises(HTTPException) as raised,
             ):
                 asyncio.run(route.endpoint(request=request, filename="blocked.vib"))
@@ -3770,8 +5241,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             {"token": "storcli-1", "filename": "BCM-vmware-storcli64.zip"}
         ]
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 response = asyncio.run(
                     route.endpoint(
                         payload=ESXiHostPrepInstallRequest(
@@ -3837,8 +5308,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         host_prep_service.install_package.return_value = {"ok": True, "detail": "installed"}
         host_prep_service.list_staged_packages.return_value = []
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 asyncio.run(
                     route.endpoint(
                         payload=ESXiHostPrepInstallRequest(
@@ -3875,8 +5346,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         )
         host_prep_service = MagicMock()
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.get_esxi_host_prep_service", return_value=host_prep_service):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.get_esxi_host_prep_service", return_value=host_prep_service):
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -3925,10 +5396,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
-                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
-                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.routes.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.routes.enrich_quantastor_nodes_from_ssh", enrich):
                         asyncio.run(
                             route.endpoint(
                                 QuantastorNodeDiscoveryRequest(
@@ -3984,10 +5455,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient", return_value=client) as client_factory:
-                with patch("admin_service.main.serialize_quantastor_nodes", return_value=[]):
-                    with patch("admin_service.main.enrich_quantastor_nodes_from_ssh", enrich):
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient", return_value=client) as client_factory:
+                with patch("admin_service.routes.serialize_quantastor_nodes", return_value=[]):
+                    with patch("admin_service.routes.enrich_quantastor_nodes_from_ssh", enrich):
                         with self.assertRaises(HTTPException) as captured:
                             asyncio.run(
                                 route.endpoint(
@@ -4096,10 +5567,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
             persisted = MagicMock()
             captured: HTTPException | None = None
-            with patch("admin_service.main.reload_app_settings", return_value=settings):
-                with patch("admin_service.main.QuantastorRESTClient", SyntheticQuantastorClient):
-                    with patch("admin_service.main.SSHProbe.run_commands", new=record_ssh_transport):
-                        with patch("admin_service.main.SystemSetupService.save_system", persisted):
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
+                with patch("admin_service.routes.QuantastorRESTClient", SyntheticQuantastorClient):
+                    with patch("admin_service.route_support.SSHProbe.run_commands", new=record_ssh_transport):
+                        with patch("admin_service.routes.SystemSetupService.save_system", persisted):
                             try:
                                 asyncio.run(
                                     route.endpoint(
@@ -4132,7 +5603,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         assert captured is not None
         self.assertEqual(captured.status_code, 400)
         detail = str(captured.detail)
-        self.assertIn("saved connection settings", detail)
+        self.assertIn("cannot be reused. Enter it again and save.", detail)
         self.assertNotIn(saved_api_password, detail)
         self.assertNotIn(fresh_ssh_password, detail)
 
@@ -4174,9 +5645,9 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         client = MagicMock()
         client.fetch_all = AsyncMock(return_value=raw_data)
         with (
-            patch("admin_service.main.reload_app_settings", return_value=settings),
-            patch("admin_service.main.QuantastorRESTClient", return_value=client),
-            patch("admin_service.main.SSHProbe.run_commands", new=fail_transport),
+            patch("admin_service.routes.reload_app_settings", return_value=settings),
+            patch("admin_service.routes.QuantastorRESTClient", return_value=client),
+            patch("admin_service.route_support.SSHProbe.run_commands", new=fail_transport),
             self.assertLogs(level="WARNING") as captured,
         ):
             response = asyncio.run(route.endpoint(QuantastorNodeDiscoveryRequest(
@@ -4232,8 +5703,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -4270,8 +5741,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(
@@ -4309,8 +5780,8 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             ]
         )
 
-        with patch("admin_service.main.reload_app_settings", return_value=settings):
-            with patch("admin_service.main.QuantastorRESTClient") as client_factory:
+        with patch("admin_service.routes.reload_app_settings", return_value=settings):
+            with patch("admin_service.routes.QuantastorRESTClient") as client_factory:
                 with self.assertRaises(HTTPException) as captured:
                     asyncio.run(
                         route.endpoint(

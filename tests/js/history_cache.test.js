@@ -348,11 +348,11 @@ test("history freshness copy distinguishes fresh, refreshing, stale, and unavail
     formatTimestamp: (value) => String(value),
   });
 
-  assert.match(historyFreshnessNote({ state: "fresh", fetchedAt: 100 }), /fresh/i);
-  assert.match(historyFreshnessNote({ state: "refreshing", fetchedAt: 100 }), /Refreshing cached history/);
+  assert.equal(historyFreshnessNote({ state: "fresh", fetchedAt: 100 }), "", "fresh history needs no note");
+  assert.match(historyFreshnessNote({ state: "refreshing", fetchedAt: 100 }), /Refreshing history saved/);
   assert.match(
     historyFreshnessNote({ state: "stale", fetchedAt: 100, error: "backend busy" }),
-    /Stale cached history.*refresh failed.*backend busy/i,
+    /Showing history from.*refresh failed.*backend busy/i,
   );
   assert.match(historyFreshnessNote({ state: "unavailable" }), /unavailable/i);
 });

@@ -62,6 +62,49 @@ TRUENAS_TLS_SERVER_NAME=truenas.example.test
 
 Use the DNS name on the certificate for `TRUENAS_TLS_SERVER_NAME`.
 
+## Apply config changes
+
+The main UI applies edits to `config/config.yaml`,
+`config/runtime-overrides.yaml` and `config/profiles.yaml` without a restart.
+Before each non-static page or API request, it checks whether at least two
+seconds have passed since its last check; a saved edit therefore takes effect
+when the main UI next handles such a request. A page that is already loading
+while the file changes uses either the old settings or the new ones, never a
+mix of both.
+
+If an edit is not valid (a YAML syntax error, an unknown platform, a value out
+of range), the main UI keeps its previous settings and says so plainly: in the
+log, as the `/healthz` reason (`status: degraded`), and as a warning on the
+page. The page and `/healthz` only say that the edit was not applied; the
+main UI log names the setting, or the line and column of a YAML syntax error.
+Fix the file and the warning clears on the next check. If `config.yaml`
+disappears after startup (for example during a temporary host-side replacement),
+the running main UI treats that as a rejected edit and keeps its last valid
+generation rather than installing defaults. A process that starts with no
+`config.yaml` still uses the documented first-start defaults.
+
+A few settings are only read when the main UI process starts. Changing them
+needs a restart:
+
+| Setting | Why |
+| --- | --- |
+| `app.public_origin` | Write checks capture it when the app is built |
+| `app.debug` | Turns the `/docs` pages on or off when the app is built |
+| `app.startup_warm_cache_enabled`, `app.startup_warm_smart_enabled` | Only used at start-up |
+| `app.release_check_*` | The release-check task starts with the process |
+| `perf.*` | The timing middleware is installed at start-up |
+| `paths.*`, `APP_CONFIG_PATH` | Open log files and data stores |
+| Sign-in (`ADMIN_AUTH_MODE` and its credentials) and every other `.env` value | Process environment |
+
+When you change one of these, the main UI keeps running with the old value,
+logs that a restart is needed and shows it on the page. Admin saves that touch
+one show **Saved. The main UI needs a restart to apply this.** with a
+**Restart main UI now** button; after a hand edit, restart it yourself:
+
+```bash
+docker compose restart enclosure-ui
+```
+
 ## Single-system vs multi-system
 
 The app supports:
@@ -136,7 +179,6 @@ Useful app-level settings:
 
 ```yaml
 app:
-  port: 8080
   refresh_interval_seconds: 30
   snapshot_cache_ttl_seconds: 10
   source_bundle_cache_ttl_seconds: 60
@@ -250,28 +292,65 @@ If you are running the optional history sidecar, the main retention knobs are:
 - `HISTORY_EVENT_RETENTION_DAYS`
 - `HISTORY_HOURLY_ROLLUP_RETENTION_DAYS`
 - `HISTORY_DAILY_ROLLUP_RETENTION_DAYS`
+- `HISTORY_BACKUP_INTERVAL_SECONDS`
 - `HISTORY_RETENTION_INTERVAL_SECONDS`
 - `HISTORY_RETENTION_BATCH_SIZE`
 - `HISTORY_RETENTION_MAX_BATCHES_PER_RUN`
+- `HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS`
 - `HISTORY_SEGMENT_CATALOG_PATH` for an already migrated segmented deployment
 
 The default behavior is:
 
-- keep short-term rotating SQLite snapshots under `./history/backups`
+- take one full SQLite snapshot a day under `./history/backups`
+- keep `7` of those rotating daily snapshots
 - keep `4` weekly promoted copies
 - keep `3` monthly promoted copies
 - keep raw metric samples for `30` days and slot events for `365` days
 - keep hourly metric rollups for `365` days and daily rollups for `1825` days
 - run retention hourly in at most `20` transactions of `5000` rows per table
 
+Each copy is the size of the live database, so without the backup scheduler the
+default footprint is at most `14` database-sized files: `7` daily plus `4`
+weekly plus `3` monthly. Lower `HISTORY_BACKUP_RETENTION_COUNT` to shrink the
+short-term set; the value must be at least `1`.
+
+When the optional backup scheduler is enabled, its daily FULL archives gradually
+replace this duplicate set only when they include `history_db`, remain present
+locally and are catalogued as verified. During cutover, usable local FULLs and
+retained history snapshots together provide at least the existing 14-copy floor;
+one first FULL therefore leaves 13 sidecar snapshots rather than collapsing the
+set to one copy. The scheduler removes only the oldest excess snapshot each time
+coverage grows. If scheduler retention is set below 14, the remaining sidecars
+stay in place. The history service treats the newest verified FULL as its current
+daily backup. Until that proof exists, history snapshots continue unchanged.
+Preserved scheduler archives, newer files and unrelated files are never removed
+by this replacement cleanup.
+
+The history dashboard shows `Backup copies on disk` (bytes and number of these
+copies) and, under `Database size`, how much of the file is free space that
+cleanup has not handed back yet.
+
 Set any of the four retention-day values to `0` to keep that data tier forever.
 Each retention transaction commits separately, so a stop or restart resumes from
-the remaining rows instead of restarting one large delete. The collector starts
-retention only after creating a backup successfully in the same slow pass.
-SQLite reuses pages
-released by pruning. The database file therefore plateaus near its high-water
-size rather than shrinking after every pass; retention does not run `VACUUM` or
-replace the live database.
+the remaining rows instead of restarting one large delete.
+
+Retention runs on its own schedule and is not part of the backup. It prunes
+whenever the snapshot taken in that pass succeeded, a snapshot on disk is
+younger than `HISTORY_RAW_METRIC_RETENTION_DAYS`, or the full backup named by
+`SCHEDULED_BACKUP_STATUS_FILE` (for example the backup scheduler's full class)
+last succeeded within that window and included the history database. When neither is true, for
+example because the backup directory is unwritable or the disk is full,
+retention waits for at most `HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS`
+(`86400` by default) and the dashboard shows the reason and the time pruning
+resumes. After that deadline retention prunes anyway and says that it ran
+without a recent backup, so a failing backup can no longer stop pruning until
+the database fills the disk. Set the value to `0` to prune immediately whatever
+the backup did. Segmented deployments keep their own gate: their retention
+consumes a sealed scheduled backup and waits for one.
+
+SQLite reuses pages released by pruning. The database file therefore plateaus
+near its high-water size rather than shrinking after every pass; retention does
+not run `VACUUM` or replace the live database.
 
 History queries combine retained raw values with hourly and daily rollups.
 Temperature and annualized-rate rollups use the sample-count-weighted average;
@@ -311,3 +390,41 @@ Prefer code only when:
 - a whole new inventory adapter is needed
 - the host needs new parser logic
 - the UI model itself must change
+
+## Reference documents in the repository
+
+The wiki covers day-to-day setup and operation. Longer references live in the
+repository under `docs/` and are linked here so they are easy to find:
+
+- [Immutable GHCR deployment](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md):
+  pin an image digest, Compose files, and the update helper
+  `scripts/update_immutable_deployment.py` to one source revision.
+- [Admin trust boundary](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ADMIN_TRUST_BOUNDARY.md):
+  what the optional admin service can change and how to limit who reaches it.
+- [Segmented history v2](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SEGMENTED_HISTORY_V2.md):
+  history layout, migration, query limits, backup format, and recovery.
+- [Enclosure profile authoring](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PROFILE_AUTHORING.md):
+  the profile-driven layout system behind custom chassis views.
+- [Read-only SSH setup](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/SSH_READ_ONLY_SETUP.md):
+  the least-privilege SSH account for live slot mapping.
+- [Disk replacement on TrueNAS CORE with SAS multipath](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/DISK_REPLACEMENT_CORE_MULTIPATH.md):
+  operator runbook for replacing or hot-adding a disk in a dual-path shelf.
+- [Inventory evidence precedence](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/INVENTORY_EVIDENCE_PRECEDENCE.md):
+  how contradicting observations of the same bay are resolved by source
+  strength.
+- [Performance budgets](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PERFORMANCE_BUDGETS.md):
+  the deterministic 60-slot and 347-slot fixtures and the limits CI enforces.
+- [Hardware report fixture intake](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/HARDWARE_REPORT_FIXTURE_INTAKE.md):
+  how to contribute a sanitized hardware report that can become a parser test.
+- [Private QA restore and Compose matrix](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/PRIVATE_QA_RESTORE.md):
+  the release QA path that keeps public CI synthetic.
+- Platform notes for
+  [Quantastor](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/QUANTASTOR_NOTES.md),
+  [UniFi UNVR](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/UNVR_NOTES.md),
+  [ESXi](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ESXI_PLATFORM_FEASIBILITY.md),
+  [a GPU server host](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/GPU_SERVER_NOTES.md),
+  and [photo-backed M.2 carrier layouts](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/M2_CARRIER_RENDERING_NOTES.md).
+- [Roadmap](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/ROADMAP.md) and
+  [release checklist](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/RELEASE_CHECKLIST.md)
+  for what is next and how releases are cut. Older release notes, wraps, and
+  milestone plans are kept under `docs/archive/` in the repository.

@@ -1,0 +1,45 @@
+name: Public docs external links
+
+# The publish workflow runs only on main and dispatch, so this keeps the online
+# link check for pull requests that change the README, Wiki or the checker.
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/public-docs-links.yml"
+      - "README.md"
+      - "wiki/**"
+      - "scripts/check_public_docs.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-docs-links-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  external-links:
+    name: README and Wiki external links
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Check README and Wiki external links
+        run: python scripts/check_public_docs.py --check-external --external-timeout-seconds 15 --external-max-attempts 2

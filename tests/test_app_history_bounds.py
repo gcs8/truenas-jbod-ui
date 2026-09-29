@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import HistoryConfig, Settings
 from app.services import history_backend as history_backend_module
 from app.services.history_backend import HistoryBackendPolicyError
@@ -65,8 +66,8 @@ class AppHistoryBoundsTests(unittest.TestCase):
         backend = Mock()
         backend.get_scope_history = AsyncMock()
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
         ):
             for slots, window_hours in ((None, 24), ([], 24), ([0], None), ([0], 8761)):
                 with self.subTest(slots=slots, window_hours=window_hours), self.assertRaises(HTTPException):
@@ -92,9 +93,9 @@ class AppHistoryBoundsTests(unittest.TestCase):
         backend = Mock(configured=True)
         backend.get_scope_history = AsyncMock(return_value={999999: {"available": True}})
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "resolve_read_layout_slots", AsyncMock(return_value=(None, "unavailable"))),
-            patch.object(app_main, "get_history_backend", return_value=backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "resolve_read_layout_slots", AsyncMock(return_value=(None, "unavailable"))),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -143,8 +144,8 @@ class AppHistoryBoundsTests(unittest.TestCase):
             }
         )
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -167,7 +168,7 @@ class AppHistoryBoundsTests(unittest.TestCase):
         route = self._route("/api/history/refresh")
         backend = Mock()
         backend.refresh = AsyncMock(return_value={"ok": True, "mode": "full"})
-        with patch.object(app_main, "get_history_backend", return_value=backend):
+        with patch.object(app_routes, "get_history_backend", return_value=backend):
             response = asyncio.run(route.endpoint(payload=SimpleNamespace(mode="full")))
         self.assertEqual(json.loads(response.body)["mode"], "full")
         backend.refresh.assert_awaited_once_with("full")
@@ -181,7 +182,7 @@ class AppHistoryBoundsTests(unittest.TestCase):
         route = self._route("/api/history/refresh")
         backend = Mock()
         backend.refresh = AsyncMock(side_effect=HistoryBackendPolicyError(429))
-        with patch.object(app_main, "get_history_backend", return_value=backend):
+        with patch.object(app_routes, "get_history_backend", return_value=backend):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(route.endpoint(payload=SimpleNamespace(mode="full")))
         self.assertEqual(raised.exception.status_code, 429)
@@ -207,7 +208,7 @@ class AppHistoryBoundsTests(unittest.TestCase):
                 "metric_limit": 1,
             }
         )
-        with patch.object(app_main, "get_history_backend", return_value=backend):
+        with patch.object(app_routes, "get_history_backend", return_value=backend):
             response = asyncio.run(route.endpoint(request=request))
         self._assert_busy_response(response)
 
@@ -222,9 +223,9 @@ class AppHistoryBoundsTests(unittest.TestCase):
             side_effect=history_backend_module.HistoryBackendBusyError()
         )
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "resolve_read_layout_slots", AsyncMock(return_value=(None, "unavailable"))),
-            patch.object(app_main, "get_history_backend", return_value=backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "resolve_read_layout_slots", AsyncMock(return_value=(None, "unavailable"))),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -256,8 +257,8 @@ class AppHistoryBoundsTests(unittest.TestCase):
             side_effect=history_backend_module.HistoryBackendBusyError()
         )
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
         ):
             response = asyncio.run(
                 route.endpoint(

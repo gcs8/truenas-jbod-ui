@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from starlette.middleware.exceptions import ExceptionMiddleware
 
 from app import main as app_main
+from app import routes as app_routes
 
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
 
@@ -82,7 +83,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
         return int(start["status"]), json.loads(body), receive_calls
 
     async def test_declared_oversize_is_rejected_without_receive_or_backend_work(self) -> None:
-        with patch.object(app_main, "get_history_backend") as get_history_backend:
+        with patch.object(app_routes, "get_history_backend") as get_history_backend:
             status, payload, receive_calls = await self._post(
                 [b"ignored"],
                 content_length=MAX_HISTORY_SCOPES_REQUEST_BYTES + 1,
@@ -93,14 +94,14 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             payload,
             {
                 "ok": False,
-                "detail": "History request exceeds 65536 bytes.",
+                "detail": "History request is too large.",
             },
         )
         self.assertEqual(receive_calls, 0)
         get_history_backend.assert_not_called()
 
     async def test_chunked_oversize_stops_immediately_after_crossing_bound(self) -> None:
-        with patch.object(app_main, "get_history_backend") as get_history_backend:
+        with patch.object(app_routes, "get_history_backend") as get_history_backend:
             status, payload, receive_calls = await self._post(
                 [b"x" * MAX_HISTORY_SCOPES_REQUEST_BYTES, b"y", b"unread"],
             )
@@ -110,14 +111,14 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             payload,
             {
                 "ok": False,
-                "detail": "History request exceeds 65536 bytes.",
+                "detail": "History request is too large.",
             },
         )
         self.assertEqual(receive_calls, 2)
         get_history_backend.assert_not_called()
 
     async def test_malformed_json_returns_stable_bounded_error(self) -> None:
-        with patch.object(app_main, "get_history_backend") as get_history_backend:
+        with patch.object(app_routes, "get_history_backend") as get_history_backend:
             status, payload, receive_calls = await self._post([b"{"])
 
         self.assertEqual(status, 422)
@@ -132,7 +133,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
         get_history_backend.assert_not_called()
 
     async def test_in_limit_invalid_shape_returns_stable_bounded_error(self) -> None:
-        with patch.object(app_main, "get_history_backend") as get_history_backend:
+        with patch.object(app_routes, "get_history_backend") as get_history_backend:
             status, payload, receive_calls = await self._post([b"{}"])
 
         self.assertEqual(status, 422)
@@ -164,7 +165,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
         backend = AsyncMock()
         backend.get_scopes_history.return_value = {"ok": True}
 
-        with patch.object(app_main, "get_history_backend", return_value=backend):
+        with patch.object(app_routes, "get_history_backend", return_value=backend):
             status, payload, receive_calls = await self._post(
                 [body],
                 content_length=len(body),
@@ -202,7 +203,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             backend = AsyncMock()
             backend.get_scopes_history.return_value = {"ok": True}
             with self.subTest(content_type=content_type), patch.object(
-                app_main,
+                app_routes,
                 "get_history_backend",
                 return_value=backend,
             ):
@@ -217,7 +218,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
                 payload,
                 {
                     "ok": False,
-                    "detail": "History request Content-Type must be application/json or application/*+json.",
+                    "detail": "Send this request with Content-Type: application/json.",
                 },
             )
             self.assertEqual(receive_calls, 0)
@@ -246,7 +247,7 @@ class MainHistoryScopesBodyBoundTests(unittest.IsolatedAsyncioTestCase):
             backend = AsyncMock()
             backend.get_scopes_history.return_value = {"ok": True}
             with self.subTest(content_type=content_type), patch.object(
-                app_main,
+                app_routes,
                 "get_history_backend",
                 return_value=backend,
             ):

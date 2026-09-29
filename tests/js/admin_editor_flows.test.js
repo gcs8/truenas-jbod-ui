@@ -264,13 +264,101 @@ test("setup collection preserves saved SSH secrets and configured timeout", () =
   assert.equal(payload.ssh_commands_source_system_id, "saved-esxi");
 });
 
+test("a clone sends its source system id whatever happens to the SSH commands", () => {
+  const collectSecretSource = sourceBetween(
+    "  function collectSecretField",
+    "\n  function renderHistoryMaintenance"
+  );
+  const collectSetupSource = sourceBetween(
+    "  function collectSetupPayload",
+    "\n  async function discoverQuantastorHaNodes"
+  );
+  // `ssh_commands_source_system_id` is null for every case below: the operator
+  // replaced or defaulted the command box, so the SSH handle is gone. The
+  // clone handle must survive that, otherwise the server cannot tell which of
+  // several systems on one endpoint this entry was cloned from.
+  const sshUpdates = {
+    replaced: {
+      ssh_commands: ["echo replaced"],
+      ssh_commands_action: "replace",
+      ssh_commands_source_system_id: null,
+    },
+    defaulted: {
+      ssh_commands: [],
+      ssh_commands_action: "default",
+      ssh_commands_source_system_id: null,
+    },
+  };
+  const collectFor = (sshUpdate, { loadedSystemId, systemId }) => {
+    const elements = sparseElements({
+      setupPlatform: { value: "scale" },
+      setupSshEnabled: { checked: false },
+      setupSshKeyMode: { value: "none" },
+      setupSystemId: { value: systemId },
+      setupTruenasHost: { value: "https://nas.example.test" },
+      setupSshPort: { value: "22" },
+      setupSshStrictHostKey: { checked: true },
+    });
+    const state = { loadedSystemId, storageViews: [] };
+    const { collectSetupPayload } = loadFunctions(
+      [collectSecretSource, collectSetupSource],
+      ["collectSetupPayload"],
+      {
+        PRESERVE_SECRET_SENTINEL,
+        collectSshCommandUpdate: () => ({ ...sshUpdate }),
+        collectTlsServerName: () => null,
+        currentQuantastorHaNodes: () => [],
+        currentSetupPlatform: () => "scale",
+        elements,
+        getSystemById: () => null,
+        isEditingLoadedSystem: () => false,
+        normalizeConnectionHost: (value) => String(value || "").trim(),
+        normalizeKeyMode: (value) => value,
+        platformSupportsSavedSudo: () => false,
+        recommendedSshUserForPlatform: () => "jbodmap",
+        savedSecretConfigured: () => false,
+        setupPlatformUsesBmcOnlyHost: () => false,
+        setupPlatformUsesSshOnlyHost: () => false,
+        state,
+      }
+    );
+    return collectSetupPayload({ preserveRedactedSecrets: false });
+  };
+
+  for (const [label, sshUpdate] of Object.entries(sshUpdates)) {
+    const clone = collectFor(sshUpdate, {
+      loadedSystemId: "saved-jsonrpc",
+      systemId: "scale-clone",
+    });
+    assert.equal(clone.ssh_commands_source_system_id, null, label);
+    assert.equal(clone.clone_source_system_id, "saved-jsonrpc", label);
+    assert.equal(clone.replace_existing, false, label);
+  }
+
+  // A re-save under the same id is not a clone, so there is nothing to inherit.
+  const resave = collectFor(sshUpdates.replaced, {
+    loadedSystemId: "saved-jsonrpc",
+    systemId: "saved-jsonrpc",
+  });
+  assert.equal(resave.clone_source_system_id, null);
+  assert.equal(resave.replace_existing, true);
+
+  // Start Fresh clears state.loadedSystemId, so a brand new system sends none.
+  const fresh = collectFor(sshUpdates.defaulted, {
+    loadedSystemId: null,
+    systemId: "brand-new",
+  });
+  assert.equal(fresh.clone_source_system_id, null);
+});
+
 test("Quantastor discovery uses canonical preserved secrets and SSH timeout", async () => {
   const discoverSource = sourceBetween(
-    "  async function discoverQuantastorHaNodes",
+    "  function setupDraftSnapshot",
     "\n  function resolveBootstrapServiceKey"
   );
-  let collectOptions;
+  const collectOptions = [];
   let requestBody;
+  const banners = [];
   const setupPayload = {
     system_id: "saved-quantastor",
     truenas_host: "https://192.0.2.30",
@@ -302,7 +390,7 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
     ["discoverQuantastorHaNodes"],
     {
       collectSetupPayload: (options) => {
-        collectOptions = options;
+        collectOptions.push(options);
         return setupPayload;
       },
       collectTlsServerName: () => null,
@@ -315,7 +403,7 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
       normalizeHaNodes: (nodes) => nodes,
       renderQuantastorHaSection: () => {},
       renderStorageViews: () => {},
-      setBanner: () => {},
+      setBanner: (message, kind) => banners.push({ message, kind }),
       state,
       syncHaNodesFromInputs: () => {},
     }
@@ -323,11 +411,14 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
 
   await discoverQuantastorHaNodes();
 
-  assert.deepEqual(JSON.parse(JSON.stringify(collectOptions)), { preserveRedactedSecrets: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(collectOptions[0])), { preserveRedactedSecrets: true });
+  assert.deepEqual(collectOptions.slice(1), [undefined, undefined], "local comparisons do not request preservation authority");
   assert.equal(requestBody.system_id, "saved-quantastor");
   assert.equal(requestBody.api_password, PRESERVE_SECRET_SENTINEL);
   assert.equal(requestBody.ssh_password, PRESERVE_SECRET_SENTINEL);
   assert.equal(requestBody.ssh_timeout_seconds, 45);
+  assert.equal(banners.at(-1).kind, "success", "the response path must finish, not swallow a missing helper");
+  assert.equal(state.setupDirty, undefined, "unchanged node discovery is not a submitted-value edit");
 });
 
 test("failed ESXi install refreshes packages before restoring controls", async () => {

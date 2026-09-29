@@ -3,6 +3,9 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import threading
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -14,6 +17,34 @@ from app.request_context import request_id_headers
 
 class DockerRuntimeError(RuntimeError):
     pass
+
+
+class RuntimeBusyError(DockerRuntimeError):
+    """Another admin operation owns an affected runtime target."""
+
+
+_runtime_reservation_lock = threading.Lock()
+_reserved_runtime_targets: set[str] = set()
+
+
+@contextmanager
+def reserve_runtime_targets(keys: Iterable[str]) -> Iterator[None]:
+    """Reserve process-local admin targets without waiting for blocking work.
+
+    Keep the reservation in the worker that performs control/maintenance, not
+    in its cancellable caller. Disjoint targets may proceed independently.
+    This coordinates this sidecar, not external Docker clients or processes.
+    """
+    targets = frozenset(keys)
+    with _runtime_reservation_lock:
+        if targets & _reserved_runtime_targets:
+            raise RuntimeBusyError("Runtime is busy with another admin operation. Try again after it finishes.")
+        _reserved_runtime_targets.update(targets)
+    try:
+        yield
+    finally:
+        with _runtime_reservation_lock:
+            _reserved_runtime_targets.difference_update(targets)
 
 
 # Docker only answers a stop/restart request after the container has actually stopped,
@@ -42,20 +73,20 @@ class DockerRuntimeService:
         self.managed_containers = {
             "ui": {
                 "name": settings.container_ui_name,
-                "label": "Read UI",
-                "description": "Primary read-mostly enclosure UI.",
+                "label": "Main UI",
+                "description": "The main page you normally use.",
                 "livez_url": settings.container_ui_livez_url,
             },
             "history": {
                 "name": settings.container_history_name,
-                "label": "History Sidecar",
-                "description": "Optional SQLite history collector.",
+                "label": "History",
+                "description": "Records disk history and charts.",
                 "livez_url": settings.container_history_livez_url,
             },
             "admin": {
                 "name": settings.container_admin_name,
-                "label": "Admin Sidecar",
-                "description": "Optional maintenance surface.",
+                "label": "Admin",
+                "description": "This admin page.",
                 "livez_url": settings.container_admin_livez_url,
             },
         }
@@ -68,7 +99,7 @@ class DockerRuntimeService:
         if not self.available:
             return {
                 "available": False,
-                "detail": f"Docker socket {self.socket_path} is not mounted into the admin sidecar.",
+                "detail": f"Docker socket {self.socket_path} is not mounted into the admin container.",
                 "containers": [self._missing_status_payload(key) for key in self.managed_containers],
             }
         try:
@@ -171,7 +202,7 @@ class DockerRuntimeService:
     ) -> bytes:
         if not self.available:
             raise DockerRuntimeError(
-                f"Docker socket {self.socket_path} is not mounted into the admin sidecar."
+                f"Docker socket {self.socket_path} is not mounted into the admin container."
             )
         effective_timeout = (
             int(timeout) if timeout is not None else int(self.settings.container_control_timeout_seconds)

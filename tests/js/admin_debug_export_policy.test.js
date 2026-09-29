@@ -166,8 +166,8 @@ test("explicit plaintext policy permits unscrubbed unencrypted export", () => {
 });
 
 test("submission and passphrase input recheck the same policy", () => {
-  assert.match(functionSource("exportDebugBundle"), /getDebugExportPolicy\(\)/);
-  assert.match(functionSource("exportDebugBundle"), /if \(!policy\.allowed\)/);
+  assert.match(functionSource("runExportDebugBundle"), /getDebugExportPolicy\(\)/);
+  assert.match(functionSource("runExportDebugBundle"), /if \(!policy\.allowed\)/);
   assert.match(
     SOURCE,
     /debugExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/
@@ -206,7 +206,7 @@ test("encrypted full backup needs a passphrase and is otherwise exportable", () 
   elements.backupExportPassphrase.value = "synthetic-passphrase";
   functions.syncBackupControls();
   assert.equal(elements.backupExportButton.disabled, false);
-  assert.match(elements.backupExportResult.textContent, /Exports can stay live/);
+  assert.match(elements.backupExportResult.textContent, /export while the app is running/);
 });
 
 test("explicit plaintext policy permits an unencrypted full backup", () => {
@@ -233,10 +233,42 @@ test("full backup without selected paths stays disabled even when policy allows 
 });
 
 test("full backup submission and passphrase input recheck the backup policy", () => {
-  assert.match(functionSource("exportBackup"), /getBackupExportPolicy\(\)/);
-  assert.match(functionSource("exportBackup"), /if \(!policy\.allowed\)/);
+  assert.match(functionSource("runExportBackup"), /getBackupExportPolicy\(\)/);
+  assert.match(functionSource("runExportBackup"), /if \(!policy\.allowed\)/);
   assert.match(
     SOURCE,
     /backupExportPassphrase\?\.addEventListener\("input",\s*syncBackupControls\)/
+  );
+});
+
+// #397: an encrypted FULL backup (history selected) defaults to tar.zst in the
+// TJBENC02 envelope and keeps 7z as a portable choice; without history an
+// encrypted export stays 7z.
+test("encrypted full backup with history defaults to tar.zst and keeps an explicit 7z choice", () => {
+  const { state, elements, functions } = buildHarness();
+  state.selectedBackupPaths = ["history_db", "config_file"];
+  elements.backupPackaging.value = "zip";
+
+  functions.syncBackupControls();
+  assert.equal(elements.backupPackaging.value, "tar.zst");
+  assert.equal(elements.backupPackaging.disabled, false);
+
+  elements.backupPackaging.value = "7z";
+  state.backupForced7z = false;
+  functions.syncBackupControls();
+  assert.equal(elements.backupPackaging.value, "7z");
+  assert.equal(elements.backupPackaging.disabled, false);
+
+  state.selectedBackupPaths = ["config_file"];
+  elements.backupPackaging.value = "tar.zst";
+  functions.syncBackupControls();
+  assert.equal(elements.backupPackaging.value, "7z");
+  assert.equal(elements.backupPackaging.disabled, true);
+});
+
+test("changing the full backup format re-syncs the controls", () => {
+  assert.match(
+    SOURCE,
+    /backupPackaging\?\.addEventListener\("change", \(\) => \{[\s\S]*?state\.backupForced7z = false;[\s\S]*?syncBackupControls\(\);/
   );
 });

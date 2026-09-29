@@ -5,7 +5,8 @@ system. Nothing is installed on TrueNAS.
 
 ## What you need
 
-- Docker with Docker Compose
+- Docker with Docker Compose on a Linux host. Windows, including Docker
+  Desktop, is best-effort: CI does not run the app or its tests there.
 - `curl`
 - A folder you can write to, or `sudo` access to create one
 - Outbound HTTPS access to GitHub and GHCR
@@ -106,7 +107,9 @@ docker compose --profile history pull
 docker compose --profile history up -d
 ```
 
-History listens on `127.0.0.1:8081` by default.
+History listens on `127.0.0.1:8081` by default. Add `COMPOSE_PROFILES=history`
+to `.env` once so that later `docker compose pull` and `docker compose up -d`
+commands include history without the `--profile` flag.
 
 ## Optional admin UI
 
@@ -124,13 +127,38 @@ Open:
 http://your-docker-host:8082
 ```
 
+The admin UI stops itself one hour after it starts. Run the same
+`docker compose --profile admin up -d enclosure-admin` command to start it
+again.
+
 ## Update
 
+In the deployment folder, change the existing `JBOD_UI_IMAGE` assignment in
+`.env` to the target release tag or immutable digest, then pull and recreate:
+
 ```bash
-cd /docker-local/truenas-jbod-ui
+${EDITOR:-vi} .env
 docker compose pull
 docker compose up -d
 ```
+
+Editing the pin is required when it names an older version or digest. Keep the
+existing Compose files, configuration, authentication, origins, and bind
+addresses. Do not download a replacement Compose file for a normal image update.
+
+Use the same ordered `-f` files and selected profiles for both commands. If you
+use history, for example, run `docker compose --profile history pull` followed
+by `docker compose --profile history up -d`. Alternatively, retain
+`COMPOSE_PROFILES=history` in `.env` so the three commands above include history.
+Include admin only when you intend it to be running; do not use `--profile '*'`
+to restart dormant admin or one-shot backup jobs. Preserve any existing secrets
+or non-root overlay rather than replacing it with the base file.
+
+Check `docker compose ps` and each enabled service's `/healthz` after startup.
+For rollback to a compatible predecessor, set `JBOD_UI_IMAGE` back to its
+recorded tag or digest and run the same pull and up commands with the same
+Compose files and profiles. Image rollback does not restore durable data.
+Review release compatibility notes and keep a verified backup before updating.
 
 ## Stop or remove the containers
 

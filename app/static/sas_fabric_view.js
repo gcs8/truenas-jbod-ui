@@ -4,11 +4,11 @@
   const modeCopy = {
     lanes: {
       title: "Storage Lanes",
-      subtitle: "Top-down source lanes with paths, transport details, enclosures, views, and mapped bays aligned in each lane.",
+      subtitle: "Each storage source in its own lane: paths, enclosures or views, and the bays behind them.",
     },
     impact: {
       title: "Impact Map",
-      subtitle: "Start from paths and degraded states, then show affected slots, pools, vdevs, and trace hops.",
+      subtitle: "Start from a path, especially a degraded one, and see which bays, pools and vdevs it carries.",
     },
     trace: {
       title: "Physical Trace",
@@ -16,17 +16,17 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay and render the available path evidence from host to source, enclosure or view, pool, vdev, and disk.",
+      subtitle: "Pick a bay to follow it from host to source, enclosure or view, pool, vdev and disk.",
     },
   };
   const coreModeCopy = {
     lanes: {
       title: "Storage Lanes",
-      subtitle: "Top-down HBA lanes with paths, expanders, enclosures, and impacted bays aligned in each lane.",
+      subtitle: "Each HBA in its own lane: paths, expanders, enclosures and the bays behind them.",
     },
     impact: {
       title: "Impact Map",
-      subtitle: "Start from paths and degraded states, then show affected slots, pools, vdevs, and trace hops.",
+      subtitle: "Start from a path, especially a degraded one, and see which bays, pools and vdevs it carries.",
     },
     trace: {
       title: "Physical Trace",
@@ -34,7 +34,7 @@
     },
     disk: {
       title: "Disk Path",
-      subtitle: "Pick a bay and render each controller path from host to HBA, SAS link, expander, backplane zone, and disk.",
+      subtitle: "Pick a bay to follow each controller path from host to HBA, SAS link, expander, backplane zone and disk.",
     },
   };
 
@@ -51,9 +51,14 @@
     expandedSlotLists: {},
     diagnosticTables: {},
     diagnosticPayloads: {},
+    openEvidencePanels: new Set(),
     smartSummaries: {},
+    smartSummaryTimes: {},
     smartRequests: {},
     aliasEditObjectId: null,
+    aliasDraft: null,
+    aliasEditGeneration: 0,
+    fabricScopeReady: Boolean(bootstrap.fabric),
     writePolicy: normalizeFabricWritePolicy(bootstrap.writePolicy),
     writeAuthorization: null,
     writeAuthPending: false,
@@ -179,11 +184,11 @@
       if (state.writeAuthPending) {
         elements.authStatus.textContent = "Checking credentials...";
       } else if (signedIn && fabricWritePolicyAllowsWrites()) {
-        elements.authStatus.textContent = "Signed in for writes. Credentials clear on reload or sign-out.";
+        elements.authStatus.textContent = "Signed in. Renaming is enabled until you reload or sign out.";
       } else if (signedIn) {
         elements.authStatus.textContent = `Signed in, but writes are blocked. ${fabricWritePolicyReason()}`;
       } else {
-        elements.authStatus.textContent = "Reads remain anonymous. Credentials stay in this page only.";
+        elements.authStatus.textContent = "Sign in to rename items. You stay signed in until you reload this page.";
       }
     }
   }
@@ -240,7 +245,16 @@
     render();
   }
 
+  function fabricScopeIsCurrent() {
+    return state.fabricScopeReady && !state.loading && Boolean(state.fabric)
+      && state.fabric.system_id === state.selectedSystemId
+      && (state.fabric.selected_enclosure_id || null) === state.selectedEnclosureId;
+  }
+
   function fabricAliasWriteAttributes() {
+    if (!fabricScopeIsCurrent()) {
+      return ' disabled title="Refresh the selected Storage Fabric scope before editing names."';
+    }
     if (fabricWritePolicyAllowsWrites()) {
       return "";
     }
@@ -305,12 +319,45 @@
     return String(value || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
   }
 
+  const KIND_LABELS = {
+    host: "Host",
+    controller: "Controller",
+    path: "Path",
+    expander: "Expander",
+    "mpr-enclosure": "MPR Enclosure",
+    "ses-enclosure": "SES Enclosure",
+    "storage-enclosure": "Storage Enclosure",
+    backplane: "Backplane",
+    bay: "Bay",
+    pool: "Pool",
+    vdev: "Vdev",
+    "host-controller": "Host Controller",
+    "controller-path": "Controller Path",
+    "controller-expander": "Controller Expander",
+    "expander-enclosure": "Expander Enclosure",
+    "path-bay": "Path Bay",
+    "path-ses-enclosure": "Path SES Enclosure",
+    "path-storage-enclosure": "Path Storage Enclosure",
+    "ses-bay": "SES Bay",
+    "backplane-bay": "Backplane Bay",
+    "bay-pool": "Bay Pool",
+    "pool-vdev": "Pool Vdev",
+  };
+
+  const KIND_ACRONYMS = new Set(["mpr", "ses", "sg", "hba", "ioc", "sas", "scsi", "nvme", "bmc", "ipmi", "pci", "pcie", "lun"]);
+
   function formatKind(kind) {
-    return String(kind || "item")
-      .replace(/-/g, " ")
-      .replace(/\b\w/g, (letter) => letter.toUpperCase())
-      .replace("Mpr", "MPR")
-      .replace("Ses", "SES");
+    const key = String(kind || "item");
+    if (KIND_LABELS[key]) {
+      return KIND_LABELS[key];
+    }
+    return key
+      .split("-")
+      .filter(Boolean)
+      .map((word) => (KIND_ACRONYMS.has(word.toLowerCase())
+        ? word.toUpperCase()
+        : word.charAt(0).toUpperCase() + word.slice(1)))
+      .join(" ");
   }
 
   function formatSlotLabel(slotNumber) {
@@ -368,6 +415,19 @@
 
   function fabricViewCopy(fabric = state.fabric) {
     const platformLabel = fabricPlatformLabel(fabric);
+    const cache = fabricCache(fabric);
+    if (cache?.viewCopy && cache.viewCopyPlatform === platformLabel) {
+      return cache.viewCopy;
+    }
+    const copy = buildFabricViewCopy(fabric, platformLabel);
+    if (cache) {
+      cache.viewCopy = copy;
+      cache.viewCopyPlatform = platformLabel;
+    }
+    return copy;
+  }
+
+  function buildFabricViewCopy(fabric, platformLabel) {
     const kind = fabricKind(fabric);
     const linuxSes = kind === "linux_ses";
     if (linuxSes) {
@@ -422,8 +482,8 @@
     if (String(kind || "").startsWith("storage_") || fabric?.raw?.fabric_domain === "storage_fabric") {
       const storageCopyByKind = {
         storage_quantastor: {
-          pageSummary: "Quantastor HA-node, enclosure, pool, disk, and ownership/fence evidence for the selected storage view.",
-          unavailableMap: "No Quantastor Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "Quantastor HA-node, enclosure, pool, disk and ownership details for the selected storage view.",
+          unavailableMap: "No Quantastor disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "storage system / HA node"],
           paths: ["Storage Paths", "pool, SES, or owner groups"],
           enclosures: ["Views", "Quantastor / SES objects"],
@@ -439,21 +499,21 @@
             ...modeCopy,
             lanes: {
               title: "Storage Lanes",
-              subtitle: "Quantastor HA nodes, SES paths, storage views, pool/vdev membership, and mapped bays grouped by source evidence.",
+              subtitle: "Each Quantastor HA member in its own lane: SES paths, storage views, pool/vdev membership and mapped bays.",
             },
             trace: {
               title: "Physical Trace",
-              subtitle: "Follow the selected bay through HA ownership, SES path evidence, storage view, pool/vdev membership, and disk identity.",
+              subtitle: "Follow the selected bay through HA ownership, SES path, storage view, pool/vdev membership and disk identity.",
             },
             disk: {
               title: "Disk Path",
-              subtitle: "Pick a bay and show the Quantastor path evidence we can prove: HA node, SES device, view, pool, vdev, and disk.",
+              subtitle: "Pick a bay to follow it from HA node to SES device, view, pool, vdev and disk.",
             },
           },
         },
         storage_esxi: {
-          pageSummary: "ESXi host, controller, member, datastore, LUN, and SMART evidence for the selected local storage view.",
-          unavailableMap: "No ESXi Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "ESXi host, controller, member, datastore, LUN and SMART details for the selected local storage view.",
+          unavailableMap: "No ESXi disk or controller data was found for this selection yet.",
           controllers: ["Sources", "ESXi / vendor CLI"],
           paths: ["Storage Paths", "controller/member groups"],
           enclosures: ["Enclosures", "vendor/BMC/profile objects"],
@@ -469,13 +529,13 @@
             ...modeCopy,
             disk: {
               title: "Disk Path",
-              subtitle: "Pick a bay and show the ESXi evidence we can prove: host, controller, member path, enclosure/profile, datastore or vdev, and disk.",
+              subtitle: "Pick a bay to follow it from host to controller, member path, enclosure or profile, datastore or vdev, and disk.",
             },
           },
         },
         storage_linux: {
-          pageSummary: "Linux block, NVMe, mdadm, profile, SMART, and optional SES evidence for the selected storage view.",
-          unavailableMap: "No Linux Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "Linux block, NVMe, mdadm, profile, SMART and optional SES details for the selected storage view.",
+          unavailableMap: "No Linux disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "Linux storage source"],
           paths: ["Storage Paths", "block, NVMe, or mdadm groups"],
           enclosures: ["Views", "profile or enclosure objects"],
@@ -489,24 +549,24 @@
           },
         },
         storage_scale: {
-          pageSummary: "TrueNAS SCALE storage, pool, disk, Linux block, and optional SES evidence for the selected view.",
-          unavailableMap: "No SCALE Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "TrueNAS SCALE storage, pool, disk, Linux block and optional SES details for the selected view.",
+          unavailableMap: "No TrueNAS SCALE disk or enclosure data was found for this selection yet.",
           controllers: ["Sources", "SCALE / Linux storage"],
           paths: ["Storage Paths", "pool, block, or SES groups"],
           enclosures: ["Enclosures", "middleware/profile objects"],
         },
         storage_bmc: {
-          pageSummary: "BMC slot and chassis evidence for the selected platform view.",
-          unavailableMap: "No BMC Storage Fabric evidence is available for this selection yet.",
+          pageSummary: "BMC slot and chassis details for the selected view.",
+          unavailableMap: "No BMC slot or chassis data was found for this selection yet.",
           controllers: ["Sources", "BMC / IPMI"],
           paths: ["Storage Paths", "slot inventory groups"],
           enclosures: ["Enclosures", "BMC chassis objects"],
         },
       };
       const details = storageCopyByKind[kind] || {
-        pageSummary: "Best-effort storage path evidence for the selected platform view.",
-        unavailableMap: `No Storage Fabric evidence is available for ${platformLabel}.`,
-        controllers: ["Sources", "platform evidence"],
+        pageSummary: "Storage path for the selected view.",
+        unavailableMap: `No disk or enclosure data was found for ${platformLabel}.`,
+        controllers: ["Sources", "reported by the platform"],
         paths: ["Storage Paths", "platform groups"],
         enclosures: ["Enclosures", "platform objects"],
       };
@@ -529,7 +589,7 @@
         summary: {
           controllers: details.controllers,
           paths: details.paths,
-          expanders: ["Transport Detail", "platform-native evidence"],
+          expanders: ["Transport Detail", "as reported by the platform"],
           enclosures: details.enclosures,
         },
         laneStages: {
@@ -550,7 +610,7 @@
         pageSummary: `Storage Fabric evidence is not available for ${platformLabel} in this snapshot.`,
         refresh: "Refresh Storage Fabric",
         statusBase: "STORAGE",
-        unavailableMap: `No Storage Fabric topology map is available for ${platformLabel}.`,
+        unavailableMap: `No Storage Fabric map is available for ${platformLabel}.`,
         modeLabels: {
           lanes: "Storage Lanes",
           impact: "Impact Map",
@@ -559,8 +619,8 @@
         },
         modes: modeCopy,
         summary: {
-          controllers: ["Sources", "no graph evidence"],
-          paths: ["Storage Paths", "no graph evidence"],
+          controllers: ["Sources", "none found"],
+          paths: ["Storage Paths", "none found"],
           expanders: ["Transport Detail", "not exposed"],
           enclosures: ["Enclosures", "platform inventory only"],
         },
@@ -577,10 +637,10 @@
     return {
       kind: "core_sas",
       eyebrow: "TrueNAS CORE / Storage Fabric",
-      pageSummary: "HBA, path, expander, SES, and affected-bay topology for the selected live enclosure.",
+      pageSummary: "Which HBA, path, expander and enclosure each bay hangs off, for the selected enclosure.",
       refresh: "Refresh Storage Fabric",
       statusBase: "STORAGE",
-      unavailableMap: "No topology map is available for this platform yet.",
+      unavailableMap: "No Storage Fabric map is available for this platform yet.",
       modeLabels: {
         lanes: "Storage Lanes",
         impact: "Impact Map",
@@ -597,10 +657,10 @@
         disk: "Disk",
       },
       summary: {
-        controllers: ["Controllers", "HBAs reported"],
-        paths: ["Paths", "multipath states"],
-        expanders: ["Expanders", "MPR expander rows"],
-        enclosures: ["Enclosures", "MPR/SES objects"],
+        controllers: ["HBAs", "reported by the host"],
+        paths: ["Paths", "active + standby"],
+        expanders: ["Expanders", "SAS expanders seen"],
+        enclosures: ["Enclosures", "seen by the HBA or SES"],
       },
       laneStages: {
         controller: "Controller",
@@ -677,12 +737,6 @@
     const rank = {
       path: 0,
       bay: 1,
-      controller: 2,
-      expander: 3,
-      "mpr-enclosure": 4,
-      "ses-enclosure": 5,
-      "storage-enclosure": 6,
-      backplane: 7,
     };
     return rank[traceItem?.kind] ?? 99;
   }
@@ -759,19 +813,62 @@
     return sorted.length > limit ? `${visible}, +${sorted.length - limit}` : visible;
   }
 
-  function renderSlotList(slots, { limit = 28, expandKey = "" } = {}) {
+  function slotListParts(slots, { limit = 28, expandKey = "" } = {}) {
     const sorted = sortedSlots(slots);
-    if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
-    }
-    const expanded = expandKey && state.expandedSlotLists[expandKey];
+    const expanded = Boolean(expandKey && state.expandedSlotLists[expandKey]);
     const visible = expanded ? sorted : sorted.slice(0, limit);
-    const overflow = sorted.length - visible.length;
-    const labels = visible.map(formatSlotLabel).join(", ");
-    const overflowMarkup = expandKey && overflow > 0
-      ? ` <span class="fabric-overflow-button" role="button" tabindex="0" data-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</span>`
-      : "";
-    return `<span>${escapeHtml(labels)}</span>${overflowMarkup}`;
+    return {
+      sorted,
+      expanded,
+      labels: visible.map(formatSlotLabel).join(", "),
+      overflow: sorted.length - visible.length,
+      canToggle: Boolean(expandKey) && sorted.length > limit,
+    };
+  }
+
+  function slotOverflowLabel(parts) {
+    return parts.expanded ? "Show fewer" : `+${parts.overflow}`;
+  }
+
+  function renderSlotList(slots, options = {}) {
+    const parts = slotListParts(slots, options);
+    if (!parts.sorted.length) {
+      return '<span class="fabric-empty-note">No mapped disks</span>';
+    }
+    const listAttribute = options.expandKey ? ` data-fabric-slot-list="${escapeHtml(options.expandKey)}"` : "";
+    return `<span${listAttribute}>${escapeHtml(parts.labels)}</span>`;
+  }
+
+  function renderSlotOverflowToggle(slots, options = {}) {
+    const parts = slotListParts(slots, options);
+    if (!parts.canToggle) {
+      return "";
+    }
+    return `<button type="button" class="fabric-overflow-button" data-fabric-expand-slots="${escapeHtml(options.expandKey)}" aria-expanded="${parts.expanded ? "true" : "false"}">${escapeHtml(slotOverflowLabel(parts))}</button>`;
+  }
+
+  function slotsForExpandKey(key) {
+    const [kind, ...rest] = String(key || "").split(":");
+    const id = rest.join(":");
+    if (kind !== "path" || !id) {
+      return [];
+    }
+    const path = list(state.fabric?.paths).find((item) => item.id === id);
+    return sortedSlots(path?.slots || traceById(id)?.slots);
+  }
+
+  function refreshSlotList(key, toggleButton) {
+    const cell = toggleButton?.closest?.("[data-fabric-slot-cell]");
+    const listElement = cell?.querySelector?.("[data-fabric-slot-list]");
+    if (!cell || !listElement) {
+      return false;
+    }
+    const limit = Number(cell.dataset?.fabricSlotLimit) || 28;
+    const parts = slotListParts(slotsForExpandKey(key), { limit, expandKey: key });
+    listElement.textContent = parts.labels;
+    toggleButton.textContent = slotOverflowLabel(parts);
+    toggleButton.setAttribute("aria-expanded", parts.expanded ? "true" : "false");
+    return true;
   }
 
   function formatTimestamp(value) {
@@ -874,9 +971,18 @@
     return params;
   }
 
+  function appUrl(path, params = null) {
+    const base = document.baseURI || window.location?.href || "http://localhost/";
+    const url = new URL(String(path || "").replace(/^\/+/, ""), base);
+    const query = params ? params.toString() : "";
+    if (query) {
+      url.search = url.search ? `${url.search}&${query}` : `?${query}`;
+    }
+    return `${url.pathname}${url.search}`;
+  }
+
   function scopedUrl(path, options = {}) {
-    const params = selectedParams(options);
-    return params.toString() ? `${path}?${params.toString()}` : path;
+    return appUrl(path, selectedParams(options));
   }
 
   function replaceLocationIfChanged(nextUrl) {
@@ -889,10 +995,8 @@
   }
 
   function syncLocation() {
-    const pageParams = selectedParams({ includeMode: true });
-    replaceLocationIfChanged(pageParams.toString() ? `/sas-fabric?${pageParams.toString()}` : "/sas-fabric");
-    const backParams = selectedParams();
-    const backHref = backParams.toString() ? `/?${backParams.toString()}` : "/";
+    replaceLocationIfChanged(appUrl("sas-fabric", selectedParams({ includeMode: true })));
+    const backHref = appUrl("./", selectedParams());
     elements.backLinks.forEach((link) => {
       link.href = backHref;
     });
@@ -927,20 +1031,47 @@
     return payload;
   }
 
+  const fabricCaches = new WeakMap();
+  const snapshotSlotCaches = new WeakMap();
+
+  function fabricCache(fabric) {
+    if (!fabric || typeof fabric !== "object") {
+      return null;
+    }
+    let cache = fabricCaches.get(fabric);
+    if (!cache) {
+      cache = {};
+      fabricCaches.set(fabric, cache);
+    }
+    return cache;
+  }
+
+  function cachedFabricMap(fabric, name, build) {
+    const cache = fabricCache(fabric);
+    if (cache?.[name]) {
+      return cache[name];
+    }
+    const built = build(fabric);
+    if (cache) {
+      cache[name] = built;
+    }
+    return built;
+  }
+
   function nodeMap(fabric = state.fabric) {
-    return new Map(list(fabric?.nodes).map((node) => [node.id, node]));
+    return cachedFabricMap(fabric, "nodeMap", (item) => new Map(list(item?.nodes).map((node) => [node.id, node])));
   }
 
   function linkMap(fabric = state.fabric) {
-    return new Map(list(fabric?.links).map((link) => [link.id, link]));
+    return cachedFabricMap(fabric, "linkMap", (item) => new Map(list(item?.links).map((link) => [link.id, link])));
   }
 
   function traceMap(fabric = state.fabric) {
-    return new Map(list(fabric?.traces).map((trace) => [trace.id, trace]));
+    return cachedFabricMap(fabric, "traceMap", (item) => new Map(list(item?.traces).map((trace) => [trace.id, trace])));
   }
 
   function aliasMap(fabric = state.fabric) {
-    return new Map(list(fabric?.aliases).map((alias) => [alias.object_id, alias]));
+    return cachedFabricMap(fabric, "aliasMap", (item) => new Map(list(item?.aliases).map((alias) => [alias.object_id, alias])));
   }
 
   function aliasForObject(objectId, fabric = state.fabric) {
@@ -1115,7 +1246,7 @@
     if (selectionRefEquals(ref, currentSelectionRef())) {
       return true;
     }
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     const trailIndex = state.selectionTrail.findIndex((trailRef) => selectionRefEquals(trailRef, ref));
     if (trailIndex >= 0) {
       state.selectionTrail = state.selectionTrail.slice(0, trailIndex);
@@ -1279,18 +1410,60 @@
   }
 
   function slotByNumber(slotNumber) {
-    return list(state.snapshot?.slots).find((slot) => Number(slot.slot) === Number(slotNumber)) || null;
+    const snapshot = state.snapshot;
+    if (!snapshot || typeof snapshot !== "object") {
+      return null;
+    }
+    let slotsByNumber = snapshotSlotCaches.get(snapshot);
+    if (!slotsByNumber) {
+      slotsByNumber = new Map();
+      list(snapshot.slots).forEach((slot) => {
+        const key = Number(slot?.slot);
+        if (Number.isFinite(key) && !slotsByNumber.has(key)) {
+          slotsByNumber.set(key, slot);
+        }
+      });
+      snapshotSlotCaches.set(snapshot, slotsByNumber);
+    }
+    return slotsByNumber.get(Number(slotNumber)) || null;
+  }
+
+  // The bay kind/ID is a compatibility key, not physical-location evidence.
+  function diskLocation(slotNumber, trace = traceById(`bay:${slotNumber}`, state.fabric)) {
+    const slot = slotByNumber(slotNumber);
+    const provenance = [trace?.metrics, slot, slot?.raw_status].filter(Boolean);
+    const denied = provenance.some((item) => item.physical_location_known === false || item.virtual_enclosure === true);
+    const physical = !denied && provenance.some((item) => item.physical_location_known === true);
+    const kind = physical ? "Bay" : "Disk";
+    const number = Number.isInteger(slotNumber) ? (physical ? formatSlotLabel(slotNumber) : String(slotNumber + 1)) : "";
+    return { physical, kind, label: `${kind} ${number}`.trim() };
   }
 
   function smartCacheKey(slotNumber) {
-    return [state.selectedSystemId || "", state.selectedEnclosureId || "", String(slotNumber)].join("|");
+    const slot = slotByNumber(slotNumber);
+    if (!slot || slot.identity_state === "unknown" || slot.present === false) return null;
+    const identity = [slot.serial, slot.logical_unit_id, slot.gptid].map((value) => String(value || "").trim());
+    if (!identity.some(Boolean)) return null;
+    return JSON.stringify([state.selectedSystemId, state.selectedEnclosureId, slot.enclosure_id, slotNumber, slot.device_name, identity]);
+  }
+
+  function pruneSmartCache() {
+    const keys = new Set(list(state.snapshot?.slots).map((slot) => smartCacheKey(slot.slot)).filter(Boolean));
+    for (const key of new Set([...Object.keys(state.smartSummaries), ...Object.keys(state.smartRequests)])) {
+      if (!keys.has(key)) {
+        delete state.smartSummaries[key];
+        delete state.smartSummaryTimes[key];
+        delete state.smartRequests[key];
+      }
+    }
   }
 
   function smartSummaryForSlot(slotNumber) {
     if (!Number.isInteger(Number(slotNumber))) {
       return null;
     }
-    return state.smartSummaries[smartCacheKey(slotNumber)] || null;
+    const key = smartCacheKey(slotNumber);
+    return key ? state.smartSummaries[key] || null : null;
   }
 
   function selectedSmartSlotNumber() {
@@ -1392,7 +1565,7 @@
 
   function ensureSelectedSmartSummary() {
     const slotNumber = selectedSmartSlotNumber();
-    if (!Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
+    if (state.loading || !Number.isInteger(slotNumber) || !state.fabric || state.fabric.available === false) {
       return;
     }
     const slot = slotByNumber(slotNumber);
@@ -1400,19 +1573,29 @@
       return;
     }
     const key = smartCacheKey(slotNumber);
-    if (state.smartSummaries[key] || state.smartRequests[key]) {
+    if (!key || state.smartRequests[key]
+      || (state.smartSummaries[key] && Date.now() - state.smartSummaryTimes[key] < 300000)) {
       return;
     }
-    state.smartRequests[key] = true;
-    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`))
+    const owner = {};
+    state.smartRequests[key] = owner;
+    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`), { signal: AbortSignal.timeout(15000) })
       .then((summary) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = summary || { available: false, message: "SMART detail returned an empty payload." };
       })
       .catch((error) => {
+        if (state.smartRequests[key] !== owner) return;
+        state.smartSummaryTimes[key] = Date.now();
         state.smartSummaries[key] = { available: false, message: error.message || String(error) };
       })
       .finally(() => {
+        if (state.smartRequests[key] !== owner) return;
         delete state.smartRequests[key];
+        if (state.aliasEditObjectId) {
+          return;
+        }
         if (smartCacheKey(selectedSmartSlotNumber()) === key) {
           render();
         }
@@ -1448,7 +1631,7 @@
     const related = selectionTouchesNode(node.id) || selectionTouchesSlots(node.related_slots);
     return `
       <button type="button" class="fabric-node-card status-${classToken(node.status)}${selected ? " is-selected" : ""}${related ? " is-related" : ""} ${extra}" data-fabric-node="${escapeHtml(node.id)}">
-        <span class="fabric-node-kind">${escapeHtml(formatKind(node.kind))}</span>
+        <span class="fabric-node-kind">${escapeHtml(node.kind === "bay" ? diskLocation(sortedSlots(node.related_slots)[0], node).kind : formatKind(node.kind))}</span>
         <strong>${escapeHtml(label || displayLabel(node) || node.id)}</strong>
         <span>${escapeHtml(meta || nodeMeta(node))}</span>
       </button>
@@ -1463,9 +1646,21 @@
       metrics.temperature ? `temp ${metrics.temperature}` : null,
       metrics.firmware ? `fw ${metrics.firmware}` : null,
       metrics.linked_phys ? `${metrics.linked_phys}/${metrics.num_phys || "?"} phys` : null,
-      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} bays` : null,
+      sortedSlots(node?.related_slots).length ? `${sortedSlots(node.related_slots).length} ${sortedSlots(node.related_slots).every((slotNumber) => diskLocation(slotNumber, node.kind === "bay" ? node : undefined).physical) ? "bays" : "disks"}` : null,
       node?.raw_id,
     ].filter(Boolean).join(" / ") || "n/a";
+  }
+
+  // A count without complete, affirmative member evidence is not a location.
+  function aggregateDiskNoun(slots, count = slots.length) {
+    return slots.length > 0 && Number(count) === slots.length
+      && slots.every((slotNumber) => diskLocation(slotNumber).physical) ? "bay" : "disk";
+  }
+
+  function hostDiskSummary(fabric) {
+    const slots = sortedSlots(list(fabric.traces).filter((trace) => trace.kind === "bay").flatMap((trace) => list(trace.slots)));
+    const noun = aggregateDiskNoun(slots);
+    return `${slots.length} ${noun}${slots.length === 1 ? "" : "s"}`;
   }
 
   function renderPathButton(path, { compact = false } = {}) {
@@ -1474,13 +1669,17 @@
     const slots = sortedSlots(path.slots || trace?.slots);
     const related = selected || selectionTouchesSlots(slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
+    const slotListOptions = { limit: compact ? 16 : 28, expandKey: `path:${path.id}` };
     return `
-      <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
-        <span>${escapeHtml(path.controller || "path")}</span>
-        <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
-        <small>${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
-        <em>${renderSlotList(slots, { limit: compact ? 16 : 28, expandKey: `path:${path.id}` })}</em>
-      </button>
+      <div class="fabric-path-cell" data-fabric-slot-cell="${escapeHtml(slotListOptions.expandKey)}" data-fabric-slot-limit="${slotListOptions.limit}">
+        <button type="button" class="fabric-path-card status-${classToken(stateName)}${selected ? " is-selected" : ""}${related ? " is-related" : ""}${compact ? " compact" : ""}" data-fabric-trace="${escapeHtml(path.id)}">
+          <span>${escapeHtml(path.controller_label || path.controller || "path")}</span>
+          <strong>${escapeHtml(displayLabel(path) || stateName)}</strong>
+          <small>${escapeHtml(`${path.count || slots.length || 0} ${aggregateDiskNoun(slots, path.count || slots.length)}${(path.count || slots.length) === 1 ? "" : "s"}`)}</small>
+          <em>${renderSlotList(slots, slotListOptions)}</em>
+        </button>
+        ${renderSlotOverflowToggle(slots, slotListOptions)}
+      </div>
     `;
   }
 
@@ -1496,7 +1695,7 @@
   function renderBayChips(slots, limit = 96, { modeTarget = "" } = {}) {
     const sorted = sortedSlots(slots);
     if (!sorted.length) {
-      return '<span class="fabric-empty-note">No mapped bays</span>';
+      return '<span class="fabric-empty-note">No mapped disks</span>';
     }
     const activeSlots = selectedSlots();
     const chips = sorted.slice(0, limit).map((slotNumber) => {
@@ -1507,12 +1706,12 @@
         ? ` data-fabric-mode-target="${escapeHtml(modeTarget)}"`
         : "";
       return `
-        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}"${modeTargetAttribute} title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}">
+        <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}" data-fabric-trace="bay:${slotNumber}"${modeTargetAttribute} title="${escapeHtml(title || diskLocation(slotNumber).label)}">
           ${escapeHtml(formatSlotLabel(slotNumber))}
         </button>
       `;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} bays</span>` : "";
+    const overflow = sorted.length > limit ? `<span class="fabric-empty-note">+${sorted.length - limit} ${aggregateDiskNoun(sorted)}s</span>` : "";
     return `${chips}${overflow}`;
   }
 
@@ -1571,7 +1770,7 @@
             <div class="fabric-node-grid">${renderNodeGrid(enclosures, 8)}</div>
           </div>
           <div class="fabric-stage">
-            <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
+            <span class="fabric-stage-title">${escapeHtml(aggregateDiskNoun(slots) === "bay" ? copy.laneStages.bays : copy.laneStages.bays.replace("Bays", "Disks"))}</span>
             <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
           </div>
         </section>
@@ -1581,7 +1780,7 @@
       <div class="fabric-host-strip">
         ${renderNodeButton(hostNode, {
           label: displayLabel(hostNode) || "Host",
-          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.nodes).length} nodes / ${list(fabric.links).length} links`,
+          meta: `${controllerRecords.length} ${copy.hostControllerNoun}${controllerRecords.length === 1 ? "" : "s"} / ${list(fabric.paths).length} path${list(fabric.paths).length === 1 ? "" : "s"} / ${hostDiskSummary(fabric)}`,
           extra: "host",
         })}
       </div>
@@ -1622,17 +1821,19 @@
           const summary = affectedSlotSummary(slots);
           const selected = state.selectedTraceId === path.id;
           return `
-            <article class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}" data-fabric-trace="${escapeHtml(path.id)}" role="button" tabindex="0">
-              <span class="fabric-node-kind">${escapeHtml(path.controller || "path")}</span>
-              <strong>${escapeHtml(path.state || "unknown")}</strong>
-              <span>${escapeHtml(`${slots.length} affected bay${slots.length === 1 ? "" : "s"}`)}</span>
+            <div class="fabric-impact-card status-${classToken(path.state)}${selected ? " is-selected" : ""}">
+              <button type="button" class="fabric-node-card fabric-impact-card-head" data-fabric-trace="${escapeHtml(path.id)}">
+                <span class="fabric-node-kind">${escapeHtml(path.controller_label || path.controller || "path")}</span>
+                <strong>${escapeHtml(path.state || "unknown")}</strong>
+                <span>${escapeHtml(`${slots.length} affected ${aggregateDiskNoun(slots)}${slots.length === 1 ? "" : "s"}`)}</span>
+              </button>
               <div class="fabric-impact-facts">
                 <span>Pools: ${escapeHtml(summary.pools.join(", ") || "n/a")}</span>
                 <span>Vdevs: ${escapeHtml(summary.vdevs.join(", ") || "n/a")}</span>
                 <span>Devices: ${escapeHtml(summary.devices.slice(0, 8).join(", ") || "n/a")}${summary.devices.length > 8 ? `, +${summary.devices.length - 8}` : ""}</span>
               </div>
               <div class="fabric-bay-grid compact">${renderBayChips(slots, 80, { modeTarget: "disk" })}</div>
-            </article>
+            </div>
           `;
         }).join("")}
       </div>
@@ -2053,7 +2254,7 @@
     if (event?.timestamp || event?.timestamp_raw) {
       return "Source timestamp";
     }
-    return "Source dmesg did not include wall-clock timestamps; showing event order from the collected kernel buffer.";
+    return "The kernel log has no timestamps; this is the position in the log.";
   }
 
   function diagnosticRowSearchText(event) {
@@ -2171,11 +2372,11 @@
 
   function renderDiagnosticTableStatus({ start, end, total, filteredTotal, hasFilter, hasSourceTimestamps }) {
     return `
-      <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} sampled events`)}</strong>
+      <strong>${escapeHtml(`Showing ${formatValue(start)}-${formatValue(end)} of ${formatValue(filteredTotal)} recent events`)}</strong>
       <small>${escapeHtml(hasFilter
-        ? `${formatValue(filteredTotal)} matches in the shipped sample; ${formatValue(total)} total events.`
-        : `${formatValue(total)} total events; newest ${formatValue(filteredTotal)} shipped. Filters apply only to this sample.`)}</small>
-      ${hasSourceTimestamps ? "" : '<small>No source timestamps in this dmesg slice; Time / Order falls back to event order.</small>'}
+        ? `${formatValue(filteredTotal)} matches in the listed events; ${formatValue(total)} in the kernel log.`
+        : `${formatValue(total)} events in the kernel log; the newest ${formatValue(filteredTotal)} are listed here. Filters search only these.`)}</small>
+      ${hasSourceTimestamps ? "" : '<small>The kernel log has no timestamps; events are listed in log order.</small>'}
     `;
   }
 
@@ -2365,8 +2566,9 @@
       ["Loginfo", diagnosticLoginfoSummary(diagnostics)],
       ["Operations", formatCountMap(diagnostics.operation_counts)],
     ].filter(([, value]) => value);
+    const rawKey = `${tableKey}:raw`;
     return `
-      <details class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}">
+      <details class="fabric-diagnostic-evidence impact-${escapeHtml(panelImpact)}"${state.openEvidencePanels.has(tableKey) ? " open" : ""} data-fabric-evidence-key="${escapeHtml(tableKey)}">
         <summary class="fabric-diagnostic-evidence-head">
           <span class="fabric-stage-title">Fault Evidence</span>
           <strong>${escapeHtml(summary || `${diagnostics.event_count} kernel events`)}</strong>
@@ -2380,7 +2582,7 @@
           </div>
           ${events.length ? `<ol class="fabric-diagnostic-events">${events.map(renderDiagnosticEvent).join("")}</ol>` : ""}
           ${rawRows.length ? `
-            <details class="fabric-diagnostic-raw">
+            <details class="fabric-diagnostic-raw"${state.openEvidencePanels.has(rawKey) ? " open" : ""} data-fabric-evidence-key="${escapeHtml(rawKey)}">
               <summary>Raw decoded buckets</summary>
               <div>
                 ${rawRows.map(([label, value]) => `<span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>`).join("")}
@@ -2532,7 +2734,7 @@
 
   function diskPathLabels(copy, linuxSes, storageFabric) {
     return {
-      host: linuxSes ? "Host" : storageFabric ? "Host" : "Host",
+      host: "Host",
       source: linuxSes ? "SES Source" : storageFabric ? "Storage Source" : "HBA",
       path: linuxSes ? "SES Link" : storageFabric ? "Storage Path" : "SAS Link",
       enclosure: linuxSes ? "SES Enclosure" : storageFabric ? "View / Enclosure" : "Expander / SES",
@@ -2554,22 +2756,37 @@
       : "";
     const tagName = actionAttribute ? "button" : "div";
     const typeAttribute = tagName === "button" ? ' type="button"' : "";
-    const detailText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle], ...facts, ...hoverFacts]);
-    const titleAttribute = detailText ? ` title="${escapeHtml(detailText)}"` : "";
-    const factRows = facts
-      .filter(([, value]) => value !== null && value !== undefined && value !== "")
-      .slice(0, 6)
-      .map(([label, value]) => `
+    const summaryText = tooltipText([["Layer", kind], ["Name", title], ["Context", subtitle]]);
+    const titleAttribute = summaryText ? ` title="${escapeHtml(summaryText)}"` : "";
+    const visibleFacts = facts.filter(([, value]) => value !== null && value !== undefined && value !== "");
+    const detailFacts = [
+      ...visibleFacts.slice(6),
+      ...hoverFacts.filter(([, value]) => value !== null && value !== undefined && value !== ""),
+    ];
+    const factRows = renderDiskPathFactRows(visibleFacts.slice(0, 6));
+    const detailRows = renderDiskPathFactRows(detailFacts);
+    return `
+      <div class="disk-path-card-cell">
+        <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
+          <span class="disk-path-kind">${escapeHtml(kind)}</span>
+          <strong>${escapeHtml(title || "n/a")}</strong>
+          ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
+          ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
+        </${tagName}>
+        ${detailRows ? `
+          <details class="disk-path-card-details">
+            <summary>More details (${detailFacts.length})</summary>
+            <div class="disk-path-facts">${detailRows}</div>
+          </details>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  function renderDiskPathFactRows(rows) {
+    return rows.map(([label, value]) => `
         <span><em>${escapeHtml(label)}</em>${escapeHtml(formatValue(value))}</span>
       `).join("");
-    return `
-      <${tagName}${typeAttribute} class="disk-path-card status-${classToken(status)}${selected ? " is-selected" : ""} ${extra}" ${actionAttribute}${modeTargetAttribute}${titleAttribute}>
-        <span class="disk-path-kind">${escapeHtml(kind)}</span>
-        <strong>${escapeHtml(title || "n/a")}</strong>
-        ${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ""}
-        ${factRows ? `<div class="disk-path-facts">${factRows}</div>` : ""}
-      </${tagName}>
-    `;
   }
 
   function renderDiskPathBayChip(slotNumber, activeSlotNumber, slotSet) {
@@ -2581,7 +2798,7 @@
     const enabled = slotSet.has(slotNumber);
     const title = [slot?.device_name, slot?.serial, slot?.pool_name, slot?.vdev_name].filter(Boolean).join(" / ");
     return `
-      <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}${enabled ? "" : " is-unavailable"}" data-fabric-trace="bay:${slotNumber}" title="${escapeHtml(title || `Bay ${formatSlotLabel(slotNumber)}`)}"${enabled ? "" : " disabled"}>
+      <button type="button" class="fabric-bay-chip${selected ? " is-selected" : ""}${enabled ? "" : " is-unavailable"}" data-fabric-trace="bay:${slotNumber}" title="${escapeHtml(title || diskLocation(slotNumber).label)}"${enabled ? "" : " disabled"}>
         ${escapeHtml(formatSlotLabel(slotNumber))}
       </button>
     `;
@@ -2684,7 +2901,8 @@
       slot?.physical_block_size || trace.metrics?.physical_block_size || seed.pathState?.physical_block_size,
     ].filter(Boolean).join(" / ");
     const diskSmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names || seed.pathState?.smart_device_names).join(", ");
-    const diskTitle = diskModel || compactDeviceLabel(fullDeviceName, 36) || `Bay ${formatSlotLabel(slotNumber)}`;
+    const location = diskLocation(slotNumber, trace);
+    const diskTitle = diskModel || compactDeviceLabel(fullDeviceName, 36) || location.label;
     const serialAlreadyShown = diskSerial && compactDiskDevice.includes(diskSerial);
     const diskSubtitle = [
       compactDiskDevice,
@@ -2710,7 +2928,7 @@
         title: displayLabel(hostNode) || "Host",
         subtitle: fabric.selected_enclosure_label || fabric.system_id || "",
         facts: [
-          ["Bay", `Bay ${formatSlotLabel(slotNumber)}`],
+          [location.kind, location.label],
           [linuxSes || storageFabric ? "Sources" : "Controllers", list(fabric.controllers).length],
         ],
         hoverFacts: [
@@ -2764,7 +2982,7 @@
       renderDiskPathCard({
         kind: labels.path,
         title: pathTitle,
-        subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "controller-level fabric", 42),
+        subtitle: compactDeviceLabel(seed.pathState?.ses_device || pathNode?.raw?.ses_device || mprDevice?.member_device_name || seed.device_name || displayLabel(pathNode) || "no per-disk path", 42),
         facts: [
           [linuxSes ? "SES device" : storageFabric ? "Path" : "Speed", linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device : storageFabric ? pathNode?.raw?.path_type || pathNode?.raw?.source : formatLinkSpeed(mprDevice?.speed)],
           [linuxSes ? "Block SG" : "PHY", linuxSes ? seed.pathState?.sg_device : storageFabric ? null : expanderPhy?.phy],
@@ -2800,7 +3018,7 @@
       }),
       renderDiskPathCard({
         kind: labels.enclosure,
-        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || sesNodes.map(displayLabel).filter(Boolean).join(" + ") || (linuxSes ? "SES enclosure" : storageFabric ? "Storage view" : "Expander unknown"),
+        title: displayLabel(expanderNode) || displayLabel(enclosureNode) || sesNodes.map(displayLabel).filter(Boolean).join(" + ") || (linuxSes ? "SES enclosure" : storageFabric ? "Storage view" : "Expander not reported"),
         subtitle: [
           linuxSes ? seed.pathState?.ses_device || pathNode?.raw?.ses_device || enclosureNode?.raw_id : null,
           !linuxSes && !storageFabric && displayLabel(enclosureNode) && displayLabel(enclosureNode) !== displayLabel(expanderNode) ? `MPR ${displayLabel(enclosureNode)}` : null,
@@ -2827,16 +3045,16 @@
         nodeId: expanderNode?.id || enclosureNode?.id || "",
       }),
       renderDiskPathCard({
-        kind: labels.backplane,
-        title: displayLabel(backplaneNode) || zone.label,
-        subtitle: zone.range,
+        kind: location.physical ? labels.backplane : "Location",
+        title: location.physical ? displayLabel(backplaneNode) || zone.label : "Physical location unavailable",
+        subtitle: location.physical ? zone.range : "Disk number is an inventory ordinal",
         facts: [
-          ["Selected", `Bay ${formatSlotLabel(slotNumber)}`],
+          ["Selected", location.label],
           ["SES element", slot?.ssh_ses_element_id],
           ["Enclosure", slot?.enclosure_name],
         ],
         hoverFacts: [
-          ["Zone slots", formatSlots(zone.slots, 999)],
+          ["Zone slots", location.physical ? formatSlots(zone.slots, 999) : null],
           ["SES targets", list(slot?.ssh_ses_targets).map((target) => `${target.ses_device}:${target.ses_element_id}`).join(", ")],
           ["SES device", slot?.ssh_ses_device],
           ["Mapping source", slot?.mapping_source],
@@ -2844,7 +3062,7 @@
           ["Descriptor", slot?.raw_status?.descriptor],
         ],
         status: slot?.state || trace.status || "online",
-        nodeId: backplaneNode?.id || zone.id || "",
+        nodeId: location.physical ? backplaneNode?.id || zone.id || "" : "",
       }),
       poolTitle && (storageFabric || linuxSes) ? renderDiskPathCard({
         kind: labels.pool,
@@ -2941,7 +3159,7 @@
         <div class="disk-path-picker">
           <div class="disk-path-selected">
             <span class="fabric-stage-title">Selected disk</span>
-            <strong>Bay ${escapeHtml(formatSlotLabel(slotNumber))}</strong>
+            <strong>${escapeHtml(diskLocation(slotNumber, trace).label)}</strong>
             <small>${escapeHtml([
               selectedModel,
               compactDeviceLabel(selectedDevice, 44),
@@ -2983,7 +3201,7 @@
           `).join("")}
         </div>
         <div class="fabric-link-list">
-          <h3>Trace Links</h3>
+          <h3>Connections in this trace</h3>
           ${linkRows.length ? linkRows.map((link) => `
             <button type="button" class="fabric-link-row status-${classToken(link.status)}" data-fabric-node="${escapeHtml(link.target)}">
               <span>${escapeHtml(formatKind(link.kind))}</span>
@@ -3051,15 +3269,12 @@
 
   function renderTraceSummaryButton(trace) {
     const selected = state.selectedTraceId === trace.id;
-    const visited = selected || traceIsInSelectionTrail(trace.id);
-    const attributes = visited
-      ? 'disabled aria-disabled="true" data-fabric-trace-disabled="true"'
-      : `data-fabric-trace="${escapeHtml(trace.id)}"`;
+    const visited = !selected && traceIsInSelectionTrail(trace.id);
     const slotText = formatSlots(trace.slots, 18);
-    const trailText = visited ? `${slotText} / already in trace` : slotText;
+    const trailText = selected ? `${slotText} (selected)` : visited ? `${slotText} (visited)` : slotText;
     return `
-      <button type="button" class="fabric-trace-summary${selected ? " is-selected" : ""}${visited ? " is-visited" : ""}" ${attributes}>
-        <span>${escapeHtml(formatKind(trace.kind))}</span>
+      <button type="button" class="fabric-trace-summary${selected ? " is-selected" : ""}${visited ? " is-visited" : ""}" data-fabric-trace="${escapeHtml(trace.id)}">
+        <span>${escapeHtml(trace.kind === "bay" ? diskLocation(sortedSlots(trace.slots)[0], trace).kind : formatKind(trace.kind))}</span>
         <strong>${escapeHtml(displayLabel(trace) || trace.id)}</strong>
         <small>${escapeHtml(trailText)}</small>
       </button>
@@ -3075,7 +3290,7 @@
           return `
             <div class="fabric-path-member-card status-${classToken(stateName)}">
               <div>
-                <strong>${escapeHtml(pathState.controller || pathState.path_id || "path")}</strong>
+                <strong>${escapeHtml(pathState.controller_label || pathState.controller || pathState.path_id || "path")}</strong>
                 <span>${escapeHtml(stateName)}</span>
               </div>
               ${deviceName ? `<small title="${escapeHtml(deviceName)}">${escapeHtml(compactDeviceLabel(deviceName, 54))}</small>` : ""}
@@ -3109,7 +3324,8 @@
     const deviceName = trace.metrics?.device_name || slot?.device_name || "";
     const compactDevice = compactDeviceLabel(deviceName, 56);
     const stateName = slot?.health || slot?.state || pathStates[0]?.state || trace.status || "unknown";
-    const bayLabel = `Bay ${formatSlotLabel(slotNumber)}`;
+    const location = diskLocation(slotNumber, trace);
+    const bayLabel = location.label;
     const bayModel = slot?.model || trace.metrics?.model;
     const baySerial = slot?.serial || trace.metrics?.serial;
     const baySize = slot?.size_human || trace.metrics?.size_human;
@@ -3120,14 +3336,14 @@
     ].filter(Boolean).join(" / ");
     const baySmartDevices = list(slot?.smart_device_names || trace.metrics?.smart_device_names).join(", ");
     const modelLine = [bayModel, baySize].filter(Boolean).join(" / ");
-    const sourceLabel = displayLabel(sourceNode) || pathStates[0]?.controller || fabric.system_label || "source";
+    const sourceLabel = displayLabel(sourceNode) || pathStates[0]?.controller_label || pathStates[0]?.controller || fabric.system_label || "source";
     const pathLabel = displayLabel(pathNode) || pathStates[0]?.ses_device || pathStates[0]?.path_id || pathStates[0]?.path_type;
     const smartSummary = smartSummaryForSlot(slotNumber);
     return `
       <div class="fabric-selected-bay">
         <section class="fabric-selected-bay-hero status-${classToken(stateName)}">
           <div>
-            <span class="fabric-stage-title">Selected Bay</span>
+            <span class="fabric-stage-title">Selected ${escapeHtml(location.kind)}</span>
             <strong>${escapeHtml(bayLabel)}</strong>
             <small>${escapeHtml(modelLine || compactDevice || "No disk metadata")}</small>
           </div>
@@ -3144,7 +3360,7 @@
           ${inspectorFact("Source", sourceLabel)}
           ${inspectorFact("Path", pathLabel)}
           ${inspectorFact("View", displayLabel(enclosureNode) || slot?.enclosure_name)}
-          ${inspectorFact("Bay Group", displayLabel(backplaneNode))}
+          ${location.physical ? inspectorFact("Bay Group", displayLabel(backplaneNode)) : inspectorFact("Location", "Physical location unavailable")}
           ${inspectorFact("Fabric", trace.metrics?.fabric_kind)}
         </div>
 
@@ -3173,7 +3389,7 @@
         </section>
 
         <section class="fabric-inspector-section">
-          <h4>Source Evidence</h4>
+          <h4>Where this comes from</h4>
           <div class="fabric-evidence-chip-list">${evidenceChips(trace.evidence)}</div>
         </section>
 
@@ -3185,12 +3401,12 @@
         <section class="fabric-inspector-section">
           <h4>Friendly Label</h4>
           <div class="kv-grid">
-            ${renderAliasRow("Bay", { objectId: trace.id, objectKind: trace.kind, item: trace })}
+            ${renderAliasRow(location.kind, { objectId: trace.id, objectKind: trace.kind, item: trace })}
           </div>
         </section>
 
         <section class="fabric-inspector-section">
-          <h4>Trace Nodes</h4>
+          <h4>Items in this trace</h4>
           <div class="fabric-node-grid fabric-inspector-node-grid">${renderNodeGrid(list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).filter(Boolean), 18)}</div>
         </section>
       </div>
@@ -3220,13 +3436,14 @@
       : ` title="${escapeHtml(fabricWritePolicyReason())}"`;
     const clearAttributes = savedLabel ? writeAttributes : (writeAttributes || " disabled");
     if (state.aliasEditObjectId === objectId) {
+      const draftLabel = typeof state.aliasDraft === "string" ? state.aliasDraft : savedLabel;
       return `
         <form class="kv-row fabric-alias-row is-editing" data-fabric-alias-form>
           <span>${escapeHtml(label)}</span>
           <div class="fabric-alias-editor">
             <input
               type="text"
-              value="${escapeHtml(savedLabel)}"
+              value="${escapeHtml(draftLabel)}"
               placeholder="${escapeHtml(fallbackLabel)}"
               maxlength="80"
               autocomplete="off"
@@ -3266,7 +3483,27 @@
     `;
   }
 
+  function openAliasEditor(objectId) {
+    state.aliasEditGeneration += 1;
+    state.aliasEditObjectId = objectId || null;
+    state.aliasDraft = null;
+  }
+
+  function closeAliasEditor() {
+    state.aliasEditGeneration += 1;
+    state.aliasEditObjectId = null;
+    state.aliasDraft = null;
+  }
+
+  function cancelAliasEdit() {
+    closeAliasEditor();
+    render();
+  }
+
   async function saveAliasFromForm(form, { clear = false } = {}) {
+    if (!fabricScopeIsCurrent()) {
+      return;
+    }
     if (fabricWriteBlockedByPolicy()) {
       render();
       return;
@@ -3276,9 +3513,18 @@
       return;
     }
     const objectId = input.dataset.fabricAliasObject || "";
-    if (!objectId) {
+    if (!objectId || objectId !== state.aliasEditObjectId) {
       return;
     }
+    // Capture both URLs before awaiting. Navigation, refresh, or a newer draft
+    // retires this operation, including its error and follow-up readback.
+    const postUrl = scopedUrl("/api/sas-fabric/aliases");
+    const readbackUrl = scopedUrl("/api/sas-fabric");
+    const navigationGeneration = state.refreshRequestToken;
+    const editorGeneration = ++state.aliasEditGeneration;
+    const ownsCompletion = () => navigationGeneration === state.refreshRequestToken
+      && editorGeneration === state.aliasEditGeneration
+      && objectId === state.aliasEditObjectId && fabricScopeIsCurrent();
     const payload = {
       object_id: objectId,
       object_kind: input.dataset.fabricAliasKind || null,
@@ -3287,16 +3533,19 @@
     };
     form.classList.add("is-saving");
     try {
-      await fetchJson(scopedUrl("/api/sas-fabric/aliases"), {
+      await fetchJson(postUrl, {
         method: "POST",
         readUiAuth: true,
         body: JSON.stringify(payload),
       });
-      state.aliasEditObjectId = null;
-      const fabric = await fetchJson(scopedUrl("/api/sas-fabric"));
+      if (!ownsCompletion()) return;
+      const fabric = await fetchJson(readbackUrl);
+      if (!ownsCompletion()) return;
+      closeAliasEditor();
       applyFabric(fabric);
       render();
     } catch (error) {
+      if (!ownsCompletion()) return;
       if (!handleFabricWriteRejection(error)) {
         state.error = error.message || String(error);
       }
@@ -3319,7 +3568,7 @@
       const pathStates = list(trace.metrics?.path_states);
       if (trace.kind === "bay") {
         const slotNumber = sortedSlots(trace.slots)[0];
-        elements.inspectorTitle.textContent = `Selected Bay ${Number.isInteger(slotNumber) ? formatSlotLabel(slotNumber) : ""}`.trim();
+        elements.inspectorTitle.textContent = `Selected ${diskLocation(slotNumber, trace).label}`;
         elements.inspectorBody.innerHTML = renderSelectedBayInspector(trace, fabric);
         return;
       }
@@ -3330,7 +3579,7 @@
           ${kvRow("Type", formatKind(trace.kind))}
           ${kvRow("Slots", formatSlots(trace.slots, 999))}
           ${metricRows(trace.metrics, { state: "State", count: "Affected bays", device_name: "Device", pool_name: "Pool", vdev_name: "Vdev" })}
-          ${kvRow("Evidence", trace.evidence)}
+          ${kvRow("Sources", trace.evidence)}
         </div>
         ${pathStates.length ? `
           <section class="fabric-inspector-section">
@@ -3338,7 +3587,7 @@
             <div class="fabric-state-list">
               ${pathStates.map((pathState) => `
                 <div class="fabric-state-row status-${classToken(pathState.state)}">
-                  <span>${escapeHtml(pathState.controller || "path")}</span>
+                  <span>${escapeHtml(pathState.controller_label || pathState.controller || "path")}</span>
                   <strong>${escapeHtml(pathState.state || "unknown")}</strong>
                   <small>${escapeHtml(pathState.device_name || "")}</small>
                 </div>
@@ -3347,7 +3596,7 @@
           </section>
         ` : ""}
         <section class="fabric-inspector-section">
-          <h4>Trace Nodes</h4>
+          <h4>Items in this trace</h4>
           <div class="fabric-node-grid">${renderNodeGrid(list(trace.node_ids).map((nodeId) => nodes.get(nodeId)).filter(Boolean), 18)}</div>
         </section>
       `;
@@ -3355,16 +3604,17 @@
     }
     if (node) {
       const relatedTraces = relatedTracesForNode(node, fabric);
-      elements.inspectorTitle.textContent = `Selected ${formatKind(node.kind)}`;
+      const kindLabel = node.kind === "bay" ? diskLocation(sortedSlots(node.related_slots)[0], node).kind : formatKind(node.kind);
+      elements.inspectorTitle.textContent = `Selected ${kindLabel}`;
       elements.inspectorBody.innerHTML = `
         <div class="kv-grid">
           ${renderAliasRow("Object", { objectId: node.id, objectKind: node.kind, item: node })}
-          ${kvRow("Type", formatKind(node.kind))}
+          ${kvRow("Type", kindLabel)}
           ${kvRow("Status", node.status || "n/a")}
           ${kvRow("Raw ID", node.raw_id || "n/a")}
           ${kvRow("Slots", formatSlots(node.related_slots, 999))}
           ${metricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
-          ${kvRow("Evidence", node.evidence)}
+          ${kvRow("Sources", node.evidence)}
         </div>
         <section class="fabric-inspector-section">
           <h4>Related Traces</h4>
@@ -3393,7 +3643,7 @@
         const selected = enclosure.id === state.selectedEnclosureId ? " selected" : "";
         return `<option value="${escapeHtml(enclosure.id)}"${selected}>${escapeHtml(enclosure.label || enclosure.id)}</option>`;
       }).join("")
-      : '<option value="">Auto-selected</option>';
+      : '<option value="">No enclosures found</option>';
     setSelectOptionsIfChanged(elements.enclosureSelect, enclosureOptions);
     elements.enclosureSelect.value = state.selectedEnclosureId || "";
     elements.enclosureSelect.disabled = enclosures.length <= 1 || state.loading;
@@ -3481,7 +3731,7 @@
       elements.statusText.dataset.tone = "error";
     } else if (state.loading) {
       className += " partial";
-      text = `${copy.statusBase} ...`;
+      text = `${copy.statusBase} LOADING`;
       elements.statusText.textContent = fabric ? `Refreshing ${copy.statusBase.toLowerCase()} data.` : `Loading ${copy.statusBase.toLowerCase()} data.`;
       elements.statusText.dataset.tone = "info";
     } else if (fabric?.available === false) {
@@ -3566,7 +3816,7 @@
       diagnosticNode ? focusButton({
         label: "Fault focus",
         title: displayLabel(diagnosticNode) || diagnosticNode.id,
-        meta: diagnosticSummary(diagnostics) || "Most diagnostic evidence",
+        meta: diagnosticSummary(diagnostics) || "Most kernel errors",
         ref: { kind: "node", id: diagnosticNode.id },
         mode: "trace",
         tone: "error",
@@ -3584,7 +3834,7 @@
       }) : "",
       diskTrace ? focusButton({
         label: "Disk path",
-        title: `Bay ${formatSlotLabel(diskSlot)}`,
+        title: diskLocation(diskSlot, diskTrace).label,
         meta: [diskSlotRecord?.device_name || diskTrace.metrics?.device_name, diskSlotRecord?.vdev_name || diskTrace.metrics?.vdev_name].filter(Boolean).join(" / ") || "Open disk path",
         ref: { kind: "trace", id: diskTrace.id },
         mode: "disk",
@@ -3623,6 +3873,10 @@
 
   function renderMap() {
     const fabric = state.fabric;
+    const inert = !fabricScopeIsCurrent();
+    elements.mapPanel.inert = inert;
+    elements.inspectorBody.inert = inert;
+    elements.focusStrip.inert = inert;
     state.diagnosticPayloads = {};
     if (!fabric) {
       elements.mapPanel.innerHTML = '<div class="warning-item muted compact">No Storage Fabric payload has been loaded yet.</div>';
@@ -3659,7 +3913,93 @@
     renderInspector(fabric);
   }
 
+  const FOCUS_ATTRIBUTES = [
+    "data-fabric-node",
+    "data-fabric-trace",
+    "data-fabric-mode-target",
+    "data-fabric-breadcrumb",
+    "data-fabric-trace-home",
+    "data-fabric-expand-slots",
+    "data-fabric-alias-edit",
+    "data-fabric-alias-input",
+    "data-fabric-alias-cancel",
+    "data-fabric-alias-clear",
+    "data-fabric-diagnostic-page",
+    "data-fabric-diagnostic-key",
+    "data-fabric-diagnostic-filter-key",
+    "data-fabric-diagnostic-type-key",
+    "data-fabric-diagnostic-severity-key",
+    "data-fabric-diagnostic-confidence-key",
+  ];
+
+  function attributeSelector(name, value) {
+    return `[${name}="${String(value).replace(/["\\]/g, "\\$&")}"]`;
+  }
+
+  function rememberFocus() {
+    const active = document.activeElement;
+    if (!active || typeof active.getAttribute !== "function" || typeof active.closest !== "function") {
+      return null;
+    }
+    const container = active.closest("#fabric-map-panel, #fabric-inspector-body, #fabric-focus-strip");
+    if (!container || typeof container.querySelectorAll !== "function") {
+      return null;
+    }
+    const selector = FOCUS_ATTRIBUTES
+      .filter((name) => active.hasAttribute(name))
+      .map((name) => attributeSelector(name, active.getAttribute(name)))
+      .join("");
+    if (!selector) {
+      return null;
+    }
+    const matches = Array.from(container.querySelectorAll(selector));
+    return {
+      container,
+      selector,
+      index: Math.max(0, matches.indexOf(active)),
+      selectionStart: Number.isInteger(active.selectionStart) ? active.selectionStart : null,
+      selectionEnd: Number.isInteger(active.selectionEnd) ? active.selectionEnd : null,
+    };
+  }
+
+  function restoreFocus(memory) {
+    if (!memory) {
+      return;
+    }
+    const matches = Array.from(memory.container.querySelectorAll(memory.selector));
+    const target = matches[memory.index] || matches[0];
+    if (!target || typeof target.focus !== "function") {
+      return;
+    }
+    target.focus({ preventScroll: true });
+    if (memory.selectionStart !== null && typeof target.setSelectionRange === "function") {
+      target.setSelectionRange(memory.selectionStart, memory.selectionEnd ?? memory.selectionStart);
+    }
+  }
+
+  function rememberScroll(element) {
+    if (!element) {
+      return null;
+    }
+    return { element, top: element.scrollTop || 0, left: element.scrollLeft || 0 };
+  }
+
+  function restoreScroll(memory) {
+    if (!memory) {
+      return;
+    }
+    if (memory.element.scrollTop !== memory.top) {
+      memory.element.scrollTop = memory.top;
+    }
+    if (memory.element.scrollLeft !== memory.left) {
+      memory.element.scrollLeft = memory.left;
+    }
+  }
+
   function render() {
+    const focusMemory = rememberFocus();
+    const scrollMemory = [rememberScroll(elements.mapPanel), rememberScroll(elements.inspectorBody)];
+    const pageScroll = { x: window.scrollX || 0, y: window.scrollY || 0 };
     renderSelectors();
     renderSummary();
     renderStatus();
@@ -3671,12 +4011,18 @@
     ensureSelectedSmartSummary();
     syncLocation();
     elements.refreshButton.disabled = state.loading;
+    scrollMemory.forEach(restoreScroll);
+    if (typeof window.scrollTo === "function" && (window.scrollX !== pageScroll.x || window.scrollY !== pageScroll.y)) {
+      window.scrollTo(pageScroll.x, pageScroll.y);
+    }
+    restoreFocus(focusMemory);
   }
 
   function applySnapshot(snapshot) {
     state.snapshot = snapshot || state.snapshot;
     state.selectedSystemId = state.snapshot.selected_system_id || state.selectedSystemId;
     state.selectedEnclosureId = state.snapshot.selected_enclosure_id || state.selectedEnclosureId;
+    pruneSmartCache();
   }
 
   function applyFabric(fabric) {
@@ -3695,20 +4041,29 @@
 
   async function refreshFabric(force = false) {
     const requestToken = ++state.refreshRequestToken;
+    state.fabricScopeReady = false;
     state.loading = true;
     state.error = null;
     render();
     try {
-      const snapshot = await fetchJson(scopedUrl("/api/inventory", { force }));
+      const [snapshot, fabric] = await Promise.all([
+        fetchJson(scopedUrl("/api/inventory", { force })),
+        fetchJson(scopedUrl("/api/sas-fabric", { force })),
+      ]);
       if (requestToken !== state.refreshRequestToken) {
         return;
       }
       applySnapshot(snapshot);
-      const fabric = await fetchJson(scopedUrl("/api/sas-fabric", { force }));
-      if (requestToken !== state.refreshRequestToken) {
-        return;
-      }
+      // A completed inventory refresh is an explicit retry opportunity. Avoid a
+      // render/failure loop while still bounding warm results on later renders.
+      Object.keys(state.smartSummaries).forEach((key) => {
+        if (state.smartSummaries[key]?.available === false) {
+          delete state.smartSummaries[key];
+          delete state.smartSummaryTimes[key];
+        }
+      });
       applyFabric(fabric);
+      state.fabricScopeReady = true;
     } catch (error) {
       if (requestToken === state.refreshRequestToken) {
         state.error = error.message || String(error);
@@ -3732,17 +4087,20 @@
         || (mode === "disk" && traceById(current?.id)?.kind !== "bay")
         || (mode === "impact" && (current?.kind !== "trace" || traceById(current?.id)?.kind !== "path"));
       state.mode = mode;
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       ensureSelectionForMode(state.fabric, { force: forceSelection, mode });
       render();
     });
   });
 
   elements.refreshButton.addEventListener("click", () => {
-    void refreshFabric(true);
+    void refreshFabric(false);
   });
 
   elements.systemSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedSystemId = elements.systemSelect.value || null;
     state.selectedEnclosureId = null;
     state.selectedTraceId = null;
@@ -3751,11 +4109,14 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
   elements.enclosureSelect.addEventListener("change", () => {
+    state.smartRequests = {};
+    state.smartSummaries = {};
+    state.smartSummaryTimes = {};
     state.selectedEnclosureId = elements.enclosureSelect.value || null;
     state.selectedTraceId = null;
     state.selectedNodeId = null;
@@ -3763,12 +4124,12 @@
     state.selectionTrail = [];
     state.expandedSlotLists = {};
     state.diagnosticTables = {};
-    state.aliasEditObjectId = null;
+    closeAliasEditor();
     void refreshFabric(false);
   });
 
   function handleFabricActivation(target) {
-    if (!target) {
+    if (!target || !fabricScopeIsCurrent()) {
       return;
     }
     const modeTargetButton = target.closest("[data-fabric-mode-target]");
@@ -3777,7 +4138,7 @@
       if (modeIds.has(mode)) {
         state.mode = mode;
       }
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       state.selectionTrail = [];
       const traceId = modeTargetButton.dataset.fabricTrace || "";
       const nodeId = modeTargetButton.dataset.fabricNode || "";
@@ -3797,7 +4158,7 @@
         render();
         return;
       }
-      state.aliasEditObjectId = aliasEditButton.dataset.fabricAliasEdit || null;
+      openAliasEditor(aliasEditButton.dataset.fabricAliasEdit);
       render();
       window.requestAnimationFrame(() => {
         const input = document.querySelector("[data-fabric-alias-input]");
@@ -3810,8 +4171,7 @@
     }
     const aliasCancelButton = target.closest("[data-fabric-alias-cancel]");
     if (aliasCancelButton) {
-      state.aliasEditObjectId = null;
-      render();
+      cancelAliasEdit();
       return;
     }
     const aliasClearButton = target.closest("[data-fabric-alias-clear]");
@@ -3842,7 +4202,9 @@
     if (expandButton) {
       const key = expandButton.dataset.fabricExpandSlots || "";
       state.expandedSlotLists[key] = !state.expandedSlotLists[key];
-      render();
+      if (!refreshSlotList(key, expandButton)) {
+        render();
+      }
       return;
     }
     const traceHomeButton = target.closest("[data-fabric-trace-home]");
@@ -3850,7 +4212,7 @@
       state.selectionTrail = [];
       state.selectedNodeId = null;
       state.selectedTraceId = resolveTraceId(null);
-      state.aliasEditObjectId = null;
+      closeAliasEditor();
       render();
       return;
     }
@@ -3909,6 +4271,13 @@
 
   document.addEventListener("input", (event) => {
     const target = event.target instanceof HTMLInputElement ? event.target : null;
+    if (target?.matches("[data-fabric-alias-input]")) {
+      if (state.aliasEditObjectId && target.dataset.fabricAliasObject === state.aliasEditObjectId) {
+        state.aliasEditGeneration += 1;
+        state.aliasDraft = target.value;
+      }
+      return;
+    }
     if (!target?.matches("[data-fabric-diagnostic-filter-key]")) {
       return;
     }
@@ -3944,7 +4313,19 @@
 
   document.addEventListener("toggle", (event) => {
     const details = event.target instanceof HTMLDetailsElement ? event.target : null;
-    if (!details?.matches("[data-fabric-diagnostic-table-key]")) {
+    if (!details) {
+      return;
+    }
+    if (details.matches("[data-fabric-evidence-key]")) {
+      const key = details.dataset.fabricEvidenceKey || "";
+      if (details.open) {
+        state.openEvidencePanels.add(key);
+      } else {
+        state.openEvidencePanels.delete(key);
+      }
+      return;
+    }
+    if (!details.matches("[data-fabric-diagnostic-table-key]")) {
       return;
     }
     const key = details.dataset.fabricDiagnosticTableKey || "";
@@ -3952,15 +4333,15 @@
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" && event.key !== " ") {
+    if (event.key !== "Escape" || !state.aliasEditObjectId) {
       return;
     }
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    if (!target?.closest("[data-fabric-mode-target], [data-fabric-diagnostic-page], [data-fabric-expand-slots], [data-fabric-trace-home], [data-fabric-breadcrumb], [data-fabric-trace], [data-fabric-node]")) {
+    if (!target?.closest("[data-fabric-alias-form]")) {
       return;
     }
     event.preventDefault();
-    handleFabricActivation(target);
+    cancelAliasEdit();
   });
 
   ensureSelectionForMode(state.fabric);

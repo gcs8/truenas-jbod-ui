@@ -8,8 +8,9 @@ from unittest.mock import Mock, patch
 from starlette.requests import Request
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings
-from app.main import build_index_context, templates
+from app.route_support import build_index_context, templates
 from app.models.domain import (
     EnclosureOption,
     EnclosureProfileView,
@@ -66,8 +67,8 @@ class EnclosureAliasRouteTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -128,7 +129,7 @@ class EnclosureAliasServerRenderTests(unittest.TestCase):
         self.assertIn("Archive East", title)
         self.assertNotIn("Raw Profile Title", title)
         self.assertIn('id="enclosure-alias-edit-button"', html)
-        self.assertIn("Raw: Shelf B", html)
+        self.assertIn("Reported name: Shelf B", html)
 
     def test_snapshot_render_omits_enclosure_alias_editor(self) -> None:
         html = self._html(snapshot_mode=True)

@@ -1,548 +1,53 @@
 from __future__ import annotations
 
-# Route collaborators remain public here for runtime monkeypatch compatibility.
-# ruff: noqa: F401
-
 import asyncio
-import json
-import logging
-import sys
+import threading
 import time
-import urllib.error
-import urllib.request
-from collections import OrderedDict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, Collection, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict
 
-from admin_service.config import get_admin_settings
 from app import __version__
-from app.config import Settings, get_settings
-from app.http_auth import (
-    basic_auth_matches,
-    configured_origin_identity,
-    request_origin_allowed,
-)
+from app.config import get_settings
+from app.http_auth import configured_origin_identity
 from app.logging_config import configure_logging
-from app.request_context import request_id_headers
-from app.models.domain import (
-    DiskInventorySyncRequest,
-    SMART_BATCH_MAX_SLOTS,
-    InventorySnapshot,
-    LedAction,
-    LedRequest,
-    MappingBundle,
-    MappingImportConfirmation,
-    MappingRequest,
-    SasFabricAliasRequest,
-    SnapshotExportRequest,
-    SmartBatchItem,
-    SmartBatchRequest,
-    SmartBatchResponse,
-    SasFabricSnapshot,
-    SmartSummaryView,
-    StorageViewRuntimePayload,
-    SystemLocatorRequest,
-    SystemLocatorStatusView,
-)
 from app.metrics import install_metrics
-from app.perf import add_perf_metadata, install_perf_timing_middleware, perf_stage
-from app.script_json import register_script_json_filters
-from app.services.history_backend import HistoryBackendClient, HistoryBackendPolicyError
-from app.services.inventory import (
-    DiskInventorySyncBusy,
-    SnapshotStateBusyError,
-    UnknownEnclosureError,
+from app.perf import install_perf_timing_middleware
+from app.read_ui_auth_config import load_read_ui_auth_settings
+from app.route_support import (
+    BASE_DIR,
+    SETTINGS_RUNTIME,
+    after_config_reload,
+    EXCEPTION_RESPONSES,
+    get_inventory_registry,
+    get_release_status_service,
+    logger,
+    mapped_exception_handler,
+    mapping_durability_exception_handler,
+    mapping_scope_conflict_exception_handler,
+    split_known_hosts_paths,
+    ui_writable_directories,
+    warm_admin_probe,
 )
-from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
+from app.router_inclusion import include_router_preserving_route_objects
+from app.routes import build_router
+from app.settings_reload import install_config_reload
 from app.services.mapping_store import (
     MappingDurabilityError,
-    MappingImportDigestMismatch,
-    MappingRevisionConflict,
     MappingScopeConflict,
 )
 from app.services.profile_registry import build_profile_reference_warnings
-from app.services.release_status import ReleaseStatusService
-from app.services.snapshot_export import (
-    SnapshotExportBusyError,
-    SnapshotExportService,
-    SnapshotExportTooLargeError,
-    collect_configured_hostnames,
+from app.services.storage_writability import (
+    check_known_hosts_files,
+    probe_writable_directories,
 )
-from app.services.truenas_ws import TrueNASAPIError
-from history_service.operation_bounds import (
-    ALLOWED_HISTORY_METRICS,
-    HistoryBudgetExceeded,
-    HistoryRequestShapeError,
-    build_history_read_plan,
-)
-
-BASE_DIR = Path(__file__).resolve().parent
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-register_script_json_filters(templates.env)
-
-logger = logging.getLogger(__name__)
-INVALID_MAPPING_BUNDLE_DETAIL = "Mapping bundle is invalid."
-
-
-class HistoryRefreshProxyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    mode: Literal["fast", "full"]
-
-
-class HistoryScopeProxyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    system_id: str
-    enclosure_id: str | None = None
-    slots: list[int]
-
-
-class HistoryScopesProxyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scopes: list[HistoryScopeProxyRequest]
-    metrics: list[str]
-    since: str
-    event_limit: int
-    metric_limit: int
-
-
-async def system_not_configured_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=404,
-    )
-
-
-async def unknown_enclosure_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
-    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=404)
-
-
-async def snapshot_state_busy_exception_handler(
-    _: Request,
-    exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {"ok": False, "detail": str(exc)},
-        status_code=503,
-        headers={"Retry-After": "1"},
-    )
-
-
-async def mapping_scope_conflict_exception_handler(
-    _: Request,
-    _exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {
-            "ok": False,
-            "error": "mapping_scope_conflict",
-            "detail": MappingScopeConflict.public_detail,
-        },
-        status_code=409,
-    )
-
-
-async def mapping_durability_exception_handler(
-    _: Request,
-    _exc: Exception,
-) -> JSONResponse:
-    return JSONResponse(
-        {
-            "ok": False,
-            "error": "mapping_durability_indeterminate",
-            "detail": MappingDurabilityError.public_detail,
-        },
-        status_code=503,
-    )
-
-
-@dataclass(slots=True)
-class SnapshotExportSourceCacheEntry:
-    stored_at_monotonic: float
-    snapshot: InventorySnapshot
-    smart_summary_cache: dict[str, dict[str, Any]]
-
-
-SNAPSHOT_EXPORT_SOURCE_CACHE: OrderedDict[str, SnapshotExportSourceCacheEntry] = OrderedDict()
-
-
-@lru_cache
-def get_inventory_registry() -> InventoryRegistry:
-    settings = get_settings()
-    configure_logging(settings)
-    return InventoryRegistry(settings)
-
-
-@lru_cache
-def get_history_backend() -> HistoryBackendClient:
-    settings = get_settings()
-    configure_logging(settings)
-    return HistoryBackendClient(settings.history)
-
-
-@lru_cache
-def get_snapshot_export_service() -> SnapshotExportService:
-    settings = get_settings()
-    configure_logging(settings)
-    return SnapshotExportService(settings, get_history_backend(), templates)
-
-
-@lru_cache
-def get_release_status_service() -> ReleaseStatusService:
-    settings = get_settings()
-    configure_logging(settings)
-    return ReleaseStatusService(
-        current_version=__version__,
-        enabled=settings.app.release_check_enabled,
-        repo_full_name=settings.app.release_check_repo,
-        interval_seconds=settings.app.release_check_interval_seconds,
-        timeout_seconds=settings.app.release_check_timeout_seconds,
-    )
-
-
-def _snapshot_export_source_cache_key(
-    *,
-    system_id: str,
-    enclosure_id: str | None,
-    payload: SnapshotExportRequest,
-) -> str:
-    request_basis = payload.model_dump(mode="json")
-    request_basis.pop("packaging", None)
-    request_basis.pop("allow_oversize", None)
-    request_basis["system_id"] = system_id
-    request_basis["enclosure_id"] = enclosure_id
-    return json.dumps(request_basis, sort_keys=True, separators=(",", ":"))
-
-
-def _get_snapshot_export_source_cache_entry(
-    cache_key: str,
-    settings: Settings,
-) -> SnapshotExportSourceCacheEntry | None:
-    ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
-    if ttl_seconds <= 0:
-        return None
-    entry = SNAPSHOT_EXPORT_SOURCE_CACHE.get(cache_key)
-    if entry is None:
-        return None
-    if time.monotonic() - entry.stored_at_monotonic > ttl_seconds:
-        SNAPSHOT_EXPORT_SOURCE_CACHE.pop(cache_key, None)
-        return None
-    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
-    return entry
-
-
-def _store_snapshot_export_source_cache_entry(
-    cache_key: str,
-    *,
-    snapshot: InventorySnapshot,
-    smart_summary_cache: dict[str, dict[str, Any]],
-    settings: Settings,
-) -> None:
-    ttl_seconds = max(0, int(settings.app.export_cache_ttl_seconds))
-    max_entries = max(0, int(settings.app.export_cache_max_entries))
-    if ttl_seconds <= 0 or max_entries <= 0:
-        return
-    SNAPSHOT_EXPORT_SOURCE_CACHE[cache_key] = SnapshotExportSourceCacheEntry(
-        stored_at_monotonic=time.monotonic(),
-        snapshot=snapshot,
-        smart_summary_cache=smart_summary_cache,
-    )
-    SNAPSHOT_EXPORT_SOURCE_CACHE.move_to_end(cache_key)
-    while len(SNAPSHOT_EXPORT_SOURCE_CACHE) > max_entries:
-        SNAPSHOT_EXPORT_SOURCE_CACHE.popitem(last=False)
-
-
-async def _load_snapshot_export_source(
-    *,
-    service: Any,
-    payload: SnapshotExportRequest,
-    enclosure_id: str | None,
-    stage_prefix: str,
-    settings: Settings,
-) -> tuple[InventorySnapshot, dict[str, dict[str, Any]]]:
-    cache_key = _snapshot_export_source_cache_key(
-        system_id=service.system.id,
-        enclosure_id=enclosure_id,
-        payload=payload,
-    )
-    cached_entry = _get_snapshot_export_source_cache_entry(cache_key, settings)
-    if cached_entry is not None:
-        add_perf_metadata(snapshot_export_source_cache="hit")
-        return cached_entry.snapshot, cached_entry.smart_summary_cache
-
-    add_perf_metadata(snapshot_export_source_cache="miss")
-    with perf_stage(f"{stage_prefix}.load_snapshot"):
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-    with perf_stage(f"{stage_prefix}.load_smart_summaries", slot_count=len(snapshot.slots)):
-        smart_summaries = await service.get_slot_smart_summaries(
-            [slot.slot for slot in snapshot.slots],
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=True,
-        )
-    smart_summary_cache = {
-        str(item.slot): item.summary.model_dump(mode="json")
-        for item in smart_summaries
-    }
-    _store_snapshot_export_source_cache_entry(
-        cache_key,
-        snapshot=snapshot,
-        smart_summary_cache=smart_summary_cache,
-        settings=settings,
-    )
-    return snapshot, smart_summary_cache
-
-
-def _filter_storage_view_runtime(
-    runtime: StorageViewRuntimePayload,
-    selected_view_ids: list[str],
-) -> StorageViewRuntimePayload:
-    selected_ids = {view_id for view_id in selected_view_ids if view_id}
-    views = [
-        view
-        for view in runtime.views
-        if view.enabled is not False
-        and view.render.show_in_main_ui is not False
-        and (not selected_ids or view.id in selected_ids)
-    ]
-    return StorageViewRuntimePayload(
-        system_id=runtime.system_id,
-        system_label=runtime.system_label,
-        views=views,
-    )
-
-
-async def _load_storage_view_export_source(
-    *,
-    service: Any,
-    payload: SnapshotExportRequest,
-    snapshot: InventorySnapshot,
-    enclosure_id: str | None,
-) -> tuple[StorageViewRuntimePayload | None, dict[str, dict[str, dict[str, Any]]]]:
-    if not payload.include_storage_views:
-        return None, {}
-    runtime = await service.get_storage_view_runtime(
-        selected_enclosure_id=enclosure_id,
-        snapshot=snapshot,
-    )
-    filtered_runtime = _filter_storage_view_runtime(runtime, payload.storage_view_ids)
-    if not filtered_runtime.views:
-        return filtered_runtime, {}
-
-    smart_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
-    for view in filtered_runtime.views:
-        slot_cache: dict[str, dict[str, Any]] = {}
-        for runtime_slot in view.slots:
-            if not runtime_slot.occupied:
-                continue
-            try:
-                summary = await service.get_storage_view_slot_smart_summary(
-                    view.id,
-                    runtime_slot.slot_index,
-                    selected_enclosure_id=enclosure_id,
-                    allow_stale_cache=True,
-                )
-            except TrueNASAPIError as exc:
-                slot_cache[str(runtime_slot.slot_index)] = {
-                    "available": False,
-                    "message": str(exc),
-                }
-                continue
-            slot_cache[str(runtime_slot.slot_index)] = summary.model_dump(mode="json")
-        smart_summary_cache[view.id] = slot_cache
-    return filtered_runtime, smart_summary_cache
-
-
-def _selected_snapshot_export_enclosure_ids(
-    *,
-    payload: SnapshotExportRequest,
-    snapshot: InventorySnapshot,
-    current_enclosure_id: str | None,
-) -> list[str]:
-    primary_enclosure_id = snapshot.selected_enclosure_id or current_enclosure_id
-    available_ids: list[str] = []
-    seen_available: set[str] = set()
-    for enclosure in snapshot.enclosures:
-        if enclosure.id and enclosure.id not in seen_available:
-            seen_available.add(enclosure.id)
-            available_ids.append(enclosure.id)
-
-    requested_ids = payload.enclosure_ids or available_ids
-    selected_ids: list[str] = []
-    seen_selected: set[str] = set()
-    if primary_enclosure_id:
-        selected_ids.append(primary_enclosure_id)
-        seen_selected.add(primary_enclosure_id)
-    if not payload.include_live_enclosures:
-        return selected_ids
-
-    for enclosure_id in requested_ids:
-        if enclosure_id not in seen_available or enclosure_id in seen_selected:
-            continue
-        seen_selected.add(enclosure_id)
-        selected_ids.append(enclosure_id)
-    return selected_ids
-
-
-async def _load_live_enclosure_export_sources(
-    *,
-    service: Any,
-    payload: SnapshotExportRequest,
-    snapshot: InventorySnapshot,
-    smart_summary_cache: dict[str, dict[str, Any]],
-    enclosure_id: str | None,
-    stage_prefix: str,
-    settings: Settings,
-) -> tuple[dict[str, InventorySnapshot] | None, dict[str, dict[str, dict[str, Any]]] | None]:
-    selected_enclosure_ids = _selected_snapshot_export_enclosure_ids(
-        payload=payload,
-        snapshot=snapshot,
-        current_enclosure_id=enclosure_id,
-    )
-    if not payload.include_live_enclosures or len(selected_enclosure_ids) <= 1:
-        return None, None
-
-    snapshots_by_enclosure: dict[str, InventorySnapshot] = {}
-    smart_summaries_by_enclosure: dict[str, dict[str, dict[str, Any]]] = {}
-    primary_enclosure_id = snapshot.selected_enclosure_id or enclosure_id
-    if primary_enclosure_id:
-        snapshots_by_enclosure[primary_enclosure_id] = snapshot
-        smart_summaries_by_enclosure[primary_enclosure_id] = {
-            str(slot_number): summary
-            for slot_number, summary in smart_summary_cache.items()
-        }
-
-    for selected_enclosure_id in selected_enclosure_ids:
-        if selected_enclosure_id in snapshots_by_enclosure:
-            continue
-        next_snapshot, next_smart_summary_cache = await _load_snapshot_export_source(
-            service=service,
-            payload=payload,
-            enclosure_id=selected_enclosure_id,
-            stage_prefix=stage_prefix,
-            settings=settings,
-        )
-        resolved_enclosure_id = next_snapshot.selected_enclosure_id or selected_enclosure_id
-        if not resolved_enclosure_id:
-            continue
-        snapshots_by_enclosure[resolved_enclosure_id] = next_snapshot
-        smart_summaries_by_enclosure[resolved_enclosure_id] = {
-            str(slot_number): summary
-            for slot_number, summary in next_smart_summary_cache.items()
-        }
-
-    add_perf_metadata(snapshot_export_live_enclosure_count=len(snapshots_by_enclosure))
-    return snapshots_by_enclosure, smart_summaries_by_enclosure
-
-
-def _clear_snapshot_export_source_cache_for_tests() -> None:
-    SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
-
-
-READ_UI_SIGN_IN_REQUIRED_REASON = "Sign in to enable mapping, LED, and alias changes."
-READ_UI_WRITE_POLICY_UNAVAILABLE_REASON = "Write controls are unavailable because the authorization mode is unknown."
-
-
-def build_read_ui_write_policy(auth_settings: Any | None) -> dict[str, object]:
-    """Describe whether the main UI's write controls can succeed (#273).
-
-    Network mode is the no-auth default. Basic mode keeps writes disabled until
-    the operator signs in. Missing or unknown settings fail closed.
-    """
-
-    auth_mode = getattr(auth_settings, "auth_mode", None)
-    if auth_mode == "basic":
-        return {
-            "enabled": False,
-            "mode": "basic",
-            "reason": READ_UI_SIGN_IN_REQUIRED_REASON,
-        }
-    if auth_mode == "network":
-        return {
-            "enabled": True,
-            "mode": "network",
-            "reason": "",
-        }
-    return {
-        "enabled": False,
-        "mode": "",
-        "reason": READ_UI_WRITE_POLICY_UNAVAILABLE_REASON,
-    }
-
-
-def resolve_read_ui_write_policy(request: Request) -> dict[str, object]:
-    try:
-        app_state = getattr(request.app, "state", None)
-    except (KeyError, AttributeError):
-        app_state = None
-    return build_read_ui_write_policy(getattr(app_state, "operator_auth_settings", None))
-
-
-def require_read_ui_basic_credentials(request: Request) -> None:
-    auth_settings = request.app.state.operator_auth_settings
-    if auth_settings.auth_mode != "basic":
-        raise HTTPException(
-            status_code=403,
-            detail="Read UI sign-in requires ADMIN_AUTH_MODE=basic.",
-        )
-    if not basic_auth_matches(
-        request.headers.get("authorization"),
-        auth_settings.auth_username,
-        auth_settings.auth_password,
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Read UI authentication required.",
-            headers={"WWW-Authenticate": 'Basic realm="truenas-jbod-ui"'},
-        )
-
-
-def require_read_ui_mutation_authorization(request: Request) -> None:
-    auth_settings = request.app.state.operator_auth_settings
-    if auth_settings.auth_mode == "network":
-        public_origin = (
-            request.app.state.read_ui_public_origin
-            or f"{request.url.scheme}://{request.url.netloc}"
-        )
-        if not request_origin_allowed(request, public_origin):
-            raise HTTPException(
-                status_code=403,
-                detail="Cross-origin Read UI mutation rejected.",
-            )
-        return
-    if auth_settings.auth_mode != "basic":
-        raise HTTPException(
-            status_code=403,
-            detail="Read UI authorization mode is unavailable.",
-        )
-    require_read_ui_basic_credentials(request)
-    if not request_origin_allowed(request, request.app.state.read_ui_public_origin):
-        raise HTTPException(
-            status_code=403,
-            detail="Cross-origin Read UI mutation rejected.",
-        )
 
 
 def create_app() -> FastAPI:
     startup_settings = get_settings()
-    operator_auth_settings = get_admin_settings()
+    operator_auth_settings = load_read_ui_auth_settings()
     if (
         operator_auth_settings.auth_mode == "basic"
         and configured_origin_identity(startup_settings.app.public_origin) is None
@@ -564,6 +69,10 @@ def create_app() -> FastAPI:
                 registry.prewarm_all(warm_smart=startup_settings.app.startup_warm_smart_enabled)
             )
         release_task = asyncio.create_task(get_release_status_service().run_periodic_refresh())
+        # A daemon thread, so a slow DNS miss here never holds up shutdown.
+        threading.Thread(
+            target=warm_admin_probe, args=(startup_settings,), name="admin-probe-warm", daemon=True,
+        ).start()
         try:
             yield
         finally:
@@ -589,31 +98,32 @@ def create_app() -> FastAPI:
     )
     app.state.operator_auth_settings = operator_auth_settings
     app.state.read_ui_public_origin = startup_settings.app.public_origin
+    writable_directories = tuple(ui_writable_directories(startup_settings))
+    _, configured_known_hosts = split_known_hosts_paths(startup_settings)
+    known_hosts_files = tuple(configured_known_hosts)
+    known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
+    startup_problems = [
+        *probe_writable_directories(writable_directories),
+        *known_hosts_problems,
+    ]
+    for problem in startup_problems:
+        logger.error("%s", problem)
+    for warning in known_hosts_read_only:
+        logger.warning("%s", warning)
+    app.state.startup_problems = tuple(startup_problems)
+    app.state.known_hosts_warnings = tuple(known_hosts_read_only)
+    app.state.writable_directories = writable_directories
+    app.state.known_hosts_files = known_hosts_files
+    app.state.storage_checked_at_monotonic = time.monotonic()
 
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
     install_metrics(app, service_name="enclosure-ui", version=__version__)
     install_perf_timing_middleware(app, startup_settings)
 
-    from app.route_compat import include_router_preserving_route_objects
-    from app.routes import build_router
-
-    include_router_preserving_route_objects(app, build_router(sys.modules[__name__]))
-    app.add_exception_handler(
-        SystemNotConfiguredError,
-        system_not_configured_exception_handler,
-    )
-    app.add_exception_handler(
-        UnknownEnclosureError,
-        unknown_enclosure_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotStateBusyError,
-        snapshot_state_busy_exception_handler,
-    )
-    app.add_exception_handler(
-        SnapshotExportBusyError,
-        snapshot_state_busy_exception_handler,
-    )
+    include_router_preserving_route_objects(app, build_router())
+    install_config_reload(app, SETTINGS_RUNTIME, startup_settings, on_applied=after_config_reload)
+    for mapped_exception_type in EXCEPTION_RESPONSES:
+        app.add_exception_handler(mapped_exception_type, mapped_exception_handler)
     app.add_exception_handler(
         MappingScopeConflict,
         mapping_scope_conflict_exception_handler,
@@ -635,203 +145,10 @@ def create_app() -> FastAPI:
     async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
         logger.error("Unhandled application error", exc_info=(type(exc), exc, exc.__traceback__))
         return JSONResponse(
-            {"ok": False, "detail": "Unhandled application error; see application logs."},
+            {"ok": False, "detail": "Something went wrong on the server. The application log has details."},
             status_code=500,
         )
 
     return app
-
-
-def build_index_context(
-    *,
-    request: Request,
-    snapshot: InventorySnapshot,
-    storage_view_runtime: StorageViewRuntimePayload,
-    settings: Settings,
-    history_configured: bool,
-    read_ui_mutation_auth_mode: str = "network",
-    admin_launch_url: str | None = None,
-    app_version: str = __version__,
-    release_status: dict[str, object] | None = None,
-    snapshot_mode: bool = False,
-    snapshot_export_meta: dict[str, object] | None = None,
-    snapshot_export_meta_json: str = "null",
-    preloaded_history_json: str = "{}",
-    preloaded_smart_summary_json: str = "{}",
-    preloaded_snapshots_json: str = "{}",
-    preloaded_snapshot_smart_summary_json: str = "{}",
-    preloaded_storage_view_smart_summary_json: str = "{}",
-    preloaded_history_summary_json: str = "{\"counts\": {}, \"collector\": {}}",
-    initial_selected_slot_json: str = "null",
-    initial_selected_storage_view_id_json: str = "null",
-    initial_history_timeframe_hours_json: str = "24",
-    initial_history_panel_open_json: str = "false",
-    initial_history_io_chart_mode_json: str = '"total"',
-) -> dict[str, object]:
-    sas_fabric_view_url = (
-        "#sas-fabric-panel"
-        if snapshot_mode
-        else request.url_for("sas_fabric_view").path
-    )
-    write_policy = resolve_read_ui_write_policy(request)
-    return {
-        "request": request,
-        "snapshot": snapshot,
-        "storage_view_runtime": storage_view_runtime,
-        "settings": settings,
-        "initial_snapshot_json": json.dumps(snapshot.model_dump(mode="json")),
-        "initial_storage_view_runtime_json": json.dumps(storage_view_runtime.model_dump(mode="json")),
-        "history_configured": history_configured,
-        "read_ui_mutation_auth_mode": read_ui_mutation_auth_mode,
-        "app_version": app_version,
-        "release_status": release_status or {},
-        "snapshot_mode": snapshot_mode,
-        "sas_fabric_view_url": sas_fabric_view_url,
-        "snapshot_export_meta": snapshot_export_meta or {},
-        "snapshot_export_meta_json": snapshot_export_meta_json,
-        "preloaded_history_json": preloaded_history_json,
-        "preloaded_smart_summary_json": preloaded_smart_summary_json,
-        "preloaded_snapshots_json": preloaded_snapshots_json,
-        "preloaded_snapshot_smart_summary_json": preloaded_snapshot_smart_summary_json,
-        "preloaded_storage_view_smart_summary_json": preloaded_storage_view_smart_summary_json,
-        "preloaded_history_summary_json": preloaded_history_summary_json,
-        "initial_selected_slot_json": initial_selected_slot_json,
-        "initial_selected_storage_view_id_json": initial_selected_storage_view_id_json,
-        "initial_history_timeframe_hours_json": initial_history_timeframe_hours_json,
-        "initial_history_panel_open_json": initial_history_panel_open_json,
-        "initial_history_io_chart_mode_json": initial_history_io_chart_mode_json,
-        "admin_launch_url": admin_launch_url,
-        "write_policy": write_policy,
-        "write_policy_json": json.dumps(write_policy),
-    }
-
-
-def check_slot_bounds(slot: int, layout_slots: Collection[int]) -> None:
-    if slot < 0 or slot not in layout_slots:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
-
-
-def snapshot_layout_slots(snapshot: Any) -> frozenset[int]:
-    """Return the set of slot numbers the snapshot actually renders.
-
-    ``layout_slot_count`` only says how many bays a view shows; a drawer
-    sub-view such as the MD1280 bottom drawer shows 42 bays numbered 42-83,
-    and operator profiles may use absolute or noncontiguous bay ids (#275).
-    The rendered ``SlotView`` numbers are authoritative; the layout rows stand
-    in before any bay has been rendered, and a bare count is only trusted when
-    the snapshot carries neither (a zero-based ``range``).
-    """
-    rendered = {int(view.slot) for view in (getattr(snapshot, "slots", None) or [])}
-    if rendered:
-        return frozenset(rendered)
-    layout_rows = getattr(snapshot, "layout_rows", None) or []
-    positioned = {int(slot) for row in layout_rows for slot in (row or []) if slot is not None}
-    if positioned:
-        return frozenset(positioned)
-    layout_slot_count = int(getattr(snapshot, "layout_slot_count", 0) or 0)
-    return frozenset(range(max(layout_slot_count, 0)))
-
-
-async def resolve_layout_slots(
-    service: Any | None = None,
-    selected_enclosure_id: str | None = None,
-) -> frozenset[int]:
-    """Return the slot numbers the selected enclosure view actually renders.
-
-    A global ``LAYOUT_SLOT_COUNT`` cannot represent mixed shelves or systems
-    with large disk inventories (#168, #213), and a bay *count* cannot
-    represent a view whose bays do not start at zero (#275). Missing, empty,
-    or mismatched snapshot evidence therefore fails closed instead of
-    permitting a mutation against an unrelated bound.
-    """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
-    try:
-        snapshot = await service.get_snapshot(
-            selected_enclosure_id=selected_enclosure_id,
-            allow_stale_cache=True,
-        )
-    except UnknownEnclosureError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except SnapshotStateBusyError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc),
-            headers={"Retry-After": "1"},
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - expose a stable route error, not source details
-        logger.debug("Slot bounds: selected enclosure snapshot unavailable (%s)", exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Unable to resolve selected enclosure layout.",
-        ) from exc
-    if selected_enclosure_id and snapshot.selected_enclosure_id != selected_enclosure_id:
-        raise HTTPException(
-            status_code=404,
-            detail="Requested enclosure is not available for this system.",
-        )
-    layout_slots = snapshot_layout_slots(snapshot)
-    if not layout_slots:
-        raise HTTPException(status_code=503, detail="Unable to resolve selected enclosure layout.")
-    return layout_slots
-
-
-async def ensure_slot_bounds(
-    slot: int,
-    service: Any | None = None,
-    selected_enclosure_id: str | None = None,
-) -> None:
-    if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
-    check_slot_bounds(slot, await resolve_layout_slots(service, selected_enclosure_id))
-
-
-async def resolve_read_layout_slots(
-    service: Any | None = None,
-    selected_enclosure_id: str | None = None,
-) -> tuple[frozenset[int] | None, str]:
-    try:
-        return await resolve_layout_slots(service, selected_enclosure_id), "verified"
-    except HTTPException as exc:
-        if exc.status_code != 503:
-            raise
-        return None, "unavailable"
-
-
-async def ensure_read_slot_bounds(
-    slot: int,
-    service: Any | None = None,
-    selected_enclosure_id: str | None = None,
-) -> str:
-    if slot < 0:
-        raise HTTPException(status_code=404, detail=f"Slot {slot} is outside configured layout.")
-    layout_slots, layout_bounds = await resolve_read_layout_slots(service, selected_enclosure_id)
-    if layout_slots is not None:
-        check_slot_bounds(slot, layout_slots)
-    return layout_bounds
-
-
-def resolve_admin_launch_url(request: Request, settings: Settings) -> str | None:
-    service_url = str(settings.admin.service_url or "").strip()
-    if not service_url:
-        return None
-
-    health_url = f"{service_url.rstrip('/')}/healthz"
-    health_request = urllib.request.Request(
-        health_url,
-        headers=request_id_headers({"Accept": "application/json"}),
-    )
-    try:
-        with urllib.request.urlopen(health_request, timeout=settings.admin.timeout_seconds) as response:
-            if getattr(response, "status", 200) >= 400:
-                return None
-    except (TimeoutError, urllib.error.URLError, ValueError):
-        return None
-
-    public_url = str(settings.admin.public_url or "").strip()
-    if public_url:
-        return public_url.rstrip("/")
-    return f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}"
-
 
 app = create_app()

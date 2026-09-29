@@ -10,7 +10,9 @@ const APP_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8")
 const ADMIN_SOURCE = fs.readFileSync(path.join(ROOT, "admin_service/static/admin.js"), "utf8");
 const TEMPLATE = fs.readFileSync(path.join(ROOT, "app/templates/index.html"), "utf8");
 const STYLE = fs.readFileSync(path.join(ROOT, "app/static/style.css"), "utf8");
-const PUBLIC_DEMO_ARTIFACT = fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8");
+const { SKIP_REASON, currentSourceDemo } = require("./current_source_demo");
+
+const PUBLIC_DEMO_ARTIFACT = currentSourceDemo();
 
 function functionSource(source, name) {
   const patterns = [`async function ${name}(`, `function ${name}(`];
@@ -153,7 +155,7 @@ test("setup-frontend and client-chosen known-hosts leftovers stay deleted", () =
   );
 });
 
-test("generated public demo keeps source-deleted UI paths absent", () => {
+test("generated public demo keeps source-deleted UI paths absent", { skip: PUBLIC_DEMO_ARTIFACT === null && SKIP_REASON }, () => {
   for (const symbol of [
     "renderStorageViewsRuntime",
     "selectStorageViewRuntimeFromCard",

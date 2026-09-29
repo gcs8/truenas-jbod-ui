@@ -1,0 +1,48 @@
+name: JBOD singleton runner trial
+
+# Publish only after parent review. Never approve external fork runs.
+# Expressions protect this reviewed workflow, not fork-modified YAML.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Owner-reviewed full SHA, matching dispatch workflow and approved variable
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: jbod-native-singleton-runner-trial
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: ${{ github.repository == 'gcs8/truenas-jbod-ui' && github.repository_id == '1208650488' && github.actor == 'gcs8' && github.triggering_actor == 'gcs8' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.source_sha != '' && inputs.source_sha == vars.JBOD_NATIVE_TRIAL_SHA && inputs.source_sha == github.sha }}
+    runs-on: jbod-native-trial
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Validate exact source before checkout
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - name: Check out exact reviewed source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: gcs8/truenas-jbod-ui
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify checkout identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Run bounded preinstalled toolchain and synthetic storage smoke
+        shell: bash
+        run: python3 scripts/jbod_runner_smoke.py --profile native

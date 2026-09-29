@@ -69,7 +69,7 @@ function functionSource(source, name) {
 }
 
 function loadFunction(name, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, renderStorageViewRuntimeStatus() {}, ...context });
   vm.runInContext(`${functionSource(APP_SOURCE, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
@@ -89,6 +89,63 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+
+
+function mappingGenerationFixture() {
+  const state = {selectedSystemId: "synthetic-system", selectedEnclosureId: "enc-a", refreshesInFlight: 0};
+  const values = {}, writes = [];
+  const mappingForm = {};
+  for (const name of ["serial", "device_name", "gptid", "notes"]) {
+    mappingForm[name] = {};
+    Object.defineProperty(mappingForm[name], "value", {
+      get() { return values[name]; },
+      set(value) { values[name] = value; writes.push(name); },
+    });
+  }
+  const mappingFormScopeKey = loadFunction("mappingFormScopeKey", {state});
+  const sync = loadFunction("syncMappingFormForSlot", {state, mappingForm, mappingFormScopeKey, scheduleAutoRefresh() {}});
+  const first = {slot: 0, serial: "SANITIZED-OLD", device_name: "sdx", gptid: "synthetic-old", notes: "Original", mapping_revision: "old-revision"};
+  sync(first);
+  writes.length = 0;
+  return {state, values, writes, sync, first};
+}
+
+test("mapping generation clean fields follow authoritative changes even with unchanged revision", () => {
+  const h = mappingGenerationFixture();
+  h.sync({...h.first, serial: null, device_name: null, gptid: null, notes: "Empty bay"});
+  assert.deepEqual(h.values, {serial: "", device_name: "", gptid: "", notes: "Empty bay"});
+  assert.equal(h.state.mappingFormBaseRevision, "old-revision");
+});
+
+test("mapping generation revision-only refresh advances a clean base without writing fields", () => {
+  const h = mappingGenerationFixture();
+  h.sync({...h.first, mapping_revision: "new-revision"});
+  assert.deepEqual(h.writes, []);
+  assert.equal(h.state.mappingFormBaseRevision, "new-revision");
+});
+
+test("mapping generation dirty values and original base survive repeated same-scope refresh", () => {
+  const h = mappingGenerationFixture();
+  h.state.mappingFormDirty = true;
+  h.values.notes = "Draft";
+  for (const revision of ["new-revision", null, "another-revision"]) {
+    h.sync({...h.first, serial: "SANITIZED-NEW", notes: "New notes", mapping_revision: revision});
+    assert.deepEqual(h.writes, []);
+    assert.equal(h.values.notes, "Draft");
+    assert.equal(h.state.mappingFormBaseRevision, "old-revision");
+  }
+});
+
+test("mapping generation new scope replaces draft values and base together", () => {
+  const h = mappingGenerationFixture();
+  h.state.mappingFormDirty = true;
+  h.state.selectedEnclosureId = "enc-b";
+  h.sync({...h.first, serial: "SANITIZED-OTHER", mapping_revision: "other-revision"});
+  assert.equal(h.values.serial, "SANITIZED-OTHER");
+  assert.equal(h.state.mappingFormBaseRevision, "other-revision");
+  assert.equal(h.state.mappingFormDirty, false);
+});
 
 test("auto refresh pause reason covers hidden documents and active mapping drafts", () => {
   const state = { mappingFormDirty: true };
@@ -325,9 +382,53 @@ test("a draft started during an automatic refresh blocks its response render", a
 
   assert.equal(events.includes("apply"), false);
   assert.equal(events.includes("render"), false);
-  assert.equal(events.some((event) => /deferred.*calibration/i.test(event)), true);
+  assert.equal(events.some((event) => /set aside.*editing a bay/i.test(event)), true);
   assert.equal(events.filter((event) => event === "schedule").length, 1);
 });
+
+for (const loading of [true, false]) {
+  test(`a set-aside refresh ${loading ? "still finishes" : "does not start"} a storage view reload`, async () => {
+    const request = deferred();
+    const events = [];
+    const state = {
+      snapshotMode: false,
+      mappingFormDirty: false,
+      latestRefreshToken: 0,
+      refreshesInFlight: 0,
+      selectedSystemId: "system-b",
+      selectedEnclosureId: null,
+      storageViewsRuntimeLoading: loading,
+      sasFabric: { open: false },
+      history: { configured: false },
+      uiPerf: { currentRun: null },
+    };
+    const refreshSnapshot = loadFunction("refreshSnapshot", {
+      state,
+      cancelAutoRefreshTimer() {},
+      beginUiPerfRun() { return null; },
+      refreshStatusMessage() { return "refreshing"; },
+      setStatus(message) { events.push(`status:${message}`); },
+      buildSelectionParams() { return new URLSearchParams(); },
+      URLSearchParams,
+      fetchJson() { return request.promise; },
+      applySnapshot() { events.push("apply"); },
+      renderAll() { events.push("render"); },
+      fetchStorageViewRuntime() { events.push("storage-views"); return Promise.resolve(); },
+      archiveUiPerfRun() {},
+      scheduleAutoRefresh() {},
+    });
+
+    const refresh = refreshSnapshot(false, "system-switch");
+    state.mappingFormDirty = true;
+    request.resolve({ selected_system_id: "system-b", slots: [] });
+    await refresh;
+
+    assert.equal(events.includes("apply"), false);
+    assert.equal(events.includes("render"), false);
+    assert.equal(events.some((event) => /set aside.*editing a bay/i.test(event)), true);
+    assert.equal(events.filter((event) => event === "storage-views").length, loading ? 1 : 0);
+  });
+}
 
 test("discard confirmation keeps or releases a dirty calibration draft explicitly", () => {
   const state = {
@@ -354,7 +455,7 @@ test("discard confirmation keeps or releases a dirty calibration draft explicitl
   assert.equal(state.mappingFormDirty, true);
   assert.equal(state.mappingFormScopeKey, "system-a|enclosure-a||1");
   assert.equal(schedules, 0);
-  assert.match(statuses.at(-1), /canceled.*edits were kept/i);
+  assert.match(statuses.at(-1), /canceled.*changes were kept/i);
 
   confirmed = true;
   assert.equal(confirmMappingDraftDiscard(), true);
@@ -427,6 +528,7 @@ test("fabric slot controls do not synchronize trace state before dirty navigatio
   const selectSasFabricSlot = loadFunction("selectSasFabricSlot", {
     Number,
     syncSasFabricTraceToSlot(slot) { events.push(`sync:${slot}`); },
+    sasFabricViewSlotForBay: (slot) => slot,
     selectSlot(slot) {
       events.push(`select:${slot}`);
       return false;

@@ -5,6 +5,7 @@ import json
 import re
 import shlex
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +56,7 @@ class FakeProbe:
                 "BOOTSTRAP_AUTHORIZED_KEYS_PATH=/home/jbodmap/.ssh/authorized_keys\n"
                 "BOOTSTRAP_SUDOERS_PATH=/etc/sudoers.d/truenas-jbod-ui-jbodmap\n"
                 "BOOTSTRAP_PERMISSION_TARGET=/etc/sudoers.d/truenas-jbod-ui-jbodmap\n"
+                "BOOTSTRAP_SUDO_RULES_INSTALLED=1\n"
             ),
             stderr="",
             exit_code=0,
@@ -143,6 +145,35 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
                 FakeProbe.last_config.known_hosts_path,
                 str(Path(temp_dir) / "data" / "known_hosts"),
             )
+
+    def test_bootstrap_uses_the_configured_known_hosts_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "config" / "config.yaml"
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            key_manager = SSHKeyManager(str(config_file))
+            generated_key = key_manager.generate_keypair("id_truenas")
+            configured = str(Path(temp_dir) / "host-trust" / "known_hosts")
+            service = ServiceAccountBootstrapService(
+                str(config_file),
+                probe_factory=FakeProbe,
+                known_hosts_path=configured,
+            )
+
+            result = service.bootstrap_service_account(
+                SystemSetupBootstrapRequest(
+                    platform="core",
+                    host="nas.example.test",
+                    bootstrap_user="root",
+                    bootstrap_password="bootstrap-secret",
+                    bootstrap_known_hosts_path=str(Path(temp_dir) / "request-selected-known-hosts"),
+                    bootstrap_strict_host_key_checking=False,
+                    service_user="jbodmap",
+                    service_key_name=generated_key["name"],
+                )
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(FakeProbe.last_config.known_hosts_path, configured)
 
     def test_bootstrap_uses_sudo_and_private_key_path_for_non_root_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -327,6 +358,146 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
         self.assertIn("/usr/sbin/smartctl -a /dev/sda", content)
         self.assertNotIn("/usr/bin/sg_ses -p aes /dev/sg*", content)
         self.assertNotIn("sudo -n", content)
+
+
+class BootstrapPolicyEvidenceTests(unittest.TestCase):
+    def payload(self):
+        return SystemSetupBootstrapRequest(
+            platform="linux", host="bootstrap.example.test", bootstrap_user="root",
+            bootstrap_password="synthetic-password", service_user="jbodmap",
+            service_public_key="ssh-ed25519 synthetic",
+        )
+
+    def run_policy(self, policy, *, both=False, validator="ok", existing=True, active="etc"):
+        """Execute only the real policy block, with all paths and visudo remapped.
+
+        No account/key operations, real sudo, or host policy files are executed.
+        The validator is a shell function, never the host visudo executable.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            etc = root / "etc/sudoers.d"
+            local = root / "usr/local/etc/sudoers.d"
+            etc.parent.mkdir(parents=True)
+            if existing:
+                etc.mkdir()
+            if both:
+                local.mkdir(parents=True)
+            target_dir = etc if active == "etc" else local
+            source = root / "etc/sudoers"
+            def remap(text):
+                text = text.replace('/usr/local/etc/', '__LOCAL_ETC__/').replace('/etc/', '__ETC__/')
+                return text.replace('__LOCAL_ETC__', str(root / 'usr/local/etc')).replace(
+                    '__ETC__', str(root / 'etc'))
+
+            if policy is not None:
+                source.write_text(remap(policy))
+            service = ServiceAccountBootstrapService(str(root / "config.yaml"), probe_factory=FakeProbe)
+            script = service._build_remote_script(self.payload(), "ssh-ed25519 synthetic")
+            start = script.index("  sudoers_dir=")
+            end = script.index('  permission_target="$sudoers_path"', start)
+            block = script[start:end + len('  permission_target="$sudoers_path"')]
+            block = remap(block)
+            self.assertNotIn('useradd', block)
+            self.assertNotIn('authorized_keys', block)
+            # timeout invokes our shell function directly; it never launches real visudo.
+            stub = (
+                'visudo() {\n'
+                + ('return 1\n' if validator == 'fail' else
+                   'if [ "$1" = "-c" ]; then\n'
+                   f"printf '%s: parsed OK\\n' {shlex.quote(str(source))}\n"
+                   + (f"for f in {shlex.quote(str(target_dir))}/truenas-jbod-ui-*; do\n"
+                      'case "$f" in *.tmp*) continue;; esac\n'
+                      '[ ! -f "$f" ] || printf "%s: parsed OK\\n" "$f"\ndone\n'
+                      if validator == 'ok' else '') + 'fi\nreturn 0\n')
+                + '}\ntimeout() { shift; "$@"; }\n'
+            )
+            completed = subprocess.run(
+                ['/bin/sh', '-c', 'set -eu\n' + stub + block + '\nprintf "%s\\n" "$permission_target"'],
+                capture_output=True, text=True, timeout=5,
+                env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+            )
+            return completed, str(target_dir / 'truenas-jbod-ui-jbodmap'), local.exists()
+
+    def test_active_etc_include_wins_with_both_directories_existing(self):
+        result, target, _ = self.run_policy('#includedir /etc/sudoers.d\n', both=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), target)
+
+    def test_active_include_does_not_create_an_unincluded_local_directory(self):
+        result, target, local_exists = self.run_policy('@includedir /etc/sudoers.d\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), target)
+        self.assertFalse(local_exists)
+
+    def test_explicit_local_include_and_commented_decoy_use_the_active_directory(self):
+        result, target, _ = self.run_policy(
+            '# @includedir /etc/sudoers.d\n  @includedir /usr/local/etc/sudoers.d # active\n',
+            both=True, active="local",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), target)
+
+    def test_active_missing_directory_can_be_created(self):
+        result, target, _ = self.run_policy('#includedir /etc/sudoers.d\n', existing=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), target)
+
+    def test_nonincluded_and_unsupported_policy_layouts_fail_closed(self):
+        policies = [None, '', '# comment /etc/sudoers.d\n', '# #includedir /etc/sudoers.d\n',
+                    '# includedir /etc/sudoers.d\n', '@include /etc/nested\n',
+                    '#include /etc/nested\n', '@includedir "/etc/sudoers.d"\n',
+                    '@includedir /etc/sudoers.d.extra\n',
+                    '@includedir /etc/sudoers.d\n@include /etc/nested\n',
+                    'Defaults env_keep += "\\\n#includedir /etc/sudoers.d\n"\n',
+                    '#' * 65537 + '\n#includedir /etc/sudoers.d\n']
+        for policy in policies:
+            with self.subTest(policy=repr(policy)[:100]):
+                result, _, _ = self.run_policy(policy, both=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('sudo', result.stderr.lower())
+                self.assertEqual(result.stdout, '')
+
+    def test_failed_or_nonincluding_validator_never_reports_policy_success(self):
+        for validator in ('fail', 'omits_target'):
+            with self.subTest(validator=validator):
+                result, _, _ = self.run_policy('#includedir /etc/sudoers.d\n', validator=validator)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_mocked_ssh_success_without_policy_receipt_is_not_grant_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = ServiceAccountBootstrapService(str(Path(temp) / 'config.yaml'), probe_factory=FakeProbe)
+            with patch.object(FakeProbe, 'run_command_sync', return_value=SSHCommandResult(
+                command='synthetic', ok=True, stdout='BOOTSTRAP_SUDOERS_PATH=/etc/sudoers.d/synthetic\n',
+                stderr='', exit_code=0,
+            )):
+                result = service.bootstrap_service_account(self.payload())
+            self.assertFalse(result['ok'])
+            self.assertFalse(result['sudo_rules_installed'])
+            self.assertIn('could not be verified', result['detail'])
+
+    def test_platform_boundaries_and_disabled_policy_remain_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = ServiceAccountBootstrapService(str(Path(temp) / "config.yaml"), probe_factory=FakeProbe)
+            payload = self.payload()
+            core = payload.model_copy(update={"platform": "core"})
+            script = service._build_remote_script(core, "ssh-ed25519 synthetic")
+            self.assertIn("midclt call user.update", script)
+            self.assertNotIn("check_sudo_policy", script)
+            with self.assertRaisesRegex(ValueError, "ESXi does not use"):
+                service.bootstrap_service_account(payload.model_copy(update={"platform": "esxi"}))
+            result = service.bootstrap_service_account(payload.model_copy(update={"install_sudo_rules": False}))
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["sudo_rules_installed"])
+
+    def test_mocked_ssh_policy_failure_is_not_grant_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            service = ServiceAccountBootstrapService(str(Path(temp) / 'config.yaml'), probe_factory=FakeProbe)
+            with patch.object(FakeProbe, 'run_command_sync', return_value=SSHCommandResult(
+                command='synthetic', ok=False, stdout='', stderr='Unable to verify sudo policy.', exit_code=1
+            )), self.assertRaisesRegex(ValueError, 'verify sudo policy'):
+                service.bootstrap_service_account(self.payload())
 
 
 def sudoers_grant_matches(grant: str, command: str) -> bool:

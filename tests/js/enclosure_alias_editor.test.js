@@ -152,7 +152,7 @@ test("opening and canceling the editor preserves raw context and restores focus"
   fns.openEnclosureAliasEditor();
   assert.equal(state.enclosureAliasEditorOpen, true);
   assert.equal(input.value, "Archive East");
-  assert.equal(rawHint.textContent, "Raw: Dell Drawer 1-42 (Top)");
+  assert.equal(rawHint.textContent, "Reported name: Dell Drawer 1-42 (Top)");
   assert.equal(formClasses.contains("hidden"), false);
   assert.equal(buttonClasses.contains("hidden"), true);
   assert.equal(inputFocused, 1);
@@ -240,7 +240,7 @@ test("changing the selected enclosure closes an open alias draft", () => {
   assert.equal(state.enclosureAliasEditorScopeKey, null);
   assert.equal(formClasses.contains("hidden"), true);
   assert.equal(buttonClasses.contains("hidden"), false);
-  assert.equal(rawHint.textContent, "Raw: Shelf B");
+  assert.equal(rawHint.textContent, "Reported name: Shelf B");
 });
 
 test("live navigation closes an alias draft before changing selection", () => {
@@ -322,9 +322,9 @@ test("a rejected alias write reports the server detail and keeps the editor open
       getSelectedEnclosureOption: () => ({ id: "enc-a" }),
       currentLiveEnclosureId: () => "enc-a",
       fetchJson: async () => {
-        const denied = new Error("Read UI authentication required.");
+        const denied = new Error("Main UI authentication required.");
         denied.status = 401;
-        denied.detail = "Read UI authentication required.";
+        denied.detail = "Main UI authentication required.";
         throw denied;
       },
       handleWriteRejection(error) {
@@ -342,7 +342,7 @@ test("a rejected alias write reports the server detail and keeps the editor open
 
   assert.equal(rejections.length, 1);
   assert.equal(rejections[0].status, 401);
-  assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+  assert.deepEqual(statuses, [{ message: "Main UI authentication required.", tone: "error" }]);
   assert.equal(focused, 1);
   assert.equal(closed, 0);
   assert.equal(refreshed, 0);
@@ -351,24 +351,44 @@ test("a rejected alias write reports the server detail and keeps the editor open
   await submitEnclosureAlias({ preventDefault() {} });
   assert.equal(rejections.length, 1);
   assert.equal(statuses.length, 2);
-  assert.equal(statuses[1].message, "Read UI authentication required.");
+  assert.equal(statuses[1].message, "Main UI authentication required.");
   assert.equal(writePolicyAllowsWrites(), false);
   assert.equal(writeBlockedByPolicy(), true);
-  assert.equal(writePolicyReason(), "Read UI authentication required.");
+  assert.equal(writePolicyReason(), "Main UI authentication required.");
 });
 
-test("clear control clears the draft and submits the clear operation", async () => {
+test("remove-name control asks first, then clears the draft and submits the clear operation", async () => {
+  const input = { value: "Archive East" };
+  let submissions = 0;
+  const questions = [];
+  const { clearEnclosureAlias } = loadFunctions(["clearEnclosureAlias"], {
+    enclosureAliasInput: input,
+    async submitEnclosureAlias() { submissions += 1; },
+    window: { confirm(message) { questions.push(message); return true; } },
+  });
+
+  await clearEnclosureAlias();
+
+  assert.equal(questions.length, 1);
+  assert.match(questions[0], /Remove this enclosure name\?/);
+  assert.equal(input.value, "");
+  assert.equal(submissions, 1);
+  assert.match(TEMPLATE, /id="enclosure-alias-clear"[^>]*>Remove name</);
+});
+
+test("declining the remove-name question keeps the draft and saves nothing", async () => {
   const input = { value: "Archive East" };
   let submissions = 0;
   const { clearEnclosureAlias } = loadFunctions(["clearEnclosureAlias"], {
     enclosureAliasInput: input,
     async submitEnclosureAlias() { submissions += 1; },
+    window: { confirm() { return false; } },
   });
 
   await clearEnclosureAlias();
 
-  assert.equal(input.value, "");
-  assert.equal(submissions, 1);
+  assert.equal(input.value, "Archive East");
+  assert.equal(submissions, 0);
 });
 
 test("multi-enclosure live title prefers the selected option label", () => {
@@ -419,11 +439,11 @@ test("virtual inventory uses system-scoped disk copy without physical profile or
 
   assert.equal(profile.profileId, null);
   assert.equal(profile.profileLabel, null);
-  assert.equal(profile.eyebrow, "System A / Virtual inventory");
-  assert.match(profile.summary, /system-scoped disk inventory/i);
-  assert.match(profile.summary, /no physical enclosure orientation/i);
+  assert.equal(profile.eyebrow, "System A / All disks");
+  assert.match(profile.summary, /disks on this system/i);
+  assert.match(profile.summary, /not physical bays/i);
   assert.equal(profile.enclosureTitle, "System disk inventory (virtual)");
-  assert.equal(profile.edgeLabel, "System-scoped disks");
+  assert.equal(profile.edgeLabel, "Not a physical layout");
   assert.equal(profile.faceStyle, "generic");
   assert.equal(profile.latchEdge, "bottom");
   assert.deepEqual(profile.slotLayout, [[0, 1]]);

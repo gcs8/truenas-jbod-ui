@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import socket
 from datetime import timedelta
 import urllib.error
@@ -24,8 +23,8 @@ from history_service.operation_bounds import (
 
 
 logger = logging.getLogger(__name__)
-HISTORY_BACKEND_FAILURE_DETAIL = "History backend request failed; see application logs."
-HISTORY_BACKEND_DEGRADED_DETAIL = "History backend is degraded; see history service logs."
+HISTORY_BACKEND_FAILURE_DETAIL = "History is temporarily unavailable."
+HISTORY_BACKEND_DEGRADED_DETAIL = "History is running with errors. Check the history service log."
 
 
 class HistoryBackendError(RuntimeError):
@@ -33,26 +32,33 @@ class HistoryBackendError(RuntimeError):
 
 
 class HistoryBackendUnavailableError(HistoryBackendError):
-    """The backend could not be reached at all (connection refused, DNS, timeout).
+    """The backend could not be reached at all (connection refused, DNS, timeout)."""
 
-    Distinguished from HTTP-level failures so per-slot fallbacks can stop fanning out
-    once the backend is known to be unreachable instead of waiting out one timeout per
-    slot.
-    """
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class HistoryBackendResponseError(HistoryBackendError):
     """The backend answered, but with an HTTP error or an unusable body."""
 
-    def __init__(self, status_code: int | str, detail: str | None = None) -> None:
-        if isinstance(status_code, str):
-            match = re.search(r"HTTP (\d{3})", status_code)
-            self.status_code = int(match.group(1)) if match else 0
-            message = detail or status_code
-        else:
-            self.status_code = status_code
-            message = detail or f"History backend returned HTTP {self.status_code}."
-        super().__init__(message)
+    def __init__(self, status_code: int, detail: str | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(detail or f"History backend returned HTTP {self.status_code}.")
+
+
+def _log_reason(exc: BaseException) -> str:
+    """Describe a failure for the application log without repeating its message.
+
+    Exception text can carry backend URLs, credentials, or private paths, so the log
+    names only the transport reason this module recorded, the HTTP status, or the
+    exception class.
+    """
+    if isinstance(exc, HistoryBackendUnavailableError) and exc.reason:
+        return exc.reason
+    if isinstance(exc, HistoryBackendResponseError) and exc.status_code:
+        return f"HTTP {exc.status_code}"
+    return type(exc).__name__
 
 
 class HistoryBackendBusyError(HistoryBackendResponseError):
@@ -87,8 +93,8 @@ class HistoryBackendClient:
 
         try:
             payload = await self._fetch_json("/healthz")
-        except Exception:  # noqa: BLE001 - surface optional-backend errors as degraded status.
-            logger.warning("History backend status request failed.")
+        except Exception as exc:  # noqa: BLE001 - surface optional-backend errors as degraded status.
+            logger.warning("History backend status request failed (%s).", _log_reason(exc))
             return {
                 "configured": True,
                 "available": False,
@@ -135,8 +141,8 @@ class HistoryBackendClient:
 
         try:
             return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-        except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
-            logger.warning("History backend slot history request failed.")
+        except Exception as exc:  # noqa: BLE001 - optional backend should degrade gracefully.
+            logger.warning("History backend slot history request failed (%s).", _log_reason(exc))
             return self._failed_slot_payload(slot, system_id, enclosure_id)
 
     async def _fetch_slot_history(
@@ -174,48 +180,6 @@ class HistoryBackendClient:
             "disk_history": payload.get("disk_history", {}),
         }
 
-    async def _fallback_scope_history(
-        self,
-        slots: list[int],
-        system_id: str | None,
-        enclosure_id: str | None,
-        *,
-        window_hours: int | None,
-    ) -> dict[int, dict[str, Any]]:
-        """Per-slot fallback for a failed batched scope call.
-
-        Bounded by ``fallback_max_concurrency`` so a degraded backend cannot saturate the
-        default thread pool, deduplicated so repeated slot ids cost one request, and
-        short-circuited: once one request proves the backend unreachable, the remaining
-        slots are marked unavailable without waiting out a timeout each.
-        """
-
-        unique_slots = list(dict.fromkeys(slots))
-        limit = max(1, int(self.config.fallback_max_concurrency or 0))
-        semaphore = asyncio.Semaphore(limit)
-        unreachable = asyncio.Event()
-
-        async def fetch_one(slot: int) -> dict[str, Any]:
-            if unreachable.is_set():
-                return self._failed_slot_payload(slot, system_id, enclosure_id)
-            async with semaphore:
-                if unreachable.is_set():
-                    return self._failed_slot_payload(slot, system_id, enclosure_id)
-                try:
-                    return await self._fetch_slot_history(slot, system_id, enclosure_id, window_hours=window_hours)
-                except HistoryBackendUnavailableError:
-                    if not unreachable.is_set():
-                        logger.warning(
-                            "History backend unreachable during per-slot fallback; skipping remaining slots."
-                        )
-                    unreachable.set()
-                except Exception:  # noqa: BLE001 - optional backend should degrade gracefully.
-                    logger.warning("History backend slot history request failed.")
-                return self._failed_slot_payload(slot, system_id, enclosure_id)
-
-        results = await asyncio.gather(*(fetch_one(slot) for slot in unique_slots))
-        return dict(zip(unique_slots, results, strict=True))
-
     async def get_scopes_history(
         self,
         *,
@@ -251,13 +215,14 @@ class HistoryBackendClient:
             detail = "History backend is not configured."
         else:
             try:
-                return await self._send_json("/api/history/scopes/bundle", document)
+                payload = await self._send_json("/api/history/scopes/bundle", document)
+                return self._normalize_scopes_history(payload, document["scopes"])
             except HistoryBackendPolicyError:
                 raise
             except HistoryBackendResponseError:
                 raise
-            except (HistoryBackendUnavailableError, OSError):
-                logger.warning("History backend multi-scope request failed.")
+            except (HistoryBackendUnavailableError, OSError) as exc:
+                logger.warning("History backend multi-scope request failed (%s).", _log_reason(exc))
                 available = False
                 detail = HISTORY_BACKEND_FAILURE_DETAIL
         return {
@@ -280,6 +245,116 @@ class HistoryBackendClient:
                 for scope in plan.scopes
             ],
             "budget": plan.budget_metadata(),
+        }
+
+    def _normalize_scopes_history(
+        self,
+        payload: dict[str, Any],
+        scopes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Attach consumer metadata only to requested, identity-matched histories.
+
+        The store's wire format omits per-slot availability and identity. Missing
+        targets are not successful empty histories; explicit outage metadata at
+        any level must survive adaptation to both export and single-scope reads.
+        """
+        response_scopes = payload.get("scopes")
+        if not isinstance(response_scopes, list):
+            raise HistoryBackendResponseError(0, "History backend returned a malformed scope payload.")
+        by_identity: dict[tuple[str, str | None], dict[str, Any]] = {}
+        for scope in response_scopes:
+            if (
+                not isinstance(scope, dict)
+                or not isinstance(scope.get("system_id"), str)
+                or (scope.get("enclosure_id") is not None and not isinstance(scope["enclosure_id"], str))
+                or not isinstance(scope.get("histories"), dict)
+            ):
+                raise HistoryBackendResponseError(0, "History backend returned a malformed scope payload.")
+            identity = (scope["system_id"], scope.get("enclosure_id"))
+            if identity in by_identity:
+                raise HistoryBackendResponseError(0, "History backend returned duplicate scope identities.")
+            by_identity[identity] = scope
+
+        normalized = []
+        for requested in scopes:
+            system_id, enclosure_id = requested["system_id"], requested["enclosure_id"]
+            scope = by_identity.get((system_id, enclosure_id), {})
+            histories = scope.get("histories", {})
+            normalized.append({
+                **scope,
+                "system_id": system_id,
+                "enclosure_id": enclosure_id,
+                "histories": {
+                    str(slot): self._normalize_scope_slot(
+                        histories.get(str(slot)), slot, system_id, enclosure_id, payload, scope,
+                    )
+                    for slot in requested["slots"]
+                },
+            })
+        return {**payload, "scopes": normalized}
+
+    def _normalize_scope_slot(
+        self,
+        history: Any,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+        *parents: dict[str, Any],
+    ) -> dict[str, Any]:
+        present = isinstance(history, dict)
+        history = history if present else {}
+        metrics = history.get("metrics", {})
+        events = history.get("events", [])
+        sample_counts = history.get("sample_counts", {})
+        latest_values = history.get("latest_values", {})
+        disk_history = history.get("disk_history", {})
+        if present and (
+            not isinstance(metrics, dict)
+            or any(
+                not isinstance(metric_name, str)
+                or not isinstance(samples, list)
+                or any(not isinstance(sample, dict) for sample in samples)
+                for metric_name, samples in metrics.items()
+            )
+            or not isinstance(events, list)
+            or any(not isinstance(event, dict) for event in events)
+            or not isinstance(sample_counts, dict)
+            or not isinstance(latest_values, dict)
+            or not isinstance(disk_history, dict)
+        ):
+            raise HistoryBackendResponseError(0, "History backend returned a malformed slot history payload.")
+        coverage = history.get("coverage")
+        coverage = coverage if isinstance(coverage, dict) else {}
+        metric_coverage = coverage.get("metrics")
+        metric_coverage = metric_coverage if isinstance(metric_coverage, dict) else {}
+        statuses = ("complete", "truncated", "unknown")
+        coverage = {
+            "metrics": {
+                name: metric_coverage.get(name) if metric_coverage.get(name) in statuses else "unknown"
+                for name in metrics
+            },
+            "events": coverage.get("events") if coverage.get("events") in statuses else "unknown",
+        }
+        layers = (*parents, history)
+        configured = self.configured and all(layer.get("configured", True) is True for layer in layers)
+        available = configured and present and all(layer.get("available", True) is True for layer in layers)
+        detail = next((layer["detail"] for layer in reversed(layers) if layer.get("detail")), None)
+        if not available and detail is None:
+            detail = HISTORY_BACKEND_FAILURE_DETAIL if configured else "History backend is not configured."
+        return {
+            **history,
+            "coverage": coverage,
+            "configured": configured,
+            "available": available,
+            "detail": detail,
+            "slot": slot,
+            "system_id": system_id,
+            "enclosure_id": enclosure_id,
+            "metrics": metrics,
+            "events": events,
+            "sample_counts": sample_counts,
+            "latest_values": latest_values,
+            "disk_history": disk_history,
         }
 
     async def get_scope_history(
@@ -341,75 +416,35 @@ class HistoryBackendClient:
                 raise HistoryBackendResponseError(0, "History backend returned a malformed histories payload.")
         except (HistoryBudgetExceeded, HistoryRequestShapeError) as exc:
             raise ValueError(str(exc)) from exc
-        except HistoryBackendUnavailableError:
-            logger.warning("History backend scope history request failed.")
+        except HistoryBackendUnavailableError as exc:
+            logger.warning("History backend scope history request failed (%s).", _log_reason(exc))
             return {
                 slot: self._failed_slot_payload(slot, system_id, enclosure_id)
                 for slot in dict.fromkeys(slots)
             }
 
-        normalized: dict[int, dict[str, Any]] = {}
-        for slot in dict.fromkeys(slots):
-            history = histories.get(str(slot))
-            if isinstance(history, dict):
-                normalized[slot] = {
-                    "configured": True,
-                    "available": True,
-                    "detail": None,
-                    "slot": slot,
-                    "system_id": system_id,
-                    "enclosure_id": enclosure_id,
-                    "metrics": history.get("metrics", {}),
-                    "events": history.get("events", []),
-                    "sample_counts": history.get("sample_counts", {}),
-                    "latest_values": history.get("latest_values", {}),
-                    "disk_history": history.get("disk_history", {}),
-                }
-            else:
-                normalized[slot] = {
-                    "configured": True,
-                    "available": True,
-                    "detail": None,
-                    "slot": slot,
-                    "system_id": system_id,
-                    "enclosure_id": enclosure_id,
-                    "metrics": {},
-                    "events": [],
-                    "sample_counts": {},
-                    "latest_values": {},
-                    "disk_history": {},
-                }
-        return normalized
-
-    @staticmethod
-    def _failed_slot_payload(
-        slot: int,
-        system_id: str | None,
-        enclosure_id: str | None,
-    ) -> dict[str, Any]:
         return {
-            "configured": True,
-            "available": False,
-            "detail": HISTORY_BACKEND_FAILURE_DETAIL,
-            "slot": slot,
-            "system_id": system_id,
-            "enclosure_id": enclosure_id,
-            "metrics": {},
-            "events": [],
-            "sample_counts": {},
-            "latest_values": {},
+            slot: self._normalize_scope_slot(
+                histories.get(str(slot)), slot, system_id, enclosure_id, payload,
+            )
+            for slot in dict.fromkeys(slots)
         }
 
     @staticmethod
-    def _unconfigured_slot_payload(
+    def _slot_payload(
         slot: int,
         system_id: str | None,
         enclosure_id: str | None,
+        *,
+        configured: bool,
+        available: bool,
+        detail: str | None,
     ) -> dict[str, Any]:
+        """The one empty slot history shape every unavailable answer uses."""
         return {
-            "configured": False,
-            "available": False,
-            "detail": "History backend is not configured.",
+            "configured": configured,
+            "available": available,
+            "detail": detail,
             "slot": slot,
             "system_id": system_id,
             "enclosure_id": enclosure_id,
@@ -419,6 +454,38 @@ class HistoryBackendClient:
             "latest_values": {},
             "disk_history": {},
         }
+
+    @classmethod
+    def _failed_slot_payload(
+        cls,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+    ) -> dict[str, Any]:
+        return cls._slot_payload(
+            slot,
+            system_id,
+            enclosure_id,
+            configured=True,
+            available=False,
+            detail=HISTORY_BACKEND_FAILURE_DETAIL,
+        )
+
+    @classmethod
+    def _unconfigured_slot_payload(
+        cls,
+        slot: int,
+        system_id: str | None,
+        enclosure_id: str | None,
+    ) -> dict[str, Any]:
+        return cls._slot_payload(
+            slot,
+            system_id,
+            enclosure_id,
+            configured=False,
+            available=False,
+            detail="History backend is not configured.",
+        )
 
     async def _fetch_json(
         self,
@@ -470,9 +537,9 @@ class HistoryBackendClient:
         try:
             payload = json.loads(payload_bytes)
         except json.JSONDecodeError as exc:
-            raise HistoryBackendResponseError("History backend returned invalid JSON.") from exc
+            raise HistoryBackendResponseError(0, "History backend returned invalid JSON.") from exc
         if not isinstance(payload, dict):
-            raise HistoryBackendResponseError("History backend returned a non-object JSON payload.")
+            raise HistoryBackendResponseError(0, "History backend returned a non-object JSON payload.")
         return payload
 
     def _request_bytes_sync(
@@ -510,6 +577,11 @@ class HistoryBackendClient:
                 raise HistoryBackendPolicyError(exc.code) from exc
             raise HistoryBackendResponseError(exc.code) from exc
         except urllib.error.URLError as exc:
-            raise HistoryBackendUnavailableError(f"History backend request failed: {exc.reason}") from exc
+            raise HistoryBackendUnavailableError(
+                f"History backend request failed: {exc.reason}",
+                reason=str(exc.reason)[:160],
+            ) from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise HistoryBackendUnavailableError("History backend request timed out.") from exc
+            raise HistoryBackendUnavailableError(
+                "History backend request timed out.", reason="timed out"
+            ) from exc

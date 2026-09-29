@@ -1,9 +1,49 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+# Repository metadata, local worktrees, and documentation are not image inputs.
+**/.git
+.github/
+.worktrees/
+worktrees/
+docs/
+wiki/
+public-demo/
+*.md
+
+# Development dependencies, QA output, and caches.
+tests/
+qa/
+node_modules/
+playwright-report/
+test-results/
+artifacts/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
 .Python
-.env
+
+# Operator state and credentials must not enter the build context.
+**/.env
+**/.env.*
+**/secrets.env
+secrets/
+**/.ssh/
+**/id_rsa
+**/id_ed25519
+**/known_hosts
+**/*.pem
+**/*.key
+config/*
+!config/config.example.yaml
+backups/
+backup-status/
+host-prep/
 data/*
 history/*
 !history/backups/
@@ -13,3 +53,6 @@ logs/*
 !history/.gitkeep
 !history/backups/.gitkeep
 !logs/.gitkeep
+
+# Keep app/, admin_service/, history_service/, requirements.txt, and the
+# Dockerfile's four scripts intact. COPY coverage lives in test_container_contract.py.

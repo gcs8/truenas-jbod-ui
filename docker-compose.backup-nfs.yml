@@ -1,0 +1,19 @@
+# Opt-in: let the backup scheduler mount NFS archive targets for the length
+# of one job (mount -> write/verify -> unmount). Add it to the Compose chain
+# only when a target uses provider: nfs:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.backup-nfs.yml \
+#     --profile backup-scheduler up -d
+#
+# mount(2) needs CAP_SYS_ADMIN, and Docker's default AppArmor profile denies
+# mounts, so this overlay grants SYS_ADMIN and disables AppArmor for the
+# backup scheduler ONLY. No other service gains a capability here (a CI
+# contract test enforces that). The scheduler must run as root (the base
+# default BACKUP_UID=0): a non-root process cannot use the capability.
+# Use NFSv4 (for example mount_options: "nfsvers=4.2") so no rpc.statd is needed.
+services:
+  enclosure-backup-scheduler:
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - "apparmor:unconfined"

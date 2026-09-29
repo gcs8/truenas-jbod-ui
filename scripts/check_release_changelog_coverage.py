@@ -2,7 +2,7 @@
 
 Usage::
 
-    python scripts/check_release_changelog_coverage.py v0.22.2 "## Unreleased" \
+    python scripts/check_release_changelog_coverage.py v0.22.2 "## v0.23.0 - 2026-09-08" \
         --merged-prs-json merged.json --wiki-commit <sha>
 
 Merged pull request numbers come from two sources, and the gate takes their

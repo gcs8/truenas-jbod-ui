@@ -8,25 +8,28 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
-import tracemalloc
 import unittest
 import warnings
 import zipfile
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import yaml
 
+from tests import heap_probe
 from app.config import PathConfig, Settings, get_settings
 from app.models.domain import (
     DebugBundleExportRequest,
     DemoSystemRequest,
+    ManualMapping,
     SystemBackupExportRequest,
     SystemSetupBootstrapRequest,
     SystemSetupRequest,
@@ -57,6 +60,7 @@ from history_service.system_backup import (
     PROFILE_FILE_KEY,
     RUNTIME_OVERRIDES_FILE_KEY,
     SAS_FABRIC_ALIAS_FILE_KEY,
+    SEGMENT_FILE_MODE,
     SEVEN_ZIP_SIGNATURE,
     SEVEN_ZIP_TIMEOUT_SECONDS,
     SLOT_DETAIL_FILE_KEY,
@@ -1108,6 +1112,1222 @@ class SystemBackupServiceTests(unittest.TestCase):
             finally:
                 artifact.cleanup()
 
+    # -- #397: fast encrypted FULL backups (tar.zst in the chunked TJBENC02 envelope) --
+
+    def _export_stream_full(self, passphrase: str) -> Any:
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the fast FULL format must not invoke 7z"),
+            ),
+        ):
+            get_settings.cache_clear()
+            return self.backup_service.export_scheduled_bundle_to_file(
+                passphrase=passphrase,
+                included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                archive_format="tar.zst",
+            )
+
+    def test_stream_encrypted_export_ratio_matches_real_reader_at_boundary(self) -> None:
+        from history_service.backup_archive import stream_envelope
+
+        passphrase = "synthetic ratio boundary passphrase"
+        with sqlite3.connect(self.history_db_path) as connection:
+            connection.execute("CREATE TABLE synthetic_filler (value BLOB)")
+            connection.execute("INSERT INTO synthetic_filler VALUES (zeroblob(0))")
+        accepted = refused = 0
+        low, high = 0, 512
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            while low <= high:
+                pages = (low + high) // 2
+                with sqlite3.connect(self.history_db_path) as connection:
+                    connection.execute(
+                        "UPDATE synthetic_filler SET value=zeroblob(?)", (pages * 4096,)
+                    )
+                    connection.commit()
+                    connection.execute("VACUUM")
+                try:
+                    artifact = self.backup_service.export_bundle_to_file(
+                        encrypt=True, passphrase=passphrase, included_paths=[HISTORY_DB_KEY]
+                    )
+                except ValueError as exc:
+                    self.assertIn("compression ratio", str(exc))
+                    refused += 1
+                    high = pages - 1
+                    continue
+                accepted += 1
+                low = pages + 1
+                try:
+                    plain = self.temp_dir / "ratio-plain.zst"
+                    plain.unlink(missing_ok=True)
+                    stream_envelope.decrypt_file(
+                        artifact.path, plain, passphrase, max_output_bytes=4 * 1024 * 1024
+                    )
+                    expanded = system_backup_module.zstd.frame_content_size(plain.read_bytes())
+                    with self.subTest(pages=pages, check="plaintext ratio"):
+                        self.assertLessEqual(
+                            expanded,
+                            plain.stat().st_size * system_backup_module.MAX_ARCHIVE_COMPRESSION_RATIO,
+                        )
+                    for name in (
+                        "inspect_bundle_file", "preflight_import_bundle_file", "import_bundle_from_file"
+                    ):
+                        with self.subTest(pages=pages, operation=name):
+                            getattr(self.backup_service, name)(artifact.path, passphrase=passphrase)
+                finally:
+                    artifact.cleanup()
+            self.assertGreater(accepted, 0)
+            self.assertGreater(refused, 0)
+
+    def test_segmented_import_busy_lock_cleans_all_temporary_roots(self) -> None:
+        service, catalog_path, segment_path = self._build_segmented_debug_service()
+        artifact = service.export_bundle_to_file(packaging="zip", included_paths=[HISTORY_DB_KEY])
+        paths = (service.store.file_path, catalog_path, segment_path)
+        before = {path: path.read_bytes() for path in paths}
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def track_root(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root))
+            return root
+
+        try:
+            with (
+                history_write_lock(service.store.file_path, blocking=False),
+                patch("history_service.system_backup.tempfile.mkdtemp", side_effect=track_root),
+            ):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "lock is held"):
+                    service.import_bundle_from_file(artifact.path)
+            self.assertTrue(roots)
+            self.assertEqual([root for root in roots if root.exists()], [])
+            self.assertEqual({path: path.read_bytes() for path in paths}, before)
+            self.assertFalse(system_backup_module.activation_pending_path(service.store.file_path).exists())
+            self.assertTrue(service.import_bundle_from_file(artifact.path)["restored_history_database"])
+        finally:
+            artifact.cleanup()
+            for root in roots:
+                shutil.rmtree(root, ignore_errors=True)
+
+    def test_segmented_import_staging_creation_failure_cleans_roots_and_releases_lock(self) -> None:
+        service, catalog_path, segment_path = self._build_segmented_debug_service()
+        artifact = service.export_bundle_to_file(packaging="zip", included_paths=[HISTORY_DB_KEY])
+        paths = (service.store.file_path, catalog_path, segment_path)
+        before = {path: path.read_bytes() for path in paths}
+        roots = []
+        real_mkdtemp, real_mkdir = tempfile.mkdtemp, Path.mkdir
+
+        def track_root(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root))
+            return root
+
+        def fail_staging(path, *args, **kwargs):
+            if path.name == "staged" and path.parent.name.startswith("truenas-jbod-ui-import-"):
+                raise OSError("synthetic staging mkdir failure")
+            return real_mkdir(path, *args, **kwargs)
+
+        try:
+            with (
+                patch("history_service.system_backup.tempfile.mkdtemp", side_effect=track_root),
+                patch.object(Path, "mkdir", fail_staging),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic staging mkdir failure"):
+                    service.import_bundle_from_file(artifact.path)
+            self.assertEqual([root for root in roots if root.exists()], [])
+            self.assertEqual({path: path.read_bytes() for path in paths}, before)
+            with history_write_lock(service.store.file_path, blocking=False):
+                pass
+            self.assertFalse(system_backup_module.activation_pending_path(service.store.file_path).exists())
+        finally:
+            artifact.cleanup()
+            for root in roots:
+                shutil.rmtree(root, ignore_errors=True)
+
+    def _assert_readonly_restore_refusal(self, path: Path, message: str) -> None:
+        for name in ("inspect_bundle_file", "preflight_import_bundle_file"):
+            receipts = []
+            with self.subTest(operation=name), patch.object(
+                self.backup_service, "_activate_import_bundle",
+                side_effect=AssertionError("read-only admission activated content"),
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    getattr(self.backup_service, name)(
+                        path, identity_callback=lambda *identity: receipts.append(identity)
+                    )
+                self.assertEqual(receipts, [])
+
+    def _assert_public_history_collision_refusal(
+        self, service: SystemBackupService, archive: Path, message: str = "history database",
+        *, passphrase: str | None = None,
+    ) -> None:
+        history_before = service.store.file_path.read_bytes()
+        archive_before = archive.read_bytes()
+        workspaces: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def record_workspace(*args, **kwargs):
+            path = Path(real_mkdtemp(*args, **kwargs))
+            workspaces.append(path)
+            return str(path)
+
+        files_before = {
+            path: path.read_bytes() for path in self.temp_dir.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        paths_before = set(self.temp_dir.rglob("*"))
+        for name in (
+            "inspect_bundle_file", "preflight_import_bundle_file", "import_bundle_from_file",
+        ):
+            callbacks = []
+            kwargs = {} if name == "import_bundle_from_file" else {
+                "identity_callback": lambda *args: callbacks.append(args),
+            }
+            with self.subTest(operation=name):
+                try:
+                    with (
+                        patch("history_service.system_backup.tempfile.mkdtemp", side_effect=record_workspace),
+                        self.assertRaisesRegex(ValueError, message),
+                    ):
+                        getattr(service, name)(archive, passphrase=passphrase, **kwargs)
+                finally:
+                    self.assertEqual(service.store.file_path.read_bytes(), history_before)
+                    self.assertEqual(archive.read_bytes(), archive_before)
+                    self.assertEqual([path for path in workspaces if path.exists()], [])
+                    self.assertEqual(set(self.temp_dir.rglob("*")), paths_before)
+                    self.assertEqual({path: path.read_bytes() for path in files_before}, files_before)
+                    self.assertEqual(callbacks, [], "refused admission issued an identity")
+
+    def test_public_mapping_only_admission_protects_unselected_history_aliases(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY],
+            )
+            config_before = self.config_path.read_bytes()
+            mapping_before = self.mapping_path.read_bytes()
+            history_before = self.history_db_path.read_bytes()
+            try:
+                # A valid mapping-only archive remains supported by all three APIs.
+                self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path)["ok"])
+                self.assertIsInstance(
+                    self.backup_service.preflight_import_bundle_file(artifact.path), str,
+                )
+                self.assertTrue(self.backup_service.import_bundle_from_file(artifact.path)["ok"])
+                leaf_alias = self.temp_dir / "history-alias.db"
+                leaf_alias.symlink_to(self.history_db_path)
+                parent_alias = self.temp_dir / "history-parent-alias"
+                parent_alias.symlink_to(self.temp_dir, target_is_directory=True)
+                aliases = {
+                    "exact": self.history_db_path,
+                    "normalized": self.ssh_dir / ".." / self.history_db_path.name,
+                    "relative": Path(os.path.relpath(self.history_db_path)),
+                    "leaf-symlink": leaf_alias,
+                    "parent-symlink": parent_alias / self.history_db_path.name,
+                    "descendant": self.history_db_path / "mapping.json",
+                }
+                for label, target in aliases.items():
+                    with self.subTest(alias=label):
+                        config = yaml.safe_load(config_before)
+                        config["paths"]["mapping_file"] = str(target)
+                        write_yaml(self.config_path, config)
+                        self._assert_public_history_collision_refusal(
+                            self.backup_service, artifact.path,
+                            "history database|symlink|hierarchy",
+                        )
+                # A shared string prefix is not a path overlap. Exercise real activation.
+                sibling = self.history_db_path.with_name("history.db.mapping.json")
+                config = yaml.safe_load(config_before)
+                config["paths"]["mapping_file"] = str(sibling)
+                write_yaml(self.config_path, config)
+                self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path)["ok"])
+                self.assertIsInstance(
+                    self.backup_service.preflight_import_bundle_file(artifact.path), str,
+                )
+                self.assertTrue(self.backup_service.import_bundle_from_file(artifact.path)["ok"])
+                self.assertEqual(sibling.read_bytes(), mapping_before)
+                self.assertEqual(self.history_db_path.read_bytes(), history_before)
+            finally:
+                self.config_path.write_bytes(config_before)
+                artifact.cleanup()
+
+    def test_non_history_admission_protects_all_live_history_artifacts(self) -> None:
+        segment_root = self.temp_dir / "history-segments"
+        segment_root.mkdir()
+        catalog_path = segment_root / "catalog.json"
+        store = HistoryStore(
+            str(self.history_db_path),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog_path,
+        )
+        service = SystemBackupService(
+            HistorySettings(
+                sqlite_path=str(self.history_db_path),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(self.history_backup_dir),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY],
+            )
+            config_before = self.config_path.read_bytes()
+            try:
+                targets = (
+                    Path(f"{self.history_db_path}-wal"),
+                    Path(f"{self.history_db_path}-shm"),
+                    Path(f"{self.history_db_path}-journal"),
+                    system_backup_module.activation_pending_path(self.history_db_path),
+                    catalog_path,
+                    segment_root / "segment-0001.sqlite3",
+                )
+                for target in targets:
+                    with self.subTest(target=target):
+                        config = yaml.safe_load(config_before)
+                        config["paths"]["mapping_file"] = str(target)
+                        write_yaml(self.config_path, config)
+                        self._assert_public_history_collision_refusal(service, artifact.path)
+                with _ImportActivationTransaction({}, history_store=store) as transaction:
+                    for target in targets:
+                        with self.subTest(runtime_target=target):
+                            with self.assertRaisesRegex(ValueError, "history database"):
+                                transaction._record_target(target, expected_kind="file")
+                    transaction._record_target(
+                        self.history_db_path,
+                        expected_kind="file",
+                        allow_history=True,
+                    )
+                    transaction._record_target(
+                        segment_root,
+                        expected_kind="directory",
+                        allow_history=True,
+                    )
+            finally:
+                self.config_path.write_bytes(config_before)
+                artifact.cleanup()
+
+    def test_directory_admission_protects_segment_root(self) -> None:
+        passphrase = "synthetic segment-root collision regression"
+        catalog_path = self.ssh_dir / "catalog.json"
+        store = HistoryStore(
+            str(self.history_db_path),
+            recover_unreadable_database=False,
+            segment_catalog_path=catalog_path,
+        )
+        service = SystemBackupService(
+            HistorySettings(
+                sqlite_path=str(self.history_db_path),
+                segment_catalog_path=str(catalog_path),
+                backup_dir=str(self.history_backup_dir),
+                startup_grace_seconds=0,
+            ),
+            store,
+        )
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_scheduled_bundle_to_file(
+                included_paths=[SSH_KEYS_KEY], passphrase=passphrase,
+            )
+            try:
+                self._assert_public_history_collision_refusal(
+                    service,
+                    artifact.path,
+                    passphrase=passphrase,
+                )
+            finally:
+                artifact.cleanup()
+
+    def test_public_non_mapping_admission_protects_unselected_history(self) -> None:
+        alias_path = self.temp_dir / "sas-aliases.json"
+        alias_path.write_text('{"sas_fabric_aliases": {}}\n', encoding="utf-8")
+        config = yaml.safe_load(self.config_path.read_bytes())
+        config["paths"]["sas_fabric_alias_file"] = str(alias_path)
+        write_yaml(self.config_path, config)
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            for group, field in (
+                (SAS_FABRIC_ALIAS_FILE_KEY, "sas_fabric_alias_file"),
+                (SLOT_DETAIL_FILE_KEY, "slot_detail_cache_file"),
+            ):
+                with self.subTest(group=group):
+                    config_before = self.config_path.read_bytes()
+                    artifact = self.backup_service.export_bundle_to_file(
+                        packaging="zip", included_paths=[group],
+                    )
+                    try:
+                        self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path)["ok"])
+                        self.assertIsInstance(
+                            self.backup_service.preflight_import_bundle_file(artifact.path), str,
+                        )
+                        self.assertTrue(self.backup_service.import_bundle_from_file(artifact.path)["ok"])
+                        config = yaml.safe_load(config_before)
+                        config["paths"][field] = str(self.history_db_path)
+                        write_yaml(self.config_path, config)
+                        self._assert_public_history_collision_refusal(self.backup_service, artifact.path)
+                    finally:
+                        self.config_path.write_bytes(config_before)
+                        artifact.cleanup()
+
+    def test_public_directory_admission_protects_unselected_nested_history(self) -> None:
+        passphrase = "synthetic history collision regression"
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            for group, target in ((SSH_KEYS_KEY, self.ssh_dir), (TLS_TRUST_KEY, self.tls_dir)):
+                with self.subTest(group=group):
+                    artifact = self.backup_service.export_scheduled_bundle_to_file(
+                        included_paths=[group], passphrase=passphrase,
+                    )
+                    try:
+                        self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path, passphrase=passphrase)["ok"])
+                        self.assertIsInstance(
+                            self.backup_service.preflight_import_bundle_file(artifact.path, passphrase=passphrase), str,
+                        )
+                        self.assertTrue(self.backup_service.import_bundle_from_file(artifact.path, passphrase=passphrase)["ok"])
+                        nested_history = target / "retained-history.db"
+                        shutil.copyfile(self.history_db_path, nested_history)
+                        store = HistoryStore(str(nested_history))
+                        service = SystemBackupService(
+                            HistorySettings(
+                                sqlite_path=str(nested_history),
+                                backup_dir=str(self.history_backup_dir),
+                                startup_grace_seconds=0,
+                            ),
+                            store,
+                        )
+                        self._assert_public_history_collision_refusal(
+                            service, artifact.path, passphrase=passphrase,
+                        )
+                    finally:
+                        artifact.cleanup()
+
+    def test_inspection_restore_admission_rejects_redirected_paths_without_receipt(self) -> None:
+        config = yaml.safe_load(self.config_path.read_bytes())
+        config["paths"]["mapping_file"] = str(self.temp_dir / "redirected.json")
+        archive = self.temp_dir / "redirected.zip"
+        archive.write_bytes(self._build_selected_group_bundle({
+            CONFIG_FILE_KEY: yaml.safe_dump(config).encode(),
+            MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+        }))
+        before = self.config_path.read_bytes(), self.mapping_path.read_bytes()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            self._assert_readonly_restore_refusal(archive, "restore path|redirect")
+        self.assertEqual((self.config_path.read_bytes(), self.mapping_path.read_bytes()), before)
+        self.assertFalse((self.temp_dir / "redirected.json").exists())
+
+    def test_inspection_restore_admission_rejects_target_type_without_receipt(self) -> None:
+        self.mapping_path.unlink()
+        self.mapping_path.mkdir()
+        sentinel = self.mapping_path / "sentinel"
+        sentinel.write_bytes(b"synthetic sentinel")
+        archive = self.temp_dir / "target-type.zip"
+        archive.write_bytes(self._build_selected_group_bundle({
+            MAPPING_FILE_KEY: b'{"version": 1, "slot_mappings": {}}',
+        }))
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            self._assert_readonly_restore_refusal(archive, "regular file")
+        self.assertEqual(sentinel.read_bytes(), b"synthetic sentinel")
+
+    def test_inspection_restore_admission_checks_segment_sqlite_integrity(self) -> None:
+        service, catalog_path, segment_path = self._build_segmented_debug_service()
+        artifact = service.export_bundle_to_file(packaging="zip", included_paths=[HISTORY_DB_KEY])
+        paths = (service.store.file_path, catalog_path, segment_path)
+        before = {path: path.read_bytes() for path in paths}
+        try:
+            with zipfile.ZipFile(artifact.path) as archive:
+                members = {name: archive.read(name) for name in archive.namelist()}
+            manifest = json.loads(members.pop("manifest.json"))
+            entry = manifest["history_catalog"]["segments"][0]
+            incomplete = self.temp_dir / "incomplete-segment.sqlite3"
+            shutil.copyfile(segment_path, incomplete)
+            with sqlite3.connect(incomplete) as connection:
+                connection.execute("DROP TABLE slot_state_current")
+            corrupt = incomplete.read_bytes()
+            members[entry["archive_path"]] = corrupt
+            for metadata in (entry, next(
+                row for row in manifest["files"] if row["key"] == entry["member_key"]
+            )):
+                metadata["size_bytes"] = len(corrupt)
+                metadata["sha256"] = hashlib.sha256(corrupt).hexdigest()
+            malformed = self.temp_dir / "invalid-segment.zip"
+            malformed.write_bytes(self._build_zip_bundle(manifest, members))
+            self.backup_service = service
+            self._assert_readonly_restore_refusal(malformed, "History database is missing table")
+            self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        finally:
+            artifact.cleanup()
+
+    def test_settings_bootstrap_yaml_admission_covers_every_public_operation(self) -> None:
+        # The mapping-only bundle forces admission of *unselected* settings too.
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+            )
+        self.addCleanup(artifact.cleanup)
+        write_yaml(self.runtime_overrides_path, {"app": {"refresh_interval_seconds": 42}})
+        paths = (self.config_path, self.runtime_overrides_path, self.profile_path)
+        originals = {path: path.read_bytes() for path in paths}
+        limit = max(map(len, originals.values()))
+        real_open, real_read = Path.open, os.read
+        for source in paths:
+            for operation in ("export", "debug", "inspect", "preflight", "import"):
+                with self.subTest(source=source.name, operation=operation):
+                    source.write_bytes(originals[source] + b"\n#" + b"x" * limit)
+                    identity = (source.stat().st_dev, source.stat().st_ino)
+                    body_reads = []
+
+                    def guarded_open(path, *args, **kwargs):
+                        if path == source:
+                            body_reads.append("Path.open")
+                        return real_open(path, *args, **kwargs)
+
+                    def guarded_read(fd, size):
+                        metadata = os.fstat(fd)
+                        if (metadata.st_dev, metadata.st_ino) == identity:
+                            body_reads.append("os.read")
+                        return real_read(fd, size)
+
+                    try:
+                        with (
+                            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True),
+                            patch.object(system_backup_module, "MAX_STRUCTURED_YAML_MEMBER_BYTES", limit),
+                            patch.object(Path, "open", guarded_open),
+                            patch.object(os, "read", guarded_read),
+                            patch.object(self.backup_service, "_activate_import_bundle",
+                                         side_effect=AssertionError("unexpected activation")),
+                        ):
+                            try:
+                                if operation == "export":
+                                    result = self.backup_service.export_bundle_to_file(
+                                        packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                                    )
+                                    result.cleanup()
+                                elif operation == "debug":
+                                    result = self.backup_service.export_debug_bundle_to_file(
+                                        packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                                    )
+                                    result.cleanup()
+                                else:
+                                    method = {
+                                        "inspect": self.backup_service.inspect_bundle_file,
+                                        "preflight": self.backup_service.preflight_import_bundle_file,
+                                        "import": self.backup_service.import_bundle_from_file,
+                                    }[operation]
+                                    method(artifact.path)
+                            except ValueError as exc:
+                                self.assertIn("Structured YAML member", str(exc))
+                            else:
+                                self.fail("oversized bootstrap settings were accepted")
+                    finally:
+                        source.write_bytes(originals[source])
+                    self.assertEqual(body_reads, [], "settings body read before size admission")
+
+    def test_settings_bootstrap_exact_limits_and_cache_are_independent_of_archive_selection(self) -> None:
+        # A non-YAML suffix must not evade YAML admission during bootstrap.
+        profile = self.temp_dir / "profiles.txt"
+        profile.write_bytes(self.profile_path.read_bytes())
+        config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        config["paths"]["profile_file"] = str(profile)
+        write_yaml(self.config_path, config)
+        write_yaml(self.runtime_overrides_path, {"app": {"refresh_interval_seconds": 42}})
+        paths = (self.config_path, self.runtime_overrides_path, profile)
+        sizes = {p: p.stat().st_size for p in paths}
+        total = sum(sizes.values())
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            cached = get_settings()
+            write_yaml(self.runtime_overrides_path, {"app": {"refresh_interval_seconds": 43}})
+            with (
+                patch.object(system_backup_module, "MAX_STRUCTURED_YAML_MEMBER_BYTES", max(sizes.values())),
+                patch.object(system_backup_module, "MAX_ARCHIVE_EXPANDED_BYTES", total),
+            ):
+                artifact = self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                )
+                self.addCleanup(artifact.cleanup)
+                callbacks = []
+                self.assertTrue(self.backup_service.inspect_bundle_file(
+                    artifact.path, identity_callback=lambda *args: callbacks.append(args)
+                )["ok"])
+                self.assertIsInstance(self.backup_service.preflight_import_bundle_file(artifact.path), str)
+                self.assertEqual(len(callbacks), 1)
+                self.assertIs(get_settings(), cached)
+                self.assertEqual(cached.app.refresh_interval_seconds, 42)
+                self.assertTrue(self.backup_service.import_bundle_from_file(artifact.path)["ok"])
+                self.assertEqual(get_settings().app.refresh_interval_seconds, 43)
+            real_read = os.read
+            identity = (profile.stat().st_dev, profile.stat().st_ino)
+
+            def forbid_profile_read(fd, size):
+                metadata = os.fstat(fd)
+                self.assertNotEqual((metadata.st_dev, metadata.st_ino), identity)
+                return real_read(fd, size)
+
+            with (
+                patch.object(system_backup_module, "MAX_ARCHIVE_EXPANDED_BYTES", total - 1),
+                patch.object(os, "read", forbid_profile_read),
+                self.assertRaisesRegex(ValueError, "expanded byte limit"),
+            ):
+                self.backup_service.inspect_bundle_file(artifact.path)
+            with (
+                patch.object(system_backup_module, "MAX_STRUCTURED_YAML_MEMBER_BYTES", sizes[profile] - 1),
+                patch.dict(os.environ, {"PATH_PROFILE_FILE": str(profile)}),
+                patch.object(os, "read", forbid_profile_read),
+                self.assertRaisesRegex(ValueError, "Structured YAML member"),
+            ):
+                # Use a small config so the intended profile, not config, refuses.
+                write_yaml(self.config_path, {})
+                self.backup_service.inspect_bundle_file(artifact.path)
+
+    def test_settings_bootstrap_growth_has_bounded_reads_and_no_workspace(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+            )
+        self.addCleanup(artifact.cleanup)
+        write_yaml(self.runtime_overrides_path, {"app": {"refresh_interval_seconds": 42}})
+        for path in (self.config_path, self.runtime_overrides_path, self.profile_path):
+            with self.subTest(source=path.name):
+                original = path.read_bytes()
+                identity = (path.stat().st_dev, path.stat().st_ino)
+                reads = []
+                real_read = os.read
+                before = set(Path(tempfile.gettempdir()).iterdir())
+
+                def grow_source(fd, size):
+                    metadata = os.fstat(fd)
+                    if (metadata.st_dev, metadata.st_ino) == identity:
+                        if not reads:
+                            with path.open("ab") as output:
+                                output.write(b"\n#" + b"x" * 4096)
+                        reads.append(size)
+                    return real_read(fd, size)
+
+                callbacks = []
+                try:
+                    with (
+                        patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True),
+                        patch.object(os, "read", grow_source),
+                        patch.object(self.backup_service, "_activate_import_bundle",
+                                     side_effect=AssertionError("unexpected activation")),
+                        self.assertRaisesRegex(ValueError, "source changed"),
+                    ):
+                        self.backup_service.inspect_bundle_file(
+                            artifact.path, identity_callback=lambda *args: callbacks.append(args)
+                        )
+                    self.assertEqual(sum(reads), len(original) + 1)
+                    self.assertEqual(callbacks, [])
+                    self.assertEqual(set(Path(tempfile.gettempdir()).iterdir()), before)
+                finally:
+                    path.write_bytes(original)
+
+    def test_settings_bootstrap_preserves_secret_file_read_budget(self) -> None:
+        from app.config import FILE_SECRET_ENV_OVERRIDES
+        from app.secret_files import MAX_SECRET_FILE_BYTES
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+            )
+        self.addCleanup(artifact.cleanup)
+        secret = self.temp_dir / "synthetic-secret.txt"
+        secret.write_bytes(b"x" * (MAX_SECRET_FILE_BYTES + 128))
+        secret.chmod(0o600)
+        real_fdopen = os.fdopen
+        identity = (secret.stat().st_dev, secret.stat().st_ino)
+        reads = []
+
+        class BoundedSecretRead:
+            def __init__(reader, handle):
+                reader.handle = handle
+            def read(reader, size=-1):
+                self.assertEqual(size, MAX_SECRET_FILE_BYTES + 1)
+                content = reader.handle.read(size)
+                reads.append(len(content))
+                return content
+            def close(reader):
+                reader.handle.close()
+
+        def observed_fdopen(fd, *args, **kwargs):
+            metadata = os.fstat(fd)
+            handle = real_fdopen(fd, *args, **kwargs)
+            return BoundedSecretRead(handle) if (metadata.st_dev, metadata.st_ino) == identity else handle
+
+        for name in sorted(FILE_SECRET_ENV_OVERRIDES):
+            for operation in ("export", "inspect", "preflight"):
+                with self.subTest(name=name, operation=operation):
+                    reads.clear()
+                    with (
+                        patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path),
+                                               name + "_FILE": str(secret)}, clear=True),
+                        patch.object(os, "fdopen", observed_fdopen),
+                        self.assertRaisesRegex(ValueError, "must not exceed"),
+                    ):
+                        if operation == "export":
+                            self.backup_service.export_bundle_to_file(
+                                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                            )
+                        elif operation == "inspect":
+                            self.backup_service.inspect_bundle_file(artifact.path)
+                        else:
+                            self.backup_service.preflight_import_bundle_file(artifact.path)
+                    self.assertEqual(reads, [MAX_SECRET_FILE_BYTES + 1])
+
+    def test_settings_bootstrap_success_does_not_create_configured_parents(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+            )
+        self.addCleanup(artifact.cleanup)
+        config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        missing = self.temp_dir / "must-stay-absent"
+        for field, name in (
+            ("mapping_file", "mapping.json"), ("sas_fabric_alias_file", "aliases.json"),
+            ("log_file", "app.log"), ("profile_file", "profiles.yaml"),
+            ("slot_detail_cache_file", "details.json"),
+        ):
+            config["paths"][field] = str(missing / field / name)
+        write_yaml(self.config_path, config)
+        before = {p: p.read_bytes() for p in (self.config_path, self.mapping_path, self.profile_path)}
+        for operation in ("export", "debug", "inspect", "preflight"):
+            with (
+                self.subTest(operation=operation),
+                patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=True),
+                patch.object(self.backup_service, "_activate_import_bundle",
+                             side_effect=AssertionError("unexpected activation")),
+            ):
+                if operation in {"export", "debug"}:
+                    method = (self.backup_service.export_bundle_to_file if operation == "export"
+                              else self.backup_service.export_debug_bundle_to_file)
+                    result = method(packaging="zip", included_paths=[MAPPING_FILE_KEY])
+                    result.cleanup()
+                elif operation == "inspect":
+                    self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path)["ok"])
+                else:
+                    self.assertIsInstance(self.backup_service.preflight_import_bundle_file(artifact.path), str)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                created = missing.exists()
+                if created:
+                    shutil.rmtree(missing)
+                self.assertFalse(created, "read-only bootstrap created configured parent directories")
+
+    def test_non_history_export_yaml_limit_precedes_body_read(self) -> None:
+        write_yaml(self.config_path, {})
+        with self.profile_path.open("ab") as output:
+            output.write(b"\n#" + b"x" * 1024)
+        real_read = Path.read_bytes
+        real_descriptor_read = os.read
+        source_identity = (self.profile_path.stat().st_dev, self.profile_path.stat().st_ino)
+
+        def forbid_descriptor_read(descriptor, size):
+            info = os.fstat(descriptor)
+            self.assertNotEqual((info.st_dev, info.st_ino), source_identity,
+                                "unadmitted source descriptor was read")
+            return real_descriptor_read(descriptor, size)
+
+
+        def forbid_source_read(path):
+            if path == self.profile_path:
+                self.fail("stat-known oversized YAML source was read")
+            return real_read(path)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module, "MAX_STRUCTURED_YAML_MEMBER_BYTES", 1024),
+            patch.object(system_backup_module.os, "read", forbid_descriptor_read),
+            patch.object(Path, "read_bytes", forbid_source_read),
+        ):
+            with self.assertRaisesRegex(ValueError, "Structured YAML member"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[PROFILE_FILE_KEY]
+                )
+
+    def test_non_history_export_refuses_known_oversize_before_body_read(self) -> None:
+        write_yaml(self.config_path, {})
+        self.mapping_path.write_bytes(b"x" * 4129)
+        real_read = Path.read_bytes
+        real_descriptor_read = os.read
+        source_identity = (self.mapping_path.stat().st_dev, self.mapping_path.stat().st_ino)
+
+        def forbid_descriptor_read(descriptor, size):
+            info = os.fstat(descriptor)
+            self.assertNotEqual((info.st_dev, info.st_ino), source_identity,
+                                "unadmitted source descriptor was read")
+            return real_descriptor_read(descriptor, size)
+
+
+        def forbid_source_read(path):
+            if path == self.mapping_path:
+                self.fail("stat-known oversized source was read")
+            return real_read(path)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module, "MAX_ARCHIVE_MEMBER_BYTES", 1024),
+            patch.object(system_backup_module.os, "read", forbid_descriptor_read),
+            patch.object(Path, "read_bytes", forbid_source_read),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded byte limit"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                )
+
+    def test_non_history_directory_export_stops_discovery_at_member_budget(self) -> None:
+        shutil.rmtree(self.ssh_dir)
+        self.ssh_dir.mkdir()
+        for index in range(12):
+            (self.ssh_dir / f"synthetic-{index}").write_bytes(b"x")
+        seen = []
+        real_scandir = os.scandir
+
+        class Scan:
+            def __init__(scan, path):
+                scan.inner = real_scandir(path)
+                scan.tracked = not isinstance(path, int) and Path(path) == self.ssh_dir
+            def __enter__(scan):
+                return scan
+            def __exit__(scan, *args):
+                scan.inner.close()
+            def __iter__(scan):
+                return scan
+            def __next__(scan):
+                entry = next(scan.inner)
+                if scan.tracked:
+                    seen.append(entry.name)
+                    self.assertLessEqual(len(seen), 4, "directory materialized before admission")
+                return entry
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module, "MAX_ARCHIVE_MEMBER_COUNT", 4),
+            patch.object(system_backup_module.os, "scandir", Scan),
+        ):
+            with self.assertRaisesRegex(ValueError, "too many members"):
+                self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="synthetic directory passphrase", included_paths=[SSH_KEYS_KEY]
+                )
+        self.assertEqual(len(seen), 4)
+
+    def test_non_history_export_aggregate_admission_precedes_next_body_read(self) -> None:
+        write_yaml(self.config_path, {})
+        self.mapping_path.write_bytes(b"m" * 700)
+        self.slot_detail_path.write_bytes(b"s" * 700)
+        real_read = Path.read_bytes
+        real_descriptor_read = os.read
+        source_identity = (self.slot_detail_path.stat().st_dev, self.slot_detail_path.stat().st_ino)
+
+        def forbid_descriptor_read(descriptor, size):
+            info = os.fstat(descriptor)
+            self.assertNotEqual((info.st_dev, info.st_ino), source_identity,
+                                "unadmitted source descriptor was read")
+            return real_descriptor_read(descriptor, size)
+
+
+        def forbid_excess_read(path):
+            if path == self.slot_detail_path:
+                self.fail("aggregate overflow source was read")
+            return real_read(path)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module, "MAX_ARCHIVE_EXPANDED_BYTES", 1024),
+            patch.object(system_backup_module.os, "read", forbid_descriptor_read),
+            patch.object(Path, "read_bytes", forbid_excess_read),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded byte limit"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[MAPPING_FILE_KEY, SLOT_DETAIL_FILE_KEY]
+                )
+
+    def test_non_history_directory_aggregate_stops_before_excess_source_read(self) -> None:
+        # Keep bootstrap inputs within the scaled limit so this still reaches
+        # directory-copy aggregate admission rather than settings admission.
+        write_yaml(self.config_path, {})
+        shutil.rmtree(self.ssh_dir)
+        self.ssh_dir.mkdir()
+        for index in range(8):
+            (self.ssh_dir / f"synthetic-{index}").write_bytes(b"x" * 700)
+        identities = {(path.stat().st_dev, path.stat().st_ino) for path in self.ssh_dir.iterdir()}
+        real_read, real_bytes = os.read, Path.read_bytes
+        observed = []
+
+        def record_read(descriptor, size):
+            info = os.fstat(descriptor)
+            if (info.st_dev, info.st_ino) in identities:
+                observed.append(size)
+                self.assertLessEqual(sum(observed), 701)
+            return real_read(descriptor, size)
+
+        def record_bytes(path):
+            if path.parent == self.ssh_dir:
+                observed.append(path.stat().st_size)
+                self.assertLessEqual(sum(observed), 701, "aggregate overflow body was read")
+            return real_bytes(path)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module, "MAX_ARCHIVE_EXPANDED_BYTES", 1024),
+            patch.object(system_backup_module.os, "read", record_read),
+            patch.object(Path, "read_bytes", record_bytes),
+        ):
+            with self.assertRaisesRegex(ValueError, "expanded byte limit"):
+                self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="synthetic aggregate passphrase", included_paths=[SSH_KEYS_KEY]
+                )
+        self.assertEqual(observed, [700, 1])
+
+    def test_non_history_export_growth_is_bounded_and_cleans_workspace(self) -> None:
+        self.mapping_path.write_bytes(b"x" * 1024)
+        info = self.mapping_path.stat()
+        source_identity = (info.st_dev, info.st_ino)
+        real_read, real_bytes, real_mkdtemp = os.read, Path.read_bytes, tempfile.mkdtemp
+        roots, observed = [], []
+        grew = False
+
+        def grow():
+            nonlocal grew
+            if not grew:
+                with self.mapping_path.open("ab") as output:
+                    output.write(b"y" * 4096)
+                grew = True
+
+        def grow_on_read(descriptor, size):
+            metadata = os.fstat(descriptor)
+            if (metadata.st_dev, metadata.st_ino) == source_identity:
+                grow()
+                observed.append(size)
+                self.assertLessEqual(sum(observed), 1025)
+            return real_read(descriptor, size)
+
+        def grow_on_bytes(path):
+            if path == self.mapping_path:
+                grow()
+                self.fail("source body read without descriptor admission")
+            return real_bytes(path)
+
+        def track_root(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root))
+            return root
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(system_backup_module.os, "read", grow_on_read),
+            patch.object(Path, "read_bytes", grow_on_bytes),
+            patch("history_service.system_backup.tempfile.mkdtemp", side_effect=track_root),
+        ):
+            with self.assertRaisesRegex(ValueError, "changed during snapshot"):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                )
+        self.assertEqual(observed, [1024, 1])
+        self.assertTrue(roots)
+        self.assertEqual([root for root in roots if root.exists()], [])
+
+    def test_non_history_export_snapshots_are_private_and_file_backed(self) -> None:
+        original = self.mapping_path.read_bytes()
+        builder = self.backup_service._build_archive_to_path
+
+        def check_snapshot(members, *args, **kwargs):
+            member = next(member for member in members if member.group_key == MAPPING_FILE_KEY)
+            self.assertIsNone(member.content)
+            self.assertIsNotNone(member.file_path)
+            self.assertNotEqual(member.file_path, self.mapping_path)
+            self.assertEqual(stat.S_IMODE(member.file_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(member.file_path.parent.stat().st_mode), 0o700)
+            self.mapping_path.write_bytes(b'{"version":1,"slot_mappings":{}}')
+            self.assertEqual(member.file_path.read_bytes(), original)
+            return builder(members, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}),
+            patch.object(self.backup_service, "_build_archive_to_path", side_effect=check_snapshot),
+        ):
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip", included_paths=[MAPPING_FILE_KEY]
+            )
+            try:
+                self.assertTrue(self.backup_service.inspect_bundle_file(artifact.path)["ok"])
+                self.backup_service.import_bundle_from_file(artifact.path)
+                self.assertEqual(self.mapping_path.read_bytes(), original)
+            finally:
+                artifact.cleanup()
+
+    def test_inspection_restore_admission_rejects_destination_collision(self) -> None:
+        archive = self.temp_dir / "collision.zip"
+        archive.write_bytes(self._build_selected_group_bundle({
+            MAPPING_FILE_KEY: self.mapping_path.read_bytes(),
+            SLOT_DETAIL_FILE_KEY: self.slot_detail_path.read_bytes(),
+        }))
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+            settings = self.backup_service._load_app_settings()
+        settings.paths.slot_detail_cache_file = str(self.mapping_path)
+        before = self.mapping_path.read_bytes(), self.slot_detail_path.read_bytes()
+        with patch.object(self.backup_service, "_load_app_settings", return_value=settings):
+            self._assert_readonly_restore_refusal(archive, "overlap|same|collision")
+        self.assertEqual((self.mapping_path.read_bytes(), self.slot_detail_path.read_bytes()), before)
+
+    def test_non_history_export_heap_is_flat_from_one_to_eight_mib(self) -> None:
+        peaks = []
+        for size in (1024 * 1024, 8 * 1024 * 1024):
+            prefix = b'{"version":1,"slot_mappings":{},"synthetic_padding":"'
+            with self.mapping_path.open("wb") as output:
+                output.write(prefix)
+                remaining = size - len(prefix) - 2
+                while remaining:
+                    chunk = os.urandom(32768).hex().encode()[:remaining]
+                    output.write(chunk)
+                    remaining -= len(chunk)
+                output.write(b'"}')
+            with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}):
+                heap_probe.start()
+                try:
+                    artifact = self.backup_service.export_bundle_to_file(
+                        packaging="zip", included_paths=[MAPPING_FILE_KEY]
+                    )
+                    peaks.append(heap_probe.get_traced_memory()[1])
+                finally:
+                    heap_probe.stop()
+            try:
+                self.assertEqual(artifact.manifest["files"][0]["size_bytes"], size)
+            finally:
+                artifact.cleanup()
+        self.assertLess(peaks[1] - peaks[0], 2 * 1024 * 1024, peaks)
+        self.assertLess(peaks[1], 8 * 1024 * 1024, peaks)
+
+    def test_stream_encrypted_full_backup_round_trips_through_file_backed_paths(self) -> None:
+        from history_service.backup_archive import stream_envelope
+
+        passphrase = "fast full backup passphrase"
+        original_mapping = self.mapping_path.read_bytes()
+        artifact = self._export_stream_full(passphrase)
+        try:
+            self.assertTrue(artifact.filename.endswith(".tar.zst.enc"))
+            raw = artifact.path.read_bytes()
+            self.assertTrue(raw.startswith(stream_envelope.MAGIC))
+            self.assertNotIn(passphrase.encode(), raw)
+            self.assertNotIn(b"SQLite format 3", raw)
+            self.assertEqual(stat.S_IMODE(artifact.path.stat().st_mode), 0o600)
+            self.assertEqual(artifact.manifest["packaging"], "tar.zst")
+
+            inspection = self.backup_service.inspect_bundle_file(
+                artifact.path, passphrase=passphrase, expected_encrypted=True
+            )
+            self.assertTrue(inspection["ok"])
+            self.assertIn(HISTORY_DB_KEY, inspection["present_groups"])
+            with self.assertRaisesRegex(ValueError, "expected plaintext"):
+                self.backup_service.inspect_bundle_file(
+                    artifact.path, passphrase=passphrase, expected_encrypted=False
+                )
+            # The multi-GiB path must not map the whole archive into memory.
+            with patch.object(system_backup_module.mmap, "mmap", side_effect=AssertionError("mmap used")):
+                self.backup_service.preflight_import_bundle_file(
+                    artifact.path, passphrase=passphrase, expected_encrypted=True
+                )
+            self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+            with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+                get_settings.cache_clear()
+                result = self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    passphrase=passphrase,
+                    expected_encrypted=True,
+                )
+            self.assertIn(HISTORY_DB_KEY, result["included_groups"])
+            self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+        finally:
+            artifact.cleanup()
+
+    def test_stream_encrypted_full_backup_refuses_wrong_passphrase_and_damage(self) -> None:
+        passphrase = "fast full damage passphrase"
+        artifact = self._export_stream_full(passphrase)
+        original_mapping = self.mapping_path.read_bytes()
+        try:
+            with self.assertRaisesRegex(ValueError, "Check the passphrase"):
+                self.backup_service.preflight_import_bundle_file(
+                    artifact.path, passphrase="not the passphrase", expected_encrypted=True
+                )
+            with self.assertRaisesRegex(ValueError, "passphrase is required"):
+                self.backup_service.preflight_import_bundle_file(artifact.path, passphrase=None)
+            raw = artifact.path.read_bytes()
+            damaged = self.temp_dir / "damaged.tar.zst.enc"
+            for label, mutated in (
+                ("flipped", raw[:-40] + bytes([raw[-40] ^ 1]) + raw[-39:]),
+                ("truncated", raw[: len(raw) - 20]),
+                ("appended", raw + b"\0" * 64),
+                ("header", raw[:9] + bytes([raw[9] ^ 1]) + raw[10:]),
+            ):
+                with self.subTest(label=label):
+                    damaged.unlink(missing_ok=True)
+                    damaged.write_bytes(mutated)
+                    with self.assertRaises(ValueError):
+                        self.backup_service.import_bundle_from_file(
+                            damaged, passphrase=passphrase, expected_encrypted=True
+                        )
+            self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+            self.assertEqual(list(Path(tempfile.gettempdir()).glob("truenas-jbod-ui-file-import-*/bundle.tar")), [])
+        finally:
+            artifact.cleanup()
+
+    def test_stream_envelope_cannot_smuggle_a_plain_small_archive_limit_bypass(self) -> None:
+        # A plaintext tar.zst keeps the small-archive limits; only the
+        # authenticated envelope admits multi-GiB history members.
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            plain = self.backup_service.export_bundle_to_file(
+                packaging="tar.zst", included_paths=[MAPPING_FILE_KEY]
+            )
+        seen: list[dict[str, Any]] = []
+        real = SystemBackupService._decompress_tar_archive_to_file.__func__
+
+        def spy(cls, *args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            return real(cls, *args, **kwargs)
+
+        try:
+            with patch.object(SystemBackupService, "_decompress_tar_archive_to_file", classmethod(spy)):
+                self.backup_service.inspect_bundle_file(plain.path)
+        finally:
+            plain.cleanup()
+        self.assertEqual(seen, [{}], "a plaintext tar.zst must keep the default small expanded limit")
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            self.backup_service._read_plain_archive_file(
+                self._write_zip_placeholder(), workspace=self.temp_dir, passphrase=None, file_backed_history=True
+            )
+
+    def _write_zip_placeholder(self) -> Path:
+        path = self.temp_dir / "placeholder.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("manifest.json", "{}")
+        return path
+
+    def test_stream_full_export_reserves_snapshot_tar_and_output_space(self) -> None:
+        calls: list[tuple[str, bool]] = []
+        real = SystemBackupService._require_export_free_space
+
+        def spy(
+            service: Any,
+            groups: Any,
+            *,
+            app_settings: Settings,
+            packaging: str,
+            scrub_history: bool = False,
+        ) -> None:
+            calls.append((packaging, scrub_history))
+            real(
+                service,
+                groups,
+                app_settings=app_settings,
+                packaging=packaging,
+                scrub_history=scrub_history,
+            )
+
+        with patch.object(SystemBackupService, "_require_export_free_space", spy):
+            self._export_stream_full("space passphrase").cleanup()
+        self.assertEqual(calls, [("tar.zst", False)])
+
+    def test_stream_full_backup_is_the_default_and_rejects_unknown_format(self) -> None:
+        # #397: new FULL backups default to tar.zst in the TJBENC02 envelope.
+        from history_service.backup_archive import stream_envelope
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with self.assertRaisesRegex(ValueError, "must be 7z or tar.zst"):
+                self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="x", included_paths=[HISTORY_DB_KEY], archive_format="zip"
+                )
+            with patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the default FULL format must not invoke 7z"),
+            ):
+                artifact = self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase="default format passphrase", included_paths=[HISTORY_DB_KEY]
+                )
+        try:
+            self.assertTrue(artifact.filename.endswith(".tar.zst.enc"))
+            self.assertTrue(artifact.path.read_bytes().startswith(stream_envelope.MAGIC))
+            self.assertEqual(artifact.manifest["packaging"], "tar.zst")
+        finally:
+            artifact.cleanup()
+
+    def test_explicit_7z_full_backup_still_exports_and_restores(self) -> None:
+        # #397: 7z stays available for older app versions and plain 7-Zip, and
+        # 7z FULL backups keep restoring through the file-backed import path.
+        passphrase = "portable 7z full passphrase"
+        original_mapping = self.mapping_path.read_bytes()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                artifact = self.backup_service.export_scheduled_bundle_to_file(
+                    passphrase=passphrase,
+                    included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                    archive_format="7z",
+                )
+                try:
+                    self.assertTrue(artifact.filename.endswith(".7z"))
+                    self.assertTrue(artifact.path.read_bytes().startswith(SEVEN_ZIP_SIGNATURE))
+                    self.assertEqual(artifact.manifest["packaging"], "7z")
+                    inspection = self.backup_service.inspect_bundle_file(
+                        artifact.path, passphrase=passphrase, expected_encrypted=True
+                    )
+                    self.assertTrue(inspection["ok"])
+                    self.assertEqual(inspection["packaging"], "7z")
+                    self.mapping_path.write_text('{"version": 1, "slot_mappings": {}}', encoding="utf-8")
+                    result = self.backup_service.import_bundle_from_file(
+                        artifact.path, passphrase=passphrase, expected_encrypted=True
+                    )
+                finally:
+                    artifact.cleanup()
+        self.assertEqual(result["packaging"], "7z")
+        self.assertIn(HISTORY_DB_KEY, result["included_groups"])
+        self.assertEqual(self.mapping_path.read_bytes(), original_mapping)
+
+    def test_admin_encrypted_full_export_defaults_to_stream_and_keeps_7z_choice(self) -> None:
+        # #397: the admin export (packaging defaults to tar.zst) seals an
+        # encrypted FULL backup in TJBENC02; packaging="7z" keeps 7z, and an
+        # encrypted export without history stays 7z.
+        from history_service.backup_archive import stream_envelope
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with patch.object(
+                self.backup_service,
+                "_run_7z_command",
+                side_effect=AssertionError("the default admin FULL export must not invoke 7z"),
+            ):
+                fast = self.backup_service.export_bundle_to_file(
+                    encrypt=True,
+                    passphrase="admin fast passphrase",
+                    included_paths=[HISTORY_DB_KEY, MAPPING_FILE_KEY],
+                )
+            try:
+                self.assertTrue(fast.filename.endswith(".tar.zst.enc"))
+                self.assertEqual(fast.media_type, "application/octet-stream")
+                self.assertTrue(fast.path.read_bytes().startswith(stream_envelope.MAGIC))
+                self.assertEqual(fast.manifest["packaging"], "tar.zst")
+                self.assertTrue(
+                    self.backup_service.inspect_bundle_file(
+                        fast.path, passphrase="admin fast passphrase", expected_encrypted=True
+                    )["ok"]
+                )
+            finally:
+                fast.cleanup()
+            with patch.object(self.backup_service, "_run_7z_command", side_effect=self._fake_7z_command):
+                for groups, packaging in (
+                    ([HISTORY_DB_KEY, MAPPING_FILE_KEY], "7z"),
+                    ([MAPPING_FILE_KEY], "tar.zst"),
+                ):
+                    with self.subTest(groups=groups, packaging=packaging):
+                        portable = self.backup_service.export_bundle_to_file(
+                            encrypt=True,
+                            passphrase="admin portable passphrase",
+                            packaging=packaging,
+                            included_paths=groups,
+                        )
+                        try:
+                            self.assertTrue(portable.filename.endswith(".7z"))
+                            self.assertEqual(portable.manifest["packaging"], "7z")
+                        finally:
+                            portable.cleanup()
+
     def test_one_shot_runner_publishes_restore_grade_mapping_profile_and_calibration_backup(
         self,
     ) -> None:
@@ -1206,6 +2426,405 @@ class SystemBackupServiceTests(unittest.TestCase):
             "files": files,
         }
         return SystemBackupServiceTests._build_zip_bundle(manifest, archive_members)
+
+    def test_inspect_and_import_refuse_a_backup_from_a_newer_app_version_before_extraction(self) -> None:
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "app_version": "99.1.0",
+            "packaging": "zip",
+            "groups": [],
+            "files": [],
+        }
+        archive_path = self.temp_dir / "newer.zip"
+        archive_path.write_bytes(self._build_zip_bundle(manifest))
+        expected = "This backup was made by v99.1.0; this deployment is v"
+
+        with patch.object(
+            self.backup_service,
+            "_extract_manifest_zip_members_to_directory",
+            side_effect=AssertionError("payload extraction must not start"),
+        ):
+            with self.assertRaises(ValueError) as inspected:
+                self.backup_service.inspect_bundle_file(archive_path)
+            with self.assertRaises(ValueError) as imported:
+                self.backup_service.import_bundle_from_file(archive_path)
+
+        for raised in (inspected.exception, imported.exception):
+            self.assertIn(expected, str(raised))
+            self.assertIn("Upgrade before restoring.", str(raised))
+
+    def test_inspect_notes_an_older_app_version_and_accepts_unknown_ones(self) -> None:
+        cases = (
+            ("0.1.0", "This backup was made by v0.1.0; settings and history will be"),
+            ("0.0.0-test", "This backup was made by v0.0.0; settings and history will be"),
+            (system_backup_module.__version__, None),
+            ("not-a-version", None),
+            (None, None),
+        )
+        for app_version, expected_note in cases:
+            with self.subTest(app_version=app_version):
+                manifest: dict[str, Any] = {
+                    "schema_version": BUNDLE_SCHEMA_VERSION,
+                    "format": BUNDLE_FORMAT,
+                    "packaging": "zip",
+                    "groups": [],
+                    "files": [],
+                }
+                if app_version is not None:
+                    manifest["app_version"] = app_version
+                archive_path = self.temp_dir / "older.zip"
+                archive_path.write_bytes(self._build_zip_bundle(manifest))
+
+                result = self.backup_service.inspect_bundle_file(archive_path)
+
+                self.assertTrue(result["ok"])
+                if expected_note is None:
+                    self.assertIsNone(result["app_version_note"])
+                else:
+                    self.assertIn(expected_note, result["app_version_note"])
+
+    def test_newer_schema_version_says_to_upgrade_first(self) -> None:
+        for schema_version, expected in (
+            (3, "This backup was made by a newer version of the app (schema version 3). Upgrade first, then restore."),
+            ("2", "This backup file is not in a format this app can restore (schema version '2')."),
+        ):
+            with self.subTest(schema_version=schema_version):
+                archive_path = self.temp_dir / "schema.zip"
+                archive_path.write_bytes(
+                    self._build_zip_bundle(
+                        {
+                            "schema_version": schema_version,
+                            "format": BUNDLE_FORMAT,
+                            "groups": [],
+                            "files": [],
+                        }
+                    )
+                )
+                with self.assertRaises(ValueError) as raised:
+                    self.backup_service.inspect_bundle_file(archive_path)
+                self.assertEqual(str(raised.exception), expected)
+
+    def test_restore_refuses_when_free_space_is_short_before_touching_live_files(self) -> None:
+        self.store.insert_metric_samples([])
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            live_before = self.history_db_path.read_bytes()
+            usage = shutil.disk_usage(self.temp_dir)
+            short = type(usage)(usage.total, usage.used, 1)
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                self.assertRaises(ValueError) as raised,
+            ):
+                self.backup_service.import_bundle_from_file(artifact.path)
+            message = str(raised.exception)
+            self.assertIn("Restore needs about", message)
+            self.assertIn("free in", message)
+            self.assertIn("1 bytes is available.", message)
+            self.assertEqual(self.history_db_path.read_bytes(), live_before)
+
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                self.assertRaisesRegex(ValueError, "Restore needs about"),
+            ):
+                self.backup_service.inspect_bundle_file(artifact.path)
+
+            result = self.backup_service.inspect_bundle_file(artifact.path)
+            self.assertTrue(result["ok"])
+        finally:
+            artifact.cleanup()
+
+    def test_restore_free_space_sums_staging_copies_on_one_filesystem(self) -> None:
+        from types import SimpleNamespace
+
+        member_bytes = 400
+        live_bytes = self.history_db_path.stat().st_size
+        manifest = {
+            "schema_version": 1,
+            "files": [{"key": "history", "group_key": HISTORY_DB_KEY}],
+        }
+        group_entries = {HISTORY_DB_KEY: {"selected": True, "present": True}}
+        extracted = {"history": b"h" * member_bytes}
+        temp_folder = Path(tempfile.gettempdir())
+        history_folder = self.history_db_path.parent
+        real_stat = os.stat
+
+        def stat_with_devices(devices: dict[str, int]):
+            def fake_stat(path, *args, **kwargs):
+                device_id = devices.get(os.path.normcase(str(path)))
+                if device_id is None:
+                    return real_stat(path, *args, **kwargs)
+                return SimpleNamespace(st_dev=device_id)
+
+            return fake_stat
+
+        shared_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 11,
+        }
+        separate_devices = {
+            os.path.normcase(str(temp_folder)): 11,
+            os.path.normcase(str(history_folder)): 22,
+        }
+        # Enough for each folder on its own, short of both staged copies at once.
+        tight_free = member_bytes + live_bytes
+        tight_usage = SimpleNamespace(total=tight_free * 4, used=tight_free * 3, free=tight_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+        message = str(raised.exception)
+        self.assertIn("Restore needs about", message)
+        self.assertIn(f"free in {temp_folder}", message)
+        self.assertIn(self.backup_service._format_size(2 * member_bytes + live_bytes), message)
+
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=tight_usage),
+            patch(
+                "history_service.system_backup.os.stat",
+                side_effect=stat_with_devices(separate_devices),
+            ),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
+        roomy_free = 2 * member_bytes + live_bytes
+        roomy_usage = SimpleNamespace(total=roomy_free * 4, used=roomy_free * 3, free=roomy_free)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=roomy_usage),
+            patch("history_service.system_backup.os.stat", side_effect=stat_with_devices(shared_devices)),
+        ):
+            self.backup_service._require_restore_free_space(manifest, group_entries, extracted)
+
+    def test_debug_export_with_history_checks_free_space_before_writing(self) -> None:
+        usage = shutil.disk_usage(self.temp_dir)
+        short = type(usage)(usage.total, usage.used, 1)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+            patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+            self.assertRaisesRegex(ValueError, "Export needs about"),
+        ):
+            self.backup_service.export_debug_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+        mkdtemp.assert_not_called()
+        source_bytes = self.backup_service._history_source_bytes()
+        with (
+            patch.object(self.backup_service, "_history_source_bytes", return_value=source_bytes),
+            patch.object(self.backup_service, "_non_history_source_bytes", return_value=0),
+        ):
+            roomy = type(usage)(usage.total, usage.used, 3 * source_bytes)
+            with patch("history_service.system_backup.shutil.disk_usage", return_value=roomy):
+                self.backup_service._require_export_free_space(
+                    [HISTORY_DB_KEY], app_settings=Settings(), packaging="zip", scrub_history=True,
+                )
+            tight = type(usage)(usage.total, usage.used, 3 * source_bytes - 1)
+            with patch("history_service.system_backup.shutil.disk_usage", return_value=tight):
+                with self.assertRaisesRegex(ValueError, "Export needs about"):
+                    self.backup_service._require_export_free_space(
+                        [HISTORY_DB_KEY], app_settings=Settings(), packaging="zip", scrub_history=True,
+                    )
+
+    def test_export_refuses_when_temp_folder_cannot_hold_the_history_snapshot(self) -> None:
+        usage = shutil.disk_usage(self.temp_dir)
+        short = type(usage)(usage.total, usage.used, 1)
+        with (
+            patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+            patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+        self.assertIn("Export needs about", str(raised.exception))
+        self.assertIn("1 bytes is available.", str(raised.exception))
+        mkdtemp.assert_not_called()
+
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            with (
+                patch("history_service.system_backup.shutil.disk_usage", return_value=short),
+                patch("history_service.system_backup.tempfile.mkdtemp") as mkdtemp,
+                self.assertRaisesRegex(ValueError, "Export needs about"),
+            ):
+                self.backup_service.export_bundle_to_file(
+                    packaging="zip", included_paths=[CONFIG_FILE_KEY],
+                )
+        mkdtemp.assert_not_called()
+
+    def test_non_history_export_space_budget_includes_files_directories_and_packaging(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            app_settings = get_settings()
+        selected = [CONFIG_FILE_KEY, SSH_KEYS_KEY]
+        payload_bytes = self.backup_service._non_history_source_bytes(app_settings, selected)
+        self.assertGreater(payload_bytes, self.config_path.stat().st_size)
+        usage = shutil.disk_usage(self.temp_dir)
+        for packaging, copies in (("zip", 2), ("tar.gz", 3), ("tar.zst", 3), ("7z", 3)):
+            with self.subTest(packaging=packaging):
+                roomy = type(usage)(usage.total, usage.used, copies * payload_bytes)
+                with patch("history_service.system_backup.shutil.disk_usage", return_value=roomy):
+                    self.backup_service._require_export_free_space(
+                        selected,
+                        app_settings=app_settings,
+                        packaging=packaging,
+                    )
+                tight = type(usage)(usage.total, usage.used, copies * payload_bytes - 1)
+                with patch("history_service.system_backup.shutil.disk_usage", return_value=tight):
+                    with self.assertRaisesRegex(ValueError, "Export needs about"):
+                        self.backup_service._require_export_free_space(
+                            selected,
+                            app_settings=app_settings,
+                            packaging=packaging,
+                        )
+
+    def test_non_history_space_budget_uses_captured_bytes_without_touching_live_path(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            app_settings = get_settings()
+        for content, expected in ((b"app: {refresh_interval_seconds: 47}\n", 36), (None, 0)):
+            with self.subTest(content=content):
+                service = self.backup_service.with_captured_config_files(
+                    {self.config_path.absolute(): content}
+                )
+                with patch.object(Path, "stat", side_effect=AssertionError("late live stat")):
+                    self.assertEqual(
+                        service._non_history_source_bytes(app_settings, [CONFIG_FILE_KEY]),
+                        expected,
+                    )
+
+    def test_import_skips_second_quick_check_only_for_the_preflighted_digest(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            real_connect = sqlite3.connect
+            pragmas: list[str] = []
+
+            class CountingConnection:
+                def __init__(self, connection: sqlite3.Connection) -> None:
+                    self._connection = connection
+
+                def execute(self, sql: str, *args: Any):
+                    if "quick_check" in sql:
+                        pragmas.append(sql)
+                    return self._connection.execute(sql, *args)
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._connection, name)
+
+            def counting_connect(database: Any, *args: Any, **kwargs: Any) -> Any:
+                connection = real_connect(database, *args, **kwargs)
+                if isinstance(database, str) and "mode=ro" in database:
+                    return CountingConnection(connection)
+                return connection
+
+            digest = self.backup_service.preflight_import_bundle_file(artifact.path)
+            self.assertRegex(digest or "", r"^[0-9a-f]{64}$")
+
+            with patch("history_service.system_backup.sqlite3.connect", side_effect=counting_connect):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    preflighted_archive_sha256=digest,
+                )
+            self.assertEqual(pragmas, [], "a matching preflight digest must skip quick_check")
+
+            with patch("history_service.system_backup.sqlite3.connect", side_effect=counting_connect):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    preflighted_archive_sha256="0" * 64,
+                )
+            self.assertEqual(len(pragmas), 1, "a different digest must run quick_check again")
+        finally:
+            artifact.cleanup()
+
+    def test_v1_history_backup_is_refused_on_a_segmented_deployment_before_any_write(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            self.assertNotEqual(artifact.manifest.get("schema_version"), 2)
+            live_before = self.history_db_path.read_bytes()
+            self.store.segment_catalog_path = self.temp_dir / "segments" / "catalog.json"
+            try:
+                for operation in (
+                    self.backup_service.inspect_bundle_file,
+                    self.backup_service.preflight_import_bundle_file,
+                    self.backup_service.import_bundle_from_file,
+                ):
+                    with self.subTest(operation=operation.__name__):
+                        receipts = []
+                        kwargs = (
+                            {"identity_callback": lambda *identity: receipts.append(identity)}
+                            if operation.__name__ != "import_bundle_from_file" else {}
+                        )
+                        with self.assertRaisesRegex(ValueError, "old single-file format"):
+                            operation(artifact.path, **kwargs)
+                        self.assertEqual(receipts, [])
+            finally:
+                self.store.segment_catalog_path = None
+            self.assertEqual(self.history_db_path.read_bytes(), live_before)
+        finally:
+            artifact.cleanup()
+
+    def test_7z_failure_keeps_raw_tool_output_out_of_the_error(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["7z"],
+            2,
+            stdout="member config/secret-name.yaml\n",
+            stderr="ERROR: synthetic tool detail",
+        )
+        with (
+            self.assertLogs("history_service.system_backup", level="WARNING") as logs,
+            self.assertRaises(ValueError) as raised,
+        ):
+            SystemBackupService._raise_for_7z_failure(
+                result,
+                "The backup could not be written.",
+                passphrase="synthetic passphrase",
+            )
+        message = str(raised.exception)
+        self.assertEqual(message, "The backup could not be written. The 7-Zip step failed (exit 2).")
+        self.assertNotIn("secret-name", message)
+        self.assertIn("synthetic tool detail", "\n".join(logs.output))
+
+    def test_passphrase_messages_are_one_sentence_each(self) -> None:
+        self.assertEqual(
+            system_backup_module.PASSPHRASE_REQUIRED_MESSAGE,
+            "This backup is encrypted. Enter its passphrase to continue.",
+        )
+        with self.assertRaisesRegex(ValueError, "^Enter a passphrase to encrypt this backup.$"):
+            self.backup_service.export_bundle_to_file(encrypt=True, passphrase=None)
+
+    def test_in_memory_import_chain_is_gone(self) -> None:
+        for name in (
+            "_read_archive",
+            "_build_archive",
+            "_decrypt_scheduled_archive",
+            "_decompress_tar_archive",
+            "_decompress_single_gzip_member",
+            "_decompress_single_zstd_frame",
+            "_extract_manifest_zip_members",
+            "_extract_manifest_tar_members",
+            "_read_tar_member",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(SystemBackupService, name))
+
+    def test_format_size_reads_like_a_person_wrote_it(self) -> None:
+        format_size = SystemBackupService._format_size
+        self.assertEqual(format_size(6 * 1024 ** 3 + 200 * 1024 ** 2), "6.2 GiB")
+        self.assertEqual(format_size(3 * 1024 ** 2), "3.0 MiB")
+        self.assertEqual(format_size(1536), "1.5 KiB")
+        self.assertEqual(format_size(12), "12 bytes")
 
     def test_import_rejects_oversized_archive_before_format_processing(self) -> None:
         with patch("history_service.system_backup.MAX_BACKUP_ARCHIVE_BYTES", 4):
@@ -1531,7 +3150,7 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with patch.object(
             self.backup_service,
-            "_extract_manifest_zip_members",
+            "_extract_manifest_zip_members_to_directory",
             side_effect=AssertionError("payload extraction must not start"),
         ):
             with self.assertRaisesRegex(ValueError, "duplicate member key"):
@@ -1666,14 +3285,20 @@ class SystemBackupServiceTests(unittest.TestCase):
             ],
         }
 
-        archive_bytes = self.backup_service._build_archive([member], manifest, "tar.gz")
-        restored_manifest, extracted, packaging, _ = self.backup_service._read_archive(
-            archive_bytes
+        bundle_path = self.temp_dir / "long-member.tar.gz"
+        self.backup_service._build_archive_to_path([member], manifest, "tar.gz", bundle_path)
+        restored_manifest, extracted, packaging, archive_meta = self.backup_service._read_archive_file(
+            bundle_path
         )
-
-        self.assertEqual(packaging, "tar.gz")
-        self.assertEqual(restored_manifest, manifest)
-        self.assertEqual(extracted, {member.key: content})
+        try:
+            self.assertEqual(packaging, "tar.gz")
+            self.assertEqual(restored_manifest, manifest)
+            self.assertEqual(
+                {key: Path(value).read_bytes() for key, value in extracted.items()},
+                {member.key: content},
+            )
+        finally:
+            self.backup_service._cleanup_extracted_archive(archive_meta.get("_cleanup_root"))
 
     def test_tar_gzip_rejects_concatenated_member_before_archive_parse(self) -> None:
         manifest = {
@@ -1692,33 +3317,25 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "concatenated gzip"):
             self.backup_service.import_bundle(concatenated)
+        archive_path = self.temp_dir / "concatenated.tar.gz"
+        archive_path.write_bytes(concatenated)
+        with self.assertRaisesRegex(ValueError, "concatenated gzip"):
+            self.backup_service.import_bundle_from_file(archive_path)
 
     def test_tar_gzip_applies_ratio_cap_during_decompression(self) -> None:
-        observed_max_lengths: list[int] = []
-
-        class FakeDecompressor:
-            eof = True
-            unused_data = b""
-
-            def decompress(self, chunk: bytes, max_length: int) -> bytes:
-                observed_max_lengths.append(max_length)
-                return b""
-
-            def flush(self, length: int) -> bytes:
-                return b""
-
-        archive_bytes = b"x" * 100
+        archive_path = self.temp_dir / "ratio.tar.gz"
+        archive_path.write_bytes(gzip.compress(b"\0" * (64 * 1024)))
+        output_path = self.temp_dir / "ratio.tar"
         with (
             patch("history_service.system_backup.MAX_ARCHIVE_COMPRESSION_RATIO", 2),
-            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 10_000),
-            patch(
-                "history_service.system_backup.zlib.decompressobj",
-                return_value=FakeDecompressor(),
-            ),
+            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 10_000_000),
         ):
-            self.backup_service._decompress_single_gzip_member(archive_bytes)
-
-        self.assertEqual(observed_max_lengths, [201])
+            with self.assertRaisesRegex(ValueError, "compression ratio exceeds"):
+                self.backup_service._decompress_tar_archive_to_file(
+                    archive_path,
+                    output_path,
+                    "tar.gz",
+                )
 
     def test_tar_zstd_rejects_concatenated_frame_before_archive_parse(self) -> None:
         if system_backup_module.zstd is None:
@@ -1740,6 +3357,94 @@ class SystemBackupServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "concatenated zstd"):
             self.backup_service.import_bundle(concatenated)
+        archive_path = self.temp_dir / "concatenated.tar.zst"
+        archive_path.write_bytes(concatenated)
+        with self.assertRaisesRegex(ValueError, "concatenated zstd"):
+            self.backup_service.import_bundle_from_file(archive_path)
+
+    def test_file_backed_zstd_ratio_rejection_stays_below_eight_mib_python_heap(self) -> None:
+        if system_backup_module.zstd is None:
+            self.skipTest("zstandard is not installed")
+        archive_path = self.temp_dir / "high-ratio.tar.zst"
+        output_path = self.temp_dir / "high-ratio.tar"
+        archive_path.write_bytes(
+            system_backup_module.zstd.ZstdCompressor(level=19).compress(
+                b"0" * (32 * 1024 * 1024)
+            )
+        )
+
+        heap_probe.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "compression ratio"):
+                self.backup_service._decompress_tar_archive_to_file(
+                    archive_path,
+                    output_path,
+                    "tar.zst",
+                )
+            _, peak_bytes = heap_probe.get_traced_memory()
+        finally:
+            heap_probe.stop()
+            output_path.unlink(missing_ok=True)
+
+        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_7z_listing_rejects_duplicate_member_metadata_keys(self) -> None:
+        output = "\n".join(
+            [
+                "Path = bundle.7z",
+                "Type = 7z",
+                "",
+                "Path = manifest.json",
+                "Size = 10",
+                "Encrypted = +",
+                "Encrypted = -",
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate metadata"):
+            self.backup_service._seven_zip_listed_entries(
+                output,
+                Path("bundle.7z"),
+            )
+
+    def test_7z_encryption_provenance_requires_every_regular_member(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "encryption metadata is missing"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_rejects_malformed_member_metadata(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "yes"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "encryption metadata is malformed"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_rejects_mixed_regular_members(self) -> None:
+        entries = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20", "Encrypted": "-"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "mixes encrypted and plaintext"):
+            self.backup_service._seven_zip_encryption_mode(entries)
+
+    def test_7z_encryption_provenance_reports_uniform_regular_members(self) -> None:
+        encrypted = [
+            {"Path": "config", "Folder": "+", "Attributes": "D"},
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "+"},
+            {"Path": "config/config.yaml", "Size": "20", "Encrypted": "+"},
+        ]
+        plaintext = [
+            {"Path": "manifest.json", "Size": "10", "Encrypted": "-"},
+        ]
+
+        self.assertTrue(self.backup_service._seven_zip_encryption_mode(encrypted))
+        self.assertFalse(self.backup_service._seven_zip_encryption_mode(plaintext))
 
     def test_7z_limits_count_and_ratio_from_listing_before_extraction(self) -> None:
         entries = [
@@ -1911,6 +3616,55 @@ sys.stdout.flush()
         self.assertNotIn(passphrase, result.stderr)
         self.assertIn("Everything is Ok", result.stdout)
 
+    def test_7z_prompt_channel_supports_a_master_fd_above_select_limit(self) -> None:
+        try:
+            import pty  # noqa: F401 - preload before intentionally occupying descriptors
+            import resource
+        except ImportError:
+            self.skipTest("high-descriptor PTY coverage requires POSIX resource APIs")
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1040:
+            self.skipTest("the process descriptor limit leaves no room above the select boundary")
+
+        holders: list[int] = []
+        try:
+            while not holders or holders[-1] < 1023:
+                holders.append(os.open(os.devnull, os.O_RDONLY))
+        except OSError:
+            for fd in holders:
+                os.close(fd)
+            self.skipTest("the process descriptor limit is below the select boundary")
+
+        prompt_program = """
+import os
+import sys
+import termios
+
+if not os.isatty(0):
+    raise SystemExit(3)
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, attributes)
+sys.stdout.write("Enter password (will not be echoed):")
+sys.stdout.flush()
+if not sys.stdin.readline().endswith("\\n"):
+    raise SystemExit(4)
+sys.stdout.write("\\nEverything is Ok\\n")
+sys.stdout.flush()
+"""
+        try:
+            result = self.backup_service._run_7z_prompt_command(
+                [sys.executable, "-c", prompt_program],
+                cwd=None,
+                passphrase="synthetic prompt secret",
+            )
+        finally:
+            for fd in holders:
+                os.close(fd)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Everything is Ok", result.stdout)
+
     def test_7z_prompt_channel_rejects_line_breaks_before_process_start(self) -> None:
         with patch("history_service.system_backup.subprocess.Popen") as popen:
             with self.assertRaisesRegex(ValueError, "line breaks"):
@@ -1999,7 +3753,7 @@ sys.stdout.flush()
                 bundle = self._build_zip_bundle(manifest, {archive_path: b"pwn"})
 
                 with self.assertRaisesRegex(ValueError, "archive member path is invalid"):
-                    self.backup_service._read_archive(bundle)
+                    self.backup_service.import_bundle(bundle)
 
     def test_directory_restore_validates_missing_members_before_replacing_existing_dir(self) -> None:
         target_dir = self.temp_dir / "existing-ssh"
@@ -2245,6 +3999,113 @@ sys.stdout.flush()
             production_history_bytes + 1024 * 1024 * 1024,
         )
 
+    def test_export_construction_counts_manifest_at_non_history_limit_boundary(self) -> None:
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/config.yaml",
+                    "size_bytes": 7,
+                }
+            ],
+        }
+
+        self.backup_service._validate_export_manifest_non_history_aggregate(
+            manifest,
+            manifest_size=3,
+            limit=10,
+        )
+        with self.assertRaisesRegex(ValueError, "non-history members exceed"):
+            self.backup_service._validate_export_manifest_non_history_aggregate(
+                manifest,
+                manifest_size=4,
+                limit=10,
+            )
+
+    def test_export_construction_applies_non_history_aggregate_limit_to_7z(self) -> None:
+        members = [
+            BundleMember(
+                key=HISTORY_DB_KEY,
+                group_key=HISTORY_DB_KEY,
+                archive_path="history/history.sqlite3",
+                source_path=None,
+                present=True,
+                content=b"h" * 50,
+            ),
+            BundleMember(
+                key=CONFIG_FILE_KEY,
+                group_key=CONFIG_FILE_KEY,
+                archive_path="config/config.yaml",
+                source_path=None,
+                present=True,
+                content=b"c" * 6,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "non-history members exceed"):
+            self.backup_service._collect_file_specs(
+                members,
+                member_limit=100,
+                expanded_limit=100,
+                large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+                non_history_expanded_limit=5,
+            )
+
+    def test_7z_export_verification_applies_manifest_aware_non_history_limit(self) -> None:
+        archive_path = self.temp_dir / "aggregate-parity.7z"
+        archive_path.write_bytes(SEVEN_ZIP_SIGNATURE + b"synthetic")
+        manifest = {
+            "schema_version": BUNDLE_SCHEMA_VERSION,
+            "format": BUNDLE_FORMAT,
+            "groups": [],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": "config/config.yaml",
+                    "size_bytes": 6,
+                    "sha256": "a" * 64,
+                }
+            ],
+        }
+        listing = subprocess.CompletedProcess(
+            ["7z", "l"],
+            0,
+            stdout="\n".join(
+                [
+                    f"Path = {archive_path.name}",
+                    "Type = 7z",
+                    "",
+                    "Path = manifest.json",
+                    "Size = 1",
+                    "Packed Size = 1",
+                    "Encrypted = -",
+                    "",
+                    "Path = config/config.yaml",
+                    "Size = 6",
+                    "Packed Size = 6",
+                    "Encrypted = -",
+                ]
+            ),
+            stderr="",
+        )
+
+        with (
+            patch.object(self.backup_service, "_run_7z_command", return_value=listing),
+            patch("history_service.system_backup.MAX_ARCHIVE_EXPANDED_BYTES", 5),
+            self.assertRaisesRegex(ValueError, "non-history members exceed"),
+        ):
+            self.backup_service._validate_export_archive(
+                archive_path,
+                "7z",
+                expanded_archive_size=None,
+                passphrase=None,
+                manifest=manifest,
+            )
+
     def test_file_backed_limit_is_only_available_to_history_manifest_member(self) -> None:
         member = {
             "key": "oversized",
@@ -2372,7 +4233,9 @@ sys.stdout.flush()
             ),
         ):
             with self.assertRaisesRegex(ValueError, expected_error):
-                self.backup_service._read_7z_archive(SEVEN_ZIP_SIGNATURE)
+                signature_path = self.temp_dir / "signature-only.7z"
+                signature_path.write_bytes(SEVEN_ZIP_SIGNATURE)
+                self.backup_service._read_7z_archive(archive_path=signature_path)
 
         self.assertFalse(payload_extraction_started)
 
@@ -2601,6 +4464,493 @@ sys.stdout.flush()
                 manifest,
                 {"member": member_path},
             )
+
+    def _write_padded_mapping_member(self, member_path: Path, payload_bytes: int, mapping_entries: int) -> None:
+        """A `payload_bytes` JSON member: one padding string, then `mapping_entries` mappings."""
+        entry_value = b'{"slot":0}'
+        fixed_bytes = (
+            len(b'{"padding":"')
+            + len(b'","slot_mappings":{')
+            + len(b'}}')
+            + sum(
+                len(f'"{index:06d}":'.encode("ascii"))
+                + len(entry_value)
+                + (1 if index else 0)
+                for index in range(mapping_entries)
+            )
+        )
+        padding_bytes = payload_bytes - fixed_bytes
+        self.assertGreaterEqual(padding_bytes, 0)
+        with member_path.open("wb") as output:
+            output.write(b'{"padding":"')
+            remaining = padding_bytes
+            chunk = b"x" * (1024 * 1024)
+            while remaining:
+                written = min(remaining, len(chunk))
+                output.write(chunk[:written])
+                remaining -= written
+            output.write(b'","slot_mappings":{')
+            for index in range(mapping_entries):
+                if index:
+                    output.write(b",")
+                output.write(f'"{index:06d}":'.encode("ascii"))
+                output.write(entry_value)
+            output.write(b'}}')
+        self.assertEqual(member_path.stat().st_size, payload_bytes)
+
+    def test_file_backed_large_mapping_preflight_heap_is_flat_from_one_to_four_mib(self) -> None:
+        # The preflight streams the member: the padding string is skipped
+        # without being held, and each mapping is validated and dropped. A
+        # reader that materialized either would grow with the member, so the
+        # peak must stay under the 8 MiB budget at both sizes *and* move by
+        # less than 1 MiB while the member grows by 3 MiB and the mapping
+        # count quadruples. (Sixteen MiB with 107k entries proved the same
+        # bound but spent most of the suite's time tracing the padding skip.)
+        peaks: list[int] = []
+        for payload_bytes, mapping_entries in ((1 * 1024 * 1024 + 776, 6_700), (4 * 1024 * 1024 + 200, 26_700)):
+            member_path = self.temp_dir / f"large-valid-mapping-{payload_bytes}.json"
+            self._write_padded_mapping_member(member_path, payload_bytes, mapping_entries)
+
+            heap_probe.start()
+            try:
+                accepted_entries = self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    ManualMapping,
+                )
+                _, peak_bytes = heap_probe.get_traced_memory()
+            finally:
+                heap_probe.stop()
+
+            self.assertEqual(accepted_entries, mapping_entries)
+            self.assertLess(peak_bytes, 8 * 1024 * 1024)
+            peaks.append(peak_bytes)
+
+        self.assertLess(abs(peaks[1] - peaks[0]), 1024 * 1024)
+
+    def test_file_backed_json_rejects_duplicate_mapping_key_across_read_chunks(self) -> None:
+        member_path = self.temp_dir / "cross-chunk-duplicate-mapping.json"
+        with member_path.open("w", encoding="utf-8") as output:
+            output.write('{"slot_mappings":{"same":{"slot":0}')
+            for index in range(4_000):
+                output.write(f',"distinct-{index:04d}":{{"slot":0}}')
+            output.write(',"same":{"slot":1}}}')
+
+        with self.assertRaisesRegex(ValueError, "duplicate object key"):
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            )
+
+    def test_file_backed_json_rejects_duplicate_key_inside_mapping_entry(self) -> None:
+        member_path = self.temp_dir / "nested-duplicate-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0,"slot":1}}}',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate object key"):
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            )
+
+    def test_file_backed_json_duplicate_tracker_cleans_workspace_after_rejection(self) -> None:
+        member_path = self.temp_dir / "cleanup-duplicate-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"same":{"slot":0},"same":{"slot":1}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            with self.assertRaisesRegex(ValueError, "duplicate object key"):
+                self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    ManualMapping,
+                )
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_uses_private_files_and_cleans_success(self) -> None:
+        member_path = self.temp_dir / "valid-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0},"second":{"slot":1}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        class InspectingManualMapping:
+            @classmethod
+            def model_validate(cls, value: object) -> object:
+                tracker_root = tracker_roots[0]
+                self.assertEqual(tracker_root.stat().st_mode & 0o777, 0o700)
+                database_path = tracker_root / "keys.sqlite3"
+                self.assertEqual(database_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    sorted(path.name for path in tracker_root.iterdir()),
+                    ["keys.sqlite3"],
+                )
+                return ManualMapping.model_validate(value)
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            accepted_entries = self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                InspectingManualMapping,
+            )
+
+        self.assertEqual(accepted_entries, 2)
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_cleans_initialization_cancellation(
+        self,
+    ) -> None:
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        tracker = system_backup_module._DiskBackedDuplicateKeyTracker()
+        with (
+            patch.object(
+                system_backup_module.tempfile,
+                "mkdtemp",
+                side_effect=allocate_tracker_workspace,
+            ),
+            patch.object(
+                system_backup_module.sqlite3,
+                "connect",
+                side_effect=KeyboardInterrupt("synthetic initialization cancellation"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic initialization cancellation",
+            ),
+        ):
+            tracker.__enter__()
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_duplicate_tracker_preserves_initialization_cancellation_when_cleanup_fails(
+        self,
+    ) -> None:
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        tracker = system_backup_module._DiskBackedDuplicateKeyTracker()
+        with (
+            patch.object(
+                system_backup_module.tempfile,
+                "mkdtemp",
+                side_effect=allocate_tracker_workspace,
+            ),
+            patch.object(
+                system_backup_module.sqlite3,
+                "connect",
+                side_effect=KeyboardInterrupt("synthetic initialization cancellation"),
+            ),
+            patch.object(
+                system_backup_module.shutil,
+                "rmtree",
+                side_effect=OSError("synthetic cleanup failure"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic initialization cancellation",
+            ) as raised,
+        ):
+            tracker.__enter__()
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertTrue(tracker_roots[0].exists())
+        self.assertIn(
+            "JSON duplicate-key tracker cleanup failed.",
+            getattr(raised.exception, "__notes__", ()),
+        )
+
+    def test_file_backed_json_duplicate_tracker_cleans_workspace_after_cancellation(self) -> None:
+        member_path = self.temp_dir / "cancelled-mapping.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0}}}',
+            encoding="utf-8",
+        )
+        real_mkdtemp = tempfile.mkdtemp
+        tracker_roots: list[Path] = []
+
+        def allocate_tracker_workspace(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+        ) -> str:
+            self.assertIsNone(dir)
+            path = Path(real_mkdtemp(suffix=suffix, prefix=prefix, dir=self.temp_dir))
+            tracker_roots.append(path)
+            return str(path)
+
+        class CancelledMapping:
+            @classmethod
+            def model_validate(cls, value: object) -> object:
+                raise KeyboardInterrupt("synthetic cancellation")
+
+        with patch.object(
+            system_backup_module.tempfile,
+            "mkdtemp",
+            side_effect=allocate_tracker_workspace,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.backup_service._validate_streaming_json_member(
+                    member_path,
+                    "slot_mappings",
+                    CancelledMapping,
+                )
+
+        self.assertEqual(len(tracker_roots), 1)
+        self.assertFalse(tracker_roots[0].exists())
+
+    def test_file_backed_json_allows_equal_field_names_in_separate_objects(self) -> None:
+        member_path = self.temp_dir / "object-scoped-keys.json"
+        member_path.write_text(
+            '{"slot_mappings":{"first":{"slot":0},"second":{"slot":1}}}',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            self.backup_service._validate_streaming_json_member(
+                member_path,
+                "slot_mappings",
+                ManualMapping,
+            ),
+            2,
+        )
+
+    def test_file_backed_json_preflight_rejects_duplicate_mapping_keys(self) -> None:
+        member_path = self.temp_dir / "duplicate-mapping.json"
+        mapping = {
+            "system_id": "synthetic",
+            "enclosure_id": "enclosure",
+            "slot": 0,
+            "serial": "SERIAL-A",
+            "updated_at": "2030-01-02T03:04:05+00:00",
+            "source": "manual",
+        }
+        encoded = json.dumps(mapping, separators=(",", ":"))
+        member_path.write_text(
+            f'{{"slot_mappings":{{"same":{encoded},"same":{encoded}}}}}',
+            encoding="utf-8",
+        )
+        manifest = {
+            "groups": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": MAPPING_FILE_KEY,
+                    "group_key": MAPPING_FILE_KEY,
+                    "archive_path": str(
+                        BACKUP_GROUP_METADATA[MAPPING_FILE_KEY]["archive_root"]
+                    ),
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "selected mapping_file member is invalid"):
+            self.backup_service._preflight_import_members(
+                manifest,
+                self.backup_service._manifest_group_entries(manifest),
+                {MAPPING_FILE_KEY: member_path},
+            )
+
+    def test_structured_yaml_member_bound_is_export_import_symmetric(self) -> None:
+        content = b" " * (2 * 1024 * 1024) + b"{}"
+        member = BundleMember(
+            key=CONFIG_FILE_KEY,
+            group_key=CONFIG_FILE_KEY,
+            archive_path=str(BACKUP_GROUP_METADATA[CONFIG_FILE_KEY]["archive_root"]),
+            source_path="synthetic",
+            present=True,
+            content=content,
+        )
+        with self.assertRaisesRegex(ValueError, "Structured YAML member"):
+            self.backup_service._collect_file_specs([member])
+
+        member_path = self.temp_dir / "large-config.yaml"
+        member_path.write_bytes(content)
+        manifest = {
+            "groups": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "selected": True,
+                    "present": True,
+                    "restore_mode": "file",
+                }
+            ],
+            "files": [
+                {
+                    "key": CONFIG_FILE_KEY,
+                    "group_key": CONFIG_FILE_KEY,
+                    "archive_path": str(
+                        BACKUP_GROUP_METADATA[CONFIG_FILE_KEY]["archive_root"]
+                    ),
+                }
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "selected config_file member is invalid"):
+            self.backup_service._preflight_import_members(
+                manifest,
+                self.backup_service._manifest_group_entries(manifest),
+                {CONFIG_FILE_KEY: member_path},
+            )
+
+    def test_primary_parse_error_survives_outer_workspace_cleanup_failure(self) -> None:
+        archive_path = self.temp_dir / "invalid.archive"
+        archive_path.write_bytes(b"not an archive")
+        real_rmtree = shutil.rmtree
+
+        def fail_import_workspace_cleanup(path: object, *args: object, **kwargs: object) -> None:
+            if "truenas-jbod-ui-file-import-" in str(path):
+                raise OSError("synthetic cleanup failure")
+            real_rmtree(path, *args, **kwargs)
+
+        with (
+            patch(
+                "history_service.system_backup.shutil.rmtree",
+                side_effect=fail_import_workspace_cleanup,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.backup_service.import_bundle_from_file(archive_path)
+
+        self.assertIn("format is not supported", str(raised.exception))
+        self.assertIn("cleanup", str(raised.exception).lower())
+        self.assertNotIn(str(archive_path), str(raised.exception))
+
+    def test_primary_preflight_error_survives_extracted_workspace_cleanup_failure(self) -> None:
+        cleanup_root = self.temp_dir / "synthetic-extracted-workspace"
+        cleanup_root.mkdir()
+        parsed = (
+            {},
+            {},
+            "zip",
+            {"encrypted": False, "_cleanup_root": cleanup_root},
+        )
+
+        with (
+            patch.object(
+                self.backup_service,
+                "_cleanup_extracted_archive",
+                side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            self.backup_service._import_parsed_bundle(
+                parsed,
+                expected_encrypted=True,
+            )
+
+        self.assertIn("expected encrypted content", str(raised.exception))
+        self.assertIn("cleanup", str(raised.exception).lower())
+        self.assertNotIn(str(cleanup_root), str(raised.exception))
+
+    def test_inspection_siblings_preserve_primary_when_extracted_cleanup_fails(self) -> None:
+        cleanup_root = self.temp_dir / "synthetic-inspection-workspace"
+        cleanup_root.mkdir()
+        cases = (
+            (
+                lambda: self.backup_service.inspect_bundle_file(
+                    Path("synthetic.archive"),
+                    expected_encrypted=True,
+                ),
+                "expected encrypted content",
+            ),
+            (
+                lambda: self.backup_service.preflight_scheduled_bundle_file(
+                    Path("synthetic.archive"),
+                    passphrase="synthetic",
+                    expected_groups=[],
+                ),
+                "encryption could not be verified",
+            ),
+        )
+
+        for operation, primary_message in cases:
+            with self.subTest(primary_message=primary_message), patch.object(
+                self.backup_service,
+                "_read_archive_file",
+                side_effect=lambda *_args, **_kwargs: (
+                    {},
+                    {},
+                    "zip",
+                    {"encrypted": False, "_cleanup_root": cleanup_root},
+                ),
+            ), patch.object(
+                self.backup_service,
+                "_cleanup_extracted_archive",
+                side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
+            ), self.assertRaises(RuntimeError) as raised:
+                operation()
+            self.assertIn(primary_message, str(raised.exception))
+            self.assertIn("cleanup", str(raised.exception).lower())
+            self.assertNotIn(str(cleanup_root), str(raised.exception))
 
     def test_activation_stages_file_backed_member_without_byte_materialization(self) -> None:
         source_path = self.temp_dir / "file-backed-member.bin"
@@ -2934,6 +5284,46 @@ sys.stdout.flush()
                         self.assertEqual(counts["tracked_slots"], 1)
                         self.assertEqual(counts["metric_sample_count"], 1)
 
+    def test_expected_encryption_contract_rejects_plaintext_substitution(self) -> None:
+        artifact = self.backup_service.export_bundle_to_file(
+            packaging="zip",
+            included_paths=[MAPPING_FILE_KEY],
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "expected encrypted"):
+                self.backup_service.inspect_bundle_file(
+                    artifact.path,
+                    expected_encrypted=True,
+                )
+            with self.assertRaisesRegex(ValueError, "expected encrypted"):
+                self.backup_service.import_bundle_from_file(
+                    artifact.path,
+                    expected_encrypted=True,
+                )
+        finally:
+            artifact.cleanup()
+
+    def test_expected_encryption_contract_rejects_encrypted_substitution(self) -> None:
+        with patch.object(
+            self.backup_service,
+            "_run_7z_command",
+            side_effect=self._fake_7z_command,
+        ):
+            artifact = self.backup_service.export_bundle_to_file(
+                encrypt=True,
+                passphrase="synthetic expected mode passphrase",
+                included_paths=[MAPPING_FILE_KEY],
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "expected plaintext"):
+                    self.backup_service.inspect_bundle_file(
+                        artifact.path,
+                        passphrase="synthetic expected mode passphrase",
+                        expected_encrypted=False,
+                    )
+            finally:
+                artifact.cleanup()
+
     def test_file_inspection_validates_without_activation_and_returns_aggregate_only(self) -> None:
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
             get_settings.cache_clear()
@@ -2955,6 +5345,7 @@ sys.stdout.flush()
                 "ok",
                 "schema_version",
                 "app_version",
+                "app_version_note",
                 "exported_at",
                 "encrypted",
                 "packaging",
@@ -3032,11 +5423,11 @@ sys.stdout.flush()
         validated_paths: list[Path] = []
         real_validate_history = SystemBackupService._validate_history_member
 
-        def record_history_path(content: bytes | Path) -> None:
+        def record_history_path(content: bytes | Path, **kwargs: Any) -> None:
             self.assertIsInstance(content, Path)
             assert isinstance(content, Path)
             validated_paths.append(content)
-            real_validate_history(content)
+            real_validate_history(content, **kwargs)
 
         with (
             patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
@@ -3068,7 +5459,7 @@ sys.stdout.flush()
         extraction_root = next(
             parent
             for parent in validated_paths[0].parents
-            if parent.name.startswith("truenas-jbod-ui-7z-import-")
+            if parent.name.startswith(("truenas-jbod-ui-7z-import-", "truenas-jbod-ui-file-import-"))
         )
         self.assertFalse(extraction_root.exists())
 
@@ -3077,26 +5468,35 @@ sys.stdout.flush()
             {"manifest.json": b"{}"},
             "correct passphrase",
         )
+        workspace = self.temp_dir / "seven-zip-cleanup-failure"
 
-        with (
-            patch.object(
-                self.backup_service,
-                "_run_7z_command",
-                side_effect=self._fake_7z_command,
-            ),
-            patch(
-                "history_service.system_backup.shutil.rmtree",
-                side_effect=OSError("synthetic cleanup failure"),
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
-                self.backup_service.import_bundle(
-                    archive,
-                    passphrase="wrong passphrase",
-                )
+        try:
+            with (
+                patch(
+                    "history_service.system_backup.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ),
+                patch.object(
+                    self.backup_service,
+                    "_run_7z_command",
+                    side_effect=self._fake_7z_command,
+                ),
+                patch(
+                    "history_service.system_backup.shutil.rmtree",
+                    side_effect=OSError("synthetic cleanup failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                    self.backup_service.import_bundle(
+                        archive,
+                        passphrase="wrong passphrase",
+                    )
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
     def test_7z_import_workspace_cleanup_failure_precedes_activation(self) -> None:
         passphrase = "cleanup ordering passphrase"
+        workspace = self.temp_dir / "seven-zip-import-cleanup-failure"
         with (
             patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
             patch.object(
@@ -3112,19 +5512,28 @@ sys.stdout.flush()
                 packaging="7z",
                 included_paths=[HISTORY_DB_KEY],
             )
-            with (
-                patch.object(
-                    self.backup_service,
-                    "_cleanup_extracted_archive",
-                    side_effect=RuntimeError("Backup bundle extraction workspace cleanup failed."),
-                ),
-                patch.object(self.backup_service, "_activate_import_bundle") as activate,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
-                    self.backup_service.import_bundle(
-                        artifact.content,
-                        passphrase=passphrase,
-                    )
+            try:
+                with (
+                    patch(
+                        "history_service.system_backup.tempfile.mkdtemp",
+                        return_value=str(workspace),
+                    ),
+                    patch.object(
+                        self.backup_service,
+                        "_cleanup_extracted_archive",
+                        side_effect=RuntimeError(
+                            "Backup bundle extraction workspace cleanup failed."
+                        ),
+                    ),
+                    patch.object(self.backup_service, "_activate_import_bundle") as activate,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"):
+                        self.backup_service.import_bundle(
+                            artifact.content,
+                            passphrase=passphrase,
+                        )
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
 
         activate.assert_not_called()
 
@@ -3217,6 +5626,242 @@ sys.stdout.flush()
                             artifact.cleanup()
                         self.assertFalse(workspace.exists())
 
+    @contextmanager
+    def _debug_selection_fixture_unchanged(self):
+        before = {
+            path: path.read_bytes()
+            for path in self.temp_dir.rglob("*")
+            if path.is_file()
+        }
+        workspaces = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def record_workspace(*args, **kwargs):
+            result = real_mkdtemp(*args, **kwargs)
+            workspaces.append(Path(result))
+            return result
+
+        with (
+            patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
+            patch("history_service.system_backup.tempfile.mkdtemp", side_effect=record_workspace),
+        ):
+            try:
+                yield
+            finally:
+                self.assertEqual(
+                    {path: path.read_bytes() for path in self.temp_dir.rglob("*") if path.is_file()},
+                    before,
+                )
+                self.assertEqual([path for path in workspaces if path.exists()], [])
+
+    def _assert_config_only_debug_archive(self, artifact, *, scrub):
+        source_paths = {
+            CONFIG_FILE_KEY: str(self.config_path),
+            RUNTIME_OVERRIDES_FILE_KEY: str(self.runtime_overrides_path),
+            PROFILE_FILE_KEY: str(self.profile_path),
+            MAPPING_FILE_KEY: str(self.mapping_path),
+            SAS_FABRIC_ALIAS_FILE_KEY: str(self.temp_dir / "sas_fabric_aliases.json"),
+            SLOT_DETAIL_FILE_KEY: str(self.slot_detail_path),
+            HISTORY_DB_KEY: str(self.history_db_path),
+            SSH_KEYS_KEY: str(self.ssh_dir),
+            TLS_TRUST_KEY: str(self.tls_dir),
+            KNOWN_HOSTS_KEY: str(self.known_hosts_path),
+            system_backup_module.DEBUG_STATE_KEY: None,
+            DEBUG_README_KEY: None,
+        }
+        with zipfile.ZipFile(artifact.path) as archive:
+            self.assertEqual(sorted(archive.namelist()), ["config/config.yaml", "manifest.json"])
+            manifest = json.loads(archive.read("manifest.json"))
+            self.assertEqual(manifest, artifact.manifest)
+            content = archive.read("config/config.yaml")
+        expected_config = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
+        if scrub:
+            expected_config = DebugScrubber().scrub_payload(expected_config)
+        self.assertEqual(yaml.safe_load(content), expected_config)
+        self.assertEqual(manifest["format"], DEBUG_BUNDLE_FORMAT)
+        self.assertEqual(manifest["packaging"], "zip")
+        for flag in ("scrub_sensitive", "scrub_secrets", "scrub_disk_identifiers"):
+            self.assertEqual(manifest[flag], scrub)
+        self.assertEqual(manifest["groups"], [
+            {
+                "key": key,
+                "label": metadata["label"],
+                "archive_root": metadata["archive_root"],
+                "source_path": source_paths[key],
+                "selected": key == CONFIG_FILE_KEY,
+                "present": key == CONFIG_FILE_KEY,
+                "sensitive": bool(metadata["sensitive"]),
+                "restore_mode": metadata["restore_mode"],
+            }
+            for key, metadata in BACKUP_GROUP_METADATA.items()
+            if "debug" in metadata["bundle_types"]
+        ])
+        self.assertEqual(manifest["files"], [{
+            "key": CONFIG_FILE_KEY,
+            "group_key": CONFIG_FILE_KEY,
+            "archive_path": "config/config.yaml",
+            "source_path": str(self.config_path),
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }])
+
+    def test_debug_config_only_ignores_excluded_malformed_json(self) -> None:
+        paths = (self.mapping_path, self.temp_dir / "sas_fabric_aliases.json", self.slot_detail_path)
+        for path in paths:
+            original = path.read_bytes() if path.exists() else None
+            try:
+                path.write_bytes(b'{"unfinished":')
+                for scrub in (True, False):
+                    with self.subTest(source=path.name, scrub=scrub), self._debug_selection_fixture_unchanged():
+                        artifact = self.backup_service.export_debug_bundle_to_file(
+                            packaging="zip", included_paths=[CONFIG_FILE_KEY],
+                            scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                        )
+                        try:
+                            self._assert_config_only_debug_archive(artifact, scrub=scrub)
+                        finally:
+                            artifact.cleanup()
+            finally:
+                if original is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(original)
+
+    def test_debug_config_only_skips_excluded_materialization(self) -> None:
+        excluded = {self.mapping_path, self.temp_dir / "sas_fabric_aliases.json", self.slot_detail_path}
+        for path in excluded:
+            path.write_bytes(b'{"unfinished":')
+        real_open = Path.open
+        opened = []
+
+        def record_open(path, *args, **kwargs):
+            opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        for scrub in (True, False):
+            with self.subTest(scrub=scrub), self._debug_selection_fixture_unchanged(), ExitStack() as stack:
+                spies = [stack.enter_context(patch.object(self.backup_service, name, wraps=getattr(self.backup_service, name)))
+                         for name in (
+                             "_read_scrubbed_json_file", "_build_debug_state_bytes", "_build_debug_readme_bytes",
+                             "_build_history_snapshot_to_directory", "_build_segmented_history_snapshot_to_directory",
+                             "_build_scrubbed_history_snapshot_file",
+                         )]
+                counts = stack.enter_context(patch.object(self.store, "counts", wraps=self.store.counts))
+                yaml_reader = stack.enter_context(patch.object(
+                    self.backup_service, "_read_scrubbed_yaml_file", wraps=self.backup_service._read_scrubbed_yaml_file,
+                ))
+                with patch.object(Path, "open", record_open):
+                    artifact = self.backup_service.export_debug_bundle_to_file(
+                        packaging="zip", included_paths=[CONFIG_FILE_KEY],
+                        scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                    )
+                try:
+                    for spy in [*spies, counts]:
+                        spy.assert_not_called()
+                    self.assertEqual(len(yaml_reader.call_args_list), 1)
+                    snapshot_path = yaml_reader.call_args_list[0].args[0]
+                    self.assertNotEqual(snapshot_path, self.config_path)
+                    self.assertTrue(snapshot_path in opened)
+                    self.assertFalse(excluded.intersection(opened))
+                    self._assert_config_only_debug_archive(artifact, scrub=scrub)
+                finally:
+                    artifact.cleanup()
+
+    def test_debug_readme_only_skips_yaml_materialization(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            self.backup_service.app_settings = get_settings()
+        originals = {
+            path: path.read_bytes()
+            for path in (self.config_path, self.runtime_overrides_path, self.profile_path)
+        }
+        try:
+            for path in originals:
+                path.write_bytes(b"not: [valid")
+            with self._debug_selection_fixture_unchanged(), patch.object(
+                self.backup_service, "_read_scrubbed_yaml_file", wraps=self.backup_service._read_scrubbed_yaml_file,
+            ) as reader:
+                artifact = self.backup_service.export_debug_bundle_to_file(
+                    packaging="zip", included_paths=[DEBUG_README_KEY],
+                )
+                try:
+                    reader.assert_not_called()
+                    with zipfile.ZipFile(artifact.path) as archive:
+                        self.assertEqual(sorted(archive.namelist()), ["debug/README.txt", "manifest.json"])
+                        self.assertIn(b"debug bundle", archive.read("debug/README.txt"))
+                finally:
+                    artifact.cleanup()
+        finally:
+            for path, content in originals.items():
+                path.write_bytes(content)
+
+    def test_debug_selected_malformed_json_still_rejected(self) -> None:
+        for key, path in (
+            (MAPPING_FILE_KEY, self.mapping_path),
+            (SAS_FABRIC_ALIAS_FILE_KEY, self.temp_dir / "sas_fabric_aliases.json"),
+            (SLOT_DETAIL_FILE_KEY, self.slot_detail_path),
+        ):
+            original = path.read_bytes() if path.exists() else None
+            try:
+                path.write_bytes(b'{"unfinished":')
+                for scrub in (True, False):
+                    with self.subTest(key=key, scrub=scrub), self._debug_selection_fixture_unchanged():
+                        with self.assertRaises(json.JSONDecodeError):
+                            self.backup_service.export_debug_bundle_to_file(
+                                packaging="zip", included_paths=[key],
+                                scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                            )
+            finally:
+                if original is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(original)
+
+    def test_debug_selected_json_is_read_and_archived(self) -> None:
+        for key, path in (
+            (MAPPING_FILE_KEY, self.mapping_path),
+            (SAS_FABRIC_ALIAS_FILE_KEY, self.temp_dir / "sas_fabric_aliases.json"),
+            (SLOT_DETAIL_FILE_KEY, self.slot_detail_path),
+        ):
+            path.write_bytes(b'{"version": 1}')
+            for scrub in (True, False):
+                with self.subTest(key=key, scrub=scrub), self._debug_selection_fixture_unchanged(), patch.object(
+                    self.backup_service, "_read_scrubbed_json_file", wraps=self.backup_service._read_scrubbed_json_file,
+                ) as reader:
+                    artifact = self.backup_service.export_debug_bundle_to_file(
+                        packaging="zip", included_paths=[key],
+                        scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                    )
+                    try:
+                        self.assertEqual(len(reader.call_args_list), 1)
+                        snapshot_path = reader.call_args_list[0].args[0]
+                        self.assertNotEqual(snapshot_path, path)
+                        self.assertEqual(snapshot_path.read_bytes(), path.read_bytes())
+                        member = BACKUP_GROUP_METADATA[key]["archive_root"]
+                        with zipfile.ZipFile(artifact.path) as archive:
+                            self.assertEqual(sorted(archive.namelist()), sorted([member, "manifest.json"]))
+                            self.assertEqual(json.loads(archive.read(member)), {"version": 1})
+                    finally:
+                        artifact.cleanup()
+
+    def test_debug_config_only_failure_cleanup_preserves_sources(self) -> None:
+        cases: tuple[tuple[Any, str, dict[str, Any], str], ...] = (
+            (system_backup_module, "MAX_ARCHIVE_MEMBER_COUNT", {"new": 1}, "too many members"),
+            (system_backup_module, "MAX_STRUCTURED_YAML_MEMBER_BYTES", {"new": 1}, "size limit"),
+            (system_backup_module, "MAX_ARCHIVE_MEMBER_BYTES", {"new": 1}, "expanded byte limit"),
+            (system_backup_module, "MAX_ARCHIVE_EXPANDED_BYTES", {"new": 1}, "expanded byte limit"),
+            (self.backup_service, "_build_archive_to_path", {"side_effect": ValueError("synthetic build failure")}, "synthetic build failure"),
+            (self.backup_service, "_validate_export_archive", {"side_effect": ValueError("synthetic validation failure")}, "synthetic validation failure"),
+        )
+        for target, name, replacement, message in cases:
+            for scrub in (True, False):
+                with self.subTest(boundary=name, scrub=scrub), self._debug_selection_fixture_unchanged():
+                    with patch.object(target, name, **replacement), self.assertRaisesRegex(ValueError, message):
+                        self.backup_service.export_debug_bundle_to_file(
+                            packaging="zip", included_paths=[CONFIG_FILE_KEY],
+                            scrub_secrets=scrub, scrub_disk_identifiers=scrub,
+                        )
+
     def test_debug_export_without_history_does_not_create_history_snapshot(self) -> None:
         with (
             patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False),
@@ -3237,6 +5882,133 @@ sys.stdout.flush()
         finally:
             artifact.cleanup()
 
+    def test_file_import_stages_zip_and_tar_members_as_files(self) -> None:
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            for packaging in ("zip", "tar.gz", "tar.zst"):
+                with self.subTest(packaging=packaging):
+                    artifact = self.backup_service.export_bundle_to_file(
+                        packaging=packaging,
+                        included_paths=[MAPPING_FILE_KEY],
+                    )
+                    cleanup_root = None
+                    try:
+                        _manifest, extracted, _packaging, metadata = (
+                            self.backup_service._read_archive_file(artifact.path)
+                        )
+                        cleanup_root = metadata.get("_cleanup_root")
+                        self.assertTrue(extracted)
+                        self.assertTrue(all(isinstance(value, Path) for value in extracted.values()))
+                    finally:
+                        self.backup_service._cleanup_extracted_archive(cleanup_root)
+                        artifact.cleanup()
+
+    def test_sixteen_mib_file_import_stays_below_eight_mib_python_heap(self) -> None:
+        with sqlite3.connect(self.history_db_path) as connection:
+            connection.execute("CREATE TABLE qa_synthetic_filler (payload BLOB NOT NULL)")
+            connection.execute(
+                "INSERT INTO qa_synthetic_filler(payload) VALUES (randomblob(?))",
+                (16 * 1024 * 1024,),
+            )
+            connection.commit()
+        with patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config_path)}, clear=False):
+            get_settings.cache_clear()
+            artifact = self.backup_service.export_bundle_to_file(
+                packaging="zip",
+                included_paths=[HISTORY_DB_KEY],
+            )
+            try:
+                heap_probe.start()
+                result = self.backup_service.import_bundle_from_file(artifact.path)
+                _, peak_bytes = heap_probe.get_traced_memory()
+                heap_probe.stop()
+            finally:
+                artifact.cleanup()
+
+        self.assertTrue(result["restored_history_database"])
+        self.assertLess(peak_bytes, 8 * 1024 * 1024)
+
+    def test_outer_file_import_workspace_cleanup_failure_is_surfaced(self) -> None:
+        archive_path = self.temp_dir / "synthetic.7z"
+        archive_path.write_bytes(SEVEN_ZIP_SIGNATURE)
+        workspace = self.temp_dir / "outer-import-workspace"
+
+        with (
+            patch("history_service.system_backup.tempfile.mkdtemp", return_value=str(workspace)),
+            patch.object(
+                self.backup_service,
+                "_read_7z_archive",
+                side_effect=ValueError("synthetic parse failure"),
+            ),
+            patch(
+                "history_service.system_backup.shutil.rmtree",
+                side_effect=OSError("synthetic cleanup failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "workspace cleanup failed"),
+        ):
+            self.backup_service._read_archive_file(archive_path)
+
+    def test_file_import_rejection_cleans_file_backed_workspace(self) -> None:
+        workspace = self.temp_dir / "file-import-workspace"
+        unrelated_workspace = Path(
+            tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-")
+        )
+        archive_path = self.temp_dir / "corrupted.zip"
+        archive_path.write_bytes(b"PK-corrupted")
+
+        try:
+            with (
+                patch(
+                    "history_service.system_backup.tempfile.mkdtemp",
+                    return_value=str(workspace),
+                ) as allocate_workspace,
+                self.assertRaisesRegex(ValueError, "ZIP archive"),
+            ):
+                self.backup_service.import_bundle_from_file(archive_path)
+
+            allocate_workspace.assert_called_once_with(
+                prefix="truenas-jbod-ui-file-import-"
+            )
+            self.assertFalse(workspace.exists())
+            self.assertTrue(unrelated_workspace.exists())
+        finally:
+            shutil.rmtree(unrelated_workspace)
+
+    def test_file_backed_aes_decryption_heap_is_flat_from_two_to_thirty_two_mib(self) -> None:
+        peaks: list[int] = []
+        for size_mib in (2, 32):
+            source_path = self.temp_dir / f"aes-source-{size_mib}.bin"
+            encrypted_path = self.temp_dir / f"aes-encrypted-{size_mib}.bin"
+            decrypted_path = self.temp_dir / f"aes-decrypted-{size_mib}.bin"
+            with source_path.open("wb") as output:
+                remaining = size_mib * 1024 * 1024
+                while remaining:
+                    chunk = os.urandom(min(1024 * 1024, remaining))
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            self.backup_service._encrypt_scheduled_archive(
+                source_path,
+                encrypted_path,
+                "synthetic flat allocation passphrase",
+            )
+
+            heap_probe.start()
+            self.backup_service._decrypt_scheduled_archive_to_file(
+                encrypted_path,
+                decrypted_path,
+                "synthetic flat allocation passphrase",
+            )
+            _, peak_bytes = heap_probe.get_traced_memory()
+            heap_probe.stop()
+            peaks.append(peak_bytes)
+            self.assertEqual(
+                self.backup_service._extracted_member_sha256(source_path),
+                self.backup_service._extracted_member_sha256(decrypted_path),
+            )
+
+        self.assertLess(max(peaks), 4 * 1024 * 1024)
+        self.assertLess(abs(peaks[1] - peaks[0]), 1024 * 1024)
+
     def test_file_export_peak_python_memory_is_not_archive_sized(self) -> None:
         large_snapshot = self.temp_dir / "large-history.sqlite3"
         with large_snapshot.open("wb") as output:
@@ -3252,13 +6024,13 @@ sys.stdout.flush()
             ),
         ):
             get_settings.cache_clear()
-            tracemalloc.start()
+            heap_probe.start()
             artifact = self.backup_service.export_bundle_to_file(
                 packaging="zip",
                 included_paths=[HISTORY_DB_KEY],
             )
-            _, peak_bytes = tracemalloc.get_traced_memory()
-            tracemalloc.stop()
+            _, peak_bytes = heap_probe.get_traced_memory()
+            heap_probe.stop()
 
         try:
             self.assertTrue(artifact.path.is_file())
@@ -3424,7 +6196,7 @@ sys.stdout.flush()
                 artifact = self.backup_service.export_bundle(
                     encrypt=True,
                     passphrase="topsecret",
-                    packaging="tar.zst",
+                    packaging="7z",
                 )
 
                 self.assertTrue(artifact.filename.endswith(".7z"))
@@ -3433,7 +6205,7 @@ sys.stdout.flush()
 
                 with self.assertRaisesRegex(ValueError, "Check the passphrase"):
                     self.backup_service.import_bundle(artifact.content, passphrase="wrong-secret")
-                with self.assertRaisesRegex(ValueError, "requires a passphrase"):
+                with self.assertRaisesRegex(ValueError, "Enter its passphrase"):
                     self.backup_service.import_bundle(artifact.content)
 
                 result = self.backup_service.import_bundle(artifact.content, passphrase="topsecret")
@@ -3497,7 +6269,7 @@ sys.stdout.flush()
                 artifact = self.backup_service.export_bundle(
                     encrypt=True,
                     passphrase=padded_passphrase,
-                    packaging="tar.zst",
+                    packaging="7z",
                 )
 
                 with self.assertRaisesRegex(ValueError, "Check the passphrase"):
@@ -3864,17 +6636,23 @@ sys.stdout.flush()
         transaction = _ImportActivationTransaction(
             {"first": b"FIRST", "second": b"SECOND"}
         )
-        real_copyfile = shutil.copyfile
+        real_copy_file_exclusive = transaction._copy_file_exclusive
 
-        def fail_second_copy(source, destination, *args, **kwargs):
+        def fail_second_copy(source, destination, *, owner, mode):
             if Path(destination).name == "second.key":
                 raise OSError("injected staging write failure")
-            return real_copyfile(source, destination, *args, **kwargs)
+            return real_copy_file_exclusive(
+                source,
+                destination,
+                owner=owner,
+                mode=mode,
+            )
 
         with self.assertRaisesRegex(OSError, "injected staging write failure"):
             with transaction:
-                with patch(
-                    "history_service.system_backup.shutil.copyfile",
+                with patch.object(
+                    transaction,
+                    "_copy_file_exclusive",
                     side_effect=fail_second_copy,
                 ):
                     transaction.activate_directory(
@@ -4048,6 +6826,156 @@ sys.stdout.flush()
                 transaction.activate_file(symlinked_parent / "missing.txt", "member")
 
         self.assertEqual(list(real_parent.iterdir()), [])
+
+    def test_missing_file_activation_keeps_descriptor_through_owner_mode_and_fsync(self) -> None:
+        target_path = self.temp_dir / "missing-target.txt"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+        real_fchown = os.fchown
+        real_fchmod = os.fchmod
+        real_fsync = os.fsync
+        events: list[tuple[str, int]] = []
+
+        def record_fchown(descriptor: int, uid: int, gid: int) -> None:
+            events.append(("fchown", descriptor))
+            real_fchown(descriptor, uid, gid)
+
+        def record_fchmod(descriptor: int, mode: int) -> None:
+            events.append(("fchmod", descriptor))
+            real_fchmod(descriptor, mode)
+
+        def record_fsync(descriptor: int) -> None:
+            if [name for name, _event_descriptor in events] == ["fchown", "fchmod"]:
+                events.append(("fsync", descriptor))
+            real_fsync(descriptor)
+
+        with transaction:
+            with (
+                patch("history_service.system_backup.os.fchown", side_effect=record_fchown),
+                patch("history_service.system_backup.os.fchmod", side_effect=record_fchmod),
+                patch("history_service.system_backup.os.fsync", side_effect=record_fsync),
+                patch.object(
+                    transaction,
+                    "_fsync_file",
+                    side_effect=PermissionError("synthetic path access lost after chown"),
+                ),
+            ):
+                transaction.activate_file(target_path, "member")
+            transaction.commit()
+
+        self.assertEqual(target_path.read_bytes(), b"IMPORTED")
+        self.assertEqual(target_path.stat().st_mode & 0o777, 0o660)
+        self.assertEqual([name for name, _descriptor in events], ["fchown", "fchmod", "fsync"])
+        self.assertEqual(len({descriptor for _name, descriptor in events}), 1)
+        self.assertEqual(list(self.temp_dir.glob(".missing-target.txt.restore-*")), [])
+
+    def test_directory_activation_does_not_reopen_owned_member_files(self) -> None:
+        target_dir = self.temp_dir / "missing-directory-target"
+        transaction = _ImportActivationTransaction({"member": b"IMPORTED"})
+
+        with transaction:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction.activate_directory(
+                    target_dir,
+                    [("member", Path("private/key"))],
+                )
+            transaction.commit()
+
+        restored = target_dir / "private/key"
+        self.assertEqual(restored.read_bytes(), b"IMPORTED")
+        self.assertEqual(restored.stat().st_mode & 0o777, 0o660)
+        fsync_file.assert_not_called()
+
+    def test_segmented_hot_staging_keeps_descriptor_through_metadata_and_fsync(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+
+        try:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction._stage_segmented_hot(
+                    staged_path,
+                    source_path=transaction._staged_member("hot"),
+                    target_path=target_path,
+                    entry=entry,
+                )
+
+            self.assertEqual(staged_path.read_bytes(), b"HOT")
+            self.assertEqual(staged_path.stat().st_mode & 0o777, 0o660)
+            fsync_file.assert_not_called()
+        finally:
+            transaction._cleanup_sibling_artifacts()
+            transaction._cleanup_root()
+
+    def test_segmented_hot_staging_does_not_claim_an_exclusive_open_race_loser(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+        real_copy_file_exclusive = transaction._copy_file_exclusive
+
+        def create_contender_before_exclusive_open(source, destination, *, owner, mode):
+            Path(destination).write_bytes(b"UNOWNED-RACER")
+            return real_copy_file_exclusive(
+                source,
+                destination,
+                owner=owner,
+                mode=mode,
+            )
+
+        try:
+            with patch.object(
+                transaction,
+                "_copy_file_exclusive",
+                side_effect=create_contender_before_exclusive_open,
+            ):
+                with self.assertRaises(FileExistsError):
+                    transaction._stage_segmented_hot(
+                        staged_path,
+                        source_path=transaction._staged_member("hot"),
+                        target_path=target_path,
+                        entry=entry,
+                    )
+
+            self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+            self.assertEqual(staged_path.read_bytes(), b"UNOWNED-RACER")
+        finally:
+            transaction._cleanup_root()
+
+    def test_segmented_directory_staging_does_not_reopen_owned_member_files(self) -> None:
+        target_dir = self.temp_dir / "missing-segments"
+        staged_dir = self.temp_dir / ".missing-segments.restore-synthetic"
+        transaction = _ImportActivationTransaction({"segment": b"SEGMENT"})
+        entry = transaction._record_target(target_dir, expected_kind="directory")
+
+        try:
+            with patch.object(
+                transaction,
+                "_fsync_file",
+                side_effect=PermissionError("synthetic path access lost after chown"),
+            ) as fsync_file:
+                transaction._stage_segmented_directory(
+                    staged_dir,
+                    target_dir=target_dir,
+                    entry=entry,
+                    members=[("segment", Path("segment.sqlite3"))],
+                )
+
+            restored = staged_dir / "segment.sqlite3"
+            self.assertEqual(restored.read_bytes(), b"SEGMENT")
+            self.assertEqual(restored.stat().st_mode & 0o777, SEGMENT_FILE_MODE)
+            fsync_file.assert_not_called()
+        finally:
+            transaction._cleanup_sibling_artifacts()
+            transaction._cleanup_root()
 
     def test_history_rollback_uses_store_snapshot_and_clears_sidecars(self) -> None:
         imported_source_dir = self.temp_dir / "imported-history-source"
@@ -4232,7 +7160,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -4241,7 +7172,11 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 2)
+        self.assertEqual(len(fchown.call_args_list), 2)
+        self.assertTrue(
+            all(call.args[1:] == expected_owner for call in fchown.call_args_list)
+        )
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -4250,7 +7185,7 @@ sys.stdout.flush()
             )
         )
 
-    def test_activation_applies_private_modes_to_missing_targets(self) -> None:
+    def test_activation_applies_shared_group_modes_to_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-file.txt"
         directory_target = self.temp_dir / "missing-directory"
         transaction = _ImportActivationTransaction(
@@ -4265,10 +7200,10 @@ sys.stdout.flush()
             )
             transaction.commit()
 
-        self.assertEqual(file_target.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o700)
-        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(file_target.stat().st_mode & 0o777, 0o660)
+        self.assertEqual(directory_target.stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested").stat().st_mode & 0o777, 0o770)
+        self.assertEqual((directory_target / "nested/id_key").stat().st_mode & 0o777, 0o660)
 
     def test_activation_inherits_parent_ownership_for_missing_targets(self) -> None:
         file_target = self.temp_dir / "missing-owner-file.txt"
@@ -4278,7 +7213,10 @@ sys.stdout.flush()
             {"file": b"IMPORTED", "key": b"IMPORTED-KEY"}
         )
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.activate_directory(
@@ -4287,7 +7225,11 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 4)
+        self.assertEqual(len(chown.call_args_list), 2)
+        self.assertEqual(len(fchown.call_args_list), 2)
+        self.assertTrue(
+            all(call.args[1:] == expected_owner for call in fchown.call_args_list)
+        )
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -4302,7 +7244,10 @@ sys.stdout.flush()
         expected_owner = (directory_target.stat().st_uid, directory_target.stat().st_gid)
         transaction = _ImportActivationTransaction({"key": b"IMPORTED-KEY"})
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_directory(
                     directory_target,
@@ -4310,7 +7255,9 @@ sys.stdout.flush()
                 )
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertEqual(len(chown.call_args_list), 2)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -4324,12 +7271,17 @@ sys.stdout.flush()
         expected_owner = (self.temp_dir.stat().st_uid, self.temp_dir.stat().st_gid)
         transaction = _ImportActivationTransaction({"file": b"IMPORTED"})
 
-        with patch("history_service.system_backup.os.chown") as chown:
+        with (
+            patch("history_service.system_backup.os.chown") as chown,
+            patch("history_service.system_backup.os.fchown") as fchown,
+        ):
             with transaction:
                 transaction.activate_file(file_target, "file")
                 transaction.commit()
 
-        self.assertEqual(len(chown.call_args_list), 3)
+        self.assertEqual(len(chown.call_args_list), 2)
+        fchown.assert_called_once()
+        self.assertEqual(fchown.call_args.args[1:], expected_owner)
         self.assertTrue(
             all(
                 call.args[1:] == expected_owner
@@ -4640,27 +7592,53 @@ class SystemSetupServiceTests(unittest.TestCase):
 
         self.assertEqual(saved["systems"][0]["ssh"]["known_hosts_path"], str(temp_dir / "known_hosts"))
 
-    def test_settings_normalizes_legacy_system_known_hosts_path(self) -> None:
+    def test_settings_honours_a_configured_system_known_hosts_path(self) -> None:
+        # #454 owner decision: a per-system value that is not a placeholder is honoured.
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"
         write_yaml(
             config_path,
             {
                 "systems": [
-                    {
-                        "id": "legacy-core",
-                        "ssh": {"known_hosts_path": str(temp_dir / "legacy-request-selected")},
-                    }
+                    {"id": "configured-core", "ssh": {"known_hosts_path": str(temp_dir / "host-trust")}},
+                    {"id": "legacy-core", "ssh": {"known_hosts_path": "/app/data/known_hosts"}},
                 ]
             },
         )
 
         with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config_path)}, clear=False):
+            os.environ.pop("SSH_KNOWN_HOSTS_PATH", None)
             get_settings.cache_clear()
             settings = get_settings()
             get_settings.cache_clear()
 
-        self.assertEqual(settings.systems[0].ssh.known_hosts_path, str(temp_dir / "known_hosts"))
+        self.assertEqual(settings.systems[0].ssh.known_hosts_path, str(temp_dir / "host-trust"))
+        self.assertEqual(settings.systems[1].ssh.known_hosts_path, str(temp_dir / "known_hosts"))
+
+    def test_resaving_a_system_keeps_its_configured_known_hosts_path(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(
+            config_path,
+            {"systems": [{"id": "example-core", "ssh": {"known_hosts_path": "/srv/host-trust/known_hosts"}}]},
+        )
+
+        service = SystemSetupService(str(config_path))
+        service.create_system(
+            SystemSetupRequest(
+                system_id="example-core",
+                label="Example CORE",
+                platform="core",
+                truenas_host="https://core.example.test",
+                ssh_enabled=True,
+                ssh_user="jbodmap",
+                ssh_known_hosts_path=str(temp_dir / "request-selected-known-hosts"),
+                replace_existing=True,
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["systems"][0]["ssh"]["known_hosts_path"], "/srv/host-trust/known_hosts")
 
     def test_create_system_can_persist_password_only_ssh_without_key_path(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -4961,7 +7939,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
@@ -5010,7 +7988,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(config_path.read_bytes(), original_bytes)
@@ -5123,7 +8101,7 @@ class SystemSetupServiceTests(unittest.TestCase):
                     **update,
                 }
 
-                with self.assertRaisesRegex(ValueError, "saved connection settings"):
+                with self.assertRaisesRegex(ValueError, "cannot be reused"):
                     SystemSetupService(str(config_path)).save_system(SystemSetupRequest(**request_values))
 
                 self.assertEqual(yaml.safe_load(config_path.read_text(encoding="utf-8")), original)
@@ -5489,3 +8467,128 @@ class SSHKeyManagerTests(unittest.TestCase):
         self.assertTrue(Path(generated["public_path"]).exists())
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["fingerprint"], generated["fingerprint"])
+
+
+class PreadViewTests(unittest.TestCase):
+    def test_bounded_positional_slices(self) -> None:
+        with tempfile.TemporaryFile() as handle:
+            handle.write(b"a" * 1024)
+            handle.flush()
+            view = system_backup_module._PreadView(handle.fileno())
+            self.assertEqual(len(view), 1024)
+            self.assertEqual(view[10:14], b"aaaa")
+            self.assertEqual(view[2000:], b"")
+            with patch.object(system_backup_module, "MAX_ARCHIVE_METADATA_BYTES", 16):
+                with self.assertRaises(ValueError):
+                    view[0:17]
+
+
+class StreamEnvelopeTests(unittest.TestCase):
+    """#397: TJBENC02 chunked AES-256-GCM (STREAM) envelope."""
+
+    def setUp(self) -> None:
+        from history_service.backup_archive import stream_envelope
+
+        self.env = stream_envelope
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.fast = patch.object(stream_envelope, "DEFAULT_SCRYPT", (14, 8, 1))
+        self.fast.start()
+        self.addCleanup(self.fast.stop)
+
+    def seal(self, data: bytes, chunk_log2: int = 16) -> Path:
+        path = self.root / f"sealed-{len(data)}-{chunk_log2}"
+        with path.open("wb") as output:
+            sealer = self.env.StreamSealer(output, "pw", chunk_log2=chunk_log2, scrypt=(14, 8, 1))
+            for offset in range(0, len(data), 7777):
+                sealer.write(data[offset : offset + 7777])
+            sealer.close()
+        return path
+
+    def open(self, path: Path, passphrase: str = "pw", limit: int = 1 << 30) -> bytes:
+        out = self.root / "plain"
+        out.unlink(missing_ok=True)
+        self.env.decrypt_file(path, out, passphrase, max_output_bytes=limit)
+        return out.read_bytes()
+
+    def test_round_trip_at_chunk_boundaries(self) -> None:
+        chunk = 1 << 16
+        for size in (0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk, 3 * chunk + 5):
+            with self.subTest(size=size):
+                data = os.urandom(size)
+                self.assertEqual(self.open(self.seal(data)), data)
+
+    def test_every_tampering_is_refused_and_leaves_no_output(self) -> None:
+        chunk = 1 << 16
+        data = os.urandom(3 * chunk + 100)
+        sealed = self.seal(data).read_bytes()
+        record = chunk + 16
+        header = 48
+        cases = {
+            "wrong passphrase": (sealed, "nope"),
+            "header byte": (sealed[:30] + bytes([sealed[30] ^ 1]) + sealed[31:], "pw"),
+            "body byte": (sealed[:header + 5] + bytes([sealed[header + 5] ^ 1]) + sealed[header + 6:], "pw"),
+            "drop last record": (sealed[: header + 3 * record], "pw"),
+            "truncate": (sealed[:-1], "pw"),
+            "append": (sealed + b"x", "pw"),
+            "swap records": (
+                sealed[:header] + sealed[header + record : header + 2 * record]
+                + sealed[header : header + record] + sealed[header + 2 * record :],
+                "pw",
+            ),
+            "empty body": (sealed[:header], "pw"),
+            "newer version": (sealed[:8] + b"\x02" + sealed[9:], "pw"),
+        }
+        for label, (blob, passphrase) in cases.items():
+            with self.subTest(label=label):
+                path = self.root / "tampered"
+                path.write_bytes(blob)
+                with self.assertRaises(self.env.StreamEnvelopeError) as raised:
+                    self.open(path, passphrase)
+                self.assertFalse((self.root / "plain").exists())
+                self.assertNotIn("pw", str(raised.exception).split())
+        path = self.root / "tampered"
+        path.write_bytes(sealed[:8] + b"\x02" + sealed[9:])
+        with self.assertRaisesRegex(self.env.StreamEnvelopeError, "newer version"):
+            self.open(path)
+
+    def test_crafted_header_cannot_demand_huge_kdf_or_chunk(self) -> None:
+        sealed = bytearray(self.seal(b"data").read_bytes())
+        for offset, value in ((9, 30), (10, 64), (11, 9), (12, 30)):
+            with self.subTest(offset=offset):
+                blob = bytearray(sealed)
+                blob[offset] = value
+                path = self.root / "crafted"
+                path.write_bytes(bytes(blob))
+                with self.assertRaisesRegex(self.env.StreamEnvelopeError, "damaged"):
+                    self.open(path)
+
+    def test_output_limit_is_checked_before_key_derivation(self) -> None:
+        path = self.seal(os.urandom(5000))
+        with patch.object(self.env, "_derive_key", side_effect=AssertionError("KDF ran")):
+            with self.assertRaisesRegex(self.env.StreamEnvelopeError, "larger than"):
+                self.open(path, limit=4000)
+
+    def test_memory_stays_near_one_chunk(self) -> None:
+        source = self.root / "source"
+        with source.open("wb") as output:
+            for _ in range(24):
+                output.write(os.urandom(1 << 20))
+        sealed = self.root / "sealed"
+        out = self.root / "plain"
+        heap_probe.start()
+        try:
+            self.env.encrypt_file(source, sealed, "pw")
+            _, encrypt_peak = heap_probe.get_traced_memory()
+        finally:
+            heap_probe.stop()
+        heap_probe.start()
+        try:
+            self.env.decrypt_file(sealed, out, "pw", max_output_bytes=1 << 30)
+            _, decrypt_peak = heap_probe.get_traced_memory()
+        finally:
+            heap_probe.stop()
+        self.assertLess(encrypt_peak, 8 << 20)
+        self.assertLess(decrypt_peak, 8 << 20)
+        self.assertEqual(out.stat().st_size, source.stat().st_size)

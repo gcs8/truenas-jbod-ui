@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import http.client
+import os
+import shutil
+import stat
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +21,7 @@ from admin_service.services.runtime_control import (
     CONTAINER_CONTROL_RESPONSE_GRACE_SECONDS,
     DockerRuntimeError,
     DockerRuntimeService,
+    RuntimeBusyError,
 )
 from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
 
@@ -92,12 +99,298 @@ def build_service(runtime: FakeRuntimeService, backup: FakeBackupService) -> Adm
     return AdminMaintenanceService(backup, runtime, clean_backup_targets=("ui", "history"))
 
 
+def quiesced_import(
+    service: AdminMaintenanceService,
+    content: bytes,
+    *,
+    stop_services: bool = False,
+    restart_services: bool = True,
+) -> tuple[Any, Any]:
+    """Run the fake import inside the real quiesce/restart harness."""
+    return service._run_with_quiesced_services(
+        lambda _stopped: service.backup_service.import_bundle(content),
+        stop_services=stop_services,
+        restart_services=restart_services,
+    )
+
+
 class MaintenanceQuiesceTests(unittest.TestCase):
+    def test_empty_target_list_still_serializes_maintenance(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        backup = FakeBackupService()
+
+        def blocking_export(**_kwargs: Any) -> str:
+            entered.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the first export")
+            return "artifact"
+
+        backup.export_bundle_to_file = blocking_export  # type: ignore[method-assign]
+        service = AdminMaintenanceService(
+            backup,
+            FakeRuntimeService([]),
+            clean_backup_targets=(),
+        )
+
+        def first_export() -> None:
+            try:
+                service.export_bundle(SystemBackupExportRequest())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=first_export)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+        try:
+            with self.assertRaises(RuntimeBusyError):
+                service.export_bundle(SystemBackupExportRequest())
+        finally:
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_archive_snapshot_closes_descriptor_when_workspace_creation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            descriptors: list[int] = []
+            real_open = os.open
+
+            def capture_open(path: Path, flags: int) -> int:
+                descriptor = real_open(path, flags)
+                descriptors.append(descriptor)
+                return descriptor
+
+            with (
+                patch(
+                    "admin_service.services.maintenance.os.open",
+                    side_effect=capture_open,
+                ),
+                patch(
+                    "admin_service.services.maintenance.tempfile.mkdtemp",
+                    side_effect=OSError("synthetic workspace failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "synthetic workspace failure"):
+                    AdminMaintenanceService._stage_archive_snapshot(archive_path)
+
+            self.assertEqual(len(descriptors), 1)
+            with self.assertRaises(OSError):
+                os.fstat(descriptors[0])
+
+    def test_file_import_activates_the_exact_snapshot_that_preflight_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"inspected-a")
+            observed: dict[str, object] = {}
+            runtime = FakeRuntimeService(["ui", "history"])
+            original_stop = runtime.stop_container
+
+            def stop_container(key: str) -> None:
+                if key == "ui":
+                    preflight_path = observed["preflight_path"]
+                    assert isinstance(preflight_path, Path)
+                    replacement = preflight_path.with_suffix(".replacement")
+                    try:
+                        replacement.write_bytes(b"uninspected-b")
+                        replacement.replace(preflight_path)
+                    except OSError:
+                        observed["replacement_rejected"] = True
+                        replacement.unlink(missing_ok=True)
+                original_stop(key)
+
+            def inspect(path: Path, **_kwargs: object) -> bytes:
+                observed["preflight_path"] = Path(path)
+                content = Path(path).read_bytes()
+                observed["preflight"] = content
+                return content
+
+            runtime.stop_container = stop_container  # type: ignore[method-assign]
+            backup = FakeBackupService()
+            backup.inspect_bundle_file = inspect  # type: ignore[attr-defined]
+            backup.import_bundle_from_file = lambda path, **_kwargs: (  # type: ignore[attr-defined]
+                observed.setdefault("activated", Path(path).read_bytes()) or {"ok": True}
+            )
+
+            build_service(runtime, backup).import_bundle_from_file(
+                archive_path,
+                stop_services=True,
+                restart_services=False,
+            )
+
+            self.assertEqual(observed["preflight"], b"inspected-a")
+            self.assertEqual(observed["activated"], b"inspected-a")
+            self.assertIs(observed.get("replacement_rejected"), True)
+
+    def test_file_import_preflights_before_stopping_services(self) -> None:
+        events: list[str] = []
+        runtime = FakeRuntimeService(["ui", "history"])
+        original_stop = runtime.stop_container
+
+        def stop_container(key: str) -> None:
+            events.append(f"stop:{key}")
+            original_stop(key)
+
+        runtime.stop_container = stop_container  # type: ignore[method-assign]
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: events.append("preflight")  # type: ignore[attr-defined]
+        backup.import_bundle_from_file = lambda *_args, **_kwargs: (  # type: ignore[attr-defined]
+            events.append("import") or {"ok": True}
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            build_service(runtime, backup).import_bundle_from_file(
+                archive_path,
+                stop_services=True,
+            )
+
+        self.assertLess(events.index("preflight"), events.index("stop:ui"))
+        self.assertLess(events.index("stop:history"), events.index("import"))
+
+    def test_file_import_cleanup_makes_the_staged_snapshot_writable_before_removing_it(self) -> None:
+        observed: dict[str, bool] = {}
+        real_rmtree = shutil.rmtree
+
+        def rmtree(path: str | Path, *args: Any, **kwargs: Any) -> None:
+            snapshot = Path(path) / "bundle.archive"
+            observed["writable"] = bool(snapshot.stat().st_mode & stat.S_IWUSR)
+            real_rmtree(path, *args, **kwargs)
+
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+        backup.import_bundle_from_file = lambda *_args, **_kwargs: {"ok": True}  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            with patch("admin_service.services.maintenance.shutil.rmtree", side_effect=rmtree):
+                build_service(FakeRuntimeService(["ui", "history"]), backup).import_bundle_from_file(archive_path)
+
+        self.assertIs(observed.get("writable"), True)
+
+    def test_stop_error_after_effect_recovers_complete_initial_running_state(self) -> None:
+        class EffectThenErrorRuntime(FakeRuntimeService):
+            def stop_container(self, key: str) -> None:
+                super().stop_container(key)
+                if key == "ui":
+                    raise DockerRuntimeError("response lost after stop")
+
+        runtime = EffectThenErrorRuntime(["ui", "history"])
+        backup = FakeBackupService()
+        backup.inspect_bundle_file = lambda *_args, **_kwargs: {"ok": True}  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "synthetic.archive"
+            archive_path.write_bytes(b"synthetic")
+            with self.assertRaises(MaintenanceStopError) as raised:
+                build_service(runtime, backup).import_bundle_from_file(
+                    archive_path,
+                    stop_services=True,
+                )
+
+        self.assertEqual(sorted(runtime.running), ["history", "ui"])
+        self.assertEqual(raised.exception.stopped_containers, ["ui"])
+        self.assertEqual(raised.exception.restarted_containers, ["ui"])
+        self.assertEqual(raised.exception.restart_failures, {})
+
+    def test_start_success_without_observed_running_state_is_not_restart_success(self) -> None:
+        class UnobservedStartRuntime(FakeRuntimeService):
+            def start_container(self, key: str) -> None:
+                self.calls.append(("start", key))
+
+        runtime = UnobservedStartRuntime(["ui", "history"])
+        backup = FakeBackupService()
+
+        _result, outcome = quiesced_import(build_service(runtime, backup),
+            b"bundle",
+            stop_services=True,
+        )
+
+        self.assertEqual(outcome.restarted_containers, [])
+        self.assertEqual(set(outcome.restart_failures), {"ui", "history"})
+
+    def test_start_error_after_effect_is_reconciled_as_observed_restart_success(self) -> None:
+        class EffectThenErrorRuntime(FakeRuntimeService):
+            def start_container(self, key: str) -> None:
+                super().start_container(key)
+                raise DockerRuntimeError("response lost after start")
+
+        runtime = EffectThenErrorRuntime(["ui", "history"])
+        backup = FakeBackupService()
+
+        _result, outcome = quiesced_import(build_service(runtime, backup),
+            b"bundle",
+            stop_services=True,
+        )
+
+        self.assertEqual(outcome.restarted_containers, ["ui", "history"])
+        self.assertEqual(outcome.restart_failures, {})
+        self.assertEqual(sorted(runtime.running), ["history", "ui"])
+
+    def test_stop_error_before_effect_after_observation_failure_reports_no_false_transitions(self) -> None:
+        class AmbiguousRuntime(FakeRuntimeService):
+            def __init__(self) -> None:
+                super().__init__(["ui", "history"])
+                self.observation_calls = 0
+
+            def stop_container(self, key: str) -> None:
+                self.calls.append(("stop", key))
+                raise DockerRuntimeError("stop response unavailable")
+
+            def running_container_keys(self, keys=None) -> list[str]:
+                self.observation_calls += 1
+                if self.observation_calls == 2:
+                    raise DockerRuntimeError("observation unavailable")
+                return super().running_container_keys(keys)
+
+            def start_container(self, key: str) -> None:
+                self.calls.append(("start", key))
+                if key not in self.running:
+                    self.running.append(key)
+
+        runtime = AmbiguousRuntime()
+
+        with self.assertRaises(MaintenanceStopError) as raised:
+            quiesced_import(build_service(runtime, FakeBackupService()),
+                b"bundle",
+                stop_services=True,
+            )
+
+        self.assertEqual(raised.exception.stopped_containers, [])
+        self.assertEqual(raised.exception.restarted_containers, [])
+        self.assertEqual(raised.exception.restart_failures, {})
+        self.assertEqual(raised.exception.final_running_containers, ["ui", "history"])
+        self.assertEqual(runtime.calls, [("stop", "ui")])
+
+    def test_partial_recovery_reports_only_confirmed_restart_and_final_state(self) -> None:
+        runtime = FakeRuntimeService(
+            ["ui", "history"],
+            stop_failures={"history": "stop failed before effect"},
+            start_failures={"ui": "start failed"},
+        )
+
+        with self.assertRaises(MaintenanceStopError) as raised:
+            quiesced_import(build_service(runtime, FakeBackupService()),
+                b"bundle",
+                stop_services=True,
+            )
+
+        self.assertEqual(raised.exception.stopped_containers, ["ui"])
+        self.assertEqual(raised.exception.restarted_containers, [])
+        self.assertEqual(raised.exception.restart_failures, {"ui": "start failed"})
+        self.assertEqual(raised.exception.final_running_containers, ["history"])
+
     def test_happy_path_stops_operates_and_restarts_every_target(self) -> None:
         runtime = FakeRuntimeService(["ui", "history", "admin"])
         backup = FakeBackupService()
 
-        result, outcome = build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+        result, outcome = quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(outcome.stopped_containers, ["ui", "history"])
@@ -111,7 +404,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         backup = FakeBackupService()
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+            quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(backup.import_calls, 0, "import must not run against a partially quiesced stack")
         self.assertIsInstance(raised.exception, DockerRuntimeError)
@@ -146,7 +439,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history"], stop_failures={"history": "boom"})
 
         with self.assertRaises(MaintenanceStopError) as raised:
-            build_service(runtime, FakeBackupService()).import_bundle(
+            quiesced_import(build_service(runtime, FakeBackupService()),
                 b"bundle", stop_services=True, restart_services=False
             )
 
@@ -158,7 +451,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime = FakeRuntimeService(["ui", "history"], start_failures={"ui": "HTTP 500: cannot start"})
         backup = FakeBackupService()
 
-        result, outcome = build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+        result, outcome = quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(outcome.stopped_containers, ["ui", "history"])
@@ -172,7 +465,7 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         backup = FakeBackupService(fail=ValueError("Bundle manifest is invalid."))
 
         with self.assertRaises(MaintenanceOperationError) as raised:
-            build_service(runtime, backup).import_bundle(b"bundle", stop_services=True)
+            quiesced_import(build_service(runtime, backup), b"bundle", stop_services=True)
 
         self.assertEqual(runtime.calls, [("stop", "ui"), ("stop", "history"), ("start", "ui"), ("start", "history")])
         self.assertEqual(runtime.running, ["history"])
@@ -218,6 +511,22 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime_payload = backup.debug_calls[0]["runtime_payload"]
         self.assertEqual(runtime_payload["before_stop"]["running"], ["ui", "history"])
         self.assertEqual(runtime_payload["after_stop"]["running"], [])
+        self.assertEqual(runtime.status_calls, 2)
+
+    def test_debug_export_without_debug_state_skips_runtime_snapshots(self) -> None:
+        runtime = FakeRuntimeService(["ui", "history"])
+        backup = FakeBackupService()
+
+        _, outcome = build_service(runtime, backup).export_debug_bundle(
+            DebugBundleExportRequest(included_paths=["debug_readme"]),
+            stop_services=False,
+        )
+
+        self.assertEqual(outcome.stopped_containers, [])
+        self.assertEqual(runtime.status_calls, 0)
+        self.assertEqual(runtime.calls, [])
+        self.assertIsNone(backup.debug_calls[0]["runtime_payload"])
+        self.assertIsNone(backup.debug_calls[0]["maintenance_payload"])
 
 
 class DockerControlTimeoutTests(unittest.TestCase):

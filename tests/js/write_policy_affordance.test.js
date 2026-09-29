@@ -128,6 +128,8 @@ const POLICY_FUNCTIONS = [
   "applyWritePolicy",
   "clearReadUiAuthorization",
   "handleWriteRejection",
+  "describeWriteRejection",
+  "syncWritePolicyFromSnapshot",
   "writeBlockedByPolicy",
 ];
 
@@ -182,17 +184,19 @@ test("a missing bootstrap policy means writes stay enabled (snapshot artifacts u
   const { fns } = buildHarness(undefined);
   // Spread copies the sandbox-realm object so deepEqual compares values, not prototypes.
   const normalize = (raw) => ({ ...fns.normalizeWritePolicy(raw) });
-  assert.deepEqual(normalize(undefined), { enabled: true, mode: "", reason: "" });
-  assert.deepEqual(normalize(null), { enabled: true, mode: "", reason: "" });
+  assert.deepEqual(normalize(undefined), { enabled: true, mode: "", reason: "", publicOrigin: "" });
+  assert.deepEqual(normalize(null), { enabled: true, mode: "", reason: "", publicOrigin: "" });
   assert.deepEqual(normalize({ enabled: true, mode: "basic", reason: "" }), {
     enabled: true,
     mode: "basic",
     reason: "",
+    publicOrigin: "",
   });
-  assert.deepEqual(normalize({ enabled: false, mode: "network", reason: NETWORK_REASON }), {
+  assert.deepEqual(normalize({ enabled: false, mode: "network", reason: NETWORK_REASON, public_origin: "https://nas.example.test" }), {
     enabled: false,
     mode: "network",
     reason: NETWORK_REASON,
+    publicOrigin: "https://nas.example.test",
   });
 });
 
@@ -257,26 +261,120 @@ test("sign-in restores policy-owned controls without changing independently disa
   assert.equal(independentlyDisabled.getAttribute("aria-describedby"), "led-help");
 });
 
-test("a 401/403 write response applies the server detail as the disabled reason", () => {
+test("a 401 write response applies the server detail as the disabled reason", () => {
   const { fns, state, controls, writePolicyNotice, statuses } = buildHarness({ enabled: true, mode: "basic", reason: "" });
 
-  const denied = new Error("Read UI authentication required.");
+  const denied = new Error("Main UI authentication required.");
   denied.status = 401;
-  denied.detail = "Read UI authentication required.";
+  denied.detail = "Main UI authentication required.";
   assert.equal(fns.handleWriteRejection(denied), true);
 
   assert.equal(state.writePolicy.enabled, false);
   assert.equal(state.writePolicy.mode, "basic");
-  assert.equal(state.writePolicy.reason, "Read UI authentication required.");
+  assert.equal(state.writePolicy.reason, "Main UI authentication required.");
   for (const element of controls) {
     assert.equal(element.disabled, true, `${element.name} must be disabled after a rejected write`);
-    assert.equal(element.title, "Read UI authentication required.");
+    assert.equal(element.title, "Main UI authentication required.");
   }
-  assert.equal(writePolicyNotice.textContent, "Read UI authentication required.");
+  assert.equal(writePolicyNotice.textContent, "Main UI authentication required.");
   assert.equal(writePolicyNotice.classList.contains("hidden"), false);
 
   assert.equal(fns.writeBlockedByPolicy(), true);
-  assert.deepEqual(statuses, [{ message: "Read UI authentication required.", tone: "error" }]);
+  assert.deepEqual(statuses, [{ message: "Main UI authentication required.", tone: "error" }]);
+});
+
+test("describeWriteRejection still recognises the pre-rename Read UI wording", () => {
+  const { fns, state } = buildHarness({
+    enabled: true,
+    mode: "network",
+    reason: "",
+    publicOrigin: "https://nas.example.test",
+  });
+  for (const detail of [
+    "Cross-origin Read UI mutation rejected.",
+    "Cross-origin Main UI mutation rejected.",
+  ]) {
+    assert.equal(
+      fns.describeWriteRejection({ status: 403, detail }),
+      "This server does not allow changes from this address. Open the UI at https://nas.example.test.",
+      detail,
+    );
+  }
+  state.writePolicy.publicOrigin = "";
+  for (const detail of [
+    "Read UI authorization mode is unavailable.",
+    "Main UI authorization mode is unavailable.",
+  ]) {
+    assert.equal(
+      fns.describeWriteRejection({ status: 403, detail }),
+      "This server does not allow changes from this address.",
+      detail,
+    );
+  }
+});
+
+test("a 403 refuses one request in plain words and leaves every write control usable", () => {
+  const { fns, state, controls, writePolicyNotice } = buildHarness({
+    enabled: true,
+    mode: "network",
+    reason: "",
+    publicOrigin: "https://nas.example.test",
+  });
+
+  const rejected = new Error("Cross-origin Main UI mutation rejected.");
+  rejected.status = 403;
+  rejected.detail = "Cross-origin Main UI mutation rejected.";
+  assert.equal(fns.handleWriteRejection(rejected), true);
+
+  assert.equal(rejected.message, "This server does not allow changes from this address. Open the UI at https://nas.example.test.");
+  assert.equal(state.writePolicy.enabled, true);
+  for (const element of controls) {
+    assert.equal(element.disabled, false, `${element.name} must stay usable after a per-request refusal`);
+  }
+  assert.equal(writePolicyNotice.classList.contains("hidden"), true);
+  assert.equal(fns.writeBlockedByPolicy(), false);
+
+  state.writePolicy.publicOrigin = "";
+  const unavailable = new Error("Main UI authorization mode is unavailable.");
+  unavailable.status = 403;
+  unavailable.detail = "Main UI authorization mode is unavailable.";
+  fns.handleWriteRejection(unavailable);
+  assert.equal(unavailable.message, "This server does not allow changes from this address.");
+
+  const other = new Error("Slot 4 is outside configured layout.");
+  other.status = 403;
+  other.detail = "Slot 4 is outside configured layout.";
+  fns.handleWriteRejection(other);
+  assert.equal(other.message, "Slot 4 is outside configured layout.");
+});
+
+test("every inventory refresh re-syncs the write policy from the server", () => {
+  const { fns, state, controls } = buildHarness({ enabled: false, mode: "network", reason: "Stale refusal." });
+  fns.syncWritePolicyControls();
+  assert.equal(controls[0].disabled, true);
+
+  assert.equal(fns.syncWritePolicyFromSnapshot({ slots: [] }), false, "a snapshot without a policy changes nothing");
+  assert.equal(state.writePolicy.enabled, false);
+
+  assert.equal(
+    fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: true, mode: "network", reason: "", public_origin: "https://nas.example.test" } }),
+    true,
+  );
+  assert.equal(state.writePolicy.enabled, true);
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+  for (const element of controls) {
+    assert.equal(element.disabled, false, `${element.name} follows the server policy after a refresh`);
+  }
+
+  state.writeAuthorization = "Basic synthetic";
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: false, mode: "basic", reason: "Sign in first." } });
+  assert.equal(state.writePolicy.enabled, true, "a signed-in Basic-mode page keeps its sign-in");
+  assert.equal(state.writePolicy.mode, "basic");
+
+  state.writeAuthorization = null;
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: false, mode: "basic", reason: "Sign in first." } });
+  assert.equal(state.writePolicy.enabled, false);
+  assert.equal(state.writePolicy.reason, "Sign in first.");
 });
 
 test("other write failures do not change the policy", () => {
@@ -353,6 +451,13 @@ test("Storage Fabric bootstrap and alias markup carry the same write policy", ()
 
 test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", () => {
   const state = {
+    fabric: { system_id: "synthetic-system", selected_enclosure_id: "enc-a" },
+    selectedSystemId: "synthetic-system",
+    selectedEnclosureId: "enc-a",
+    fabricScopeReady: true,
+    loading: false,
+    refreshRequestToken: 0,
+    aliasEditGeneration: 0,
     writePolicy: { enabled: false, mode: "network", reason: NETWORK_REASON },
     error: null,
   };
@@ -360,6 +465,7 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
     "normalizeFabricWritePolicy",
     "fabricWritePolicyAllowsWrites",
     "fabricWritePolicyReason",
+    "fabricScopeIsCurrent",
     "fabricAliasWriteAttributes",
     "fabricWriteBlockedByPolicy",
     "clearFabricAuthorization",
@@ -375,14 +481,34 @@ test("Storage Fabric rejects blocked alias writes and adopts 401/403 details", (
   assert.equal(state.error, NETWORK_REASON);
 
   state.writePolicy = fns.normalizeFabricWritePolicy({ enabled: true, mode: "basic", reason: "" });
-  const denied = new Error("Read UI authentication required.");
+  const denied = new Error("Main UI authentication required.");
   denied.status = 401;
-  denied.detail = "Read UI authentication required.";
+  denied.detail = "Main UI authentication required.";
   assert.equal(fns.handleFabricWriteRejection(denied), true);
   assert.equal(state.writePolicy.enabled, false);
   assert.equal(state.writePolicy.mode, "basic");
-  assert.equal(state.writePolicy.reason, "Read UI authentication required.");
-  assert.equal(state.error, "Read UI authentication required.");
+  assert.equal(state.writePolicy.reason, "Main UI authentication required.");
+  assert.equal(state.error, "Main UI authentication required.");
+
+  state.writePolicy = fns.normalizeFabricWritePolicy({ enabled: true, mode: "network", reason: "" });
+  assert.equal(fns.fabricScopeIsCurrent(), true);
+  assert.equal(fns.fabricAliasWriteAttributes(), "");
+  state.loading = true;
+  assert.equal(fns.fabricScopeIsCurrent(), false);
+  assert.match(fns.fabricAliasWriteAttributes(), /disabled/);
+  state.loading = false;
+  state.selectedEnclosureId = "enc-b";
+  assert.equal(fns.fabricScopeIsCurrent(), false);
+  assert.match(fns.fabricAliasWriteAttributes(), /disabled/);
+  assert.equal(state.writePolicy.enabled, true, "scope admission does not rewrite auth policy");
+  state.selectedEnclosureId = "enc-a";
+  const forbidden = new Error("Synthetic origin refusal.");
+  forbidden.status = 403;
+  forbidden.detail = "Synthetic origin refusal.";
+  assert.equal(fns.handleFabricWriteRejection(forbidden), true);
+  assert.equal(state.writePolicy.enabled, false);
+  assert.equal(state.writePolicy.reason, "Synthetic origin refusal.");
+  assert.equal(state.error, "Synthetic origin refusal.");
 });
 
 test("main UI Basic credentials stay in memory and are sent only on explicit same-origin auth requests", async () => {
@@ -614,7 +740,7 @@ test("a signed-in 403 state reports that writes remain blocked on both live page
     readUiAuthStatus: mainStatus,
   });
   main.renderReadUiAuth();
-  assert.match(mainStatus.textContent, /writes are blocked/i);
+  assert.match(mainStatus.textContent, /changes are blocked/i);
   assert.match(mainStatus.textContent, /Origin is not allowed/);
 
   const fabricStatus = node();
@@ -646,10 +772,14 @@ test("a signed-in 403 state reports that writes remain blocked on both live page
 test("main and Storage Fabric templates expose memory-only sign-in and explicit sign-out controls", () => {
   for (const [template, prefix] of [[TEMPLATE, "read-ui"], [FABRIC_TEMPLATE, "fabric-read-ui"]]) {
     assert.match(template, new RegExp(`id="${prefix}-auth-form"`));
-    assert.match(template, new RegExp(`id="${prefix}-auth-username"[^>]+autocomplete="off"`));
-    assert.match(template, new RegExp(`id="${prefix}-auth-password"[^>]+type="password"[^>]+autocomplete="off"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-username"[^>]+autocomplete="(off|username)"`));
+    assert.match(template, new RegExp(`id="${prefix}-auth-password"[^>]+type="password"[^>]+autocomplete="(off|current-password)"`));
     assert.match(template, new RegExp(`id="${prefix}-auth-sign-out"`));
   }
+  // The main page lets a password manager fill the form; the memory-only
+  // lifecycle below is what keeps credentials out of storage, not autocomplete.
+  assert.match(TEMPLATE, /id="read-ui-auth-username"[^>]+autocomplete="username"/);
+  assert.match(TEMPLATE, /id="read-ui-auth-password"[^>]+autocomplete="current-password"/);
   const credentialLifecycleSource = [
     functionSource(APP_SOURCE, "submitReadUiSignIn"),
     functionSource(APP_SOURCE, "clearReadUiAuthorization"),
@@ -666,4 +796,57 @@ test("every main and Storage Fabric mutation explicitly opts into the in-memory 
     assert.match(functionSource(APP_SOURCE, name), /readUiAuth:\s*true/, `${name} must request the memory-only header`);
   }
   assert.match(functionSource(FABRIC_SOURCE, "saveAliasFromForm"), /readUiAuth:\s*true/);
+});
+
+test("a policy refresh keeps the configured public origin for wrong-origin guidance", async () => {
+  const state = {
+    snapshotMode: false,
+    writePolicy: {
+      enabled: false,
+      mode: "basic",
+      reason: "Sign in to enable mapping, LED, and alias changes.",
+      publicOrigin: "https://nas.example.test",
+    },
+    writeAuthorization: null,
+    writeAuthPending: false,
+    writeAuthRequestToken: 0,
+  };
+  const fns = loadFunctions([...POLICY_FUNCTIONS, "submitReadUiSignIn"], {
+    state,
+    ledButtons: [control("led-identify")],
+    clearMappingButton: control("clear-mapping"),
+    importMappingsButton: control("import-mappings"),
+    enclosureAliasEditButton: control("alias-edit"),
+    enclosureAliasClear: control("alias-clear"),
+    mappingForm: null,
+    enclosureAliasForm: null,
+    writePolicyNotice: { textContent: "", classList: classList(["hidden"]) },
+    readUiAuthPanel: null,
+    readUiAuthUsername: { value: "operator", disabled: false },
+    readUiAuthPassword: { value: "synthetic-passphrase", disabled: false },
+    encodeBasicAuthorization: () => "Basic synthetic",
+    fetchJson: async () => ({ ok: true }),
+    renderAll() {},
+    setStatus() {},
+  });
+  const crossOrigin = { status: 403, detail: "Cross-origin Main UI mutation rejected." };
+
+  await fns.submitReadUiSignIn({ preventDefault() {} });
+
+  assert.equal(state.writePolicy.enabled, true);
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+  assert.equal(
+    fns.describeWriteRejection(crossOrigin),
+    "This server does not allow changes from this address. Open the UI at https://nas.example.test.",
+  );
+
+  // A later refresh whose payload omits the origin must not erase it either.
+  fns.syncWritePolicyFromSnapshot({ write_policy: { enabled: true, mode: "basic", reason: "" } });
+  assert.equal(state.writePolicy.publicOrigin, "https://nas.example.test");
+
+  // A server that reports a different origin still wins.
+  fns.syncWritePolicyFromSnapshot({
+    write_policy: { enabled: true, mode: "basic", reason: "", public_origin: "https://jbod.example.test" },
+  });
+  assert.equal(state.writePolicy.publicOrigin, "https://jbod.example.test");
 });

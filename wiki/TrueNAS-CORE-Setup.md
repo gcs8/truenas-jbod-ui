@@ -31,6 +31,10 @@ systems:
 Supply the API key through the setup UI or the documented secret setting. Open
 the main UI and confirm that disks and pools load before adding SSH.
 
+Leave `api_dialect` at its `ddp` default on CORE. CORE serves only the legacy
+`/websocket` middleware endpoint, so the JSON-RPC 2.0 dialect described in
+[[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] does not apply here.
+
 This first connection does not verify the appliance certificate. After the UI
 works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
 verification with the system trust store or a private CA bundle.

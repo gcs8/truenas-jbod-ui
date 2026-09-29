@@ -1,17 +1,190 @@
 from __future__ import annotations
 
-# Handler globals are populated from admin_service.main by MainModuleAPIRouter.
-# pyright: reportUndefinedVariable=false
-# ruff: noqa: F821
-
-from types import ModuleType
+import asyncio
+import json
+import os
+import secrets
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
-from app.route_compat import MainModuleAPIRouter
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.concurrency import iterate_in_threadpool
+
+from admin_service.config import get_admin_settings
+from admin_service.route_support import (
+    SERVICE_STARTED_AT,
+    TemporaryFileResponse,
+    _format_count,
+    build_admin_state_payload,
+    build_runtime_payload,
+    compute_expires_at,
+    decode_optional_secret_header,
+    enrich_quantastor_nodes_from_ssh,
+    format_history_cleanup_summary,
+    format_history_system_summary,
+    get_backup_receipt_store,
+    get_backup_scheduler_client,
+    get_backup_service,
+    get_esxi_host_prep_service,
+    get_history_store,
+    get_maintenance_service,
+    get_runtime_service,
+    limited_request_content_length,
+    logger,
+    merge_quantastor_node_hosts,
+    observe_backup_route,
+    project_runtime_observation,
+    quantastor_node_discovery_seed_hosts,
+    quantastor_request_node_host_map,
+    reload_app_settings,
+    resolve_saved_secondary_secret,
+    run_file_export_worker,
+    serialize_live_enclosures,
+    serialize_profiles,
+    serialize_quantastor_nodes,
+    serialize_systems,
+    stream_limited_request_body_to_file,
+    templates,
+    validate_admin_export_policy,
+)
+from admin_service.services.account_bootstrap import (
+    ServiceAccountBootstrapService,
+    saved_sudo_commands_for_system,
+)
+from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+from admin_service.services.esxi_host_prep import (
+    MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
+)
+from admin_service.services.esxi_host_prep import (
+    STAGING_QUOTA_ERROR,
+    HostPrepStagingQuotaError,
+)
+from admin_service.services.runtime_control import (
+    DockerRuntimeError,
+    RuntimeBusyError,
+    reserve_runtime_targets,
+)
+from admin_service.services.tls_trust import TLSTrustStoreService
+from app import __version__
+from app.config import (
+    TrueNASConfig,
+    known_hosts_path_for_target,
+    restart_only_changes,
+    save_runtime_behavior_overrides,
+)
+from app.models.domain import (
+    DebugBundleExportRequest,
+    DemoSystemRequest,
+    EnclosureProfileRequest,
+    ESXiHostPrepInstallRequest,
+    HistoryAdoptRequest,
+    QuantastorNodeDiscoveryRequest,
+    SSHKeyGenerateRequest,
+    SystemBackupExportRequest,
+    SystemSetupBootstrapRequest,
+    SystemSetupRequest,
+    SystemSetupSudoPreviewRequest,
+    TLSCertificateImportRequest,
+    TLSCertificateInspectRequest,
+    TLSRemoteCertificateTrustRequest,
+)
+from app.services.config_change_journal import record_config_change
+from app.services.credential_authority import (
+    api_credential_authority,
+    credential_authorities_are_approved,
+    same_credential_authority,
+    ssh_credential_authorities,
+)
+from app.services.demo_system_factory import DemoSystemFactory
+from app.services.inventory_registry import InventoryRegistry
+from app.services.parsers import normalize_text
+from app.services.profile_builder import ProfileBuilderService
+from app.services.quantastor_api import QuantastorRESTClient
+from app.services.ssh_key_manager import SSHKeyManager
+from app.services.system_setup import _CONFIG_WRITE_LOCK, SystemSetupService
 
 
-def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIRouter:
-    router = MainModuleAPIRouter(main_module, globals())
+# History-summary scans allowed to hold worker threads at once, so a slow scan
+# never takes the whole default executor from the rest of the admin API.
+HISTORY_SCAN_CONCURRENCY = 2
+
+
+class HistorySummaryScans:
+    """One shared history-summary scan per history generation.
+
+    On production-sized history a scan takes minutes and cannot be cancelled
+    once it is in a worker thread, so every page load starting its own scan
+    filled the default executor and stalled unrelated admin requests. Callers
+    join the scan in flight; a history change bumps the generation so later
+    callers never join a scan that may predate it. Results are not kept after a
+    scan finishes, so purge proofs are always taken from a scan that started
+    after the last change.
+    """
+
+    def __init__(self, concurrency: int = HISTORY_SCAN_CONCURRENCY) -> None:
+        self.concurrency = concurrency
+        self.generation = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._inflight: tuple[int, asyncio.Task[list[dict[str, Any]]]] | None = None
+        self._limit: asyncio.Semaphore | None = None
+
+    def history_changed(self) -> None:
+        self.generation += 1
+
+    async def scan(self) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._loop, self._inflight = loop, None
+            self._limit = asyncio.Semaphore(self.concurrency)
+        inflight = self._inflight
+        if inflight is None or inflight[0] != self.generation or inflight[1].done():
+            history_store = get_history_store()
+            limit = self._limit
+
+            async def run_scan() -> list[dict[str, Any]]:
+                async with limit:
+                    return await asyncio.to_thread(history_store.list_history_system_summaries)
+
+            entry = (self.generation, loop.create_task(run_scan()))
+            self._inflight = inflight = entry
+
+            def clear(done: asyncio.Task[Any]) -> None:
+                if self._inflight is entry:
+                    self._inflight = None
+                if not done.cancelled():
+                    done.exception()  # retrieved so a failure with no waiter is not logged as unhandled
+
+            entry[1].add_done_callback(clear)
+        # A waiter that goes away must not cancel the scan other callers share.
+        return list(await asyncio.shield(inflight[1]))
+
+
+def build_router(admin_settings: Any) -> APIRouter:
+    router = APIRouter()
+    # Bounded, short-lived, one-use proof of the exact preview shown to the operator.
+    purge_previews: dict[str, tuple[float, list[str], list[dict[str, Any]]]] = {}
+    summary_scans = HistorySummaryScans()
+    history_changed = summary_scans.history_changed
+    scan_history_summaries = summary_scans.scan
+
+    def without_system_ids(
+        summaries: list[dict[str, Any]], system_ids: list[str] | tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        excluded = {system_id.strip() for system_id in system_ids if system_id and system_id.strip()}
+        return [summary for summary in summaries if summary.get("system_id") not in excluded]
 
     async def container_action_response(
         container_key: str,
@@ -22,8 +195,14 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         if container_key == "admin":
             raise HTTPException(status_code=400, detail=admin_detail)
         runtime_service = get_runtime_service()
+        def control() -> None:
+            with reserve_runtime_targets((container_key,)):
+                getattr(runtime_service, f"{action}_container")(container_key)
+
         try:
-            await asyncio.to_thread(getattr(runtime_service, f"{action}_container"), container_key)
+            await run_retained_thread_worker(control)
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except DockerRuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return JSONResponse({"ok": True, "runtime": await build_runtime_payload(runtime_service)})
@@ -40,15 +219,43 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             artifact.cleanup()
             raise
 
-    async def config_mutation_response(content: dict[str, Any]) -> JSONResponse:
+    async def config_mutation_response(
+        content: dict[str, Any],
+        *,
+        before: Any,
+        after: Any,
+        lead: str,
+    ) -> JSONResponse:
+        """Answer a config save, saying whether the main UI applies it on its next request.
+
+        The main UI checks config.yaml, runtime-overrides.yaml and profiles.yaml
+        before its next non-static request (#432). Only a change to a setting in
+        ``RESTART_ONLY_SETTINGS`` still needs a new main UI process; then the
+        answer carries ``restart_required: ["ui"]`` and the admin page shows
+        the Restart main UI now button.
+        """
         runtime_service = get_runtime_service()
-        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
-        content["restart_required"] = ["ui"]
+        restart_keys = restart_only_changes(before, after)
+        if restart_keys:
+            await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
+            content["restart_required"] = ["ui"]
+            content["restart_settings"] = restart_keys
+            content["detail"] = f"{lead} The main UI needs a restart to apply this."
+        else:
+            content["restart_required"] = []
+            content["detail"] = (
+                f"{lead} The main UI applies it when it next handles a page or API request; "
+                "no restart needed."
+            )
         content["runtime"] = await build_runtime_payload(runtime_service)
         return JSONResponse(content)
 
-    async def run_retained_thread_worker(function: Any, *args: Any) -> Any:
-        operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def run_retained_thread_worker(
+        function: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         try:
             await asyncio.wait((operation,))
         except asyncio.CancelledError as cancellation:
@@ -61,6 +268,17 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 operation.exception()
             raise cancellation
         return operation.result()
+
+    def expected_backup_encryption_mode(request: Request) -> str:
+        mode = request.headers.get("X-Backup-Expected-Encryption", "")
+        if mode not in {"encrypted", "plaintext"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "X-Backup-Expected-Encryption must be exactly encrypted or plaintext."
+                ),
+            )
+        return mode
 
     @router.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
@@ -95,16 +313,13 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await asyncio.to_thread(record_config_change, "runtime_overrides.save", ",".join(sorted(values or {})))
 
-        runtime_service = get_runtime_service()
-        await asyncio.to_thread(runtime_service.mark_restart_required, ("ui",))
-        return JSONResponse(
-            {
-                "ok": True,
-                "runtime_behavior": runtime_behavior,
-                "runtime": await build_runtime_payload(runtime_service),
-                "detail": "Runtime behavior overrides saved. Restart the Read UI container to apply them.",
-            }
+        return await config_mutation_response(
+            {"ok": True, "runtime_behavior": runtime_behavior},
+            before=settings,
+            after=reload_app_settings(),
+            lead="Timing saved.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/stop")
@@ -112,7 +327,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="stop",
-            admin_detail="The admin sidecar cannot stop itself from the UI.",
+            admin_detail="Admin can't stop itself from this page.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/start")
@@ -120,7 +335,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="start",
-            admin_detail="The admin sidecar is already running.",
+            admin_detail="Admin is already running.",
         )
 
     @router.post("/api/admin/runtime/containers/{container_key}/restart")
@@ -128,7 +343,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         return await container_action_response(
             container_key,
             action="restart",
-            admin_detail="The admin sidecar cannot restart itself from the UI.",
+            admin_detail="Admin can't restart itself from this page.",
         )
 
     @router.post("/api/admin/backup/export")
@@ -153,6 +368,8 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 stop_services=stop_services,
                 restart_services=restart_services,
             )
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -170,7 +387,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/debug/export")
     async def export_debug_bundle(
         payload: DebugBundleExportRequest,
-        stop_services: bool = Query(default=True),
+        stop_services: bool = Query(default=False),
         restart_services: bool = Query(default=True),
     ) -> Response:
         try:
@@ -189,6 +406,8 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 stop_services=stop_services,
                 restart_services=restart_services,
             )
+        except RuntimeBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, DockerRuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -206,13 +425,16 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         }
         return export_file_response(artifact, headers)
 
+    async def upload_archive_source(request: Request, body_description: str) -> Path:
+        return await stream_limited_request_body_to_file(request, body_description=body_description)
+
     @router.post("/api/admin/backup/inspect")
     @observe_backup_route("inspect")
     async def inspect_backup(request: Request) -> JSONResponse:
-        archive_path = await stream_limited_request_body_to_file(
-            request,
-            body_description="Backup inspection",
-        )
+        return await inspect_archive(request, upload_archive_source)
+
+    async def inspect_archive(request: Request, archive_source: Any) -> JSONResponse:
+        archive_path = await archive_source(request, "Backup inspection")
         try:
             if archive_path.stat().st_size == 0:
                 raise HTTPException(status_code=400, detail="Backup inspection request body was empty.")
@@ -224,15 +446,41 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             if passphrase is None:
                 passphrase = request.headers.get("X-Backup-Passphrase") or None
-            try:
-                result = await asyncio.to_thread(
-                    get_backup_service().inspect_bundle_file,
+            def inspect_and_issue_receipt() -> tuple[dict[str, Any], dict[str, Any]]:
+                issued: dict[str, Any] = {}
+
+                def issue_for_identity(archive_digest: str, mode: str) -> None:
+                    issued.update(
+                        get_backup_receipt_store().issue_digest(
+                            archive_digest,
+                            observed_encryption_mode=mode,
+                        )
+                    )
+
+                result = get_backup_service().inspect_bundle_file(
                     archive_path,
                     passphrase=passphrase,
+                    identity_callback=issue_for_identity,
+                )
+                if not issued:
+                    raise RuntimeError("Backup inspection identity was not bound.")
+                return result, issued
+
+            try:
+                result, issued = await run_retained_thread_worker(
+                    inspect_and_issue_receipt,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return JSONResponse(result)
+            encryption_mode = "encrypted" if result.get("encrypted") is True else "plaintext"
+            return JSONResponse(
+                {
+                    **result,
+                    "encryption_mode": encryption_mode,
+                    "inspection_receipt": issued["receipt"],
+                    "inspection_receipt_expires_at": issued["expires_at"],
+                }
+            )
         finally:
             archive_path.unlink(missing_ok=True)
             archive_path.parent.rmdir()
@@ -244,59 +492,118 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         stop_services: bool = Query(default=True),
         restart_services: bool = Query(default=True),
     ) -> JSONResponse:
-        archive_path = await stream_limited_request_body_to_file(request)
+        return await import_archive(request, upload_archive_source, stop_services, restart_services)
+
+    async def import_archive(
+        request: Request,
+        archive_source: Any,
+        stop_services: bool,
+        restart_services: bool,
+    ) -> JSONResponse:
+        admission_started_at = int(time.time())
+        expected_mode = expected_backup_encryption_mode(request)
+        receipt = request.headers.get("X-Backup-Inspection-Receipt", "")
+        if not receipt:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Backup-Inspection-Receipt is required before import.",
+            )
+        receipt_store = get_backup_receipt_store()
+        admission: str | None = None
         try:
-            if archive_path.stat().st_size == 0:
-                raise HTTPException(status_code=400, detail="Backup import request body was empty.")
             try:
-                passphrase = decode_optional_secret_header(
-                    request.headers.get("X-Backup-Passphrase-Base64")
+                admission = receipt_store.begin_admission(
+                    receipt,
+                    expected_encryption_mode=expected_mode,
+                    now=admission_started_at,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            if passphrase is None:
-                passphrase = request.headers.get("X-Backup-Passphrase") or None
-            maintenance_service = get_maintenance_service()
+            archive_path = await archive_source(request, "Backup import")
             try:
-                result, maintenance = await asyncio.to_thread(
-                    maintenance_service.import_bundle_from_file,
-                    archive_path,
-                    passphrase=passphrase,
-                    stop_services=stop_services,
-                    restart_services=restart_services,
-                )
-            except (ValueError, DockerRuntimeError) as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if archive_path.stat().st_size == 0:
+                    raise HTTPException(status_code=400, detail="Backup import request body was empty.")
+                try:
+                    passphrase = decode_optional_secret_header(
+                        request.headers.get("X-Backup-Passphrase-Base64")
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if passphrase is None:
+                    passphrase = request.headers.get("X-Backup-Passphrase") or None
+                maintenance_service = get_maintenance_service()
 
-            settings = reload_app_settings()
-            runtime_service = get_runtime_service()
-            impacted = tuple(
-                key for key in admin_settings.clean_backup_targets
-                if key in runtime_service.managed_containers
-            )
-            restarted = tuple(
-                key for key in maintenance.restarted_containers
-                if key in impacted
-            )
-            await asyncio.to_thread(runtime_service.clear_restart_required, restarted)
-            await asyncio.to_thread(
-                runtime_service.mark_restart_required,
-                tuple(key for key in impacted if key not in restarted),
-            )
-            return JSONResponse(
-                {
-                    **result,
-                    "systems": serialize_systems(settings),
-                    "default_system_id": settings.default_system_id,
-                    "stopped_containers": maintenance.stopped_containers,
-                    "restarted_containers": maintenance.restarted_containers,
-                    "restart_failures": dict(maintenance.restart_failures),
-                    "runtime": await build_runtime_payload(runtime_service),
-                }
-            )
+                def admitted_import() -> Any:
+                    def consume_admission(archive_digest: str, observed_mode: str) -> None:
+                        if observed_mode != expected_mode:
+                            raise ValueError(
+                                "Backup inspection receipt encryption mode does not match the import mode."
+                            )
+                        receipt_store.consume_digest(
+                            receipt,
+                            archive_digest,
+                            expected_encryption_mode=expected_mode,
+                            admission=admission,
+                            now=admission_started_at,
+                        )
+
+                    return maintenance_service.import_bundle_from_file(
+                        archive_path,
+                        passphrase=passphrase,
+                        expected_encrypted=expected_mode == "encrypted",
+                        stop_services=stop_services,
+                        restart_services=restart_services,
+                        admission_callback=consume_admission,
+                    )
+
+                try:
+                    result, maintenance = await run_retained_thread_worker(
+                        admitted_import,
+                    )
+                except RuntimeBusyError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except (ValueError, DockerRuntimeError) as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+                history_changed()
+                record_config_change("backup.restore", "system backup import")
+                settings = reload_app_settings()
+                runtime_service = get_runtime_service()
+                impacted = tuple(
+                    key for key in admin_settings.clean_backup_targets
+                    if key in runtime_service.managed_containers
+                )
+                restarted = tuple(
+                    key for key in maintenance.restarted_containers
+                    if key in impacted
+                )
+                await asyncio.to_thread(runtime_service.clear_restart_required, restarted)
+                await asyncio.to_thread(
+                    runtime_service.mark_restart_required,
+                    tuple(key for key in impacted if key not in restarted),
+                )
+                return JSONResponse(
+                    {
+                        **result,
+                        "systems": serialize_systems(settings),
+                        "default_system_id": settings.default_system_id,
+                        "stopped_containers": maintenance.stopped_containers,
+                        "restarted_containers": maintenance.restarted_containers,
+                        "restart_failures": dict(maintenance.restart_failures),
+                        "final_running_containers": getattr(
+                            maintenance,
+                            "final_running_containers",
+                            [],
+                        ),
+                        "runtime": await build_runtime_payload(runtime_service),
+                    }
+                )
+            finally:
+                archive_path.unlink(missing_ok=True)
+                archive_path.parent.rmdir()
         finally:
-            archive_path.unlink(missing_ok=True)
-            archive_path.parent.rmdir()
+            if admission is not None:
+                receipt_store.release_admission(admission)
 
     @router.post("/api/admin/esxi-host-prep/upload")
     async def upload_esxi_host_prep_package(
@@ -388,7 +695,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             result = await asyncio.to_thread(
                 service.install_package,
                 payload,
-                known_hosts_path=settings.ssh.known_hosts_path,
+                known_hosts_path=known_hosts_path_for_target(
+                    settings,
+                    system_id=payload.system_id,
+                    target_host=payload.host,
+                ),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -598,7 +909,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             payload,
             raw_data,
             nodes,
-            known_hosts_path=settings.ssh.known_hosts_path,
+            known_hosts_path=known_hosts_path_for_target(
+                settings,
+                system_id=payload.system_id,
+                target_host=payload.ssh_host,
+            ),
         )
         return JSONResponse({"ok": True, "nodes": nodes, "host_discovery": host_discovery})
 
@@ -622,13 +937,11 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 },
                 "systems": serialize_systems(refreshed_settings),
                 "default_system_id": refreshed_settings.default_system_id,
-                "detail": (
-                    "Config updated. Restart the Read UI container to pick up the revised system."
-                    if updated_existing
-                    else "Config saved. Restart the Read UI container to pick up the new system."
-                ),
                 "updated_existing": updated_existing,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead="Saved.",
         )
 
     @router.post("/api/admin/system-setup/demo")
@@ -664,10 +977,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "default_system_id": refreshed_settings.default_system_id,
                 "updated_existing": bool(result.get("updated_existing")),
                 "updated_profile": bool(result.get("updated_profile")),
-                "detail": (
-                    f"Demo builder system {saved_system.label} saved. Restart the Read UI container to pick the synthetic chassis and views up cleanly."
-                ),
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=f"Demo builder system {saved_system.label} saved.",
         )
 
     @router.delete("/api/admin/system-setup/{system_id}")
@@ -688,7 +1001,10 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         if purge_history:
             history_store = get_history_store()
             try:
-                purge_summary = await asyncio.to_thread(history_store.delete_system_history, system_id)
+                try:
+                    purge_summary = await asyncio.to_thread(history_store.delete_system_history, system_id)
+                finally:
+                    history_changed()
                 if purge_summary["total_rows"]:
                     purge_detail = (
                         f"Purged {_format_count(int(purge_summary['total_rows']), 'saved history row')} "
@@ -715,7 +1031,6 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
         detail = f"Removed {deleted_label}."
         if purge_history:
             detail = f"{detail} {history_purge['detail']}"
-        detail = f"{detail} Restart the Read UI container to drop the deleted system from the live runtime."
         return await config_mutation_response(
             {
                 "ok": True,
@@ -723,18 +1038,38 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "deleted_label": deleted_label,
                 "systems": serialize_systems(refreshed_settings),
                 "default_system_id": next_default_id,
-                "detail": detail,
                 "history_purge": history_purge,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=detail,
         )
 
     @router.post("/api/admin/history/purge-orphaned")
-    async def purge_orphaned_history() -> JSONResponse:
-        settings = reload_app_settings()
-        valid_system_ids = [system.id for system in settings.systems]
-        history_store = get_history_store()
+    async def purge_orphaned_history(payload: dict[str, Any]) -> JSONResponse:
+        token = payload.get("preview_token")
+        proof = purge_previews.pop(token, None) if isinstance(token, str) else None
+        if payload.get("confirm_irreversible") is not True or proof is None or proof[0] < time.monotonic():
+            raise HTTPException(status_code=409, detail="Preview orphaned history again and confirm irreversible deletion.")
+
+        def purge_confirmed() -> tuple[dict[str, Any], list[str]]:
+            # Keep config writers out until the history transaction has committed.
+            with _CONFIG_WRITE_LOCK:
+                settings = reload_app_settings()
+                valid_ids = sorted(system.id for system in settings.systems)
+                if valid_ids != proof[1]:
+                    raise ValueError("Saved systems changed. Preview again before purging.")
+                summary = get_history_store().purge_orphaned_history(valid_ids, expected_summaries=proof[2])
+                return summary, valid_ids
+
         try:
-            summary = await asyncio.to_thread(history_store.purge_orphaned_history, valid_system_ids)
+            try:
+                summary, valid_system_ids = await run_retained_thread_worker(purge_confirmed)
+            finally:
+                # Bump after the write settles, so no scan that could predate it is joined.
+                history_changed()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="Orphaned history or saved systems changed. Preview again before purging.") from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to purge orphaned history")
             raise HTTPException(status_code=500, detail="Unable to purge orphaned history; see admin logs.") from exc
@@ -762,23 +1097,37 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     async def list_orphaned_history() -> JSONResponse:
         settings = reload_app_settings()
         valid_system_ids = [system.id for system in settings.systems]
-        history_store = get_history_store()
         try:
-            orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to inspect orphaned history")
             raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
 
+        now = time.monotonic()
+        for token, proof in list(purge_previews.items()):
+            if proof[0] < now:
+                del purge_previews[token]
+        while len(purge_previews) >= 128:
+            del purge_previews[next(iter(purge_previews))]
+        token = secrets.token_urlsafe(32)
+        purge_previews[token] = (now + 300, sorted(valid_system_ids), orphaned_systems)
         return JSONResponse(
             {
                 "ok": True,
                 "orphaned_systems": orphaned_systems,
                 "valid_system_ids": valid_system_ids,
+                "purge_preview_token": token,
             }
         )
+
+    @router.get("/api/admin/history/systems")
+    async def list_history_systems() -> JSONResponse:
+        try:
+            systems = await scan_history_summaries()
+        except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
+            logger.exception("Unable to inspect saved history")
+            raise HTTPException(status_code=500, detail="Unable to inspect saved history; see admin logs.") from exc
+        return JSONResponse({"ok": True, "systems": systems})
 
     @router.post("/api/admin/history/adopt-removed-system")
     async def adopt_removed_system_history(payload: HistoryAdoptRequest) -> JSONResponse:
@@ -799,10 +1148,7 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
 
         history_store = get_history_store()
         try:
-            orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to inspect orphaned history before adoption")
             raise HTTPException(status_code=500, detail="Unable to inspect orphaned history; see admin logs.") from exc
@@ -818,16 +1164,16 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
             )
 
         try:
-            summary = await asyncio.to_thread(
-                history_store.adopt_system_history,
-                source_system_id,
-                target_system_id,
-                target_system_label=target_system.label,
-            )
-            remaining_orphaned_systems = await asyncio.to_thread(
-                history_store.list_history_system_summaries,
-                valid_system_ids,
-            )
+            try:
+                summary = await asyncio.to_thread(
+                    history_store.adopt_system_history,
+                    source_system_id,
+                    target_system_id,
+                    target_system_label=target_system.label,
+                )
+            finally:
+                history_changed()
+            remaining_orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
@@ -863,7 +1209,14 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
     @router.post("/api/admin/system-setup/bootstrap")
     async def bootstrap_service_account(payload: SystemSetupBootstrapRequest) -> JSONResponse:
         settings = reload_app_settings()
-        bootstrap_service = ServiceAccountBootstrapService(settings.config_file)
+        bootstrap_service = ServiceAccountBootstrapService(
+            settings.config_file,
+            known_hosts_path=known_hosts_path_for_target(
+                settings,
+                system_id=payload.ssh_commands_source_system_id,
+                target_host=payload.host,
+            ),
+        )
         try:
             if not payload.sudo_commands and payload.ssh_commands_source_system_id:
                 # Re-validate so saved commands pass the same request-model sanitizer
@@ -975,13 +1328,15 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "ok": True,
                 "profile": serialized_profile,
                 "profiles": serialized_profiles,
-                "detail": (
-                    "Custom enclosure profile updated. Restart the Read UI container to pick up the revised profile."
-                    if updated_existing
-                    else "Custom enclosure profile saved. Restart the Read UI container to pick up the new profile."
-                ),
                 "updated_existing": updated_existing,
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=(
+                "Custom enclosure profile updated."
+                if updated_existing
+                else "Custom enclosure profile saved."
+            ),
         )
 
     @router.delete("/api/admin/profiles/{profile_id}")
@@ -1000,10 +1355,218 @@ def build_router(main_module: ModuleType, admin_settings: Any) -> MainModuleAPIR
                 "profile_id": profile_id,
                 "deleted_label": deleted_label,
                 "profiles": serialize_profiles(refreshed_settings),
-                "detail": (
-                    f"Deleted custom profile {deleted_label}. Restart the Read UI container when you are ready to drop it from the runtime profile list too."
-                ),
-            }
+            },
+            before=settings,
+            after=refreshed_settings,
+            lead=f"Deleted custom profile {deleted_label}.",
+        )
+
+    # -- backup library (#398/#573): proxied to the backup scheduler sidecar -----------
+
+    _BACKUP_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    _UNAVAILABLE_LIBRARY = {
+        "available": False,
+        "running": None,
+        "classes": {
+            "config": {"enabled": False, "last_run": None, "pending_changes": 0},
+            "full": {"enabled": False, "last_run": None, "next_run_at": None},
+        },
+        "targets": [],
+        "artifacts": [],
+        "storage": {},
+    }
+
+    def backup_id_or_404(artifact_id: str) -> str:
+        import re
+
+        if not re.fullmatch(_BACKUP_ID_PATTERN, artifact_id or ""):
+            raise HTTPException(status_code=404, detail="Backup not found.")
+        return artifact_id
+
+    scheduler_unavailable_detail = "The backup scheduler service is not available."
+
+    async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
+        client = get_backup_scheduler_client()
+        try:
+            response = await asyncio.to_thread(client.request, method, path, body=body, actor="admin")
+        except SchedulerUnavailableError:
+            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
+        payload = response.payload if isinstance(response.payload, dict) else {"detail": "Unexpected answer."}
+        if response.status >= 400:
+            raise HTTPException(status_code=response.status, detail=str(payload.get("detail") or "Backup request failed."))
+        return JSONResponse(payload, status_code=response.status)
+
+    @router.get("/api/admin/backups")
+    async def list_backups() -> JSONResponse:
+        client = get_backup_scheduler_client()
+        try:
+            response = await asyncio.to_thread(client.request, "GET", "/internal/backups")
+        except SchedulerUnavailableError:
+            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": scheduler_unavailable_detail})
+        if response.status >= 400 or not isinstance(response.payload, dict):
+            return JSONResponse({**_UNAVAILABLE_LIBRARY, "detail": "The backup scheduler could not list backups."})
+        return JSONResponse(response.payload)
+
+    @router.post("/api/admin/backups/run")
+    async def run_backup(payload: dict[str, Any]) -> JSONResponse:
+        backup_class = payload.get("backup_class") if isinstance(payload, dict) else None
+        if backup_class not in ("config", "full"):
+            raise HTTPException(status_code=400, detail="backup_class must be config or full.")
+        return await scheduler_call("POST", "/internal/backups/run", {"backup_class": backup_class})
+
+    # Policy and target editor (#573). Secrets stay file-only: the view reports
+    # present/missing per *_file setting and never returns the path itself.
+    @router.get("/api/admin/backups/policy")
+    async def get_backup_policy() -> JSONResponse:
+        from history_service.backup_archive.editor import (
+            PolicyEditError,
+            load_editor_view,
+        )
+
+        settings = reload_app_settings()
+        try:
+            view = await asyncio.to_thread(load_editor_view, settings.config_file, dict(os.environ))
+        except PolicyEditError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(view)
+
+    @router.put("/api/admin/backups/policy")
+    async def save_backup_policy(payload: dict[str, Any]) -> JSONResponse:
+        from history_service.backup_archive.editor import (
+            PolicyEditError,
+            apply_editor_change,
+        )
+
+        settings = reload_app_settings()
+        try:
+            view = await asyncio.to_thread(
+                apply_editor_change,
+                settings.config_file,
+                payload,
+                dict(os.environ),
+                write_lock=_CONFIG_WRITE_LOCK,
+                record_change=record_config_change,
+            )
+        except PolicyEditError as exc:
+            raise HTTPException(
+                status_code=409 if exc.conflict else 400,
+                detail=str(exc),
+            ) from exc
+        return JSONResponse({"ok": True, "restart_required": True, **view})
+
+    @router.get("/api/admin/backups/lifecycle/plan")
+    async def plan_backup_grooming() -> JSONResponse:
+        return await scheduler_call("GET", "/internal/backups/lifecycle/plan")
+
+    @router.post("/api/admin/backups/lifecycle/apply")
+    async def apply_backup_grooming(payload: dict[str, Any]) -> JSONResponse:
+        token = payload.get("plan_token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token or len(token) > 128:
+            raise HTTPException(status_code=400, detail="plan_token is required.")
+        return await scheduler_call("POST", "/internal/backups/lifecycle/apply", {"plan_token": token})
+
+    @router.post("/api/admin/backups/targets/{target_id}/test")
+    async def test_backup_target(target_id: str) -> JSONResponse:
+        return await scheduler_call("POST", f"/internal/backups/targets/{backup_id_or_404(target_id)}/test")
+
+    @router.get("/api/admin/backups/{artifact_id}")
+    async def get_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("GET", f"/internal/backups/{backup_id_or_404(artifact_id)}")
+
+    @router.post("/api/admin/backups/{artifact_id}/verify")
+    async def verify_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("POST", f"/internal/backups/{backup_id_or_404(artifact_id)}/verify")
+
+    @router.post("/api/admin/backups/{artifact_id}/preserve")
+    async def preserve_backup(artifact_id: str, payload: dict[str, Any]) -> JSONResponse:
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if not isinstance(reason, str) or not reason.strip():
+            raise HTTPException(status_code=400, detail="reason is required.")
+        return await scheduler_call(
+            "POST", f"/internal/backups/{backup_id_or_404(artifact_id)}/preserve", {"reason": reason}
+        )
+
+    @router.delete("/api/admin/backups/{artifact_id}/preserve")
+    async def unpreserve_backup(artifact_id: str) -> JSONResponse:
+        return await scheduler_call("DELETE", f"/internal/backups/{backup_id_or_404(artifact_id)}/preserve")
+
+    @router.get("/api/admin/backups/{artifact_id}/download")
+    async def download_backup(artifact_id: str) -> Response:
+        client = get_backup_scheduler_client()
+        try:
+            response, chunks = await asyncio.to_thread(client.stream, backup_id_or_404(artifact_id))
+        except SchedulerUnavailableError:
+            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
+        if chunks is None:
+            detail = response.payload.get("detail") if isinstance(response.payload, dict) else None
+            raise HTTPException(status_code=response.status, detail=str(detail or "Backup could not be read."))
+        headers = {"Content-Disposition": f'attachment; filename="{response.payload["filename"]}"'}
+        if response.payload.get("length"):
+            headers["Content-Length"] = str(response.payload["length"])
+        if response.payload.get("sha256"):
+            headers["X-Backup-Sha256"] = str(response.payload["sha256"])
+        return StreamingResponse(
+            iterate_in_threadpool(chunks), media_type="application/octet-stream", headers=headers
+        )
+
+    def catalog_archive_source(artifact_id: str) -> Any:
+        async def source(_request: Request, body_description: str) -> Path:
+            client = get_backup_scheduler_client()
+            workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-admin-catalog-"))
+            archive_path = workspace / "bundle.archive"
+
+            def fetch() -> Any:
+                descriptor = os.open(
+                    archive_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as handle:
+                    result = client.download_to(artifact_id, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                return result
+
+            try:
+                result = await run_retained_thread_worker(fetch)
+            except SchedulerUnavailableError:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
+            except BaseException:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                raise
+            if result.status != 200:
+                archive_path.unlink(missing_ok=True)
+                workspace.rmdir()
+                detail = result.payload.get("detail") if isinstance(result.payload, dict) else None
+                raise HTTPException(
+                    status_code=result.status if result.status in (404, 409, 502, 503) else 502,
+                    detail=str(detail or f"{body_description} could not read the backup."),
+                )
+            return archive_path
+
+        return source
+
+    @router.post("/api/admin/backups/{artifact_id}/restore/inspect")
+    @observe_backup_route("inspect")
+    async def inspect_catalog_backup(artifact_id: str, request: Request) -> JSONResponse:
+        return await inspect_archive(request, catalog_archive_source(backup_id_or_404(artifact_id)))
+
+    @router.post("/api/admin/backups/{artifact_id}/restore/import")
+    @observe_backup_route("import")
+    async def import_catalog_backup(
+        artifact_id: str,
+        request: Request,
+        stop_services: bool = Query(default=True),
+        restart_services: bool = Query(default=True),
+    ) -> JSONResponse:
+        return await import_archive(
+            request,
+            catalog_archive_source(backup_id_or_404(artifact_id)),
+            stop_services,
+            restart_services,
         )
 
     @router.get("/healthz")

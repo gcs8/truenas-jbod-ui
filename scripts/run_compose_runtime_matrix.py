@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import shutil
 import socket
 import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +21,11 @@ from typing import Callable, NamedTuple, Sequence
 APP_UID = 10001
 APP_GID = 10001
 BACKUP_UID = 1000
+# The default docker-compose.yml runs enclosure-ui as root ("0:0") since #399;
+# the non-root identity lives in docker-compose.nonroot.yml, which this matrix
+# does not apply. Files the UI writes are therefore owned by root.
+UI_WRITER_UID = 0
+UI_WRITER_GID = 0
 BACKUP_GID = 1000
 AUTH_USERNAME = "operator"
 AUTH_PASSWORD = "synthetic-compose-matrix-passphrase"
@@ -31,7 +38,13 @@ MATRIX_CONTAINER_NAMES = {
     "truenas-jbod-history",
     "truenas-jbod-admin",
 }
-SUCCESS_MARKER = "compose_runtime_matrix=ok variants=5 ui_alias_cycles=4 ui_mapping_cycles=4 admin_setup_cycles=1"
+SYNTHETIC_BACKUP_PASSPHRASE = "synthetic-compose-matrix-backup-passphrase"
+SCHEDULER_WAIT_SECONDS = 90
+SUCCESS_MARKER = (
+    "compose_runtime_matrix=ok variants=7 ui_alias_cycles=4 "
+    "ui_mapping_cycles=4 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
+    "scheduler_backup_cycles=1"
+)
 
 
 class Variant(NamedTuple):
@@ -42,6 +55,8 @@ class Variant(NamedTuple):
     history_enabled: bool
     admin_enabled: bool
     admin_initial_setup: bool = False
+    scheduler_enabled: bool = False
+    scheduler_policy_enabled: bool = False
 
 
 class Ports(NamedTuple):
@@ -84,6 +99,25 @@ VARIANTS = (
         True,
         True,
         True,
+    ),
+    Variant(
+        "scheduler-disabled",
+        ("backup-scheduler",),
+        ("enclosure-backup-scheduler",),
+        False,
+        False,
+        False,
+        scheduler_enabled=True,
+    ),
+    Variant(
+        "scheduler-enabled",
+        ("admin", "backup-scheduler"),
+        ("enclosure-admin", "enclosure-backup-scheduler"),
+        False,
+        False,
+        True,
+        scheduler_enabled=True,
+        scheduler_policy_enabled=True,
     ),
 )
 
@@ -182,11 +216,26 @@ def validate_free_disk(free_bytes: int, *, minimum_gib: int) -> int:
     return free_gib
 
 
+def _require_linux_docker_host(meminfo: Path = Path("/proc/meminfo")) -> None:
+    if not meminfo.exists():
+        raise SystemExit(
+            "This tool runs on a Linux Docker host. It reads /proc/meminfo and drives Docker "
+            "directly, neither of which is available here."
+        )
+
+
 def _read_available_memory_kib() -> int:
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
         if line.startswith("MemAvailable:"):
             return int(line.split()[1])
     raise RuntimeError("MemAvailable is missing from /proc/meminfo.")
+
+
+def _child_environment() -> dict[str, str]:
+    # Never inherit Compose interpolation, remote Docker contexts, credentials,
+    # or user config. The owned --env-file is the sole interpolation input.
+    return {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/dev/null",
+            "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
 
 def _run(
@@ -197,6 +246,7 @@ def _run(
     return subprocess.run(
         list(command),
         check=True,
+        env=_child_environment(),
         capture_output=capture_output,
         text=True,
     )
@@ -271,6 +321,7 @@ def validate_exact_image(image: str, source_commit: str) -> None:
         text=True,
         timeout=30,
         check=False,
+        env=_child_environment(),
     )
     if result.returncode != 0:
         raise RuntimeError("Exact matrix image is not present on the local Docker host.")
@@ -291,47 +342,89 @@ def _compose_prefix(root: Path, variant: Variant) -> list[str]:
         str(root),
         "-f",
         str(root / "compose.yaml"),
+        "--env-file",
+        str(root / ".env"),
     ]
     for profile in variant.profiles:
         command.extend(("--profile", profile))
     return command
 
 
-def _write_environment(root: Path, image: str, ports: Ports) -> None:
-    environment = "\n".join(
-        (
-            f"JBOD_UI_IMAGE={image}",
-            f"APP_UID={APP_UID}",
-            f"APP_GID={APP_GID}",
-            f"BACKUP_UID={BACKUP_UID}",
-            f"BACKUP_GID={BACKUP_GID}",
-            f"APP_PORT={ports.ui}",
-            f"HISTORY_PORT={ports.history}",
-            "HISTORY_BIND_ADDRESS=127.0.0.1",
-            f"ADMIN_PORT={ports.admin}",
-            "ADMIN_BIND_ADDRESS=127.0.0.1",
-            "ADMIN_AUTO_STOP_SECONDS=0",
-            "READ_UI_AUTH_MODE=basic",
-            f"READ_UI_AUTH_USERNAME={AUTH_USERNAME}",
-            f"READ_UI_AUTH_PASSWORD={AUTH_PASSWORD}",
-            "ADMIN_AUTH_MODE=basic",
-            f"ADMIN_AUTH_USERNAME={AUTH_USERNAME}",
-            f"ADMIN_AUTH_PASSWORD={AUTH_PASSWORD}",
-            f"APP_PUBLIC_ORIGIN=http://127.0.0.1:{ports.ui}",
-            f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
-            "METRICS_ENABLED=true",
-            "SCHEDULED_BACKUP_ENABLED=false",
-            "",
+def _write_environment(
+    root: Path,
+    image: str,
+    ports: Ports,
+    *,
+    variant: Variant | None = None,
+) -> None:
+    scheduler_policy_enabled = bool(variant and variant.scheduler_policy_enabled)
+    values = [
+        f"JBOD_UI_IMAGE={image}",
+        f"APP_UID={APP_UID}",
+        f"APP_GID={APP_GID}",
+        f"BACKUP_UID={BACKUP_UID}",
+        f"BACKUP_GID={BACKUP_GID}",
+        f"APP_PORT={ports.ui}",
+        "APP_BIND_ADDRESS=127.0.0.1",
+        "RELEASE_CHECK_ENABLED=false",
+        f"HISTORY_PORT={ports.history}",
+        "HISTORY_BIND_ADDRESS=127.0.0.1",
+        f"ADMIN_PORT={ports.admin}",
+        "ADMIN_BIND_ADDRESS=127.0.0.1",
+        "ADMIN_AUTO_STOP_SECONDS=0",
+        "READ_UI_AUTH_MODE=basic",
+        f"READ_UI_AUTH_USERNAME={AUTH_USERNAME}",
+        f"READ_UI_AUTH_PASSWORD={AUTH_PASSWORD}",
+        "ADMIN_AUTH_MODE=basic",
+        f"ADMIN_AUTH_USERNAME={AUTH_USERNAME}",
+        f"ADMIN_AUTH_PASSWORD={AUTH_PASSWORD}",
+        f"APP_PUBLIC_ORIGIN=http://127.0.0.1:{ports.ui}",
+        f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
+        "METRICS_ENABLED=true",
+        "SCHEDULED_BACKUP_ENABLED=false",
+        f"BACKUP_CONFIG_ENABLED={'true' if scheduler_policy_enabled else 'false'}",
+        "BACKUP_FULL_ENABLED=false",
+        # Replace any backups.targets from the config fixture: the matrix must
+        # never ship to, or run retention against, real remote storage.
+        "BACKUP_TARGETS_JSON=[]",
+    ]
+    if scheduler_policy_enabled:
+        values.extend(
+            (
+                "BACKUP_CONFIG_DEBOUNCE_SECONDS=1",
+                "BACKUP_CONFIG_MAX_DELAY_SECONDS=2",
+                "BACKUP_CONFIG_LOCAL_KEEP=1",
+                "BACKUP_ARCHIVE_PASSPHRASE_FILE=/run/backup-secrets/archive-passphrase",
+            )
         )
-    )
+    values.append("")
+    environment = "\n".join(values)
     env_path = root / ".env"
     env_path.write_text(environment, encoding="utf-8", newline="\n")
     env_path.chmod(0o600)
 
 
+# Initial setup starts from a fresh install: no systems and no legacy
+# single-system `truenas:` block. The smoke fixture has a legacy host, and the
+# demo builder refuses to add a demo until that system is saved (#424).
+INITIAL_SETUP_CONFIG = """app:
+  release_check_enabled: false
+  startup_warm_cache_enabled: false
+  startup_warm_smart_enabled: false
+"""
+
+
+def _initial_setup_config(root: Path) -> Path:
+    path = root / ".initial-setup-config.yaml"
+    path.write_text(INITIAL_SETUP_CONFIG, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 def _prepare_variant_root(
     root: Path,
     *,
+    variant: Variant,
     compose_path: Path,
     config_fixture: Path,
     image: str,
@@ -340,7 +433,7 @@ def _prepare_variant_root(
     root.mkdir(mode=0o700)
     shutil.copyfile(compose_path, root / "compose.yaml")
     (root / "compose.yaml").chmod(0o600)
-    _write_environment(root, image, ports)
+    _write_environment(root, image, ports, variant=variant)
     _run(
         (
             "sudo",
@@ -395,16 +488,52 @@ def _prepare_variant_root(
         (
             "sudo",
             "install",
+            "-d",
+            "-m",
+            "2770",
+            "-o",
+            str(BACKUP_UID),
+            "-g",
+            str(APP_GID),
+            str(root / "backup-journal"),
+            str(root / "backup-api"),
+        )
+    )
+    _run(
+        (
+            "sudo",
+            "install",
             "-m",
             "0640",
             "-o",
             str(APP_UID),
             "-g",
             str(APP_GID),
-            str(config_fixture),
+            str(_initial_setup_config(root) if variant.admin_initial_setup else config_fixture),
             str(root / "config" / "config.yaml"),
         )
     )
+    if variant.scheduler_policy_enabled:
+        source = root / ".synthetic-backup-passphrase"
+        source.write_text(SYNTHETIC_BACKUP_PASSPHRASE, encoding="utf-8")
+        source.chmod(0o600)
+        try:
+            _run(
+                (
+                    "sudo",
+                    "install",
+                    "-m",
+                    "0600",
+                    "-o",
+                    str(BACKUP_UID),
+                    "-g",
+                    str(BACKUP_GID),
+                    str(source),
+                    str(root / "config" / "backup-secrets" / "archive-passphrase"),
+                )
+            )
+        finally:
+            source.unlink(missing_ok=True)
 
 
 def _authorization_header() -> str:
@@ -457,6 +586,210 @@ def _require_status(
     return body
 
 
+def _json_object(raw: bytes, label: str) -> dict[str, object]:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} returned unreadable JSON.") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} did not return a JSON object.")
+    return payload
+
+
+def _scheduler_request(
+    prefix: Sequence[str],
+    method: str,
+    path: str,
+) -> dict[str, object]:
+    script = (
+        "import json,sys; "
+        "from admin_service.services.backup_scheduler_client import BackupSchedulerClient; "
+        "response=BackupSchedulerClient().request(sys.argv[1],sys.argv[2]); "
+        "print(json.dumps({'status':response.status,'payload':response.payload},sort_keys=True))"
+    )
+    result = _run(
+        (
+            *prefix,
+            "exec",
+            "-T",
+            "enclosure-backup-scheduler",
+            "python",
+            "-c",
+            script,
+            method,
+            path,
+        ),
+        capture_output=True,
+    )
+    try:
+        response = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError("Backup scheduler socket returned unreadable JSON.") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError("Backup scheduler socket returned an invalid response.")
+    return response
+
+
+def _verify_scheduler_socket(prefix: Sequence[str]) -> None:
+    response = _scheduler_request(prefix, "GET", "/internal/healthz")
+    if response.get("status") != 200 or response.get("payload") != {"status": "ok"}:
+        raise RuntimeError("Backup scheduler Unix-socket health check failed.")
+
+
+def _verify_scheduler_disabled(prefix: Sequence[str]) -> None:
+    _verify_scheduler_socket(prefix)
+    response = _scheduler_request(prefix, "GET", "/internal/backups")
+    library = response.get("payload")
+    if response.get("status") != 200 or not isinstance(library, dict):
+        raise RuntimeError("Disabled backup scheduler library check failed.")
+    classes = library.get("classes")
+    if not isinstance(classes, dict):
+        raise RuntimeError("Disabled backup scheduler class policy is unavailable.")
+    config = classes.get("config")
+    full = classes.get("full")
+    if (
+        not isinstance(config, dict)
+        or config.get("enabled") is not False
+        or not isinstance(full, dict)
+        or full.get("enabled") is not False
+        or library.get("running") is not None
+        or library.get("artifacts") != []
+    ):
+        raise RuntimeError("Disabled backup scheduler did not remain idle with both classes off.")
+
+
+def _restart_scheduler(prefix: Sequence[str]) -> None:
+    _run((*prefix, "restart", "enclosure-backup-scheduler"))
+    _run(
+        (
+            *prefix,
+            "up",
+            "-d",
+            "--no-deps",
+            "--wait",
+            "--wait-timeout",
+            "90",
+            "enclosure-backup-scheduler",
+        )
+    )
+
+
+def _scheduler_admin_library(ports: Ports) -> dict[str, object]:
+    return _json_object(
+        _require_status(
+            f"http://127.0.0.1:{ports.admin}/api/admin/backups",
+            200,
+            authenticated=True,
+        ),
+        "Backup scheduler library",
+    )
+
+
+def _completed_config_artifact(library: dict[str, object]) -> dict[str, object] | None:
+    classes = library.get("classes")
+    if not isinstance(classes, dict):
+        raise RuntimeError("Backup scheduler class policy is unavailable.")
+    config = classes.get("config")
+    full = classes.get("full")
+    if (
+        not isinstance(config, dict)
+        or config.get("enabled") is not True
+        or not isinstance(full, dict)
+        or full.get("enabled") is not False
+    ):
+        raise RuntimeError("Backup scheduler enabled-policy state did not match the matrix contract.")
+    artifacts = library.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise RuntimeError("Backup scheduler artifact list is unavailable.")
+    if library.get("running") is not None:
+        return None
+    last_run = config.get("last_run")
+    if isinstance(last_run, dict) and last_run.get("ok") is False:
+        raise RuntimeError("Backup scheduler config backup failed.")
+    if not artifacts:
+        return None
+    if len(artifacts) != 1 or not isinstance(artifacts[0], dict):
+        raise RuntimeError("Backup scheduler created an unexpected artifact set.")
+    artifact = artifacts[0]
+    if (
+        artifact.get("backup_class") != "config"
+        or artifact.get("location") != "local"
+        or artifact.get("verified") is not True
+        or artifact.get("restorable") is not True
+        or artifact.get("state") != "ok"
+        or not isinstance(artifact.get("size"), int)
+        or int(artifact["size"]) <= 0
+        or not isinstance(artifact.get("id"), str)
+        or not artifact["id"]
+    ):
+        raise RuntimeError("Backup scheduler config artifact failed readback validation.")
+    if not isinstance(last_run, dict) or last_run.get("ok") is not True:
+        raise RuntimeError("Backup scheduler success status is unavailable.")
+    return artifact
+
+
+def _verify_scheduler_enabled(ports: Ports, prefix: Sequence[str]) -> None:
+    _verify_scheduler_socket(prefix)
+    initial = _scheduler_admin_library(ports)
+    classes = initial.get("classes")
+    if (
+        initial.get("available") is not True
+        or initial.get("running") is not None
+        or initial.get("artifacts") != []
+        or not isinstance(classes, dict)
+        or not isinstance(classes.get("config"), dict)
+        or classes["config"].get("enabled") is not True
+        or not isinstance(classes.get("full"), dict)
+        or classes["full"].get("enabled") is not False
+    ):
+        raise RuntimeError("Backup scheduler did not start with the expected enabled policy.")
+
+    base = f"http://127.0.0.1:{ports.admin}"
+    started = _json_object(
+        _require_status(
+            f"{base}/api/admin/backups/run",
+            202,
+            method="POST",
+            payload={"backup_class": "config"},
+            authenticated=True,
+            origin=base,
+        ),
+        "Backup scheduler run request",
+    )
+    if started.get("ok") is not True or started.get("state") != "started":
+        raise RuntimeError("Backup scheduler did not accept the config backup request.")
+
+    deadline = time.monotonic() + SCHEDULER_WAIT_SECONDS
+    artifact: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        artifact = _completed_config_artifact(_scheduler_admin_library(ports))
+        if artifact is not None:
+            break
+        time.sleep(1)
+    if artifact is None:
+        raise RuntimeError("Backup scheduler config backup did not finish before the deadline.")
+
+    artifact_id = str(artifact["id"])
+    verified = _json_object(
+        _require_status(
+            f"{base}/api/admin/backups/{artifact_id}/verify",
+            200,
+            method="POST",
+            authenticated=True,
+            origin=base,
+        ),
+        "Backup scheduler artifact verification",
+    )
+    if verified.get("ok") is not True:
+        raise RuntimeError("Backup scheduler artifact verification failed.")
+
+    _restart_scheduler(prefix)
+    _verify_scheduler_socket(prefix)
+    restored = _completed_config_artifact(_scheduler_admin_library(ports))
+    if restored is None or restored.get("id") != artifact_id:
+        raise RuntimeError("Backup scheduler restart readback did not retain the verified artifact.")
+
+
 def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
     _run((*prefix, "restart", "enclosure-ui"))
     _run(
@@ -472,6 +805,15 @@ def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
         )
     )
     _verify_ui(ports)
+
+
+def _require_ui_written_file(owner_uid: int, owner_gid: int, file_mode: int, kind: str) -> None:
+    expected = (UI_WRITER_UID, UI_WRITER_GID)
+    if (owner_uid, owner_gid) != expected or not stat.S_ISREG(file_mode):
+        raise RuntimeError(
+            f"{kind} persistence ownership failed: owner={owner_uid}:{owner_gid} "
+            f"regular={stat.S_ISREG(file_mode)} expected={expected[0]}:{expected[1]}"
+        )
 
 
 def _verify_pencil_cycle(
@@ -522,8 +864,7 @@ def _verify_pencil_cycle(
     if saved_alias.get("object_id") != object_id or saved_alias.get("label") != save_payload["label"]:
         raise RuntimeError("alias persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(alias_path)
-    if (owner_uid, owner_gid) != (APP_UID, APP_GID) or not stat.S_ISREG(file_mode):
-        raise RuntimeError("alias persistence ownership failed")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "alias")
 
     _restart_ui(prefix, ports)
     aliases = _read_app_owned_json(alias_path).get("sas_fabric_aliases")
@@ -560,15 +901,49 @@ def _verify_mapping_cycle(
 ) -> None:
     base = f"http://127.0.0.1:{ports.ui}"
     same_origin = base
-    export_url = f"{base}/api/mappings/export"
+    inventory = json.loads(
+        _require_status(f"{base}/api/inventory", 200, authenticated=True)
+    )
+    system_id = inventory.get("selected_system_id")
+    enclosure_id = inventory.get("selected_enclosure_id")
+    # The CI smoke fixture points at an unreachable source, so discovery finds no
+    # enclosure and the UI selects none. Mapping then uses the system scope alone,
+    # which the mapping routes accept. A present enclosure ID must still be valid.
+    if (
+        not isinstance(system_id, str)
+        or not system_id
+        or (enclosure_id is not None and (not isinstance(enclosure_id, str) or not enclosure_id))
+    ):
+        raise RuntimeError("physical mapping scope is unavailable")
+    inventory_slots = inventory.get("slots")
+    selected_slot = next(
+        (
+            item
+            for item in inventory_slots
+            if isinstance(item, dict) and item.get("slot") == 0
+        ),
+        None,
+    ) if isinstance(inventory_slots, list) else None
+    save_revision = (
+        selected_slot.get("mapping_revision")
+        if isinstance(selected_slot, dict)
+        else None
+    )
+    if not isinstance(save_revision, str) or len(save_revision) != 64:
+        raise RuntimeError("slot save revision is unavailable")
+    scope = [("system_id", system_id)]
+    if enclosure_id is not None:
+        scope.append(("enclosure_id", enclosure_id))
+    scope_query = urllib.parse.urlencode(scope)
+    export_url = f"{base}/api/mappings/export?{scope_query}"
     initial = json.loads(_require_status(export_url, 200, authenticated=True))
     initial_revision = initial.get("revision")
     if not isinstance(initial_revision, str) or len(initial_revision) != 64:
         raise RuntimeError("initial mapping revision is unavailable")
 
-    save_url = f"{base}/api/slots/0/mapping"
+    save_url = f"{base}/api/slots/0/mapping?{scope_query}"
     payload = {
-        "expected_revision": initial_revision,
+        "expected_revision": save_revision,
         "notes": f"Matrix {variant.name}",
         "clear_identify_after_save": False,
     }
@@ -610,8 +985,7 @@ def _verify_mapping_cycle(
     if saved_mapping.get("slot") != 0 or saved_mapping.get("notes") != payload["notes"]:
         raise RuntimeError("mapping persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(mapping_path)
-    if (owner_uid, owner_gid) != (APP_UID, APP_GID) or not stat.S_ISREG(file_mode):
-        raise RuntimeError("mapping persistence ownership failed")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "mapping")
 
     _restart_ui(prefix, ports)
     mappings = _read_app_owned_json(mapping_path).get("slot_mappings")
@@ -621,7 +995,7 @@ def _verify_mapping_cycle(
     if saved_mapping.get("slot") != 0 or saved_mapping.get("notes") != payload["notes"]:
         raise RuntimeError("mapping restart persistence readback failed")
 
-    clear_url = f"{save_url}?{urllib.parse.urlencode({'expected_revision': clear_revision})}"
+    clear_url = f"{save_url}&{urllib.parse.urlencode({'expected_revision': clear_revision})}"
     response = json.loads(
         _require_status(
             clear_url,
@@ -697,26 +1071,30 @@ def _verify_admin_initial_setup(root: Path, prefix: Sequence[str], ports: Ports)
 
 
 def _safe_diagnostics(prefix: Sequence[str]) -> None:
-    subprocess.run((*prefix, "ps", "--all"), check=False)
+    subprocess.run((*prefix, "ps", "--all"), check=False, env=_child_environment())
     subprocess.run(
         (*prefix, "logs", "--no-color", "--timestamps", "--tail", "200"),
         check=False,
+        env=_child_environment(),
     )
 
 
 def _assert_compose_resources_removed(project: str) -> None:
-    for resource_type, name in (
-        *(("container", name) for name in MATRIX_CONTAINER_NAMES),
-        ("network", f"{project}_default"),
-    ):
-        result = subprocess.run(
-            ["docker", resource_type, "inspect", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 1:
+    commands = [
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+        ["docker", "container", "ls", "--all", "--filter",
+         f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"],
+        *(["docker", kind, "ls", "--filter", f"label=com.docker.compose.project={project}",
+           "--format", "{{.Name}}"] for kind in ("network", "volume")),
+    ]
+    for index, command in enumerate(commands):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                check=False, env=_child_environment())
+        if result.returncode != 0:
+            raise RuntimeError("Compose matrix cleanup readback is unavailable.")
+        names = set(result.stdout.splitlines())
+        remaining = names & MATRIX_CONTAINER_NAMES if index == 0 else names
+        if remaining:
             raise RuntimeError("Compose matrix cleanup readback found a remaining resource.")
 
 
@@ -751,27 +1129,170 @@ def _cleanup_after_run(step: Callable[[], None], description: str) -> bool:
     return True
 
 
-def _remove_runtime_root(runtime_root: Path) -> None:
+def _remove_runtime_root(runtime_root: Path, *, require_empty: bool = False) -> None:
+    if require_empty and runtime_root.exists() and next(runtime_root.iterdir(), None) is not None:
+        raise RuntimeError(f"Compose matrix recovery configuration retained at {runtime_root}")
     cleanup = subprocess.run(
         ("sudo", "rm", "-rf", str(runtime_root)),
         check=False,
+        env=_child_environment(),
     )
     if cleanup.returncode != 0 or runtime_root.exists():
         raise RuntimeError("Compose matrix runtime-root cleanup failed.")
 
 
 def _cleanup_variant(prefix: Sequence[str], root: Path) -> None:
-    compose_cleanup = subprocess.run(
-        (*prefix, "down", "--volumes", "--remove-orphans"),
-        check=False,
-    )
-    scratch_cleanup = subprocess.run(
-        ("sudo", "rm", "-rf", str(root)),
-        check=False,
-    )
-    if compose_cleanup.returncode != 0 or scratch_cleanup.returncode != 0 or root.exists():
-        raise RuntimeError("Compose matrix variant cleanup failed.")
-    _assert_compose_resources_removed(_compose_project_name(prefix))
+    down_error: BaseException | None = None
+    try:
+        result = subprocess.run((*prefix, "down", "--volumes", "--remove-orphans"),
+                                check=False, env=_child_environment())
+        if result.returncode != 0:
+            raise RuntimeError("Compose matrix variant cleanup failed.")
+    except BaseException as error:
+        down_error = error
+    try:
+        _assert_compose_resources_removed(_compose_project_name(prefix))
+    except BaseException:
+        if down_error is not None:
+            raise down_error
+        raise
+    if down_error is not None:
+        raise down_error
+    _remove_runtime_root(root)
+
+
+def _verify_rendered_contract(
+    prefix: Sequence[str], root: Path, image: str, ports: Ports,
+) -> dict[str, object]:
+    model = json.loads(_run((*prefix, "config", "--format", "json"), capture_output=True).stdout)
+    services = model.get("services")
+    if not isinstance(services, dict) or not services:
+        raise RuntimeError("Compose rendered contract has no services.")
+    port_map = {"enclosure-ui": (ports.ui, 8000), "enclosure-history": (ports.history, 8001),
+                "enclosure-admin": (ports.admin, 8002), "enclosure-backup-scheduler": None}
+    bind_paths = {"/app/" + name: root / name for name in (
+        "config", "data", "logs", "history", "backups", "backup-status", "backup-journal", "backup-api")}
+    bind_paths.update({"/run/ssh": root / "config/ssh",
+                       "/run/backup-secrets": root / "config/backup-secrets"})
+    project = _compose_project_name(prefix)
+    for name, service in services.items():
+        if name not in port_map or not isinstance(service, dict) or service.get("image") != image:
+            raise RuntimeError("Compose rendered image/service contract mismatch.")
+        if any(service.get(key) for key in ("build", "privileged", "devices", "volumes_from",
+                                            "network_mode", "pid", "ipc", "env_file", "extends")):
+            raise RuntimeError("Compose rendered isolation contract mismatch.")
+        expected_port = port_map[name]
+        bindings = service.get("ports", [])
+        if expected_port is None:
+            valid_ports = bindings == []
+        else:
+            valid_ports = len(bindings) == 1 and all(
+                isinstance(binding, dict) and binding.get("host_ip") == "127.0.0.1"
+                and str(binding.get("published")) == str(expected_port[0])
+                and binding.get("target") == expected_port[1] and binding.get("protocol", "tcp") == "tcp"
+                for binding in bindings
+            )
+        if not valid_ports:
+            raise RuntimeError("Compose rendered loopback binding contract mismatch.")
+        for mount in service.get("volumes", []):
+            target = mount.get("target")
+            source = mount.get("source")
+            if mount.get("type") == "bind":
+                allowed = bind_paths.get(target)
+                if name == "enclosure-admin" and target == "/var/run/docker.sock":
+                    allowed = Path("/var/run/docker.sock")
+                if allowed is None or source != str(allowed):
+                    raise RuntimeError("Compose rendered isolated mount contract mismatch.")
+                if allowed != Path("/var/run/docker.sock") and Path(source).resolve() != allowed.absolute():
+                    raise RuntimeError("Compose rendered mount contract crosses a symlink.")
+            elif mount.get("type") == "volume":
+                declaration = model.get("volumes", {}).get(source, {})
+                if (name != "enclosure-admin" or target != "/app/host-prep"
+                        or source != "host-prep-staging" or declaration.get("external")
+                        or declaration.get("driver", "local") != "local"
+                        or declaration.get("driver_opts")
+                        or declaration.get("name") != f"{project}_host-prep-staging"):
+                    raise RuntimeError("Compose rendered isolated volume contract mismatch.")
+            else:
+                raise RuntimeError("Compose rendered mount type contract mismatch.")
+        environment = service.get("environment", {})
+        if name in {"enclosure-ui", "enclosure-admin", "enclosure-backup-scheduler"}:
+            if environment.get("BACKUP_TARGETS_JSON") != "[]" or environment.get("BACKUP_FULL_ENABLED") != "false":
+                raise RuntimeError("Compose rendered backup destination contract mismatch.")
+        for key, value in environment.items():
+            if value and key != "METRICS_PATH" and key.endswith(("_DIR", "_PATH", "_FILE")):
+                if not isinstance(value, str) or not value.startswith(("/app/", "/run/backup-secrets/")) or ".." in Path(value).parts:
+                    raise RuntimeError("Compose rendered destination path contract mismatch.")
+        auth_prefixes = ("ADMIN", "READ_UI") if name in {"enclosure-ui", "enclosure-admin"} else ()
+        for auth in auth_prefixes:
+            if any(environment.get(f"{auth}_AUTH_{key}") != value for key, value in (
+                ("MODE", "basic"), ("USERNAME", AUTH_USERNAME), ("PASSWORD", AUTH_PASSWORD),
+            )):
+                raise RuntimeError("Compose rendered authentication contract mismatch.")
+    for network in model.get("networks", {}).values():
+        if network.get("external") or network.get("driver", "bridge") != "bridge" or network.get("driver_opts"):
+            raise RuntimeError("Compose rendered network contract mismatch.")
+    return model
+
+
+def _verify_runtime_contract(
+    prefix: Sequence[str], model: dict[str, object], services: Sequence[str], source_commit: str,
+) -> None:
+    project = _compose_project_name(prefix)
+    ids = _run(["docker", "container", "ls", "--all", "--filter",
+                f"label=com.docker.compose.project={project}", "--format", "{{.ID}}"],
+               capture_output=True).stdout.splitlines()
+    if not ids:
+        raise RuntimeError("Compose runtime container contract is empty.")
+    records = json.loads(_run(["docker", "container", "inspect", *ids], capture_output=True).stdout)
+    observed = set()
+    for record in records:
+        labels = record.get("Config", {}).get("Labels", {}) or {}
+        name = labels.get("com.docker.compose.service")
+        if (name not in services or name in observed or labels.get("com.docker.compose.project") != project
+                or labels.get("org.opencontainers.image.revision") != source_commit
+                or record.get("State", {}).get("Running") is not True):
+            raise RuntimeError("Compose runtime identity/revision contract mismatch.")
+        observed.add(name)
+        expected = model["services"][name]
+        if record.get("Image") != expected["image"]:
+            raise RuntimeError("Compose runtime image contract mismatch.")
+        expected_ports = {
+            f"{port['target']}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port["published"])}]
+            for port in expected.get("ports", [])
+        }
+        for bindings in (record.get("HostConfig", {}).get("PortBindings"), record.get("NetworkSettings", {}).get("Ports")):
+            # Docker includes exposed but unpublished image ports as null.
+            if {key: value for key, value in (bindings or {}).items() if value} != expected_ports:
+                raise RuntimeError("Compose runtime loopback binding contract mismatch.")
+        if record.get("HostConfig", {}).get("NetworkMode") in {"host", "none"}:
+            raise RuntimeError("Compose runtime network contract mismatch.")
+        environment = {}
+        for entry in record.get("Config", {}).get("Env", []):
+            key, separator, value = entry.partition("=")
+            if not separator or key in environment:
+                raise RuntimeError("Compose runtime environment contract is ambiguous.")
+            environment[key] = value
+        if any(environment.get(key) != str(value) for key, value in expected.get("environment", {}).items()):
+            raise RuntimeError("Compose runtime environment contract mismatch.")
+        expected_mounts = {}
+        for mount in expected.get("volumes", []):
+            source = mount["source"]
+            if mount["type"] == "volume":
+                source = model["volumes"][source]["name"]
+            expected_mounts[mount["target"]] = (mount["type"], source, not mount.get("read_only", False))
+        actual_mounts = {}
+        for mount in record.get("Mounts", []):
+            if mount.get("Type") == "tmpfs" and mount.get("Destination") in expected.get("tmpfs", []):
+                continue
+            destination = mount.get("Destination")
+            if destination in actual_mounts:
+                raise RuntimeError("Compose runtime mount contract is ambiguous.")
+            actual_mounts[destination] = (mount.get("Type"), mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source"), mount.get("RW"))
+        if actual_mounts != expected_mounts:
+            raise RuntimeError("Compose runtime isolated mount contract mismatch.")
+    if observed != set(services):
+        raise RuntimeError("Compose runtime service set contract mismatch.")
 
 
 def _run_variant(
@@ -782,17 +1303,22 @@ def _run_variant(
     config_fixture: Path,
     image: str,
     ports: Ports,
+    source_commit: str,
 ) -> None:
     root = runtime_root / variant.name
+    prefix = _compose_prefix(root, variant)
+    # Refuse an existing project before acquiring any teardown authority.
+    _assert_compose_resources_removed(_compose_project_name(prefix))
     _prepare_variant_root(
         root,
+        variant=variant,
         compose_path=compose_path,
         config_fixture=config_fixture,
         image=image,
         ports=ports,
     )
-    prefix = _compose_prefix(root, variant)
     try:
+        model = _verify_rendered_contract(prefix, root, image, ports)
         up = [*prefix, "up", "-d", "--wait", "--wait-timeout", "90"]
         if variant.admin_initial_setup:
             up.append("--no-deps")
@@ -804,6 +1330,7 @@ def _run_variant(
         )
         if running != set(variant.services):
             raise RuntimeError(f"{variant.name} started an unexpected service set")
+        _verify_runtime_contract(prefix, model, variant.services, source_commit)
         if variant.ui_enabled:
             _verify_ui(ports)
             _verify_pencil_cycle(root, variant, ports, prefix)
@@ -814,12 +1341,21 @@ def _run_variant(
             _verify_admin(ports)
         if variant.admin_initial_setup:
             _verify_admin_initial_setup(root, prefix, ports)
+        if variant.scheduler_enabled:
+            if variant.scheduler_policy_enabled:
+                _verify_scheduler_enabled(ports, prefix)
+            else:
+                _verify_scheduler_disabled(prefix)
+        final_services = (*variant.services, "enclosure-ui") if variant.admin_initial_setup else variant.services
+        _verify_runtime_contract(prefix, model, final_services, source_commit)
         print(
             json.dumps(
                 {
                     "admin_initial_setup": variant.admin_initial_setup,
                     "alias_cycle": variant.ui_enabled,
                     "mapping_cycle": variant.ui_enabled,
+                    "scheduler": variant.scheduler_enabled,
+                    "scheduler_backup": variant.scheduler_policy_enabled,
                     "services": list(variant.services),
                     "status": "pass",
                     "variant": variant.name,
@@ -828,7 +1364,7 @@ def _run_variant(
             )
         )
     except BaseException:
-        _safe_diagnostics(prefix)
+        _cleanup_after_run(lambda: _safe_diagnostics(prefix), "compose matrix diagnostics")
         raise
     finally:
         _cleanup_after_run(
@@ -839,6 +1375,7 @@ def _run_variant(
 
 def main() -> int:
     args = parse_args()
+    _require_linux_docker_host()
     if args.ack != "I_APPROVE_DISPOSABLE_COMPOSE_QA":
         raise RuntimeError("Explicit disposable-QA acknowledgement is required.")
     validate_exact_image(args.image, args.source_commit)
@@ -865,10 +1402,11 @@ def main() -> int:
                 config_fixture=config_fixture,
                 image=args.image,
                 ports=ports,
+                source_commit=args.source_commit,
             )
     finally:
         _cleanup_after_run(
-            lambda: _remove_runtime_root(runtime_root),
+            lambda: _remove_runtime_root(runtime_root, require_empty=True),
             "compose matrix runtime-root cleanup",
         )
     print(SUCCESS_MARKER)

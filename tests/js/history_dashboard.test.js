@@ -78,6 +78,7 @@ test("history dashboard JavaScript is an extracted static asset", () => {
 test("dashboard formatters preserve count, byte, duration, and status labels", () => {
   const functions = loadFunctions([
     "formatDuration",
+    "formatTimestamp",
     "formatCount",
     "formatBytes",
     "statusValue",
@@ -87,15 +88,59 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
   ]);
 
   assert.equal(functions.formatDuration(125), "2m 5s");
-  assert.equal(functions.formatCount(null), "deferred");
-  assert.equal(functions.formatCount(12, true), "~12");
+  assert.equal(functions.formatCount(null), "-");
+  assert.equal(functions.formatCount(undefined), "-");
+  assert.equal(functions.formatCount(0), "0");
+  assert.equal(functions.formatTimestamp(null), "never");
+  assert.equal(functions.formatTimestamp("bad"), "not recorded");
+  assert.equal(functions.formatTimestamp("", "not scheduled"), "not scheduled");
+  assert.equal(functions.formatTimestamp("2026-09-09T12:00:00Z"), new Date("2026-09-09T12:00:00Z").toLocaleString());
+  assert.equal(functions.collectionDurationLabel(null), "not recorded");
+  assert.equal(functions.formatCount(12), "12");
   assert.equal(functions.formatBytes(1536), "1.5 KiB");
   assert.equal(functions.statusValue("", "unknown"), "unknown");
-  assert.equal(functions.collectionInventoryLabel(true), "forced");
-  assert.equal(functions.collectionInventoryLabel(false), "cached");
+  assert.equal(functions.collectionInventoryLabel(true), "fresh inventory");
+  assert.equal(functions.collectionInventoryLabel(false), "cached inventory");
   assert.equal(functions.collectionInventoryLabel(null), "not recorded");
   assert.equal(functions.collectionDurationLabel(1.25), "1.3s");
   assert.equal(functions.backoffLabel(1.2), "2s remaining");
+});
+
+test("collector state says Starting during the grace period (#441)", () => {
+  const { collectorStateLabel } = loadFunctions(["collectorStateLabel"]);
+
+  assert.equal(collectorStateLabel({ collector_running: true, collector_starting: true }), "Starting");
+  assert.equal(collectorStateLabel({ collector_running: true, collector_starting: false }), "Running");
+  assert.equal(collectorStateLabel({ collector_running: false }), "Stopped");
+});
+
+test("only the Full button counts down the refresh cooldown (#456)", () => {
+  const source = functionSource("fullRefreshLabel");
+  const context = vm.createContext({ Math, Number, FULL_REFRESH_LABEL: "Full refresh" });
+  vm.runInContext(
+    `${functionSource("formatDuration")}\n${source}\nglobalThis.__tested = { fullRefreshLabel };`,
+    context
+  );
+  const { fullRefreshLabel } = context.__tested;
+
+  assert.equal(fullRefreshLabel(0), "Full refresh");
+  assert.equal(fullRefreshLabel(null), "Full refresh");
+  assert.equal(fullRefreshLabel(125), "Full refresh (in 2m 5s)");
+  assert.match(functionSource("renderFullRefreshCooldown"), /fullButton\.disabled/);
+  assert.doesNotMatch(functionSource("renderFullRefreshCooldown"), /fastButton/);
+  assert.match(TEMPLATE_SOURCE, /data-cooldown-seconds-remaining=/);
+});
+
+test("a failed full refresh keeps the cooldown its admission already started", () => {
+  const { refreshCooldownFromFailure } = loadFunctions(["refreshCooldownFromFailure"]);
+
+  assert.equal(refreshCooldownFromFailure(429, { retry_after_seconds: 42 }), 42);
+  assert.equal(
+    refreshCooldownFromFailure(500, { ok: false, refresh: { full_refresh_cooldown_seconds_remaining: 900 } }),
+    900
+  );
+  assert.equal(refreshCooldownFromFailure(500, { ok: false }), undefined);
+  assert.equal(refreshCooldownFromFailure(502, { detail: "Bad gateway" }), undefined);
 });
 
 test("dashboard reads the script-safe JSON bootstrap block", () => {
@@ -136,58 +181,5 @@ test("dashboard does not repaint the server-rendered overview during bootstrap",
   assert.doesNotMatch(SOURCE, /renderOverview\(initial(?:OverviewPayload|CollectorStatus)\)/);
 });
 
-test("refresh preserves success payload rendering and button state", async () => {
-  const status = { textContent: "" };
-  const buttons = [{ disabled: false }, { disabled: false }];
-  const rendered = [];
-  const requests = [];
-  const payload = { ok: true, detail: "History fast refresh completed.", counts: {} };
-  const { runRefresh } = loadFunctions(["runRefresh"], {
-    status,
-    buttons,
-    encodeURIComponent,
-    async fetch(url, options) {
-      requests.push([url, options]);
-      return { ok: true, status: 200, text: async () => JSON.stringify(payload) };
-    },
-    renderOverview(value) {
-      rendered.push(value);
-    },
-  });
-
-  await runRefresh("fast");
-
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0][0], "/api/history/refresh");
-  assert.equal(requests[0][1].method, "POST");
-  assert.equal(requests[0][1].headers["Content-Type"], "application/json");
-  assert.equal(requests[0][1].body, JSON.stringify({ mode: "fast" }));
-  assert.equal(status.textContent, "History fast refresh completed.");
-  assert.deepEqual(rendered, [payload]);
-  assert.deepEqual(buttons.map((button) => button.disabled), [false, false]);
-});
-
-test("refresh preserves structured HTTP error detail and restores buttons", async () => {
-  const status = { textContent: "" };
-  const buttons = [{ disabled: false }, { disabled: false }];
-  const { runRefresh } = loadFunctions(["runRefresh"], {
-    status,
-    buttons,
-    encodeURIComponent,
-    async fetch() {
-      return {
-        ok: false,
-        status: 409,
-        text: async () => JSON.stringify({ ok: false, detail: "History collection already running." }),
-      };
-    },
-    renderOverview() {
-      assert.fail("failed refreshes must not replace the dashboard overview");
-    },
-  });
-
-  await runRefresh("full");
-
-  assert.equal(status.textContent, "Refresh failed: History collection already running.");
-  assert.deepEqual(buttons.map((button) => button.disabled), [false, false]);
-});
+// Refresh success/refusal and polling lifecycle are exercised through the
+// complete asset in history_dashboard_polling.test.js.

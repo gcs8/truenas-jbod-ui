@@ -24,14 +24,14 @@ On a Quantastor HA deployment, a virtual view can pin an HA node. Use this setti
 
 ## Create saved and virtual views
 
-Open the admin sidecar and select `Add Storage View`. Use this flow to create:
+Open Admin and select `Add Storage View`. Use this flow to create:
 
 - a saved chassis layout for a live enclosure
 - an internal NVMe carrier layout
 - a SATADOM or boot-device group
 - a manual group for fixed internal disks
 
-The admin sidecar saves configuration-backed views and bindings. It does not create or emulate live hardware.
+Admin saves configuration-backed views and bindings. It does not create or emulate live hardware.
 
 For a `ses_enclosure` view, select the profile that should render the saved view. The view keeps its own `profile_id`, so it can remain on a layout such as `Generic Front 24` even when the live enclosure uses a different profile.
 

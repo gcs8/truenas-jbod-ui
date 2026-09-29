@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { chromium } = require("@playwright/test");
+const { normalizeCaptureState } = require("./screenshot_capture_state.js");
 
 const repoRoot = path.resolve(__dirname, "..");
 const artifactPath = path.join(repoRoot, "public-demo", "index.html");
@@ -88,6 +89,7 @@ async function capture(browser, plan, destination) {
     if (unexpected.length) {
       throw new Error(`capture attempted ${unexpected.length} network request(s)`);
     }
+    await normalizeCaptureState(page);
     await page.screenshot({ path: destination, fullPage: true, animations: "disabled" });
   } finally {
     await context.close();

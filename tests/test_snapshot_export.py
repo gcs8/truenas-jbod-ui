@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 from starlette.datastructures import URLPath
@@ -17,9 +19,10 @@ from starlette.requests import Request
 
 import app.services.snapshot_export as snapshot_export
 from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
-from app.main import templates
+from app.route_support import templates
 from app.models.domain import (
     EnclosureOption,
+    EnclosureProfileView,
     InventorySnapshot,
     InventorySummary,
     SnapshotExportRequest,
@@ -31,7 +34,12 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemOption,
 )
-from app.services.history_backend import HistoryBackendClient
+from app.services.history_backend import (
+    HISTORY_BACKEND_FAILURE_DETAIL,
+    HistoryBackendClient,
+    HistoryBackendResponseError,
+    HistoryBackendUnavailableError,
+)
 from app.services.snapshot_export import (
     EXPORT_HISTORY_CACHE,
     EXPORT_RENDER_CACHE,
@@ -40,6 +48,9 @@ from app.services.snapshot_export import (
     SnapshotRedactor,
     collect_configured_hostnames,
 )
+from history_service import main as history_main
+from history_service.store import HistoryStore
+from tests import test_history_bulk_bounds
 from history_service.operation_bounds import (
     MAX_EVENT_ROWS,
     MAX_REQUEST_BYTES,
@@ -691,18 +702,23 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rendered.filename.endswith(".html"))
         self.assertIn("<style>", rendered.html)
         self.assertIn("<script>", rendered.html)
-        self.assertIn("Offline Snapshot", rendered.html)
+        self.assertIn("Offline copy", rendered.html)
+        self.assertIn("This is a saved copy, not live data.", rendered.html)
+        self.assertIn("About this copy", rendered.html)
         self.assertIn("snapshotMode: true", rendered.html)
         self.assertIn("preloadedHistoryBySlot", rendered.html)
         self.assertIn("preloadedSmartSummariesBySlot", rendered.html)
         self.assertIn("33105", rendered.html)
-        self.assertIn("Frozen Offline Artifact", rendered.html)
-        self.assertIn("Artifact app v", rendered.html)
-        self.assertIn("metric samples", rendered.html)
+        self.assertNotIn("Frozen Offline Artifact", rendered.html)
+        self.assertNotIn("Explorable Enclosure Snapshot", rendered.html)
+        self.assertNotIn("Artifact app v", rendered.html)
+        self.assertIn('id="snapshot-app-version">v', rendered.html)
         self.assertIn("SMART summaries", rendered.html)
         self.assertIn("events", rendered.html)
-        self.assertIn("Downsampling None", rendered.html)
-        self.assertIn("None", rendered.export_meta["redaction_label"])
+        self.assertIn("History coverage is unverified", rendered.html)
+        self.assertIn('class="summary-disclosure hidden" id="inventory-evidence-disclosure"', rendered.html)
+        self.assertIn('id="refresh-button" class="button hidden"', rendered.html)
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials shown")
         self.assertEqual(rendered.export_meta["redaction"], "none")
         self.assertEqual(rendered.export_meta["event_count"], 0)
         self.assertNotIn('src="/static/app.js"', rendered.html)
@@ -711,10 +727,163 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("new URLSearchParams(target.search)", rendered.html)
         self.assertIn("buildScopedUrl(url, queryParams)", rendered.html)
         self.assertNotIn("`${url}?${params.toString()}`", rendered.html)
-        self.assertNotIn("/static/images/hyper-m2-gen3-card.png", rendered.html)
-        self.assertIn("data:image/png;base64", rendered.html)
-        self.assertNotIn("Export Snapshot", rendered.html)
+        self.assertNotIn("data:image/", rendered.html)
+        self.assertNotIn("Save offline copy", rendered.html)
         self.assertNotIn('id="sas-fabric-view-link"', rendered.html)
+
+    @staticmethod
+    def _card_photo_data_url(relative_path: str) -> str:
+        encoded = base64.b64encode((snapshot_export.STATIC_DIR / relative_path).read_bytes()).decode("ascii")
+        return f"data:{snapshot_export.OFFLINE_IMAGE_ASSETS[relative_path]};base64,{encoded}"
+
+    @staticmethod
+    def _runtime_with_view(view: StorageViewRuntimeView) -> StorageViewRuntimePayload:
+        runtime = build_storage_view_runtime()
+        return runtime.model_copy(update={"views": [*runtime.views, view]})
+
+    async def test_demo_image_mode_does_not_share_selective_render_work_or_cache(self) -> None:
+        selective = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        demo = SnapshotExportService(
+            Settings(), FakeHistoryBackend(), templates, embed_all_images=True,  # type: ignore[arg-type]
+        )
+        # Exercise the mode against an already populated shared render cache.
+        kwargs: dict[str, Any] = dict(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            selected_slot=None,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        plain = await selective.build_enclosure_snapshot_html(**kwargs)
+        complete = await demo.build_enclosure_snapshot_html(**kwargs)
+        again = await selective.build_enclosure_snapshot_html(**kwargs)
+
+        self.assertNotEqual(plain.cache_key, complete.cache_key)
+        self.assertNotIn("data:image/", plain.html)
+        self.assertIs(again, plain)
+        for path in snapshot_export.OFFLINE_IMAGE_ASSETS:
+            self.assertTrue(self._card_photo_data_url(path) in complete.html, path)
+        self.assertEqual(complete.size_bytes, len(complete.html.encode("utf-8")))
+
+    async def test_export_inlines_only_the_card_photos_its_views_can_draw(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        photos = {path: self._card_photo_data_url(path) for path in snapshot_export.OFFLINE_IMAGE_ASSETS}
+        carrier_profile = EnclosureProfileView(
+            id=snapshot_export.AOC_SLG4_2H8M2_PROFILE_ID,
+            label="AOC-SLG4-2H8M2",
+            face_style="nvme-carrier",
+            rows=1,
+            columns=2,
+        )
+        cases = {
+            "generic M.2 carrier view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="m2-carrier", label="M.2 carrier", kind="nvme_carrier", template_id="nvme-carrier-4")
+                ),
+                {snapshot_export.NVME_CARRIER_CARD_IMAGE},
+            ),
+            "AOC-SLG4-2H8M2 carrier view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="add-in-card", label="Add-in card", kind="nvme_carrier", template_id="aoc-slg4-2h8m2-2")
+                ),
+                {snapshot_export.AOC_SLG4_2H8M2_CARD_IMAGE},
+            ),
+            "SATADOM boot view": (
+                build_snapshot(),
+                self._runtime_with_view(
+                    StorageViewRuntimeView(id="doms", label="Boot DOMs", kind="boot_devices", template_id="satadom-pair-2")
+                ),
+                {snapshot_export.SATADOM_CARD_IMAGE},
+            ),
+            "NVMe-carrier enclosure profile": (
+                build_snapshot().model_copy(update={"selected_profile": carrier_profile}),
+                None,
+                {snapshot_export.AOC_SLG4_2H8M2_CARD_IMAGE},
+            ),
+        }
+        for label, (snapshot, runtime, expected) in cases.items():
+            with self.subTest(case=label):
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=snapshot,
+                    smart_summary_cache=build_smart_summary_cache(),
+                    storage_view_runtime=runtime,
+                    selected_slot=0,
+                    history_window_hours=24,
+                    io_chart_mode="total",
+                )
+                inlined = {path for path, data_url in photos.items() if data_url in rendered.html}
+                self.assertEqual(inlined, expected)
+
+    async def test_static_assets_are_read_once_per_service(self) -> None:
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        runtime = self._runtime_with_view(
+            StorageViewRuntimeView(id="m2-carrier", label="M.2 carrier", kind="nvme_carrier", template_id="nvme-carrier-4")
+        )
+        reads: Counter[str] = Counter()
+        original_read_text = Path.read_text
+        original_read_bytes = Path.read_bytes
+
+        def counting_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path.parent == snapshot_export.STATIC_DIR:
+                reads[path.name] += 1
+            return original_read_text(path, *args, **kwargs)
+
+        def counting_read_bytes(path: Path) -> bytes:
+            if path.parent == snapshot_export.STATIC_DIR / "images":
+                reads[path.name] += 1
+            return original_read_bytes(path)
+
+        with patch.object(Path, "read_text", counting_read_text), patch.object(Path, "read_bytes", counting_read_bytes):
+            for history_window_hours in (24, 48):
+                await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=build_snapshot(),
+                    smart_summary_cache=build_smart_summary_cache(),
+                    storage_view_runtime=runtime,
+                    selected_slot=0,
+                    history_window_hours=history_window_hours,
+                    io_chart_mode="total",
+                )
+
+        self.assertEqual(reads, {"style.css": 1, "app.js": 1, "hyper-m2-gen3-card.png": 1})
+
+    async def test_oversize_export_redacts_the_snapshot_once_across_passes(self) -> None:
+        exporter = SnapshotExportService(
+            Settings(),
+            DenseHistoryBackend(),  # type: ignore[arg-type]
+            templates,
+            size_limit_bytes=1,
+        )
+        render_calls = 0
+        original_render = exporter._render_template_with_assets
+
+        def counting_render(*args: Any, **kwargs: Any) -> str:
+            nonlocal render_calls
+            render_calls += 1
+            return original_render(*args, **kwargs)
+
+        exporter._render_template_with_assets = counting_render  # type: ignore[method-assign]
+
+        with patch.object(
+            SnapshotRedactor, "redact_snapshot", autospec=True, side_effect=SnapshotRedactor.redact_snapshot
+        ) as redact_snapshot:
+            rendered = await exporter.build_enclosure_snapshot_html(
+                request=build_request(),
+                snapshot=build_snapshot(),
+                smart_summary_cache=build_smart_summary_cache(),
+                selected_slot=0,
+                history_window_hours=24,
+                io_chart_mode="total",
+                redact_sensitive=True,
+            )
+
+        self.assertEqual(render_calls, len(SnapshotExportService._build_downsampling_strategies()))
+        self.assertEqual(redact_snapshot.call_count, 1)
+        self.assertEqual(rendered.export_meta["redaction"], "partial")
+        self.assertNotIn("Archive CORE", rendered.html)
 
     async def test_service_redacts_sensitive_values_with_stable_aliases(self) -> None:
         snapshot = build_snapshot()
@@ -742,7 +911,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("192.168.1.174", rendered.html)
         self.assertNotIn("5000c500c2a7f220", rendered.html)
         self.assertEqual(rendered.export_meta["redaction"], "partial")
-        self.assertEqual(rendered.export_meta["redaction_label"], "Partial")
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials hidden")
         redacted_cache_key = exporter._build_history_cache_key(
             rendered.snapshot.selected_system_id,
             rendered.snapshot.selected_enclosure_id,
@@ -751,6 +920,239 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(redacted_cache_key, rendered.history_cache)
         self.assertTrue(rendered.history_cache[redacted_cache_key]["available"])
         self.assertEqual(rendered.history_cache[redacted_cache_key]["sample_counts"]["temperature_c"], 2)
+
+    async def test_endpoint_text_is_consistent_across_rendered_export_payloads(self) -> None:
+        # Invented documentation addresses, not captured appliance output.
+        endpoints = {
+            "192.0.2.173": "x.x.x.173",
+            "192.0.2.173.": "x.x.x.173.",
+            "Request to 192.0.2.173... retrying": "Request to x.x.x.173... retrying",
+            "192.0.2.10-192.0.2.20": "x.x.x.10-x.x.x.20",
+            "192.0.2.10-192.0.2.20.": "x.x.x.10-x.x.x.20.",
+            "2001:DB8::A7.": "x:x:DB8:A7.",
+            "192.0.2.173:9443": "x.x.x.173:9443",
+            "https://192.0.2.173:9443/api": "https://x.x.x.173:9443/api",
+            "2001:db8:42:53:64:75:86:97": "x:x:86:97",
+            "2001:db8:42::97": "x:x:42:97",
+            "[2001:db8:42::97]:9443": "[x:x:42:97]:9443",
+            "https://[2001:db8:42::97]:9443/api": "https://[x:x:42:97]:9443/api",
+            "[2001:db8::97%eth7]:9443": "[x:x:db8:97%eth7]:9443",
+            "[2001:db8::97%25eth7]:9443": "[x:x:db8:97%25eth7]:9443",
+            "::ffff:192.0.2.173": "x:x:ffff:192.0.2.173",
+            "::97": "x:x:97",
+            "2001:db8::": "x:x:2001:db8",
+        }
+        text = " | ".join(f"endpoint=({value})" for value in endpoints)
+        expected = " | ".join(f"endpoint=({value})" for value in endpoints.values())
+        await self._assert_rendered_endpoint_text(text, expected)
+
+    async def test_endpoint_redaction_preserves_nonaddresses_and_zero_sentinels(self) -> None:
+        text = (
+            "2026-04-17T12:34:56+00:00 | 12:34:56 | 01:23:45:67:89:ab | "
+            "abcdef12-3456-7890-abcd-1234567890ab | SANITIZED-DRIVE-740Q | "
+            "999.0.2.173 | v192.0.2.173suffix | 1.2.3.4.5 | "
+            "0 | 0x0 | 0.0.0.0 | :: | 0:0:0:0:0:0:0:0 | "
+            "http://0.0.0.0:9443/ | [::]:9443"
+        )
+        await self._assert_rendered_endpoint_text(text, text)
+
+    async def test_colon_adjacent_endpoints_across_rendered_export_payloads(self) -> None:
+        endpoints = {
+            "peer:198.51.100.219": "peer:x.x.x.219",
+            "face:198.51.100.219": "face:x.x.x.219",
+            "bad:198.51.100.219": "bad:x.x.x.219",
+            "peer:2001:db8:91::ab:cd": "peer:x:x:ab:cd",
+            "2001:db8:91::ab:cd: unavailable": "x:x:ab:cd: unavailable",
+            "2001:db8::1: 404": "x:x:db8:1: 404",
+            "2001:db8::1: 2 failures": "x:x:db8:1: 2 failures",
+            "2001:db8::1:/dev/sda: failed": "x:x:db8:1:/dev/sda: failed",
+            "peer:198.51.100.219:8443": "peer:x.x.x.219:8443",
+            "peer:2001:db8:91::ab:cd: unavailable": "peer:x:x:ab:cd: unavailable",
+            "peer:::ab:cd": "peer:x:x:ab:cd",
+            "peer:2001:db8::": "peer:x:x:2001:db8",
+            "peer:::ffff:198.51.100.219": "peer:x:x:ffff:198.51.100.219",
+            "peer:2001:db8::ab:cd%eth9.2": "peer:x:x:ab:cd%eth9.2",
+            "face:2001:db8::ab:cd": "x:x:ab:cd",
+        }
+        await self._assert_rendered_endpoint_text(
+            " | ".join(endpoints), " | ".join(endpoints.values()),
+        )
+
+    async def test_colon_context_preserves_invalid_whole_tokens(self) -> None:
+        text = " | ".join((
+            "peer:198.51.100.999", "peer:v198.51.100.219tag",
+            "peer:2001:db8:::91", "2001:db8:::198.51.100.219",
+            "12345:2001:db8::ab:cd", "abcd:2001:db8:::ab:cd",
+            "peer:2001:db8::ab:cdZ", "peer:2001:db8::ab:cd::",
+            "x2001:db8::ab:cd", "2001:db8::ab:cdZ",
+            "peer:2001:db8::ab:cd:", "peer:15:32:41",
+            "peer:02:11:22:33:44:55", "2026-09-28T15:32:41Z",
+            "abcdef01-2345-6789-abcd-0123456789ab", "SANITIZED-DRIVE-219Q",
+            "peer:0.0.0.0", "peer:::", "peer:0:0:0:0:0:0:0:0",
+        ))
+        await self._assert_rendered_endpoint_text(text, text)
+
+    async def test_history_json_whitespace_matches_raw_rendered_text(self) -> None:
+        endpoints = {
+            f'"2001:db8:72::be:ef:{space}Unavailable"':
+            f'"x:x:be:ef:{space}Unavailable"'
+            for space in ("\t", "\n", "\r", " ")
+        }
+        # A literal backslash plus t is not whitespace, even inside JSON.
+        literal = r"2001:db8:72::be:ef:\tUnavailable"
+        endpoints[literal] = literal
+        await self._assert_rendered_endpoint_text(
+            " | ".join(endpoints), " | ".join(endpoints.values()),
+        )
+
+    async def test_history_json_representation_preserves_types_and_text_key_policy(self) -> None:
+        text = "2001:db8:72::be:ef:\tUnavailable"
+        wanted = "x:x:be:ef:\tUnavailable"
+        redactor = SnapshotRedactor(build_snapshot(), {}, {})
+        details = {
+            "message": text,
+            "serial": "tiny",
+            "system_id": "unregistered",
+            "enclosure_id": "unregistered",
+            text: {"previous": [text, 42, 1.25, True, False, None], "current": '"quoted"'},
+            "literal": r"2001:db8:72::be:ef:\tUnavailable",
+        }
+        expected = {
+            "message": wanted,
+            "serial": "tiny",
+            "system_id": "unregistered",
+            "enclosure_id": "unregistered",
+            wanted: {"previous": [wanted, 42, 1.25, True, False, None], "current": '"quoted"'},
+            "literal": r"2001:db8:72::be:ef:\tUnavailable",
+        }
+        # Details used general text replacement, not path-based alias minting.
+        # A parsed serial/system_id key must not introduce stronger masking.
+        aliases = (dict(redactor.system_aliases), dict(redactor.enclosure_aliases))
+        for raw in (
+            json.dumps(details), json.dumps(details, ensure_ascii=False, indent=2),
+            json.dumps(details).replace(r":\t", r":\u0009"),
+        ):
+            with self.subTest(representation=raw):
+                result = redactor.redact_object({"details_json": raw})["details_json"]
+                decoded = json.loads(result)
+                self.assertEqual(decoded, expected)
+                self.assertEqual(
+                    [type(value) for value in decoded[wanted]["previous"]],
+                    [str, int, float, bool, bool, type(None)],
+                )
+        self.assertEqual((redactor.system_aliases, redactor.enclosure_aliases), aliases)
+        # The declared JSON field may contain a scalar/list, but arbitrary text
+        # fields must not be parsed or have their literal escapes interpreted.
+        for value in (text, [text, None, False, 7], None, True, 42, 1.25):
+            raw = json.dumps(value)
+            expected_value = wanted if isinstance(value, str) else (
+                [wanted, None, False, 7] if isinstance(value, list) else value
+            )
+            self.assertEqual(json.loads(redactor.redact_object({"details_json": raw})["details_json"]), expected_value)
+        raw = json.dumps({"message": text})
+        self.assertEqual(redactor.redact_object({"note": raw})["note"], redactor._redact_string(raw, ("note",)))
+
+    async def test_history_json_malformed_fallback_and_known_aliases_are_unchanged(self) -> None:
+        details = {"system_id": "retired.example.test", "serial": "SANITIZED-HISTORY-740Q"}
+        history = {"scope": {"events": [{"details_json": json.dumps(details)}]}}
+        redactor = SnapshotRedactor(build_snapshot(), history, {})
+        raw = json.dumps(details)
+        legacy = redactor._redact_string(raw, ("details_json",))
+        self.assertEqual(
+            json.loads(redactor.redact_history_cache(history)["scope"]["events"][0]["details_json"]),
+            json.loads(legacy),
+        )
+        for raw in ('{"message": "192.0.2.173",', '{"message": "2001:db8:72::be:ef:\tUnavailable"}'):
+            self.assertEqual(
+                redactor.redact_object({"details_json": raw})["details_json"],
+                redactor._redact_string(raw, ("details_json",)),
+            )
+
+    async def _assert_rendered_endpoint_text(self, text: str, expected: str) -> None:
+        snapshot = build_snapshot_with_rear_option()
+        snapshot.warnings = [text]
+        rear = build_rear_snapshot()
+        rear.warnings = [text]
+        smart = build_smart_summary_cache()
+        smart["0"]["detail"] = text
+        rear_smart = build_rear_smart_summary_cache()
+        rear_smart["0"]["detail"] = text
+        runtime = build_storage_view_runtime()
+        runtime.views[0].notes = [text]
+        view_smart = build_storage_view_smart_summary_cache()
+        view_smart["boot-doms"]["0"]["detail"] = text
+
+        class EndpointHistory(FakeHistoryBackend):
+            async def get_scope_history(self, **kwargs: Any) -> dict[int, dict[str, object]]:
+                histories = await super().get_scope_history(**kwargs)
+                for history in histories.values():
+                    history["detail"] = text
+                    history["events"] = [{
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "event_type": "note", "details_json": json.dumps({
+                            "message": text,
+                            "change": {"previous": text, "current": [text, 0, True, None]},
+                        }),
+                    }]
+                return histories
+
+        exporter = SnapshotExportService(Settings(), EndpointHistory(), templates)
+        kwargs: dict[str, Any] = dict(
+            request=build_request(), snapshot=snapshot, smart_summary_cache=smart,
+            live_enclosure_snapshots={"front": snapshot, "rear": rear},
+            live_enclosure_smart_summary_cache={"front": smart, "rear": rear_smart},
+            storage_view_runtime=runtime, storage_view_smart_summary_cache=view_smart,
+            selected_slot=0, history_window_hours=None, io_chart_mode="total",
+        )
+        original_snapshot = snapshot.model_dump(mode="json")
+        for redact in (True, False):
+            with self.subTest(redact=redact):
+                # Estimate and download receive the same inputs and masking flag.
+                estimate = await exporter.estimate_enclosure_snapshot_export(
+                    **kwargs, redact_sensitive=redact, packaging="html",
+                )
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    **kwargs, redact_sensitive=redact,
+                )
+                self.assertTrue(estimate["ok"])
+                wanted = expected if redact else text
+                if redact:
+                    for original, masked in zip(text.split(" | "), expected.split(" | "), strict=True):
+                        if original != masked:
+                            self.assertFalse(original in rendered.html, "Unmasked contextual endpoint in HTML")
+
+                def embedded(name: str) -> Any:
+                    marker = f"    {name}: "
+                    offset = rendered.html.index(marker) + len(marker)
+                    return json.JSONDecoder().raw_decode(rendered.html[offset:])[0]
+
+                self.assertEqual(embedded("snapshot")["warnings"], [wanted])
+                self.assertEqual(rendered.snapshot.warnings, [wanted])
+                self.assertEqual(embedded("preloadedSmartSummariesBySlot")["0"]["detail"], wanted)
+                for item in embedded("preloadedSnapshotsByEnclosure").values():
+                    self.assertEqual(item["warnings"], [wanted])
+                for name in ("preloadedSnapshotSmartSummaries", "preloadedStorageViewSmartSummaries"):
+                    for cache in embedded(name).values():
+                        self.assertEqual(cache["0"]["detail"], wanted)
+                self.assertEqual(embedded("storageViewsRuntime")["views"][0]["notes"], [wanted])
+                histories = embedded("preloadedHistoryBySlot")
+                self.assertEqual(histories, rendered.history_cache)
+                for history in histories.values():
+                    self.assertEqual(history["detail"], wanted)
+                    details_raw = history["events"][0]["details_json"]
+                    self.assertEqual(json.loads(details_raw), {
+                        "message": wanted,
+                        "change": {"previous": wanted, "current": [wanted, 0, True, None]},
+                    })
+                    if not redact:
+                        self.assertEqual(details_raw, json.dumps({
+                            "message": text,
+                            "change": {"previous": text, "current": [text, 0, True, None]},
+                        }))
+                self.assertEqual(rendered.export_meta["redaction"], "partial" if redact else "none")
+                self.assertEqual(rendered.export_meta["downsampling_label"], "None")
+        self.assertEqual(snapshot.model_dump(mode="json"), original_snapshot)
+        self.assertEqual(smart["0"]["detail"], text)
 
     async def test_partial_export_redacts_configured_hostnames_from_all_embedded_payloads(self) -> None:
         hostnames = {
@@ -925,7 +1327,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.snapshot.warnings, [original_warning])
         self.assertIn(original_warning, rendered.html)
         self.assertEqual(rendered.export_meta["redaction"], "none")
-        self.assertEqual(rendered.export_meta["redaction_label"], "None")
+        self.assertEqual(rendered.export_meta["redaction_label"], "Serials shown")
 
     async def test_partial_export_cache_varies_with_serialized_source_hostnames(self) -> None:
         hostname = "cache206.redact.invalid"
@@ -1107,11 +1509,11 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         event_loop_released = threading.Event()
 
-        def blocking_inliner(request, html: str) -> str:
+        def blocking_inliner(request, html: str, *args: Any, **kwargs: Any) -> str:
             loop.call_soon_threadsafe(event_loop_released.set)
             if not event_loop_released.wait(timeout=0.5):
                 raise AssertionError("Template rendering blocked the event loop")
-            return original_inliner(request, html)
+            return original_inliner(request, html, *args, **kwargs)
 
         exporter._inline_static_assets = blocking_inliner  # type: ignore[method-assign]
 
@@ -1322,7 +1724,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5)
         self.assertLessEqual(rendered.export_meta["event_count"], 10)
 
@@ -1911,7 +2313,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rendered.export_meta["storage_view_count"], 1)
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 2)
         self.assertLess(rendered.export_meta["event_count"], 80 * 2)
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
@@ -1949,7 +2351,7 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered.export_meta["enclosure_count"], 2)
         self.assertEqual(rendered.export_meta["storage_view_count"], 1)
         self.assertNotEqual(rendered.export_meta["downsampling_label"], "None")
-        self.assertIn("rollups", rendered.export_meta["downsampling_note"])
+        self.assertIn("averaged", rendered.export_meta["downsampling_note"])
         self.assertLess(rendered.export_meta["metric_sample_count"], 288 * 5 * 3)
         self.assertLess(rendered.export_meta["event_count"], 80 * 3)
         self.assertIn("archive-core|rear|0", rendered.history_cache)
@@ -2106,7 +2508,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         release_second = threading.Event()
         render_calls = 0
 
-        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+        def controlled_render(*_args: Any, **_kwargs: Any) -> str:
             nonlocal render_calls
             render_calls += 1
             if render_calls == 1:
@@ -2164,7 +2566,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         release = threading.Event()
         render_calls = 0
 
-        def controlled_render(_request: Request, _template: Any, _context: dict[str, Any]) -> str:
+        def controlled_render(*_args: Any, **_kwargs: Any) -> str:
             nonlocal render_calls
             render_calls += 1
             started.set()
@@ -2699,6 +3101,393 @@ class SnapshotRedactorHostnameFormTests(unittest.TestCase):
         redacted = redactor.redact_snapshot(snapshot)
 
         self.assertEqual(redacted.warnings, ["collector on host-01 failed"])
+
+
+async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
+                                        scope_kind="virtual", redact=False, selected_view="boot"):
+    """Real disposable store -> route -> client -> HTML, with only transport replaced."""
+    from contextlib import closing
+
+    for cache in (EXPORT_HISTORY_CACHE, EXPORT_RENDER_CACHE, EXPORT_ZIP_CACHE):
+        cache.clear()
+    snapshot = build_snapshot()
+    snapshot.selected_system_id = "host.example.test"
+    snapshot.selected_system_label = "Synthetic host"
+    snapshot.systems = [SystemOption(id="host.example.test", label="Synthetic host", platform="linux")]
+    snapshot.sources = {}
+    snapshot.warnings = []
+    snapshot.slots[0].serial = "SANITIZED-EXPORT-PHYSICAL"
+    snapshot.last_updated = datetime.now(timezone.utc)
+    rear = snapshot.model_copy(deep=True)
+    rear.selected_enclosure_id = "rear"
+    rear.selected_enclosure_label = "Synthetic rear"
+    rear.slots[0].enclosure_id = "rear"
+    runtime = StorageViewRuntimePayload(
+        system_id=snapshot.selected_system_id,
+        views=[StorageViewRuntimeView(
+            id=view_id, label=f"Synthetic {view_id}", kind=kind, template_id=template,
+            slot_layout=[[0]], slot_count=1, matched_count=1,
+            backing_enclosure_id="front",
+            slots=[StorageViewRuntimeSlot(
+                slot_index=0, slot_label="00", occupied=True, state="matched",
+                source="snapshot_slot" if bound else "inventory_candidate",
+                snapshot_slot=0 if bound else None, device_name="disk0",
+                serial=f"SANITIZED-EXPORT-{view_id.upper()}", temperature_c=temperature,
+            )],
+        ) for view_id, kind, template, bound, temperature in (
+            ("boot", "boot_devices", "boot-devices-2", False, 41),
+            ("nvme", "nvme_carrier", "nvme-4", False, 42),
+            ("bound", "boot_devices", "boot-devices-2", True, 37),
+        )],
+    )
+    enclosures = ["front"]
+    if scope_kind == "multiple":
+        enclosures.append("rear")
+    if scope_kind == "virtual":
+        enclosures.extend(["storage-view:boot", "storage-view:nvme"])
+    client = HistoryBackendClient(HistoryConfig(service_url="http://history.example.test"))
+    wire = []
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as directory:
+        store = HistoryStore(str(Path(directory) / "history.db"))
+        with closing(store._connect()) as connection:
+            for enclosure in enclosures:
+                for metric in ("temperature_c", "bytes_read", "bytes_written", "annualized_bytes_read",
+                               "annualized_bytes_written", "power_on_hours"):
+                    for index in range(metric_count):
+                        value = {"storage-view:boot": 41, "storage-view:nvme": 42, "rear": 38}.get(enclosure, 37)
+                        connection.execute(
+                            "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                            "enclosure_id, slot, slot_label, metric_name, value_real) VALUES (?,?,?,?,?,?,?,?)",
+                            ((now - timedelta(minutes=index + 1)).isoformat(), snapshot.selected_system_id,
+                             enclosure, enclosure, 0, "00", metric, value),
+                        )
+                for index in range(event_count):
+                    connection.execute(
+                        "INSERT INTO slot_events (observed_at, system_id, enclosure_key, enclosure_id, "
+                        "slot, slot_label, event_type, details_json) VALUES (?,?,?,?,?,?,?,?)",
+                        ((now - timedelta(minutes=index + 1)).isoformat(), snapshot.selected_system_id,
+                         enclosure, enclosure, 0, "00", "slot_state_changed", "{}"),
+                    )
+            connection.commit()
+
+        async def send(path, document):
+            assert path == "/api/history/scopes/bundle"
+            response = await history_main.scopes_history_bundle(
+                test_history_bulk_bounds.HistoryBulkRouteBoundsTests._request(json.dumps(document).encode())
+            )
+            assert response.status_code == 200, response.body
+            payload = json.loads(bytes(response.body))
+            wire.append((document, payload))
+            return payload
+
+        async def fetch(path, **kwargs):
+            assert path == "/healthz"
+            return {"available": True}
+
+        exporter = SnapshotExportService(Settings(), client, templates)
+        arguments: dict[str, Any] = dict(request=build_request(), snapshot=snapshot, selected_slot=0,
+                         history_window_hours=24, history_panel_open=True, io_chart_mode="total",
+                         redact_sensitive=redact)
+        if scope_kind == "multiple":
+            arguments["live_enclosure_snapshots"] = {"front": snapshot, "rear": rear}
+        if scope_kind == "virtual":
+            arguments.update(storage_view_runtime=runtime, selected_storage_view_id=selected_view)
+        with patch.object(history_main, "store", store), patch.object(client, "_send_json", side_effect=send), \
+                patch.object(client, "_fetch_json", side_effect=fetch):
+            rendered = await exporter.build_enclosure_snapshot_html(**arguments)
+            packaged = await exporter.build_enclosure_snapshot_export(**arguments)
+            assert packaged.content == rendered.html.encode("utf-8")
+            estimate = await exporter.estimate_enclosure_snapshot_export(**arguments)
+        with closing(store._connect()) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0] == len(enclosures) * 6 * metric_count
+            assert connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0] == len(enclosures) * event_count
+        return rendered, estimate, wire
+
+
+class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.client = HistoryBackendClient(HistoryConfig(service_url="http://synthetic-history.invalid"))
+        self.since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        self.clear_caches()
+        self.addCleanup(self.clear_caches)
+
+    @staticmethod
+    def clear_caches() -> None:
+        for cache in (EXPORT_HISTORY_CACHE, EXPORT_RENDER_CACHE, EXPORT_ZIP_CACHE):
+            cache.clear()
+
+    async def export(self, snapshot, *, redact_sensitive=False, multiple=False):
+        exporter = SnapshotExportService(Settings(), self.client, templates)
+        return await exporter.build_enclosure_snapshot_html(
+            request=build_request(), snapshot=snapshot,
+            live_enclosure_snapshots=({"front": snapshot, "rear": build_rear_snapshot()} if multiple else {"front": snapshot}),
+            selected_slot=0,
+            history_window_hours=24, history_panel_open=True, io_chart_mode="total",
+            redact_sensitive=redact_sensitive,
+        )
+
+    async def test_missing_or_malformed_coverage_is_unverified_not_complete(self) -> None:
+        for coverage in (None, {}, {"events": True, "metrics": {"temperature_c": "yes"}}):
+            with self.subTest(coverage=coverage):
+                raw = {"scopes": [{"system_id": "synthetic", "enclosure_id": "front", "histories": {
+                    "0": {"metrics": {"temperature_c": []}, "coverage": coverage},
+                }}]}
+                with patch.object(self.client, "_send_json", AsyncMock(return_value=raw)):
+                    histories = await self.client.get_scope_history(
+                        system_id="synthetic", enclosure_id="front", slots=[0], window_hours=24,
+                        metrics=["temperature_c"], event_limit=11, metric_limit=15,
+                    )
+                self.assertEqual(histories[0].get("coverage"),
+                                 {"events": "unknown", "metrics": {"temperature_c": "unknown"}})
+                exporter = SnapshotExportService(Settings(), self.client, templates)
+                _, meta = exporter._prepare_history_cache_for_export(
+                    {"synthetic|front|0": histories[0]}, history_window_hours=24,
+                    reference_time=datetime.now(timezone.utc), target_points_per_series=None, max_events_per_slot=None,
+                )
+                self.assertEqual(meta["coverage"], "unknown")
+                self.assertNotIn("Every recorded sample", meta["note"])
+
+        reference_time = datetime(2026, 1, 1, 0, 4, tzinfo=timezone.utc)
+        samples = [
+            {"observed_at": reference_time.replace(minute=minute).isoformat(), "value": minute}
+            for minute in (1, 2, 3)
+        ]
+        exporter = SnapshotExportService(Settings(), self.client, templates)
+        _, meta = exporter._prepare_history_cache_for_export(
+            {"synthetic|front|0": {"available": True, "metrics": {"temperature_c": samples}}},
+            history_window_hours=24,
+            reference_time=reference_time,
+            target_points_per_series=1,
+            max_events_per_slot=None,
+        )
+        self.assertEqual(meta["coverage"], "unknown")
+        self.assertIn("averaged", meta["coverage_note"])
+
+    async def test_bounded_history_coverage_real_export_and_estimate(self) -> None:
+        for scope_kind in ("single", "multiple", "virtual"):
+            for metric_count, event_count in ((14, 10), (15, 11), (16, 11), (15, 12), (16, 12), (0, 0)):
+                with self.subTest(scope=scope_kind, metrics=metric_count, events=event_count):
+                    rendered, estimate, wire = await build_bounded_history_fixture(
+                        metric_count=metric_count, event_count=event_count, scope_kind=scope_kind,
+                    )
+                    expected = "truncated" if metric_count > 15 or event_count > 11 else "complete"
+                    self.assertEqual(rendered.export_meta.get("history_coverage"), expected)
+                    self.assertEqual(estimate.get("history_coverage"), expected)
+                    self.assertEqual(estimate.get("history_coverage_note"), rendered.export_meta["history_coverage_note"])
+                    self.assertIn(rendered.export_meta["history_coverage_note"], rendered.html)
+                    if expected == "truncated":
+                        self.assertNotIn("Every recorded sample is included", rendered.export_meta["downsampling_note"])
+                        self.assertNotIn("full history detail", rendered.html)
+                    for history in rendered.history_cache.values():
+                        self.assertEqual(history["system_id"], "host.example.test")
+                        self.assertEqual(len(history["events"]), min(event_count, 11))
+                        for samples in history["metrics"].values():
+                            self.assertEqual(len(samples), min(metric_count, 15))
+                        self.assertEqual(history["coverage"]["events"],
+                                         "truncated" if event_count > 11 else "complete")
+                        self.assertEqual(set(history["coverage"]["metrics"].values()),
+                                         {"truncated" if metric_count > 15 else "complete"})
+                    self.assertEqual(len(wire), 2 if scope_kind == "virtual" else 1)
+                    for document, response in wire:
+                        self.assertEqual((document["metric_limit"], document["event_limit"]), (15, 11))
+                        plan = build_history_read_plan(**document)
+                        self.assertLessEqual(response["budget"]["returned_row_count"], plan.projected_rows)
+                        self.assertLessEqual(plan.projected_rows, MAX_RETURNED_ROWS)
+                        self.assertLessEqual(len(json.dumps(document).encode()), MAX_REQUEST_BYTES)
+
+    async def test_virtual_history_redaction_matches_runtime_targets(self) -> None:
+        for redact in (False, True):
+            for selected in ("boot", "nvme", "bound"):
+                with self.subTest(redact=redact, selected=selected):
+                    rendered, _, _ = await build_bounded_history_fixture(redact=redact, selected_view=selected)
+                    runtime = json.loads(re.search(r"storageViewsRuntime: (.*),\n", rendered.html)[1])
+                    self.assertEqual(len({view["id"] for view in runtime["views"]}), 3)
+                    targets = []
+                    for view in runtime["views"]:
+                        slot = view["slots"][0]
+                        enclosure = view["backing_enclosure_id"] if slot["snapshot_slot"] is not None else f"storage-view:{view['id']}"
+                        key = f"{rendered.snapshot.selected_system_id}|{enclosure}|0"
+                        self.assertIn(key, rendered.history_cache)
+                        targets.append(key)
+                    self.assertEqual(len(set(targets)), 3)
+                    self.assertEqual(rendered.export_meta["selected_storage_view_id"],
+                                     runtime["views"][("boot", "nvme", "bound").index(selected)]["id"])
+                    if redact:
+                        self.assertNotIn("host.example.test", rendered.html)
+                        self.assertNotIn('"enclosure_id": "front"', rendered.html)
+
+    async def test_real_bulk_handler_store_client_export_keeps_available_history_and_identity(self) -> None:
+        snapshot = build_snapshot()
+        with tempfile.TemporaryDirectory() as directory:
+            store = HistoryStore(str(Path(directory) / "history.db"))
+            with store._connect() as connection:
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) VALUES (?,?,?,?,?,?,?,?)",
+                    ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                     snapshot.selected_system_id, "front", "front", 0, "00", "temperature_c", 37.0),
+                )
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) VALUES (?,?,?,?,?,?,?,?)",
+                    ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+                     snapshot.selected_system_id, "rear", "rear", 0, "00", "temperature_c", 42.0),
+                )
+                connection.commit()
+
+            async def send(path, document):
+                self.assertEqual(path, "/api/history/scopes/bundle")
+                response = await history_main.scopes_history_bundle(
+                    test_history_bulk_bounds.HistoryBulkRouteBoundsTests._request(json.dumps(document).encode())
+                )
+                self.assertEqual(response.status_code, 200, response.body)
+                return json.loads(bytes(response.body))
+
+            with patch.object(history_main, "store", store), patch.object(self.client, "_send_json", side_effect=send) as sent:
+                for multiple, redact in ((False, False), (False, True), (True, False), (True, True)):
+                    with self.subTest(multiple=multiple, redact=redact):
+                        self.clear_caches()
+                        rendered = await self.export(
+                            build_snapshot_with_rear_option() if multiple else snapshot,
+                            redact_sensitive=redact, multiple=multiple,
+                        )
+                        self.assertTrue(rendered.history_available)
+                        self.assertIn("initialHistoryPanelOpen: true", rendered.html)
+                        system_id = rendered.snapshot.selected_system_id
+                        enclosure_id = rendered.snapshot.selected_enclosure_id
+                        key = SnapshotExportService._build_history_cache_key(system_id, enclosure_id, 0)
+                        history = rendered.history_cache[key]
+                        self.assertTrue(history["available"])
+                        self.assertTrue(history["configured"])
+                        self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                                         (system_id, enclosure_id, 0))
+                        self.assertEqual(history["metrics"]["temperature_c"][0]["value"], 37.0)
+                        self.assertEqual(history["sample_counts"]["temperature_c"], 1)
+                        sampled = [item for item in rendered.history_cache.values()
+                                   if item.get("sample_counts", {}).get("temperature_c")]
+                        self.assertEqual(sorted(item["latest_values"]["temperature_c"] for item in sampled),
+                                         [37.0, 42.0] if multiple else [37.0])
+                        self.assertEqual(len({item["enclosure_id"] for item in sampled}), 2 if multiple else 1)
+                        for item in sampled:
+                            self.assertTrue(item["available"])
+                            self.assertEqual(item["system_id"], system_id)
+                            cache_key = SnapshotExportService._build_history_cache_key(
+                                item["system_id"], item["enclosure_id"], item["slot"],
+                            )
+                            self.assertEqual(rendered.history_cache[cache_key], item)
+                self.assertEqual(sent.await_count, 4)
+
+    async def test_transport_outage_survives_single_scope_adapter_without_fanout(self) -> None:
+        with (
+            patch.object(self.client, "_send_json", side_effect=HistoryBackendUnavailableError("synthetic secret")) as sent,
+            patch.object(self.client, "_fetch_json", AsyncMock()) as fetched,
+        ):
+            result = await self.client.get_scope_history(
+                system_id="synthetic", enclosure_id="front", slots=[0, 1, 0],
+                window_hours=24, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+            )
+        self.assertEqual(set(result), {0, 1})
+        for slot, history in result.items():
+            self.assertFalse(history["available"])
+            self.assertEqual(history["detail"], HISTORY_BACKEND_FAILURE_DETAIL)
+            self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                             ("synthetic", "front", slot))
+        sent.assert_awaited_once()
+        fetched.assert_not_awaited()
+        self.assertNotIn("synthetic secret", str(result))
+
+    async def test_transport_outage_export_stays_unavailable(self) -> None:
+        with patch.object(self.client, "_send_json", side_effect=HistoryBackendUnavailableError("offline")):
+            rendered = await self.export(build_snapshot())
+        self.assertFalse(rendered.history_available)
+        self.assertTrue(rendered.history_cache)
+        self.assertTrue(all(not history["available"] for history in rendered.history_cache.values()))
+
+    async def test_malformed_inner_slot_collections_fail_before_export(self) -> None:
+        snapshot = build_snapshot()
+        valid = {
+            "metrics": {},
+            "events": [],
+            "sample_counts": {},
+            "latest_values": {},
+            "disk_history": {},
+        }
+        for replacement in (
+            {"metrics": "malformed-nonempty"},
+            {"metrics": {"temperature_c": ["not-a-sample"]}},
+            {"events": {"bad": "shape"}},
+            {"events": ["not-an-event"]},
+        ):
+            response = {
+                "scopes": [
+                    {
+                        "system_id": snapshot.selected_system_id,
+                        "enclosure_id": snapshot.selected_enclosure_id,
+                        "histories": {"0": {**valid, **replacement}},
+                    }
+                ]
+            }
+            with self.subTest(replacement=replacement), patch.object(
+                self.client,
+                "_send_json",
+                AsyncMock(return_value=response),
+            ):
+                self.clear_caches()
+                with self.assertRaisesRegex(HistoryBackendResponseError, "malformed slot history"):
+                    await self.export(snapshot)
+
+    async def test_partial_response_matches_scope_identity_and_marks_missing_slots_unavailable(self) -> None:
+        scopes = [
+            {"system_id": "synthetic", "enclosure_id": "front", "slots": [0, 1]},
+            {"system_id": "synthetic", "enclosure_id": "rear", "slots": [0]},
+            {"system_id": "other", "enclosure_id": None, "slots": [0]},
+        ]
+        raw = {"budget": {"target_count": 4}, "scopes": [
+            {"system_id": "synthetic", "enclosure_id": "rear", "histories": {
+                "0": {"available": False, "detail": "History unavailable.", "metrics": {}}}},
+            {"system_id": "synthetic", "enclosure_id": "front", "histories": {
+                "0": {"metrics": {"temperature_c": []}, "disk_history": {"followed": True}},
+                "999": {"metrics": {}}}},
+        ]}
+        with patch.object(self.client, "_send_json", AsyncMock(return_value=raw)) as sent:
+            result = await self.client.get_scopes_history(
+                scopes=scopes, since=self.since, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+            )
+        self.assertEqual(result["budget"], raw["budget"])
+        self.assertEqual(len(result["scopes"]), 3)
+        for expected, actual in zip(scopes, result["scopes"], strict=True):
+            self.assertEqual((actual["system_id"], actual["enclosure_id"]),
+                             (expected["system_id"], expected["enclosure_id"]))
+            self.assertEqual(set(actual["histories"]), {str(slot) for slot in expected["slots"]})
+            for slot, history in actual["histories"].items():
+                self.assertEqual((history["system_id"], history["enclosure_id"], history["slot"]),
+                                 (expected["system_id"], expected["enclosure_id"], int(slot)))
+        front, rear, missing = result["scopes"]
+        self.assertTrue(front["histories"]["0"]["available"])
+        self.assertTrue(front["histories"]["0"]["disk_history"]["followed"])
+        self.assertFalse(front["histories"]["1"]["available"])
+        self.assertFalse(rear["histories"]["0"]["available"])
+        self.assertEqual(rear["histories"]["0"]["detail"], "History unavailable.")
+        self.assertFalse(missing["histories"]["0"]["available"])
+        sent.assert_awaited_once()
+
+    async def test_explicit_unavailability_at_each_layer_is_not_promoted_to_success(self) -> None:
+        for layer in ("response", "scope", "slot"):
+            with self.subTest(layer=layer):
+                history = {"metrics": {}}
+                scope = {"system_id": "synthetic", "enclosure_id": "front", "histories": {"0": history}}
+                raw = {"scopes": [scope]}
+                {"response": raw, "scope": scope, "slot": history}[layer].update(
+                    available=False, detail="History unavailable."
+                )
+                with patch.object(self.client, "_send_json", AsyncMock(return_value=raw)):
+                    result = await self.client.get_scope_history(
+                        system_id="synthetic", enclosure_id="front", slots=[0],
+                        window_hours=24, metrics=["temperature_c"], event_limit=0, metric_limit=1,
+                    )
+                self.assertFalse(result[0]["available"])
+                self.assertEqual(result[0]["detail"], "History unavailable.")
 
 
 if __name__ == "__main__":

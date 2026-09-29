@@ -7,8 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings
 from app.models.domain import InventorySnapshot
+from app.services.history_backend import HISTORY_BACKEND_DEGRADED_DETAIL
 
 
 class SlotHistoryRouteTests(unittest.TestCase):
@@ -37,7 +39,7 @@ class SlotHistoryRouteTests(unittest.TestCase):
         history_backend = Mock()
         history_backend.get_status = AsyncMock(return_value=backend_payload)
 
-        with patch.object(app_main, "get_history_backend", return_value=history_backend):
+        with patch.object(app_routes, "get_history_backend", return_value=history_backend):
             response = asyncio.run(route.endpoint())
 
         payload = json.loads(response.body)
@@ -53,7 +55,7 @@ class SlotHistoryRouteTests(unittest.TestCase):
                     "collector_running": True,
                     "last_success_at": "2026-09-06T10:00:00+00:00",
                     "last_completed_at": "2026-09-06T09:59:00+00:00",
-                    "last_error": "History backend is degraded; see history service logs.",
+                    "last_error": HISTORY_BACKEND_DEGRADED_DETAIL,
                 },
             },
         )
@@ -78,9 +80,9 @@ class SlotHistoryRouteTests(unittest.TestCase):
         history_backend.get_slot_history = AsyncMock(return_value=backend_payload)
 
         with (
-            patch.object(app_main, "get_settings", return_value=Settings()),
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "get_settings", return_value=Settings()),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
         ):
             response = asyncio.run(
                 route.endpoint(slot=5, system_id=None, enclosure_id="enc-a", window_hours=24)

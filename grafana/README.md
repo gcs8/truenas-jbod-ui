@@ -1,17 +1,16 @@
 # Grafana Dashboards
 
-This directory holds starter Grafana dashboards for the first-pass
-Prometheus/OpenMetrics slice.
+This directory holds starter Grafana dashboards for the Prometheus/OpenMetrics
+endpoints the services expose.
 
 Current dashboards:
 
 - `dashboards/truenas-jbod-ui-backend-overview.json`
 - `dashboards/truenas-jbod-ui-history-data.json`
 
-They assume a Prometheus datasource named `Prometheus Lab`, which matches the
-current disposable dev Grafana sandbox. If your Grafana instance uses a
-different datasource name or UID, update the datasource reference during
-import.
+The dashboards reference a Prometheus datasource named `Prometheus Lab`. If
+your Grafana instance uses a different datasource name or UID, remap it when
+Grafana asks during import.
 
 Suggested import flow:
 
@@ -20,8 +19,7 @@ Suggested import flow:
 3. upload one of the JSON files from `grafana/dashboards/`
 4. choose your Prometheus datasource if Grafana asks for remapping
 
-The dashboards intentionally focus on low-cardinality service metrics that
-ship today:
+The dashboards focus on the low-cardinality service metrics that ship today:
 
 - HTTP request rate, error rate, latency, and in-flight requests
 - process memory/CPU visibility per service
@@ -30,10 +28,10 @@ ship today:
 - history collector running state, pass duration, freshness, and stored sample
   counts
 
-The current dashboard revisions also assume Prometheus static labels for
-`deployment` (for example `windows-docker` or `linux-dev`) and expose that as
-a Grafana dropdown. The backend dashboard adds a second `system_id` dropdown
-for the new inventory/cache metrics so you can compare one or more configured
-systems inside a selected deployment set.
+Both dashboards expect a Prometheus static label named `deployment` on each
+scrape target and expose it as a Grafana dropdown, so you can keep more than one
+installation in the same Prometheus. The backend dashboard adds a second
+`system_id` dropdown for the inventory and cache metrics, so you can compare
+one or more configured systems inside a selected deployment.
 
-They are meant to be a useful first crack, not a final observability story.
+Treat them as a starting point and adjust panels to match your own setup.

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
 from urllib.parse import quote, unquote
 
 from app.config import SystemConfig
@@ -64,7 +66,7 @@ CORE_MPR_SYSCTL_LOCATION_COMMAND = (
 
 _INVENTORY_SNAPSHOT_EVIDENCE = ("inventory snapshot",)
 _PROFILE_SLOT_LAYOUT_EVIDENCE = ("profile slot layout",)
-_SLOT_MULTIPATH_EVIDENCE = ("slot.multipath.members",)
+_SLOT_MULTIPATH_EVIDENCE = ("multipath members",)
 _LINUX_SES_PATH_EVIDENCE = (
     "lsscsi -g",
     "lsscsi -g -t",
@@ -212,6 +214,30 @@ def _build_sas_fabric_result(
     raw: dict[str, Any] | None = None,
     sort_controllers: bool = False,
 ) -> SasFabricSnapshot:
+    # Keep bay IDs/kinds for selection and alias compatibility, but never present
+    # a logical inventory ordinal as a known physical bay.
+    location_unknown_slots = [slot for slot in snapshot.slots if not slot.physical_location_known]
+    if location_unknown_slots:
+        warnings = [*(warnings or []), (
+            "Logical disk inventory (virtual): physical location unavailable for unmapped disks. "
+            "Disk numbers are inventory ordinals, not physical bays."
+        )]
+        for slot in location_unknown_slots:
+            object_id = f"bay:{slot.slot}"
+            provenance = {
+                "physical_location_known": False,
+                "virtual_enclosure": bool(slot.raw_status.get("virtual_enclosure")),
+            }
+            node = (nodes or {}).get(object_id)
+            trace = (traces or {}).get(object_id)
+            for item in (node, trace):
+                if item is not None:
+                    item.label = f"Disk {slot.slot + 1}"
+                    item.metrics.update(provenance)
+                    item.evidence = _dedupe_strings([*item.evidence, "physical location unavailable"])
+            if node is not None:
+                node.raw.update(provenance)
+        available = available or any(_slot_has_disk(slot) for slot in location_unknown_slots)
     controller_rows = controllers or []
     if sort_controllers:
         controller_rows = sorted(controller_rows, key=lambda item: str(item.get("name") or ""))
@@ -288,7 +314,7 @@ def _add_backplane_zone_nodes(
     nodes: dict[str, SasFabricNode],
     snapshot: InventorySnapshot,
 ) -> dict[int, dict[str, Any]]:
-    backplane_zones = _backplane_zones_for_slots(snapshot.slots)
+    backplane_zones = _backplane_zones_for_slots([slot for slot in snapshot.slots if slot.physical_location_known])
     for zone in backplane_zones.values():
         add_node(
             nodes,
@@ -369,6 +395,13 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
     unit_data = _parse_unit_data(normalized_outputs)
+    if snapshot.slots and all(not slot.physical_location_known for slot in snapshot.slots):
+        # The legacy unit -1 placeholder is not observed controller evidence.
+        if -1 in unit_data and not any(
+            normalized_outputs.get(f"mprutil show {subcommand}", "").strip()
+            for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
+        ):
+            unit_data.pop(-1)
     pci_controllers = parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", ""))
     pcie_slots = parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", ""))
     mpr_sysctl_locations = parse_mpr_sysctl_locations(normalized_outputs.get("mpr sysctl pci locations", ""))
@@ -576,6 +609,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 member_device_name=member.device_name,
                 slot_enclosure_ids=_slot_enclosure_candidates(slot),
                 slot_location_numbers=_slot_location_number_candidates(slot),
+                slot_ses_number=_parse_mpr_slot_number((slot.raw_status or {}).get("ses_slot_number")),
                 diagnostics=mpr_kernel_diagnostics,
             )
             if mpr_context:
@@ -612,7 +646,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                     label=ses_device,
                     raw_id=ses_device,
                     related_slots=[slot.slot],
-                    evidence=["slot.ssh_ses_device"],
+                    evidence=["SES enclosure device"],
                     raw={"ses_device": ses_device},
                 ),
             )
@@ -648,7 +682,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
                 ],
                 "mpr_devices": mpr_device_metrics,
             },
-            evidence=["inventory snapshot", "slot.multipath.members"],
+            evidence=["inventory snapshot", *_SLOT_MULTIPATH_EVIDENCE],
         )
 
     _scope_mpr_infrastructure(
@@ -780,8 +814,8 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
     platform_label = "TrueNAS SCALE" if system.truenas.platform == "scale" else "Linux"
     if not slots_with_ses:
         fabric_warnings.append(
-            f"No {_linux_ses_platform_phrase(platform_label)} slot evidence is available for this selection. "
-            "Run stable lsblk --json, lsscsi -g -t, and sg_ses AES/EC/join probes before rendering a SCALE/Linux Storage Fabric map."
+            f"No SES enclosure data was found for this {platform_label} system. "
+            "Check that SSH works and that sg_ses is installed on the host (see Troubleshooting)."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1139,8 +1173,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
 
     if not evidence_slots:
         fabric_warnings.append(
-            f"No Storage Fabric evidence is available for {platform_label}. "
-            "This selection needs platform inventory, slot, block-device, controller, or BMC evidence before a graph can render."
+            f"No disk or enclosure data was found for {platform_label}, so there is nothing to map yet."
         )
         return _build_unavailable_sas_fabric_snapshot(
             system=system,
@@ -1190,10 +1223,11 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
         enclosure_id = route["enclosure_id"]
         slot_numbers = [slot.slot]
         controller_slots = controllers_by_name.setdefault(
-            controller_name,
+            controller_id,
             {
                 "id": controller_id,
                 "name": controller_name,
+                "label": route["controller_label"],
                 "device": route.get("controller_device"),
                 "board": route.get("controller_label"),
                 "path_counts": Counter(),
@@ -1242,7 +1276,11 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             {
                 "id": path_id,
                 "controller": controller_name,
+                "controller_label": route["controller_label"],
+                "controller_id": controller_id,
                 "state": route["path_state"],
+                "member_state_counts": Counter(),
+                "state_basis": "member-health-not-transport",
                 "count": 0,
                 "slots": [],
                 "label": route["path_label"],
@@ -1252,6 +1290,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             },
         )
         path["count"] += 1
+        path["member_state_counts"][route["path_state"]] += 1
         path["slots"] = _dedupe_ints([*path["slots"], slot.slot])
         add_node(
             nodes,
@@ -1401,7 +1440,10 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
                 "path_states": [
                     {
                         "controller": controller_name,
+                        "controller_label": route["controller_label"],
                         "state": route["path_state"],
+                        "member_state": route["path_state"],
+                        "state_basis": "member-health-not-transport",
                         "device_name": slot.device_name,
                         "path_id": path_id,
                         "source": route.get("source"),
@@ -1415,24 +1457,43 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
         )
 
     for path in paths_by_id.values():
+        # Aggregate only after every member has contributed. These are member
+        # health observations, not proof that a shared transport has failed.
+        counts = dict(sorted(path["member_state_counts"].items()))
+        known_states = set(counts) - {"unknown"}
+        state = "mixed" if len(known_states) > 1 else "unknown" if "unknown" in counts else next(iter(counts))
+        path["state"] = state
+        path["member_state_counts"] = counts
+        nodes[path["id"]].status = state
+        nodes[path["id"]].metrics.update(
+            member_state_counts=counts, state_basis=path["state_basis"],
+        )
         traces[path["id"]] = SasFabricTrace(
             id=path["id"],
             label=path["label"],
             kind="path",
-            node_ids=_dedupe_strings(["host", f"controller:{path['controller']}", path["id"]]),
+            node_ids=_dedupe_strings(["host", path["controller_id"], path["id"]]),
             link_ids=[
-                _link_id("host", f"controller:{path['controller']}", "host-controller"),
-                _link_id(f"controller:{path['controller']}", path["id"], "controller-path"),
+                _link_id("host", path["controller_id"], "host-controller"),
+                _link_id(path["controller_id"], path["id"], "controller-path"),
             ],
             slots=path["slots"],
             metrics={
                 "count": path["count"],
                 "state": path["state"],
+                "member_state_counts": counts,
+                "state_basis": path["state_basis"],
                 "source": path.get("source"),
                 "fabric_kind": fabric_kind,
             },
             evidence=list(_INVENTORY_SNAPSHOT_EVIDENCE),
         )
+
+    for link in links.values():
+        if link.kind == "controller-path":
+            link.status = paths_by_id[link.target]["state"]
+        elif link.kind == "path-storage-enclosure":
+            link.status = paths_by_id[link.source]["state"]
 
     controllers = []
     for controller in controllers_by_name.values():
@@ -1440,6 +1501,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
         controllers.append(controller)
     paths = sorted(paths_by_id.values(), key=lambda item: (str(item.get("controller") or ""), str(item.get("label") or "")))
     aliases_by_id = _resolve_sas_fabric_alias_map(aliases_by_id, nodes)
+    aliases_by_id = _resolve_platform_route_aliases(aliases_by_id, nodes, fabric_warnings)
     _apply_sas_fabric_aliases(
         nodes=nodes,
         traces=traces,
@@ -1495,7 +1557,10 @@ def add_node(nodes: dict[str, SasFabricNode], node: SasFabricNode) -> SasFabricN
     existing.related_slots = _dedupe_ints([*existing.related_slots, *node.related_slots])
     existing.evidence = _dedupe_strings([*existing.evidence, *node.evidence])
     existing.metrics.update({key: value for key, value in node.metrics.items() if value is not None})
+    legacy_ids = sorted(set(existing.raw.get("legacy_alias_ids", [])) | set(node.raw.get("legacy_alias_ids", [])))
     existing.raw.update({key: value for key, value in node.raw.items() if value is not None})
+    if legacy_ids:
+        existing.raw["legacy_alias_ids"] = legacy_ids
     if existing.status is None:
         existing.status = node.status
     return existing
@@ -1672,10 +1737,6 @@ def _snapshot_has_linux_ses_evidence(snapshot: InventorySnapshot) -> bool:
     return any(_slot_ses_devices(slot) for slot in snapshot.slots)
 
 
-def _linux_ses_platform_phrase(platform_label: str) -> str:
-    return "Linux SES" if platform_label.strip().lower() == "linux" else f"{platform_label} Linux SES"
-
-
 def _platform_label(platform: str | None) -> str:
     normalized = normalize_text(platform).lower()
     return {
@@ -1702,27 +1763,27 @@ def _storage_fabric_kind(platform: str | None) -> str:
 def _storage_fabric_scope_warning(platform_label: str, fabric_kind: str) -> str:
     if fabric_kind == "storage_quantastor":
         return (
-            f"{platform_label} Storage Fabric is built from Quantastor storage-system, "
-            "HA-node, pool, disk, and optional SES/qs evidence. Low-level controller, path, or expander hops are shown only when those sources prove them."
+            f"{platform_label} Storage Fabric is built from Quantastor storage-system, HA-node, pool, disk and "
+            "optional SES data; controller and expander hops appear only when those sources report them."
         )
     if fabric_kind == "storage_esxi":
         return (
-            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller evidence. "
-            "It shows host/controller/member relationships without enabling RAID-management actions."
+            f"{platform_label} Storage Fabric is built from ESXCLI and vendor controller data; "
+            "it shows host, controller and member relationships and never changes RAID settings."
         )
     if fabric_kind in {"storage_linux", "storage_scale"}:
         return (
-            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART, and optional SES evidence. "
-            "Unproven physical HBA or expander hops are kept out of the map."
+            f"{platform_label} Storage Fabric is built from Linux block, pool, profile, SMART and optional SES data; "
+            "HBA and expander hops are not shown."
         )
     if fabric_kind == "storage_bmc":
         return (
-            f"{platform_label} Storage Fabric is limited to BMC slot/chassis evidence for this selection. "
-            "Host storage paths need OS or vendor storage data."
+            f"{platform_label} Storage Fabric is built from BMC slot and chassis data only; "
+            "host storage paths need OS or vendor storage data."
         )
     return (
-        f"{platform_label} Storage Fabric is built from the platform evidence available in this snapshot. "
-        "Unproven physical hops are labeled by omission rather than inferred."
+        f"{platform_label} Storage Fabric is built from the data this platform reports; "
+        "hops it does not report are left out rather than guessed."
     )
 
 
@@ -1921,7 +1982,36 @@ def _storage_fabric_route_for_slot(
         fabric_kind=fabric_kind,
         platform_label=platform_label,
     )
-    return _select_storage_fabric_route_provider(context).route(context)
+    route = _select_storage_fabric_route_provider(context).route(context)
+    legacy_controller_id = route["controller_id"]
+    legacy_path_id = route["path_id"]
+    controller_identity = [route["source"], route["controller_identity"]]
+    route["controller_id"] = _platform_route_id("controller", controller_identity)
+    route["path_id"] = _platform_route_id(
+        "path", [*controller_identity, route["path_identity"], slot.pool_name, slot.vdev_name],
+    )
+    # The enclosure belongs to the same controller scope, even when the old
+    # normalized controller names collide.
+    legacy_enclosure_id = route["enclosure_id"]
+    route["enclosure_id"] = route["enclosure_id"].replace(
+        f":{route['controller_name']}:", f":{route['controller_id'].removeprefix('controller:')}:", 1,
+    )
+    route["controller_name"] = route["controller_id"].removeprefix("controller:")
+    route["enclosure_raw"]["legacy_alias_ids"] = [legacy_enclosure_id]
+    route["controller_raw"]["legacy_alias_ids"] = [legacy_controller_id]
+    route["path_raw"]["legacy_alias_ids"] = [legacy_path_id]
+    return route
+
+
+def _platform_route_id(kind: str, components: list[Any]) -> str:
+    """Versioned, case-preserving tuple identity, independent of row order.
+
+    JSON keeps absent components distinct from literal labels. SHA-256 keeps
+    IDs within the alias API's 256-character limit even for long labels, without
+    case folding or delimiter substitution. No row ordinal enters the identity.
+    """
+    digest = hashlib.sha256(json.dumps(components, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return f"{kind}:storage-v2:{digest}"
 
 
 def _quantastor_storage_route(
@@ -1955,6 +2045,8 @@ def _quantastor_storage_route(
     enclosure_token = _object_id_token(snapshot.selected_enclosure_id or selected_label)
     return {
         "source": "quantastor",
+        "controller_identity": selected_label,
+        "path_identity": ses_device or owner_label or (None if slot.pool_name or slot.vdev_name else path_anchor),
         "controller_id": f"controller:{controller_name}",
         "controller_name": controller_name,
         "controller_label": selected_label,
@@ -2030,6 +2122,8 @@ def _esxi_storage_route(
     )
     return {
         "source": "esxi",
+        "controller_identity": controller,
+        "path_identity": connector,
         "controller_id": f"controller:{controller_name}",
         "controller_name": controller_name,
         "controller_label": controller_label,
@@ -2108,6 +2202,8 @@ def _linux_storage_route(
     enclosure_label = snapshot.selected_enclosure_label or snapshot.selected_enclosure_name or "Storage view"
     return {
         "source": source,
+        "controller_identity": source_name,
+        "path_identity": None if slot.pool_name or slot.vdev_name else path_label,
         "controller_id": f"controller:{controller_name}",
         "controller_name": controller_name,
         "controller_label": source_label,
@@ -2130,7 +2226,10 @@ def _linux_storage_route(
         "enclosure_kind": "storage-enclosure",
         "enclosure_label": enclosure_label,
         "enclosure_raw_id": snapshot.selected_enclosure_id,
-        "enclosure_evidence": ["profile/storage view"],
+        "enclosure_evidence": (
+            ["inventory snapshot", "virtual inventory", "physical location unavailable"]
+            if not slot.physical_location_known else ["profile/storage view"]
+        ),
         "enclosure_raw": {
             "source": source,
             "fabric_kind": fabric_kind,
@@ -2156,6 +2255,8 @@ def _bmc_storage_route(
         path_label = "BMC slot inventory"
     return {
         "source": "bmc",
+        "controller_identity": controller_name,
+        "path_identity": raw_status.get("bmc_controller_id"),
         "controller_id": f"controller:{controller_name}",
         "controller_name": controller_name,
         "controller_label": "BMC / IPMI",
@@ -2202,8 +2303,9 @@ def _build_mpr_trace_index(
         for item in controllers
         if item.get("unit") is not None
     }
-    devices: dict[tuple[str, str], dict[str, Any]] = {}
-    devices_by_location: dict[tuple[str, str, int], dict[str, Any]] = {}
+    devices: dict[tuple[str, str], dict[str, Any] | None] = {}
+    devices_by_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
+    devices_by_handle_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
     enclosures: dict[tuple[str, str], str] = {}
     enclosure_keys_by_handle: dict[tuple[str, str], str] = {}
     expanders: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -2240,17 +2342,34 @@ def _build_mpr_trace_index(
                 controller_name,
                 context,
             )
-            for candidate in _device_name_candidates(device.get("device")):
-                devices[(controller_name, candidate)] = context
             enc_handle = str(device.get("enclosure_handle") or "")
             enclosure_key = enclosure_keys_by_handle.get((controller_id, enc_handle))
+            context["enclosure_key"] = enclosure_key
+            for candidate in _device_name_candidates(device.get("device")):
+                key = (controller_name, candidate)
+                # None latches contradictory provider rows instead of letting
+                # the last row choose which bay receives their diagnostics.
+                devices[key] = context if key not in devices or devices[key] == context else None
             device_slot = _parse_mpr_slot_number(device.get("slot"))
+            # Provider-local handles still locate conflicting occupants when
+            # the optional enclosure logical-ID probe is absent.
+            if device_slot is not None and _is_mpr_disk_target(device.get("device")):
+                handle_location = (controller_name, enc_handle, device_slot)
+                devices_by_handle_location[handle_location] = (
+                    context if handle_location not in devices_by_handle_location
+                    or devices_by_handle_location[handle_location] == context else None
+                )
             if enclosure_key and device_slot is not None and _is_mpr_disk_target(device.get("device")):
-                devices_by_location[(controller_name, enclosure_key, device_slot)] = context
+                location_key = (controller_name, enclosure_key, device_slot)
+                devices_by_location[location_key] = (
+                    context if location_key not in devices_by_location or devices_by_location[location_key] == context else None
+                )
 
     return {
         "devices": devices,
         "devices_by_location": devices_by_location,
+        "devices_by_handle_location": devices_by_handle_location,
+        "enclosure_keys_by_handle": enclosure_keys_by_handle,
         "enclosures": enclosures,
         "expanders": {key: _dedupe_strings(value) for key, value in expanders.items()},
     }
@@ -2269,6 +2388,7 @@ def _add_mpr_member_trace_context(
     member_device_name: str | None,
     slot_enclosure_ids: list[str] | None = None,
     slot_location_numbers: list[int] | None = None,
+    slot_ses_number: int | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     device_context = _lookup_mpr_device_context(
@@ -2277,6 +2397,7 @@ def _add_mpr_member_trace_context(
         member_device_name,
         slot_enclosure_ids=slot_enclosure_ids,
         slot_location_numbers=slot_location_numbers,
+        slot_ses_number=slot_ses_number,
     )
     if not device_context:
         return {}
@@ -2408,11 +2529,45 @@ def _lookup_mpr_device_context(
     *,
     slot_enclosure_ids: list[str] | None = None,
     slot_location_numbers: list[int] | None = None,
+    slot_ses_number: int | None = None,
 ) -> dict[str, Any] | None:
     devices = trace_index.get("devices", {})
-    for candidate in _device_name_candidates(device_name):
-        context = devices.get((controller_name, candidate))
+    member_names = set(_device_name_candidates(device_name))
+    enclosure_keys = {
+        key for value in slot_enclosure_ids or [] if (key := _identifier_lookup_key(value))
+    }
+    for candidate in sorted(member_names):
+        key = (controller_name, candidate)
+        if key in devices and devices[key] is None:
+            return None
+        context = devices.get(key)
         if context:
+            # A named member on this controller is independent identity evidence.
+            # Only that match can establish SES N -> MPR N-1; never infer it
+            # from a nameless neighbouring SAS target or a shared SAS address.
+            if enclosure_keys and context.get("enclosure_key") and context["enclosure_key"] not in enclosure_keys:
+                return None
+            known_handles = {
+                handle for (controller_id, handle), enclosure_key in trace_index.get("enclosure_keys_by_handle", {}).items()
+                if controller_id == context["controller_id"] and enclosure_key in enclosure_keys
+            }
+            enc_handle = str(context.get("enclosure_handle") or "")
+            if known_handles and enc_handle and enc_handle not in known_handles:
+                return None
+            location = _parse_mpr_slot_number(context.get("slot"))
+            handle_location = (controller_name, enc_handle, location)
+            handle_locations = trace_index.get("devices_by_handle_location", {})
+            if handle_location in handle_locations and handle_locations[handle_location] is None:
+                return None
+            location_key = (controller_name, context.get("enclosure_key"), location)
+            locations = trace_index.get("devices_by_location", {})
+            # An exact name cannot override contradictory occupants at its own
+            # provider location, including an independently proven SES offset.
+            if location_key in locations and locations[location_key] is None:
+                return None
+            if slot_location_numbers and location not in slot_location_numbers:
+                if slot_ses_number is None or slot_ses_number <= 0 or location != slot_ses_number - 1:
+                    return None
             return context
     devices_by_location = trace_index.get("devices_by_location", {})
     for enclosure_id in slot_enclosure_ids or []:
@@ -2420,8 +2575,14 @@ def _lookup_mpr_device_context(
         if not enclosure_key:
             continue
         for location_number in slot_location_numbers or []:
-            context = devices_by_location.get((controller_name, enclosure_key, location_number))
+            location_key = (controller_name, enclosure_key, location_number)
+            if location_key in devices_by_location and devices_by_location[location_key] is None:
+                return None
+            context = devices_by_location.get(location_key)
             if context:
+                named_occupants = set(_device_name_candidates(context.get("device")))
+                if named_occupants and member_names and not named_occupants.intersection(member_names):
+                    return None
                 return context
     return None
 
@@ -2491,35 +2652,18 @@ def _slot_enclosure_candidates(slot: SlotView) -> list[str]:
 
 
 def _slot_location_number_candidates(slot: SlotView) -> list[int]:
-    """
-    Return mpr location-number candidates for a slot, exact bays first.
+    """Exact bay coordinates only; SES element indices are not bay numbers.
 
-    The N-1 aliases exist for shelves whose SES slot numbers are 1-based
-    while the controller reports 0-based locations. They must only be tried
-    after every exact candidate has missed: `_lookup_mpr_device_context`
-    returns the first hit, so ordering the aliases first would attach the
-    previous bay's device context to every populated bay.
+    A provider-named member can independently prove a one-based SES conversion
+    in `_lookup_mpr_device_context`. Missing exact evidence alone cannot.
     """
     raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
     exact: list[int] = [slot.slot]
-    shifted: list[int] = []
-    for value in (
-        raw_status.get("ses_slot_number"),
-        raw_status.get("slot_number"),
-        raw_status.get("element_index"),
-        slot.ssh_ses_element_id,
-    ):
+    for value in (raw_status.get("ses_slot_number"), raw_status.get("slot_number")):
         parsed = _parse_mpr_slot_number(value)
-        if parsed is None:
-            continue
-        exact.append(parsed)
-        if parsed > 0:
-            shifted.append(parsed - 1)
-    ordered: list[int] = []
-    for value in (*exact, *shifted):
-        if value not in ordered:
-            ordered.append(value)
-    return ordered
+        if parsed is not None and parsed not in exact:
+            exact.append(parsed)
+    return exact
 
 
 def _device_name_candidates(*values: Any) -> list[str]:
@@ -2882,19 +3026,24 @@ def _sas_fabric_alias_map(aliases: list[SasFabricAlias]) -> dict[str, SasFabricA
     return {alias.object_id: alias for alias in aliases if alias.object_id and alias.label}
 
 
+def sas_fabric_legacy_alias_targets(nodes: Iterable[SasFabricNode]) -> dict[str, set[str]]:
+    """Map historical IDs to all observed owners, never reverse a digest ID."""
+    targets: dict[str, set[str]] = defaultdict(set)
+    for node in nodes:
+        legacy_ids = storage_node_legacy_alias_ids(node.id, node.kind)
+        legacy_ids.extend(node.raw.get("legacy_alias_ids", []))
+        for legacy_id in legacy_ids:
+            targets[legacy_id].add(node.id)
+    return dict(targets)
+
+
 def _resolve_sas_fabric_alias_map(
     aliases: dict[str, SasFabricAlias],
     nodes: dict[str, SasFabricNode],
 ) -> dict[str, SasFabricAlias]:
-    legacy_targets: dict[str, set[str]] = defaultdict(set)
-    for node in nodes.values():
-        if node.kind not in {"pool", "vdev"}:
-            continue
-        raw_label = normalize_text(node.label)
-        if not raw_label:
-            continue
-        legacy_targets[f"{node.kind}:{raw_label}"].add(node.id)
-        legacy_targets[f"{node.kind}:{_object_id_token(raw_label)}"].add(node.id)
+    legacy_targets = sas_fabric_legacy_alias_targets(
+        node for node in nodes.values() if node.kind in {"pool", "vdev"}
+    )
 
     resolved: dict[str, SasFabricAlias] = {
         object_id: alias
@@ -2907,7 +3056,7 @@ def _resolve_sas_fabric_alias_map(
         )
     }
     for object_id, alias in aliases.items():
-        if object_id in resolved:
+        if object_id in resolved or alias.source == SAS_FABRIC_CANONICAL_ALIAS_SOURCE:
             continue
         targets = legacy_targets.get(object_id, set())
         if len(targets) == 1:
@@ -2920,6 +3069,47 @@ def _resolve_sas_fabric_alias_map(
                 resolved[canonical_id] = alias.model_copy(update={"object_id": canonical_id})
         elif object_id not in nodes:
             resolved[object_id] = alias
+    return resolved
+
+
+def _resolve_platform_route_aliases(
+    aliases: dict[str, SasFabricAlias],
+    nodes: dict[str, SasFabricNode],
+    warnings: list[str],
+) -> dict[str, SasFabricAlias]:
+    """Read compatibility only: never rewrite or delete persisted aliases.
+
+    A legacy label-derived ID may name several current routes. Retain that
+    alias and warn rather than assigning an operator name to an arbitrary bay.
+    Explicit aliases on the new ID take precedence within the same scope;
+    enclosure overrides still win over system defaults across ID formats.
+    """
+    targets = sas_fabric_legacy_alias_targets(
+        node for node in nodes.values() if node.raw.get("legacy_alias_ids")
+    )
+    resolved = dict(aliases)
+    candidates: dict[str, list[SasFabricAlias]] = defaultdict(list)
+    for legacy_id, node_ids in sorted(targets.items()):
+        alias = aliases.get(legacy_id)
+        if alias is None or alias.source == SAS_FABRIC_CANONICAL_ALIAS_SOURCE:
+            continue
+        if len(node_ids) == 1:
+            candidates[next(iter(node_ids))].append(alias)
+        else:
+            warnings.append(
+                f"A saved {alias.object_kind or 'route'} alias is ambiguous across {len(node_ids)} "
+                "Storage Fabric objects. It was retained but not applied; its ownership must be resolved before renaming."
+            )
+    for canonical_id, compatible in candidates.items():
+        if canonical_id in aliases:
+            compatible.append(aliases[canonical_id])
+        # Resolve logical scope before ID format. Within that scope, exact
+        # canonical IDs win; legacy ties use timestamp then original ID.
+        alias = max(compatible, key=lambda item: (
+            item.enclosure_id is not None, item.object_id == canonical_id,
+            item.updated_at, item.object_id,
+        ))
+        resolved[canonical_id] = alias.model_copy(update={"object_id": canonical_id})
     return resolved
 
 

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -111,8 +112,13 @@ class QuantastorRESTClient:
     def _fetch_optional_list(self, endpoint: str) -> list[dict[str, Any]]:
         try:
             payload = self._request_json(endpoint, {"flags": 0})
-        except TrueNASAPIError:
-            logger.warning("Quantastor endpoint %s failed; continuing without it.", endpoint)
+        except TrueNASAPIError as exc:
+            # Retain the endpoint and failure kind without logging response bodies.
+            logger.warning(
+                "Quantastor endpoint %s failed (%s); continuing without it.",
+                endpoint,
+                type(exc.__cause__ or exc).__name__,
+            )
             return []
         if self._is_error_payload(payload):
             logger.warning("Quantastor endpoint %s returned an API error payload; continuing without it.", endpoint)
@@ -150,12 +156,29 @@ class QuantastorRESTClient:
                 server_hostname=resolve_tls_server_name(self.config),
             ) as response:
                 charset = response.headers.get_content_charset() or "utf-8"
-                payload = response.read().decode(charset)
+                body = response.read()
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
+            try:
+                with exc:
+                    detail = exc.read().decode("utf-8", errors="replace").strip()
+            except (OSError, HTTPException) as read_exc:
+                raise TrueNASAPIError(
+                    f"Quantastor endpoint {endpoint} failed ({exc.code}); error response could not be read."
+                ) from read_exc
             raise TrueNASAPIError(f"Quantastor endpoint {endpoint} failed ({exc.code}): {detail or exc.reason}") from exc
         except URLError as exc:
             raise TrueNASAPIError(f"Quantastor API request to {endpoint} failed: {exc.reason}") from exc
+        except (OSError, HTTPException) as exc:
+            raise TrueNASAPIError(f"Quantastor API request to {endpoint} failed ({type(exc).__name__}).") from exc
+
+        try:
+            payload = body.decode(charset)
+        except (UnicodeError, LookupError) as exc:
+            # Limit codec lookup handling to decode, not unrelated client code.
+            raise TrueNASAPIError(f"Quantastor endpoint {endpoint} returned an undecodable response.") from exc
+
+        # Do not retain the raw response alongside decoded text during parsing.
+        del body
 
         try:
             return json.loads(payload)

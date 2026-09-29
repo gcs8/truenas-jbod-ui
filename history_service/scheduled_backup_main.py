@@ -46,6 +46,7 @@ def main() -> int:
             included_groups=settings.included_groups,
             retention_count=settings.retention_count,
             app_gid=settings.app_gid,
+            archive_format=settings.archive_format,
         )
         result = runner.run_once()
         logger.info(

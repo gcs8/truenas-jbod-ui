@@ -102,7 +102,7 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
     if (url.pathname.startsWith("/api/")) apiRequests.push(`${request.method()} ${url.pathname}${url.search}`);
   });
   page.on("dialog", async (dialog) => {
-    expect(dialog.message()).toContain("Discard unsaved calibration edits");
+    expect(dialog.message()).toContain("You have unsaved changes for this bay. Discard them?");
     if (confirmDiscard) await dialog.accept();
     else await dialog.dismiss();
   });
@@ -182,7 +182,7 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
 
   await expect(page.locator("#enclosure-select")).toHaveValue("view:saved-chassis");
   await expect(page.locator("#enclosure-panel-title")).toHaveText("Saved Chassis");
-  await expect(page.locator("#mapping-health-summary")).toContainText("Saved Chassis: All 1 populated bay is matched.");
+  await expect(page.locator("#mapping-health-summary")).toContainText("Saved Chassis: The only disk is in a known bay.");
   await expect(page.locator("#enclosure-alias-form")).toBeHidden();
   await expect(page.locator("#detail-empty")).toBeVisible();
   await expect(page.locator("#mapping-form")).toBeHidden();

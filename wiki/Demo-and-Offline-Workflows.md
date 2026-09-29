@@ -29,7 +29,7 @@ See [[Public Demo Site|Public-Demo-Site]] for more detail.
 
 ## Add the Demo Builder Seed
 
-Open the admin sidecar and select `Add Demo Builder System`. The action writes these synthetic entries to the mounted local configuration:
+Open Admin and select `Add Demo Builder System`. The action writes these synthetic entries to the mounted local configuration:
 
 - `demo-builder-lab`
 - `demo-builder-lab-chassis`
@@ -38,7 +38,7 @@ Open the admin sidecar and select `Add Demo Builder System`. The action writes t
 - `Demo Boot Pair`
 - `Demo Manual Group`
 
-Use the seed to test the profile builder, saved chassis views, or virtual storage views without connecting a real appliance. Restart the main UI after saving so the runtime selector reloads the system list.
+Use the seed to test the profile builder, saved chassis views, or virtual storage views without connecting a real appliance. The main UI shows the new system after it next handles a page or API request; no restart is needed.
 
 See [[Admin UI and System Setup|Admin-UI-and-System-Setup]] for the setup flow.
 
@@ -52,7 +52,7 @@ See [[History and Snapshot Export|History-and-Snapshot-Export]].
 
 ## Create a debug bundle
 
-Use `Debug Bundle` in the admin sidecar to collect selected configuration, history, logs, and support files. Apply the scrub options that fit the recipient, then inspect the archive before sending it.
+Use `Debug Bundle` in Admin to collect selected configuration, history, logs, and support files. Apply the scrub options that fit the recipient, then inspect the archive before sending it.
 
 A debug bundle is not an HTML viewer and cannot be restored. See [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]].
 

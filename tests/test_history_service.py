@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import errno
+import hashlib
+import io
 import json
 import os
 import re
+import socket
+import shlex
+import shutil
 import sqlite3
 import stat
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import ExitStack, contextmanager
+import urllib.error
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.request_context import request_context
@@ -32,11 +40,18 @@ from history_service.collector import (
     ScopeSnapshot,
 )
 from history_service.config import HistorySettings, get_history_settings
+from history_service.diagnostics import HistorySourceError
 from history_service.domain import MetricSample, SlotStateRecord, build_slot_events, isoformat_utc
-from history_service.migration_lock import history_lock_path, history_write_lock
+from history_service.migration_lock import history_write_lock
 from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.segment_reader import SegmentedHistoryReader
-from history_service.store import DISK_IDENTITY_BACKFILL_USER_VERSION, HistoryStore, SlotStateUpdate
+from history_service.store import (
+    DISK_IDENTITY_BACKFILL_USER_VERSION,
+    RETENTION_WAIT_STATE_NAME,
+    HistoryStore,
+    SlotStateUpdate,
+)
+from history_service.startup import HistoryStartupError, open_history_store_with_retries
 
 
 @contextmanager
@@ -47,6 +62,19 @@ def freeze_operation_bounds_now(now: datetime):
             return now.replace(tzinfo=None) if tz is None else now.astimezone(tz)
 
     with patch("history_service.operation_bounds.datetime", FrozenDateTime):
+        yield
+
+
+@contextmanager
+def freeze_history_store_now(now: datetime):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.fromtimestamp(now.timestamp())
+            return cls.fromtimestamp(now.timestamp(), tz)
+
+    with patch("history_service.store.datetime", FrozenDateTime):
         yield
 
 
@@ -365,10 +393,22 @@ class HistoryConfigTests(unittest.TestCase):
         self.assertEqual(settings.failure_backoff_initial_seconds, 30)
         self.assertEqual(settings.failure_backoff_max_seconds, 900)
 
-    def test_history_settings_default_backup_interval_matches_slow_interval(self) -> None:
+    def test_history_settings_default_backup_footprint_is_documented(self) -> None:
         settings = HistorySettings()
 
-        self.assertEqual(settings.backup_interval_seconds, settings.slow_interval_seconds)
+        self.assertEqual(settings.backup_interval_seconds, 86400)
+        self.assertEqual(settings.backup_retention_count, 7)
+        self.assertEqual(settings.weekly_backup_retention_count, 4)
+        self.assertEqual(settings.monthly_backup_retention_count, 3)
+
+    def test_history_settings_reject_an_unusable_backup_copy_count(self) -> None:
+        with self.assertRaises(ValueError):
+            HistorySettings(backup_retention_count=0)
+
+    def test_history_settings_bound_the_retention_backup_skip_window(self) -> None:
+        self.assertEqual(HistorySettings().retention_backup_skip_max_seconds, 86400)
+        with self.assertRaises(ValueError):
+            HistorySettings(retention_backup_skip_max_seconds=-1)
 
     def test_history_settings_fast_collection_uses_cached_inventory_by_default(self) -> None:
         self.assertFalse(HistorySettings().force_inventory_on_fast_collection)
@@ -550,7 +590,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(health_payload["collector"], expected)
         self.assertEqual(
             set(health_payload),
-            {"status", "collector", "database_size_bytes", *expected},
+            {"status", "detail", "collector", "database_size_bytes"},
         )
         self.assertEqual(overview["collector"], expected)
         for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):
@@ -585,6 +625,32 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         workflow = (service_dir.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("node --check history_service/static/dashboard.js", workflow)
 
+    def test_dashboard_labels_no_sample_metric_timestamps_as_attempts(self) -> None:
+        attempted_at = "2026-09-09T10:00:00+00:00"
+        markup = self._render_dashboard(
+            {
+                "collector_running": True,
+                "collection_running": False,
+                "last_fast_metrics_at": attempted_at,
+                "last_slow_metrics_at": attempted_at,
+            },
+            {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0},
+            [],
+        )
+
+        for label, element_id in (
+            ("Last temperature collection attempt", "status-last-fast-metrics-at"),
+            ("Last full SMART collection attempt", "status-last-slow-metrics-at"),
+        ):
+            with self.subTest(label=label):
+                self.assertRegex(
+                    markup,
+                    rf'<dt>{label}</dt><dd id="{element_id}">'
+                    rf'<time[^>]*datetime="{re.escape(attempted_at)}"[^>]*>.*?</time></dd>',
+                )
+        self.assertNotIn("Last temperature reading", markup)
+        self.assertNotIn("Last full SMART reading", markup)
+
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
         markup = self._render_dashboard(
             {"collector_running": True},
@@ -600,23 +666,27 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertIn('id="history-refresh-full"', markup)
         self.assertIn('src="http://testserver/static/dashboard.js"', markup)
         self.assertIn('href="http://testserver/static/dashboard.css"', markup)
-        self.assertIn('fetch("/api/history/refresh"', script_source)
+        self.assertIn('"/api/history/refresh"', script_source)
+        self.assertIn('id="history-collector-freshness"', markup)
+        self.assertIn("Last checked: page load. Collector status snapshot", markup)
+        self.assertIn('id="history-overview-freshness"', markup)
+        self.assertIn("Last checked: page load. Overview snapshot", markup)
         self.assertIn('body: JSON.stringify({ mode })', script_source)
         self.assertIn("const body = await response.text();", script_source)
         self.assertIn("JSON.parse(body)", script_source)
-        self.assertIn("Next background pass", markup)
-        self.assertIn("Background backoff", markup)
-        self.assertIn("Last collection duration", markup)
-        self.assertIn("Last schedule overrun", markup)
+        self.assertIn("Next scan", markup)
+        self.assertIn("Retry wait after errors", markup)
+        self.assertIn("Last run took", markup)
+        self.assertIn("Ran late by", markup)
         self.assertIn('id="status-last-background-overrun"', markup)
-        self.assertIn("Last retention pass", markup)
+        self.assertIn("Last cleanup", markup)
         self.assertIn('id="status-last-retention-at"', markup)
-        self.assertIn("Last retention rows removed", markup)
+        self.assertIn("Rows removed", markup)
         self.assertIn('id="status-last-retention-rows-removed"', markup)
-        self.assertIn("Last retention failure", markup)
+        self.assertIn("Cleanup error", markup)
         self.assertIn('id="status-last-retention-error"', markup)
-        self.assertIn("Last collection inventory", markup)
-        self.assertIn("DB Size", markup)
+        self.assertIn("Last scan used", markup)
+        self.assertIn("Database size", markup)
         self.assertIn("collector-activity-banner", markup)
         self.assertIn("pollCollectorStatus", script_source)
         self.assertIn("pollOverviewStatus", script_source)
@@ -640,7 +710,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertNotIn('id="history-refresh-fast"', markup)
         self.assertNotIn('id="history-refresh-full"', markup)
         self.assertNotIn("synthetic-token", markup)
-        self.assertIn("authenticated main UI", markup)
+        self.assertIn("Refresh from the main page", markup)
 
     def test_dashboard_omits_release_link_for_non_http_urls(self) -> None:
         markup = self._render_dashboard(
@@ -699,10 +769,10 @@ class HistoryDashboardRouteTests(unittest.TestCase):
 
         self.assertRegex(
             markup,
-            r'id="collector-activity-banner"[^>]*>\s*History background collection is backed off for 2m 5s '
+            r'id="collector-activity-banner"[^>]*>\s*History collection paused for 2m 5s '
             r'after repeated failures\.',
         )
-        self.assertRegex(markup, r'id="status-current-collection">\s*not running')
+        self.assertRegex(markup, r'id="status-current-collection">\s*no')
 
     def test_dashboard_bootstrap_is_script_safe_and_round_trips(self) -> None:
         hostile_text = "</script><script>alert('&')</script>" + chr(0x2028) + chr(0x2029)
@@ -878,6 +948,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 "status",
                 return_value={
                     "collector_running": True,
+                    "collection_running": False,
                     "last_error": "POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s",
                     "source_base_url": "https://collector.status-leak-ZXQ9.example.test",
                     "sqlite_path": "/synthetic/private/status-leak-ZXQ9/history.db",
@@ -889,7 +960,19 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             patch.object(history_main.store, "list_scopes", return_value=[]),
             patch.object(history_main.logger, "exception"),
         ):
-            response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
+            with (
+                patch.object(history_main.store, "database_size_bytes", return_value=0),
+                patch.object(
+                    history_main,
+                    "database_disk_metrics",
+                    return_value={
+                        "reclaimable_bytes": 0,
+                        "main_file_size_bytes": 0,
+                        "backup_footprint": {"copies": 0, "bytes": 0},
+                    },
+                ),
+            ):
+                response = asyncio.run(route.endpoint(request=self._refresh_request("full")))
 
         run_once.assert_awaited_once_with(
             force_fast=True,
@@ -902,10 +985,20 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["mode"], "full")
         self.assertEqual(payload["detail"], "History full refresh failed; see service logs.")
+        fixture = Path(__file__).parent / "fixtures" / "history_refresh_failure.json"
+        refresh_block = payload.pop("refresh")
+        self.assertEqual(payload, json.loads(fixture.read_text(encoding="utf-8")))
+        self.assertEqual(
+            refresh_block["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertGreater(refresh_block["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(refresh_block["full_refresh_available_at"], str)
         self.assertEqual(
             payload["collector"],
             {
                 "collector_running": True,
+                "collection_running": False,
                 "last_error": "History full refresh failed; see service logs.",
             },
         )
@@ -1037,6 +1130,54 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                     f"{route_path} executed a HistoryStore read on the event-loop thread",
                 )
 
+    def test_slot_history_routes_pass_since_to_the_store_as_utc(self) -> None:
+        route_cases = (
+            (
+                "/api/history/slots/{slot}/metrics",
+                "list_metric_samples",
+                [],
+                {"metric_name": None, "limit": 500},
+            ),
+            (
+                "/api/history/slots/{slot}/bundle",
+                "get_slot_history_bundle",
+                {"events": [], "metrics": {}},
+                {"event_limit": 12},
+            ),
+        )
+        for route_path, method_name, result, extra_kwargs in route_cases:
+            route = next(
+                route
+                for route in history_main.app.routes
+                if getattr(route, "path", None) == route_path
+            )
+            with self.subTest(route=route_path):
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    asyncio.run(
+                        route.endpoint(
+                            slot=5,
+                            system_id="archive-core",
+                            enclosure_id="front",
+                            since="2026-04-16T23:00:00+02:00",
+                            **extra_kwargs,
+                        )
+                    )
+                self.assertEqual(store_call.call_args.kwargs["since"], "2026-04-16T21:00:00+00:00")
+
+                with patch.object(history_main.store, method_name, return_value=result) as store_call:
+                    with self.assertRaises(HTTPException) as caught:
+                        asyncio.run(
+                            route.endpoint(
+                                slot=5,
+                                system_id="archive-core",
+                                enclosure_id="front",
+                                since="2026-04-16T23:00:00",
+                                **extra_kwargs,
+                            )
+                        )
+                self.assertEqual(caught.exception.status_code, 422)
+                store_call.assert_not_called()
+
     def test_history_fetch_json_timeout_reports_url_and_timeout(self) -> None:
         collector = HistoryCollector(
             HistorySettings(source_base_url="http://enclosure-ui:8000", request_timeout_seconds=7),
@@ -1077,7 +1218,954 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-request-id"), "d" * 32)
 
 
+class HistoryPublicationDurabilityTests(unittest.TestCase):
+    """Real SQLite/rename/fsync probes; not a power-loss simulation."""
+
+    @contextmanager
+    def _observe_publication(self, store, *, fail_syncs=()):
+        events = []
+        real_sync = os.fsync
+        real_rename = store._rename_at2
+        real_unlink = os.unlink
+        directory_syncs = 0
+
+        def sync(fd):
+            nonlocal directory_syncs
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+            events.append((kind, path))
+            if kind == "directory":
+                directory_syncs += 1
+                if directory_syncs in fail_syncs:
+                    raise OSError(errno.EIO, f"injected directory sync {directory_syncs}")
+            real_sync(fd)
+
+        def rename(source, target, *, flags):
+            real_rename(source, target, flags=flags)
+            events.append(("rename", source, target, flags))
+
+        def unlink(path, *, dir_fd=None):
+            resolved = Path(path)
+            if dir_fd is not None:
+                resolved = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
+            events.append(("unlink", resolved))
+            if dir_fd is None:
+                real_unlink(path)
+            else:
+                real_unlink(path, dir_fd=dir_fd)
+
+        with (
+            patch("history_service.store.os.fsync", side_effect=sync),
+            patch.object(store, "_rename_at2", side_effect=rename),
+            patch("history_service.store.os.unlink", side_effect=unlink),
+        ):
+            yield events
+
+    def _seed(self, root):
+        store = HistoryStore(str(root / "history.db"))
+        with closing(sqlite3.connect(store.file_path)) as connection:
+            connection.execute("CREATE TABLE synthetic_publication (value TEXT)")
+            connection.execute("INSERT INTO synthetic_publication VALUES ('prior')")
+            connection.commit()
+        return store
+
+    def _change(self, store):
+        with closing(sqlite3.connect(store.file_path)) as connection:
+            connection.execute("UPDATE synthetic_publication SET value = 'successor'")
+            connection.commit()
+
+    def _value(self, path):
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            return connection.execute("SELECT value FROM synthetic_publication").fetchone()[0]
+
+    @contextmanager
+    def _observe_directory_entries(self, store):
+        real_mkdir = os.mkdir
+        real_rename = store._rename_at2
+        real_local_prune = store._prune_backup_snapshots
+        real_archive_prune = store._prune_named_backups
+        with self._observe_publication(store) as events:
+            observed_rename = store._rename_at2
+
+            def mkdir(path, mode=0o777, *, dir_fd=None):
+                real_mkdir(path, mode, dir_fd=dir_fd)
+                resolved = Path(path) if dir_fd is None else Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
+                events.append(("created-directory", resolved))
+
+            def rename(source, target, *, flags):
+                if source.is_dir():
+                    real_rename(source, target, flags=flags)
+                    events.append(("created-directory", target))
+                else:
+                    observed_rename(source, target, flags=flags)
+
+            def local_prune(*args):
+                path, count = args[-2:]
+                events.append(("prune", path))
+                return real_local_prune(*args)
+
+            def archive_prune(path, pattern, count):
+                events.append(("prune", path))
+                return real_archive_prune(path, pattern, count)
+
+            with (
+                patch("history_service.store.os.mkdir", side_effect=mkdir),
+                patch.object(store, "_rename_at2", side_effect=rename),
+                patch.object(store, "_prune_backup_snapshots", local_prune),
+                patch.object(store, "_prune_named_backups", side_effect=archive_prune),
+            ):
+                yield events
+
+    @contextmanager
+    def _fail_entry_parent(self, parent):
+        real_sync = os.fsync
+        attempts = []
+
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and Path(os.readlink(f"/proc/self/fd/{fd}")) == parent:
+                attempts.append(parent)
+                raise OSError(errno.EIO, "injected new-directory parent sync")
+            real_sync(fd)
+
+        with patch("history_service.store.os.fsync", side_effect=sync):
+            yield attempts
+
+    def _production_runtime(self):
+        # Execute unchanged construction bodies without importing app startup.
+        from history_service.startup import DEFAULT_ATTEMPTS, DEFAULT_INITIAL_BACKOFF_SECONDS
+        from history_service.startup_migration import open_history_store_after_recovery
+
+        source = Path(history_store.__file__).with_name("main.py")
+        names = {"build_history_store", "_configured_history_directory", "open_history_runtime"}
+        functions = [node for node in ast.parse(source.read_bytes()).body
+                     if isinstance(node, ast.FunctionDef) and node.name in names]
+        self.assertEqual({node.name for node in functions}, names)
+        namespace: dict[str, Any] = dict(
+            HistorySettings=HistorySettings, HistoryStore=HistoryStore,
+            get_history_settings=get_history_settings, Path=Path, os=os, time=time,
+            Callable=Any, DEFAULT_ATTEMPTS=DEFAULT_ATTEMPTS,
+            DEFAULT_INITIAL_BACKOFF_SECONDS=DEFAULT_INITIAL_BACKOFF_SECONDS,
+            open_history_store_with_retries=open_history_store_with_retries,
+            open_history_store_after_recovery=open_history_store_after_recovery,
+        )
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+        get_history_settings.cache_clear()
+        try:
+            return namespace["open_history_runtime"](attempts=1, initial_backoff_seconds=0)
+        finally:
+            get_history_settings.cache_clear()
+
+    def _loaded_backup(self, settings, store):
+        return store.create_backup(
+            settings.backup_dir, snapshot_label="2030-01-01T00:00:00Z", retention_count=1,
+            long_term_backup_dir=settings.long_term_backup_dir,
+            weekly_retention_count=1, monthly_retention_count=1,
+        )
+
+    def test_production_loader_preserves_directory_entry_obligations(self):
+        for layout in ("separate", "nested", "default-existing-db", "default-fresh-db",
+                       "nested-database", "database-inside-backup", "existing"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                db = root / "history.db"
+                if layout not in ("default-fresh-db", "nested-database", "database-inside-backup"):
+                    self._seed(root)
+                default = layout.startswith("default")
+                local = root / "backups" if default else root / "local"
+                archive = local / "long-term" if default else root / "archive"
+                if layout == "nested":
+                    local, archive = root / "one" / "local", root / "two" / "archive"
+                elif layout == "nested-database":
+                    db = root / "new" / "database" / "history.db"
+                    local, archive = db.parent / "backups", db.parent / "backups" / "long-term"
+                elif layout == "database-inside-backup":
+                    db = local / "database" / "history.db"
+                destinations = [local, archive / "weekly", archive / "monthly"]
+                if layout == "existing":
+                    for directory in destinations:
+                        directory.mkdir(parents=True, exist_ok=True)
+                required = set()
+                for directory in destinations:
+                    while not directory.exists():
+                        required.add(directory)
+                        directory = directory.parent
+                env = {"HISTORY_SQLITE_PATH": str(db), "RELEASE_CHECK_ENABLED": "false"}
+                if not default:
+                    env.update(HISTORY_BACKUP_DIR=str(local), HISTORY_LONG_TERM_BACKUP_DIR=str(archive))
+                # Observe before the real settings loader, not only create_backup.
+                with patch.dict(os.environ, env, clear=True), self._observe_directory_entries(HistoryStore) as events:
+                    settings, store = self._production_runtime()
+                    result = self._loaded_backup(settings, store)
+                    events.append(("return", result))
+                for directory in required:
+                    created = next(i for i, event in enumerate(events) if event == ("created-directory", directory))
+                    barrier = next((i for i, event in enumerate(events)
+                                    if i > created and event == ("directory", directory.parent)), None)
+                    self.assertIsNotNone(barrier, f"loader-created entry lacks parent barrier: {directory}")
+                    assert barrier is not None
+                    prunes = [i for i, event in enumerate(events)
+                              if event[0] == "prune" and event[1].is_relative_to(directory)]
+                    self.assertTrue(prunes)
+                    self.assertLess(barrier, min(prunes))
+                allowed = {directory.parent for directory in required} | set(destinations)
+                for event in events:
+                    if event[0] == "directory":
+                        self.assertTrue(event[1] in allowed or event[1].name.startswith(".history-"), event)
+                for directory in destinations:
+                    snapshot, = directory.glob("*.sqlite3")
+                    with closing(sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)) as connection:
+                        self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+                        self.assertGreater(connection.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
+
+    def test_production_loader_local_barrier_failure_retries_without_ack_or_prune(self):
+        for defaults in (False, True):
+            for position in range(2 if not defaults else 1):
+                with self.subTest(defaults=defaults, position=position), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._seed(root)
+                    local = root / "backups" if defaults else root / "one" / "local"
+                    parent = local.parent if position == 0 else root
+                    env = {"HISTORY_SQLITE_PATH": str(root / "history.db"), "RELEASE_CHECK_ENABLED": "false"}
+                    if not defaults:
+                        env.update(HISTORY_BACKUP_DIR=str(local), HISTORY_LONG_TERM_BACKUP_DIR=str(root / "archive"))
+                    with patch.dict(os.environ, env, clear=True):
+                        for attempt in range(2):
+                            # Loader preparation leaves the barrier to the operation.
+                            with self._fail_entry_parent(parent) as failures:
+                                settings, store = self._production_runtime()
+                                with patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune:
+                                    with self.assertRaisesRegex(OSError, "injected new-directory parent sync"):
+                                        self._loaded_backup(settings, store)
+                            self.assertEqual(failures, [parent], f"fresh runtime retry {attempt}")
+                            prune.assert_not_called()
+                            self.assertEqual(list(local.glob("*.sqlite3")), [])
+                        settings, store = self._production_runtime()
+                        with self._observe_directory_entries(store) as events:
+                            result = self._loaded_backup(settings, store)
+                        self.assertIn(("directory", parent), events)
+                        self.assertEqual(self._value(result), "prior")
+
+    def test_production_loader_archive_barrier_remains_best_effort_across_retries(self):
+        for period in ("weekly", "monthly"):
+            for position in range(3):
+                with self.subTest(period=period, position=position), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._seed(root)
+                    local = root / "local"
+                    local.mkdir()
+                    archive = root / "one" / "archive"
+                    chain = [root / "one", archive, archive / period]
+                    parent = chain[position].parent
+                    env = {"HISTORY_SQLITE_PATH": str(root / "history.db"),
+                           "HISTORY_BACKUP_DIR": str(local), "HISTORY_LONG_TERM_BACKUP_DIR": str(archive),
+                           "RELEASE_CHECK_ENABLED": "false"}
+                    with patch.dict(os.environ, env, clear=True):
+                        for attempt in range(2):
+                            with self._fail_entry_parent(parent) as failures:
+                                settings, store = self._production_runtime()
+                                with patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune:
+                                    with self.assertLogs("history_service.store", level="WARNING"):
+                                        result = store.create_backup(
+                                            settings.backup_dir, snapshot_label="2030-01-01T00:00:00Z",
+                                            long_term_backup_dir=settings.long_term_backup_dir,
+                                            weekly_retention_count=int(period == "weekly"),
+                                            monthly_retention_count=int(period == "monthly"),
+                                        )
+                            self.assertEqual(failures, [parent], f"fresh runtime archive retry {attempt}")
+                            prune.assert_not_called()
+                            self.assertEqual(self._value(result), "prior")
+                        settings, store = self._production_runtime()
+                        with self._observe_directory_entries(store) as events:
+                            result = self._loaded_backup(settings, store)
+                        self.assertIn(("directory", parent), events)
+                        self.assertEqual(self._value(result), "prior")
+                        self.assertEqual(self._value(next(chain[-1].glob("*.sqlite3"))), "prior")
+
+    def test_loader_preparation_failure_never_adopts_unmarked_created_roots(self):
+        for boundary in ("marker-open", "marker-sync", "staging-sync", "install"):
+            for after in (False, True):
+                with self.subTest(boundary=boundary, after=after), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self._seed(root)
+                    local = root / "one" / "local"
+                    env = {"HISTORY_SQLITE_PATH": str(root / "history.db"),
+                           "HISTORY_BACKUP_DIR": str(local), "HISTORY_LONG_TERM_BACKUP_DIR": str(root / "archive"),
+                           "RELEASE_CHECK_ENABLED": "false"}
+                    real_open, real_sync, real_rename = os.open, os.fsync, HistoryStore._rename_at2
+                    hits = []
+
+                    def fail():
+                        hits.append(boundary)
+                        raise OSError(errno.EIO, "injected loader preparation")
+
+                    def open_file(path, flags, mode=0o777, *, dir_fd=None):
+                        match = boundary == "marker-open" and Path(path).name == ".history-backup-directory-pending" and not hits
+                        if match and not after:
+                            fail()
+                        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                        if match and after:
+                            os.close(fd)
+                            fail()
+                        return fd
+
+                    def sync(fd):
+                        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+                        match = ((boundary == "marker-sync" and path.name == ".history-backup-directory-pending")
+                                 or (boundary == "staging-sync" and path.name.startswith(".history-directory-"))) and not hits
+                        if match and not after:
+                            fail()
+                        real_sync(fd)
+                        if match and after:
+                            fail()
+
+                    def rename(source, target, *, flags):
+                        match = boundary == "install" and target == root / "one" and not hits
+                        if match and not after:
+                            fail()
+                        real_rename(source, target, flags=flags)
+                        if match and after:
+                            fail()
+
+                    with patch.dict(os.environ, env, clear=True):
+                        with (patch("os.open", side_effect=open_file), patch("os.fsync", side_effect=sync),
+                              patch.object(HistoryStore, "_rename_at2", side_effect=rename)):
+                            with self.assertRaises((OSError, HistoryStartupError)):
+                                self._production_runtime()
+                        self.assertEqual(hits, [boundary])
+                        self.assertEqual(list(local.glob("*.sqlite3")), [])
+                        if (root / "one").exists():
+                            self.assertTrue((root / "one" / ".history-backup-directory-pending").is_file())
+                        # A fresh loader and store must still pay the root barrier.
+                        with self._fail_entry_parent(root) as failures:
+                            settings, store = self._production_runtime()
+                            with self.assertRaisesRegex(OSError, "injected new-directory parent sync"):
+                                self._loaded_backup(settings, store)
+                        self.assertEqual(failures, [root])
+                        settings, store = self._production_runtime()
+                        self.assertEqual(self._value(self._loaded_backup(settings, store)), "prior")
+
+    def test_production_construction_retries_every_sync_and_destructive_boundary(self):
+        def run(failed=None, after=False):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._seed(root)
+                local, archive = root / "one" / "local", root / "two" / "archive"
+                env = {"HISTORY_SQLITE_PATH": str(root / "history.db"),
+                       "HISTORY_BACKUP_DIR": str(local), "HISTORY_LONG_TERM_BACKUP_DIR": str(archive),
+                       "RELEASE_CHECK_ENABLED": "false"}
+                events, hits, prunes = [], [], []
+                phase = "loader"
+                real_sync, real_rename, real_unlink = os.fsync, HistoryStore._rename_at2, os.unlink
+                real_local_prune, real_archive_prune = HistoryStore._prune_backup_snapshots, HistoryStore._prune_named_backups
+
+                def boundary(kind, path, operation):
+                    events.append((phase, kind, path))
+                    match = len(events) == failed
+                    if match and not after:
+                        hits.append(events[-1])
+                        raise OSError(errno.EIO, "injected construction boundary")
+                    result = operation()
+                    if match and after:
+                        hits.append(events[-1])
+                        raise OSError(errno.EIO, "injected construction boundary")
+                    return result
+
+                def sync(fd):
+                    return boundary("sync", Path(os.readlink(f"/proc/self/fd/{fd}")), lambda: real_sync(fd))
+
+                def rename(source, target, *, flags):
+                    return boundary("rename", target, lambda: real_rename(source, target, flags=flags))
+
+                def unlink(path, *, dir_fd=None):
+                    resolved = Path(path) if dir_fd is None else Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
+                    return boundary("unlink", resolved, lambda: real_unlink(path, dir_fd=dir_fd))
+
+                def local_prune(store, path, count):
+                    prunes.append(path)
+                    return real_local_prune(store, path, count)
+
+                def archive_prune(path, pattern, count):
+                    prunes.append(path)
+                    return real_archive_prune(path, pattern, count)
+
+                result = None
+                with patch.dict(os.environ, env, clear=True):
+                    with (patch("os.fsync", side_effect=sync), patch("os.unlink", side_effect=unlink),
+                          patch.object(HistoryStore, "_rename_at2", side_effect=rename),
+                          patch.object(HistoryStore, "_prune_backup_snapshots", local_prune),
+                          patch.object(HistoryStore, "_prune_named_backups", side_effect=archive_prune),
+                          patch.object(history_store.logger, "warning") as warnings):
+                        try:
+                            settings, store = self._production_runtime()
+                            phase = "backup"
+                            result = self._loaded_backup(settings, store)
+                        except (OSError, HistoryStartupError):
+                            self.assertIsNotNone(failed)
+                    if failed is None:
+                        self.assertEqual(self._value(result), "prior")
+                        warnings.assert_not_called()
+                        return len(events)
+                    self.assertEqual(len(hits), 1)
+                    if hits[0][0] == "loader":
+                        self.assertIsNone(result)
+                        self.assertEqual(prunes, [])
+                    elif hits[0][2].is_relative_to(root / "one") or (hits[0][2] == root and local not in prunes):
+                        # A failed local publication cannot earn prune credit.
+                        self.assertIsNone(result)
+                        self.assertEqual(prunes, [])
+                    else:
+                        self.assertEqual(self._value(result), "prior")
+                    pending = [marker.parent for marker in root.rglob(".history-backup-directory-pending")
+                               if not marker.parent.name.startswith(".history-")]
+                    # Cache eviction plus a new store must not forget any entry
+                    # installed before the interrupted loader/operation returned.
+                    with self._observe_directory_entries(HistoryStore) as retry:
+                        settings, store = self._production_runtime()
+                        result = self._loaded_backup(settings, store)
+                    for directory in pending:
+                        self.assertIn(("directory", directory.parent), retry)
+                        self.assertFalse((directory / ".history-backup-directory-pending").exists())
+                    for directory in (local, archive / "weekly", archive / "monthly"):
+                        snapshot, = directory.glob("*.sqlite3")
+                        self.assertEqual(self._value(snapshot), "prior")
+                return len(events)
+
+        count = run()
+        self.assertGreater(count, 20)
+        for failed in range(1, count + 1):
+            for after in (False, True):
+                with self.subTest(failed=failed, after=after):
+                    run(failed, after)
+
+    def test_loader_pending_markers_refuse_invalid_entries_and_preserve_concurrent_creation(self):
+        marker_name = ".history-backup-directory-pending"
+        for kind in ("contents", "directory", "symlink", "hardlink", "concurrent"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._seed(root)
+                local = root / "local"
+                env = {"HISTORY_SQLITE_PATH": str(root / "history.db"),
+                       "HISTORY_BACKUP_DIR": str(local), "HISTORY_LONG_TERM_BACKUP_DIR": str(root / "archive"),
+                       "RELEASE_CHECK_ENABLED": "false"}
+                if kind != "concurrent":
+                    local.mkdir()
+                    marker = local / marker_name
+                    if kind == "contents":
+                        marker.write_bytes(b"invalid")
+                    elif kind == "directory":
+                        marker.mkdir()
+                    else:
+                        source = root / "synthetic-marker"
+                        source.touch()
+                        if kind == "symlink":
+                            marker.symlink_to(source)
+                        else:
+                            os.link(source, marker)
+                    before = marker.lstat()
+                    with patch.dict(os.environ, env, clear=True):
+                        with self.assertRaisesRegex(ValueError, "invalid directory marker"):
+                            self._production_runtime()
+                    self.assertEqual(marker.lstat(), before)
+                    self.assertEqual(list(local.glob("*.sqlite3")), [])
+                else:
+                    real_rename = HistoryStore._rename_at2
+                    winners = []
+
+                    def rename(source, target, *, flags):
+                        if target == local and not winners:
+                            # A second real loader prepares the winning root.
+                            winners.append(target)
+                            get_history_settings.cache_clear()
+                            get_history_settings()
+                        return real_rename(source, target, flags=flags)
+
+                    with patch.dict(os.environ, env, clear=True):
+                        with patch.object(HistoryStore, "_rename_at2", side_effect=rename):
+                            settings, store = self._production_runtime()
+                        self.assertEqual(winners, [local])
+                        self.assertTrue((local / marker_name).is_file())
+                        with self._fail_entry_parent(root) as failures:
+                            with self.assertRaisesRegex(OSError, "injected new-directory parent sync"):
+                                self._loaded_backup(settings, store)
+                        self.assertEqual(failures, [root])
+                        settings, store = self._production_runtime()
+                        self.assertEqual(self._value(self._loaded_backup(settings, store)), "prior")
+                        self.assertEqual(list(root.glob(".history-directory-*")), [])
+
+    def test_long_term_invalid_marker_is_contained_by_best_effort_promotion(self):
+        marker_name = ".history-backup-directory-pending"
+        for kind in ("contents", "directory", "symlink", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._seed(root)
+                local = root / "local"
+                archive = root / "archive"
+                archive.mkdir()
+                marker = archive / marker_name
+                source = root / "synthetic-marker"
+                if kind == "contents":
+                    marker.write_bytes(b"invalid")
+                elif kind == "directory":
+                    marker.mkdir()
+                else:
+                    source.write_bytes(b"synthetic")
+                    if kind == "symlink":
+                        marker.symlink_to(source)
+                    else:
+                        os.link(source, marker)
+                before = marker.lstat()
+                env = {
+                    "HISTORY_SQLITE_PATH": str(root / "history.db"),
+                    "HISTORY_BACKUP_DIR": str(local),
+                    "HISTORY_LONG_TERM_BACKUP_DIR": str(archive),
+                    "RELEASE_CHECK_ENABLED": "false",
+                }
+
+                with patch.dict(os.environ, env, clear=True):
+                    settings, store = self._production_runtime()
+                    with patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune:
+                        with self.assertLogs("history_service.store", level="WARNING") as logs:
+                            result = self._loaded_backup(settings, store)
+
+                self.assertEqual(self._value(result), "prior")
+                self.assertTrue(any("long-term backup promotion failed" in line for line in logs.output))
+                self.assertEqual(marker.lstat(), before)
+                if kind == "contents":
+                    self.assertEqual(marker.read_bytes(), b"invalid")
+                elif kind in {"symlink", "hardlink"}:
+                    self.assertEqual(source.read_bytes(), b"synthetic")
+                self.assertEqual(list(archive.rglob("*.sqlite3")), [])
+                prune.assert_not_called()
+
+    def test_public_backup_persists_only_new_directory_entry_chains(self):
+        cases = (
+            (0, None, (), False),
+            (1, None, (), False),
+            (2, None, (), False),
+            (0, 0, ("weekly",), False),
+            (0, 0, ("monthly",), False),
+            (0, 1, ("weekly", "monthly"), False),
+            (0, 2, ("weekly", "monthly"), False),
+            (0, 0, ("weekly", "monthly"), True),
+        )
+        for local_depth, archive_depth, periods, existing_periods in cases:
+            with self.subTest(case=(local_depth, archive_depth, periods, existing_periods)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                local = root / "local-parent" / "local" if local_depth == 2 else root / "local"
+                if local_depth == 0:
+                    local.mkdir()
+                archive = root / "archive-parent" / "archive" if archive_depth == 2 else root / "archive"
+                if archive_depth == 0:
+                    archive.mkdir()
+                if existing_periods:
+                    for period in periods:
+                        (archive / period).mkdir()
+                destinations = [local, *(archive / period for period in periods)]
+                required = set()
+                for destination in destinations:
+                    while not destination.exists():
+                        required.add(destination)
+                        destination = destination.parent
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(
+                        local, snapshot_label="2030-01-01T00:00:00Z", retention_count=1,
+                        long_term_backup_dir=archive if periods else None,
+                        weekly_retention_count=int("weekly" in periods),
+                        monthly_retention_count=int("monthly" in periods),
+                    )
+                    events.append(("return", result))
+                for directory in required:
+                    created = next(i for i, event in enumerate(events) if event == ("created-directory", directory))
+                    barrier = next((i for i, event in enumerate(events) if i > created and event == ("directory", directory.parent)), None)
+                    self.assertIsNotNone(barrier, f"new directory entry lacks parent barrier: {directory}")
+                    assert barrier is not None
+                    relevant_prunes = [i for i, event in enumerate(events) if event[0] == "prune" and event[1].is_relative_to(directory)]
+                    self.assertTrue(relevant_prunes)
+                    self.assertLess(barrier, min(relevant_prunes))
+                # No attempt to repair arbitrary pre-existing ancestors.
+                allowed = {directory.parent for directory in required} | set(destinations)
+                for event in events:
+                    if event[0] == "directory":
+                        self.assertTrue(event[1] in allowed or event[1].name.startswith(".history-"), event)
+                for destination in destinations:
+                    snapshots = list(destination.glob("*.sqlite3"))
+                    self.assertEqual(len(snapshots), 1)
+                    self.assertEqual(self._value(snapshots[0]), "prior")
+
+    def test_new_local_entry_failure_refuses_pruning_and_retries_in_fresh_store(self):
+        for position in range(3):
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                chain = [root / "one", root / "one" / "two", root / "one" / "two" / "local"]
+                failed_parent = chain[position].parent
+                for attempt in range(2):
+                    store = HistoryStore(str(store.file_path))
+                    with (
+                        self._fail_entry_parent(failed_parent) as failures,
+                        patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                        self.assertRaisesRegex(OSError, "injected new-directory parent sync"),
+                    ):
+                        store.create_backup(chain[-1], snapshot_label="2030-01-01T00:00:00Z")
+                    self.assertEqual(failures, [failed_parent], f"fresh retry {attempt} skipped its failed entry")
+                    prune.assert_not_called()
+                    self.assertEqual(list(chain[-1].glob("*.sqlite3")), [])
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(chain[-1], snapshot_label="2030-01-01T00:00:00Z")
+                self.assertIn(("directory", failed_parent), events)
+                self.assertEqual(self._value(result), "prior")
+                # Once acknowledged, an ordinary repeat must not sync ancestors.
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    store.create_backup(chain[-1], snapshot_label="2030-01-02T00:00:00Z", retention_count=1)
+                self.assertNotIn(("directory", failed_parent), events)
+
+    def test_new_archive_entry_failure_keeps_local_backup_and_retries_in_fresh_store(self):
+        for period in ("weekly", "monthly"):
+            for position in range(3):
+                with self.subTest(period=period, position=position), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    store = self._seed(root)
+                    local = root / "local"
+                    local.mkdir()
+                    archive = root / "one" / "archive"
+                    chain = [root / "one", archive, archive / period]
+                    failed_parent = chain[position].parent
+                    options: dict[str, Any] = dict(long_term_backup_dir=archive, weekly_retention_count=0, monthly_retention_count=0)
+                    options[f"{period}_retention_count"] = 1
+                    for attempt in range(2):
+                        store = HistoryStore(str(store.file_path))
+                        with (
+                            self._fail_entry_parent(failed_parent) as failures,
+                            patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                            self.assertLogs("history_service.store", level="WARNING"),
+                        ):
+                            result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z", **options)
+                        self.assertEqual(failures, [failed_parent], f"fresh archive retry {attempt} skipped its failed entry")
+                        prune.assert_not_called()
+                        self.assertEqual(self._value(result), "prior")
+                        self.assertEqual(list(chain[-1].glob("*.sqlite3")), [])
+                    store = HistoryStore(str(store.file_path))
+                    with self._observe_directory_entries(store) as events:
+                        result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z", **options)
+                    self.assertIn(("directory", failed_parent), events)
+                    self.assertEqual(self._value(result), "prior")
+                    self.assertEqual(self._value(next(chain[-1].glob("*.sqlite3"))), "prior")
+
+    def test_new_directory_preparation_and_marker_retirement_fail_closed(self):
+        for boundary in ("marker-sync", "staging-sync", "install", "marker-unlink"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                local = root / "local"
+                real_sync, real_rename, real_unlink = os.fsync, store._rename_at2, os.unlink
+                failures = []
+
+                def fail():
+                    failures.append(boundary)
+                    raise OSError(errno.EIO, "injected directory preparation failure")
+
+                def sync(fd):
+                    path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+                    is_directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+                    if boundary == "marker-sync" and path.name == ".history-backup-directory-pending":
+                        fail()
+                    if boundary == "staging-sync" and is_directory and path.name.startswith(".history-directory-"):
+                        fail()
+                    return real_sync(fd)
+
+                def rename(source, target, *, flags):
+                    if boundary == "install" and target == local:
+                        fail()
+                    return real_rename(source, target, flags=flags)
+
+                def unlink(path, *, dir_fd=None):
+                    if boundary == "marker-unlink" and Path(path) == local / ".history-backup-directory-pending":
+                        fail()
+                    return real_unlink(path, dir_fd=dir_fd)
+
+                with (
+                    patch("history_service.store.os.fsync", side_effect=sync),
+                    patch.object(store, "_rename_at2", side_effect=rename),
+                    patch("history_service.store.os.unlink", side_effect=unlink),
+                    patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                    self.assertRaisesRegex(OSError, "injected directory preparation failure"),
+                ):
+                    store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z")
+                self.assertEqual(failures, [boundary])
+                prune.assert_not_called()
+                self.assertEqual(list(local.glob("*.sqlite3")), [])
+                self.assertEqual(local.exists(), boundary == "marker-unlink")
+                self.assertEqual(list(root.glob(".history-directory-*")), [])
+                store = HistoryStore(str(store.file_path))
+                with self._observe_directory_entries(store) as events:
+                    result = store.create_backup(local, snapshot_label="2030-01-01T00:00:00Z")
+                self.assertIn(("directory", root), events)
+                self.assertEqual(self._value(result), "prior")
+
+    def test_local_publication_syncs_file_and_both_parents_before_retirement(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                self._change(store)
+                with self._observe_publication(store) as events:
+                    result = store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                rename_index = next(i for i, event in enumerate(events) if event[0] == "rename")
+                rename = events[rename_index]
+                self.assertEqual(rename[3], 2 if existing else 1)
+                self.assertTrue(any(event[0] == "file" for event in events[:rename_index]))
+                barriers = events[rename_index + 1:rename_index + 3]
+                self.assertEqual(barriers, [("directory", rename[1].parent), ("directory", rename[2].parent)])
+                unlinks = [i for i, event in enumerate(events) if event[0] == "unlink"]
+                self.assertTrue(unlinks)
+                self.assertGreater(min(unlinks), rename_index + 2)
+                self.assertEqual(self._value(result), "successor")
+                if not existing:
+                    self.assertFalse(prior.exists())
+
+    def test_local_directory_sync_failures_preserve_prior_and_gate_pruning(self):
+        for existing in (False, True):
+            for failed in (1, 2):
+                with self.subTest(existing=existing, failed=failed), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    store = self._seed(root)
+                    prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                    before = prior.read_bytes()
+                    self._change(store)
+                    label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                    with (
+                        self._observe_publication(store, fail_syncs=(failed,)),
+                        patch.object(store, "_prune_backup_snapshots", wraps=store._prune_backup_snapshots) as prune,
+                        self.assertRaisesRegex(OSError, "injected directory sync"),
+                    ):
+                        store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                    prune.assert_not_called()
+                    self.assertEqual(prior.read_bytes(), before)
+                    self.assertEqual(self._value(prior), "prior")
+                    self.assertEqual(list((root / "backups").glob("*.sqlite3")), [prior])
+
+    def test_promotion_durability_and_failures_gate_weekly_and_monthly_pruning(self):
+        for period in ("weekly", "monthly"):
+            for existing in (False, True):
+                for failed in (None, 1, 2):
+                    with self.subTest(period=period, existing=existing, failed=failed), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        store = self._seed(root)
+                        source = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                        options = dict(long_term_backup_dir=root / "archive", weekly_retention_count=0, monthly_retention_count=0)
+                        options[f"{period}_retention_count"] = 1
+                        store._promote_long_term_backups(source, snapshot_label="2030-01-01T00:00:00Z", **options)
+                        prior = next((root / "archive" / period).glob("*.sqlite3"))
+                        before = prior.read_bytes()
+                        self._change(store)
+                        source = store.create_backup(root / "backups", snapshot_label="2030-03-01T00:00:00Z")
+                        label = "2030-01-01T00:00:00Z" if existing else "2030-03-01T00:00:00Z"
+                        with (
+                            self._observe_publication(store, fail_syncs=(() if failed is None else (failed,))) as events,
+                            patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                        ):
+                            if failed is None:
+                                store._promote_long_term_backups(source, snapshot_label=label, **options)
+                            else:
+                                with self.assertRaisesRegex(OSError, "injected directory sync"):
+                                    store._promote_long_term_backups(source, snapshot_label=label, **options)
+                        if failed is not None:
+                            prune.assert_not_called()
+                            self.assertEqual(prior.read_bytes(), before)
+                            self.assertEqual(self._value(prior), "prior")
+                        else:
+                            prune.assert_called_once()
+                            index = next(i for i, event in enumerate(events) if event[0] == "rename")
+                            rename = events[index]
+                            self.assertEqual(rename[3], 2 if existing else 1)
+                            self.assertTrue(any(event[0] == "file" for event in events[:index]))
+                            self.assertEqual(events[index + 1:index + 3], [
+                                ("directory", rename[1].parent), ("directory", rename[2].parent),
+                            ])
+                            self.assertTrue(all(i > index + 2 for i, event in enumerate(events) if event[0] == "unlink"))
+                            self.assertEqual(self._value(next(prior.parent.glob("*.sqlite3"))), "successor")
+
+    def test_restore_directory_sync_failure_rolls_back_before_sidecar_cleanup(self):
+        for failed in (1, 2):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                backup = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                self._change(store)
+                before = store.file_path.read_bytes()
+                family = [Path(f"{store.file_path}{suffix}") for suffix in ("-wal", "-shm")]
+                for path in family:
+                    path.write_bytes(b"synthetic-sidecar")
+                with self._observe_publication(store, fail_syncs=(failed,)), self.assertRaises(OSError):
+                    store.restore_backup(backup)
+                self.assertEqual(store.file_path.read_bytes(), before)
+                for path in family:
+                    self.assertEqual(path.read_bytes(), b"synthetic-sidecar")
+
+    def test_rollback_sync_failure_keeps_prior_generation(self):
+        for rollback_failure in (2, 3):
+            with self.subTest(rollback_failure=rollback_failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                before = prior.read_bytes()
+                self._change(store)
+                with (
+                    self._observe_publication(store, fail_syncs=(1, rollback_failure)) as events,
+                    self.assertRaises(OSError),
+                ):
+                    store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(self._value(prior), "prior")
+                self.assertEqual(len([e for e in events if e[0] == "rename"]), 2)
+                self.assertEqual(len([e for e in events if e[0] == "directory"]), rollback_failure)
+
+    def test_file_sync_failure_prevents_publication_and_preserves_prior(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                prior = store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z")
+                assert prior is not None
+                before = prior.read_bytes()
+                self._change(store)
+                label = "2030-01-01T00:00:00Z" if existing else "2030-01-02T00:00:00Z"
+                with (
+                    patch("history_service.store.os.fsync", side_effect=OSError(errno.EIO, "injected file sync")),
+                    patch.object(store, "_rename_at2", wraps=store._rename_at2) as rename,
+                    self.assertRaisesRegex(OSError, "injected file sync"),
+                ):
+                    store.create_backup(root / "backups", snapshot_label=label, retention_count=1)
+                rename.assert_not_called()
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(self._value(prior), "prior")
+
+    def test_archive_failure_keeps_existing_best_effort_local_backup_contract(self):
+        for period in ("weekly", "monthly"):
+            with self.subTest(period=period), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                options: dict[str, Any] = dict(
+                    long_term_backup_dir=root / "archive",
+                    weekly_retention_count=0, monthly_retention_count=0,
+                )
+                options[f"{period}_retention_count"] = 1
+                store.create_backup(root / "backups", snapshot_label="2030-01-01T00:00:00Z", **options)
+                prior = next((root / "archive" / period).glob("*.sqlite3"))
+                before = prior.read_bytes()
+                self._change(store)
+                # Local publication has two directory barriers; fail the first
+                # archive barrier, not the already-durable local snapshot.
+                with (
+                    self._observe_publication(store, fail_syncs=(3,)),
+                    patch.object(store, "_prune_named_backups", wraps=store._prune_named_backups) as prune,
+                    self.assertLogs("history_service.store", level="WARNING") as warnings,
+                ):
+                    result = store.create_backup(
+                        root / "backups", snapshot_label="2030-03-01T00:00:00Z", **options,
+                    )
+                prune.assert_not_called()
+                self.assertIn("long-term backup promotion failed", warnings.output[0])
+                self.assertEqual(self._value(result), "successor")
+                self.assertEqual(prior.read_bytes(), before)
+                self.assertEqual(list(prior.parent.glob("*.sqlite3")), [prior])
+
+    def test_collector_does_not_credit_failed_real_publication_for_retention(self):
+        for failed in (None, 1, 2):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = self._seed(root)
+                collector = HistoryCollector(HistorySettings(
+                    sqlite_path=str(store.file_path), backup_dir=str(root / "backups"),
+                    startup_grace_seconds=0,
+                ), store)
+                collector.last_fast_metrics_at = collector.started_at
+                collector._enumerate_scopes = AsyncMock(return_value=[])
+                with (
+                    self._observe_publication(store, fail_syncs=(failed,)),
+                    patch.object(store, "maintain_retention", wraps=store.maintain_retention) as retention,
+                    patch.object(collector, "_run_retention_if_due", wraps=collector._run_retention_if_due) as gate,
+                ):
+                    asyncio.run(collector.run_once(force_slow=True))
+                if failed is None:
+                    self.assertTrue(gate.call_args.kwargs["backup_succeeded"])
+                    self.assertIsNotNone(gate.call_args.kwargs["backup_at"])
+                    retention.assert_called_once()
+                    self.assertIsNotNone(collector.last_backup_at)
+                    self.assertIsNone(collector.last_backup_error)
+                    self.assertEqual(len(list((root / "backups").glob("*.sqlite3"))), 1)
+                else:
+                    self.assertFalse(gate.call_args.kwargs["backup_succeeded"])
+                    self.assertIsNone(gate.call_args.kwargs["backup_at"])
+                    retention.assert_not_called()
+                    self.assertIsNone(collector.last_backup_at)
+                    self.assertIsNotNone(collector.last_backup_error)
+                    self.assertEqual(list((root / "backups").glob("*.sqlite3")), [])
+
+
 class HistoryStoreTests(unittest.TestCase):
+    @staticmethod
+    def _create_crashed_wal_fixture(db_path: Path) -> dict[str, str]:
+        """Leave a real committed WAL/SHM pair as if its writer crashed."""
+
+        pid = os.fork()
+        if pid == 0:
+            connection = sqlite3.connect(db_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+            connection.execute("CREATE TABLE retained_wal_evidence (value TEXT NOT NULL)")
+            connection.execute(
+                "INSERT INTO retained_wal_evidence (value) VALUES ('committed WAL bytes')"
+            )
+            connection.commit()
+            os._exit(0)
+        waited_pid, status = os.waitpid(pid, 0)
+        if waited_pid != pid or status != 0:
+            raise AssertionError(f"WAL fixture child failed with wait status {status}")
+        paths = {
+            "database": db_path,
+            "wal": Path(f"{db_path}-wal"),
+            "shm": Path(f"{db_path}-shm"),
+        }
+        if not all(path.is_file() for path in paths.values()):
+            raise AssertionError("WAL fixture did not retain database, WAL, and SHM files")
+        return {
+            label: hashlib.sha256(path.read_bytes()).hexdigest()
+            for label, path in paths.items()
+        }
+
+    @staticmethod
+    def _assert_quarantine_component_hashes(
+        db_path: Path,
+        expected: dict[str, str],
+    ) -> None:
+        suffixes = {"database": "", "wal": "-wal", "shm": "-shm"}
+        entries = list(db_path.parent.iterdir())
+        for label, suffix in suffixes.items():
+            active = Path(f"{db_path}{suffix}")
+            retained = [
+                path
+                for path in entries
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith(suffix)
+                and not (
+                    label == "database"
+                    and path.name.endswith(("-wal", "-shm"))
+                )
+            ]
+            candidates = ([active] if active.is_file() else []) + retained
+            hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in candidates]
+            if expected[label] not in hashes:
+                raise AssertionError(
+                    f"original {label} bytes were not retained; observed hashes: {hashes}"
+                )
+
     def test_slot_state_column_contract_matches_existing_schema_and_projections(self) -> None:
         expected_columns = (
             ("system_id", "TEXT NOT NULL", False),
@@ -1395,6 +2483,42 @@ class HistoryStoreTests(unittest.TestCase):
             restarted.release_segmented_retention_backup(newer_backup_at)
             self.assertTrue(restarted.claim_segmented_retention_backup(newer_backup_at))
 
+    def test_the_retention_wait_anchor_survives_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history.db"
+            first = HistoryStore(str(db_path))
+            anchor = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+            self.assertIsNone(first.read_retention_wait_anchor())
+            self.assertEqual(first.start_retention_wait(anchor), anchor)
+
+            restarted = HistoryStore(str(db_path))
+            self.assertEqual(restarted.read_retention_wait_anchor(), anchor)
+            # First writer wins: a restart cannot push the deadline out.
+            self.assertEqual(
+                restarted.start_retention_wait(anchor + timedelta(days=5)),
+                anchor,
+            )
+
+            restarted.clear_retention_wait()
+            self.assertIsNone(HistoryStore(str(db_path)).read_retention_wait_anchor())
+
+    def test_a_corrupt_retention_wait_anchor_is_reported_not_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "history.db"
+            store = HistoryStore(str(db_path))
+            store.start_retention_wait(datetime(2030, 1, 2, tzinfo=timezone.utc))
+
+            with sqlite3.connect(str(db_path)) as connection:
+                connection.execute(
+                    "UPDATE history_maintenance_state SET backup_at = ? WHERE name = ?",
+                    ("not a timestamp", RETENTION_WAIT_STATE_NAME),
+                )
+                connection.commit()
+
+            with self.assertRaises(ValueError):
+                HistoryStore(str(db_path)).read_retention_wait_anchor()
+
     def test_segmented_retention_claim_respects_the_shared_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = HistoryStore(str(Path(temp_dir) / "history.db"))
@@ -1470,7 +2594,7 @@ class HistoryStoreTests(unittest.TestCase):
             database_path = Path(temp_dir) / "history.db"
 
             with history_write_lock(database_path, blocking=False):
-                legacy_lock_path = history_lock_path(database_path)
+                legacy_lock_path = Path(f"{database_path}.migration.lock")
                 legacy_lock_path.unlink(missing_ok=True)
                 with self.assertRaisesRegex(sqlite3.OperationalError, "migration"):
                     with history_write_lock(database_path, blocking=False):
@@ -1528,6 +2652,102 @@ class HistoryStoreTests(unittest.TestCase):
                 recovered._execute_write(lambda connection: connection.execute("SELECT 1").fetchone())[0],
                 1,
             )
+
+    def test_pending_marker_refusal_names_the_recovery_command_and_logs_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            segments_directory = root / "segments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+
+            cases = (
+                (
+                    activation_pending_path(database_path),
+                    "scripts/rotate_segmented_history.py",
+                    "--recover",
+                ),
+                (
+                    segments_directory / MIGRATION_PENDING_MARKER,
+                    "scripts/migrate_segmented_history.py",
+                    "--recover-rollback",
+                ),
+            )
+            for marker_path, script, mode in cases:
+                marker_path.write_text("{}", encoding="utf-8")
+                try:
+                    with self.assertLogs("history_service.store", level="ERROR") as logs:
+                        with self.assertRaises(sqlite3.OperationalError) as raised:
+                            HistoryStore(
+                                str(database_path),
+                                recover_unreadable_database=False,
+                                segment_catalog_path=catalog_path,
+                            )
+                    message = str(raised.exception)
+                    self.assertIn(
+                        f"docker compose run --rm --entrypoint python enclosure-history {script} "
+                        f"--source {database_path} --segments-dir {segments_directory} {mode}",
+                        message,
+                    )
+                    self.assertIn("start the history service again", message)
+                    self.assertIn(str(marker_path), message)
+                    self.assertEqual(len(logs.records), 1)
+                    self.assertIn(script, logs.records[0].getMessage())
+                finally:
+                    marker_path.unlink()
+
+            # Without a catalog the store cannot know the segments folder, so the
+            # message says which value is missing instead of guessing a path.
+            unsegmented_path = root / "plain.db"
+            HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            marker_path = activation_pending_path(unsegmented_path)
+            marker_path.write_text("{}", encoding="utf-8")
+            try:
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    HistoryStore(str(unsegmented_path), recover_unreadable_database=False)
+            finally:
+                marker_path.unlink()
+            self.assertIn("HISTORY_SEGMENT_CATALOG_PATH is not set", str(raised.exception))
+            self.assertIn("scripts/rotate_segmented_history.py", str(raised.exception))
+
+    def test_pending_marker_recovery_command_quotes_paths_for_the_shell(self) -> None:
+        # A path with spaces or shell syntax must survive copy-paste into a
+        # shell as one argument, exactly when history is down (#495 review).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "history data; $(id)"
+            root.mkdir()
+            database_path = root / "history.db"
+            segments_directory = root / "seg ments"
+            segments_directory.mkdir()
+            catalog_path = segments_directory / "catalog.json"
+            HistoryStore(
+                str(database_path),
+                recover_unreadable_database=False,
+                segment_catalog_path=catalog_path,
+            )
+            marker_path = activation_pending_path(database_path)
+            marker_path.write_text("{}", encoding="utf-8")
+            try:
+                with self.assertLogs("history_service.store", level="ERROR"):
+                    with self.assertRaises(sqlite3.OperationalError) as raised:
+                        HistoryStore(
+                            str(database_path),
+                            recover_unreadable_database=False,
+                            segment_catalog_path=catalog_path,
+                        )
+            finally:
+                marker_path.unlink()
+            message = str(raised.exception)
+            command = message.split("Inspect it with: ", 1)[1].split(" (add --apply", 1)[0]
+            argv = shlex.split(command)
+            self.assertEqual(argv[argv.index("--source") + 1], str(database_path))
+            self.assertEqual(argv[argv.index("--segments-dir") + 1], str(segments_directory))
+            self.assertEqual(argv[-1], "--recover")
 
     def test_store_refuses_reads_and_retention_claims_while_a_lifecycle_marker_is_pending(self) -> None:
         # PR #191 gated __init__ and _execute_write, but plain reads and the
@@ -1660,7 +2880,7 @@ class HistoryStoreTests(unittest.TestCase):
             store = HistoryStore(str(root / "history.db"))
             backup_has_thread_lock = threading.Event()
             backup_has_lifecycle_lock = threading.Event()
-            writer_attempted_lifecycle_lock = threading.Event()
+            writer_completed = threading.Event()
             writer_waits_for_thread_lock = threading.Event()
             backup_errors: list[BaseException] = []
             writer_errors: list[BaseException] = []
@@ -1675,9 +2895,11 @@ class HistoryStoreTests(unittest.TestCase):
                     real_thread_lock.acquire()
                     if current_thread is backup_thread:
                         backup_has_thread_lock.set()
-                        if backup_has_lifecycle_lock.is_set() and not writer_attempted_lifecycle_lock.wait(5):
+                        # Hold the lifecycle lock through the real writer attempt,
+                        # not merely its announcement before lock acquisition.
+                        if backup_has_lifecycle_lock.is_set() and not writer_completed.wait(5):
                             real_thread_lock.release()
-                            raise TimeoutError("ordinary writer did not attempt the lifecycle lock")
+                            raise TimeoutError("ordinary writer did not complete the lifecycle lock attempt")
                     return self
 
                 def __exit__(self, *args: object) -> None:
@@ -1707,6 +2929,8 @@ class HistoryStoreTests(unittest.TestCase):
                     )
                 except BaseException as exc:
                     writer_errors.append(exc)
+                finally:
+                    writer_completed.set()
 
             backup_thread = threading.Thread(target=run_backup, name="history-backup")
             writer_thread = threading.Thread(target=run_writer, name="ordinary-history-writer")
@@ -1722,8 +2946,6 @@ class HistoryStoreTests(unittest.TestCase):
                         "lifecycle lock, and ordinary writer holds the lifecycle lock while waiting "
                         "for the thread lock"
                     )
-                if current_thread is writer_thread:
-                    writer_attempted_lifecycle_lock.set()
                 with history_write_lock(*args, **kwargs):
                     if current_thread is backup_thread:
                         backup_has_lifecycle_lock.set()
@@ -1752,6 +2974,96 @@ class HistoryStoreTests(unittest.TestCase):
             self.assertEqual(len(writer_errors), 1)
             self.assertIsInstance(writer_errors[0], sqlite3.OperationalError)
             self.assertRegex(str(writer_errors[0]), "migration lock")
+
+    def test_backup_copies_outside_the_locks_and_publishes_under_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = HistoryStore(str(root / "history.db"))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            events: list[str] = []
+            real_publish = HistoryStore._publish_replacement
+            real_thread_lock = store._lock
+
+            @contextmanager
+            def recording_history_write_lock(*args: Any, **kwargs: Any):
+                events.append("lifecycle-lock:enter")
+                with history_write_lock(*args, **kwargs):
+                    try:
+                        yield
+                    finally:
+                        events.append("lifecycle-lock:exit")
+
+            class RecordingThreadLock:
+                def __enter__(self) -> RecordingThreadLock:
+                    real_thread_lock.acquire()
+                    events.append("thread-lock:enter")
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    events.append("thread-lock:exit")
+                    real_thread_lock.release()
+
+            def recording_publish(self_store: HistoryStore, *args: Any, **kwargs: Any) -> None:
+                events.append("publish")
+                real_publish(self_store, *args, **kwargs)
+
+            store._lock = RecordingThreadLock()  # type: ignore[assignment]
+            with patch("history_service.store.history_write_lock", recording_history_write_lock), patch.object(
+                HistoryStore, "_publish_replacement", recording_publish
+            ):
+                backup_path = store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertIsNotNone(backup_path)
+            assert backup_path is not None
+            with sqlite3.connect(backup_path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 1)
+            # The copy borrows the lifecycle lock only to open its read connection;
+            # both locks are held together only while the finished file is published.
+            self.assertEqual(
+                events,
+                [
+                    "lifecycle-lock:enter",
+                    "lifecycle-lock:exit",
+                    "lifecycle-lock:enter",
+                    "thread-lock:enter",
+                    "publish",
+                    "thread-lock:exit",
+                    "lifecycle-lock:exit",
+                ],
+            )
+
+    def test_backup_discards_a_copy_when_the_database_is_replaced_mid_copy(self) -> None:
+        # The copy runs outside the lifecycle lock, so a restore or quarantine can
+        # swap the hot file under it. Publishing that copy would let retention
+        # prune rows it never contained (#560 review), so it must be discarded.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "history.db"
+            store = HistoryStore(str(database_path))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            real_connect = HistoryStore._connect
+            replaced: list[bool] = []
+
+            def connect_then_replace(self_store: HistoryStore, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+                connection = real_connect(self_store, *args, **kwargs)
+                if not replaced:
+                    replaced.append(True)
+                    staged = root / "restored.db"
+                    shutil.copyfile(database_path, staged)
+                    os.replace(staged, database_path)
+                return connection
+
+            with patch.object(HistoryStore, "_connect", connect_then_replace):
+                with self.assertRaises(history_store.HistoryBackupSourceReplacedError):
+                    store.create_backup(root / "backups", snapshot_label="2030-01-02T03:04:05+00:00")
+
+            self.assertEqual(replaced, [True])
+            published = [path.name for path in (root / "backups").glob("*.sqlite3")]
+            self.assertEqual(published, [], "a copy of the replaced file must not be published")
+            self.assertIsNotNone(
+                store.create_backup(root / "backups", snapshot_label="2030-01-02T04:04:05+00:00"),
+                "the next pass backs up the current file",
+            )
 
     def test_store_rechecks_lifecycle_markers_after_acquiring_the_history_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2289,100 +3601,6 @@ class HistoryStoreTests(unittest.TestCase):
 
             self.assertEqual(backup_path, target_path)
             self.assertEqual(target_path.stat().st_mode & 0o777, 0o640)
-
-    def test_default_replacement_mode_preservation_refuses_target_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o600)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == target_path and not swapped:
-                    swapped = True
-                    target_path.unlink()
-                    target_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o600)
-
-    def test_default_replacement_mode_preservation_refuses_temp_symlink_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            victim_path = root / "victim.sqlite3"
-            victim_path.write_bytes(b"victim")
-            victim_path.chmod(0o644)
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    temp_path.symlink_to(victim_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaises((OSError, ValueError)),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(victim_path.stat().st_mode & 0o777, 0o644)
-
-    def test_default_replacement_mode_preservation_refuses_temp_inode_swap(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            store = HistoryStore(str(root / "history.db"))
-            target_path = root / "target.sqlite3"
-            target_path.write_bytes(b"target")
-            target_path.chmod(0o600)
-            temp_path = root / "replacement.tmp"
-            temp_path.write_bytes(b"replacement")
-            replacement_path = root / "replacement-raced.tmp"
-            replacement_path.write_bytes(b"raced")
-            real_open = os.open
-            swapped = False
-
-            def swap_before_open(path: str | os.PathLike[str], flags: int) -> int:
-                nonlocal swapped
-                if Path(path) == temp_path and not swapped:
-                    swapped = True
-                    temp_path.unlink()
-                    replacement_path.replace(temp_path)
-                return real_open(path, flags)
-
-            with (
-                patch("history_service.store.os.open", side_effect=swap_before_open),
-                self.assertRaisesRegex(ValueError, "changed temporary path"),
-            ):
-                store._preserve_existing_target_mode(temp_path, target_path)
-
-            self.assertTrue(swapped)
-            self.assertEqual(temp_path.read_bytes(), b"raced")
 
     def test_default_replacement_publisher_leaves_one_sided_temp_swap_generations_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2933,7 +4151,9 @@ class HistoryStoreTests(unittest.TestCase):
                 rows = self._cursor.fetchall()
                 if "FROM metric_samples" in self._query:
                     materialized["raw"] = materialized.get("raw", 0) + len(rows)
-                if "FROM metric_rollups" in self._query:
+                if self._query.startswith("SELECT slot, metric_name FROM metric_rollups"):
+                    materialized["coverage_pairs"] = materialized.get("coverage_pairs", 0) + len(rows)
+                elif "FROM metric_rollups" in self._query:
                     materialized["rollup"] = materialized.get("rollup", 0) + len(rows)
                 return rows
 
@@ -2992,6 +4212,114 @@ class HistoryStoreTests(unittest.TestCase):
                 payload = reader.list_scope_history("archive-core", "enc-a", **arguments)
         return payload, materialized
 
+    def _coverage_window_fixture(self) -> tuple[HistoryStore, list[tuple[int, int]], dict[str, Any]]:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        store = HistoryStore(str(Path(temp_dir.name) / "history.db"))
+        now = datetime.now(timezone.utc)
+        counts = [(0, 0), (1, 1), (14, 10), (15, 11), (16, 12), (200, 200)]
+        with closing(store._connect()) as connection:
+            for scope in ("front", "other"):
+                for slot, (metrics, events) in enumerate(counts):
+                    # Tied timestamps exercise the id tie-break as well as the cap.
+                    connection.executemany(
+                        "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                        "enclosure_id, slot, slot_label, metric_name, value_real) "
+                        "VALUES (?, 'coverage.example.test', ?, ?, ?, '00', 'temperature_c', ?)",
+                        [(now.isoformat(), scope, scope, slot, i) for i in range(metrics)],
+                    )
+                    connection.executemany(
+                        "INSERT INTO slot_events (observed_at, system_id, enclosure_key, "
+                        "enclosure_id, slot, slot_label, event_type, details_json) "
+                        "VALUES (?, 'coverage.example.test', ?, ?, ?, '00', 'slot_state_changed', '{}')",
+                        [(now.isoformat(), scope, scope, slot) for _ in range(events)],
+                    )
+                # An old row must not turn the exact-cap target into truncation.
+                old = (now - timedelta(days=2)).isoformat()
+                connection.execute(
+                    "INSERT INTO metric_samples (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, metric_name, value_real) "
+                    "VALUES (?, 'coverage.example.test', ?, ?, 3, '00', 'temperature_c', 999)",
+                    (old, scope, scope),
+                )
+                connection.execute(
+                    "INSERT INTO slot_events (observed_at, system_id, enclosure_key, "
+                    "enclosure_id, slot, slot_label, event_type, details_json) "
+                    "VALUES (?, 'coverage.example.test', ?, ?, 3, '00', 'slot_state_changed', '{}')",
+                    (old, scope, scope),
+                )
+            connection.commit()
+        arguments: dict[str, Any] = dict(
+            slots=list(range(len(counts))), event_limit=11,
+            metric_limits={"temperature_c": 15},
+            since=(now - timedelta(hours=24)).isoformat(),
+        )
+        return store, counts, arguments
+
+    def test_scope_coverage_counts_only_bounded_window_inputs(self) -> None:
+        store, counts, arguments = self._coverage_window_fixture()
+        windows = []
+
+        class ObservedCount:
+            # Instrument SQLite's actual aggregate input, not Python fetch counts.
+            # The unbounded COUNT window receives every omitted row before fetch.
+            def __init__(self):
+                self.count = 0
+                self.peak = 0
+                windows.append(self)
+
+            def step(self, *args):
+                self.count += 1
+                self.peak = max(self.peak, self.count)
+
+            def inverse(self, *args):
+                self.count -= 1
+
+            def value(self):
+                return self.count
+
+            def finalize(self):
+                return self.count
+
+        original_connect = store._connect
+
+        def observed_connect():
+            connection = original_connect()
+            connection.create_window_function("count", 0, ObservedCount)
+            return connection
+
+        with patch.object(store, "_connect", side_effect=observed_connect):
+            payload = store.list_scope_history("coverage.example.test", "front", **arguments)
+        self.assertEqual(payload[5]["coverage"], {
+            "metrics": {"temperature_c": "truncated"}, "events": "truncated",
+        })
+        self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 15)
+        self.assertEqual(len(payload[5]["events"]), 11)
+        self.assertTrue(windows, "No real SQLite coverage aggregate was observed")
+        self.assertEqual(
+            sorted(window.peak for window in windows),
+            sorted(min(n, cap + 1) for m, e in counts for n, cap in ((m, 15), (e, 11)) if n),
+            "Coverage aggregate input must stop at cap + one sentinel per partition",
+        )
+
+    def test_scope_coverage_sentinel_is_not_a_total_or_returned_row(self) -> None:
+        store, counts, arguments = self._coverage_window_fixture()
+        payload = store.list_scope_history("coverage.example.test", "front", **arguments)
+        for slot, (metrics, events) in enumerate(counts):
+            with self.subTest(slot=slot):
+                history = payload[slot]
+                self.assertEqual(history["coverage"], {
+                    "metrics": {"temperature_c": "truncated" if metrics > 15 else "complete"},
+                    "events": "truncated" if events > 11 else "complete",
+                })
+                self.assertEqual(len(history["events"]), min(events, 11))
+                samples = history["metrics"]["temperature_c"]
+                self.assertEqual(history["sample_counts"], {"temperature_c": len(samples)})
+                self.assertEqual(len(samples), min(metrics, 15))
+                self.assertEqual([s["value"] for s in samples], list(reversed(range(metrics)))[:15])
+                for row in [*samples, *history["events"]]:
+                    self.assertTrue({"bounded_count", "available_count", "row_number"}.isdisjoint(row))
+
     def test_scope_bulk_materializes_only_one_rollup_after_nine_raw_rows(self) -> None:
         for segmented in (False, True):
             with self.subTest(segmented=segmented):
@@ -3004,7 +4332,7 @@ class HistoryStoreTests(unittest.TestCase):
                 )
 
                 samples = payload[5]["metrics"]["temperature_c"]
-                self.assertEqual(materialized, {"raw": 9, "rollup": 1})
+                self.assertEqual(materialized, {"raw": 9, "rollup": 1, **({} if segmented else {"coverage_pairs": 1})})
                 self.assertEqual(len(samples), 10)
                 self.assertNotIn("rollup_seconds", samples[8])
                 self.assertEqual(samples[9]["rollup_seconds"], 3600)
@@ -3026,7 +4354,7 @@ class HistoryStoreTests(unittest.TestCase):
                     metric_limits={"temperature_c": 10, "bytes_read": 10},
                 )
 
-                self.assertEqual(materialized, {"raw": 34, "rollup": 6})
+                self.assertEqual(materialized, {"raw": 34, "rollup": 6, **({} if segmented else {"coverage_pairs": 4})})
                 for slot in (5, 6):
                     for metric_name in ("temperature_c", "bytes_read"):
                         samples = payload[slot]["metrics"][metric_name]
@@ -3050,7 +4378,9 @@ class HistoryStoreTests(unittest.TestCase):
                     metric_limits={"temperature_c": 10},
                 )
 
-                self.assertEqual(materialized, {"raw": 10})
+                self.assertEqual(materialized, {"raw": 10, **({} if segmented else {"coverage_pairs": 1})})
+                if not segmented:
+                    self.assertEqual(payload[5]["coverage"]["metrics"]["temperature_c"], "unknown")
                 self.assertEqual(len(payload[5]["metrics"]["temperature_c"]), 10)
 
     @staticmethod
@@ -3590,6 +4920,127 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertFalse(fast_counts["estimated"])
         self.assertEqual(fast_counts["count_mode"], "tracked")
 
+    def test_retention_batch_size_is_not_limited_by_sqlite_variable_count(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample(f"2020-01-01T{index // 60:02d}:{index % 60:02d}:00+00:00", index)
+                for index in range(60)
+            ]
+        )
+        real_connect_locked = HistoryStore._connect_locked
+
+        def connect_with_small_variable_limit(self_store: HistoryStore) -> sqlite3.Connection:
+            connection = real_connect_locked(self_store)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+            return connection
+
+        with patch.object(HistoryStore, "_connect_locked", connect_with_small_variable_limit):
+            result = store.maintain_retention(
+                now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                raw_metric_retention_days=30,
+                event_retention_days=0,
+                hourly_rollup_retention_days=0,
+                daily_rollup_retention_days=0,
+                batch_size=100,
+                max_batches=1,
+            )
+
+        self.assertEqual(result["metric_samples_removed"], 60)
+        self.assertFalse(result["has_more"])
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT SUM(sample_count) FROM metric_rollups WHERE bucket_seconds = 3600").fetchone()[0],
+                60,
+            )
+
+    def test_retention_returns_freed_pages_to_the_filesystem(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.insert_metric_samples(
+            [
+                self._metric_sample(f"2020-01-{1 + index // 1440:02d}T{(index // 60) % 24:02d}:{index % 60:02d}:00+00:00", index)
+                for index in range(3000)
+            ]
+        )
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA auto_vacuum").fetchone()[0], 2)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        size_before = store.file_path.stat().st_size
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=1000,
+            max_batches=3,
+        )
+
+        self.assertEqual(result["metric_samples_removed"], 3000)
+        self.assertGreater(result["pages_reclaimed"], 0)
+        with sqlite3.connect(store.file_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA freelist_count").fetchone()[0], 0)
+        self.assertLess(store.file_path.stat().st_size, size_before)
+        wal_path = Path(f"{store.file_path}-wal")
+        if wal_path.exists():
+            self.assertEqual(wal_path.stat().st_size, 0)
+
+    def test_retention_keeps_reusing_pages_on_databases_created_without_incremental_vacuum(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        with sqlite3.connect(db_path) as connection:
+            # A database that already holds objects cannot switch vacuum modes without
+            # a full VACUUM, which the service never runs on a user's data by itself.
+            connection.execute("CREATE TABLE placeholder (value INTEGER)")
+        store = HistoryStore(str(db_path))
+        store.insert_metric_samples(
+            [self._metric_sample(f"2020-01-01T00:{index % 60:02d}:00+00:00", index) for index in range(50)]
+        )
+
+        result = store.maintain_retention(
+            now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            raw_metric_retention_days=30,
+            event_retention_days=0,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=1825,
+            batch_size=100,
+            max_batches=1,
+        )
+
+        self.assertEqual(result["metric_samples_removed"], 50)
+        self.assertEqual(result["pages_reclaimed"], 0)
+        with sqlite3.connect(db_path) as connection:
+            self.assertEqual(connection.execute("PRAGMA auto_vacuum").fetchone()[0], 0)
+
+    def test_startup_counts_only_tables_whose_counter_row_is_missing(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        counted_per_open: list[list[str]] = []
+        real_synchronize = HistoryStore._synchronize_table_counts
+
+        def recording_synchronize(connection: sqlite3.Connection) -> list[str]:
+            counted = real_synchronize(connection)
+            counted_per_open.append(counted)
+            return counted
+
+        with patch.object(HistoryStore, "_synchronize_table_counts", staticmethod(recording_synchronize)):
+            store = HistoryStore(str(db_path))
+            store.insert_metric_samples([self._metric_sample("2026-06-30T00:00:00+00:00", 22)])
+            HistoryStore(str(db_path))
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("DELETE FROM history_table_counts WHERE table_name = 'metric_samples'")
+            HistoryStore(str(db_path))
+
+        self.assertEqual(
+            counted_per_open,
+            [["slot_events", "metric_samples", "metric_rollups"], [], ["metric_samples"]],
+        )
+        self.assertEqual(store.estimated_counts()["metric_sample_count"], 1)
+
     def test_retention_rollups_remain_visible_in_batched_scope_and_disk_history(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -3863,6 +5314,16 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual([sample["value"] for sample in payload[5]["metrics"]["temperature_c"]], [31])
         self.assertEqual(payload[5]["sample_counts"]["temperature_c"], 1)
         self.assertEqual(payload[5]["latest_values"]["temperature_c"], 31)
+
+        offset_payload = store.list_scope_history(
+            "archive-core",
+            "enc-a",
+            slots=[5],
+            metric_limits={"temperature_c": 10},
+            since="2026-04-16T23:00:00+02:00",
+        )
+
+        self.assertEqual([sample["value"] for sample in offset_payload[5]["metrics"]["temperature_c"]], [31])
 
     def test_scope_history_can_skip_events_for_metric_only_reads(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -4787,6 +6248,906 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertTrue(db_path.exists())
         self.assertEqual(len(broken_files), 1)
 
+    def test_store_persists_quarantine_recovery_across_restart(self) -> None:
+        """A recovered database keeps saying "recovery required" after a restart (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        recovered = HistoryStore(str(db_path))
+        quarantined_at = recovered.read_quarantine_recovery()
+        del recovered
+
+        restarted = HistoryStore(str(db_path))
+
+        self.assertIsNotNone(quarantined_at)
+        self.assertEqual(restarted.read_quarantine_recovery(), quarantined_at)
+        self.assertEqual(len(list(temp_dir.glob("history.db.broken-*"))), 1)
+
+    def test_store_fails_closed_when_quarantine_marker_write_fails(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        original = b"not a sqlite database"
+        db_path.write_bytes(original)
+
+        with (
+            patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ),
+            self.assertLogs("history_service.store", level="WARNING"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        status = store.quarantine_recovery_status()
+        broken_files = list(temp_dir.glob("history.db.broken-*"))
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(".broken-", json.dumps(status))
+        self.assertEqual(len(broken_files), 1)
+        self.assertEqual(broken_files[0].read_bytes(), original)
+
+    def test_literal_database_name_quarantine_evidence_survives_marker_failure_and_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history[1].db"
+        original = b"literal metacharacter database bytes"
+        db_path.write_bytes(original)
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history[1].db.broken-")
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual([path.read_bytes() for path in retained], [original])
+
+    def test_quarantine_first_sidecar_fsync_failure_refuses_restart_before_wal_replay(self) -> None:
+        """Reviewer reproduction: moved SHM must not leave the live WAL admissible."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_first_fsync_after_shm_move(directory: Path) -> None:
+            nonlocal injected
+            staged_shm = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and path.name.endswith("-shm")
+            ]
+            if not injected and staged_shm and not Path(f"{db_path}-shm").exists():
+                injected = True
+                raise OSError(errno.EIO, "synthetic first post-SHM fsync failure")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_first_fsync_after_shm_move):
+            with self.assertRaisesRegex(OSError, "post-SHM fsync failure"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError) as restart_error:
+            open_history_store_with_retries(
+                lambda: HistoryStore(str(db_path)),
+                directory=temp_dir,
+                attempts=1,
+            )
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", restart_error.exception.reason),
+            patch.object(history_main, "store", None),
+            patch.object(history_main, "collector", None),
+        ):
+            response = asyncio.run(history_main.healthz())
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["status"], "down")
+        self.assertNotIn(str(temp_dir), json.dumps(payload))
+
+    def test_quarantine_intent_write_failure_precedes_every_destructive_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            history_store.os,
+            "open",
+            side_effect=OSError(errno.EIO, "synthetic intent write failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent write failure"):
+                store._quarantine_database()
+
+        self.assertTrue(db_path.is_file())
+        self.assertTrue(Path(f"{db_path}-wal").is_file())
+        self.assertTrue(Path(f"{db_path}-shm").is_file())
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_scan_failure_is_a_bounded_startup_refusal(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        with patch.object(
+            history_store.os,
+            "scandir",
+            side_effect=OSError(errno.EIO, "synthetic private directory detail"),
+        ):
+            with self.assertRaises(HistoryStartupError) as failure:
+                HistoryStore(str(db_path))
+
+        self.assertNotIn(str(temp_dir), failure.exception.reason)
+        self.assertNotIn("private directory detail", failure.exception.reason)
+
+    def test_startup_refuses_every_nonregular_matching_quarantine_intent_without_sqlite_open(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "intent-target"
+                    target.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+                    intent_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(intent_path)
+                elif fixture_type == "directory":
+                    intent_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(intent_path))
+
+                sqlite_opens: list[object] = []
+
+                def reject_sqlite_open(*args: object, **kwargs: object) -> sqlite3.Connection:
+                    sqlite_opens.append(args[0] if args else kwargs.get("database"))
+                    raise AssertionError("SQLite opened before quarantine intent refusal")
+
+                try:
+                    with patch("history_service.store.sqlite3.connect", side_effect=reject_sqlite_open):
+                        with self.assertRaises(HistoryStartupError) as failure:
+                            HistoryStore(str(db_path))
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(sqlite_opens, [])
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_startup_refuses_valid_malformed_and_multilink_regular_quarantine_intents(self) -> None:
+        fixture_types = ("valid", "malformed", "multilink")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+                intent_path.write_bytes(
+                    history_store.QUARANTINE_INTENT_BYTES if fixture_type != "malformed" else b"not an intent"
+                )
+                if fixture_type == "multilink":
+                    (temp_dir / "second-link").hardlink_to(intent_path)
+
+                scanner = HistoryStore(str(db_path), initialize=False)
+                if fixture_type == "valid":
+                    self.assertEqual(scanner._quarantine_intent_paths(), [intent_path])
+                else:
+                    with self.assertRaises(OSError):
+                        scanner._quarantine_intent_paths()
+
+                with patch("history_service.store.sqlite3.connect") as connect:
+                    with self.assertRaises(HistoryStartupError) as failure:
+                        HistoryStore(str(db_path))
+
+                connect.assert_not_called()
+                self.assertNotIn(str(temp_dir), failure.exception.reason)
+
+    def test_quarantine_intent_scanner_rejects_an_inappropriate_owner(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        scanner = HistoryStore(str(db_path), initialize=False)
+        actual_owner = os.geteuid()
+
+        with patch("history_service.store.os.geteuid", return_value=actual_owner + 1):
+            with self.assertRaises(OSError):
+                scanner._quarantine_intent_paths()
+
+    def test_quarantine_intent_type_race_is_nonblocking_and_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_to_fifo_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                intent_path.unlink()
+                os.mkfifo(intent_path)
+                self.assertTrue(flags & getattr(os, "O_NONBLOCK", 0))
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_to_fifo_before_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
+    def test_quarantine_intent_identity_race_refuses_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        intent_name = "history.db.quarantine-20300102T030405.000000Z.pending"
+        intent_path = temp_dir / intent_name
+        intent_path.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        replacement = temp_dir / "replacement"
+        replacement.write_bytes(history_store.QUARANTINE_INTENT_BYTES)
+        real_open = os.open
+        swapped = False
+
+        def swap_after_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal swapped
+            descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            if path == intent_name and kwargs.get("dir_fd") is not None and not swapped:
+                swapped = True
+                os.replace(replacement, intent_path)
+            return descriptor
+
+        with (
+            patch("history_service.store.os.open", side_effect=swap_after_open),
+            patch("history_service.store.sqlite3.connect") as connect,
+        ):
+            with self.assertRaises(HistoryStartupError):
+                HistoryStore(str(db_path))
+
+        self.assertTrue(swapped)
+        connect.assert_not_called()
+
+    def test_startup_refuses_intent_published_after_prelock_scan_before_sqlite_open(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        self._create_crashed_wal_fixture(db_path)
+        intent_owner = HistoryStore(str(db_path), initialize=False)
+        intent_path = temp_dir / "history.db.quarantine-20300102T030405.000000Z.pending"
+        publication_requested = threading.Event()
+        publication_complete = threading.Event()
+        publication_errors: list[BaseException] = []
+        sqlite_opens_after_publication: list[object] = []
+        real_connect = sqlite3.connect
+        real_intent_check = HistoryStore._require_no_pending_quarantine_intent
+
+        def publish_intent() -> None:
+            if not publication_requested.wait(timeout=5):
+                publication_errors.append(TimeoutError("startup never reached the publication seam"))
+                publication_complete.set()
+                return
+            try:
+                with history_write_lock(db_path, blocking=True):
+                    intent_owner._publish_quarantine_intent(intent_path)
+            except BaseException as exc:
+                publication_errors.append(exc)
+            finally:
+                publication_complete.set()
+
+        def scan_then_release_quarantiner(store: HistoryStore) -> None:
+            real_intent_check(store)
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+
+        @contextmanager
+        def lifecycle_lock_after_quarantiner(*args: Any, **kwargs: Any):
+            if not publication_requested.is_set():
+                publication_requested.set()
+                self.assertTrue(publication_complete.wait(timeout=5))
+            with history_write_lock(*args, **kwargs):
+                yield
+
+        def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            if publication_complete.is_set():
+                sqlite_opens_after_publication.append(args[0] if args else kwargs.get("database"))
+            return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+        publisher = threading.Thread(target=publish_intent, name="history-quarantine-publisher")
+        publisher.start()
+        try:
+            with (
+                patch.object(
+                    HistoryStore,
+                    "_require_no_pending_quarantine_intent",
+                    autospec=True,
+                    side_effect=scan_then_release_quarantiner,
+                ),
+                patch("history_service.store.history_write_lock", lifecycle_lock_after_quarantiner),
+                patch("history_service.store.sqlite3.connect", side_effect=tracking_connect),
+            ):
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+        finally:
+            publication_requested.set()
+            publisher.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual(publication_errors, [])
+        self.assertTrue(intent_path.is_file())
+        self.assertEqual(intent_path.read_bytes(), history_store.QUARANTINE_INTENT_BYTES)
+        self.assertEqual(sqlite_opens_after_publication, [])
+
+    def test_quarantine_restart_fails_closed_after_each_rename_and_fsync_boundary(self) -> None:
+        for operation, boundary in (
+            ("rename", 1),
+            ("rename", 2),
+            ("rename", 3),
+            ("fsync", 1),
+            ("fsync", 2),
+            ("fsync", 3),
+        ):
+            with self.subTest(operation=operation, boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history[1].db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_rename = store._rename_at2
+                real_fsync_directory = store._fsync_directory
+                destinations: list[Path] = []
+                injected = False
+
+                def fail_after_rename(source: Path, target: Path, *, flags: int) -> None:
+                    nonlocal injected
+                    real_rename(source, target, flags=flags)
+                    destinations.append(target)
+                    if operation == "rename" and len(destinations) == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic rename boundary {boundary}")
+
+                def fail_after_fsync(directory: Path) -> None:
+                    nonlocal injected
+                    real_fsync_directory(directory)
+                    moved = sum(path_entry.exists() for path_entry in destinations)
+                    if operation == "fsync" and moved == boundary:
+                        injected = True
+                        raise OSError(errno.EIO, f"synthetic fsync boundary {boundary}")
+
+                with (
+                    patch.object(store, "_rename_at2", side_effect=fail_after_rename),
+                    patch.object(store, "_fsync_directory", side_effect=fail_after_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"{operation} boundary {boundary}"):
+                        store._quarantine_database()
+
+                self.assertTrue(injected)
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+                with self.assertRaises(HistoryStartupError):
+                    HistoryStore(str(db_path))
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_publication_failures_move_no_database_bytes(self) -> None:
+        for boundary in ("write", "file-fsync", "directory-fsync"):
+            with self.subTest(boundary=boundary):
+                temp_dir = Path(tempfile.mkdtemp())
+                db_path = temp_dir / "history.db"
+                expected_hashes = self._create_crashed_wal_fixture(db_path)
+                store = HistoryStore(str(db_path), initialize=False)
+                real_write = history_store.os.write
+                real_fsync = history_store.os.fsync
+                real_fsync_directory = store._fsync_directory
+
+                def fail_write(descriptor: int, value: bytes) -> int:
+                    if boundary == "write":
+                        raise OSError(errno.EIO, "synthetic intent write boundary")
+                    return real_write(descriptor, value)
+
+                def fail_file_fsync(descriptor: int) -> None:
+                    if boundary == "file-fsync":
+                        raise OSError(errno.EIO, "synthetic intent file-fsync boundary")
+                    real_fsync(descriptor)
+
+                def fail_directory_fsync(directory: Path) -> None:
+                    if boundary == "directory-fsync":
+                        raise OSError(errno.EIO, "synthetic intent directory-fsync boundary")
+                    real_fsync_directory(directory)
+
+                with (
+                    patch.object(history_store.os, "write", side_effect=fail_write),
+                    patch.object(history_store.os, "fsync", side_effect=fail_file_fsync),
+                    patch.object(store, "_fsync_directory", side_effect=fail_directory_fsync),
+                ):
+                    with self.assertRaisesRegex(OSError, f"intent {boundary} boundary"):
+                        store._quarantine_database()
+
+                self.assertTrue(db_path.is_file())
+                self.assertTrue(Path(f"{db_path}-wal").is_file())
+                self.assertTrue(Path(f"{db_path}-shm").is_file())
+                self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_intent_unlink_failure_refuses_restart_with_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+
+        with patch.object(
+            Path,
+            "unlink",
+            side_effect=OSError(errno.EIO, "synthetic intent unlink boundary"),
+        ):
+            with self.assertRaisesRegex(OSError, "intent unlink boundary"):
+                store._quarantine_database()
+
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        with self.assertRaises(HistoryStartupError):
+            HistoryStore(str(db_path))
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_final_fsync_failure_restarts_degraded_from_complete_evidence(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        expected_hashes = self._create_crashed_wal_fixture(db_path)
+        store = HistoryStore(str(db_path), initialize=False)
+        real_fsync_directory = store._fsync_directory
+        injected = False
+
+        def fail_after_intent_removal(directory: Path) -> None:
+            nonlocal injected
+            intents = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.quarantine-")
+                and path.name.endswith(".pending")
+            ]
+            retained_database = [
+                path
+                for path in directory.iterdir()
+                if path.name.startswith(f"{db_path.name}.broken-")
+                and not path.name.endswith(("-wal", "-shm"))
+            ]
+            if not injected and retained_database and not intents:
+                injected = True
+                raise OSError(errno.EIO, "synthetic final directory-fsync boundary")
+            real_fsync_directory(directory)
+
+        with patch.object(store, "_fsync_directory", side_effect=fail_after_intent_removal):
+            with self.assertRaisesRegex(OSError, "final directory-fsync boundary"):
+                store._quarantine_database()
+
+        self.assertTrue(injected)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+        restarted = HistoryStore(str(db_path))
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self._assert_quarantine_component_hashes(db_path, expected_hashes)
+
+    def test_quarantine_evidence_scan_is_bounded_and_fails_closed(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        (temp_dir / "unrelated-one").write_bytes(b"one")
+        (temp_dir / "unrelated-two").write_bytes(b"two")
+
+        with patch.object(
+            history_store,
+            "MAX_QUARANTINE_EVIDENCE_DIRECTORY_ENTRIES",
+            1,
+            create=True,
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_nonregular_matching_quarantine_evidence_never_reports_healthy(self) -> None:
+        fixture_types = ("symlink", "fifo", "directory", "socket")
+
+        for fixture_type in fixture_types:
+            with self.subTest(fixture_type=fixture_type):
+                temp_dir = Path(tempfile.mkdtemp())
+                store = HistoryStore(str(temp_dir / "history.db"))
+                store.record_quarantine_recovery(datetime(2031, 1, 1, tzinfo=timezone.utc))
+                self.assertTrue(store.acknowledge_quarantine_recovery())
+                evidence_path = temp_dir / "history.db.broken-20300102T030405.000000Z"
+                socket_owner: socket.socket | None = None
+                if fixture_type == "symlink":
+                    target = temp_dir / "evidence-target"
+                    target.write_bytes(b"retained")
+                    evidence_path.symlink_to(target)
+                elif fixture_type == "fifo":
+                    os.mkfifo(evidence_path)
+                elif fixture_type == "directory":
+                    evidence_path.mkdir()
+                else:
+                    socket_owner = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    socket_owner.bind(str(evidence_path))
+
+                try:
+                    status = store.quarantine_recovery_status()
+                finally:
+                    if socket_owner is not None:
+                        socket_owner.close()
+
+                self.assertEqual(
+                    status,
+                    {"history_recovery_required": True, "history_quarantined_at": None},
+                )
+                self.assertNotIn(str(temp_dir), json.dumps(status))
+
+    def test_same_instant_quarantines_preserve_each_database_and_sidecar_byte_set(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+        byte_sets = (
+            (b"first database", b"first wal", b"first shm"),
+            (b"second database", b"second wal", b"second shm"),
+        )
+
+        store = HistoryStore(str(db_path))
+        with freeze_history_store_now(frozen):
+            for database_bytes, wal_bytes, shm_bytes in byte_sets:
+                db_path.write_bytes(database_bytes)
+                Path(f"{db_path}-wal").write_bytes(wal_bytes)
+                Path(f"{db_path}-shm").write_bytes(shm_bytes)
+                store._quarantine_database()
+
+        retained = sorted(
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        )
+
+        self.assertEqual(len(retained), 2)
+        self.assertEqual({path.read_bytes() for path in retained}, {item[0] for item in byte_sets})
+        self.assertEqual(
+            {Path(f"{path}-wal").read_bytes() for path in retained},
+            {item[1] for item in byte_sets},
+        )
+        self.assertEqual(
+            {Path(f"{path}-shm").read_bytes() for path in retained},
+            {item[2] for item in byte_sets},
+        )
+
+    def test_quarantine_preserves_sidecars_if_publication_stops_before_database_move(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        db_path.write_bytes(b"database bytes")
+        Path(f"{db_path}-wal").write_bytes(b"wal bytes")
+        Path(f"{db_path}-shm").write_bytes(b"shm bytes")
+        real_rename = store._rename_at2
+
+        def stop_before_database_move(source: Path, target: Path, *, flags: int) -> None:
+            if source == db_path:
+                raise OSError(errno.EIO, "synthetic stop before database move")
+            real_rename(source, target, flags=flags)
+
+        with patch.object(store, "_rename_at2", side_effect=stop_before_database_move):
+            with self.assertRaisesRegex(OSError, "synthetic stop"):
+                store._quarantine_database()
+
+        retained_wal = list(temp_dir.glob("history.db.broken-*-wal"))
+        retained_shm = list(temp_dir.glob("history.db.broken-*-shm"))
+        self.assertEqual(db_path.read_bytes(), b"database bytes")
+        self.assertFalse(Path(f"{db_path}-wal").exists())
+        self.assertFalse(Path(f"{db_path}-shm").exists())
+        self.assertEqual([path.read_bytes() for path in retained_wal], [b"wal bytes"])
+        self.assertEqual([path.read_bytes() for path in retained_shm], [b"shm bytes"])
+
+    def test_same_instant_quarantine_after_acknowledgement_fails_closed_after_marker_failure(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        frozen = datetime(2026, 5, 1, 4, 30, 0, 123456, tzinfo=timezone.utc)
+
+        with freeze_history_store_now(frozen):
+            db_path.write_bytes(b"first unreadable database")
+            first = HistoryStore(str(db_path))
+            self.assertTrue(first.acknowledge_quarantine_recovery())
+            self.assertFalse(first.quarantine_recovery_status()["history_recovery_required"])
+
+            db_path.write_bytes(b"later unreadable database")
+            with patch.object(
+                HistoryStore,
+                "record_quarantine_recovery",
+                side_effect=OSError("synthetic marker write failure"),
+            ):
+                HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        status = restarted.quarantine_recovery_status()
+        retained = [
+            path
+            for path in temp_dir.iterdir()
+            if path.name.startswith("history.db.broken-") and not path.name.endswith(("-wal", "-shm"))
+        ]
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertIsNotNone(status["history_quarantined_at"])
+        self.assertNotIn(str(temp_dir), json.dumps(status))
+        self.assertEqual({path.read_bytes() for path in retained}, {b"first unreadable database", b"later unreadable database"})
+
+    def test_marker_write_failure_stays_degraded_after_restart(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=sqlite3.OperationalError("synthetic marker write failure"),
+        ):
+            HistoryStore(str(db_path))
+
+        restarted = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), restarted)
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", restarted),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIs(restarted.quarantine_recovery_status()["history_recovery_required"], True)
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
+
+    def test_quarantine_evidence_without_a_marker_can_be_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertFalse(store.acknowledge_quarantine_recovery())
+
+    def test_quarantine_evidence_keeps_first_timestamp_when_marker_is_retried(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        with patch.object(
+            HistoryStore,
+            "record_quarantine_recovery",
+            side_effect=OSError("synthetic marker write failure"),
+        ):
+            store = HistoryStore(str(db_path))
+
+        first = store.read_quarantine_recovery()
+        self.assertIsInstance(first, datetime)
+        assert first is not None
+        later = first + timedelta(days=1)
+
+        self.assertEqual(store.record_quarantine_recovery(later), first)
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
+    def test_store_distinguishes_a_first_installation_from_a_recovery(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+
+        fresh = HistoryStore(str(temp_dir / "history.db"))
+
+        self.assertIsNone(fresh.read_quarantine_recovery())
+        self.assertEqual(
+            fresh.quarantine_recovery_status(),
+            {"history_recovery_required": False, "history_quarantined_at": None},
+        )
+
+    def test_store_reports_quarantine_recovery_in_its_status(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+
+        store = HistoryStore(str(db_path))
+        status = store.quarantine_recovery_status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+        self.assertNotIn(
+            ".broken-",
+            json.dumps(status),
+            "the recovery indication must not expose the quarantine path",
+        )
+
+    def test_store_keeps_the_first_quarantine_timestamp_until_acknowledged(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+
+        store.record_quarantine_recovery(first)
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), first)
+
+    def test_store_clears_the_recovery_indication_only_on_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        quarantined_at = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(quarantined_at)
+
+        acknowledged = store.acknowledge_quarantine_recovery()
+        again = store.acknowledge_quarantine_recovery()
+
+        self.assertTrue(acknowledged)
+        self.assertFalse(again)
+        self.assertIsNone(store.read_quarantine_recovery())
+        self.assertIs(
+            store.quarantine_recovery_status()["history_recovery_required"],
+            False,
+        )
+
+    def test_store_records_a_later_quarantine_after_an_acknowledgement(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+
+        store.record_quarantine_recovery(later)
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+
+    def test_later_quarantine_evidence_overrides_an_acknowledged_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        store = HistoryStore(str(db_path))
+        first = datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc)
+        later = datetime(2026, 5, 2, 4, 30, tzinfo=timezone.utc)
+        store.record_quarantine_recovery(first)
+        store.acknowledge_quarantine_recovery()
+        evidence = temp_dir / "history.db.broken-20260502T043000Z"
+        evidence.write_bytes(b"retained original bytes")
+
+        self.assertEqual(store.read_quarantine_recovery(), later)
+        self.assertTrue(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertTrue(store.acknowledge_quarantine_recovery())
+        self.assertFalse(store.quarantine_recovery_status()["history_recovery_required"])
+        self.assertEqual(evidence.read_bytes(), b"retained original bytes")
+
+    def test_store_fails_closed_on_an_unreadable_recovery_marker(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+        store.record_quarantine_recovery(datetime(2026, 5, 1, 4, 30, tzinfo=timezone.utc))
+        with closing(sqlite3.connect(temp_dir / "history.db")) as connection:
+            connection.execute(
+                "UPDATE history_maintenance_state SET backup_at = ? WHERE name = ?",
+                ("not a timestamp", history_store.QUARANTINE_RECOVERY_STATE_NAME),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            store.quarantine_recovery_status(),
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_store_fails_closed_when_quarantine_evidence_cannot_be_inspected(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = HistoryStore(str(temp_dir / "history.db"))
+
+        with patch.object(
+            store,
+            "_quarantine_evidence_timestamps",
+            side_effect=OSError("synthetic evidence scan failure"),
+        ):
+            status = store.quarantine_recovery_status()
+
+        self.assertEqual(
+            status,
+            {"history_recovery_required": True, "history_quarantined_at": None},
+        )
+
+    def test_public_collector_status_surfaces_quarantine_recovery(self) -> None:
+        """The recovery indication survives the public projection (#417)."""
+
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "history_recovery_required": True,
+                "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+                "sqlite_path": "/private/history.db",
+            }
+        )
+
+        self.assertIs(projected["history_recovery_required"], True)
+        self.assertEqual(projected["history_quarantined_at"], "2026-05-01T04:30:00+00:00")
+        self.assertNotIn("sqlite_path", projected)
+
+    def test_collector_status_reports_the_store_recovery_indication(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        status = collector.status()
+
+        self.assertIs(status["history_recovery_required"], True)
+        self.assertEqual(
+            status["history_quarantined_at"],
+            store.read_quarantine_recovery().isoformat(),
+        )
+
+    def test_healthz_grades_a_required_recovery_as_degraded(self) -> None:
+        """An empty last_error must not make a recovery-required service look ok (#417)."""
+
+        status = {
+            "collector_running": True,
+            "last_error": None,
+            "history_recovery_required": True,
+            "history_quarantined_at": "2026-05-01T04:30:00+00:00",
+        }
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value=status),
+            patch.object(history_main.collector, "last_error", None),
+            patch.object(history_main.store, "database_size_bytes", return_value=4096),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertNotEqual(payload["status"], "ok")
+        self.assertEqual(payload["status"], "degraded")
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
+
+    def test_healthz_reports_degraded_after_a_quarantine_activated_a_fresh_database(self) -> None:
+        """Quarantine must not activate a fresh database that reports itself healthy (#417)."""
+
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        db_path.write_text("not a sqlite database", encoding="utf-8")
+        store = HistoryStore(str(db_path))
+        collector = HistoryCollector(HistorySettings(sqlite_path=str(db_path)), store)
+
+        with (
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main, "store", store),
+            patch.object(history_main, "collector", collector),
+        ):
+            response = asyncio.run(history_main.healthz())
+
+        payload = json.loads(response.body)
+        self.assertIsNone(collector.last_error)
+        self.assertIs(payload["collector"]["history_recovery_required"], True)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertNotIn(".broken-", json.dumps(payload))
+
     def test_store_can_fail_closed_without_quarantining_unreadable_database(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         db_path = temp_dir / "history.db"
@@ -5307,6 +7668,58 @@ class HistoryStoreTests(unittest.TestCase):
                 DISK_IDENTITY_BACKFILL_USER_VERSION,
             )
 
+    def test_disk_identity_backfill_commits_batches_and_resumes_after_an_interruption(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        db_path = temp_dir / "history.db"
+        HistoryStore(str(db_path))
+        with sqlite3.connect(db_path) as connection:
+            for slot in range(25):
+                self._legacy_metric_row_without_identity_key(connection, slot)
+            connection.execute("PRAGMA user_version = 0")
+
+        real_batch = HistoryStore._backfill_disk_identity_batch
+        batch_calls: list[str] = []
+
+        def interrupted_batch(connection: sqlite3.Connection, table_name: str, *, batch_size: int) -> int:
+            batch_calls.append(table_name)
+            if len(batch_calls) == 2:
+                raise sqlite3.OperationalError("simulated restart during the upgrade")
+            return real_batch(connection, table_name, batch_size=batch_size)
+
+        with patch.object(history_store, "DISK_IDENTITY_BACKFILL_BATCH_SIZE", 10), patch.object(
+            HistoryStore, "_backfill_disk_identity_batch", staticmethod(interrupted_batch)
+        ), self.assertLogs("history_service.store", level="INFO") as logs:
+            with self.assertRaises(sqlite3.OperationalError):
+                HistoryStore(str(db_path), recover_unreadable_database=False)
+
+        self.assertEqual(batch_calls, ["metric_samples", "metric_samples"])
+        self.assertTrue(
+            any("Upgrading history database: 25 rows to backfill" in line for line in logs.output),
+            logs.output,
+        )
+        with sqlite3.connect(db_path) as connection:
+            keyed = connection.execute(
+                "SELECT COUNT(*) FROM metric_samples WHERE disk_identity_key IS NOT NULL"
+            ).fetchone()[0]
+            self.assertEqual(keyed, 10, "the first batch stays committed after the interruption")
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+
+        with patch.object(history_store, "DISK_IDENTITY_BACKFILL_BATCH_SIZE", 10), patch.object(
+            HistoryStore, "_backfill_disk_identity_batch", wraps=real_batch
+        ) as resumed_batch:
+            HistoryStore(str(db_path))
+
+        self.assertEqual(resumed_batch.call_count, 2, "only the remaining 15 rows are scanned after a restart")
+        with sqlite3.connect(db_path) as connection:
+            keyed = connection.execute(
+                "SELECT COUNT(*) FROM metric_samples WHERE disk_identity_key IS NOT NULL"
+            ).fetchone()[0]
+            self.assertEqual(keyed, 25)
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                DISK_IDENTITY_BACKFILL_USER_VERSION,
+            )
+
     def test_get_slot_states_returns_only_the_requested_scope(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         store = HistoryStore(str(temp_dir / "history.db"))
@@ -5618,7 +8031,54 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertIn("history_table_counts", table_names)
 
 
+def _collector_store() -> MagicMock:
+    """A mock store whose retention wait anchor is durable, like the real one.
+
+    The anchor lives in the store, not the collector, so a collector rebuilt
+    from the same store is exactly what a service restart looks like (#455).
+    """
+
+    store = MagicMock()
+    recorded: dict[str, datetime] = {}
+
+    def read_anchor() -> datetime | None:
+        return recorded.get("anchor")
+
+    def start_wait(anchor: datetime) -> datetime:
+        return recorded.setdefault("anchor", anchor.astimezone(timezone.utc))
+
+    def clear_wait() -> None:
+        recorded.pop("anchor", None)
+
+    store.read_retention_wait_anchor.side_effect = read_anchor
+    store.start_retention_wait.side_effect = start_wait
+    store.clear_retention_wait.side_effect = clear_wait
+    return store
+
+
+
+def _storage_view_smart_batch_reply(summary: dict[str, object]):
+    """Answer the storage-view SMART batch route the way the main UI does (#457)."""
+
+    async def reply(path: str, **kwargs: object) -> dict[str, object]:
+        slots = json.loads(kwargs["body"])["slots"]  # type: ignore[arg-type]
+        return {"summaries": [{"slot": slot, "summary": dict(summary)} for slot in slots]}
+
+    return reply
+
+
 class HistoryCollectorTests(unittest.TestCase):
+    def test_ipmi_snapshot_requires_healthy_bmc_source(self) -> None:
+        snapshot = {
+            "selected_system_platform": "ipmi",
+            "sources": {"bmc": {"enabled": True, "ok": False}},
+        }
+
+        self.assertFalse(HistoryCollector._should_record_scope_snapshot(snapshot))
+
+        snapshot["sources"]["bmc"]["ok"] = True
+        self.assertTrue(HistoryCollector._should_record_scope_snapshot(snapshot))
+
     @staticmethod
     def _topology_history_fixture(
         *,
@@ -5953,7 +8413,7 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
     def test_retention_runs_when_due_and_reports_status(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         store.maintain_retention.return_value = {
             "metric_samples_removed": 12,
             "events_removed": 3,
@@ -5992,7 +8452,7 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNone(status["last_retention_error"])
 
     def test_retention_catchup_runs_again_before_interval_when_more_rows_remain(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         store.maintain_retention.side_effect = [
             {
                 "metric_samples_removed": 10,
@@ -6027,8 +8487,8 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(store.maintain_retention.call_count, 2)
         self.assertFalse(collector.status()["last_retention_has_more"])
 
-    def test_retention_failure_reports_only_exception_class_and_does_not_raise(self) -> None:
-        store = MagicMock()
+    def test_retention_failure_reports_a_plain_sentence_and_does_not_raise(self) -> None:
+        store = _collector_store()
         store.maintain_retention.side_effect = RuntimeError("private database path")
         collector = HistoryCollector(HistorySettings(), store)
 
@@ -6038,11 +8498,29 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
         status = collector.status()
-        self.assertEqual(status["last_retention_error"], "RuntimeError")
+        self.assertEqual(
+            status["last_retention_error"],
+            "Unexpected retention error; see the service logs. (RuntimeError)",
+        )
+        self.assertEqual(status["last_retention_error_kind"], "unexpected")
         self.assertNotIn("private database path", str(status))
 
+    def test_retention_batch_overflow_names_the_setting_to_lower(self) -> None:
+        store = _collector_store()
+        store.maintain_retention.side_effect = sqlite3.OperationalError("too many SQL variables")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(
+            datetime(2026, 7, 1, tzinfo=timezone.utc),
+            backup_succeeded=True,
+        )
+
+        status = collector.status()
+        self.assertEqual(status["last_retention_error_kind"], "retention_batch_too_large")
+        self.assertIn("HISTORY_RETENTION_BATCH_SIZE", str(status["last_retention_error"]))
+
     def test_retention_failure_reports_prior_commits_and_keeps_catchup_pending(self) -> None:
-        store = MagicMock()
+        store = _collector_store()
         failure = RuntimeError("private database path")
         setattr(failure, "retention_summary", {
             "metric_samples_removed": 1,
@@ -6079,9 +8557,202 @@ class HistoryCollectorTests(unittest.TestCase):
             },
         )
 
-    def test_retention_requires_a_successful_same_pass_backup(self) -> None:
-        store = MagicMock()
+    def test_retention_runs_on_a_failed_pass_when_a_recent_backup_exists(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = now - timedelta(hours=6)
         collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_retention_skip_without_any_backup_is_bounded_and_records_a_reason(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(
+            HistorySettings(retention_backup_skip_max_seconds=86400),
+            store,
+        )
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        skipped = collector.status()
+        self.assertEqual(
+            skipped["last_retention_skip_reason"],
+            "Waiting for a successful database backup before pruning.",
+        )
+        self.assertEqual(skipped["last_retention_skip_until"], "2026-07-02T00:00:00+00:00")
+        self.assertIsNone(skipped["last_retention_attempt_at"])
+
+        collector._run_retention_if_due(now + timedelta(hours=2), backup_succeeded=False)
+        store.maintain_retention.assert_not_called()
+
+        collector._run_retention_if_due(now + timedelta(hours=25), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        ran = collector.status()
+        self.assertTrue(ran["last_retention_ran_without_backup"])
+        self.assertEqual(
+            ran["last_retention_skip_reason"],
+            "Pruned without a recent database backup because backups are failing.",
+        )
+
+    def test_the_retention_skip_deadline_is_anchored_to_the_newest_backup(self) -> None:
+        # The deadline used to start at the pass that noticed the miss, so a
+        # container restarting more often than the window postponed pruning
+        # forever. The newest backup survives a restart, so anchor on it.
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+        stale_for = timedelta(hours=2)
+        usable_for = HistoryCollector(settings, store)._usable_backup_max_age()
+        store.latest_backup_snapshot_at.return_value = now - usable_for - stale_for
+
+        first = HistoryCollector(settings, store)
+        first._run_retention_if_due(now, backup_succeeded=False)
+        deadline = first.status()["last_retention_skip_until"]
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(deadline, "2026-07-01T22:00:00+00:00")
+
+        restarted = HistoryCollector(settings, store)
+        restarted._run_retention_if_due(now + timedelta(hours=12), backup_succeeded=False)
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(restarted.status()["last_retention_skip_until"], deadline)
+
+        after_the_deadline = HistoryCollector(settings, store)
+        after_the_deadline._run_retention_if_due(now + timedelta(hours=23), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        self.assertTrue(after_the_deadline.status()["last_retention_ran_without_backup"])
+
+    def test_retention_skip_window_clears_once_a_backup_succeeds(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=False)
+        collector._run_retention_if_due(now + timedelta(hours=1), backup_succeeded=True)
+
+        store.maintain_retention.assert_called_once()
+        status = collector.status()
+        self.assertIsNone(status["last_retention_skip_reason"])
+        self.assertIsNone(status["last_retention_skip_until"])
+        self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_the_no_backup_wait_survives_restarts_and_still_prunes_on_time(self) -> None:
+        # With no backup ever taken the anchor used to live only in memory, so
+        # a service restarting inside the window restarted the wait and never
+        # pruned while backups kept failing (#455).
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+
+        first = HistoryCollector(settings, store)
+        first._run_retention_if_due(now, backup_succeeded=False)
+        deadline = first.status()["last_retention_skip_until"]
+        self.assertEqual(deadline, "2026-07-02T00:00:00+00:00")
+        store.maintain_retention.assert_not_called()
+
+        for restart_after in (6, 12, 18):
+            restarted = HistoryCollector(settings, store)
+            restarted._run_retention_if_due(
+                now + timedelta(hours=restart_after),
+                backup_succeeded=False,
+            )
+            store.maintain_retention.assert_not_called()
+            self.assertEqual(restarted.status()["last_retention_skip_until"], deadline)
+
+        after_the_deadline = HistoryCollector(settings, store)
+        after_the_deadline._run_retention_if_due(now + timedelta(hours=25), backup_succeeded=False)
+
+        store.maintain_retention.assert_called_once()
+        self.assertTrue(after_the_deadline.status()["last_retention_ran_without_backup"])
+
+    def test_the_wait_anchor_is_forgotten_once_a_backup_succeeds(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        settings = HistorySettings(retention_backup_skip_max_seconds=86400)
+
+        HistoryCollector(settings, store)._run_retention_if_due(now, backup_succeeded=False)
+        HistoryCollector(settings, store)._run_retention_if_due(
+            now + timedelta(hours=1),
+            backup_succeeded=True,
+        )
+        store.clear_retention_wait.assert_called()
+
+        # Backups start failing again: the window starts over, it is not
+        # inherited from the wait that a backup already ended.
+        restarted = HistoryCollector(settings, store)
+        restarted._run_retention_if_due(now + timedelta(hours=2), backup_succeeded=False)
+
+        self.assertEqual(
+            restarted.status()["last_retention_skip_until"],
+            "2026-07-02T02:00:00+00:00",
+        )
+        store.maintain_retention.assert_called_once()
+
+    def test_an_unusable_wait_anchor_stops_pruning(self) -> None:
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        for broken in ("read_retention_wait_anchor", "start_retention_wait"):
+            with self.subTest(method=broken):
+                store = _collector_store()
+                store.latest_backup_snapshot_at.return_value = None
+                getattr(store, broken).side_effect = sqlite3.OperationalError(
+                    "attempt to write a readonly database"
+                )
+                collector = HistoryCollector(
+                    HistorySettings(retention_backup_skip_max_seconds=0),
+                    store,
+                )
+
+                collector._run_retention_if_due(now, backup_succeeded=False)
+
+                store.maintain_retention.assert_not_called()
+                status = collector.status()
+                self.assertEqual(
+                    status["last_retention_skip_reason"],
+                    "Not pruning: the retention wait record could not be read or written.",
+                )
+                self.assertIsNone(status["last_retention_skip_until"])
+                self.assertFalse(status["last_retention_ran_without_backup"])
+
+    def test_a_wait_record_that_cannot_be_cleared_stops_pruning(self) -> None:
+        # A stale record would make the next missing backup prune immediately.
+        now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.clear_retention_wait.side_effect = sqlite3.OperationalError("disk I/O error")
+        collector = HistoryCollector(HistorySettings(), store)
+
+        collector._run_retention_if_due(now, backup_succeeded=True)
+
+        store.maintain_retention.assert_not_called()
+        self.assertEqual(
+            collector.status()["last_retention_skip_reason"],
+            "Not pruning: the retention wait record could not be read or written.",
+        )
+
+    def test_segmented_retention_still_requires_its_scheduled_backup(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = _collector_store()
+        collector = HistoryCollector(
+            HistorySettings(
+                sqlite_path=str(temp_dir / "history.db"),
+                segment_catalog_path=str(temp_dir / "segments" / "catalog.json"),
+            ),
+            store,
+        )
 
         collector._run_retention_if_due(
             datetime(2026, 7, 1, tzinfo=timezone.utc),
@@ -6090,6 +8761,43 @@ class HistoryCollectorTests(unittest.TestCase):
 
         store.maintain_retention.assert_not_called()
         self.assertIsNone(collector.status()["last_retention_attempt_at"])
+
+    def test_backup_failure_records_a_plain_reason_for_the_dashboard(self) -> None:
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.side_effect = PermissionError(13, "Permission denied")
+        collector = HistoryCollector(
+            HistorySettings(startup_grace_seconds=0),
+            store,
+        )
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertEqual(status["last_backup_error_kind"], "permission_denied")
+        self.assertEqual(
+            status["last_backup_error"],
+            "The history service may not write the backup directory. (PermissionError)",
+        )
+        self.assertNotIn("Permission denied", str(status["last_backup_error"]))
+
+    def test_successful_backup_clears_the_recorded_backup_failure(self) -> None:
+        store = _collector_store()
+        store.latest_backup_snapshot_at.return_value = None
+        store.create_backup.return_value = Path("history-2026.sqlite3")
+        collector = HistoryCollector(HistorySettings(startup_grace_seconds=0), store)
+        collector.last_backup_error = "The disk holding the history backups is full. (OSError)"
+        collector.last_backup_error_kind = "disk_full"
+        collector.last_fast_metrics_at = collector.started_at
+        collector._enumerate_scopes = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        asyncio.run(collector.run_once(force_slow=True))
+
+        status = collector.status()
+        self.assertIsNone(status["last_backup_error"])
+        self.assertIsNone(status["last_backup_error_kind"])
 
     def test_stop_waits_for_inflight_worker_before_returning(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -6134,7 +8842,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
     def test_stop_request_prevents_later_scope_writes(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
-        store = MagicMock()
+        store = _collector_store()
         store.estimated_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
@@ -6298,7 +9006,7 @@ class HistoryCollectorTests(unittest.TestCase):
 
     def test_background_startup_collection_is_fast_only(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
-        store = MagicMock()
+        store = _collector_store()
         store.estimated_counts.return_value = {}
         collector = HistoryCollector(
             HistorySettings(
@@ -7942,15 +10650,17 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
         collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "available": True,
-                "temperature_c": 31,
-                "bytes_read": 100,
-                "bytes_written": 200,
-                "annualized_bytes_read": 25,
-                "annualized_bytes_written": None,
-                "power_on_hours": 48,
-            }
+            side_effect=_storage_view_smart_batch_reply(
+                {
+                    "available": True,
+                    "temperature_c": 31,
+                    "bytes_read": 100,
+                    "bytes_written": 200,
+                    "annualized_bytes_read": 25,
+                    "annualized_bytes_written": None,
+                    "power_on_hours": 48,
+                }
+            )
         )
 
         asyncio.run(collector.run_once())
@@ -7987,9 +10697,10 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertEqual(loaded.persistent_id_label, "GPTID")
         self.assertEqual(loaded.logical_unit_id, "0x5000c500abcd0000")
         self.assertEqual(loaded.sas_address, "0x5000c500abcd0001")
+        # #457: the view is collected through the storage-view batch route.
         self.assertEqual(
             collector._fetch_json.await_args_list[0].args[0],  # type: ignore[attr-defined]
-            "/api/storage-views/boot-doms/slots/0/smart",
+            "/api/storage-views/boot-doms/slots/smart-batch",
         )
         self.assertEqual(
             collector._fetch_json.await_args_list[0].kwargs["params"],  # type: ignore[attr-defined]
@@ -8146,15 +10857,17 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
         collector._fetch_json = AsyncMock(  # type: ignore[method-assign]
-            return_value={
-                "available": True,
-                "temperature_c": 31,
-                "bytes_read": 100,
-                "bytes_written": 200,
-                "annualized_bytes_read": 25,
-                "annualized_bytes_written": 50,
-                "power_on_hours": 48,
-            }
+            side_effect=_storage_view_smart_batch_reply(
+                {
+                    "available": True,
+                    "temperature_c": 31,
+                    "bytes_read": 100,
+                    "bytes_written": 200,
+                    "annualized_bytes_read": 25,
+                    "annualized_bytes_written": 50,
+                    "power_on_hours": 48,
+                }
+            )
         )
 
         asyncio.run(collector.run_once(force_slow=True))
@@ -8389,3 +11102,752 @@ class HistoryCollectorTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.vdev_name, "mirror-0")
         self.assertEqual(loaded.topology_label, "HA-Pool-R10 > mirror-0 > data (Active on QSOSN-Right)")
+
+
+class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
+    """Real synthetic stores and the public worker, with outbound HTTP replaced."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.store = HistoryStore(str(root / "history.db"))
+        self.collector = HistoryCollector(
+            HistorySettings(sqlite_path=str(root / "history.db"), backup_dir=str(root / "backups"),
+                            startup_grace_seconds=0, smart_batch_size=1),
+            self.store,
+        )
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.omitted = "system"
+        self.failed = True
+        self.empty_root = False
+        self.empty_view = False
+        self.view_state = "trusted"
+        self.legacy_view = False
+        self.transport = patch.object(self.collector, "_fetch_json_sync", side_effect=self._source)
+        self.transport.start()
+        self.addCleanup(self.transport.stop)
+
+    def _snapshot(self, system: str, enclosure: str) -> dict[str, Any]:
+        return {
+            "selected_system_id": system, "selected_enclosure_id": enclosure,
+            "selected_system_label": "Synthetic system",
+            "selected_system_platform": "quantastor",
+            "platform_context": {"topology_complete": self.view_state != "topology-incomplete"},
+            "systems": [{"id": "system-a"}, {"id": "system-b"}],
+            "enclosures": [{"id": "enc-a"}, {"id": "enc-b"}],
+            "sources": {"api": {"enabled": True, "ok": self.view_state != "untrusted"}},
+            "slots": [] if self.empty_root else [
+                {"slot": n, "present": True, "state": "healthy",
+                 "serial": f"SANITIZED-{system}-{enclosure}-{n}"} for n in range(2)
+            ],
+        }
+
+    def _source(self, path, params, method, body, headers, timeout):
+        self.calls.append((path, dict(params)))
+        system = params.get("system_id", "system-a")
+        enclosure = params.get("enclosure_id", "enc-a")
+        if path == "/api/inventory":
+            return self._snapshot(system, enclosure)
+        if path == "/api/storage-views":
+            if self.view_state == "failed":
+                raise HistorySourceError.rejected("Synthetic source failure", status_code=503)
+            return {"views": [] if system != "system-a" or self.view_state == "missing" else [{
+                "id": "view-a", "label": "Synthetic view", "source": "inventory_binding",
+                "slots": [{"slot_index": n, "occupied": not self.empty_view,
+                           "serial": None if self.empty_view else f"SANITIZED-view-disk-{n}"}
+                          for n in range(2)],
+            }]}
+        if self.legacy_view and "storage-views" in path:
+            if path.endswith("smart-batch"):
+                raise HistorySourceError.rejected("Synthetic legacy route", status_code=404)
+            if path.endswith("/smart"):
+                return {"available": True, "smart_health_status": "PASSED", "temperature_c": 30}
+        if path.endswith("smart-batch"):
+            is_failed = self.failed and (
+                (self.omitted == "system" and system == "system-b")
+                or (self.omitted == "enclosure" and enclosure == "enc-b")
+                or (self.omitted == "view" and "storage-views" in path)
+            )
+            return {"summaries": [{"slot": n, "summary": {
+                "available": True, "smart_health_status": "FAILED" if is_failed else "PASSED",
+                "temperature_c": 65 if is_failed else 30,
+            }} for n in json.loads(body)["slots"]]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    async def _pass(self, *, root_only=False):
+        self.now += timedelta(minutes=5)
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False,
+                                          cached_root_only=root_only)
+        return self.collector.status()
+
+    async def test_root_only_preserves_complete_fleet_evidence_and_recovery(self):
+        keys = ("last_smart_failure_evidence_disks", "last_max_temperature_celsius",
+                "last_smart_failure_evidence_at", "last_temperature_evidence_at", "last_smart_evidence_at")
+        for omitted in ("system", "enclosure", "view"):
+            for empty_root in (False, True):
+                with self.subTest(omitted=omitted, empty_root=empty_root):
+                    self.omitted, self.failed, self.empty_root = omitted, True, False
+                    complete = await self._pass()
+                    self.assertGreater(complete[keys[0]], 0)
+                    self.assertEqual(complete[keys[1]], 65)
+                    self.empty_root = empty_root
+                    self.calls.clear()
+                    partial = await self._pass(root_only=True)
+                    self.assertEqual({k: partial[k] for k in keys}, {k: complete[k] for k in keys})
+                    self.assertEqual(sum(path == "/api/inventory" for path, _ in self.calls), 1)
+                    self.assertFalse(any(path == "/api/storage-views" for path, _ in self.calls))
+                    self.assertTrue(all(not params.get("force") and not params.get("fresh")
+                                        for _, params in self.calls))
+                    self.failed, self.empty_root = False, False
+                    recovered = await self._pass()
+                    self.assertEqual(recovered[keys[0]], 0)
+                    self.assertEqual(recovered[keys[1]], 30)
+                    self.assertEqual(recovered[keys[4]], isoformat_utc(self.now))
+                    self.assertNotEqual(recovered[keys[4]], complete[keys[4]])
+
+    async def test_empty_view_records_removal_once_and_reinsertion(self):
+        await self._pass()
+        def events():
+            return self.store.list_slot_events("system-a", "storage-view:view-a", 0)
+        self.assertTrue(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+        self.empty_view = True
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed"])
+        self.assertFalse(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed"])
+        self.empty_view = False
+        await self._pass()
+        self.assertEqual([e["event_type"] for e in events()], ["slot_state_changed", "slot_state_changed"])
+        transitions = [json.loads(e["details_json"])["present"] for e in events()]
+        self.assertCountEqual([(t["previous"], t["current"]) for t in transitions], [(True, False), (False, True)])
+
+    async def test_untrusted_failed_and_missing_views_do_not_remove_disks(self):
+        await self._pass()
+        self.empty_view = True
+        for state in ("untrusted", "topology-incomplete", "failed", "missing"):
+            with self.subTest(state=state):
+                self.view_state = state
+                await self._pass()
+                self.assertTrue(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
+                self.assertEqual(self.store.list_slot_events("system-a", "storage-view:view-a", 0), [])
+
+    async def _producer_empty_view(self, platform, *, ssh_failed):
+        from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
+        from app.models.domain import InventorySnapshot
+        from app.services.truenas_ws import TrueNASRawData
+        from tests.test_inventory import build_inventory_service
+
+        system = SystemConfig(
+            id=f"synthetic-{platform}", label="Synthetic system",
+            truenas=TrueNASConfig(platform=platform, host="https://host.example.test"),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[]),
+            storage_views=[{
+                "id": "synthetic-boot", "label": "Synthetic boot", "kind": "boot_devices",
+                "template_id": "embedded-boot-media-1", "enabled": True,
+                "binding": {"mode": "auto", "device_names": ["boot"]},
+            }],
+        )
+        api, ssh = AsyncMock(), AsyncMock()
+        api.fetch_all.return_value = TrueNASRawData(
+            enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+        )
+        ssh.run_planned_commands.return_value = []
+        if ssh_failed:
+            ssh.run_planned_commands.side_effect = RuntimeError("Synthetic SSH source unavailable")
+        service = build_inventory_service(Settings(), system, api, ssh, self.temp.name)
+        # Keep the actual producer's status and empty data, replacing only transport.
+        if ssh_failed:
+            with self.assertLogs("app.services.inventory", level="ERROR"):
+                bundle = await service._collect_inventory_source_bundle()
+        else:
+            bundle = await service._collect_inventory_source_bundle()
+        ssh.run_planned_commands.assert_awaited_once()
+        api_enabled = platform not in {"linux", "esxi"}
+        self.assertEqual(bundle.sources["api"].enabled, api_enabled)
+        self.assertTrue(bundle.sources["api"].ok)
+        self.assertTrue(bundle.sources["ssh"].enabled)
+        self.assertEqual(bundle.sources["ssh"].ok, not ssh_failed)
+        if api_enabled:
+            api.fetch_all.assert_awaited_once()
+        else:
+            api.fetch_all.assert_not_awaited()
+        service._source_bundle = bundle
+        service._source_bundle_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        snapshot = InventorySnapshot(
+            slots=[], refresh_interval_seconds=30,
+            selected_system_id=system.id, selected_system_label=system.label,
+            selected_system_platform=platform, sources=bundle.sources,
+        )
+        runtime = await service.get_storage_view_runtime(snapshot=snapshot)
+        self.assertEqual(len(runtime.views), 1)
+        self.assertEqual(runtime.views[0].source, "inventory_binding")
+        self.assertEqual(len(runtime.views[0].slots), 1)
+        self.assertFalse(runtime.views[0].slots[0].occupied)
+        return snapshot.model_dump(mode="json"), runtime.model_dump(mode="json")
+
+    async def _collect_producer_view(self, inventory, runtime):
+        calls = []
+        def transport(path, params, method, body, headers, timeout):
+            calls.append(path)
+            if path == "/api/inventory":
+                return inventory
+            if path == "/api/storage-views":
+                return runtime
+            raise AssertionError(f"Unexpected synthetic request: {path}")
+        with patch.object(self.collector, "_fetch_json_sync", side_effect=transport):
+            await self.collector.run_once(include_due_intervals=False)
+        self.assertIn("/api/inventory", calls)
+        self.assertIn("/api/storage-views", calls)
+
+    async def _seed_producer_view(self, inventory, runtime):
+        healthy_inventory = json.loads(json.dumps(inventory))
+        healthy_inventory["sources"]["ssh"]["ok"] = True
+        occupied_runtime = json.loads(json.dumps(runtime))
+        occupied_runtime["views"][0]["slots"][0].update(
+            occupied=True, state="matched", serial="SANITIZED-history-boot", device_name="boot",
+        )
+        await self._collect_producer_view(healthy_inventory, occupied_runtime)
+        key = (inventory["selected_system_id"], "storage-view:synthetic-boot", 0)
+        self.assertTrue(self.store.get_slot_state(*key).present)
+        self.assertEqual(self.store.list_slot_events(*key), [])
+        return key, healthy_inventory, occupied_runtime
+
+    async def test_failed_authoritative_ssh_empty_view_preserves_history(self):
+        for platform in ("linux", "esxi"):
+            with self.subTest(platform=platform):
+                inventory, runtime = await self._producer_empty_view(platform, ssh_failed=True)
+                key, healthy_inventory, occupied_runtime = await self._seed_producer_view(inventory, runtime)
+                previous = self.store.get_slot_state(*key)
+                await self._collect_producer_view(inventory, runtime)
+                self.assertEqual(self.store.get_slot_state(*key), previous,
+                                 "Failed authoritative SSH must preserve the occupied slot")
+                self.assertEqual(self.store.list_slot_events(*key), [])
+
+                # Recovery with genuinely empty producer data still records removal once.
+                empty_inventory, empty_runtime = await self._producer_empty_view(platform, ssh_failed=False)
+                for _ in range(2):
+                    await self._collect_producer_view(empty_inventory, empty_runtime)
+                    self.assertFalse(self.store.get_slot_state(*key).present)
+                    events = self.store.list_slot_events(*key)
+                    self.assertEqual([e["event_type"] for e in events], ["slot_state_changed"])
+                    self.assertEqual(json.loads(events[0]["details_json"])["present"],
+                                     {"label": "Present", "previous": True, "current": False})
+                await self._collect_producer_view(healthy_inventory, occupied_runtime)
+                self.assertTrue(self.store.get_slot_state(*key).present)
+                events = self.store.list_slot_events(*key)
+                self.assertEqual([e["event_type"] for e in events],
+                                 ["slot_state_changed", "slot_state_changed"])
+                transitions = [json.loads(e["details_json"])["present"] for e in events]
+                self.assertCountEqual(transitions, [{"label": "Present", "previous": True, "current": False},
+                                                     {"label": "Present", "previous": False, "current": True}])
+
+    async def test_api_backed_empty_view_allows_optional_ssh_failure(self):
+        for platform in ("core", "scale", "quantastor"):
+            with self.subTest(platform=platform):
+                inventory, runtime = await self._producer_empty_view(platform, ssh_failed=True)
+                key, _, _ = await self._seed_producer_view(inventory, runtime)
+                for _ in range(2):
+                    await self._collect_producer_view(inventory, runtime)
+                    self.assertFalse(self.store.get_slot_state(*key).present)
+                    events = self.store.list_slot_events(*key)
+                    self.assertEqual([e["event_type"] for e in events], ["slot_state_changed"])
+                    self.assertEqual(json.loads(events[0]["details_json"])["present"],
+                                     {"label": "Present", "previous": True, "current": False})
+
+    async def test_durable_status_does_not_block_liveness_under_lifecycle_lock(self):
+        self.store.record_quarantine_recovery(self.now)
+        for surface in ("health", "index", "overview", "metrics-success", "metrics-error"):
+            with self.subTest(surface=surface):
+                await self._check_status_off_loop(surface)
+
+    async def _check_status_off_loop(self, surface):
+        entered, locked, heartbeat = threading.Event(), threading.Event(), threading.Event()
+        holder_saw_heartbeat = []
+        reader_threads = []
+        loop_thread = threading.get_ident()
+        loop = asyncio.get_running_loop()
+        self.collector._stopping.clear()
+        reader = self.store.quarantine_recovery_status
+
+        def hold_lock():
+            if not entered.wait(3):
+                return
+            with history_write_lock(self.store.file_path, blocking=True):
+                locked.set()
+                holder_saw_heartbeat.append(heartbeat.wait(2))
+
+        def observed_read():
+            reader_threads.append(threading.get_ident())
+            entered.set()
+            if not locked.wait(3):
+                raise AssertionError("Lifecycle lock holder did not start")
+            result = reader()
+            if surface.startswith("metrics"):
+                loop.call_soon_threadsafe(self.collector._stopping.set)
+            return result
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        request = Request({"type": "http", "method": "GET", "scheme": "http", "path": "/",
+                           "headers": [], "query_string": b"", "server": ("history.example.test", 80),
+                           "app": history_main.app, "router": history_main.app.router})
+        task = None
+        with (
+            patch.object(history_main, "collector", self.collector),
+            patch.object(history_main, "store", self.store),
+            patch.object(history_main, "settings", self.collector.settings),
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(self.store, "quarantine_recovery_status", side_effect=observed_read),
+        ):
+            try:
+                if surface == "metrics-error":
+                    self.collector._fetch_json_sync.side_effect = HistorySourceError.unreachable("Synthetic offline source")
+                work = (history_main.healthz() if surface == "health" else
+                        history_main.index(request, exact_counts=False) if surface == "index" else
+                        history_main.overview(exact_counts=False) if surface == "overview" else
+                        self.collector._run_loop())
+                task = asyncio.create_task(work)
+                self.assertTrue(await asyncio.to_thread(locked.wait, 3))
+                live = await history_main.livez()
+                self.assertEqual(live.status_code, 200)
+                heartbeat.set()
+                result = await asyncio.wait_for(task, 3)
+                self.assertEqual(holder_saw_heartbeat, [True], "durable status blocked the event loop")
+                self.assertTrue(reader_threads)
+                self.assertTrue(all(t != loop_thread for t in reader_threads))
+                if surface == "health":
+                    self.assertEqual(json.loads(result.body)["status"], "degraded")
+                    self.assertTrue(json.loads(result.body)["collector"]["history_recovery_required"])
+                elif surface == "overview":
+                    self.assertTrue(result["collector"]["history_recovery_required"])
+                elif surface == "index":
+                    self.assertIn(b"quarantined", result.body.lower())
+            finally:
+                heartbeat.set()
+                self.collector._stopping.set()
+                if task:
+                    await asyncio.gather(task, return_exceptions=True)
+                await asyncio.to_thread(holder.join, 3)
+                self.assertFalse(holder.is_alive())
+                self.collector._fetch_json_sync.side_effect = self._source
+
+    async def test_cancelled_caller_late_source_error_remains_owned_until_shutdown(self):
+        entered, release = threading.Event(), threading.Event()
+        contexts = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+        def late_error(path, params, *_args):
+            self.calls.append((path, dict(params)))
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("Synthetic request was not released")
+            raise HistorySourceError.unreachable("Synthetic late failure")
+
+        with patch.object(self.collector, "_fetch_json_sync", side_effect=late_error):
+            worker = asyncio.create_task(self._pass())
+            stopping = None
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
+                self.assertTrue(self.collector.collection_running)
+                stopping = asyncio.create_task(self.collector.stop())
+                await asyncio.sleep(0)
+                self.assertFalse(stopping.done())
+                release.set()
+                await asyncio.wait_for(stopping, 3)
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertFalse(self.collector.collection_running)
+                self.assertEqual(self.calls, [("/api/inventory", {})])
+                self.assertEqual(self.store.counts()["tracked_slots"], 0)
+                self.assertIsNone(self.collector.last_success_at)
+                self.assertIsNone(self.collector.last_smart_evidence_at)
+                self.assertEqual(contexts, [])
+            finally:
+                release.set()
+                await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
+                loop.set_exception_handler(previous_handler)
+
+    async def test_shutdown_stops_follow_on_requests_and_drains_worker(self):
+        self.collector._stopping.set()
+        with self.assertRaises(HistoryCollectionStopping):
+            await self.collector._fetch_inventory()
+        self.assertEqual(self.calls, [])
+        # The executor may pick up an already-admitted request after stop.
+        with patch("history_service.collector.urllib.request.urlopen", return_value=io.BytesIO(b"{}")) as outbound:
+            with self.assertRaises(HistoryCollectionStopping):
+                HistoryCollector._fetch_json_sync(self.collector, "/api/inventory", {}, "GET", None, {})
+            outbound.assert_not_called()
+        for boundary in ("root", "system", "enclosure", "view", "smart", "view-smart",
+                         "legacy-fallback", "legacy-smart", "root-error", "system-error",
+                         "enclosure-error", "view-error", "smart-error"):
+            with self.subTest(boundary=boundary):
+                self.legacy_view = boundary.startswith("legacy")
+                self.collector._stopping.clear()
+                self.calls.clear()
+                entered, release = threading.Event(), threading.Event()
+                original = self._source
+
+                def gated(path, params, *args):
+                    failure = None
+                    try:
+                        result = original(path, params, *args)
+                    except HistorySourceError as exc:
+                        failure, result = exc, None
+                    matches = {
+                        "root": path == "/api/inventory" and not params.get("system_id"),
+                        "system": path == "/api/inventory" and params.get("system_id") == "system-a"
+                                  and not params.get("enclosure_id"),
+                        "enclosure": path == "/api/inventory" and params.get("enclosure_id") == "enc-b",
+                        "view": path == "/api/storage-views",
+                        "smart": path.endswith("smart-batch"),
+                        "view-smart": "storage-views" in path and path.endswith("smart-batch"),
+                        "legacy-fallback": "storage-views" in path and path.endswith("smart-batch"),
+                        "legacy-smart": "storage-views" in path and path.endswith("/smart"),
+                    }
+                    if matches[boundary.removesuffix("-error")] and not entered.is_set():
+                        entered.set()
+                        if not release.wait(3):
+                            raise AssertionError("Synthetic request was not released")
+                        if boundary.endswith("-error"):
+                            failure = HistorySourceError.unreachable("Synthetic late failure")
+                    if failure:
+                        raise failure
+                    return result
+
+                with (
+                    patch.object(self.collector, "_fetch_json_sync", side_effect=gated),
+                    patch.object(self.store, "record_slot_updates", wraps=self.store.record_slot_updates) as slot_writes,
+                    patch.object(self.store, "insert_metric_samples", wraps=self.store.insert_metric_samples) as metric_writes,
+                    patch.object(self.store, "start_retention_wait", wraps=self.store.start_retention_wait) as retention_writes,
+                ):
+                    worker = asyncio.create_task(self._pass())
+                    stopping = None
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+                        at_stop = list(self.calls)
+                        before = self.store.counts()
+                        writes_at_stop = (slot_writes.call_count, metric_writes.call_count, retention_writes.call_count)
+                        stopping = asyncio.create_task(self.collector.stop())
+                        await asyncio.sleep(0)
+                        self.assertTrue(self.collector._stopping.is_set())
+                        self.assertFalse(stopping.done())
+                        release.set()
+                        with self.assertRaises(HistoryCollectionStopping):
+                            await asyncio.wait_for(worker, 3)
+                        await asyncio.wait_for(stopping, 3)
+                        self.assertEqual(self.calls, at_stop)
+                        self.assertEqual(self.store.counts(), before)
+                        self.assertEqual((slot_writes.call_count, metric_writes.call_count, retention_writes.call_count),
+                                         writes_at_stop)
+                        self.assertIsNone(self.collector.last_success_at)
+                        self.assertFalse(self.collector.collection_running)
+                        self.assertFalse(any(stage["stage"].endswith("failed")
+                                             for stage in self.collector.last_collection_stage_timings))
+                    finally:
+                        release.set()
+                        await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
+
+
+class HistoryCollectorDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _collector() -> HistoryCollector:
+        return HistoryCollector(HistorySettings(request_timeout_seconds=45), MagicMock())
+
+    def test_unreachable_source_is_raised_as_a_classified_error(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("Connection refused"),
+        ):
+            with self.assertRaises(HistorySourceError) as caught:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+
+        self.assertEqual(caught.exception.kind, "source_unreachable")
+        self.assertEqual(caught.exception.summary, "Could not reach the main UI service.")
+        self.assertIn("/api/slots", str(caught.exception))
+
+    def test_timeout_and_http_rejection_carry_bounded_details(self) -> None:
+        collector = self._collector()
+
+        with patch(
+            "history_service.collector.urllib.request.urlopen",
+            side_effect=TimeoutError(),
+        ):
+            with self.assertRaises(HistorySourceError) as timed_out:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(timed_out.exception.kind, "source_timeout")
+        self.assertIn("timeout 45 s", timed_out.exception.summary)
+
+        rejection = urllib.error.HTTPError(
+            "http://enclosure-ui:8000/api/slots",
+            500,
+            "Server Error",
+            {},
+            io.BytesIO(b"secret-token=abc"),
+        )
+        with patch("history_service.collector.urllib.request.urlopen", side_effect=rejection):
+            with self.assertRaises(HistorySourceError) as rejected:
+                collector._fetch_json_sync("/api/slots", {}, "GET", None, {}, None)
+        self.assertEqual(rejected.exception.kind, "source_rejected")
+        self.assertEqual(
+            rejected.exception.summary,
+            "The main UI rejected the request. (HTTP 500)",
+        )
+        self.assertNotIn("secret-token", rejected.exception.summary)
+
+    def test_status_publishes_the_failure_kind_and_summary_and_clears_them(self) -> None:
+        collector = self._collector()
+
+        collector.record_failure_diagnostics(
+            HistorySourceError.unreachable("GET http://enclosure-ui:8000/api/slots failed")
+        )
+        collector.last_error = "GET http://enclosure-ui:8000/api/slots failed"
+
+        status = collector.status()
+        self.assertEqual(status["last_error_kind"], "source_unreachable")
+        self.assertEqual(status["last_error_summary"], "Could not reach the main UI service.")
+
+        collector.clear_failure_diagnostics()
+        cleared = collector.status()
+        self.assertIsNone(cleared["last_error_kind"])
+        self.assertIsNone(cleared["last_error_summary"])
+        self.assertIsNone(cleared["last_error"])
+
+
+class HistoryDashboardDiagnosticStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        history_main.refresh_admission = history_main.ManualRefreshAdmission(
+            cooldown_seconds=history_main.settings.full_refresh_cooldown_seconds
+        )
+
+    def test_public_status_keeps_the_diagnostic_fields_the_dashboard_reads(self) -> None:
+        projected = history_main.public_collector_status(
+            {
+                "collector_running": True,
+                "last_error": "GET http://enclosure-ui:8000/api/slots failed",
+                "last_error_kind": "source_unreachable",
+                "last_error_summary": "Could not reach the main UI service.",
+                "last_retention_error": "The history database is read-only. (OperationalError)",
+                "last_retention_error_kind": "database_read_only",
+            }
+        )
+
+        self.assertEqual(projected["last_error"], history_main.HISTORY_COLLECTOR_ERROR_DETAIL)
+        self.assertEqual(projected["last_error_kind"], "source_unreachable")
+        self.assertEqual(
+            projected["last_error_summary"],
+            "Could not reach the main UI service.",
+        )
+        self.assertEqual(projected["last_retention_error_kind"], "database_read_only")
+
+    def test_refresh_cooldown_status_publishes_the_deadline_beside_the_collector(self) -> None:
+        idle = history_main.refresh_cooldown_status()
+        self.assertEqual(
+            idle["full_refresh_cooldown_seconds"],
+            history_main.settings.full_refresh_cooldown_seconds,
+        )
+        self.assertEqual(idle["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsNone(idle["full_refresh_available_at"])
+        self.assertNotIn(
+            "full_refresh_cooldown_seconds",
+            history_main.public_collector_status({"collector_running": True}),
+        )
+
+        asyncio.run(history_main.refresh_admission.try_acquire("full"))
+        asyncio.run(history_main.refresh_admission.release())
+
+        cooling = history_main.refresh_cooldown_status()
+        self.assertGreater(cooling["full_refresh_cooldown_seconds_remaining"], 0)
+        self.assertIsInstance(cooling["full_refresh_available_at"], str)
+
+    def test_public_status_of_a_non_mapping_stays_empty(self) -> None:
+        self.assertEqual(history_main.public_collector_status(None), {})
+
+
+class HistoryReadConnectionBudgetTests(unittest.TestCase):
+    """#457: one slot bundle must not cost fifteen SQLite connections."""
+
+    @staticmethod
+    def _seed_store(temp_dir: Path) -> HistoryStore:
+        store = HistoryStore(str(temp_dir / "history.db"))
+        record = SlotStateRecord(
+            system_id="archive-core",
+            system_label="Archive CORE",
+            enclosure_key="enc-a",
+            enclosure_id="enc-a",
+            enclosure_label="Front Shelf",
+            slot=5,
+            slot_label="05",
+            present=True,
+            state="healthy",
+            identify_active=False,
+            device_name="da5",
+            serial="SERIAL-5",
+            model="Drive 5",
+            gptid="eui.000000000000001000a075012b91c7cf",
+            pool_name="tank",
+            vdev_name="raidz2-0",
+            health="ONLINE",
+            persistent_id_label="EUI64",
+        )
+        store.upsert_slot_state(record, "2026-04-10T22:00:00+00:00")
+        store.insert_events(
+            build_slot_events(
+                record,
+                replace(record, health="DEGRADED"),
+                "2026-04-10T23:00:00+00:00",
+            )
+        )
+        store.insert_metric_samples(
+            [
+                MetricSample(
+                    observed_at="2026-04-10T23:00:00+00:00",
+                    system_id="archive-core",
+                    system_label="Archive CORE",
+                    enclosure_key="enc-a",
+                    enclosure_id="enc-a",
+                    enclosure_label="Front Shelf",
+                    slot=5,
+                    slot_label="05",
+                    metric_name=metric_name,
+                    value_integer=100,
+                    value_real=None,
+                    device_name="da5",
+                    serial="SERIAL-5",
+                    model="Drive 5",
+                    state="healthy",
+                    gptid="eui.000000000000001000a075012b91c7cf",
+                    persistent_id_label="EUI64",
+                )
+                for metric_name in ("temperature_c", "bytes_read", "bytes_written")
+            ]
+        )
+        return store
+
+    def test_slot_history_bundle_opens_one_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+        opened = 0
+        original_connect_locked = store._connect_locked
+
+        def counting_connect_locked():
+            nonlocal opened
+            opened += 1
+            return original_connect_locked()
+
+        store._connect_locked = counting_connect_locked  # type: ignore[method-assign]
+        payload = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10, "bytes_read": 10, "bytes_written": 10},
+        )
+
+        self.assertEqual(opened, 1)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(len(payload["metrics"]["temperature_c"]), 1)
+        self.assertTrue(payload["disk_history"]["identity_available"])
+
+    def test_bundle_result_is_unchanged_by_the_shared_connection(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        store = self._seed_store(temp_dir)
+
+        bundle = store.get_slot_history_bundle(
+            "archive-core",
+            "enc-a",
+            5,
+            metric_limits={"temperature_c": 10},
+        )
+        separately = {
+            "events": store.list_slot_events("archive-core", "enc-a", 5, limit=12),
+            "samples": store.list_metric_samples(
+                "archive-core",
+                "enc-a",
+                5,
+                metric_name="temperature_c",
+                limit=10,
+            ),
+        }
+
+        self.assertEqual(bundle["events"], separately["events"])
+        self.assertEqual(bundle["metrics"]["temperature_c"], separately["samples"])
+
+
+class HistoryLockAddressCacheTests(unittest.TestCase):
+    """#457: every write lock re-read and re-parsed /proc/self/mountinfo."""
+
+    def setUp(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def tearDown(self) -> None:
+        migration_lock.clear_lock_address_cache()
+
+    def test_mountinfo_is_parsed_once_per_database_identity(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        calls = 0
+        original = migration_lock._database_path_is_mount_point
+
+        def counting_mount_point_check(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        with patch.object(
+            migration_lock,
+            "_database_path_is_mount_point",
+            counting_mount_point_check,
+        ):
+            first = migration_lock._history_lock_address(database_path)
+            for _ in range(4):
+                self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # Writes keep the inode, so the cached validation still holds.
+            database_path.write_text("more", encoding="utf-8")
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 1)
+
+            # A replaced file is a new identity and must be validated again.
+            # The replacement is created while the original still exists, so the
+            # two inodes cannot collide.
+            replacement = temp_dir / "history-replacement.db"
+            replacement.write_text("replaced", encoding="utf-8")
+            os.replace(replacement, database_path)
+            self.assertEqual(migration_lock._history_lock_address(database_path), first)
+            self.assertEqual(calls, 2)
+
+    def test_cached_addresses_do_not_grow_without_bound(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        for index in range(migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES + 8):
+            candidate = temp_dir / f"history-{index}.db"
+            candidate.write_text("seed", encoding="utf-8")
+            migration_lock._history_lock_address(candidate)
+
+        self.assertLessEqual(
+            migration_lock.lock_address_cache_size(),
+            migration_lock.LOCK_ADDRESS_CACHE_MAX_ENTRIES,
+        )
+
+    def test_rejected_paths_are_still_rejected_when_cached(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        database_path = temp_dir / "history.db"
+        database_path.write_text("seed", encoding="utf-8")
+        link_path = temp_dir / "history-link.db"
+        link_path.hardlink_to(database_path)
+
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)
+        with self.assertRaises(ValueError):
+            migration_lock._history_lock_address(database_path)

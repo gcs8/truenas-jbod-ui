@@ -36,8 +36,8 @@ At the start of a work session:
      than only a closure comment
 
 For release or release-adjacent work, review `docs/RELEASE_CHECKLIST.md` before
-changes. Older cycle plans under `docs/` are historical records, not active
-scope.
+changes. Older cycle plans and release records under `docs/archive/` are
+historical records, not active scope.
 
 ## Standing Maintenance Priorities
 
@@ -146,7 +146,9 @@ Important framing:
 - It is intended for LAN/headless/local infrastructure use, not public Internet
   exposure.
 - It is explicitly started when needed.
-- It auto-stops by default after about 3600 seconds unless configured otherwise.
+- The published Compose files set `ADMIN_AUTO_STOP_SECONDS=3600`, so it stops
+  itself after one hour. The application default is `0` (no auto-stop), so set
+  it explicitly when running admin any other way.
 - It is powerful because it can touch config, runtime state, backups, and Docker
   control paths.
 
@@ -190,6 +192,12 @@ Useful orientation files:
 - `CHANGELOG.md`
 - `docs/ROADMAP.md`
 - `docs/RELEASE_CHECKLIST.md`
+- `docs/JBOD_RUNNER_TRIAL.md` for the manual native runner trial boundary
+- `docs/SCREENSHOT_CAPTURE.md` when recapturing public-demo screenshots
+- `docs/PUBLISHING_THE_WIKI.md` for how the wiki source is verified and
+  published
+- `docs/SAS_DIAGNOSTIC_DECODER_SOURCES.md` when working on the SAS Fabric
+  decoders
 - relevant tests under `tests/` and `qa/`
 
 ### Tier 1: Safe Source Checks
@@ -225,11 +233,18 @@ semantics. Do not replace that honest result with full unittest discovery or
 claim those POSIX contracts were validated on Windows. Run the POSIX CI/Linux
 gate for their coverage.
 
+Windows, including running the app under Docker Desktop, is best-effort. CI has
+no Windows runner and no native Windows `dev_check.py --safe` run is recorded,
+so a Windows failure is a bug to fix, not a regression CI would have caught.
+
 Raw command reference (the wrapper remains authoritative):
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
-coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
+COVERAGE_CORE=sysmon coverage run -m unittest discover -s tests -p "test_*.py" -v && coverage report
+python scripts/run_test_shard.py check-counts  # compare discovery with the reviewed per-module baseline
+python scripts/run_test_shard.py update-counts # after intentional test additions/removals; review the JSON diff
+python scripts/run_test_shard.py run --shard 1 # one CI shard; `list` prints the table
 python -m compileall app admin_service history_service scripts tests
 node --check app/static/app.js
 node --check app/static/sas_fabric_view.js
@@ -308,6 +323,7 @@ Optional sidecars:
 docker compose -f docker-compose.dev.yml --profile history up -d --build
 docker compose -f docker-compose.dev.yml --profile admin up -d --build enclosure-admin
 docker compose -f docker-compose.dev.yml --profile history --profile admin up -d --build
+docker compose -f docker-compose.dev.yml --profile backup-scheduler up -d --build enclosure-backup-scheduler
 ```
 
 Sidecar matrix to validate when relevant:
@@ -325,8 +341,17 @@ Sidecar matrix to validate when relevant:
    - `:8080/livez`, `:8082/livez`, `:8082/healthz`
    - admin runtime cards handle stopped history intentionally
 4. UI + history + admin:
-   - all services healthy
+   - all HTTP services healthy
    - runtime cards show aligned running versions after startup/restart
+5. Scheduler disabled:
+   - scheduler is the only running service
+   - Unix-socket health and library requests succeed
+   - config and full policies stay disabled, with no job or artifact
+6. Scheduler enabled:
+   - scheduler and admin are the only running services
+   - one synthetic config backup completes and verifies
+   - restart/readback retains the same catalogued artifact
+   - Compose resources and scratch state are removed afterward
 
 Browser smoke:
 
@@ -335,6 +360,16 @@ npm ci
 npm run qa:ui:install
 npx playwright test qa/public-demo.spec.js
 PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-operations.spec.js
+```
+
+CI runs the fixture-only browser specs on every pull request, in the
+`Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
+`qa/offline-snapshot.spec.js`, `qa/saved-view-selection.spec.js`,
+`qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
+own synthetic fixtures and need no running stack:
+
+```bash
+npx playwright test qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
 
 The switching and ESXi suites are live-appliance contracts, not portable fixture
@@ -384,6 +419,17 @@ contributors may use descriptive prefixes such as `feat/`, `fix/`, `refactor/`,
 `docs/`, `perf/`, `test/`, `ci/`, `codex/`, or `claude/` without creating a CI
 coverage gap. Tag pushes are not part of this preflight workflow.
 
+A branch push whose branch already has an open pull request skips the preflight
+jobs, because that pull request's own run already covers the same commit. The
+`Run routing` job makes that decision and the gated jobs report `Skipped`,
+which satisfies a required check; superseding the duplicate by cancellation
+would report `Cancelled`, which does not. A zero-result lookup receives one
+15-second recheck to cover GitHub's pull-request visibility delay; API failures
+and a second zero result run the full branch preflight. Before a pull request
+exists the branch push still runs every job. CodeQL follows the same rule: it
+analyses pushes to `main`, pull requests targeting `main`, and the weekly
+schedule.
+
 ## CI blocking policy
 
 The following pull-request checks are release-blocking and required for `main`:
@@ -396,10 +442,34 @@ The following pull-request checks are release-blocking and required for `main`:
 - `JavaScript syntax and npm lock`
 - `Checked-in public demo artifact`
 - `Admin clean-room browser QA`
+- `Image-only upgrade smoke`
 - `Changelog entry` (pull requests only; see "Changelog And Release Notes")
 
-Coverage is report-only. CodeQL is report-only until repository branch
-protection explicitly makes it required. Publish workflows are release gates,
+Each `Python compile and unittest (<version>)` check is a gate job over
+four parallel shard jobs (`Python unittest shard (<version>, <shard>)`). The
+shards split the test modules by the `SHARDS` table in
+`scripts/run_test_shard.py`; the gate downloads every shard's result and fails
+unless each one ran and passed on that Python version, so a shard that failed,
+was skipped, or never uploaded a result turns the required check red. Each result
+also records discovery counts by module. The gate compares their union with the
+reviewed `tests/unittest_test_counts.json` baseline and names every module that
+gained or lost tests; method- and class-level skips remain counted because the
+contract concerns discovery, not platform-dependent outcomes. A module that raises
+`SkipTest` at import collapses to one test, so the gate reports it as lost tests
+and `update-counts` refuses to record it. Regenerate the baseline only after an intentional
+test change with `python scripts/run_test_shard.py update-counts`, then review the
+manifest diff. Every `tests/test_*.py` module must sit in exactly one shard; `run`
+refuses to start otherwise and `tests.test_unittest_shards` asserts the same
+partition. Report-only
+coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
+combined in the 3.14 gate. Coverage is report-only. CodeQL is report-only until
+repository branch protection explicitly makes it required. `Image-only upgrade smoke` (the previous public release upgraded by
+`JBOD_UI_IMAGE` only, then rolled back, by `scripts/run_image_upgrade_smoke.py`)
+is required on `main`. `Hardened, interrupted and segmented upgrade smoke` runs
+the same script's longer `hardened`, `interrupted-migration` and
+`segmented-catalog` scenarios on every pull request and is report-only until
+branch protection adds it.
+Publish workflows are release gates,
 not ordinary pull-request checks. `PR type labels` is a labelling helper, not a
 check. If a check name changes, update branch protection and this list together
 after the new workflow has run successfully.
@@ -454,6 +524,63 @@ Additional notes by area:
   - Validate archive member paths and restore targets defensively.
   - Do not imply public-facing/cloud exposure is supported.
 
+## History schema changes
+
+`CURRENT_SCHEMA_VERSION` and `MIN_SUPPORTED_SCHEMA_VERSION` in
+`history_service/store.py` are the on-disk contract. A build refuses a database
+stamped newer than it knows, before writing anything.
+
+- An additive change (new table, column or index, a resumable backfill) must
+  stay readable by the previous release. Prove it with a fixture test such as
+  `tests/test_history_released_schema_upgrades.py`, and add the new release's
+  `SCHEMA` under `tests/fixtures/history_released_schemas/`.
+- A change the previous release cannot read has one rollback policy: restore
+  the backup taken before the upgrade and accept losing writes made after it.
+  Do not write down-migrations. The pull request must:
+  1. bump `CURRENT_SCHEMA_VERSION`;
+  2. make startup copy the database next to it, as a verified pre-upgrade
+     snapshot, before the first write of the migration, and fail closed if the
+     copy fails;
+  3. add an interrupted-migration test for every new phase, as the existing
+     ones do;
+  4. add a `Breaking changes` or `Upgrade notes` changelog bullet that says
+     rollback means restoring the pre-upgrade backup and losing later writes;
+  5. update the rollback rows of the table in `wiki/Upgrading.md`.
+
+## Things that must move together
+
+Some strings, files and declarations in this repository are load-bearing: a
+test, a workflow, a generated artifact or a second copy depends on them
+byte-for-byte. Changing one without the others fails CI, or worse, passes CI
+while making a claim the code no longer keeps. Before you edit any of the items
+below, find every dependant listed next to it and change them in the same
+commit.
+
+When you add a new dependency of this kind, add it here, and if the dependency
+lives in code, add a short comment at the site naming this section so future
+editors can discover it there too. Existing sites are not all backfilled with
+that comment yet; the table below is the authoritative list either way.
+
+| If you change | Also change | Why |
+| --- | --- | --- |
+| Any file listed in `PUBLIC_DEMO_INPUT_PATHS` (`scripts/public_demo_inputs.py`): `app/main.py`, `app/config.py`, `app/static/app.js`, `app/static/style.css`, `app/templates/*.html`, the services and images it names | Nothing in the pull request. Do not rebuild the public demo or recapture screenshots. The demo is rebuilt once per release (see "Public Demo And Fixture Policy") | Pull-request CI checks that the checked-in demo is an exact build of the commit it records. `scripts/validate_release_wrap.py` and the GHCR release workflow refuse a release whose demo was not rebuilt from the release source |
+| A Python module that a declared demo input imports (for example a new helper imported by `app/config.py`) | Add it to `PUBLIC_DEMO_INPUT_PATHS` and to the mirrored list in `tests/test_public_demo_deterministic.py` | `test_shared_input_graph_covers_recursive_local_python_imports` checks the source graph; the all-PR CI workflow needs no per-path mirror |
+| `public-demo/index.html` | `docs/images/screenshots/manifest.json`, the two PNGs under `docs/images/screenshots/` and their byte-identical copies under `wiki/images/`, and the review record `docs/PUBLIC_SCREENSHOT_REVIEW.md` (revision, artifact hash, per-image hash, `PASS`) | `tests.test_public_screenshots` and `scripts/check_public_screenshots.py` bind the manifest to the exact artifact bytes; a Windows capture produces different bytes, so capture on Linux |
+| A backup scheduler route, the `backups:` config.yaml section or the archive status file (`history_service/backup_scheduler/`) | The public contract in `admin_service/routes.py` (`/api/admin/backups/*`), `ADMIN_ROUTE_MATRIX` in `tests/test_route_contracts.py`, `SIDECAR_OWNED_CONFIG_KEYS` in `app/config.py`, `app/services/backup_health.py`, and the scheduler service in both Compose files plus `docker-compose.nonroot.yml` | The admin UI is built against the route contract; the UI must not flag `backups:` as an unknown key; `/healthz` reads the status file schema; `tests.test_container_contract` pins every Compose service's mounts, users and capabilities |
+| Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
+| `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
+| A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
+| A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted), and `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts` | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard; the reviewed count baseline makes the intentional addition explicit |
+| An added, removed, or generated Python unittest | `tests/unittest_test_counts.json` via `python scripts/run_test_shard.py update-counts`, with the resulting per-module count change reviewed | The required shard gate reports per-module count drift. It compares counts, not test IDs, so a rename, or a deletion paired with an addition in the same module, leaves the count unchanged and needs a reviewer's eye on the test diff |
+| Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
+| A wiki page added or removed | The page count in `scripts/check_public_docs.py`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` (the inventory under `docs/archive/` is a historical baseline and is not updated) | `check_public_docs.py` and the docs contract test count and enumerate pages |
+| `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
+| A behaviour or policy that a workflow, a contract test, `CONTRIBUTING.md`, `CHANGELOG.md` and the PR body all describe (CI triggers, defaults, auto-stop) | All of them, in the same change; a revert that leaves one surface asserting the old behaviour is not a revert | `tests/test_ci_contract.py` and `tests/test_container_contract.py` assert the documented policy against the live files |
+
+When a change of this kind is deliberate, say so in the PR body under Risks and
+name the surfaces you updated, so the reviewer can check the set rather than
+rediscover it.
+
 ## Public Demo And Fixture Policy
 
 The checked-in public demo is reproducible from synthetic public repository
@@ -471,21 +598,30 @@ Rules:
 3. Generated public-demo artifacts are produced by the builder, never by manual
    edits.
 4. The builder and checker share one centrally declared semantic input graph.
-   Any declared input change must make the old artifact fail closed.
-5. Any future local-history conversion must be an explicit maintainer-only tool
+   The checked-in artifact must always be an exact build of the reachable
+   commit it records.
+5. The public demo is rebuilt when a release is cut, not in ordinary pull
+   requests. A pull request that changes a declared input leaves
+   `public-demo/**`, the screenshots, and the review record alone. Release
+   preparation rebuilds the demo from the release source, recaptures the
+   screenshots on Linux, and records the pixel review. The release checks
+   (`check_public_demo_artifact.py --require-current`,
+   `validate_release_wrap.py --public-demo-only`, and the same check in
+   `.github/workflows/publish-ghcr.yml`) fail until that is done.
+6. Any future local-history conversion must be an explicit maintainer-only tool
    that writes the bounded public fixture. Fixture review, artifact regeneration,
    and publication remain separate later steps.
-6. Public-demo output must not contain real hostnames, private IPs, serials,
+7. Public-demo output must not contain real hostnames, private IPs, serials,
    WWNs/SAS addresses, keys, configured system names, credentials, or secrets.
 
-Regenerate and verify from a clean checkout:
+At release time, regenerate and verify from a clean checkout of the release commit:
 
 ```bash
 python -m unittest tests.test_public_demo_fixture tests.test_public_demo_deterministic -v
 SOURCE_COMMIT="$(git rev-parse HEAD)"
 python scripts/build_public_demo.py --output public-demo/index.html --source-revision "$SOURCE_COMMIT"
 python scripts/build_public_demo.py --output public-demo/index.html --check
-python scripts/check_public_demo_artifact.py public-demo
+python scripts/check_public_demo_artifact.py public-demo --require-current
 python scripts/check_public_docs.py
 python scripts/check_public_screenshots.py
 slot_focus_artifact="$(mktemp "${TMPDIR:-/tmp}/truenas-jbod-ui-slot-focus-XXXXXX.html")"
@@ -498,6 +634,10 @@ A local build does not publish. Pull requests and pushes to `main` run
 verification only and do not deploy. An owner-approved `workflow_dispatch` run
 publishes the reviewed `public-demo/**` bytes. Commit, push, merge, exact-byte
 approval, publication, and public readback remain separate gates.
+
+`docs/PUBLIC_DEMO_PRODUCT_BRIEF.md` says what the demo is for and what it must
+not show. `docs/PUBLIC_SCREENSHOT_REVIEW.md` is the exact-byte review record
+for the checked-in desktop screenshots.
 
 ## Live Data Cautions
 
@@ -596,6 +736,24 @@ labels plus that file. The rules:
   `no-changelog`; an unlabeled invisible pull request fails the entry gate so
   release coverage cannot discover an implicit escape later.
 
+### How to satisfy the `Changelog entry` check
+
+1. Open the pull request. The number does not exist before `gh pr create`, so
+   the first run fails; that is expected.
+2. Add one bullet to `CHANGELOG.md` under `## Unreleased`, in the subsection
+   that matches the change, ending with your pull request number:
+   `- Fixed the thing an operator sees (#123).`
+3. Push that as the next commit. The job re-runs and passes.
+4. If the change is invisible to operators (tests-only, CI-only, tooling),
+   apply the `no-changelog` label instead of a bullet and re-run the job; it
+   reads labels live, so no new commit is needed.
+
+Outside contributors cannot apply labels, so the gate runs in advisory mode for
+them: `scripts/check_changelog_entry.py --advisory` prints the same guidance and
+exits 0, and a maintainer applies the label or adds the bullet before merge. The
+workflow selects the mode from the pull request's `author_association`; `OWNER`,
+`MEMBER`, and `COLLABORATOR` remain blocking.
+
 Two scripts enforce this:
 
 - `scripts/check_changelog_entry.py` runs as the `Changelog entry` job on
@@ -641,7 +799,7 @@ GitHub appends the label-categorized pull request list from
 `.github/release.yml`. Check the rendered release for pull requests that landed
 in the wrong category and fix the label rather than editing the body by hand.
 
-## AI / Codex Handoff Shape
+## Handoff shape
 
 Every substantial agent handoff should be concise and auditable.
 
@@ -676,7 +834,7 @@ Use this shape:
 - Known risks:
 - Deferred items:
 - Follow-up TODOs:
-- Questions for Ryoko/user:
+- Questions for the maintainer:
 ```
 
 For release work, also update the required release wrap evidence table from

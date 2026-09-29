@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 from app.config import Settings
-from app.main import templates
+from app.route_support import templates
 from app.models.domain import (
     EnclosureOption,
     InventorySnapshot,
@@ -577,10 +577,10 @@ def measure_modeled_perf_case(slot_count: int) -> dict[str, Any]:
         zip_build_calls += 1
         return original_zip_builder(*args, **kwargs)
 
-    def measuring_inline_assets(request, html):
+    def measuring_inline_assets(request, html, *args, **kwargs):
         nonlocal export_html_document_bytes, inlined_static_asset_bytes
         export_html_document_bytes = len(html.encode("utf-8"))
-        rendered = original_inline_assets(request, html)
+        rendered = original_inline_assets(request, html, *args, **kwargs)
         inlined_static_asset_bytes = len(rendered.encode("utf-8")) - export_html_document_bytes
         return rendered
 

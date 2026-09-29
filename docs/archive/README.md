@@ -1,0 +1,1 @@
+Historical release notes, release wraps, milestone plans, and QA checklists kept for reference; nothing here is active scope. The current release notes and wrap stay in `docs/`, and the GitHub Releases page carries every published release body.

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 
 from app import main as app_main
+from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     EnclosureOption,
@@ -20,6 +21,7 @@ from app.models.domain import (
     MappingBundle,
     MappingImportConfirmation,
     MappingRequest,
+    SasFabricAliasRequest,
     SlotView,
 )
 from app.services.inventory import InventoryService
@@ -28,9 +30,11 @@ from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingScopeConflict,
+    MappingStorageUnwritable,
     MappingStore,
 )
 from app.services.profile_registry import ProfileRegistry
+from app.services.sas_fabric_alias_store import SasFabricAliasStorageUnwritable
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import TrueNASAPIError
 
@@ -138,9 +142,9 @@ class MappingImportRouteTests(unittest.TestCase):
             )
 
             with (
-                patch.object(app_main, "get_inventory_registry", return_value=registry),
-                patch.object(app_main, "ensure_slot_bounds"),
-                patch.object(app_main, "add_perf_metadata"),
+                patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                patch.object(app_routes, "ensure_slot_bounds"),
+                patch.object(app_routes, "add_perf_metadata"),
             ):
                 response = asyncio.run(save_route.endpoint(
                     slot=7,
@@ -194,7 +198,7 @@ class MappingImportRouteTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             response = asyncio.run(
                 route.endpoint(payload=bundle, system_id="system-a", enclosure_id="enc-a")
             )
@@ -212,10 +216,7 @@ class MappingImportRouteTests(unittest.TestCase):
             getattr(route, "path", ""): route
             for route in app_main.app.routes
         }
-        reason = (
-            "Mapping import is unavailable because this system disk inventory has no identified "
-            "physical enclosure or stable physical slot identities."
-        )
+        reason = "Bay mapping is not available because this system has no known enclosure."
         bundle = MappingBundle(mappings=[ManualMapping(slot=0, serial="UNSTABLE")])
         confirmation = MappingImportConfirmation(
             bundle=bundle,
@@ -238,7 +239,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 registry.get_service.return_value = service
 
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
                     self.assertRaises(HTTPException) as raised,
                 ):
                     asyncio.run(
@@ -321,9 +322,9 @@ class MappingImportRouteTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 save_route.endpoint(
@@ -377,10 +378,7 @@ class MappingImportRouteTests(unittest.TestCase):
             for route in app_main.app.routes
             if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
         ]
-        reason = (
-            "Manual mapping is unavailable because this system disk has no identified physical "
-            "enclosure or stable physical location."
-        )
+        reason = "Bay mapping is not available because this system has no known enclosure."
         payload = MappingRequest(
             expected_revision="a" * 64,
             serial="UNSTABLE",
@@ -402,9 +400,9 @@ class MappingImportRouteTests(unittest.TestCase):
                 arguments = {"payload": payload} if method == "POST" else {"expected_revision": "a" * 64}
 
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "ensure_slot_bounds"),
-                    patch.object(app_main, "add_perf_metadata"),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
                     self.assertRaises(HTTPException) as raised,
                 ):
                     asyncio.run(
@@ -440,9 +438,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -485,9 +483,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -551,9 +549,9 @@ class MappingImportRouteTests(unittest.TestCase):
                 registry = Mock()
                 registry.get_service.return_value = service
                 with (
-                    patch.object(app_main, "get_inventory_registry", return_value=registry),
-                    patch.object(app_main, "ensure_slot_bounds"),
-                    patch.object(app_main, "add_perf_metadata"),
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
                 ):
                     response = asyncio.run(
                         route.endpoint(
@@ -596,9 +594,9 @@ class MappingImportRouteTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "ensure_slot_bounds"),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(save_route.endpoint(
                 slot=7,
@@ -650,7 +648,7 @@ class MappingImportRouteTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             response = asyncio.run(
                 route.endpoint(payload=payload, system_id="system-a", enclosure_id="enc-a")
             )
@@ -715,7 +713,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
                 registry.get_service.return_value = service
-                with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                with patch.object(app_routes, "get_inventory_registry", return_value=registry):
                     response = asyncio.run(
                         route.endpoint(payload=payload, system_id="system-a", enclosure_id="enc-a")
                     )
@@ -762,7 +760,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
                 registry.get_service.return_value = service
-                with patch.object(app_main, "get_inventory_registry", return_value=registry):
+                with patch.object(app_routes, "get_inventory_registry", return_value=registry):
                     response = asyncio.run(
                         route.endpoint(
                             **arguments,
@@ -779,6 +777,110 @@ class MappingImportRouteTests(unittest.TestCase):
                 self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
                 service.invalidate_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
+
+
+class UnwritableDataDirectoryRouteTests(unittest.TestCase):
+    """#429: a read-only data directory must not read as a generic 500."""
+
+    def _mapping_routes(self) -> list:
+        return [
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/mapping"
+        ]
+
+    def test_mapping_save_and_clear_answer_503_with_plain_words(self) -> None:
+        payload = MappingRequest(
+            expected_revision="a" * 64,
+            serial="SANITIZED",
+            clear_identify_after_save=False,
+        )
+        for route in self._mapping_routes():
+            method = next(iter(route.methods))
+            with self.subTest(method=method):
+                error = with_private_exception_detail(
+                    MappingStorageUnwritable(Path("/app/data"))
+                )
+                service = Mock()
+                service.system.id = "system-a"
+                service.system.truenas.platform = "core"
+                service.save_mapping = AsyncMock(side_effect=error)
+                service.clear_mapping = AsyncMock(side_effect=error)
+                service.set_slot_led = AsyncMock()
+                service.get_snapshot = AsyncMock()
+                registry = Mock()
+                registry.get_service.return_value = service
+                arguments = (
+                    {"payload": payload}
+                    if method == "POST"
+                    else {"expected_revision": "a" * 64}
+                )
+
+                with (
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "ensure_slot_bounds"),
+                    patch.object(app_routes, "add_perf_metadata"),
+                ):
+                    response = asyncio.run(
+                        route.endpoint(
+                            slot=2,
+                            **arguments,
+                            system_id="system-a",
+                            enclosure_id="enc-a",
+                        )
+                    )
+
+                self.assertEqual(response.status_code, 503)
+                body = json.loads(response.body)
+                self.assertEqual(body["error"], "data_directory_unwritable")
+                self.assertEqual(
+                    body["detail"],
+                    "Could not save: the data folder is not writable by the app. "
+                    "See Troubleshooting.",
+                )
+                self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
+                service.get_snapshot.assert_not_awaited()
+
+    def test_the_alias_save_route_answers_503_too(self) -> None:
+        route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/sas-fabric/aliases"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = Mock()
+        service.system.id = "system-a"
+        service.system.truenas.platform = "core"
+        service.save_sas_fabric_alias = Mock(
+            side_effect=SasFabricAliasStorageUnwritable(Path("/app/data"))
+        )
+        registry = Mock()
+        registry.get_service.return_value = service
+        registry.has_system.return_value = True
+
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
+        ):
+            response = asyncio.run(
+                route.endpoint(
+                    payload=SasFabricAliasRequest(
+                        object_id="enclosure-1",
+                        object_kind="enclosure",
+                        label="Shelf A",
+                    ),
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                )
+            )
+
+        self.assertEqual(response.status_code, 503)
+        body = json.loads(response.body)
+        self.assertEqual(body["error"], "data_directory_unwritable")
+        self.assertEqual(
+            body["detail"],
+            "Could not save: the data folder is not writable by the app. See Troubleshooting.",
+        )
 
 
 if __name__ == "__main__":

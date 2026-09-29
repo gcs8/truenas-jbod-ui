@@ -95,7 +95,7 @@ def main() -> int:
         if published != artifact:
             raise ValueError("published bytes do not match the checked artifact")
         text = published.decode("utf-8")
-        for marker in ("Frozen Sanitized Snapshot", "Source revision", "Build ID"):
+        for marker in ("Demo data", "Source revision", "Build ID"):
             if marker not in text:
                 raise ValueError(f"published demo is missing marker: {marker}")
     except (OSError, UnicodeDecodeError, ValueError) as exc:

@@ -6,11 +6,13 @@ name: PR type labels
 # pull request code and reads nothing but the event title and number.
 
 on:
+  # No `synchronize`: the job reads only the pull request title, so a new
+  # commit cannot change its result. Re-running it on every push produced a
+  # CANCELLED check that contributors read as a failure (#TBD).
   pull_request_target:
     types:
       - opened
       - edited
-      - synchronize
       - reopened
 
 permissions:
@@ -18,7 +20,7 @@ permissions:
 
 concurrency:
   group: pr-labels-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   label:

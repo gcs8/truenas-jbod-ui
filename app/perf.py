@@ -62,39 +62,25 @@ class PerfTrace:
     def has_slow_stage(self, threshold_ms: int) -> bool:
         return any(stage.duration_ms >= threshold_ms for stage in self.stages)
 
-    def stage_summary(self, *, limit: int = 8) -> str:
-        grouped: OrderedDict[str, dict[str, float | int]] = OrderedDict()
-        for stage in self.stages:
-            bucket = grouped.setdefault(stage.label, {"total_ms": 0.0, "count": 0})
-            bucket["total_ms"] = float(bucket["total_ms"]) + stage.duration_ms
-            bucket["count"] = int(bucket["count"]) + 1
-        ranked = sorted(grouped.items(), key=lambda item: float(item[1]["total_ms"]), reverse=True)
-        parts: list[str] = []
-        for label, payload in ranked[:limit]:
-            total_ms = float(payload["total_ms"])
-            count = int(payload["count"])
-            suffix = f" x{count}" if count > 1 else ""
-            parts.append(f"{label}={total_ms:.1f}ms{suffix}")
-        remaining = len(ranked) - limit
-        if remaining > 0:
-            parts.append(f"+{remaining} more")
-        return ", ".join(parts)
-
     def stage_rollups(self, *, limit: int = 8) -> list[tuple[str, float, int]]:
-        grouped: OrderedDict[str, dict[str, float | int]] = OrderedDict()
+        """The `limit` slowest stage labels as (label, total ms, count), slowest first."""
+        grouped: OrderedDict[str, list[float | int]] = OrderedDict()
         for stage in self.stages:
-            bucket = grouped.setdefault(stage.label, {"total_ms": 0.0, "count": 0})
-            bucket["total_ms"] = float(bucket["total_ms"]) + stage.duration_ms
-            bucket["count"] = int(bucket["count"]) + 1
-        ranked = sorted(grouped.items(), key=lambda item: float(item[1]["total_ms"]), reverse=True)
-        return [
-            (
-                label,
-                round(float(payload["total_ms"]), 1),
-                int(payload["count"]),
-            )
-            for label, payload in ranked[:limit]
+            bucket = grouped.setdefault(stage.label, [0.0, 0])
+            bucket[0] += stage.duration_ms
+            bucket[1] += 1
+        ranked = sorted(grouped.items(), key=lambda item: float(item[1][0]), reverse=True)
+        return [(label, round(float(total), 1), int(count)) for label, (total, count) in ranked[:limit]]
+
+    def stage_summary(self, *, limit: int = 8) -> str:
+        rollups = self.stage_rollups(limit=len(self.stages) or 1)
+        parts = [
+            f"{label}={total_ms:.1f}ms" + (f" x{count}" if count > 1 else "")
+            for label, total_ms, count in rollups[:limit]
         ]
+        if len(rollups) > limit:
+            parts.append(f"+{len(rollups) - limit} more")
+        return ", ".join(parts)
 
 
 _CURRENT_TRACE: ContextVar[PerfTrace | None] = ContextVar("current_perf_trace", default=None)

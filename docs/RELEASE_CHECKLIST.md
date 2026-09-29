@@ -30,6 +30,13 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   release that documents the gap, remediation, and full gate evidence.
 - If this checklist changes during release prep, rerun or re-evaluate the
   affected gates and update the release wrap before cutting the tag.
+- Every release rebuilds the public demo from the release source. Pull requests
+  do not, so the checked-in demo is normally older than `main`. Follow
+  "Public demo rebuild" below before tagging. The pre-tag and final validators
+  and the GHCR release workflow run
+  `python scripts/validate_release_wrap.py <version> --public-demo-only` and
+  refuse the release until the demo, screenshots, and pixel review match the
+  release source and version.
 
 ## Required Release Wrap Evidence
 
@@ -46,7 +53,7 @@ using this shape:
 | Full Playwright/browser gates | yes | command output summary | Pass/Blocked/N/A | reason |
 | Feature-specific live API/UI gates | yes | API/browser evidence | Pass/Blocked/N/A | reason |
 | Local release perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
-| Linux QA restore gate | yes | target, counts, health, smoke evidence | Pass/Blocked/N/A | reason |
+| Linux QA restore gate | yes | separate default `tar.zst` and explicit `7z` receipts with observed format, export-source app version, candidate commit/image, counts, health, and smoke evidence | Pass/Blocked/N/A | reason |
 | Restored Linux QA perf harnesses | yes | artifact path and summary | Pass/Blocked/N/A | reason |
 | Snapshot/export/offline artifact gate | yes | command and browser smoke | Pass/Blocked/N/A | reason |
 | Docs/wiki/public-demo gate | yes | changed files, reviewed source diff, privacy checks, checked-in artifact commands and results | Pass/Blocked/N/A | reason |
@@ -99,7 +106,10 @@ python scripts/validate_release_wrap.py "$version" \
    local handoff before doing release work.
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
-3. Draft or update the release notes and release wrap before tagging.
+3. Draft or update the release notes and release wrap before tagging. Bump
+   `app/__init__.py` to the release version, then do the "Public demo rebuild"
+   below from that commit. `validate_release_wrap.py <version>
+   --public-demo-only` must pass before the next step.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
@@ -229,9 +239,21 @@ python scripts/validate_release_wrap.py "$version" \
     or history service started, save a synthetic demo system/profile, read the
     files back, then start the UI from that saved configuration and verify it
     becomes healthy without rebuilding or weakening mount permissions
-  - **UI + history + admin:** run all three services, then confirm UI,
+  - **UI + history + admin:** run all three HTTP services, then confirm UI,
     history, and admin health plus `Runtime Control` cards showing aligned
     running versions after startup or sidecar restarts
+  - **Scheduler disabled:** start only `enclosure-backup-scheduler` through the
+    `backup-scheduler` profile with both policy classes explicitly disabled;
+    call `/internal/healthz` and `/internal/backups` through its Unix socket,
+    confirm no artifact or running job, then remove the container and scratch
+    state
+  - **Scheduler enabled:** start `enclosure-admin` plus
+    `enclosure-backup-scheduler` with only synthetic config backups enabled;
+    call the scheduler through the Unix socket, request one config backup through
+    the authenticated admin API, wait for verified/restorable local readback,
+    verify it again, restart the scheduler, confirm the same artifact from the
+    persisted catalogue, then remove all archive, catalogue, socket, container,
+    network, and scratch state
 - run the Linux QA Docker restore release gate before ship/no-ship:
   - for a segmented-history release, first complete an encrypted schema-v2
     export/mutation/import/query drill with historical data larger than the
@@ -248,25 +270,55 @@ python scripts/validate_release_wrap.py "$version" \
   - stop the disposable development history stack after the drill and preserve
     only sanitized receipts
   - immediately before the one production deployment, take and verify a fresh
-    encrypted FULL backup through the admin sidecar
-  - export a full backup from the long-running local Windows Docker admin API,
-    not by copying host folders. Use the default restore-grade path set:
-    `config_file`, `runtime_overrides_file`, `profile_file`, `mapping_file`,
-    `sas_fabric_alias_file`, `slot_detail_file`, and `history_db`
-  - example export request:
-    `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
-    with JSON body
-    `{"encrypt":true,"packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db"]}`
-  - copy that exported bundle to the Linux release target
+    encrypted FULL backup through Admin
   - create a disposable QA Docker stack on the Linux target using the current
     release-candidate source/image, a separate Compose project name, separate
     runtime directories, and a different port range such as
     `APP_BIND_ADDRESS=127.0.0.1`, `APP_PORT=18080`,
     `HISTORY_BIND_ADDRESS=127.0.0.1`, `HISTORY_PORT=18081`,
     `ADMIN_BIND_ADDRESS=127.0.0.1`, and `ADMIN_PORT=18082`
-  - import the backup through the disposable Linux admin API:
+  - **Primary default-format round trip:** export an encrypted FULL backup from
+    the long-running local Windows Docker admin API, not by copying host folders.
+    Use the standard FULL configuration with no `7z` format override and the
+    restore-controller path set: `config_file`, `runtime_overrides_file`,
+    `profile_file`, `mapping_file`, `sas_fabric_alias_file`, `slot_detail_file`,
+    `history_db`, `ssh_keys`, `tls_trust`, and `known_hosts` (the private
+    controller rejects an archive missing any of them). Encrypted exports
+    require a `passphrase`; read it from the private passphrase file and never
+    record it in receipts or the release wrap
+  - send
+    `POST http://127.0.0.1:8082/api/admin/backup/export?stop_services=false&restart_services=true`
+    with JSON body
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`;
+    deliberately omit `packaging` so this gate follows the configured FULL
+    default instead of forcing a format
+  - copy that primary exported bundle to the Linux release target, inspect it,
+    and require the observed `tar.zst` packaging before import; a `7z` result in
+    the primary path is a release `HOLD`, not substitute coverage
+  - import the primary archive, restart the disposable stack, and complete the
+    aggregate and application readback below before starting compatibility work
+  - **Legacy 7z readability round trip:** make a second encrypted FULL export
+    from the same source API and path set, this time explicitly sending
+    `{"encrypt":true,"passphrase":"<private passphrase, never recorded>","packaging":"7z","included_paths":["config_file","runtime_overrides_file","profile_file","mapping_file","sas_fabric_alias_file","slot_detail_file","history_db","ssh_keys","tls_trust","known_hosts"]}`
+  - copy the legacy bundle separately, then perform a second complete export,
+    inspect, import, restart, and readback round trip. Require the observed
+    packaging to be `7z`; this backward-readability check cannot replace or be
+    combined with the primary default-format result
+  - keep a separate sanitized receipt for each round trip. Each receipt must
+    retain `inspection.packaging` and `inspection.app_version` as the archive
+    format and export-source application provenance, plus `source_commit` and
+    `image_id` for the release candidate that performed inspection, import,
+    restart, and readback. Record both receipt paths and results in the release
+    wrap without copying raw private payloads
+  - for each copied bundle, inspect it first through
+    `POST http://127.0.0.1:18082/api/admin/backup/inspect`, confirm the required
+    observed packaging and encryption mode plus aggregate counts, and retain its
+    short-lived single-use inspection receipt only in memory
+  - import that same backup through the disposable Linux admin API:
     `POST http://127.0.0.1:18082/api/admin/backup/import?stop_services=true&restart_services=true`
-    with the exported bundle as `application/octet-stream`
+    with the same exported bundle as `application/octet-stream`, the observed
+    mode in `X-Backup-Expected-Encryption`, and the receipt in
+    `X-Backup-Inspection-Receipt`
   - confirm the restored Linux QA stack has the expected systems, profiles,
     storage views, runtime overrides, SAS Fabric aliases, slot-detail cache,
     history DB counts, and healthy UI/history/admin `/livez` and `/healthz`
@@ -350,16 +402,75 @@ python scripts/validate_release_wrap.py "$version" \
   - if the docs still call out the older `AOC-SLG4-2H8M2` path, confirm that
     saved system still renders the board image and its two matched member slots
 
+## Public demo rebuild
+
+Required for every release. Ordinary pull requests leave the demo alone, so
+this is the only place it catches up with the source.
+
+1. On the release branch, after the version bump and the last source change,
+   commit, then build from that exact commit:
+
+   ```bash
+   release_source_commit="$(git rev-parse HEAD)"
+   python scripts/build_public_demo.py --output public-demo/index.html \
+     --source-revision "$release_source_commit"
+   python scripts/check_public_demo_artifact.py public-demo --require-current
+   ```
+
+2. Commit the rebuilt artifact, push, and recapture the screenshots from that
+   commit with the pinned Linux workflow in "Screenshots" below.
+3. Review the exact PNG bytes, set `pixel_review` to `PASS`, and update
+   `docs/PUBLIC_SCREENSHOT_REVIEW.md`.
+4. Run the release gate. It must print `Public demo is current for release`:
+
+   ```bash
+   python scripts/validate_release_wrap.py "$version" --public-demo-only
+   ```
+
+5. Merge the release pull request with a merge commit, not a squash, so the
+   recorded source commit stays reachable from `main` and the tag.
+
+The same check runs in `.github/workflows/publish-ghcr.yml` when the GitHub
+release is published, and fails before any image is pushed if a step was
+missed. Publishing the rebuilt demo to Pages is still a separate
+owner-approved `workflow_dispatch`.
+
 ## Screenshots
 
-- regenerate public screenshots only from the checked synthetic artifact:
-  `node scripts/capture_public_demo_screenshots.js`
+- follow [`SCREENSHOT_CAPTURE.md`](SCREENSHOT_CAPTURE.md); do not run the
+  capture script on the release maintainer's workstation
+- push the checked synthetic artifact, record its full commit SHA, and dispatch
+  the pinned workflow from its default-branch definition:
+
+  ```bash
+  candidate_sha="$(git rev-parse HEAD)"
+  gh workflow run capture-public-demo-screenshots.yml --ref main \
+    -f ref="$candidate_sha" -f qualification_only=false
+  ```
+
+- identify that dispatch's run ID, require `gh run watch <run-id> --exit-status`
+  to succeed, then retrieve its candidate artifact into a new empty directory:
+
+  ```bash
+  rm -rf /tmp/public-demo-screenshot-candidate
+  gh run download <run-id> \
+    --name public-demo-screenshot-candidate \
+    --dir /tmp/public-demo-screenshot-candidate
+  cd /tmp/public-demo-screenshot-candidate
+  sha256sum --check sha256sums.txt
+  ```
+
+- review `capture.log` for the requested full commit SHA and pinned environment,
+  `platform-fonts.json` for the rendered font families, and
+  `proposed-manifest.json` for the same PNG hashes reported by
+  `sha256sums.txt`; reject a missing or mismatched file
 - do not capture a live app, admin page, operator config, local history, or
   private deployment for the public README or Wiki
-- inspect `public-demo-overview.png` and `public-demo-history.png` at their
-  exact manifest hashes
+- inspect the downloaded `public-demo-overview.png` and
+  `public-demo-history.png` at the exact hashes in `sha256sums.txt`, then copy
+  the reviewed bytes into both docs and Wiki locations
 - after pixel review, set each manifest review field to `PASS` and run:
-  - `python3 scripts/check_public_demo_artifact.py public-demo`
+  - `python3 scripts/check_public_demo_artifact.py public-demo --require-current`
   - `python3 scripts/check_public_screenshots.py`
   - `python3 scripts/check_public_docs.py`
 - require the docs and Wiki PNG copies to be byte-identical; remove obsolete
@@ -382,7 +493,7 @@ python scripts/validate_release_wrap.py "$version" \
   `python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md`
 - record the exact `Changelog coverage: pass (<N> PRs)` line in the release wrap
 - refresh the checked-in release notes file for the target tag, for example
-  `docs/RELEASE_NOTES_0.15.0.md`
+  `docs/RELEASE_NOTES_<version>.md`
 - review `README.md` for stale version or milestone wording
 - review `docs/ROADMAP.md` for stale "current direction" text
 - review profile/config docs for dead or outdated comments, especially builder
@@ -574,6 +685,10 @@ python scripts/validate_release_wrap.py "$version" \
   tear down only the temporary Linux QA restore containers, networks, and
   scratch runtime directories
 - start a new `Unreleased` section in `CHANGELOG.md` for follow-up work
+- `git mv` the previous release's `docs/RELEASE_NOTES_<version>.md` and
+  `docs/RELEASE_WRAP_<version>.md` into `docs/archive/` so only the current
+  release stays at the top level; `scripts/validate_release_wrap.py` reads
+  archived wraps from there
 - update `HANDOFF.md` and `TODO.md` with the shipped release state, GHCR digest,
   external wiki/public-demo state, deployment sniff results, and next branch
   only after the post-publish gates above are recorded

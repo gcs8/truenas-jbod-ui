@@ -7,9 +7,12 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "../..");
+const { SKIP_REASON, currentSourceDemo } = require("./current_source_demo");
+
+const GENERATED_DEMO = currentSourceDemo();
 const SOURCES = [
   ["live asset", fs.readFileSync(path.join(ROOT, "app/static/app.js"), "utf8")],
-  ["checked public demo", fs.readFileSync(path.join(ROOT, "public-demo/index.html"), "utf8")],
+  ["generated public demo", GENERATED_DEMO],
 ];
 
 function functionSource(source, name) {
@@ -76,7 +79,7 @@ function loadRenderer(source) {
 }
 
 for (const [label, source] of SOURCES) {
-  test(`${label} bounds the multipath state class token and escapes its label`, () => {
+  test(`${label} bounds the multipath state class token and escapes its label`, { skip: source === null && SKIP_REASON }, () => {
     const renderMultipathPills = loadRenderer(source);
     const html = renderMultipathPills([
       {

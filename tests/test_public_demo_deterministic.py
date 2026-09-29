@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 
+import yaml
 from pydantic import ValidationError
 
 from app import __version__
@@ -24,6 +25,8 @@ EXPECTED_INPUT_PATHS = {
     FIXTURE_PATH,
     Path("app/__init__.py"),
     Path("app/config.py"),
+    Path("app/config_errors.py"),
+    Path("app/env_values.py"),
     Path("app/logging_config.py"),
     Path("app/main.py"),
     Path("app/metrics.py"),
@@ -117,20 +120,6 @@ def recursive_local_python_inputs(entrypoint: Path) -> set[Path]:
     return discovered
 
 
-def workflow_paths_for_event(workflow: str, event_name: str) -> set[str]:
-    lines = workflow.splitlines()
-    event_header = f"  {event_name}:"
-    start = lines.index(event_header)
-    paths_start = next(index for index in range(start + 1, len(lines)) if lines[index] == "    paths:")
-    paths: set[str] = set()
-    for line in lines[paths_start + 1 :]:
-        if line.startswith("  ") and not line.startswith("      "):
-            break
-        if line.startswith('      - "') and line.endswith('"'):
-            paths.add(line.removeprefix('      - "').removesuffix('"'))
-    return paths
-
-
 class DeterministicPublicDemoContractTests(unittest.TestCase):
     def test_clean_source_materialization_regenerates_without_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -152,6 +141,11 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 "APP_CONFIG_PATH": str(materialized / "absent-config.yaml"),
                 "PYTHONHASHSEED": "random",
             }
+            # Windows cannot start Python's socket and random layers without
+            # these; they carry no operator state (#445).
+            for name in ("SYSTEMROOT", "SystemDrive"):
+                if os.environ.get(name):
+                    env[name] = os.environ[name]
             result = subprocess.run(
                 [
                     sys.executable,
@@ -186,13 +180,13 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative_path, target)
             version_file = source_root / "app/__init__.py"
             version_file.write_text(
-                version_file.read_text(encoding="utf-8").replace(__version__, "0.22.3"),
+                version_file.read_text(encoding="utf-8").replace(__version__, "0.23.1"),
                 encoding="utf-8",
             )
             result = run_checker(demo_dir, source_root=source_root)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("artifact app version 0.22.2 does not match source 0.22.3", result.stderr)
+        self.assertIn("artifact app version 0.23.0 does not match source 0.23.1", result.stderr)
 
     def test_shared_input_graph_is_complete_and_unique(self) -> None:
         module = importlib.import_module("scripts.public_demo_inputs")
@@ -239,31 +233,22 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
                         result.stderr,
                     )
 
-    def test_publish_workflow_watches_every_declared_input(self) -> None:
+    def test_declared_inputs_keep_one_authoritative_pull_request_validation_path(self) -> None:
         module = importlib.import_module("scripts.public_demo_inputs")
-        workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
-
-        expected_paths = {path.as_posix() for path in module.PUBLIC_DEMO_INPUT_PATHS}
-        expected_paths.update(
-            {
-                ".github/workflows/publish-public-demo.yml",
-                "public-demo/**",
-                "qa/public-demo.spec.js",
-                "README.md",
-                "docs/DOCUMENTATION_INVENTORY.md",
-                "docs/PUBLIC_DEMO_PRODUCT_BRIEF.md",
-                "docs/PUBLIC_SCREENSHOT_REVIEW.md",
-                "docs/images/screenshots/**",
-                "wiki/**",
-                "scripts/build_current_source_browser_fixture.py",
-                "scripts/check_public_demo_artifact.py",
-                "scripts/check_public_demo_deployment.py",
-                "scripts/check_public_docs.py",
-                "scripts/check_public_screenshots.py",
-            }
+        ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        publish = yaml.safe_load(
+            (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
         )
-        self.assertEqual(workflow_paths_for_event(workflow, "pull_request"), expected_paths)
-        self.assertEqual(workflow_paths_for_event(workflow, "push"), {"public-demo/**"})
+        ci_triggers = ci.get("on", ci.get(True, {}))
+        publish_triggers = publish.get("on", publish.get(True, {}))
+
+        self.assertGreater(len(module.PUBLIC_DEMO_INPUT_PATHS), 0)
+        self.assertEqual(ci_triggers["pull_request"], {"branches": ["main"]})
+        self.assertNotIn("pull_request", publish_triggers)
+        self.assertEqual(
+            publish_triggers["push"],
+            {"branches": ["main"], "paths": ["public-demo/**"]},
+        )
 
     def test_pages_deploy_requires_manual_dispatch(self) -> None:
         workflow = (ROOT / ".github/workflows/publish-public-demo.yml").read_text(encoding="utf-8")
@@ -309,6 +294,24 @@ class DeterministicPublicDemoContractTests(unittest.TestCase):
         self.assertNotRegex(fixture_text, r"(?i)\b(?:wwn|naa)\.[0-9a-f]{16,}\b")
         self.assertRegex(fixture_text, re.compile(r'"provenance": "synthetic"'))
         self.assertIn('"id": "demo-system"', fixture_text)
+
+    def test_fixture_models_the_two_production_spares_as_one_synthetic_group(self) -> None:
+        fixture_module = importlib.import_module("app.services.public_demo_fixture")
+        fixture = fixture_module.load_public_demo_fixture(ROOT / FIXTURE_PATH)
+        spare_slots = [slot for slot in fixture.slots if slot.vdev_class == "spare"]
+
+        self.assertEqual([slot.slot for slot in spare_slots], [42, 43])
+        self.assertEqual(
+            {(slot.pool_name, slot.vdev_name, slot.vdev_class) for slot in spare_slots},
+            {("demo-capacity", "spares", "spare")},
+        )
+
+        bundle = fixture_module.build_public_demo_snapshot_bundle(fixture=fixture)
+        rendered_spares = [slot for slot in bundle.primary_snapshot.slots if slot.vdev_class == "spare"]
+        self.assertEqual(
+            {slot.topology_label for slot in rendered_spares},
+            {"demo-capacity > spares > spare"},
+        )
 
     def test_builder_ignores_ambient_operator_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

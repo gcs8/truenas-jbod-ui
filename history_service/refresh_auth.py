@@ -58,6 +58,23 @@ class ManualRefreshAdmission:
         async with self._state_lock:
             self._running = False
 
+    def cooldown_state(self) -> dict[str, object]:
+        """Report the full-refresh cooldown without consuming or moving it.
+
+        The dashboard polls this so it can show the deadline instead of
+        discovering the cooldown by being refused with a 429.
+        """
+
+        remaining = 0
+        if self.cooldown_seconds > 0 and self._last_full_started_at is not None:
+            elapsed = self.monotonic() - self._last_full_started_at
+            remaining = max(0, math.ceil(self.cooldown_seconds - elapsed))
+        return {
+            "cooldown_seconds": int(self.cooldown_seconds),
+            "seconds_remaining": int(remaining),
+            "active": remaining > 0,
+        }
+
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
@@ -81,7 +98,12 @@ async def read_refresh_document(request: Request) -> str:
         payload = json.loads(body, object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Refresh request must be valid JSON.") from exc
-    if not isinstance(payload, dict) or set(payload) != {"mode"} or payload["mode"] not in {"fast", "full"}:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"mode"}
+        or not isinstance(payload["mode"], str)
+        or payload["mode"] not in {"fast", "full"}
+    ):
         raise HTTPException(status_code=422, detail="Refresh request must contain exactly mode 'fast' or 'full'.")
     return str(payload["mode"])
 

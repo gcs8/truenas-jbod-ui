@@ -19,6 +19,12 @@ from pydantic import BaseModel, Field, model_validator
 
 _ARCHIVE_PREFIX = "jbod-scheduled-backup-"
 _ARCHIVE_SUFFIX = ".tar.zst.enc"
+# FULL backups default to tar.zst in the TJBENC02 envelope (#397). Set
+# BACKUP_FULL_ARCHIVE_FORMAT=7z for archives older app versions and plain
+# 7-Zip can open.
+DEFAULT_FULL_ARCHIVE_FORMAT = "tar.zst"
+FULL_ARCHIVE_FORMAT_ENV = "BACKUP_FULL_ARCHIVE_FORMAT"
+_FULL_ARCHIVE_FORMATS = ("7z", "tar.zst")
 _ARCHIVE_NAME = re.compile(
     r"^jbod-scheduled-backup-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)-"
     r"(?P<nonce>[0-9a-f]{8})(?:\.7z|\.tar\.zst\.enc)$"
@@ -169,9 +175,12 @@ class ScheduledBackupSettings(BaseModel):
     included_groups: list[str] = Field(default_factory=list)
     passphrase_file: str | None = None
     app_gid: int | None = None
+    archive_format: str = DEFAULT_FULL_ARCHIVE_FORMAT
 
     @model_validator(mode="after")
     def validate_enabled_settings(self) -> ScheduledBackupSettings:
+        if self.archive_format not in _FULL_ARCHIVE_FORMATS:
+            raise ValueError(f"{FULL_ARCHIVE_FORMAT_ENV} must be 7z or tar.zst.")
         if not self.enabled:
             return self
         if not str(self.destination_dir or "").strip():
@@ -230,6 +239,10 @@ class ScheduledBackupSettings(BaseModel):
             included_groups=groups,
             passphrase_file=os.getenv("SCHEDULED_BACKUP_PASSPHRASE_FILE"),
             app_gid=app_gid,
+            archive_format=(
+                str(os.getenv(FULL_ARCHIVE_FORMAT_ENV) or "").strip().lower()
+                or DEFAULT_FULL_ARCHIVE_FORMAT
+            ),
         )
 
 
@@ -245,6 +258,9 @@ class ScheduledBackupRunner:
         retention_count: int,
         app_gid: int,
         clock: Callable[[], datetime] | None = None,
+        apply_retention: bool = True,
+        archive_format: str = DEFAULT_FULL_ARCHIVE_FORMAT,
+        before_publish: Callable[[Path, Path], None] | None = None,
     ) -> None:
         self.backup_service = backup_service
         self.destination_dir = Path(destination_dir)
@@ -254,6 +270,12 @@ class ScheduledBackupRunner:
         self.retention_count = int(retention_count)
         self.app_gid = int(app_gid)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # The backup scheduler sidecar grooms through the artifact catalog and
+        # lifecycle manager instead, so it turns the filename-pattern pruning off.
+        self.apply_retention = bool(apply_retention)
+        self.archive_format = archive_format
+        self.last_manifest: dict[str, Any] | None = None
+        self.before_publish = before_publish
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -552,6 +574,10 @@ class ScheduledBackupRunner:
                 expected_groups=list(self.included_groups),
             )
             source_metadata = temporary.lstat()
+            # Scheduler ownership must be durable before the final name exists.
+            # The standalone runner keeps its existing retention/status contract.
+            if self.before_publish is not None:
+                self.before_publish(temporary, target)
             os.link(temporary, target, follow_symlinks=False)
             target_descriptor: int | None = None
             try:
@@ -648,6 +674,7 @@ class ScheduledBackupRunner:
                 artifact = self.backup_service.export_scheduled_bundle_to_file(
                     passphrase=passphrase,
                     included_paths=list(self.included_groups),
+                    archive_format=self.archive_format,
                 )
                 archive_suffix = ".7z" if artifact.filename.endswith(".7z") else _ARCHIVE_SUFFIX
                 filename = (
@@ -659,7 +686,9 @@ class ScheduledBackupRunner:
                     self.destination_dir / filename,
                     passphrase=passphrase,
                 )
-                retention_removed = self._apply_retention()
+                retention_removed = self._apply_retention() if self.apply_retention else 0
+                manifest = getattr(artifact, "manifest", None)
+                self.last_manifest = manifest if isinstance(manifest, dict) else None
                 status.update(
                     {
                         "success_count": int(status.get("success_count") or 0) + 1,

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, model_validator
+from pydantic import Field, StrictInt, ValidationError
 
+from app.config_errors import ConfigurationError, describe_validation_error
+from app.env_values import annotation_is_text
+from app.read_ui_auth_config import AUTH_ENV_OVERRIDES, ReadUiAuthSettings, _parse_scalar
 from app.secret_files import load_secret_environment_value
 
 
@@ -16,9 +18,7 @@ def _default_host_prep_temp_dir() -> str:
     return str(Path(temp_root) / "truenas-jbod-ui-host-prep")
 
 
-class AdminSettings(BaseModel):
-    model_config = ConfigDict(hide_input_in_errors=True)
-
+class AdminSettings(ReadUiAuthSettings):
     app_name: str = "TrueNAS JBOD Admin Service"
     host: str = "0.0.0.0"
     port: int = 8002
@@ -32,10 +32,6 @@ class AdminSettings(BaseModel):
     container_history_livez_url: str = "http://enclosure-history:8001/livez"
     container_admin_livez_url: str = "http://127.0.0.1:8002/livez"
     container_version_probe_timeout_seconds: float = 1.5
-    public_origin: str | None = None
-    auth_mode: Literal["network", "basic"] = "network"
-    auth_username: str | None = None
-    auth_password: SecretStr | None = None
     allow_plaintext_backup_export: bool = False
     clean_backup_targets: list[Literal["ui", "history"]] = Field(
         default_factory=lambda: ["ui", "history"]
@@ -44,19 +40,6 @@ class AdminSettings(BaseModel):
     host_prep_stale_ttl_seconds: StrictInt = Field(default=24 * 60 * 60, ge=0)
     host_prep_max_packages: StrictInt = Field(default=8, ge=1, le=1000)
     host_prep_max_bytes: StrictInt = Field(default=2 * 1024 * 1024 * 1024, ge=1)
-
-    @model_validator(mode="after")
-    def validate_authentication(self) -> "AdminSettings":
-        if self.auth_mode != "basic":
-            return self
-        username = str(self.auth_username or "").strip()
-        password = self.auth_password.get_secret_value() if self.auth_password else ""
-        if not username or not password:
-            raise ValueError(
-                "ADMIN_AUTH_MODE=basic requires non-empty ADMIN_AUTH_USERNAME and ADMIN_AUTH_PASSWORD."
-            )
-        self.auth_username = username
-        return self
 
 
 ENV_OVERRIDES: dict[str, str] = {
@@ -73,10 +56,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "ADMIN_CONTAINER_HISTORY_LIVEZ_URL": "container_history_livez_url",
     "ADMIN_CONTAINER_ADMIN_LIVEZ_URL": "container_admin_livez_url",
     "ADMIN_CONTAINER_VERSION_PROBE_TIMEOUT_SECONDS": "container_version_probe_timeout_seconds",
-    "ADMIN_PUBLIC_ORIGIN": "public_origin",
-    "ADMIN_AUTH_MODE": "auth_mode",
-    "ADMIN_AUTH_USERNAME": "auth_username",
-    "ADMIN_AUTH_PASSWORD": "auth_password",
+    **AUTH_ENV_OVERRIDES,
     "ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT": "allow_plaintext_backup_export",
     "ADMIN_CLEAN_BACKUP_TARGETS_JSON": "clean_backup_targets",
     "ADMIN_HOST_PREP_TEMP_DIR": "host_prep_temp_dir",
@@ -87,19 +67,11 @@ ENV_OVERRIDES: dict[str, str] = {
 FILE_SECRET_ENV_OVERRIDES = frozenset({"ADMIN_AUTH_PASSWORD"})
 
 
-def _parse_scalar(value: str):
-    stripped = value.strip()
-    lowered = stripped.lower()
-    if lowered in {"true", "false"}:
-        return lowered == "true"
-    try:
-        return int(stripped)
-    except ValueError:
-        pass
-    try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped
+EXACT_TEXT_FIELDS = frozenset({"auth_username", "auth_password"})
+
+
+def _field_is_text(field_name: str) -> bool:
+    return annotation_is_text(AdminSettings.model_fields[field_name].annotation)
 
 
 @lru_cache
@@ -113,13 +85,25 @@ def get_admin_settings() -> AdminSettings:
         )
         if raw_value is None:
             continue
-        payload[field_name] = (
-            raw_value
-            if field_name in {"auth_username", "auth_password"}
-            else _parse_scalar(raw_value)
-        )
+        if field_name in EXACT_TEXT_FIELDS:
+            payload[field_name] = raw_value
+        elif _field_is_text(field_name):
+            payload[field_name] = raw_value.strip()
+        else:
+            payload[field_name] = _parse_scalar(raw_value)
 
-    settings = AdminSettings.model_validate(payload)
+    field_to_env = {field_name: env_name for env_name, field_name in ENV_OVERRIDES.items()}
+    try:
+        settings = AdminSettings.model_validate(payload)
+    except ValidationError as exc:
+        problems = describe_validation_error(
+            exc,
+            resolve_location=lambda location: (
+                (field_to_env[str(location[0])], ".env") if str(location[0]) in field_to_env else None
+            ),
+            default_source=".env",
+        )
+        raise ConfigurationError(problems) from None
     Path("/tmp").mkdir(parents=True, exist_ok=True)
     Path(settings.host_prep_temp_dir).mkdir(parents=True, exist_ok=True)
     return settings

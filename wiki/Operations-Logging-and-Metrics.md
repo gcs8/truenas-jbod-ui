@@ -14,7 +14,7 @@ For installation, see [[Quick Start|Quick-Start]]. For service roles, see [[Arch
 | Show deployed images | `docker compose images` |
 | Follow all service logs | `docker compose logs -f` |
 | Disable metrics endpoints | `METRICS_ENABLED=false` |
-| Bind history off-host | `HISTORY_BIND_ADDRESS=0.0.0.0` |
+| Bind history off-host | `HISTORY_BIND_ADDRESS`, plus token mode, a token, and `HISTORY_PUBLIC_ORIGIN`; see [Scrape metrics](#scrape-metrics) |
 
 ## Update published images
 
@@ -36,7 +36,9 @@ docker compose pull
 docker compose up -d
 ```
 
-Run `docker compose images` to confirm the image in use. See [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]] for deployment and rollback procedures.
+Run `docker compose images` to confirm the image in use. To go back to the
+previous version, see
+[[Rolling back a release|Docker-and-GHCR-Deployment#rolling-back-a-release]].
 
 ## Check service health
 
@@ -52,7 +54,30 @@ Use `/healthz` to inspect cached application readiness and dependency state:
 curl http://your-docker-host:8080/healthz
 ```
 
-`/healthz` does not force a full inventory refresh. The history and admin sidecars provide their own `/livez` and `/healthz` endpoints while running.
+`/healthz` does not force a full inventory refresh. It reports three levels in
+`status`, with a one-line `summary` and a `problems` list:
+
+- `ok` (HTTP 200): nothing to act on.
+- `degraded` (HTTP 200): a system outside the container is unhealthy: the
+  TrueNAS API is unreachable or partial, SSH or BMC collection failed, or the
+  history service is unavailable or degraded. An uptime monitor that only
+  checks the HTTP code stays green; alert on `status` if you want to hear about
+  these.
+- `down` (HTTP 503): a local fault the container cannot operate through: its
+  data, logs or known-hosts folder is not writable. `curl -f` and uptime checks
+  trip on this.
+
+The history probe is cached for 30 seconds after success and 10 seconds after a
+failure. An unset `HISTORY_BACKEND_URL` is not probed, and the default
+`enclosure-history` name not resolving (history profile off) is not reported; a
+custom history host that does not resolve is. The Docker healthcheck for the main UI probes
+`/livez`, not `/healthz`, so neither level restarts the container.
+
+The history service and Admin service provide their own `/livez` and `/healthz`
+endpoints while running. History `/healthz` answers HTTP 503 with
+`status: down` only when its database could not be opened; collection and
+cleanup failures are `degraded` with HTTP 200. Admin `/healthz` is `ok` while
+the process runs.
 
 ## Read local logs
 
@@ -78,7 +103,7 @@ LOG_FORMAT=json
 
 ## Correlate requests
 
-The UI, history sidecar, and admin sidecar create a new 32-character lowercase hexadecimal request ID for every inbound HTTP request. The response returns it in `X-Request-ID`.
+The UI, history sidecar, and Admin service create a new 32-character lowercase hexadecimal request ID for every inbound HTTP request. The response returns it in `X-Request-ID`.
 
 A caller-provided value never becomes the service's request ID. When valid, it can appear as `parent_request_id`, which lets you follow internal calls across services. Internal clients forward the server-issued ID in `X-Request-ID`.
 
@@ -132,13 +157,22 @@ The services expose Prometheus/OpenMetrics endpoints while metrics are enabled:
 
 - main UI: `http://your-docker-host:8080/metrics`
 - history sidecar: `http://your-docker-host:8081/metrics`
-- admin sidecar: `http://your-docker-host:8082/metrics`
+- Admin service: `http://your-docker-host:8082/metrics`
 
-The history sidecar listens on loopback by default. To scrape it from another host, intentionally bind it off-host:
+The history sidecar listens on loopback by default. A non-loopback bind
+requires token-authenticated refreshes and one exact browser origin, so set the
+four values together or the service exits at startup with
+`Configuration error: HISTORY_BIND_ADDRESS is not loopback.` followed by the variables to set:
 
 ```dotenv
 HISTORY_BIND_ADDRESS=0.0.0.0
+HISTORY_REFRESH_AUTH_MODE=token
+HISTORY_REFRESH_TOKEN=<a long random string>
+HISTORY_PUBLIC_ORIGIN=http://your-docker-host:8081
 ```
+
+Recreate the service with `docker compose --profile history up -d`. Prometheus
+scrapes `/metrics` without the token; the token authenticates refresh requests.
 
 Binding a service to `0.0.0.0` makes it reachable on every available interface unless host or network controls restrict it. Review that exposure before enabling the setting.
 
@@ -230,7 +264,7 @@ rule_files:
   - /etc/prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-Add `truenas_jbod_ui_monitor: required` only to services that must remain available. The admin sidecar normally stops when it is not needed, so do not label it `required` unless you intentionally keep it running.
+Add `truenas_jbod_ui_monitor: required` only to services that must remain available. The Admin service normally stops when it is not needed, so do not label it `required` unless you intentionally keep it running.
 
 ```yaml
 scrape_configs:

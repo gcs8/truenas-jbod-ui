@@ -1,7 +1,7 @@
 # Admin UI and system setup
 
-This page is the practical guide for launching and using the optional admin
-sidecar.
+This page is the practical guide for launching and using the optional Admin
+service.
 
 Use it when you want:
 
@@ -30,17 +30,17 @@ exact address operators will open in their browsers:
 ADMIN_PUBLIC_ORIGIN=http://your-docker-host:8082
 ```
 
-The admin sidecar requires this fixed origin in both network and Basic modes.
+The Admin service requires this fixed origin in both network and Basic modes.
 Basic mode also requires `APP_PUBLIC_ORIGIN` for the main UI.
 
-If the main UI is already running and you only want to add the admin sidecar:
+If the main UI is already running and you only want to add the Admin service:
 
 ```bash
 docker compose --profile admin pull
 docker compose --profile admin up -d enclosure-admin
 ```
 
-If you want the main UI and admin sidecar started together:
+If you want the main UI and Admin service started together:
 
 ```bash
 docker compose --profile admin pull
@@ -92,7 +92,7 @@ rules or segmentation.
 Segmentation limits reachability but does not authenticate a client. See
 [[Advanced Configuration|Advanced-Configuration]] for the full explanation.
 
-With the shipped Compose file, the admin sidecar:
+With the shipped Compose file, the Admin service:
 
 - listens on port `8082`
 - auto-stops after `3600` seconds unless you change
@@ -109,7 +109,7 @@ environment value, recreate the admin container so the process receives it:
 docker compose --profile admin up -d --force-recreate enclosure-admin
 ```
 
-If the admin sidecar is reachable, the main UI on `:8080` also shows a
+If the Admin service is reachable, the main UI on `:8080` also shows a
 `System Setup` button that opens the same page in a new tab.
 
 The top of the admin page now has two section targets:
@@ -155,7 +155,7 @@ This is where you confirm the intended chassis shape before you save.
 
 ### Enclosure / profile builder
 
-The admin sidecar now also has a dedicated builder workspace for reusable
+The Admin service now also has a dedicated builder workspace for reusable
 custom chassis profiles.
 
 
@@ -172,7 +172,7 @@ it does not yet try to be a full drag-and-drop freeform editor.
 
 ### Storage views
 
-The admin sidecar now uses one grouped `Add Storage View` flow.
+The Admin service now uses one grouped `Add Storage View` flow.
 
 That means:
 
@@ -208,7 +208,7 @@ For TrueNAS CORE, the permission preview is the same one-line
 after resolving the service account's middleware user id. For Linux-like
 platforms, the preview remains the generated sudoers content.
 
-For VMware ESXi, the admin sidecar now keeps the setup intentionally narrower:
+For VMware ESXi, the Admin service now keeps the setup intentionally narrower:
 
 - the recommended saved SSH user stays `root`
 - `Password Only / No Key` is a first-class option when the host is using
@@ -266,7 +266,7 @@ material for later runtime use.
 
 Use runtime control when you need to:
 
-- restart the read UI
+- restart the main UI
 - restart the history sidecar
 - coordinate backup or restore work with a cleaner maintenance window
 - confirm whether UI, history, and admin are all running the same app version
@@ -283,13 +283,15 @@ partially updated sidecar without jumping across three separate pages.
 
 ### Runtime behavior
 
-The admin sidecar also exposes the supported runtime behavior knobs for cache
+The Admin service also exposes the supported runtime behavior knobs for cache
 and refresh timing.
 
 Fields owned by `.env` stay read-only and show their source. Fields owned by
 admin runtime overrides are editable and save to
-`config/runtime-overrides.yaml`. After saving those values, restart the read UI
-from the runtime cards so the main surface picks up the new timing behavior.
+`config/runtime-overrides.yaml`. The main UI applies saved values when it next
+handles a non-static page or API request; no restart is needed. Only settings
+that need a new process (see [[Advanced Configuration|Advanced-Configuration]])
+show a **Restart main UI now** button next to the save result.
 
 ## Backup, restore, debug, and demo data
 
@@ -303,7 +305,7 @@ separate pages so the setup walkthrough stays readable:
   local `Add Demo Builder System` seed differs from offline snapshots, debug
   bundles, full backups, and the public demo site.
 
-The short rule: use the admin sidecar for real local maintenance, but keep
+The short rule: use the Admin service for real local maintenance, but keep
 demo/offline artifacts visibly separate from restore-grade backup bundles.
 
 ## History maintenance and recovery
@@ -327,7 +329,7 @@ The detailed operator guidance lives on:
 For a first-time setup on a new host:
 
 1. start the main UI and confirm basic inventory loads
-2. start the admin sidecar on `:8082`
+2. start the Admin service on `:8082`
 3. load or create the target system entry
 4. configure SSH if you want richer mapping, SMART, or LED support
 5. for ESXi, use `Host Prep / Vendor Tool Upload` only if the validated read

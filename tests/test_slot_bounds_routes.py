@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import socket
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -11,8 +13,11 @@ from unittest.mock import AsyncMock, Mock, call, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
+from websockets.exceptions import ConnectionClosedError
 
 from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import (
     SMART_BATCH_MAX_SLOTS,
@@ -76,6 +81,7 @@ def _service_with_cached_smart(
     service._smart_negative_cache = OrderedDict()
     service._smart_cache_global_generation = 0
     service._smart_cache_enclosure_generations = {}
+    service._identity_unknown_slots = set()
     service._observe_inventory_cache_metrics = Mock()
     service._observe_smart_summary_request = Mock()
     for slot, summary in summaries.items():
@@ -123,7 +129,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
 
     def test_bay_above_global_layout_is_accepted_when_profile_has_it(self) -> None:
         service = _service(layout_slot_count=84)
-        asyncio.run(app_main.ensure_slot_bounds(78, service, "50050cc11ac013fc"))
+        asyncio.run(app_route_support.ensure_slot_bounds(78, service, "50050cc11ac013fc"))
         service.get_snapshot.assert_awaited_once_with(
             selected_enclosure_id="50050cc11ac013fc",
             allow_stale_cache=True,
@@ -132,26 +138,26 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
     def test_bay_beyond_selected_profile_is_rejected_even_below_global_layout(self) -> None:
         service = _service(layout_slot_count=12, selected_enclosure_id="small-shelf")
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(40, service, "small-shelf"))
+            asyncio.run(app_route_support.ensure_slot_bounds(40, service, "small-shelf"))
         self.assertEqual(raised.exception.status_code, 404)
         self.assertIn("Slot 40", raised.exception.detail)
 
     def test_negative_slot_never_touches_the_service(self) -> None:
         service = _service(layout_slot_count=84)
         with self.assertRaises(HTTPException):
-            asyncio.run(app_main.ensure_slot_bounds(-1, service, "50050cc11ac013fc"))
+            asyncio.run(app_route_support.ensure_slot_bounds(-1, service, "50050cc11ac013fc"))
         service.get_snapshot.assert_not_awaited()
 
     def test_slot_bounds_require_an_inventory_service(self) -> None:
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(59, None, "enc"))
+            asyncio.run(app_route_support.ensure_slot_bounds(59, None, "enc"))
         self.assertEqual(raised.exception.status_code, 503)
 
     def test_scoped_bounds_fail_closed_when_the_snapshot_is_unavailable(self) -> None:
         service = _service(layout_slot_count=None)
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(40, service, "small-shelf"))
+            asyncio.run(app_route_support.ensure_slot_bounds(40, service, "small-shelf"))
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail, "Unable to resolve selected enclosure layout.")
@@ -161,7 +167,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         service.get_snapshot.side_effect = UnknownEnclosureError()
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(4, service, "caller-controlled-value"))
+            asyncio.run(app_route_support.ensure_slot_bounds(4, service, "caller-controlled-value"))
 
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
@@ -172,7 +178,7 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         service.get_snapshot.return_value.selected_enclosure_id = "other-shelf"
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(40, service, "small-shelf"))
+            asyncio.run(app_route_support.ensure_slot_bounds(40, service, "small-shelf"))
 
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(raised.exception.detail, "Requested enclosure is not available for this system.")
@@ -184,9 +190,9 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_settings", return_value=self.settings),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -223,9 +229,9 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
         payload.max_concurrency = 2
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_settings", return_value=self.settings),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             try:
                 asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id="50050cc11ac013fc"))
@@ -241,6 +247,99 @@ class SlotBoundsFollowSelectedEnclosureTests(unittest.TestCase):
 
         self.assertEqual(service.get_snapshot.await_count, 2)
 
+    def _smart_batch_failure(self, error: Exception, *, logs: list[str] | None = None) -> Exception:
+        """Drive the batch endpoint with a service that fails, return what escapes."""
+        route = _route("/api/slots/smart-batch", "POST")
+        service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
+        service.get_slot_smart_summaries = AsyncMock(side_effect=error)
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock()
+        payload.slots = [5, 63]
+        payload.max_concurrency = 2
+
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "add_perf_metadata"),
+            self.assertLogs("app.main", level="ERROR") as captured,
+            self.assertRaises(Exception) as raised,
+        ):
+            asyncio.run(route.endpoint(
+                payload=payload, system_id="system-a", enclosure_id="invented-shelf",
+            ))
+        if logs is not None:
+            logs.extend(captured.output)
+        return raised.exception
+
+    def _smart_batch_failure_quiet(self, error: Exception) -> Exception:
+        """Same drive, for failures that must not be reported as a local fault."""
+        route = _route("/api/slots/smart-batch", "POST")
+        service = _service(layout_slot_count=84, selected_enclosure_id="invented-shelf")
+        service.get_slot_smart_summaries = AsyncMock(side_effect=error)
+        registry = Mock()
+        registry.get_service.return_value = service
+        payload = Mock()
+        payload.slots = [5, 63]
+        payload.max_concurrency = 2
+
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_settings", return_value=self.settings),
+            patch.object(app_routes, "add_perf_metadata"),
+            self.assertRaises(Exception) as raised,
+        ):
+            asyncio.run(route.endpoint(
+                payload=payload, system_id="system-a", enclosure_id="invented-shelf",
+            ))
+        return raised.exception
+
+    def test_smart_batch_transport_failure_is_not_a_server_fault(self) -> None:
+        # #523: a slow or dropped middleware call is a temporary unavailability
+        # of the shelf's SMART data. The endpoint must not answer 500 for every
+        # slot, whichever layer the transport failure escapes from.
+        for error in (
+            TimeoutError("invented slow disk"),
+            ConnectionRefusedError("invented refused connection"),
+            ConnectionResetError("invented reset connection"),
+            socket.gaierror("invented name resolution failure"),
+            OSError(errno.EHOSTUNREACH, "invented unreachable host"),
+            ConnectionClosedError(None, None),
+        ):
+            with self.subTest(error=type(error).__name__):
+                raised = self._smart_batch_failure_quiet(error)
+                self.assertIsInstance(raised, HTTPException)
+                self.assertEqual(raised.status_code, 503)
+
+    def test_smart_batch_filesystem_failure_is_not_a_transient_outage(self) -> None:
+        # #526: OSError is equally the base of every filesystem failure, and the
+        # slot-detail store raises those unwrapped through the SMART batch
+        # (`SlotDetailStore._write` -> `SmartDetailBatch.flush` ->
+        # `complete_batch`). A data directory the app cannot write must keep
+        # reaching the data-directory handling rather than being relabelled as a
+        # transient enclosure outage that an operator is invited to wait out.
+        for error in (
+            PermissionError(errno.EACCES, "invented unwritable data directory"),
+            OSError(errno.ENOSPC, "invented full filesystem"),
+            OSError(errno.EROFS, "invented read-only filesystem"),
+            FileNotFoundError(errno.ENOENT, "invented missing data directory"),
+            IsADirectoryError(errno.EISDIR, "invented directory in the way"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                logs: list[str] = []
+                raised = self._smart_batch_failure(error, logs=logs)
+                self.assertIsInstance(raised, HTTPException)
+                # A persistent local fault is a server fault, and it has to say
+                # so: 500 with a message that names the data directory, plus one
+                # log line an operator can find, instead of a bare 500 body or a
+                # 503 that invites waiting out a permissions problem.
+                self.assertEqual(raised.status_code, 500)
+                self.assertIn("data directory", raised.detail.lower())
+                self.assertNotIn("temporarily unavailable", raised.detail.lower())
+                self.assertIs(raised.__cause__, error)
+                self.assertTrue(logs, "no operator-visible log line was emitted")
+                self.assertIn("smart", " ".join(logs).lower())
+
 
 class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
     """Regression for #275: a drawer sub-view numbers its bays from a non-zero
@@ -252,22 +351,22 @@ class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
         service = _drawer_service()
         for slot in range(42, 84):
             with self.subTest(slot=slot):
-                asyncio.run(app_main.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
+                asyncio.run(app_route_support.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
 
     def test_drawer_sub_view_rejects_bays_from_the_other_drawer(self) -> None:
         service = _drawer_service()
         for slot in (0, 41, 84):
             with self.subTest(slot=slot), self.assertRaises(HTTPException) as raised:
-                asyncio.run(app_main.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
+                asyncio.run(app_route_support.ensure_slot_bounds(slot, service, BOTTOM_DRAWER_ID))
             self.assertEqual(raised.exception.status_code, 404)
             self.assertIn(f"Slot {slot}", raised.exception.detail)
 
     def test_layout_rows_bound_the_view_when_no_slot_views_are_rendered_yet(self) -> None:
         service = _drawer_service(layout_rows_in_snapshot=True)
-        asyncio.run(app_main.ensure_slot_bounds(42, service, BOTTOM_DRAWER_ID))
-        asyncio.run(app_main.ensure_slot_bounds(83, service, BOTTOM_DRAWER_ID))
+        asyncio.run(app_route_support.ensure_slot_bounds(42, service, BOTTOM_DRAWER_ID))
+        asyncio.run(app_route_support.ensure_slot_bounds(83, service, BOTTOM_DRAWER_ID))
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(0, service, BOTTOM_DRAWER_ID))
+            asyncio.run(app_route_support.ensure_slot_bounds(0, service, BOTTOM_DRAWER_ID))
         self.assertEqual(raised.exception.status_code, 404)
 
     def test_noncontiguous_layout_rejects_ids_in_the_gap(self) -> None:
@@ -276,18 +375,18 @@ class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
             selected_enclosure_id="sparse-shelf",
             layout_rows=[[0, 1, 2], [10, 11, 12]],
         )
-        asyncio.run(app_main.ensure_slot_bounds(2, service, "sparse-shelf"))
-        asyncio.run(app_main.ensure_slot_bounds(10, service, "sparse-shelf"))
+        asyncio.run(app_route_support.ensure_slot_bounds(2, service, "sparse-shelf"))
+        asyncio.run(app_route_support.ensure_slot_bounds(10, service, "sparse-shelf"))
         for slot in (5, 6, 13):
             with self.subTest(slot=slot), self.assertRaises(HTTPException) as raised:
-                asyncio.run(app_main.ensure_slot_bounds(slot, service, "sparse-shelf"))
+                asyncio.run(app_route_support.ensure_slot_bounds(slot, service, "sparse-shelf"))
             self.assertEqual(raised.exception.status_code, 404)
 
     def test_count_only_snapshot_keeps_the_zero_based_rule(self) -> None:
         service = _service(layout_slot_count=12, selected_enclosure_id="small-shelf")
-        asyncio.run(app_main.ensure_slot_bounds(11, service, "small-shelf"))
+        asyncio.run(app_route_support.ensure_slot_bounds(11, service, "small-shelf"))
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(app_main.ensure_slot_bounds(12, service, "small-shelf"))
+            asyncio.run(app_route_support.ensure_slot_bounds(12, service, "small-shelf"))
         self.assertEqual(raised.exception.status_code, 404)
 
     def test_smart_batch_admits_drawer_bays_and_resolves_the_layout_once(self) -> None:
@@ -301,9 +400,9 @@ class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
         payload.max_concurrency = 2
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_settings", return_value=Settings()),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_settings", return_value=Settings()),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             try:
                 asyncio.run(route.endpoint(payload=payload, system_id="system-a", enclosure_id=BOTTOM_DRAWER_ID))
@@ -331,9 +430,9 @@ class SlotBoundsFollowRenderedSlotsTests(unittest.TestCase):
         history_backend.get_scope_history = AsyncMock(return_value={})
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -379,9 +478,9 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", window_hours=24)
@@ -404,9 +503,9 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         history_backend.get_scope_history = AsyncMock(return_value={5: {"metrics": {}}})
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -431,8 +530,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         history_backend.get_scope_history = AsyncMock(return_value={})
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
         ):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(
@@ -457,8 +556,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         history_backend.get_scope_history = AsyncMock(return_value={})
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "get_history_backend", return_value=history_backend),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "get_history_backend", return_value=history_backend),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -483,8 +582,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             summary = asyncio.run(
                 route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", fresh=False)
@@ -507,8 +606,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             summary = asyncio.run(
                 route.endpoint(slot=5, system_id="system-a", enclosure_id="enc-a", fresh=False)
@@ -547,8 +646,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         self.service.get_slot_smart_summary = AsyncMock(return_value=SmartSummaryView(available=True))
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(
@@ -567,8 +666,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         registry.get_service.return_value = service
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(route.endpoint(slot=0, system_id="system-a", enclosure_id="enc", fresh=False))
             asyncio.run(route.endpoint(slot=0, system_id="system-a", enclosure_id="enc", fresh=True))
@@ -601,8 +700,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         registry = Mock()
         registry.get_service.return_value = service
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -653,8 +752,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         payload = Mock(slots=[0], max_concurrency=3)
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             asyncio.run(
                 route.endpoint(
@@ -700,8 +799,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         payload = Mock(slots=[5, 6], max_concurrency=2)
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -746,8 +845,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         )
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             response = asyncio.run(
                 route.endpoint(
@@ -791,8 +890,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
             service.slot_detail_store = store
 
             with (
-                patch.object(app_main, "get_inventory_registry", return_value=registry),
-                patch.object(app_main, "add_perf_metadata"),
+                patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                patch.object(app_routes, "add_perf_metadata"),
             ):
                 response = asyncio.run(
                     route.endpoint(
@@ -816,8 +915,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         payload = Mock(slots=[5, 6], max_concurrency=2)
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(
@@ -838,8 +937,8 @@ class DegradedReadSlotBoundsTests(unittest.TestCase):
         payload = Mock(action="on")
 
         with (
-            patch.object(app_main, "get_inventory_registry", return_value=self.registry),
-            patch.object(app_main, "add_perf_metadata"),
+            patch.object(app_routes, "get_inventory_registry", return_value=self.registry),
+            patch.object(app_routes, "add_perf_metadata"),
         ):
             with self.assertRaises(HTTPException) as raised:
                 asyncio.run(

@@ -80,11 +80,12 @@ test("diagnostic UI labels bounded rows as a recent sample instead of a full tab
 
   assert.match(panel, /Recent event sample/);
   assert.doesNotMatch(panel, /Full event table/);
-  assert.match(status, /sampled events/);
-  assert.match(status, /newest .* shipped/i);
+  assert.match(status, /recent events/);
+  assert.match(status, /the newest .* are listed here/i);
+  assert.doesNotMatch(status, /sampled|shipped|dmesg/);
 });
 
-test("diagnostic controls distinguish shipped samples from total events", () => {
+test("diagnostic controls distinguish the listed events from the kernel log total", () => {
   const { renderDiagnosticTableControls } = loadFunctions([
     "escapeHtml",
     "formatValue",
@@ -124,10 +125,11 @@ test("diagnostic controls distinguish shipped samples from total events", () => 
     filter: "timeout",
   });
 
-  assert.match(unfiltered, /Showing 1-25 of 25 sampled events/);
-  assert.match(unfiltered, /40 total events; newest 25 shipped/);
-  assert.match(filtered, /Showing 1-3 of 3 sampled events/);
-  assert.match(filtered, /3 matches in the shipped sample; 40 total events/);
+  assert.match(unfiltered, /Showing 1-25 of 25 recent events/);
+  assert.match(unfiltered, /40 events in the kernel log; the newest 25 are listed here\. Filters search only these\./);
+  assert.match(filtered, /Showing 1-3 of 3 recent events/);
+  assert.match(filtered, /3 matches in the listed events; 40 in the kernel log\./);
+  assert.doesNotMatch(unfiltered + filtered, /sample|shipped|dmesg/);
 });
 
 test("generic SAS formatters keep legacy decoded records hidden", () => {

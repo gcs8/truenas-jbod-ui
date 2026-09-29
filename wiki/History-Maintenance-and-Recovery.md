@@ -4,7 +4,7 @@ Use the admin maintenance tools when a saved system is deleted, renamed, or rebu
 
 ## Back up history before changing it
 
-Create a `Full Backup` in the admin sidecar before any destructive cleanup. Include the history database and any configuration, profiles, mappings, or cache files needed for recovery.
+Create a `Full Backup` in Admin before any destructive cleanup. Include the history database and any configuration, profiles, mappings, or cache files needed for recovery.
 
 If you are unsure whether to purge or adopt history, stop and export the backup first.
 
@@ -56,6 +56,118 @@ Segmented recovery can report unexpected files named like `.<hot-name>.segmented
 7. Review the proposed action before applying recovery.
 
 Never use wildcard deletion in the history directory. Leave every other hot database, catalog, staging file, rollback file, journal, and segment untouched. If ownership or catalog membership is unclear, keep the file and stop. Filename, age, and parseable contents are not proof of ownership.
+
+## Read the history dashboard diagnostics
+
+The history dashboard reports failures as plain sentences. The raw exception
+text, which can carry URLs, file paths, and appliance replies, stays in the
+service logs.
+
+| Cell | What it means |
+| --- | --- |
+| `Last error` | A collection pass failed. The text stays generic on purpose. |
+| `What went wrong` | The classified reason for that failure, such as not reaching the main UI, a request timeout, or a rejected request with its status code. |
+| `Backup error` | The last snapshot attempt failed, named in plain words: a full disk, an unwritable backup directory, or a read-only database. |
+| `Cleanup error` | The last retention pass failed, named in plain words (read-only database, full disk, missing permission). Retention selects each batch with a bounded subquery, so any `HISTORY_RETENTION_BATCH_SIZE` works; a very large value only makes each cleanup transaction longer. |
+| `Cleanup waiting` | Retention is holding off because no recent backup exists. |
+| `Cleanup resumes by` | The deadline after which retention prunes anyway. |
+| `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
+
+The history service `/healthz` answers HTTP 503 with `status: down` only when
+the history database could not be opened at startup (for example an unwritable
+`./history` folder); `reason` carries the plain line from the log. Otherwise it
+answers HTTP 200. Its `status` is `degraded`, with a plain `detail`, when the last background
+collection failed, the history database is read-only, cleanup failed twice in a
+row, or earlier history was quarantined and needs recovery. A failed manual
+refresh shows in `Last error` but does not make the service degraded. The
+Collector card reads `Starting` during the startup grace period, and a scheduled
+backup status file with group or world write permission is named in
+`Cleanup error` (expected mode `0640`).
+
+If `Cleanup waiting` stays set, fix the backup first: read `Backup error`, check
+that the backup directory is writable by the history service and has free
+space, then confirm that `Last backup` moves forward. Pruning resumes on its own
+once a snapshot succeeds, and no later than `Cleanup resumes by`.
+
+`Cleanup resumes by` is a real deadline across restarts: the moment the wait
+started is written into the history database, so restarting the service does
+not push it out and does not bring it forward. If that record cannot be read or
+written, `Cleanup waiting` says the retention wait record could not be read or
+written and nothing is pruned at all until the database is writable again.
+
+## Recover a damaged history database
+
+If SQLite reports the history database as damaged while the service is running
+(`database disk image is malformed` or `file is not a database`), collection
+stops writing to protect what is left. `/healthz` reports `degraded` with "The
+history database is damaged; collection is paused to protect it." The
+dashboard shows `Collection paused: yes`, and a manual refresh is refused. Reads
+stay available. The pause is recorded in a small marker file next to the
+database (`history.sqlite3.collection-paused`, holding only a timestamp), so a
+restart does not resume writing.
+
+The same state is used when startup had to quarantine an unreadable database
+and start an empty one (`Recovery required: yes`). The original file is kept
+next to the database as `*.broken-*` and is never deleted automatically.
+
+To recover:
+
+1. Restore a full backup that includes the history database from the admin
+   **Backups** page, or put a known-good copy of the database in place.
+2. Check the result:
+
+   ```bash
+   docker compose exec enclosure-history python -m history_service.recovery status
+   ```
+
+   `database_check` must read `ok`.
+3. Acknowledge the recovery:
+
+   ```bash
+   docker compose exec enclosure-history python -m history_service.recovery acknowledge
+   ```
+
+   This refuses and changes nothing while the integrity check fails. When the
+   check passes, it removes the pause marker and acknowledges a pending
+   quarantine. Collection resumes on the next pass. It does not touch
+   `*.broken-*` files or history rows, and it adds no network endpoint.
+
+## Roll back after an incompatible history change
+
+So far every history schema change only adds to the database, and the previous
+release can still open an upgraded one. A future release may make a change the
+previous release cannot read. Its upgrade notes will say so. Releases after
+v0.23.0 refuse to start history on such a database, name the newer schema
+version and do not write to the file. v0.23.0 and older have no such check, so
+never start them on the newer database.
+
+There are no down-migrations. Put the pre-upgrade backup back before anything
+built from the newer release can open it again, then pin back.
+
+From a backup kept on the admin **Backups** page:
+
+1. Leave the admin UI and the backup scheduler running. They serve that page
+   and the backup file.
+2. Open **Restore** on the pre-upgrade copy. Keep **Pause the main UI and
+   history while importing** checked, and **uncheck Start them again
+   afterwards**. Otherwise the newer history service reopens the restored
+   database and upgrades it again.
+3. Set `JBOD_UI_IMAGE` in `.env` back to the release you were on.
+4. Run `docker compose pull` and `docker compose up -d` with your usual files
+   and profiles, then check history's `/healthz`.
+
+From a copy of the folders:
+
+1. Stop the stack with `docker compose down`, using your usual files and
+   profiles.
+2. Put the copied `history` folder (and `config` and `data`, if you copied
+   them) back in place.
+3. Set `JBOD_UI_IMAGE` back, then `pull` and `up -d` as above.
+
+Everything history recorded after the upgrade is lost: samples, slot events
+and any maintenance you did in the newer release. That is the accepted cost of
+rolling back across such a change. Take the backup before upgrading; see
+[[Upgrading|Upgrading#before-you-start]].
 
 ## Common procedures
 

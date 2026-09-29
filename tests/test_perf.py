@@ -219,7 +219,7 @@ class PerfConfigTests(unittest.TestCase):
                 settings = get_settings()
                 get_settings.cache_clear()
 
-            self.assertEqual(settings.app.port, 8080)
+            self.assertNotIn("port", settings.app.model_dump())
             self.assertEqual(settings.app.source_bundle_cache_ttl_seconds, 150)
             self.assertNotEqual(Path(settings.paths.mapping_file), Path("C:/should/not/win.json"))
 
@@ -319,7 +319,7 @@ class PerfTraceTests(unittest.TestCase):
         self.assertEqual(payload["method"], "GET")
         self.assertEqual(payload["status_code"], 200)
         self.assertEqual(payload["component"], "enclosure-ui")
-        self.assertEqual(payload["release"], "0.22.2")
+        self.assertEqual(payload["release"], "0.23.0")
         serialized = json.dumps(payload)
         for forbidden in (
             "private-system-alpha",

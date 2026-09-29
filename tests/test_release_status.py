@@ -1,49 +1,75 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
+import re
+import subprocess
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 from app.services.release_status import ReleaseStatusService, describe_release_status
+from app import routes as app_routes
 
 
 class ReleaseStatusTests(unittest.TestCase):
-    def test_v0222_release_metadata_is_aligned(self) -> None:
+    def test_v0230_release_metadata_is_aligned(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         package = json.loads((repository / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((repository / "package-lock.json").read_text(encoding="utf-8"))
         changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
         wiki_home = (repository / "wiki" / "Home.md").read_text(encoding="utf-8")
-        release_notes = (repository / "docs" / "RELEASE_NOTES_0.22.2.md").read_text(encoding="utf-8")
+        release_notes = (repository / "docs" / "RELEASE_NOTES_0.23.0.md").read_text(encoding="utf-8")
 
         from app import __version__
 
-        self.assertEqual(__version__, "0.22.2")
-        self.assertEqual(package["version"], "0.22.2")
-        self.assertEqual(package_lock["version"], "0.22.2")
-        self.assertEqual(package_lock["packages"][""]["version"], "0.22.2")
-        self.assertIn("## Unreleased", changelog)
-        self.assertLess(changelog.index("## Unreleased"), changelog.index("## v0.22.2"))
+        self.assertEqual(__version__, "0.23.0")
+        self.assertEqual(package["version"], "0.23.0")
+        self.assertEqual(package_lock["version"], "0.23.0")
+        self.assertEqual(package_lock["packages"][""]["version"], "0.23.0")
+        self.assertIn("## v0.23.0 - 2026-09-08", changelog)
+        self.assertLess(changelog.index("## v0.23.0"), changelog.index("## v0.22.2"))
         self.assertIn("## v0.22.2 - 2026-09-01", changelog)
-        self.assertIn("# Release Notes - v0.22.2", release_notes)
-        self.assertIn("issue #124", release_notes)
+        self.assertIn("# Release Notes - v0.23.0", release_notes)
+        self.assertIn("two synthetic spares", release_notes)
+        self.assertIn("tag and GitHub release were published", release_notes)
+        self.assertIn("Private deployment qualification remains unverified", release_notes)
+        self.assertNotIn("tag remains blocked", release_notes)
 
-        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.22.2"
-        for current_doc in (roadmap, wiki_home):
-            with self.subTest(document=current_doc[:40]):
-                self.assertIn("v0.22.2", current_doc)
-                self.assertIn("latest published release", current_doc)
-                self.assertIn("2026-09-01", current_doc)
-                self.assertIn(release_url, current_doc)
-                self.assertNotIn("v0.22.1` is the latest published release", current_doc)
+        self.assertIn("`v0.23.0` is the latest published release", roadmap)
+        self.assertIn("2026-09-09", roadmap)
+        self.assertIn("https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0", roadmap)
+        self.assertIn("docs/archive/ROADMAP_HISTORY.md", roadmap)
+        self.assertNotIn("v0.22.2` is the latest published release", roadmap)
 
-    def test_post_v0222_roadmap_reconciles_completed_follow_up_work(self) -> None:
+        release_url = "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.23.0"
+        normalized_wiki_home = " ".join(wiki_home.split())
+        self.assertIn("`v0.23.0` is the latest published release", wiki_home)
+        self.assertIn("2026-09-09", wiki_home)
+        self.assertIn(release_url, wiki_home)
+        self.assertIn("beginner installation remains pinned to `v0.22.2`", normalized_wiki_home)
+        self.assertNotIn("`v0.22.2` is the latest published release", wiki_home)
+
+    def test_roadmap_is_short_and_points_at_the_archived_history(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+        history = repository / "docs" / "archive" / "ROADMAP_HISTORY.md"
+
+        self.assertLessEqual(len(roadmap.splitlines()), 60)
+        self.assertTrue(history.is_file())
+        for stale in ("Current status: shipped", "HANDOFF.md", "TODO.md", "V0_3_X_PLAN"):
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, roadmap)
+
+    def test_post_v0222_roadmap_history_reconciles_completed_follow_up_work(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        history = (repository / "docs" / "archive" / "ROADMAP_HISTORY.md").read_text(encoding="utf-8")
 
         for marker in (
             "Issue #119 closed",
@@ -53,19 +79,20 @@ class ReleaseStatusTests(unittest.TestCase):
             "#162",
         ):
             with self.subTest(marker=marker):
-                self.assertIn(marker, roadmap)
+                self.assertIn(marker, history)
 
-        self.assertNotIn("issue #119 and draft PR #121 remains", roadmap)
-        self.assertNotIn("publication also remains v0.22.3 work", roadmap)
+        self.assertNotIn("issue #119 and draft PR #121 remains", history)
+        self.assertNotIn("publication also remains v0.22.3 work", history)
 
     def test_roadmap_does_not_claim_absent_v011_plan_is_preserved_locally(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
-
-        self.assertNotRegex(
-            roadmap,
-            r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
-        )
+        for relative in ("docs/ROADMAP.md", "docs/archive/ROADMAP_HISTORY.md"):
+            text = (repository / relative).read_text(encoding="utf-8")
+            with self.subTest(document=relative):
+                self.assertNotRegex(
+                    text,
+                    r"artifacts/deferred-docs/V0_11_0_PLAN\.md|preserved locally",
+                )
 
     def test_unreleased_changelog_records_selected_post_v0222_changes(self) -> None:
         repository = Path(__file__).resolve().parents[1]
@@ -113,8 +140,28 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertIn("docker compose down", normalized)
         self.assertIn('app_uid="${APP_UID:-10001}"', normalized)
         self.assertIn('app_gid="${APP_GID:-10001}"', normalized)
-        self.assertIn('--uid "$app_uid" --gid "$app_gid"', normalized)
-        self.assertNotIn("--uid 10001 --gid 10001", normalized)
+        # The published image has no ownership helper, so the note uses the
+        # host shell with the same configured identity (#541).
+        self.assertIn('sudo chown -R "$app_uid:$app_gid"', normalized)
+        self.assertNotIn("10001:10001", normalized)
+
+    def test_nonroot_upgrade_note_preserves_the_backup_identity(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        changelog = (repository / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## v0.22.2", maxsplit=1)[0]
+        normalized = " ".join(unreleased.split())
+
+        # The recursive chown must not reach config/backup-secrets, which stays
+        # private to the backup user, and backup-status must be prepared as
+        # BACKUP_UID:APP_GID mode 2750 or the next scheduled backup aborts.
+        self.assertIn("-path ./config/backup-secrets -prune", normalized)
+        self.assertIn(
+            'sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status',
+            normalized,
+        )
+        self.assertNotIn('"$app_uid:$app_gid" ./config ', normalized)
+        self.assertNotIn('"$app_uid:$app_gid" ./config/backup-secrets', normalized)
+        self.assertNotIn('"$app_uid:$app_gid" ./data ./logs ./history ./backup-status', normalized)
 
     def test_network_mode_upgrade_note_names_every_write_control(self) -> None:
         repository = Path(__file__).resolve().parents[1]
@@ -144,7 +191,7 @@ class ReleaseStatusTests(unittest.TestCase):
         status, summary = describe_release_status("0.15.0-dev", "v0.14.1")
 
         self.assertEqual(status, "dev-build")
-        self.assertEqual(summary, "Dev build · latest stable v0.14.1")
+        self.assertEqual(summary, "Development build (newest release is v0.14.1)")
 
     def test_release_status_service_refresh_populates_latest_release_payload(self) -> None:
         payload = {
@@ -161,9 +208,57 @@ class ReleaseStatusTests(unittest.TestCase):
             snapshot = asyncio.run(service.refresh(force=True))
 
         self.assertEqual(snapshot["status"], "current")
-        self.assertEqual(snapshot["summary"], "Latest tagged release")
+        self.assertEqual(snapshot["summary"], "Up to date")
         self.assertEqual(snapshot["latest_tag"], "v0.14.1")
         self.assertEqual(snapshot["latest_url"], payload["html_url"])
+
+    def test_periodic_refresh_restarts_on_a_new_event_loop(self) -> None:
+        service = ReleaseStatusService(current_version="0.14.1")
+        now = 1000.0
+
+        async def lifespan() -> None:
+            nonlocal now
+            loop = asyncio.get_running_loop()
+            loop.slow_callback_duration = float("inf")
+            baseline = asyncio.all_tasks()
+
+            async def settle() -> None:
+                for _ in range(12):
+                    await asyncio.sleep(0)
+
+            async def fetch(function):
+                return function()
+
+            with (
+                patch.object(loop, "time", side_effect=lambda: now),
+                patch("app.services.release_status.monotonic", side_effect=lambda: now),
+                patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+                patch.object(service, "_fetch_latest_release", return_value={"tag_name": "v0.14.1"}) as network,
+            ):
+                worker = asyncio.create_task(service.run_periodic_refresh())
+                try:
+                    await settle()
+                    # Surface a worker crash instead of masking it with cancellation.
+                    if worker.done():
+                        await worker
+                    before = network.call_count
+                    now = service._next_refresh_at
+                    await settle()
+                    self.assertEqual(network.call_count, before + 1)
+                    self.assertEqual(service.snapshot()["status"], "current")
+                    self.assertFalse(worker.done())
+                finally:
+                    worker.cancel()
+                    if not worker.done():
+                        with self.assertRaises(asyncio.CancelledError):
+                            await worker
+                    await settle()
+                    self.assertEqual(asyncio.all_tasks(), baseline)
+                    self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+        # Reuse the instance, as the process-wide cached getters do on restart.
+        asyncio.run(lifespan())
+        asyncio.run(lifespan())
 
     def test_release_status_service_reports_error_when_initial_refresh_fails(self) -> None:
         service = ReleaseStatusService(current_version="0.15.0-dev")
@@ -172,5 +267,470 @@ class ReleaseStatusTests(unittest.TestCase):
             snapshot = asyncio.run(service.refresh(force=True))
 
         self.assertEqual(snapshot["status"], "error")
-        self.assertEqual(snapshot["summary"], "Release check unavailable")
+        self.assertEqual(snapshot["summary"], "Could not check for updates")
         self.assertIn("offline", snapshot["error"])
+
+    def test_describe_release_status_copy_avoids_git_speak(self) -> None:
+        self.assertEqual(describe_release_status("0.14.1", None), ("unknown", "Release information unavailable"))
+        self.assertEqual(describe_release_status("0.14.1-dev", "v0.14.1"), ("dev-build", "Development build of v0.14.1"))
+        self.assertEqual(describe_release_status("0.15.0", "v0.14.1"), ("ahead", "Newer than the latest release (v0.14.1)"))
+        for _status, summary in (
+            describe_release_status("0.14.1", "v0.14.1"),
+            describe_release_status("0.14.0", "v0.14.1"),
+            describe_release_status("0.15.0-dev", "v0.14.1"),
+        ):
+            self.assertFalse(summary.endswith("."), summary)
+            self.assertNotIn("tagged", summary.lower())
+
+    def test_initial_and_disabled_summaries_read_as_plain_words(self) -> None:
+        checking = ReleaseStatusService(current_version="0.14.1")
+        self.assertEqual(checking.snapshot()["summary"], "Checking for updates...")
+
+        disabled = ReleaseStatusService(current_version="0.14.1", enabled=False)
+        self.assertEqual(disabled.snapshot()["summary"], "Update checks are off")
+
+class ReleaseRetryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.now = 1000.0
+        utc_clock = patch(
+            "app.services.release_status._utc_now",
+            side_effect=lambda: datetime.fromtimestamp(self.now, timezone.utc),
+        )
+        utc_clock.start()
+        self.addCleanup(utc_clock.stop)
+        self.clock = patch("app.services.release_status.monotonic", side_effect=lambda: self.now, create=True)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.network = patch("app.services.release_status.urllib.request.urlopen", side_effect=OSError("offline"))
+        self.urlopen = self.network.start()
+        self.addCleanup(self.network.stop)
+        self.service = ReleaseStatusService(current_version="0.14.1")
+
+    def succeed(self) -> None:
+        response = MagicMock()
+        response.__enter__.side_effect = lambda: io.BytesIO(json.dumps({
+            "tag_name": "v0.14.1",
+            "html_url": "https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.14.1",
+        }).encode())
+        self.urlopen.side_effect = None
+        self.urlopen.return_value = response
+
+    async def test_initial_failure_retries_at_one_minute_not_one_day(self) -> None:
+        self.assertEqual((await self.service.refresh())["status"], "error")
+        self.now += 59
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.succeed()
+        self.now += 1
+        self.assertEqual((await self.service.refresh())["status"], "current")
+        self.assertEqual(self.urlopen.call_count, 2)
+
+    async def test_repeated_failures_back_off_and_cap_at_one_hour(self) -> None:
+        await self.service.refresh()
+        for calls, delay in enumerate((60, 300, 3600, 3600), start=1):
+            with self.subTest(delay=delay, calls=calls):
+                self.now += delay - 1
+                await self.service.refresh()
+                self.assertEqual(self.urlopen.call_count, calls)
+                self.now += 1
+                await self.service.refresh()
+                self.assertEqual(self.urlopen.call_count, calls + 1)
+
+    async def test_success_resets_backoff_and_restores_normal_interval(self) -> None:
+        await self.service.refresh()
+        self.now += 60
+        await self.service.refresh()
+        self.now += 300
+        self.succeed()
+        good = await self.service.refresh()
+        self.assertEqual(good["status"], "current")
+        self.now += 86399
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 3)
+        self.now += 1
+        self.urlopen.side_effect = OSError("offline again")
+        self.assertEqual(await self.service.refresh(), good)
+        self.assertEqual(self.urlopen.call_count, 4)
+        self.now += 59
+        self.assertEqual(await self.service.refresh(), good)
+        self.assertEqual(self.urlopen.call_count, 4)
+        self.now += 1
+        self.succeed()
+        self.assertEqual((await self.service.refresh())["status"], "current")
+        self.assertEqual(self.urlopen.call_count, 5)
+
+    async def test_periodic_loop_uses_failure_delays_then_success_interval(self) -> None:
+        delays = []
+
+        async def wait():
+            delay = self.service._next_refresh_at - self.now
+            delays.append(delay)
+            self.now += delay
+            if len(delays) == 2:
+                self.succeed()
+            if len(delays) == 3:
+                raise asyncio.CancelledError
+            raise asyncio.TimeoutError
+
+        with patch.object(self.service._deadline_changed, "wait", side_effect=wait):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.service.run_periodic_refresh()
+        self.assertEqual(delays, [60, 300, 86400])
+        self.assertEqual(self.urlopen.call_count, 3)
+
+    async def _settle_periodic(self) -> None:
+        # Bounded event-loop turns drain ready callbacks, without wall-clock waits.
+        for _ in range(12):
+            await asyncio.sleep(0)
+
+    async def _check_forced_refresh_wakeup(self, *, failure: bool) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        # Virtual time jumps are not real slow callbacks.
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+
+        async def fetch(function):
+            return function()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 1)
+                good = self.service.snapshot()
+                old_deadline = self.service._next_refresh_at
+                self.now += 10
+                if failure:
+                    self.urlopen.side_effect = OSError("forced failure")
+                await self.service.refresh(force=True)
+                if failure:
+                    self.assertEqual(self.service.snapshot(), good)
+                await self._settle_periodic()
+                deadline = self.service._next_refresh_at
+                self.assertEqual(deadline, self.now + (60 if failure else 86400))
+                # The active timer must move in either direction, not just the
+                # stored deadline. Inspect only live timers on this isolated loop.
+                timers = [timer.when() for timer in loop._scheduled if not timer.cancelled()]
+                self.assertIn(deadline, timers)
+                self.assertNotIn(old_deadline, timers)
+                self.succeed()
+                self.now = deadline - 1
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.now = deadline
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 3)
+                self.assertEqual(self.service.snapshot()["status"], "current")
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+    async def test_forced_failure_interrupts_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=True)
+
+    async def test_forced_success_replaces_existing_day_wait(self) -> None:
+        await self._check_forced_refresh_wakeup(failure=False)
+
+    async def test_deadline_update_before_wait_registration_is_not_lost(self) -> None:
+        self.succeed()
+        loop = asyncio.get_running_loop()
+        loop.slow_callback_duration = float("inf")
+        baseline = asyncio.all_tasks()
+        event = self.service._deadline_changed
+        original_wait = event.wait
+        registrations = 0
+
+        async def fetch(function):
+            return function()
+
+        async def wait():
+            nonlocal registrations
+            registrations += 1
+            if registrations == 1:
+                # Force an update after the timer is chosen but before the
+                # event has registered its waiter. The notification must latch.
+                self.now += 10
+                self.urlopen.side_effect = OSError("registration race")
+                await self.service.refresh(force=True)
+            await original_wait()
+
+        with (
+            patch.object(loop, "time", side_effect=lambda: self.now),
+            patch.object(event, "wait", side_effect=wait),
+            patch("app.services.release_status.asyncio.to_thread", side_effect=fetch),
+        ):
+            periodic = asyncio.create_task(self.service.run_periodic_refresh())
+            try:
+                await self._settle_periodic()
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.assertEqual(registrations, 2)
+                self.assertEqual(
+                    [timer.when() for timer in loop._scheduled if not timer.cancelled()],
+                    [1070.0],
+                )
+                # Multiple updates before the periodic task resumes coalesce
+                # to the latest deadline. Cancel while a wakeup is pending.
+                self.succeed()
+                await self.service.refresh(force=True)
+                self.urlopen.side_effect = OSError("pending wake cancellation")
+                await self.service.refresh(force=True)
+            finally:
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+                await self._settle_periodic()
+                self.assertEqual(asyncio.all_tasks(), baseline)
+                self.assertFalse(event._waiters)
+                self.assertFalse([timer for timer in loop._scheduled if not timer.cancelled()])
+
+    async def test_disabled_checks_never_fetch_or_sleep_even_when_forced(self) -> None:
+        service = ReleaseStatusService(current_version="0.14.1", enabled=False)
+        with patch("app.services.release_status.asyncio.sleep") as sleep:
+            await service.run_periodic_refresh()
+            self.assertEqual((await service.refresh(force=True))["status"], "disabled")
+        sleep.assert_not_called()
+        self.urlopen.assert_not_called()
+
+    async def test_concurrent_due_refreshes_share_one_attempt(self) -> None:
+        await self.service.refresh()
+        self.now += 60
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def fetch(function):
+            started.set()
+            await finish.wait()
+            return function()
+
+        self.succeed()
+        with patch("app.services.release_status.asyncio.to_thread", side_effect=fetch) as worker:
+            first = asyncio.create_task(self.service.refresh(force=True))
+            await started.wait()
+            second = asyncio.create_task(self.service.refresh())
+            await asyncio.sleep(0)
+            finish.set()
+            results = await asyncio.gather(first, second)
+        self.assertEqual(worker.call_count, 1)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0]["status"], "current")
+
+    async def test_retry_delay_starts_after_failed_attempt_finishes(self) -> None:
+        def slow_failure(*args, **kwargs):
+            self.now += 5
+            raise OSError("offline")
+
+        self.urlopen.side_effect = slow_failure
+        await self.service.refresh()
+        self.now += 59
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.now += 1
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 2)
+
+    async def test_force_bypasses_deadline_but_success_keeps_interval_floor(self) -> None:
+        self.service = ReleaseStatusService(current_version="0.14.1", interval_seconds=1)
+        await self.service.refresh()
+        self.succeed()
+        self.assertEqual((await self.service.refresh(force=True))["status"], "current")
+        self.now += 3599
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 2)
+        self.now += 1
+        await self.service.refresh()
+        self.assertEqual(self.urlopen.call_count, 3)
+
+
+# --- Released upgrade notes (#TBD, #430) ---------------------------------
+# A published-image operator never clones the repository, so an upgrade note
+# may only name a command the image, Compose, or the host shell provides.
+
+UPGRADE_NOTES_ROOT = Path(__file__).resolve().parents[1]
+UPGRADE_CHANGELOG = UPGRADE_NOTES_ROOT / "CHANGELOG.md"
+UPGRADE_RELEASE_NOTES = UPGRADE_NOTES_ROOT / "docs" / "RELEASE_NOTES_0.23.0.md"
+UPGRADE_DOCKERFILE = UPGRADE_NOTES_ROOT / "Dockerfile"
+REPO_ONLY_HELPER = "prepare_nonroot_bind_mounts.py"
+
+
+# `git show v0.23.0:docker-compose.yml`, byte for byte. A checked-in copy keeps
+# the suite working in shallow and --no-tags checkouts.
+V0230_COMPOSE_FIXTURE = UPGRADE_NOTES_ROOT / "tests" / "fixtures" / "compose" / "v0.23.0.yml"
+V0230_COMPOSE_SHA256 = "191e492e2f7fab841654a5cfbddfe664a8a82d372f26cdeaa6c18e36309233a9"
+
+
+def tagged_v0230_compose() -> dict:
+    data = V0230_COMPOSE_FIXTURE.read_bytes()
+    if hashlib.sha256(data).hexdigest() != V0230_COMPOSE_SHA256:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml is not the v0.23.0 tag's docker-compose.yml")
+    tagged = subprocess.run(
+        ["git", "show", "v0.23.0:docker-compose.yml"],
+        cwd=UPGRADE_NOTES_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    # Cross-check against the tag only when this checkout has it.
+    if tagged.returncode == 0 and tagged.stdout != data:
+        raise AssertionError("tests/fixtures/compose/v0.23.0.yml differs from the v0.23.0 tag")
+    return yaml.safe_load(data)
+
+
+def upgrade_release_section(version: str) -> str:
+    text = UPGRADE_CHANGELOG.read_text(encoding="utf-8")
+    start = text.index(f"## {version}")
+    rest = text[start + 1 :]
+    end = rest.find("\n## ")
+    return rest if end < 0 else rest[:end]
+
+
+def upgrade_subsection(section: str, heading: str) -> str:
+    start = section.index(f"### {heading}")
+    rest = section[start + 1 :]
+    end = rest.find("\n### ")
+    return rest if end < 0 else rest[:end]
+
+
+def upgrade_bullets(block: str) -> list[str]:
+    found: list[str] = []
+    for line in block.splitlines():
+        if line.startswith("- "):
+            found.append(line[2:].strip())
+        elif found and line.startswith("  ") and line.strip():
+            found[-1] = f"{found[-1]} {line.strip()}"
+    return found
+
+
+class ReleaseStatusRouteAndCopyTests(unittest.TestCase):
+    def test_release_status_route_returns_the_service_snapshot(self) -> None:
+        from app import main as app_main
+
+        app = app_main.create_app()
+        route = next(route for route in app.routes if getattr(route, "path", "") == "/api/release-status")
+        service = MagicMock()
+        service.snapshot.return_value = {"status": "error", "summary": "Could not check for updates"}
+        with patch.object(app_routes, "get_release_status_service", return_value=service):
+            response = asyncio.run(route.endpoint())
+        self.assertEqual(json.loads(response.body), {"status": "error", "summary": "Could not check for updates"})
+
+    def test_timing_and_template_labels_use_plain_words(self) -> None:
+        from app.config import RUNTIME_BEHAVIOR_APP_FIELDS
+        from app.services.storage_view_templates import list_storage_view_templates
+
+        labels = {field["label"] for field in RUNTIME_BEHAVIOR_APP_FIELDS.values()}
+        self.assertEqual(
+            labels,
+            {"Page refresh", "Inventory reuse", "Appliance query reuse", "SMART reuse", "Enclosure path reuse"},
+        )
+        jargon = re.compile(r"TTL|cache|cadence|stale|first.pass|read UI|rollup|downsampl|masking", re.IGNORECASE)
+        for field in RUNTIME_BEHAVIOR_APP_FIELDS.values():
+            self.assertIsNone(jargon.search(field["label"] + " " + field["description"]), field["label"])
+        for template in list_storage_view_templates():
+            text = f"{template.summary or ''} {template.notes or ''}"
+            self.assertIsNone(jargon.search(text), template.id)
+
+
+class UpgradeNotesContractTests(unittest.TestCase):
+    def test_v0230_hardening_claims_match_the_tag_and_current_guidance(self) -> None:
+        tagged_base = tagged_v0230_compose()["services"]
+        current_base = yaml.safe_load(
+            (UPGRADE_NOTES_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )["services"]
+        current_overlay = yaml.safe_load(
+            (UPGRADE_NOTES_ROOT / "docker-compose.nonroot.yml").read_text(encoding="utf-8")
+        )["services"]
+
+        for service in ("enclosure-ui", "enclosure-history"):
+            with self.subTest(service=service):
+                self.assertEqual(
+                    tagged_base[service]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertIs(tagged_base[service]["read_only"], True)
+                self.assertEqual(current_base[service]["user"], "0:0")
+                self.assertFalse(current_base[service].get("read_only", False))
+                self.assertEqual(
+                    current_overlay[service]["user"],
+                    "${APP_UID:-10001}:${APP_GID:-10001}",
+                )
+                self.assertIs(current_overlay[service]["read_only"], True)
+
+        historical_documents = (
+            UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8"),
+            upgrade_release_section("v0.23.0"),
+        )
+        for document in historical_documents:
+            normalized = " ".join(document.split())
+            with self.subTest(document=normalized[:40]):
+                self.assertIn("the `v0.23.0` tag", normalized)
+                self.assertIn("base `docker-compose.yml` already", normalized)
+                self.assertIn("one-time ownership step", normalized)
+                self.assertIn("post-release", normalized)
+                self.assertIn("current `main`", normalized)
+                self.assertNotIn("Hardening is opt-in", normalized)
+                self.assertNotIn("base Compose file is root-compatible", normalized)
+                self.assertNotIn("Skip this note entirely unless", normalized)
+
+        upgrading = " ".join(
+            (UPGRADE_NOTES_ROOT / "wiki" / "Upgrading.md")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+        self.assertIn("Unlike the `v0.23.0` tag", upgrading)
+        self.assertIn("current `main`", upgrading)
+        self.assertIn("root-compatible", upgrading)
+        self.assertIn("optional `docker-compose.nonroot.yml` overlay", upgrading)
+        self.assertIn("v0.23.0 base `docker-compose.yml`", upgrading)
+
+    def test_the_ownership_helper_is_still_absent_from_the_image(self) -> None:
+        # The premise of the other tests: the helper is repository-only, so no
+        # published-image instruction may depend on it.
+        self.assertNotIn(REPO_ONLY_HELPER, UPGRADE_DOCKERFILE.read_text(encoding="utf-8"))
+
+    def test_released_upgrade_notes_never_require_the_repository_only_helper(self) -> None:
+        self.assertNotIn(REPO_ONLY_HELPER, upgrade_release_section("v0.23.0"))
+        self.assertNotIn(REPO_ONLY_HELPER, UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8"))
+
+    def test_released_upgrade_notes_keep_backup_secrets_and_status_separate(self) -> None:
+        notes = UPGRADE_RELEASE_NOTES.read_text(encoding="utf-8")
+        normalized = " ".join(notes.split())
+
+        self.assertIn("except `config/backup-secrets`", normalized)
+        self.assertIn("`BACKUP_UID:APP_GID`", normalized)
+        self.assertNotIn(
+            "(`./config`, `./data`, `./logs`, `./history`, `./backup-status`)",
+            normalized,
+        )
+
+    def test_released_upgrade_notes_carry_a_rollback_path(self) -> None:
+        notes = upgrade_subsection(upgrade_release_section("v0.23.0"), "Upgrade notes")
+
+        self.assertIn("Rolling back", notes)
+        self.assertIn("JBOD_UI_IMAGE", notes)
+        self.assertIn("Backup-Restore-and-Debug-Bundles", notes)
+
+    def test_released_breaking_changes_name_one_authentication_outcome(self) -> None:
+        breaking = upgrade_bullets(upgrade_subsection(upgrade_release_section("v0.23.0"), "Breaking changes"))
+        authentication = [
+            bullet
+            for bullet in breaking
+            if re.search(r"authentic|public origin", bullet, re.IGNORECASE)
+        ]
+
+        self.assertEqual(len(authentication), 1, breaking)
+        self.assertIn("#392", authentication[0])
+        joined = "\n".join(breaking)
+        self.assertNotIn("Required local authentication", joined)
+        self.assertNotIn("Required a configured admin public origin", joined)
+
+    def test_one_feature_is_one_added_bullet(self) -> None:
+        added = "\n".join(upgrade_bullets(upgrade_subsection(upgrade_release_section("v0.23.0"), "Added")))
+
+        self.assertNotIn("(#359)", added)
+        self.assertIn("(#357 and #359)", added)

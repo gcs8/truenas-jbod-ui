@@ -1,30 +1,153 @@
 from __future__ import annotations
 
-# Handler globals are populated from app.main by MainModuleAPIRouter.
-# pyright: reportUndefinedVariable=false
-# ruff: noqa: F821
-
+import asyncio
 import email.message
+import errno
 import json
-from types import ModuleType
+import logging
+import socket
+from datetime import (
+    datetime,
+    timedelta,
+    timezone,
+)
 from typing import Any
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
 from pydantic import ValidationError
+from websockets.exceptions import ConnectionClosed
 
-from app.route_compat import MainModuleAPIRouter
+from app import __version__
+from app.models.domain import (
+    DiskInventorySyncRequest,
+    InventoryReadResponse,
+    LedAction,
+    LedRequest,
+    MappingBundle,
+    MappingImportConfirmation,
+    MappingRequest,
+    SasFabricAliasRequest,
+    SasFabricSnapshot,
+    SmartBatchItem,
+    SmartBatchRequest,
+    SmartBatchResponse,
+    SmartSummaryView,
+    SnapshotExportRequest,
+    StorageViewRuntimePayload,
+    SystemLocatorRequest,
+    SystemLocatorStatusView,
+)
+from app.perf import (
+    add_perf_metadata,
+    perf_stage,
+)
+from app.settings_reload import config_reload_problems
+from app.route_support import (
+    get_settings,
+    INVALID_MAPPING_BUNDLE_DETAIL,
+    HistoryRefreshProxyRequest,
+    HistoryScopeProxyRequest,
+    HistoryScopesProxyRequest,
+    _load_live_enclosure_export_sources,
+    _load_snapshot_export_source,
+    _load_storage_view_export_source,
+    build_health_payload,
+    build_index_context,
+    check_slot_bounds,
+    ensure_read_slot_bounds,
+    ensure_slot_bounds,
+    get_history_backend,
+    get_inventory_registry,
+    get_release_status_service,
+    get_snapshot_export_service,
+    health_status_code,
+    history_service_problem,
+    logger,
+    refresh_storage_problems,
+    require_read_ui_basic_credentials,
+    require_read_ui_mutation_authorization,
+    resolve_admin_launch_url,
+    resolve_layout_slots,
+    resolve_read_layout_slots,
+    resolve_read_ui_write_policy,
+    runtime_warnings_for,
+    known_hosts_warnings_for,
+    templates,
+    upgrade_notice_data_dir,
+)
+from app.services import upgrade_notice
+from app.services.backup_health import backup_archive_problems
 from app.services.history_backend import (
     HISTORY_BACKEND_DEGRADED_DETAIL,
     HistoryBackendBusyError,
+    HistoryBackendPolicyError,
 )
 from app.services.history_status import project_public_collector_status
+from app.services.inventory import DiskInventorySyncBusy
+from app.services.mapping_store import (
+    MappingImportDigestMismatch,
+    MappingRevisionConflict,
+    MappingScopeConflict,
+)
+from app.services.snapshot_export import (
+    SnapshotExportTooLargeError,
+    collect_configured_hostnames,
+)
+from app.services.storage_writability import StorageDirectoryUnwritable
+from app.services.tls_context import TlsTrustConfigurationError
+from app.services.truenas_ws import TrueNASAPIError
 from history_service.operation_bounds import (
+    ALLOWED_HISTORY_METRICS,
     HISTORY_READ_BUSY_DETAIL,
     HISTORY_READ_RETRY_AFTER_SECONDS,
+    MAX_TARGETS,
+    HistoryBudgetExceeded,
+    HistoryRequestShapeError,
+    build_history_read_plan,
 )
 from history_service.refresh_auth import read_limited_request_body
 
-
 MAX_HISTORY_SCOPES_REQUEST_BYTES = 64 * 1024
+
+_routes_logger = logging.getLogger(__name__)
+
+
+def _storage_unwritable_response(exc: StorageDirectoryUnwritable) -> JSONResponse:
+    """Answer a save that failed on directory permissions in words a user can act on."""
+    _routes_logger.error("%s", exc.operator_message)
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": exc.error_code,
+            "detail": exc.public_detail,
+        },
+        status_code=503,
+        headers={"Retry-After": "5"},
+    )
+
+
+def live_write_policy(request: Request) -> dict[str, Any]:
+    """Write policy for the main UI plus the public origin a browser must use.
+
+    The origin is only named when an operator configured one; otherwise the
+    browser has no better address to suggest than the one it is already on.
+    """
+    policy = dict(resolve_read_ui_write_policy(request))
+    app_state = getattr(request.app, "state", None)
+    public_origin = getattr(app_state, "read_ui_public_origin", None)
+    policy["public_origin"] = public_origin if isinstance(public_origin, str) and public_origin else None
+    return policy
 
 
 def _history_read_busy_response() -> JSONResponse:
@@ -46,8 +169,67 @@ def _is_json_media_type(content_type: str | None) -> bool:
     return subtype == "json" or subtype.endswith("+json")
 
 
-def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
-    router = MainModuleAPIRouter(main_module, globals())
+def _unknown_system_notice(system_id: str, settings: Any) -> str:
+    default_label = next(
+        (system.label or system.id for system in settings.systems if system.id == settings.default_system_id),
+        settings.default_system_id or "the default system",
+    )
+    return f'System "{system_id}" is not configured. Showing {default_label} instead.'
+
+
+SMART_BATCH_TRANSPORT_EXCEPTIONS = (
+    TimeoutError,
+    ConnectionClosed,
+    ConnectionError,
+    socket.gaierror,
+    socket.herror,
+)
+# Socket-class errno values a bare `OSError` can carry. `OSError` itself is NOT
+# transport: it is equally the base of PermissionError, ENOSPC, EROFS and every
+# other filesystem failure, and the slot-detail store raises those unwrapped
+# through the SMART batch. Those must keep reaching the data-directory
+# handling with its own message instead of being relabelled as a shelf outage.
+SMART_BATCH_TRANSPORT_ERRNOS = frozenset(
+    number
+    for number in (
+        getattr(errno, name, None)
+        for name in (
+            "EADDRNOTAVAIL", "ECONNABORTED", "ECONNREFUSED", "ECONNRESET",
+            "EHOSTDOWN", "EHOSTUNREACH", "ENETDOWN", "ENETRESET", "ENETUNREACH",
+            "ENOTCONN", "ENOTSOCK", "EPROTO", "ESHUTDOWN", "ETIMEDOUT",
+        )
+    )
+    if number is not None
+)
+
+
+def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, SMART_BATCH_TRANSPORT_EXCEPTIONS):
+        return True
+    return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
+
+
+# The other half of that split: a filesystem failure on the SMART path is the
+# local data directory, not the shelf. It does not clear by waiting, and the
+# operator has to be told which of the two it is.
+SMART_BATCH_LOCAL_STORAGE_DETAIL = (
+    "SMART data could not be stored: the application data directory is not "
+    "usable. This is a local fault, not a shelf outage, and retrying will not "
+    "clear it; check the data directory's permissions, ownership and free space."
+)
+
+# A configured CA bundle that cannot be read is also a local fault that
+# retrying will not clear, but it lives on the TLS path, so it gets its own
+# sentence instead of sending the operator to the data directory.
+SMART_BATCH_TLS_TRUST_DETAIL = (
+    "SMART data could not be fetched: the configured TLS CA bundle for this "
+    "system could not be loaded. This is a local configuration fault, not a "
+    "shelf outage; check the CA bundle path and its permissions."
+)
+
+
+def build_router() -> APIRouter:
+    router = APIRouter()
 
     def route_service(
         system_id: str | None,
@@ -57,7 +239,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
     ) -> Any:
         registry = get_inventory_registry()
         if exact_system_id and (system_id is None or not registry.has_system(system_id)):
-            raise HTTPException(status_code=404, detail=f"System {system_id!r} is not configured.")
+            raise HTTPException(status_code=404, detail=f'No system named "{system_id}" is configured.')
         service = registry.get_service(system_id)
         add_perf_metadata(
             system_id=service.system.id,
@@ -139,31 +321,80 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             if system_id in configured_system_ids
             else current_settings.default_system_id
         )
+        system_notice = (
+            None
+            if system_id is None or system_id in configured_system_ids
+            else _unknown_system_notice(system_id, current_settings)
+        )
         service = route_service(selected_system_id, enclosure_id=enclosure_id)
-        admin_launch_url = await asyncio.to_thread(resolve_admin_launch_url, request, current_settings)
-        snapshot = await service.get_snapshot(
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=True,
+        admin_launch, snapshot = await asyncio.gather(
+            asyncio.to_thread(resolve_admin_launch_url, request, current_settings),
+            service.get_snapshot(
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            ),
         )
         storage_view_runtime = await service.get_storage_view_runtime(
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
-        return templates.TemplateResponse(
-            request,
-            "index.html",
-            build_index_context(
-                request=request,
-                snapshot=snapshot,
-                storage_view_runtime=storage_view_runtime,
-                settings=current_settings,
-                history_configured=bool(current_settings.history.service_url),
-                read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
-                admin_launch_url=admin_launch_url,
-                app_version=__version__,
-                release_status=get_release_status_service().snapshot(),
-            ),
+        startup_problems = await asyncio.to_thread(runtime_warnings_for, request)
+        if startup_problems:
+            snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})
+        upgrade_notice_payload = await asyncio.to_thread(
+            upgrade_notice.current_notice,
+            upgrade_notice_data_dir(current_settings),
+            auth_mode=resolve_read_ui_write_policy(request)["mode"],
         )
+        context = build_index_context(
+            request=request,
+            snapshot=snapshot,
+            storage_view_runtime=storage_view_runtime,
+            settings=current_settings,
+            history_configured=bool(current_settings.history.service_url),
+            read_ui_mutation_auth_mode=request.app.state.operator_auth_settings.auth_mode,
+            admin_launch_url=admin_launch.url if admin_launch else None,
+            admin_launch_stopped=bool(admin_launch and admin_launch.stopped),
+            app_version=__version__,
+            release_status=get_release_status_service().snapshot(),
+            upgrade_notice_payload=upgrade_notice_payload,
+            system_notice=system_notice,
+        )
+        context["write_policy"] = live_write_policy(request)
+        context["write_policy_json"] = json.dumps(context["write_policy"])
+        return templates.TemplateResponse(request, "index.html", context)
+
+    @router.get("/api/release-status")
+    async def get_release_status() -> JSONResponse:
+        # The header note is rendered once; the page polls this while the
+        # first check is still running or has failed (for example DNS not
+        # ready at boot) so it recovers without a reload.
+        return JSONResponse(get_release_status_service().snapshot())
+
+    @router.post(
+        "/api/upgrade-notice/dismiss",
+        dependencies=[Depends(require_read_ui_mutation_authorization)],
+    )
+    async def dismiss_upgrade_notice(
+        payload: upgrade_notice.UpgradeNoticeDismissRequest,
+    ) -> JSONResponse:
+        try:
+            cleared = await asyncio.to_thread(
+                upgrade_notice.dismiss_notice,
+                upgrade_notice_data_dir(get_settings()),
+                notice_version=payload.version,
+            )
+        except upgrade_notice.UpgradeNoticeVersionConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A newer upgrade notice is pending. Reload the page before dismissing it.",
+            ) from exc
+        if not cleared:
+            raise HTTPException(
+                status_code=503,
+                detail="The notice could not be saved as dismissed because the data directory is not writable.",
+            )
+        return JSONResponse({"ok": True})
 
     @router.get("/sas-fabric", response_class=HTMLResponse)
     async def sas_fabric_view(
@@ -205,22 +436,33 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             },
         )
 
-    @router.get("/api/inventory", response_model=InventorySnapshot)
+    @router.get("/api/inventory", response_model=InventoryReadResponse)
     async def get_inventory(
+        request: Request,
         force: bool = False,
         system_id: str | None = None,
         enclosure_id: str | None = None,
-    ) -> InventorySnapshot:
+    ) -> JSONResponse:
         service = route_service(
             system_id,
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        return await service.get_snapshot(
+        snapshot = await service.get_snapshot(
             force_refresh=force,
             selected_enclosure_id=enclosure_id,
             allow_stale_cache=not force,
         )
+        payload = snapshot.model_dump(mode="json")
+        runtime_warnings = await asyncio.to_thread(runtime_warnings_for, request)
+        if runtime_warnings:
+            payload["warnings"] = [*runtime_warnings, *payload.get("warnings", [])]
+        # The browser re-syncs its write controls and its cached page from
+        # every refresh, so a rejected write or a container upgrade never
+        # leaves the page stuck on stale policy or stale JavaScript.
+        payload["write_policy"] = live_write_policy(request)
+        payload["app_version"] = __version__
+        return JSONResponse(payload)
 
     @router.get(
         "/api/read-ui/auth/verify",
@@ -268,6 +510,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 selected_enclosure_id=enclosure_id,
                 scope=payload.scope,
             )
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(result)
@@ -402,6 +646,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -460,6 +706,8 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             return mapping_revision_conflict_response(exc)
         except MappingScopeConflict:
             return mapping_scope_conflict_response()
+        except StorageDirectoryUnwritable as exc:
+            return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if cleared:
@@ -701,7 +949,101 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
                 )
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TlsTrustConfigurationError as exc:
+            # Classified before the broad OSError branch below, which
+            # would otherwise report a missing CA bundle's ENOENT as a
+            # slot-detail-cache write failure and name the wrong path.
+            logger.error(
+                "SMART batch could not load the TLS CA bundle for enclosure %s: %s",
+                enclosure_id,
+                exc,
+                exc_info=exc,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=SMART_BATCH_TLS_TRUST_DETAIL,
+            ) from exc
+        except (OSError, ConnectionClosed) as exc:
+            # A call that outlasts the timeout, or a dropped socket, is a
+            # temporary unavailability of this shelf's SMART data and not a
+            # server fault. One slow disk must never render as a 500 for the
+            # whole grid, whichever layer the transport failure escapes from.
+            # Only the transport may say that. A filesystem failure shares
+            # OSError's base but means the data directory is misconfigured, so
+            # it is reported as the server fault it is, with the message and the
+            # log line an operator needs to find it, rather than as a shelf
+            # outage they are invited to wait out.
+            if not _is_smart_batch_transport_failure(exc):
+                logger.error(
+                    "SMART batch could not write the slot-detail cache for "
+                    "enclosure %s; the data directory is not usable: %s",
+                    enclosure_id,
+                    exc,
+                    exc_info=exc,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=SMART_BATCH_LOCAL_STORAGE_DETAIL,
+                ) from exc
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this enclosure.",
+            ) from exc
         return SmartBatchResponse(summaries=summaries, layout_bounds=layout_bounds)
+
+    @router.post("/api/storage-views/{view_id}/slots/smart-batch", response_model=SmartBatchResponse)
+    async def get_storage_view_slot_smart_summaries(
+        view_id: str,
+        payload: SmartBatchRequest,
+        system_id: str | None = None,
+        enclosure_id: str | None = None,
+        fresh: bool = False,
+    ) -> SmartBatchResponse:
+        # The storage-view twin of /api/slots/smart-batch, so the history
+        # collector asks for a view in chunks instead of one request per slot.
+        # Slots are storage-view slot indexes; unknown ones are skipped, and
+        # failures map to the same statuses as the enclosure batch.
+        service = route_service(
+            system_id,
+            storage_view_id=view_id,
+            enclosure_id=enclosure_id,
+            slot_count=len(payload.slots),
+            smart_batch_max_concurrency=payload.max_concurrency,
+        )
+        try:
+            summaries = await service.get_storage_view_slot_smart_summaries(
+                view_id,
+                payload.slots,
+                selected_enclosure_id=enclosure_id,
+                max_concurrency=payload.max_concurrency,
+                allow_stale_cache=not fresh,
+                bypass_negative_cache=fresh,
+            )
+        except TrueNASAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TlsTrustConfigurationError as exc:
+            logger.error(
+                "Storage-view SMART batch could not load the TLS CA bundle for view %s: %s",
+                view_id,
+                exc,
+                exc_info=exc,
+            )
+            raise HTTPException(status_code=500, detail=SMART_BATCH_TLS_TRUST_DETAIL) from exc
+        except (OSError, ConnectionClosed) as exc:
+            if not _is_smart_batch_transport_failure(exc):
+                logger.error(
+                    "Storage-view SMART batch could not write the slot-detail cache for "
+                    "view %s; the data directory is not usable: %s",
+                    view_id,
+                    exc,
+                    exc_info=exc,
+                )
+                raise HTTPException(status_code=500, detail=SMART_BATCH_LOCAL_STORAGE_DETAIL) from exc
+            raise HTTPException(
+                status_code=503,
+                detail="SMART data is temporarily unavailable for this storage view.",
+            ) from exc
+        return SmartBatchResponse(summaries=summaries)
 
     @router.get("/api/history/status")
     async def get_history_status() -> JSONResponse:
@@ -726,7 +1068,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         try:
             result = await history_backend.refresh(payload.mode)
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History refresh was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         return JSONResponse(result)
 
     history_scopes_request_schema = HistoryScopesProxyRequest.model_json_schema()
@@ -752,12 +1094,12 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         if not _is_json_media_type(request.headers.get("content-type")):
             raise HTTPException(
                 status_code=415,
-                detail="History request Content-Type must be application/json or application/*+json.",
+                detail="Send this request with Content-Type: application/json.",
             )
         body = await read_limited_request_body(
             request,
             limit=MAX_HISTORY_SCOPES_REQUEST_BYTES,
-            detail=f"History request exceeds {MAX_HISTORY_SCOPES_REQUEST_BYTES} bytes.",
+            detail="History request is too large.",
         )
         try:
             document = json.loads(body)
@@ -779,7 +1121,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         except HistoryBackendBusyError:
             return _history_read_busy_response()
         except HistoryBackendPolicyError as exc:
-            raise HTTPException(status_code=exc.status_code, detail="History request was rejected by policy.") from exc
+            raise HTTPException(status_code=exc.status_code, detail="The history service refused this request. Check the history service log.") from exc
         except (HistoryRequestShapeError, HistoryBudgetExceeded, ValueError) as exc:
             raise HTTPException(
                 status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
@@ -825,12 +1167,15 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         requested_slots = [int(slot) for slot in (slots or [])]
-        if len(requested_slots) > 347:
-            raise HTTPException(status_code=413, detail="History request exceeds target_count limit (347).")
+        if len(requested_slots) > MAX_TARGETS:
+            raise HTTPException(
+                status_code=413,
+                detail=f"History can be requested for at most {MAX_TARGETS} slots at a time.",
+            )
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         if not requested_slots or not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="Bounded history slots and window_hours are required.")
+            raise HTTPException(status_code=422, detail="Choose at least one slot and a time range between 1 hour and 1 year.")
         selected_metrics = metrics or list(ALLOWED_HISTORY_METRICS)
         since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
         try:
@@ -896,7 +1241,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         metric_limit: int = 60,
     ) -> JSONResponse:
         if not isinstance(window_hours, int) or not 1 <= window_hours <= 8760:
-            raise HTTPException(status_code=422, detail="A bounded window_hours is required.")
+            raise HTTPException(status_code=422, detail="Choose a time range between 1 hour and 1 year.")
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
         try:
@@ -908,7 +1253,7 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
-            raise HTTPException(status_code=404, detail=f"Storage view {view_id!r} is not present for this system.")
+            raise HTTPException(status_code=404, detail=f'The saved view "{view_id}" does not exist on this system.')
 
         display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
         slots_by_enclosure: dict[str | None, set[int]] = {}
@@ -1092,33 +1437,24 @@ def build_router(main_module: ModuleType) -> MainModuleAPIRouter:
         )
 
     @router.get("/healthz")
-    async def healthz() -> JSONResponse:
+    async def healthz(request: Request) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(None)
-        snapshot = service.peek_cached_snapshot()
-        if snapshot is None:
-            return JSONResponse(
-                {
-                    "status": "ok",
-                    "dependency_status": "unknown",
-                    "last_updated": None,
-                    "sources": {},
-                    "warnings": [],
-                    "cache_state": "empty",
-                },
-                status_code=200,
-            )
-        api_status = snapshot.sources.get("api")
-        return JSONResponse(
-            {
-                "status": "ok",
-                "dependency_status": "ok" if api_status and api_status.ok else "degraded",
-                "last_updated": snapshot.last_updated.isoformat(),
-                "sources": snapshot.model_dump(mode="json").get("sources", {}),
-                "warnings": snapshot.warnings,
-                "cache_state": "cached",
-            },
-            status_code=200,
+        storage_problems, history_problem, backup_problems = await asyncio.gather(
+            asyncio.to_thread(refresh_storage_problems, request),
+            asyncio.to_thread(history_service_problem, get_settings()),
+            asyncio.to_thread(backup_archive_problems),
         )
+        payload = build_health_payload(
+            service.peek_cached_snapshot(),
+            startup_problems=storage_problems,
+            remote_problems=[
+                *known_hosts_warnings_for(request),
+                *config_reload_problems(request, include_restart_notice=False),
+                *([history_problem] if history_problem else []),
+                *backup_problems,
+            ],
+        )
+        return JSONResponse(payload, status_code=health_status_code(payload))
 
     return router

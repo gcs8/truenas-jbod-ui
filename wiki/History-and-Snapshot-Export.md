@@ -118,7 +118,7 @@ Select an enclosure or storage view, then choose `Export Snapshot` from the main
 
 The dialog shows estimated sizes for the HTML, ZIP, and selected package. Snapshot history uses the window currently selected in the History drawer. Change that window before opening the export dialog if you need a different range.
 
-The export is a self-contained HTML file. It opens without access to the live application and displays a `Frozen Offline Artifact` banner. The selected slot and an open history drawer can remain selected in the file. Inspection and navigation work, but live actions remain disabled.
+The export is a self-contained HTML file. It opens without access to the live application and shows an `Offline copy` banner with the enclosure name and capture time. The selected slot and an open history drawer can remain selected in the file. Inspection and navigation work, but live actions remain disabled.
 
 ### Redact sensitive IDs
 

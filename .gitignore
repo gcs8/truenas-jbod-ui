@@ -13,6 +13,7 @@ secrets/*
 data/slot_mappings.json
 data/sas_fabric_aliases.json
 data/slot_detail_cache.json
+data/last_seen_version.json
 data/known_hosts
 data/*.tmp
 data/perf/*

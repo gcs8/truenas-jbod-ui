@@ -73,7 +73,7 @@ function functionSource(source, name) {
 }
 
 function loadFunction(source, name, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   vm.runInContext(`${functionSource(source, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
@@ -81,7 +81,7 @@ function loadFunction(source, name, context = {}) {
 }
 
 function loadFunctions(source, names, context = {}) {
-  const sandbox = vm.createContext({ ...context });
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
   const declarations = names.map((name) => functionSource(source, name)).join("\n");
   vm.runInContext(
     `${declarations}\n${names.map((name) => `this.${name} = ${name};`).join("\n")}`,
@@ -222,7 +222,9 @@ test("successful inventory refresh invalidates history before render and a faile
 
   events.length = 0;
   shouldFail = true;
+  state.storageViewsRuntimeLoading = true;
   await refreshSnapshot(true);
+  assert.match(state.storageViewsRuntimeError, /freshness is unverified/);
   assert.equal(events.includes("invalidate"), false);
   assert.deepEqual(events, ["stale:inventory unavailable"]);
 });
@@ -230,13 +232,14 @@ test("successful inventory refresh invalidates history before render and a faile
 test("storage-view refresh updates the live selector before the completed main render", async () => {
   const state = {
     snapshotMode: false,
+    selectedSystemId: "system-a",
     storageViewsRuntimeRequestToken: 0,
     storageViewsRuntimeLoading: false,
   };
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
-    renderSelectors() { events.push("loading-selectors"); },
+    renderSelectors() { events.push(state.storageViewsRuntimeLoading ? "loading-selectors" : "complete-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
     async fetchJson() { return { system_id: "system-a", views: [] }; },
@@ -247,7 +250,7 @@ test("storage-view refresh updates the live selector before the completed main r
 
   await fetchStorageViewRuntime();
 
-  assert.deepEqual(events, ["loading-selectors", "apply", "complete"]);
+  assert.deepEqual(events, ["loading-selectors", "apply", "complete-selectors"]);
   assert.equal(state.storageViewsRuntimeLoading, false);
 });
 
@@ -275,6 +278,10 @@ test("mapping draft survives repeated renders for the same selected slot", () =>
   syncMappingFormForSlot({ slot: 7, serial: "server-old", device_name: "da7", gptid: "gpt-old", notes: "old" });
   mappingForm.serial.value = "operator draft";
   mappingForm.notes.value = "typed while SMART loaded";
+  const { fn: markMappingFormDirty } = loadFunction(APP_SOURCE, "markMappingFormDirty", {
+    state, scheduleAutoRefresh() {}, renderTimingSurfaces() {},
+  });
+  markMappingFormDirty();
 
   syncMappingFormForSlot({ slot: 7, serial: "server-new", device_name: "da7", gptid: "gpt-new", notes: "new" });
 
@@ -314,7 +321,8 @@ test("mapping form initializes from the newly selected slot scope", () => {
 });
 
 test("successful mapping save renders the authoritative snapshot instead of the old draft", async () => {
-  const state = { snapshotMode: false, selectedSlot: 7, mappingFormScopeKey: "system|enc||7" };
+  const state = { snapshotMode: false, selectedSystemId: "system", selectedEnclosureId: "enc", selectedSlot: 7, mappingFormScopeKey: "system|enc||7", mappingFormBaseRevision: "a".repeat(64) };
+  const { fn: mappingFormScopeKey } = loadFunction(APP_SOURCE, "mappingFormScopeKey", {state});
   let renderedScopeKey = "not-rendered";
   let appliedSnapshot = null;
   const events = [];
@@ -328,6 +336,7 @@ test("successful mapping save renders the authoritative snapshot instead of the 
     state,
     FormData: FakeFormData,
     mappingForm: {},
+    mappingFormScopeKey,
     getSlotById() { return { slot: 7, slot_label: "07", mapping_revision: "a".repeat(64) }; },
     setStatus() {},
     writeBlockedByPolicy: () => false,
@@ -474,6 +483,7 @@ test("mapping clear final fetch URL carries separate revision and selection para
 
 test("mapping mutations without a scope revision fail closed before any request", async () => {
   const state = { snapshotMode: false, selectedSlot: 7 };
+  const { fn: mappingFormScopeKey } = loadFunction(APP_SOURCE, "mappingFormScopeKey", {state});
   const statuses = [];
   let requestCount = 0;
   let confirmCount = 0;
@@ -485,6 +495,7 @@ test("mapping mutations without a scope revision fail closed before any request"
     FormData: FakeFormData,
     mappingForm: {},
     window: { confirm() { confirmCount += 1; return true; } },
+    mappingFormScopeKey,
     getSlotById() { return { slot: 7, slot_label: "07" }; },
     setStatus(message) { statuses.push(message); },
     writeBlockedByPolicy: () => false,
@@ -613,7 +624,7 @@ test("mapping import is disabled with a reason for the active virtual inventory"
 
   renderMappingImportControl();
 
-  assert.match(reason, /no identified physical enclosure/i);
+  assert.match(reason, /no physical enclosure/i);
   assert.equal(button.disabled, true);
   assert.equal(button.title, reason);
   assert.equal(reasonView.textContent, reason);
@@ -666,11 +677,12 @@ test("mapping import preview lists every exact scope and slot classification", (
     unchanged: [{ enclosure_id: null, slot: 4 }],
   });
 
-  assert.match(message, /Add \(1\): enc-a slot 1.*serial=ADD/);
-  assert.match(message, /Update \(1\): enc-a slot 2.*serial: OLD → NEW/);
-  assert.match(message, /Remove \(1\): enc-b slot 3.*serial=REMOVE/);
+  assert.match(message, /Add \(1\): enc-a slot 1.*Serial ADD/);
+  assert.match(message, /Update \(1\): enc-a slot 2.*Serial: OLD → NEW/);
+  assert.match(message, /Remove \(1\): enc-b slot 3.*Serial REMOVE/);
   assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
-  assert.match(message, /rejected if the active mapping scope changes/i);
+  assert.match(message, /^Restore these bay assignments\?/);
+  assert.match(message, /inventory changes before you confirm/i);
 });
 
 test("mapping import previews and confirms the exact diff before rendering imported state", async () => {
@@ -891,6 +903,8 @@ test("dedicated fabric refresh ignores a response for an older selection", async
     error: null,
     snapshot: {},
     fabric: null,
+    smartSummaries: {},
+    smartSummaryTimes: {},
     refreshRequestToken: 0,
   };
   function scopedUrl(endpoint, { force = false } = {}) {
@@ -957,6 +971,8 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,
@@ -969,7 +985,7 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: (_slot, activeView) => `${activeView.id}:slot-5`,
       refreshGridTileAriaLabel(slotIndex, label) {
         presentationEvents.push(`aria:${slotIndex}:${label}:${state.selectedStorageViewRuntimeId}`);
@@ -1008,6 +1024,8 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
     "ensureStorageViewSmartSummary",
     {
       state,
+      AbortSignal,
+      SMART_PREFETCH_STALE_MS: 15000,
       getStorageViewSmartCacheKey: () => cacheKey,
       isSmartEntryCurrent: () => false,
       isSmartEntryInFlight: () => false,
@@ -1022,7 +1040,7 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
       getSmartSummaryEntry: () => null,
-      slotTooltip: () => "live label",
+      slotAccessibleName: () => "live label",
       buildStorageViewRuntimeTooltip: () => "stale system-a label",
       refreshGridTileAriaLabel() { presentationEvents.push("aria"); },
       refreshHeatmapTileOverlays() { presentationEvents.push("heatmap"); },

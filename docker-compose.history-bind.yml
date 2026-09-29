@@ -1,0 +1,8 @@
+# Explicit migration for legacy Compose files whose history port still uses
+# ${HISTORY_BIND_ADDRESS:-127.0.0.1}. Append after the existing ordered file chain.
+# See docs/HISTORY_COMPOSE_MIGRATION.md before use with customized publications.
+# No ports, auth defaults, profiles, identities, mounts, or images are changed.
+services:
+  enclosure-history:
+    environment:
+      HISTORY_PUBLISHED_BIND_ADDRESS: ${HISTORY_BIND_ADDRESS:-127.0.0.1}

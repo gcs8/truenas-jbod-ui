@@ -4,6 +4,16 @@ The `wiki/` directory is the reviewed source for GitHub Wiki pages. The files
 under `wiki/images/` are the reviewed source for wiki images.
 
 Publishing is an owner-approved action.
+
+`scripts/check_public_docs.py` is the release gate for these pages. It runs
+from a clean checkout and rejects missing pages, broken links, stale screenshot
+files, invalid YAML examples, missing command paths, and configuration keys
+that do not exist in source or `.env.example`. Run it before every publish:
+
+```bash
+python scripts/check_public_docs.py
+```
+
 The verification command does not publish or change the external wiki.
 It reads committed Git objects and compares the root Markdown pages plus the
 complete `images/` tree byte for byte.

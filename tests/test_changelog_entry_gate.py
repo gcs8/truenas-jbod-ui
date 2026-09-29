@@ -102,6 +102,40 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         self.assertIn("Fixed", result.messages[0])
 
+    def test_release_candidate_section_with_entry_passes_without_unreleased(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1)
+        text = text.replace(
+            "### Fixed\n\n",
+            "### Fixed\n\n- Prepared the release candidate (#42).\n",
+            1,
+        )
+        self._write("CHANGELOG.md", text)
+        self._commit("chore: prepare release")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("v0.2.0", result.messages[0])
+
+    def test_release_candidate_section_accepts_prerelease_and_build_metadata(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        text = text.replace("## Unreleased", "## v1.2.3-rc.1+build.5 - 2026-02-01", 1)
+        text = text.replace(
+            "### Fixed\n\n",
+            "### Fixed\n\n- Prepared the release candidate (#42).\n",
+            1,
+        )
+        self._write("CHANGELOG.md", text)
+        self._commit("chore: prepare release")
+
+        result = self._evaluate()
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertIn("v1.2.3-rc.1+build.5", result.messages[0])
+
     def test_entry_for_a_different_pr_number_fails(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
         self._add_entry("Fixed", "- Bumped the value (#41).")
@@ -130,6 +164,44 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.messages)
         self.assertIn("dependencies", result.messages[0])
+
+    def test_bullet_appended_to_a_shipped_release_section_fails_with_the_fix(self) -> None:
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write("CHANGELOG.md", text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1))
+        self._commit("chore: cut v0.2.0")
+        _git(self.repo, "branch", "-f", "main", "topic")
+
+        self._write("app/service.py", "VALUE = 2\n")
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write(
+            "CHANGELOG.md",
+            text.replace("### Fixed\n\n", "### Fixed\n\n- Bumped the value (#42).\n", 1),
+        )
+        self._commit("fix: bump value")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.messages)
+        self.assertIn("has no '## Unreleased' section", joined)
+        self.assertIn("already shipped '## v0.2.0 - 2026-02-01' section", joined)
+        self.assertIn("Insert '## Unreleased'", joined)
+
+    def test_missing_entry_names_the_absent_unreleased_section(self) -> None:
+        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self._write("CHANGELOG.md", text.replace("## Unreleased", "## v0.2.0 - 2026-02-01", 1))
+        self._commit("chore: cut v0.2.0")
+        _git(self.repo, "branch", "-f", "main", "topic")
+
+        self._write("app/service.py", "VALUE = 2\n")
+        self._commit("fix: bump value")
+
+        result = self._evaluate()
+
+        self.assertFalse(result.ok)
+        joined = "\n".join(result.messages)
+        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
+        self.assertIn("has no '## Unreleased' section yet", joined)
 
     def test_change_outside_operator_visible_paths_requires_escape_label(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
@@ -204,7 +276,84 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertFalse(result.ok)
 
 
+    def test_advisory_mode_turns_a_missing_entry_into_a_pass_with_guidance(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        self._commit("fix: bump value")
+
+        result = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        joined = "\n".join(result.messages)
+        self.assertIn("Advisory", joined)
+        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
+        self.assertIn("a maintainer", joined)
+
+    def test_advisory_mode_still_reports_a_satisfied_gate_as_a_plain_pass(self) -> None:
+        self._write("app/service.py", "VALUE = 2\n")
+        self._add_entry("Fixed", "- Bumped the value (#42).")
+        self._commit("fix: bump value")
+
+        result = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertTrue(result.ok, result.messages)
+        self.assertNotIn("Advisory", "\n".join(result.messages))
+
+    def test_advisory_mode_passes_a_tests_only_change_that_cannot_be_labelled(self) -> None:
+        self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
+        self._commit("test: add a case")
+
+        blocking = self._evaluate()
+        advisory = gate.evaluate(
+            self.repo,
+            base="main",
+            head="topic",
+            pr_number=42,
+            labels=set(),
+            advisory=True,
+        )
+
+        self.assertFalse(blocking.ok)
+        self.assertTrue(advisory.ok, advisory.messages)
+        self.assertIn("no-changelog", "\n".join(advisory.messages))
+
+
 class ChangelogEntryParsingTests(unittest.TestCase):
+    def test_release_heading_uses_strict_semver_core_and_identifier_grammar(self) -> None:
+        for valid in (
+            "## v0.0.0",
+            "## v1.2.3-rc.1+build.5",
+            "## v1.2.3-x-y-z+001 - 2026-02-01",
+        ):
+            with self.subTest(valid=valid):
+                self.assertIsNotNone(gate.RELEASE_HEADING.fullmatch(valid))
+
+        for invalid in (
+            "## v01.2.3",
+            "## v1.02.3",
+            "## v1.2.03",
+            "## v1.2.3-01",
+            "## v1.2.3-rc..1",
+            "## v1.2.3+build..5",
+            "## v1١.2.3",
+            "## v1.2.3-1١",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(gate.RELEASE_HEADING.fullmatch(invalid))
+
     def test_relevant_path_classification(self) -> None:
         for path in (
             "app/main.py",
@@ -224,6 +373,10 @@ class ChangelogEntryParsingTests(unittest.TestCase):
             "CHANGELOG.md",
             "docs/RELEASE_WRAP_0.22.3.md",
             "docs/RELEASE_NOTES_0.22.3.md",
+            "docs/archive/RELEASE_WRAP_0.22.2.md",
+            "docs/archive/RELEASE_NOTES_0.22.2.md",
+            "docs/archive/ROADMAP_HISTORY.md",
+            "docs/archive/README.md",
             "tests/test_x.py",
             "README.md",
             ".github/workflows/ci.yml",

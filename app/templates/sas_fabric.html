@@ -7,7 +7,7 @@
       <p class="eyebrow" id="fabric-page-eyebrow">TrueNAS CORE / Storage Fabric</p>
       <h1>Storage Fabric</h1>
       <p class="subtle" id="fabric-page-summary">
-        Storage source, path, enclosure or view, pool, vdev, and bay evidence for the selected view.
+        Which HBA, path, expander and enclosure each bay hangs off, for the selected system.
       </p>
     </div>
     <div class="topbar-meta">
@@ -31,7 +31,7 @@
               </option>
             {% endfor %}
           {% else %}
-            <option value="">Auto-selected</option>
+            <option value="">No enclosures found</option>
           {% endif %}
         </select>
       </div>
@@ -56,6 +56,7 @@
     </div>
     <div class="fabric-view-actions">
       <a class="button secondary" id="fabric-back-button" data-fabric-back-link href="/">Back to Enclosure</a>
+      <a class="button secondary" id="fabric-guide-link" href="https://github.com/gcs8/truenas-jbod-ui/wiki/Storage-Fabric" target="_blank" rel="noopener noreferrer">Guide</a>
       <button class="button" id="fabric-refresh-button" type="button">Refresh Storage Fabric</button>
     </div>
   </section>
@@ -74,7 +75,7 @@
         <span>Password</span>
         <input id="fabric-read-ui-auth-password" type="password" autocomplete="off" required>
       </label>
-      <button class="button small" id="fabric-read-ui-auth-submit" type="submit">Sign in for writes</button>
+      <button class="button small" id="fabric-read-ui-auth-submit" type="submit">Sign in</button>
     </form>
     <button class="button secondary small hidden" id="fabric-read-ui-auth-sign-out" type="button">Sign out</button>
     <span class="subtle" id="fabric-read-ui-auth-status" role="status" aria-live="polite"></span>
@@ -88,34 +89,34 @@
 
   <section class="summary-strip fabric-summary-strip" id="fabric-summary-strip">
     <div class="summary-card">
-      <span class="summary-label">Controllers</span>
+      <span class="summary-label">HBAs</span>
       <span class="summary-value" id="fabric-summary-controllers">{{ fabric.controllers | length }}</span>
-      <span class="summary-note">sources reported</span>
+      <span class="summary-note">reported by the host</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Paths</span>
       <span class="summary-value" id="fabric-summary-paths">{{ fabric.paths | length }}</span>
-      <span class="summary-note">multipath states</span>
+      <span class="summary-note">active + standby</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Expanders</span>
       <span class="summary-value" id="fabric-summary-expanders">{{ fabric.expanders | length }}</span>
-      <span class="summary-note">transport detail</span>
+      <span class="summary-note">SAS expanders seen</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Enclosures</span>
       <span class="summary-value" id="fabric-summary-enclosures">{{ fabric.enclosures | length }}</span>
-      <span class="summary-note">MPR/SES objects</span>
+      <span class="summary-note">seen by the HBA or SES</span>
     </div>
     <div class="summary-card">
       <span class="summary-label">Traces</span>
       <span class="summary-value" id="fabric-summary-traces">{{ fabric.traces | length }}</span>
-      <span class="summary-note">clickable chains</span>
+      <span class="summary-note">paths and bays you can follow</span>
     </div>
     <div class="summary-card">
-      <span class="summary-label">Links</span>
+      <span class="summary-label">Connections</span>
       <span class="summary-value" id="fabric-summary-links">{{ fabric.links | length }}</span>
-      <span class="summary-note">topology edges</span>
+      <span class="summary-note">between the items above</span>
     </div>
   </section>
 
@@ -123,7 +124,7 @@
     <div class="panel-header compact">
       <div>
         <h2 id="fabric-map-title">Storage Lanes</h2>
-        <p id="fabric-map-subtitle" class="subtle">Top-down path lanes aligned by source.</p>
+        <p id="fabric-map-subtitle" class="subtle">Each HBA in its own lane: paths, expanders, enclosures and the bays behind them.</p>
       </div>
     </div>
     <div id="fabric-warning-list" class="fabric-warning-list"></div>
@@ -133,7 +134,7 @@
       <aside class="fabric-inspector-panel">
         <h3 id="fabric-inspector-title">Fabric Inspector</h3>
         <div id="fabric-inspector-body" class="fabric-inspector-body">
-          Select a source, path, enclosure, pool, vdev, or bay trace.
+          Select an HBA, path, enclosure, pool, vdev or bay to see its details here.
         </div>
       </aside>
     </div>

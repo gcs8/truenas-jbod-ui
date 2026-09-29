@@ -385,7 +385,7 @@ def install_metrics(app: FastAPI, *, service_name: str, version: str) -> None:
                 response = JSONResponse(
                     {
                         "ok": False,
-                        "detail": "Unhandled application error; see application logs.",
+                        "detail": "Something went wrong on the server. The application log has details.",
                         "request_id": request_id,
                     },
                     status_code=status_code,

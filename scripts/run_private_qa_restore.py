@@ -25,6 +25,13 @@ from typing import Any, Callable, NamedTuple, Sequence
 import yaml
 
 
+# The documented segmented-history catalog location (.env.example).
+SEGMENT_CATALOG_PATH = "/app/history/segments/catalog.json"
+SEGMENTED_BACKUP_SCHEMA_VERSION = 2
+# Playwright deletes and recreates its output folder at the start of a run, so
+# the folder gets the process umask. playwright.config.js refuses a private
+# output folder that is group- or world-accessible.
+PLAYWRIGHT_UMASK = 0o077
 APP_UID = 10001
 APP_GID = 10001
 APP_CONTAINER_NAMES = (
@@ -39,8 +46,12 @@ INSPECTION_FIELDS = {
     "ok",
     "schema_version",
     "app_version",
+    "app_version_note",
     "exported_at",
     "encrypted",
+    "encryption_mode",
+    "inspection_receipt",
+    "inspection_receipt_expires_at",
     "packaging",
     "selected_groups",
     "present_groups",
@@ -163,6 +174,20 @@ def _validate_optional_count(value: object, field: str) -> None:
         raise QaRestoreError(f"inspection {field} must be a non-negative integer or null")
 
 
+def require_matching_history_mode(inspection: dict[str, Any], *, segmented_history: bool) -> None:
+    """Fail before import when the stack's history mode does not match the backup."""
+
+    segmented_backup = inspection.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
+    if segmented_backup and not segmented_history:
+        raise QaRestoreError(
+            "backup contains segmented history; rerun with --segmented-history"
+        )
+    if segmented_history and not segmented_backup:
+        raise QaRestoreError(
+            "--segmented-history was set but the backup has single-file history"
+        )
+
+
 def validate_inspection_payload(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise QaRestoreError("inspection response must be an object")
@@ -174,8 +199,23 @@ def validate_inspection_payload(payload: object) -> dict[str, Any]:
         )
     if payload.get("ok") is not True:
         raise QaRestoreError("backup inspection did not report success")
+    note = payload.get("app_version_note")
+    if note is not None and (not isinstance(note, str) or len(note) > 512):
+        raise QaRestoreError("inspection app version note must be short text or null")
     if payload.get("encrypted") is not True:
         raise QaRestoreError("private QA requires an encrypted FULL backup")
+    if payload.get("encryption_mode") != "encrypted":
+        raise QaRestoreError("private QA inspection encryption mode was not encrypted")
+    if not isinstance(payload.get("inspection_receipt"), str) or not payload[
+        "inspection_receipt"
+    ]:
+        raise QaRestoreError("private QA inspection receipt was missing")
+    if (
+        isinstance(payload.get("inspection_receipt_expires_at"), bool)
+        or not isinstance(payload.get("inspection_receipt_expires_at"), int)
+        or payload["inspection_receipt_expires_at"] <= 0
+    ):
+        raise QaRestoreError("private QA inspection receipt expiry was invalid")
     aggregate = payload.get("aggregate_counts")
     if not isinstance(aggregate, dict) or set(aggregate) != AGGREGATE_FIELDS:
         raise QaRestoreError("inspection aggregate count fields are invalid")
@@ -366,6 +406,8 @@ def post_archive(
     passphrase: str,
     username: str,
     password: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1800)
     try:
@@ -378,6 +420,14 @@ def post_archive(
             "X-Backup-Passphrase-Base64",
             base64.b64encode(passphrase.encode("utf-8")).decode("ascii"),
         )
+        allowed_extra_headers = {
+            "X-Backup-Expected-Encryption",
+            "X-Backup-Inspection-Receipt",
+        }
+        if set(extra_headers or {}) - allowed_extra_headers:
+            raise QaRestoreError("archive request contained an unsupported extra header")
+        for key, value in (extra_headers or {}).items():
+            connection.putheader(key, value)
         connection.endheaders()
         with archive.open("rb", buffering=0) as source:
             while chunk := source.read(1024 * 1024):
@@ -557,6 +607,14 @@ class _LoopbackProxySet:
             raise QaRestoreError("loopback service access ports were not released")
 
 
+def _require_linux_docker_host(meminfo: Path = Path("/proc/meminfo")) -> None:
+    if not meminfo.exists():
+        raise SystemExit(
+            "This tool runs on a Linux Docker QA host. It reads /proc/meminfo and drives Docker "
+            "directly, neither of which is available here."
+        )
+
+
 def _available_memory_kib() -> int:
     fields: dict[str, int] = {}
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
@@ -704,6 +762,7 @@ def _run(
     log_path: Path,
     timeout: int,
     env: dict[str, str] | None = None,
+    umask: int = -1,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path.parent.chmod(0o700)
@@ -717,6 +776,7 @@ def _run(
             stderr=subprocess.STDOUT,
             timeout=timeout,
             check=False,
+            umask=umask,
         )
     if result.returncode != 0:
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
@@ -828,29 +888,45 @@ def _remove_runtime_root(runtime_root: Path) -> None:
         raise QaRestoreError("private QA runtime cleanup failed")
 
 
-def _assert_compose_resources_removed(
-    project: str,
-    *,
-    env: dict[str, str],
-) -> None:
-    targets = [
-        *(
-            ("container", name)
-            for name in APP_CONTAINER_NAMES
-        ),
-        ("network", f"{project}_default"),
+def _compose_resource_state(project: str, *, env: dict[str, str]) -> str:
+    # Only successful list operations can prove absence. `inspect` exit 1 also
+    # means daemon/permission failures, not just a missing object.
+    commands = [
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}} {{.State}}"],
+        ["docker", "container", "ls", "--all", "--filter",
+         f"label=com.docker.compose.project={project}", "--format", "{{.Names}} {{.State}}"],
+        *(["docker", kind, "ls", "--filter", f"label=com.docker.compose.project={project}",
+           "--format", "{{.Name}}"] for kind in ("network", "volume")),
     ]
-    for resource_type, name in targets:
-        result = subprocess.run(
-            ["docker", resource_type, "inspect", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-            env=env,
-        )
-        if result.returncode != 1:
-            raise QaRestoreError("private QA cleanup readback found a remaining resource")
+    residual = False
+    unknown = False
+    running = False
+    for index, command in enumerate(commands):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    check=False, env=env)
+        except (OSError, subprocess.SubprocessError):
+            unknown = True
+            continue
+        if result.returncode != 0:
+            unknown = True
+            continue
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            if index == 0 and fields[0] not in APP_CONTAINER_NAMES:
+                continue
+            residual = True
+            running |= index < 2 and len(fields) == 2 and fields[1] == "running"
+    if running:
+        return "running"
+    return "unknown" if residual or unknown else "verified-stopped"
+
+
+def _assert_compose_resources_removed(project: str, *, env: dict[str, str]) -> None:
+    if _compose_resource_state(project, env=env) != "verified-stopped":
+        raise QaRestoreError("private QA cleanup readback did not verify resource absence")
 
 
 def _compose_command(runtime_root: Path, project: str) -> list[str]:
@@ -879,6 +955,7 @@ def _write_runtime_files(
     password: str,
     *,
     live_read_only: bool,
+    segmented_history: bool = False,
 ) -> None:
     runtime_root.mkdir(mode=0o700)
     for name in (
@@ -920,6 +997,7 @@ def _write_runtime_files(
             "HISTORY_STARTUP_GRACE_SECONDS=0",
             "HISTORY_POLL_INTERVAL_SECONDS=3600",
             "ADMIN_AUTO_STOP_SECONDS=0",
+            *((f"HISTORY_SEGMENT_CATALOG_PATH={SEGMENT_CATALOG_PATH}",) if segmented_history else ()),
             "",
         )
     )
@@ -1178,15 +1256,40 @@ def _exercise_pencil_writes(
     query = urllib.parse.urlencode(
         {"system_id": system_id, "enclosure_id": enclosure_id}
     )
+    slots = inventory.get("slots")
+    candidates = [
+        item for item in slots
+        if isinstance(item, dict) and type(item.get("slot")) is int and item["slot"] == 0
+        and item.get("enclosure_id", enclosure_id) == enclosure_id
+    ] if isinstance(slots, list) else []
+    revision = candidates[0].get("mapping_revision") if len(candidates) == 1 else None
+    if not isinstance(revision, str) or not revision.strip():
+        raise QaRestoreError("selected physical slot save revision is unavailable")
+    # Retain the system-wide export so enclosureless legacy mappings stay protected.
+    # Resolve the selected physical scope through the API, including drawer aliases.
+    # Refuse a populated target rather than replacing and then deleting it.
     export = get_json(
         ui_port,
-        f"/api/mappings/export?{query}",
+        "/api/mappings/export?" + urllib.parse.urlencode({"system_id": system_id}),
         username,
         password,
     )
-    revision = export.get("revision")
-    if not isinstance(revision, str):
-        raise QaRestoreError("mapping export did not return a revision")
+    mappings = export.get("mappings")
+    if not isinstance(mappings, list) or any(not isinstance(item, dict) for item in mappings):
+        raise QaRestoreError("mapping export did not return mappings")
+    if any(item.get("slot") == 0 and item.get("enclosure_id") is None for item in mappings):
+        raise QaRestoreError("transient mapping probe requires an unpopulated target")
+    selected_export = get_json(
+        ui_port,
+        "/api/mappings/export?" + query,
+        username,
+        password,
+    )
+    selected_mappings = selected_export.get("mappings")
+    if not isinstance(selected_mappings, list) or any(not isinstance(item, dict) for item in selected_mappings):
+        raise QaRestoreError("selected mapping export did not return mappings")
+    if any(item.get("slot") == 0 for item in selected_mappings):
+        raise QaRestoreError("transient mapping probe requires an unpopulated target")
     mapping_payload = {
         "expected_revision": revision,
         "notes": f"QA restore transient mapping {nonce}",
@@ -1225,7 +1328,7 @@ def _exercise_pencil_writes(
         if isinstance(saved_slot, dict)
         else None
     )
-    if not isinstance(next_revision, str):
+    if not isinstance(next_revision, str) or not next_revision.strip():
         raise QaRestoreError("saved slot did not return a clear revision")
     removed = delete_json(
         ui_port,
@@ -1396,6 +1499,7 @@ def _run_browser_and_perf(
             log_path=raw_dir / "browser-offline.log",
             timeout=900,
             env=env,
+            umask=PLAYWRIGHT_UMASK,
         )
         _run(
             [
@@ -1429,6 +1533,7 @@ def _run_browser_and_perf(
                 log_path=raw_dir / "browser-live-read-only.log",
                 timeout=1800,
                 env=env,
+                umask=PLAYWRIGHT_UMASK,
             )
             _run(
                 [
@@ -1494,6 +1599,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-available-memory-mib", type=int, default=3072)
     parser.add_argument("--minimum-free-disk-gib", type=int, default=10)
     parser.add_argument("--approval", required=True)
+    parser.add_argument(
+        "--segmented-history",
+        action="store_true",
+        help="Configure the QA stack for segmented history; required for a segmented backup.",
+    )
     parser.add_argument("--live-read-only", action="store_true")
     parser.add_argument("--live-approval")
     parser.add_argument("--keep-running", action="store_true")
@@ -1503,6 +1613,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    _require_linux_docker_host()
     if args.approval != APPROVAL:
         raise QaRestoreError("private QA restore approval phrase did not match")
     if args.live_read_only and args.live_approval != LIVE_APPROVAL:
@@ -1542,12 +1653,15 @@ def main() -> int:
     project = f"tjuiqa{uuid.uuid4().hex[:12]}"
     compose: list[str] = []
     service_access: _LoopbackProxySet | None = None
-    stack_started = False
+    startup_attempted = False
     completed = False
+    receipt: dict[str, Any] = {}
+    backup_digest: str | None = None
     phase = "preflight"
     started_at = time.time()
     receipt_path = evidence_dir / "sanitized-receipt.json"
     try:
+        backup_digest = sha256_file(backup)
         phase = "runtime-setup"
         _write_runtime_files(
             repo_root,
@@ -1557,6 +1671,7 @@ def main() -> int:
             username,
             password,
             live_read_only=args.live_read_only,
+            segmented_history=args.segmented_history,
         )
         _run(
             [
@@ -1576,6 +1691,7 @@ def main() -> int:
         )
         compose = _compose_command(args.runtime_root, project)
         phase = "compose-start"
+        startup_attempted = True
         _run(
             [*compose, "up", "-d", "enclosure-ui", "enclosure-history", "enclosure-admin"],
             cwd=args.runtime_root,
@@ -1583,7 +1699,6 @@ def main() -> int:
             timeout=600,
             env=compose_env,
         )
-        stack_started = True
         access_plans = (
             _resolve_service_access(
                 "truenas-jbod-ui", 8000, ports[0], env=compose_env
@@ -1618,6 +1733,7 @@ def main() -> int:
                 password,
             )
         )
+        require_matching_history_mode(inspection, segmented_history=args.segmented_history)
         phase = "backup-import"
         imported = post_archive(
             ports[2],
@@ -1626,6 +1742,10 @@ def main() -> int:
             passphrase,
             username,
             password,
+            extra_headers={
+                "X-Backup-Expected-Encryption": inspection["encryption_mode"],
+                "X-Backup-Inspection-Receipt": inspection["inspection_receipt"],
+            },
         )
         import_summary = _safe_import_summary(
             imported,
@@ -1718,27 +1838,12 @@ def main() -> int:
             raw_dir,
             env=compose_env,
         )
-        if not args.keep_running:
-            phase = "cleanup"
-            if service_access is not None:
-                service_access.close()
-                service_access = None
-            _run(
-                [*compose, "down", "--remove-orphans", "--volumes"],
-                cwd=args.runtime_root,
-                log_path=raw_dir / "compose-down.log",
-                timeout=600,
-                env=compose_env,
-            )
-            _assert_compose_resources_removed(project, env=compose_env)
-            stack_started = False
-            _remove_runtime_root(args.runtime_root)
         receipt = {
             "status": "PASS",
             "run_id": run_id,
             "source_commit": args.source_commit,
             "image_id": args.image,
-            "backup_sha256": sha256_file(backup),
+            "backup_sha256": backup_digest,
             "backup_size_bytes": backup.stat().st_size,
             "target_handle": target_handle,
             "network_mode": "live-read-only" if args.live_read_only else "egress-blocked",
@@ -1765,66 +1870,78 @@ def main() -> int:
             "stack_running": bool(args.keep_running),
             "elapsed_seconds": round(time.time() - started_at, 3),
         }
-        write_private_json(receipt_path, receipt)
         completed = True
-        print(
-            "private_qa_restore=PASS "
-            f"receipt={receipt_path} stack_running={str(args.keep_running).lower()}"
-        )
-        return 0
     except BaseException as exc:
-        if stack_started and compose:
+        if startup_attempted and compose:
             try:
-                _capture_compose_logs(
-                    compose,
-                    args.runtime_root,
-                    raw_dir,
-                    env=compose_env,
-                )
+                _capture_compose_logs(compose, args.runtime_root, raw_dir, env=compose_env)
             except BaseException:
                 pass
-        failure_receipt = {
+        receipt = {
             "status": "FAIL",
             "run_id": run_id,
             "source_commit": args.source_commit,
             "image_id": args.image,
-            "backup_sha256": sha256_file(backup),
             "target_handle": target_handle,
             "failed_phase": phase,
             "error_class": type(exc).__name__,
-            "stack_running": False,
-            "elapsed_seconds": round(time.time() - started_at, 3),
+            "backup_sha256": backup_digest,
         }
-        write_private_json(receipt_path, failure_receipt)
         raise
     finally:
         passphrase = ""
+        original_error = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+
+        def attempt(step: Callable[[], None]) -> bool:
+            try:
+                step()
+                return True
+            except BaseException as error:
+                cleanup_errors.append(error)
+                return False
+
+        # A proxy failure must not prevent independent container teardown.
         if service_access is not None:
-            if _cleanup_after_run(service_access.close, "QA service access close"):
-                service_access = None
-        if stack_started and compose and not (completed and args.keep_running):
-
-            def _teardown_stack() -> None:
-                _run(
-                    [*compose, "down", "--remove-orphans", "--volumes"],
-                    cwd=args.runtime_root,
-                    log_path=raw_dir / "compose-down.log",
-                    timeout=600,
-                    env=compose_env,
-                )
-                _assert_compose_resources_removed(project, env=compose_env)
-
-            if _cleanup_after_run(_teardown_stack, "QA compose stack teardown"):
-                stack_started = False
-        if (
-            not stack_started
-            and args.runtime_root.exists()
-            and not (completed and args.keep_running)
-        ):
-            _cleanup_after_run(
-                lambda: _remove_runtime_root(args.runtime_root),
-                "QA runtime-root cleanup",
-            )
+            attempt(service_access.close)
+        keep_running = completed and args.keep_running
+        down_ok = not startup_attempted
+        if startup_attempted and not keep_running:
+            phase = "cleanup"
+            down_ok = attempt(lambda: _run(
+                [*compose, "down", "--remove-orphans", "--volumes"],
+                cwd=args.runtime_root, log_path=raw_dir / "compose-down.log",
+                timeout=600, env=compose_env,
+            ))
+        # Read back even if up/down failed. Retain config on failed down even
+        # when this independent read happens to prove absence.
+        state = "unknown"
+        try:
+            state = _compose_resource_state(project, env=compose_env)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if not keep_running and state != "verified-stopped":
+            cleanup_errors.append(QaRestoreError("private QA cleanup readback is incomplete"))
+        if keep_running and state != "running":
+            cleanup_errors.append(QaRestoreError("private QA running stack readback is incomplete"))
+        if down_ok and state == "verified-stopped" and not keep_running and args.runtime_root.exists():
+            attempt(lambda: _remove_runtime_root(args.runtime_root))
+        if cleanup_errors and original_error is None:
+            receipt.update(status="FAIL", failed_phase="cleanup", error_class=type(cleanup_errors[0]).__name__)
+        receipt.update(
+            stack_state=state,
+            stack_running={"running": True, "verified-stopped": False, "unknown": None}[state],
+            cleanup_verified=down_ok and state == "verified-stopped",
+            runtime_retained=args.runtime_root.exists(),
+            elapsed_seconds=round(time.time() - started_at, 3),
+        )
+        attempt(lambda: write_private_json(receipt_path, receipt))
+        if cleanup_errors:
+            print("warning: QA cleanup incomplete; consult finalized receipt and retained runtime", file=sys.stderr)
+            if original_error is None:
+                raise cleanup_errors[0]
+    print(f"private_qa_restore=PASS receipt={receipt_path} stack_running={str(args.keep_running).lower()}")
+    return 0
 
 
 if __name__ == "__main__":

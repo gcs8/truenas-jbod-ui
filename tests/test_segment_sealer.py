@@ -19,6 +19,25 @@ from history_service.store import SCHEMA
 
 
 class SegmentSealerCliTests(unittest.TestCase):
+    def test_help_describes_value_shapes_without_creating_output(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "scripts/seal_history_segment.py"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = subprocess.run(
+                [sys.executable, "-B", str(script), "--help"], cwd=temp_dir,
+                text=True, capture_output=True, check=False, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(list(Path(temp_dir).iterdir()), [])
+            help_text = " ".join(result.stdout.split())
+            for description in (
+                "quiesced SQLite", "output directory", "segment-0001",
+                "ISO-8601", "2026-01-01T00:00:00+00:00", "UTC midnight",
+                "not secret key material", "positive integer", "default: 1",
+            ):
+                self.assertIn(description, help_text)
+
+
     def test_sealer_allows_atime_only_source_metadata_change_during_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

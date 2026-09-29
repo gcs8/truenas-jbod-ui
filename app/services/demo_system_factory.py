@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from app.config import Settings
+from pathlib import Path
+import re
+
+from app.config import Settings, _normalize_system_id
 from app.models.domain import DemoSystemRequest, EnclosureProfileRequest, SystemSetupRequest
-from app.services.profile_builder import ProfileBuilderService
-from app.services.system_setup import SystemSetupService
+from app.services.profile_builder import ProfileBuilderService, _PROFILE_WRITE_LOCK
+from app.services.system_setup import SystemSetupService, _CONFIG_WRITE_LOCK
 
 
 DEFAULT_DEMO_SYSTEM_ID = "demo-builder-lab"
@@ -23,6 +26,39 @@ class DemoSystemFactory:
         payload: DemoSystemRequest,
         settings: Settings,
     ) -> dict[str, object]:
+        # Hold the same locks as ordinary editors across preflight and both saves.
+        # Lock order is config then profiles; neither editor acquires the other.
+        with _CONFIG_WRITE_LOCK, _PROFILE_WRITE_LOCK:
+            system_id = payload.system_id or DEFAULT_DEMO_SYSTEM_ID
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", system_id) or len(system_id) > 248:
+                raise ValueError("Demo system id must be at most 248 lowercase letters, digits, hyphens or underscores.")
+            config = self.system_service._load_config()
+            if not config.get("systems") and (config.get("truenas") or {}).get("host"):
+                raise ValueError("Save the legacy system in System Setup before adding a demo, so its configuration is preserved.")
+            if any(
+                _normalize_system_id(item.get("id"), index + 1) == system_id
+                for index, item in enumerate(config.get("systems") or [])
+                if isinstance(item, dict)
+            ):
+                raise ValueError(f"System id '{system_id}' already exists. Choose a new demo id.")
+            profile_id = f"{system_id}-{DEFAULT_DEMO_PROFILE_SUFFIX}"
+            if any(profile.id == profile_id for profile in self.profile_service._load_profiles()):
+                raise ValueError(f"Profile id '{profile_id}' already exists. Choose a new demo id.")
+            profile_path = Path(self.profile_path)
+            previous = profile_path.read_bytes() if profile_path.exists() else None
+            try:
+                return self._create_new_demo_system(payload, settings)
+            except Exception:
+                # A rejected/failed config save must not leave a new demo profile.
+                if previous is None:
+                    profile_path.unlink(missing_ok=True)
+                else:
+                    temporary = profile_path.with_suffix(".tmp")
+                    temporary.write_bytes(previous)
+                    temporary.replace(profile_path)
+                raise
+
+    def _create_new_demo_system(self, payload: DemoSystemRequest, settings: Settings) -> dict[str, object]:
         system_id = payload.system_id or DEFAULT_DEMO_SYSTEM_ID
         system_label = payload.label or DEFAULT_DEMO_LABEL
         profile_id = f"{system_id}-{DEFAULT_DEMO_PROFILE_SUFFIX}"
@@ -64,7 +100,7 @@ class DemoSystemFactory:
                 verify_ssl=False,
                 ssh_enabled=False,
                 default_profile_id=saved_profile.id,
-                replace_existing=payload.replace_existing,
+                replace_existing=False,
                 make_default=payload.make_default,
                 storage_views=[
                     {

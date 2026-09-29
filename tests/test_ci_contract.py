@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +16,9 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
 PUBLISH_GHCR_WORKFLOW = WORKFLOW_DIR / "publish-ghcr.yml"
 PUBLISH_PUBLIC_DEMO_WORKFLOW = WORKFLOW_DIR / "publish-public-demo.yml"
+PUBLIC_DOCS_LINKS_WORKFLOW = WORKFLOW_DIR / "public-docs-links.yml"
+CAPTURE_SCREENSHOTS_WORKFLOW = WORKFLOW_DIR / "capture-public-demo-screenshots.yml"
+RELEASE_CHECKLIST = ROOT / "docs" / "RELEASE_CHECKLIST.md"
 PUBLIC_DEMO_SPEC = ROOT / "qa" / "public-demo.spec.js"
 ADMIN_CLEANROOM_CONFIG = ROOT / "qa" / "fixtures" / "admin-cleanroom-config.yaml"
 ADMIN_CLEANROOM_SPEC = ROOT / "qa" / "admin-operations.spec.js"
@@ -49,6 +56,10 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("${{ matrix.python-version }}", job["name"])
         setup_step = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
         self.assertEqual(setup_step["with"]["python-version"], "${{ matrix.python-version }}")
+        shard_job = workflow["jobs"]["python-unittest"]
+        self.assertEqual(shard_job["strategy"]["matrix"]["python-version"], ["3.12", "3.14"])
+        shard_setup = next(step for step in shard_job["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
+        self.assertEqual(shard_setup["with"]["python-version"], "${{ matrix.python-version }}")
 
     def test_bounded_ruff_gate_and_config_are_present(self) -> None:
         workflow_text = self.read(CI_WORKFLOW)
@@ -92,10 +103,51 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn('"dependency_status": "unknown"', workflow_text)
         self.assertIn('"cache_state": "empty"', workflow_text)
         self.assertIn(
+            'cp docker-compose.nonroot.yml "$compose_contract_root/nonroot.yaml"',
+            workflow_text,
+        )
+        self.assertGreaterEqual(
+            workflow_text.count('-f "$compose_contract_root/nonroot.yaml"'), 2
+        )
+        self.assertIn("hardened_compose_service_contracts=ok", workflow_text)
+        self.assertIn(
             "probe_compose_service enclosure-admin 0 10001 0000000000000009 "
             "/app/host-prep /app/data",
             workflow_text,
         )
+
+    def test_container_smoke_starts_hardened_compose_from_verbatim_env_example(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        steps = workflow["jobs"]["container-smoke"]["steps"]
+        names = [step.get("name") for step in steps]
+        step_name = "Start hardened Compose from a verbatim .env.example"
+        self.assertIn(step_name, names)
+        self.assertGreater(
+            names.index(step_name),
+            names.index("Build production image and verify cache-only health"),
+        )
+        build_run = steps[names.index("Build production image and verify cache-only health")]["run"]
+        self.assertIn('printf \'CI_SMOKE_IMAGE_ID=%s\\n\' "$image_id" >> "$GITHUB_ENV"', build_run)
+        step = steps[names.index(step_name)]
+        # Only the image comes from the shell environment; .env stays unedited.
+        self.assertEqual(step["env"], {"JBOD_UI_IMAGE": "${{ env.CI_SMOKE_IMAGE_ID }}"})
+        run = step["run"]
+        self.assertIn('cp docker-compose.yml "$env_example_root/compose.yaml"', run)
+        self.assertIn('cp docker-compose.nonroot.yml "$env_example_root/nonroot.yaml"', run)
+        self.assertIn('cp .env.example "$env_example_root/.env"', run)
+        self.assertIn('cmp .env.example "$env_example_root/.env"', run)
+        self.assertNotIn('>> "$env_example_root/.env"', run)
+        self.assertNotIn('> "$env_example_root/.env"', run)
+        self.assertIn('-f "$env_example_root/nonroot.yaml"', run)
+        self.assertIn("compose_env_example up -d enclosure-ui", run)
+        self.assertIn("trap cleanup EXIT", run)
+        self.assertIn("compose_env_example down --volumes --remove-orphans", run)
+        self.assertIn("http://127.0.0.1:8080/livez", run)
+        self.assertIn("http://127.0.0.1:8080/healthz", run)
+        self.assertIn('assert health["status"] != "down", health', run)
+        self.assertIn("{{.State.Status}} {{.RestartCount}}", run)
+        self.assertIn('= "running 0"', run)
+        self.assertIn("env_example_hardened_compose_ui=ok restart_count=0", run)
 
     def test_ci_runs_admin_browser_qa_against_cleanroom_fixture_without_skips(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
@@ -114,14 +166,29 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertFalse(config["app"]["startup_warm_cache_enabled"])
         self.assertFalse(config["app"]["startup_warm_smart_enabled"])
         self.assertEqual(
-            browser_step["env"]["APP_CONFIG_PATH"],
-            "${{ github.workspace }}/qa/fixtures/admin-cleanroom-config.yaml",
+            browser_step["env"].get("PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS"), "1"
         )
+        self.assertEqual(
+            browser_step["env"]["APP_CONFIG_PATH"],
+            "/tmp/truenas-jbod-ui-admin-cleanroom/config.yaml",
+        )
+        self.assertIn('cp qa/fixtures/admin-cleanroom-config.yaml "$APP_CONFIG_PATH"', commands)
         self.assertIn("npm ci --ignore-scripts", commands)
         self.assertIn("npx playwright test qa/admin-operations.spec.js", commands)
         self.assertIn("http://127.0.0.1:8082/healthz", commands)
         self.assertIn("git status --short", commands)
-        self.assertNotIn("test.skip", spec)
+        self.assertEqual(spec.count("test.skip("), 1)
+        self.assertIn('test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1"', spec)
+
+    def test_ci_runs_admin_draft_target_ownership_fixture(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        fixture_step = next(
+            step
+            for step in workflow["jobs"]["public-demo-artifact"]["steps"]
+            if step.get("name") == "Run fixture-only browser specs"
+        )
+
+        self.assertIn("qa/admin-draft-target-ownership.spec.js", fixture_step["run"])
 
     def test_appliance_browser_specs_are_explicit_and_portable(self) -> None:
         contributing = self.read(ROOT / "CONTRIBUTING.md")
@@ -159,9 +226,14 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if match.group("version") is None:
                     uncommented.append(f"{workflow_path.name}: {action}")
 
-        # 29 existing uses plus checkout, setup-python, and setup-node in the
-        # owner-gated Pages readback job.
-        self.assertEqual(action_count, 32)
+        # Existing actions plus the trial's pinned checkout, the dispatch-only
+        # screenshot capture workflow's checkout and upload, the unittest
+        # gate job's checkout, Python setup, shard-result download and coverage
+        # upload, the GHCR release workflow's Python setup for the
+        # public-demo release gate, and the image-upgrade smoke's and the
+        # upgrade-scenario job's checkouts, and the pull-request docs
+        # external-link workflow's checkout and Python setup.
+        self.assertEqual(action_count, 44)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -230,15 +302,70 @@ class CIWorkflowContractTests(unittest.TestCase):
                 self.assertLess(install_index, generator_index)
                 self.assertNotIn("requirements-dev.txt", str(steps[install_index].get("run", "")))
 
-    def test_public_demo_publish_push_trigger_requires_checked_in_artifact_change(self) -> None:
+    def test_public_demo_publish_workflow_is_reserved_for_main_and_dispatch(self) -> None:
         workflow = yaml.safe_load(self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW))
         triggers = workflow.get("on", workflow.get(True, {}))
 
-        self.assertIn(".github/workflows/publish-public-demo.yml", triggers["pull_request"]["paths"])
-        self.assertIn("scripts/build_current_source_browser_fixture.py", triggers["pull_request"]["paths"])
+        self.assertEqual(set(triggers), {"push", "workflow_dispatch"})
         self.assertEqual(triggers["push"]["branches"], ["main"])
         self.assertEqual(triggers["push"]["paths"], ["public-demo/**"])
-        self.assertIn("workflow_dispatch", triggers)
+
+    def test_ordinary_pull_requests_have_one_current_source_public_demo_browser_validation(self) -> None:
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
+        browser_command = "npx playwright test qa/public-demo.spec.js --retries=0"
+        validations: list[tuple[str, str]] = []
+
+        for workflow_path in (CI_WORKFLOW, PUBLISH_PUBLIC_DEMO_WORKFLOW):
+            workflow = yaml.safe_load(self.read(workflow_path))
+            triggers = workflow.get("on", workflow.get(True, {}))
+            if "pull_request" not in triggers:
+                continue
+            for job_name, job in workflow["jobs"].items():
+                commands = "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+                if current_source_build in commands and browser_command in commands:
+                    validations.append((workflow_path.name, job_name))
+
+        self.assertEqual(validations, [("ci.yml", "public-demo-artifact")])
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
+
+    def test_the_sole_public_demo_validation_always_runs_on_pull_requests(self) -> None:
+        # With the publish workflow off pull_request, this job is the only PR
+        # browser check of current source, so nothing may route it to skipped.
+        ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        self.assertEqual(ci["jobs"]["public-demo-artifact"]["if"], "needs.route.outputs.run == 'true'")
+        route_script = ci["jobs"]["route"]["steps"][0]["run"]
+
+        with tempfile.TemporaryDirectory() as raw:
+            temp = Path(raw)
+            bin_dir = temp / "bin"
+            bin_dir.mkdir()
+            for tool in ("gh", "sleep"):
+                fake = bin_dir / tool
+                fake.write_text("#!/bin/sh\necho unexpected >&2\nexit 97\n", encoding="utf-8")
+                fake.chmod(0o755)
+            output = temp / "github-output"
+            env = dict(
+                os.environ,
+                EVENT_NAME="pull_request",
+                BRANCH_NAME="feature/example",
+                GH_REPO="example/project",
+                GITHUB_OUTPUT=str(output),
+                PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            )
+            result = subprocess.run(
+                ["bash", "-e", "-o", "pipefail"],
+                input=route_script.encode("utf-8"),
+                env=env,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+            self.assertEqual(output.read_text(encoding="utf-8"), "run=true\n")
+            self.assertNotIn(b"unexpected", result.stderr)
 
     def test_public_demo_artifact_and_browser_smoke_remain_in_ci(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
@@ -250,12 +377,243 @@ class CIWorkflowContractTests(unittest.TestCase):
                 workflow_text = self.read(workflow_path)
                 self.assertIn("python scripts/check_public_demo_artifact.py public-demo", workflow_text)
                 self.assertIn("python scripts/build_current_source_browser_fixture.py", workflow_text)
-                self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", workflow_text)
                 self.assertIn("SLOT_FOCUS_ARTIFACT:", workflow_text)
                 self.assertIn("npx playwright test qa/public-demo.spec.js --retries=0", workflow_text)
                 self.assertIn("npm ci --ignore-scripts", workflow_text)
                 self.assertIn('rm -rf "$fixture_root"', workflow_text)
                 self.assertIn("git status --short", workflow_text)
+
+        current_source_build = (
+            'python scripts/build_public_demo.py --output "$PUBLIC_DEMO_ARTIFACT" '
+            '--source-revision "$(git rev-parse HEAD)"'
+        )
+        ci_text = self.read(CI_WORKFLOW)
+        self.assertIn(current_source_build, ci_text)
+        self.assertIn(
+            "PUBLIC_DEMO_ARTIFACT: ${{ runner.temp }}/truenas-jbod-ui-current-source-browser/public-demo.html",
+            ci_text,
+        )
+        self.assertNotIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", ci_text)
+        self.assertIn("node --test tests/js/*.test.js", ci_text)
+
+        # Publication validates the exact checked-in bytes; current-source pull
+        # request behavior stays in the required CI check above.
+        publish_text = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
+        self.assertIn("PUBLIC_DEMO_ARTIFACT: public-demo/index.html", publish_text)
+        self.assertNotIn(current_source_build, publish_text)
+
+    def test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        lock = json.loads(self.read(ROOT / "package-lock.json"))
+        locked_playwright = lock["packages"]["node_modules/@playwright/test"]["version"]
+        triggers = workflow.get("on", workflow.get(True, {}))
+        job = workflow["jobs"]["capture"]
+        commands = "\n".join(str(step.get("run", "")) for step in job["steps"])
+
+        self.assertEqual(set(triggers), {"workflow_dispatch"})
+        self.assertIn("ref", triggers["workflow_dispatch"]["inputs"])
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertNotIn("permissions", job)
+        image = job["container"]["image"]
+        expected_tag = f"mcr.microsoft.com/playwright:v{locked_playwright}-jammy"
+        self.assertRegex(image, rf"^{re.escape(expected_tag)}@sha256:[0-9a-f]{{64}}$")
+        self.assertEqual(job["env"]["CONTAINER_IMAGE"], image)
+        self.assertEqual(job["env"]["CONTAINER_TAG"], expected_tag)
+        self.assertEqual(job["env"]["PLAYWRIGHT_VERSION"], locked_playwright)
+        self.assertNotIn("runner.", json.dumps(job["env"]))
+        self.assertNotIn("runner.", json.dumps(job["container"]))
+        self.assertIn('printf \'container image: %s\\n\' "$CONTAINER_IMAGE"', commands)
+        self.assertIn('printf \'container tag: %s\\n\' "$CONTAINER_TAG"', commands)
+        ref_check = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Require the requested ref to be the checked-out commit SHA"
+        )
+        self.assertEqual(ref_check["env"]["REQUESTED_REF"], "${{ inputs.ref }}")
+        self.assertIn('[[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]', ref_check["run"])
+        self.assertIn(
+            'git config --global --add safe.directory "$GITHUB_WORKSPACE"',
+            ref_check["run"],
+        )
+        self.assertIn('resolved_ref="$(git rev-parse HEAD)"', ref_check["run"])
+        self.assertIn('[ "$resolved_ref" != "$REQUESTED_REF" ]', ref_check["run"])
+        self.assertEqual(
+            [step.get("name") for step in job["steps"][:3]],
+            [
+                "Check out the dispatched ref",
+                "Require the requested ref to be the checked-out commit SHA",
+                "Prepare the candidate directory and the run log",
+            ],
+        )
+        prepare = job["steps"][2]["run"]
+        self.assertIn('candidate_dir="$RUNNER_TEMP/public-demo-screenshot-candidate"', prepare)
+        self.assertIn('>> "$GITHUB_ENV"', prepare)
+        self.assertNotIn("safe.directory", prepare)
+        self.assertTrue(
+            all("$CANDIDATE_DIR" not in str(step.get("run", "")) for step in job["steps"][:2])
+        )
+
+        self.assertEqual(commands.count("node scripts/capture_public_demo_screenshots.js"), 2)
+        self.assertIn('cmp -s "$CANDIDATE_DIR/run-1/$name" "$CANDIDATE_DIR/run-2/$name"', commands)
+        self.assertIn("the capture is not byte-reproducible in this environment", commands)
+        self.assertIn("npm ci --ignore-scripts", commands)
+        self.assertIn("scripts/check_public_screenshots.py --report", commands)
+        self.assertIn(
+            'sha256sum ./*.png | tee sha256sums.txt',
+            commands,
+        )
+        self.assertIn("fc-match", commands)
+        self.assertIn("git status --short", commands)
+        for forbidden in ("git push", "git commit", "gh pr ", "gh release", "peter-evans"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+        self.assertEqual(upload["with"]["retention-days"], 14)
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertEqual(
+            upload["with"]["path"], "${{ env.CANDIDATE_DIR }}"
+        )
+
+    def test_release_checklist_uses_and_reviews_the_dispatch_capture_artifact(self) -> None:
+        checklist = self.read(RELEASE_CHECKLIST)
+        screenshot_section = checklist.split("## Screenshots", 1)[1].split("\n## ", 1)[0]
+
+        for required in (
+            "capture-public-demo-screenshots.yml",
+            "full commit SHA",
+            "qualification_only=false",
+            "public-demo-screenshot-candidate",
+            "gh run download",
+            "sha256sum --check sha256sums.txt",
+            "proposed-manifest.json",
+            "platform-fonts.json",
+            "capture.log",
+            "SCREENSHOT_CAPTURE.md",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, screenshot_section)
+        self.assertNotIn(
+            "node scripts/capture_public_demo_screenshots.js",
+            screenshot_section,
+        )
+
+    def test_screenshot_capture_ref_guard_admits_container_checkout_ownership(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        guard = workflow["jobs"]["capture"]["steps"][1]["run"]
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+
+        with tempfile.TemporaryDirectory() as home:
+            result = subprocess.run(
+                ["bash", "-c", guard],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(ROOT),
+                    "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+                    "HOME": home,
+                    "REQUESTED_REF": head,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"directory = {ROOT}",
+                (Path(home) / ".gitconfig").read_text(encoding="utf-8"),
+            )
+
+    def test_screenshot_capture_qualification_run_cannot_pass_as_a_candidate(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        job = workflow["jobs"]["capture"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+        capture_step = next(
+            run
+            for run in (str(step.get("run", "")) for step in job["steps"])
+            if "proposed-manifest.json" in run
+        )
+        upload = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        )
+
+        self.assertEqual(inputs["qualification_only"]["type"], "boolean")
+        self.assertIs(inputs["qualification_only"]["default"], True)
+        self.assertIn("commit SHA", inputs["ref"]["description"])
+        self.assertEqual(job["env"]["QUALIFICATION_ONLY"], "${{ inputs.qualification_only }}")
+        self.assertIn('if [ "$QUALIFICATION_ONLY" = "true" ]', capture_step)
+        self.assertIn("public-demo-screenshot-qualification", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-candidate", str(upload["with"]["name"]))
+        self.assertIn("public-demo-screenshot-qualification", docs)
+
+    def test_screenshot_capture_checks_the_fonts_chromium_actually_used(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        job = workflow["jobs"]["capture"]
+        runs = [str(step.get("run", "")) for step in job["steps"]]
+        probe_step = next(run for run in runs if "report_public_demo_platform_fonts.js" in run)
+        fc_match_step = next(run for run in runs if "fc-match" in run)
+        script = self.read(ROOT / "scripts" / "report_public_demo_platform_fonts.js")
+
+        self.assertIn(
+            'node scripts/report_public_demo_platform_fonts.js "$CANDIDATE_DIR/platform-fonts.json"',
+            probe_step,
+        )
+        # The expected families are compared against the platform fonts Chromium
+        # reported, not against fc-match, whose output stays informational.
+        for variable in ("EXPECTED_SANS_FALLBACK", "EXPECTED_MONO_FALLBACK"):
+            with self.subTest(variable=variable):
+                self.assertIn(variable, probe_step)
+                self.assertNotIn(variable, fc_match_step)
+        self.assertEqual(job["env"]["EXPECTED_SANS_FALLBACK"], "Liberation Sans")
+        self.assertEqual(job["env"]["EXPECTED_MONO_FALLBACK"], "WenQuanYi Zen Hei Mono")
+        self.assertIn("probes.sans.dominant_family", probe_step)
+        self.assertIn("probes.mono.dominant_family", probe_step)
+        self.assertIn('"$CANDIDATE_DIR/platform-fonts.json"', probe_step)
+
+        for fragment in (
+            "CSS.getPlatformFontsForNode",
+            "DOM.enable",
+            "CSS.enable",
+            "DOM.getDocument",
+            "DOM.querySelector",
+            "newCDPSession",
+            "glyphCount",
+            "dominant_family",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, script)
+
+    def test_screenshot_capture_doc_quotes_the_pinned_fallback_families(self) -> None:
+        """docs/SCREENSHOT_CAPTURE.md must not drift from the enforced pins (#528)."""
+
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        env = workflow["jobs"]["capture"]["env"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+
+        for variable in ("EXPECTED_SANS_FALLBACK", "EXPECTED_MONO_FALLBACK"):
+            with self.subTest(variable=variable):
+                family = env[variable]
+                self.assertTrue(family, f"{variable} is unpinned in the workflow")
+                self.assertTrue(
+                    any(
+                        f"`{variable}`" in line and f"`{family}`" in line
+                        for line in docs.splitlines()
+                    ),
+                    f"the capture doc does not name the pinned {variable}",
+                )
+        self.assertNotIn("Both are empty until", docs)
+        self.assertIn("re-qualify", docs.lower())
 
     def test_public_demo_pages_request_allowlist_is_probe_specific(self) -> None:
         spec = self.read(PUBLIC_DEMO_SPEC)
@@ -273,6 +631,26 @@ class CIWorkflowContractTests(unittest.TestCase):
             spec,
         )
 
+    def test_pull_requests_that_change_public_docs_keep_the_external_link_check(self) -> None:
+        # The publish workflow no longer runs on pull_request, so this workflow
+        # is the only online link check a README or Wiki change gets before merge.
+        workflow = yaml.safe_load(self.read(PUBLIC_DOCS_LINKS_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        paths = triggers["pull_request"]["paths"]
+        for path in (
+            ".github/workflows/public-docs-links.yml",
+            "README.md",
+            "wiki/**",
+            "scripts/check_public_docs.py",
+        ):
+            self.assertIn(path, paths)
+        commands = "\n".join(
+            str(step.get("run", "")) for step in workflow["jobs"]["external-links"]["steps"]
+        )
+        self.assertIn("python scripts/check_public_docs.py --check-external", commands)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+
     def test_public_docs_screenshots_and_deployment_readback_are_release_gates(self) -> None:
         ci = self.read(CI_WORKFLOW)
         publish = self.read(PUBLISH_PUBLIC_DEMO_WORKFLOW)
@@ -288,7 +666,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_public_demo_source_revision_jobs_checkout_full_history(self) -> None:
         expected_jobs = {
-            CI_WORKFLOW: ("python-source", "public-demo-artifact"),
+            CI_WORKFLOW: ("python-unittest", "python-source", "public-demo-artifact"),
             PUBLISH_PUBLIC_DEMO_WORKFLOW: ("verify",),
         }
 
@@ -418,7 +796,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         self.assertEqual(
             triggers["pull_request_target"]["types"],
-            ["opened", "edited", "synchronize", "reopened"],
+            ["opened", "edited", "reopened"],
         )
         self.assertEqual(workflow["permissions"], {"pull-requests": "write"})
         for job_name, job in workflow["jobs"].items():
@@ -516,11 +894,136 @@ class CIWorkflowContractTests(unittest.TestCase):
             "JavaScript syntax and npm lock",
             "Checked-in public demo artifact",
             "Admin clean-room browser QA",
+            "Image-only upgrade smoke",
             "Changelog entry",
         ):
             self.assertIn(required_check, contributing)
         self.assertIn("Coverage is report-only", contributing)
         self.assertIn("CodeQL is report-only", contributing)
+
+
+class CIRunsOncePerPullRequestTests(unittest.TestCase):
+    """#541: one CI run per head commit, no CANCELLED required check."""
+
+    def read(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    def test_push_runs_defer_to_the_pull_request_run_for_the_same_branch(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        route = workflow["jobs"]["route"]
+        script = route["steps"][0]["run"]
+
+        self.assertEqual(route["outputs"]["run"], "${{ steps.decide.outputs.run }}")
+        self.assertEqual(route["permissions"]["pull-requests"], "read")
+        self.assertIn('if [ "${EVENT_NAME}" != "push" ]', script)
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
+        self.assertIn('echo "run=false" >> "$GITHUB_OUTPUT"', script)
+
+    def test_push_runs_only_defer_to_pull_requests_this_workflow_runs(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        triggers = workflow.get("on", workflow.get(True, {}))
+        script = workflow["jobs"]["route"]["steps"][0]["run"]
+
+        # `pull_request` fires only for pull requests into main. A stacked
+        # branch whose open pull request targets another branch therefore gets
+        # no pull_request run, so its push run must not defer to it.
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+        self.assertIn(
+            'gh pr list --repo "$GH_REPO" --head "$BRANCH_NAME" --base main --state open',
+            script,
+        )
+
+    def test_every_billable_job_is_gated_on_the_routing_decision(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+
+        for name in (
+            "diff-hygiene",
+            "python-unittest",
+            "python-source",
+            "ruff-check",
+            "javascript-source",
+            "container-smoke",
+            "admin-browser-cleanroom",
+            "public-demo-artifact",
+            "image-upgrade-smoke",
+            "image-upgrade-scenarios",
+        ):
+            job = workflow["jobs"][name]
+            needs = job["needs"]
+            needs = [needs] if isinstance(needs, str) else needs
+            self.assertIn("route", needs, name)
+            self.assertIn("needs.route.outputs.run == 'true'", job["if"], name)
+
+    def test_the_routing_gate_skips_rather_than_cancels(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+
+        self.assertEqual(workflow["concurrency"]["group"], "ci-preflight-${{ github.ref }}")
+        self.assertIn(
+            "A branch push whose branch already has an open pull request skips",
+            contributing,
+        )
+        self.assertIn(
+            "A zero-result lookup receives one 15-second recheck",
+            " ".join(contributing.split()),
+        )
+
+    def test_codeql_does_not_run_twice_for_branches_with_pull_requests(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "codeql.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertEqual(triggers["push"]["branches"], ["main"])
+        self.assertEqual(triggers["pull_request"]["branches"], ["main"])
+
+    def test_pr_label_job_does_not_cancel_itself_on_every_push(self) -> None:
+        workflow = yaml.safe_load(self.read(WORKFLOW_DIR / "pr-labels.yml"))
+        triggers = workflow.get("on", workflow.get(True, {}))
+
+        self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
+        self.assertEqual(triggers["pull_request_target"]["types"], ["opened", "edited", "reopened"])
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+
+    def test_changelog_gate_advises_outside_contributors_instead_of_blocking(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        step = workflow["jobs"]["changelog-entry"]["steps"][-1]
+
+        self.assertEqual(
+            step["env"]["PR_AUTHOR_ASSOCIATION"],
+            "${{ github.event.pull_request.author_association }}",
+        )
+        self.assertIn("OWNER|MEMBER|COLLABORATOR)", step["run"])
+        self.assertIn("--advisory", step["run"])
+
+    def test_fixture_only_browser_specs_run_in_ci(self) -> None:
+        workflow = yaml.safe_load(self.read(CI_WORKFLOW))
+        steps = workflow["jobs"]["public-demo-artifact"]["steps"]
+        step = next(step for step in steps if step.get("name") == "Run fixture-only browser specs")
+        for spec in (
+            "qa/offline-snapshot.spec.js",
+            "qa/saved-view-selection.spec.js",
+            "qa/ui-scope-safety.spec.js",
+            "qa/upgrade-notice.spec.js",
+        ):
+            with self.subTest(spec=spec):
+                self.assertTrue((ROOT / spec).is_file())
+                self.assertIn(spec, step["run"])
+                self.assertNotIn("PLAYWRIGHT_LIVE_APPLIANCE_QA", self.read(ROOT / spec))
+        self.assertIn("--retries=0", step["run"])
+        self.assertIn("git status --short", step["run"])
+        contributing = self.read(ROOT / "CONTRIBUTING.md")
+        self.assertIn("Run fixture-only browser specs", contributing)
+
+    def test_contributing_documents_how_to_satisfy_the_changelog_check(self) -> None:
+        contributing = " ".join(self.read(ROOT / "CONTRIBUTING.md").split())
+
+        self.assertIn("How to satisfy the `Changelog entry` check", contributing)
+        self.assertIn(
+            "Outside contributors cannot apply labels, so the gate runs in advisory mode",
+            contributing,
+        )
 
 
 if __name__ == "__main__":

@@ -6,10 +6,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error
+from app.env_values import annotation_is_text
 from app.http_auth import configured_origin_identity
 from app.secret_files import load_secret_environment_value
+
+
+DEFAULT_BACKUP_RETENTION_COUNT = 7
+DEFAULT_BACKUP_INTERVAL_SECONDS = 86400
 
 
 def _history_runtime_root() -> Path:
@@ -45,9 +51,15 @@ class HistorySettings(BaseModel):
     shared_dir_mode: int = Field(default=0o770, ge=0, le=0o777)
     shared_file_mode: int = Field(default=0o660, ge=0, le=0o777)
     backup_dir: str = Field(default_factory=_default_history_backup_dir)
-    backup_retention_count: int = 28
-    backup_interval_seconds: int = 3600
+    # Default footprint: one daily copy kept for a week, plus the promoted
+    # long-term copies below, so at most 14 database-sized files on disk.
+    backup_retention_count: int = Field(default=DEFAULT_BACKUP_RETENTION_COUNT, ge=1, le=365)
+    backup_interval_seconds: int = Field(default=DEFAULT_BACKUP_INTERVAL_SECONDS, ge=0)
     scheduled_backup_status_file: str | None = None
+    # Secret-free receipt written by the long-running backup scheduler after a
+    # FULL archive is catalogued as verified. The history sidecar uses it to
+    # avoid writing a duplicate SQLite snapshot (#455).
+    backup_archive_status_file: str | None = None
     segmented_backup_max_age_seconds: int = Field(default=36 * 3600, ge=1)
     long_term_backup_dir: str | None = Field(default_factory=_default_history_long_term_backup_dir)
     weekly_backup_retention_count: int = 4
@@ -66,6 +78,8 @@ class HistorySettings(BaseModel):
     hourly_rollup_retention_days: int = Field(default=365, ge=0)
     daily_rollup_retention_days: int = Field(default=1825, ge=0)
     retention_interval_seconds: int = Field(default=3600, ge=1)
+    # How long retention may wait for a usable backup before pruning anyway.
+    retention_backup_skip_max_seconds: int = Field(default=86400, ge=0)
     retention_batch_size: int = Field(default=5000, ge=1)
     retention_max_batches_per_run: int = Field(default=20, ge=1)
     published_bind_address: str = "127.0.0.1"
@@ -87,7 +101,12 @@ class HistorySettings(BaseModel):
         normalized = str(value or "").strip()
         return normalized or None
 
-    @field_validator("segment_catalog_path", "scheduled_backup_status_file", mode="before")
+    @field_validator(
+        "segment_catalog_path",
+        "scheduled_backup_status_file",
+        "backup_archive_status_file",
+        mode="before",
+    )
     @classmethod
     def normalize_optional_segment_catalog_path(cls, value: Any) -> str | None:
         if value is None:
@@ -124,13 +143,25 @@ class HistorySettings(BaseModel):
             loopback = False
         token = self.refresh_token.get_secret_value() if self.refresh_token is not None else ""
         if not loopback and self.refresh_auth_mode != "token":
-            raise ValueError("Non-loopback history exposure requires refresh token mode.")
+            raise ValueError(
+                "HISTORY_BIND_ADDRESS is not loopback. Set HISTORY_REFRESH_AUTH_MODE=token, "
+                "HISTORY_REFRESH_TOKEN (or _FILE) and HISTORY_PUBLIC_ORIGIN, or set it back to 127.0.0.1."
+            )
         if self.refresh_auth_mode == "token" and not token:
-            raise ValueError("History refresh token mode requires a non-empty token.")
+            raise ValueError(
+                "HISTORY_REFRESH_AUTH_MODE=token needs a token. Set HISTORY_REFRESH_TOKEN "
+                "(or HISTORY_REFRESH_TOKEN_FILE) to a non-empty value."
+            )
         if not loopback and configured_origin_identity(self.public_origin) is None:
-            raise ValueError("Non-loopback history exposure requires a valid HISTORY_PUBLIC_ORIGIN.")
+            raise ValueError(
+                "HISTORY_BIND_ADDRESS is not loopback, so HISTORY_PUBLIC_ORIGIN must be set to the "
+                "address the browser uses for history, for example http://192.0.2.10:8081."
+            )
         if self.public_origin is not None and configured_origin_identity(self.public_origin) is None:
-            raise ValueError("HISTORY_PUBLIC_ORIGIN must be an absolute HTTP(S) origin.")
+            raise ValueError(
+                "HISTORY_PUBLIC_ORIGIN must be an absolute HTTP(S) origin such as "
+                "http://192.0.2.10:8081, with no path."
+            )
 
         return self
 
@@ -152,6 +183,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_BACKUP_RETENTION_COUNT": "backup_retention_count",
     "HISTORY_BACKUP_INTERVAL_SECONDS": "backup_interval_seconds",
     "SCHEDULED_BACKUP_STATUS_FILE": "scheduled_backup_status_file",
+    "BACKUP_ARCHIVE_STATUS_FILE": "backup_archive_status_file",
     "HISTORY_SEGMENTED_BACKUP_MAX_AGE_SECONDS": "segmented_backup_max_age_seconds",
     "HISTORY_LONG_TERM_BACKUP_DIR": "long_term_backup_dir",
     "HISTORY_WEEKLY_BACKUP_RETENTION_COUNT": "weekly_backup_retention_count",
@@ -170,6 +202,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_HOURLY_ROLLUP_RETENTION_DAYS": "hourly_rollup_retention_days",
     "HISTORY_DAILY_ROLLUP_RETENTION_DAYS": "daily_rollup_retention_days",
     "HISTORY_RETENTION_INTERVAL_SECONDS": "retention_interval_seconds",
+    "HISTORY_RETENTION_BACKUP_SKIP_MAX_SECONDS": "retention_backup_skip_max_seconds",
     "HISTORY_RETENTION_BATCH_SIZE": "retention_batch_size",
     "HISTORY_RETENTION_MAX_BATCHES_PER_RUN": "retention_max_batches_per_run",
     "HISTORY_PUBLISHED_BIND_ADDRESS": "published_bind_address",
@@ -202,24 +235,57 @@ def _parse_permission_mode(value: str) -> int:
     return int(normalized, 8)
 
 
+def _field_is_text(field_name: str) -> bool:
+    return annotation_is_text(HistorySettings.model_fields[field_name].annotation)
+
+
 @lru_cache
 def get_history_settings() -> HistorySettings:
     payload = HistorySettings().model_dump()
+    field_to_env = {field_name: env_name for env_name, field_name in ENV_OVERRIDES.items()}
+    field_to_env["refresh_token"] = "HISTORY_REFRESH_TOKEN"
     for env_name, field_name in ENV_OVERRIDES.items():
         raw_value = os.getenv(env_name)
         if raw_value is None:
             continue
-        payload[field_name] = (
-            _parse_permission_mode(raw_value) if env_name in PERMISSION_MODE_ENV_VARS else _parse_scalar(raw_value)
-        )
+        if env_name in PERMISSION_MODE_ENV_VARS:
+            try:
+                payload[field_name] = _parse_permission_mode(raw_value)
+            except ValueError:
+                raise ConfigurationError(
+                    [f"{env_name} in .env must be an octal mode such as 0770 and must not be world-writable."]
+                ) from None
+        elif _field_is_text(field_name):
+            payload[field_name] = raw_value.strip()
+        elif not raw_value.strip():
+            # Compose passes unset keys as "${KEY:-}", an empty string. Keep the
+            # default instead of failing bool/number validation (as app/config.py does).
+            continue
+        else:
+            payload[field_name] = _parse_scalar(raw_value)
 
     refresh_token = load_secret_environment_value("HISTORY_REFRESH_TOKEN")
     if refresh_token is not None:
         payload["refresh_token"] = refresh_token
 
-    settings = HistorySettings.model_validate(payload)
-    Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.backup_dir).mkdir(parents=True, exist_ok=True)
-    if settings.long_term_backup_dir:
-        Path(settings.long_term_backup_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        settings = HistorySettings.model_validate(payload)
+    except ValidationError as exc:
+        problems = describe_validation_error(
+            exc,
+            resolve_location=lambda location: (
+                (field_to_env[str(location[0])], ".env") if str(location[0]) in field_to_env else None
+            ),
+            default_source=".env",
+        )
+        raise ConfigurationError(problems) from None
+    # Keep required runtime-path creation inside the startup retry boundary,
+    # but carry its new-entry obligations to the operation that publishes
+    # backups. Long-term archive roots are intentionally prepared later by
+    # _promote_long_term_backups(), inside its best-effort failure boundary.
+    # Include the database parent: it can also be an ancestor of a backup root.
+    from history_service.store import HistoryStore
+
+    HistoryStore.prepare_backup_directory(Path(settings.sqlite_path).parent)
+    HistoryStore.prepare_backup_directory(Path(settings.backup_dir))
     return settings

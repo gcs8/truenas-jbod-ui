@@ -13,9 +13,11 @@ pass in another.
    archive safety, and controller guards without private data.
 2. The synthetic runtime matrix builds one exact candidate image and exercises
    service combinations with public fixtures.
-3. The private restore drill accepts a separately staged encrypted FULL backup,
-   restores it into an isolated QA root, and compares aggregate counts from the
-   validated archive with the running stack.
+3. The private restore drill accepts two separately staged encrypted FULL
+   backups: a primary export that follows the configured default (`tar.zst`) and
+   a separate explicitly selected `7z` export for backward readability. Each is
+   restored into an isolated QA root and its aggregate counts are compared with
+   the running stack.
 
 Do not put a production-derived archive, passphrase, raw restore response,
 container log, browser trace, screenshot, history database, or admin state in
@@ -34,6 +36,8 @@ required full source commit:
 | Admin only / initial setup | Admin health and auth; create a synthetic initial system; start the UI from the saved config; verify persistence |
 | UI + admin | Exact running service set; UI/admin health; runtime cards; both pencil cycles |
 | UI + history + admin | All three health paths; history and admin APIs; both pencil cycles |
+| Scheduler disabled | Scheduler only; Unix-socket `/internal/healthz` and library readback; config and full classes both off; no running job or artifact |
+| Scheduler enabled | Scheduler + admin; Unix-socket health; one authenticated synthetic config backup; verified/restorable artifact; explicit verify; scheduler restart and persisted catalogue readback |
 | One-shot FULL backup | Separate `backup` profile contract; no network; disk-backed archive workspace; encrypted archive preflight and cleanup |
 
 History-only is not a supported combination because the history service depends
@@ -62,8 +66,8 @@ readback, clear, and restored-count checks for both. The private egress-blocked
 restore drill always exercises labels. Slot mappings need a resolved enclosure
 layout, so the private drill exercises them only in the separately approved
 live-read-only mode. This is not a gap in the standalone UI proof because the
-synthetic UI-only matrix runs the real mapping route with no history or admin
-sidecar.
+synthetic UI-only matrix runs the real mapping route with no history or Admin
+service.
 
 Admin touchpoints include system/profile setup, SSH and TLS material, runtime
 behavior overrides, backup inspection/import/export, container controls, and
@@ -75,6 +79,18 @@ LED and system-locator actions are hardware mutations. Neither automated mode
 runs them unless a separate device-safe target and approval are supplied.
 
 ## Private production-derived restore
+
+The release gate runs the private controller twice against separately exported
+archives and separate scratch, runtime, evidence, and target handles:
+
+1. Export the primary encrypted FULL backup with the standard configured default
+   and no request-level `packaging` field. Inspection must report `tar.zst`.
+2. Export a second encrypted FULL backup with `packaging` explicitly set to `7z`.
+   Inspection must report `7z`.
+
+Each run is a complete inspect, import, health/readback, restart, second readback,
+browser, performance, and cleanup cycle. A passing legacy run cannot replace the
+primary default-format run, and the two formats must not share one receipt.
 
 Run `scripts/run_private_qa_restore.py` only on a disposable Docker host. The
 normal mode is egress-blocked. The default Docker network is internal. A
@@ -112,12 +128,16 @@ The controller performs these phases:
    network metadata, and establish loopback-only host access.
 4. Stream the archive to `/api/admin/backup/inspect`. Inspection validates the
    archive, manifest, member sizes and hashes, candidate config, mapping/profile
-   data, SQLite databases, and segmented history without activating it.
+   data, SQLite databases, and segmented history without activating it. The
+   response includes the observed encryption mode and an expiring server-issued
+   single-use inspection receipt bound to the exact archive bytes.
 5. Keep only the sanitized inspection fields and aggregate counts. The raw
    manifest, systems, identifiers, filenames, and restored paths never enter the
-   receipt.
+   durable QA receipt. Keep the short-lived import receipt only in memory.
 6. Stream the same archive to
-   `/api/admin/backup/import?stop_services=true&restart_services=true`.
+   `/api/admin/backup/import?stop_services=true&restart_services=true`, supplying
+   the observed encryption mode and single-use receipt. The server rehashes the
+   archive and consumes the receipt atomically when import admission succeeds.
 7. Wait for all three services, compare every known archive count with the
    restored stack, exercise allowed pencil edits, clear them, and compare again.
 8. Run `docker compose restart`, wait for health, and compare counts a third
@@ -129,6 +149,13 @@ The controller performs these phases:
     same cleanup.
 12. Write `sanitized-receipt.json` only after default cleanup succeeds. A
     cleanup failure cannot produce a passing receipt.
+
+A backup from a deployment with segmented history (bundle `schema_version` 2)
+needs `--segmented-history`. The flag sets the documented
+`HISTORY_SEGMENT_CATALOG_PATH` in the QA stack before it starts, so the restore
+runs the same fresh-host path an operator would. After inspection the controller
+compares the flag with the backup and stops before import if they disagree. It
+never creates a placeholder catalog or segments folder.
 
 The controller's help output is the command authority:
 
@@ -189,10 +216,14 @@ retains that private state only for an explicitly supervised follow-up check.
 
 `sanitized-receipt.json` contains only:
 
-- run ID, target handle, source commit, exact image ID, archive SHA-256 and size;
+- run ID, target handle, archive SHA-256 and size;
+- `inspection.packaging` for the observed archive format and
+  `inspection.app_version` for the export-source application provenance;
+- `source_commit` and exact candidate `image_id` for the release candidate that
+  performed the inspect/import/restart/readback cycle;
 - offline or live-read-only mode;
-- schema, packaging, encryption, selected/present/absent group names, aggregate
-  counts, and member totals;
+- schema, encryption, selected/present/absent group names, aggregate counts, and
+  member totals;
 - restore/restart counts without names or paths;
 - pass/fail for count reconciliation, pencil cleanup, restart survival, browser,
   and performance gates;

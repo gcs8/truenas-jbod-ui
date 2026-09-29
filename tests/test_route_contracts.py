@@ -16,9 +16,13 @@ from fastapi.routing import APIRoute
 # Must precede admin_service.main, which builds its app at import time.
 import tests.admin_test_env  # noqa: F401  (must precede admin_service.main)
 from admin_service import main as admin_main
+from admin_service import routes as admin_routes
 from app import main as app_main
+from app import route_support as app_route_support
+from app import routes as app_routes
 from app.models.domain import SystemBackupExportRequest
 from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
+from app.services.snapshot_export import SnapshotExportBusyError
 
 
 APP_ROUTE_MATRIX = [
@@ -26,8 +30,10 @@ APP_ROUTE_MATRIX = [
     ("/static", (), "static", None, None),
     ("/metrics", ("GET",), "prometheus_metrics_endpoint", "starlette.responses.JSONResponse", None),
     ("/", ("GET",), "index", "starlette.responses.HTMLResponse", None),
+    ("/api/release-status", ("GET",), "get_release_status", "starlette.responses.JSONResponse", None),
+    ("/api/upgrade-notice/dismiss", ("POST",), "dismiss_upgrade_notice", "starlette.responses.JSONResponse", None),
     ("/sas-fabric", ("GET",), "sas_fabric_view", "starlette.responses.HTMLResponse", None),
-    ("/api/inventory", ("GET",), "get_inventory", "starlette.responses.JSONResponse", "app.models.domain.InventorySnapshot"),
+    ("/api/inventory", ("GET",), "get_inventory", "starlette.responses.JSONResponse", "app.models.domain.InventoryReadResponse"),
     ("/api/read-ui/auth/verify", ("GET",), "verify_read_ui_credentials", "starlette.responses.JSONResponse", None),
     ("/api/sas-fabric", ("GET",), "get_sas_fabric", "starlette.responses.JSONResponse", "app.models.domain.SasFabricSnapshot"),
     ("/api/sas-fabric/aliases", ("POST",), "save_sas_fabric_alias", "starlette.responses.JSONResponse", None),
@@ -45,6 +51,7 @@ APP_ROUTE_MATRIX = [
     ("/api/storage-views/{view_id}/slots/{slot_index}/smart", ("GET",), "get_storage_view_slot_smart_summary", "starlette.responses.JSONResponse", "app.models.domain.SmartSummaryView"),
     ("/api/storage-views/{view_id}/slots/{slot_index}/history", ("GET",), "get_storage_view_slot_history", "starlette.responses.JSONResponse", None),
     ("/api/slots/smart-batch", ("POST",), "get_slot_smart_summaries", "starlette.responses.JSONResponse", "app.models.domain.SmartBatchResponse"),
+    ("/api/storage-views/{view_id}/slots/smart-batch", ("POST",), "get_storage_view_slot_smart_summaries", "starlette.responses.JSONResponse", "app.models.domain.SmartBatchResponse"),
     ("/api/history/status", ("GET",), "get_history_status", "starlette.responses.JSONResponse", None),
     ("/api/history/refresh", ("POST",), "refresh_history_proxy", "starlette.responses.JSONResponse", None),
     ("/api/history/scopes/bundle", ("POST",), "get_history_scopes_bundle", "starlette.responses.JSONResponse", None),
@@ -85,6 +92,7 @@ ADMIN_ROUTE_MATRIX = [
     ("/api/admin/system-setup/{system_id}", ("DELETE",), "delete_system", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/purge-orphaned", ("POST",), "purge_orphaned_history", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/orphaned", ("GET",), "list_orphaned_history", "starlette.responses.JSONResponse", None),
+    ("/api/admin/history/systems", ("GET",), "list_history_systems", "starlette.responses.JSONResponse", None),
     ("/api/admin/history/adopt-removed-system", ("POST",), "adopt_removed_system_history", "starlette.responses.JSONResponse", None),
     ("/api/admin/system-setup/bootstrap", ("POST",), "bootstrap_service_account", "starlette.responses.JSONResponse", None),
     ("/api/admin/system-setup/sudoers-preview", ("POST",), "preview_sudoers_file", "starlette.responses.JSONResponse", None),
@@ -92,6 +100,20 @@ ADMIN_ROUTE_MATRIX = [
     ("/api/admin/storage-views/live-enclosures", ("GET",), "list_storage_view_live_enclosures", "starlette.responses.JSONResponse", None),
     ("/api/admin/profiles", ("POST",), "save_profile", "starlette.responses.JSONResponse", None),
     ("/api/admin/profiles/{profile_id}", ("DELETE",), "delete_profile", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups", ("GET",), "list_backups", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/run", ("POST",), "run_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/policy", ("GET",), "get_backup_policy", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/policy", ("PUT",), "save_backup_policy", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/lifecycle/plan", ("GET",), "plan_backup_grooming", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/lifecycle/apply", ("POST",), "apply_backup_grooming", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/targets/{target_id}/test", ("POST",), "test_backup_target", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}", ("GET",), "get_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/verify", ("POST",), "verify_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/preserve", ("POST",), "preserve_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/preserve", ("DELETE",), "unpreserve_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/download", ("GET",), "download_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/restore/inspect", ("POST",), "inspect_catalog_backup", "starlette.responses.JSONResponse", None),
+    ("/api/admin/backups/{artifact_id}/restore/import", ("POST",), "import_catalog_backup", "starlette.responses.JSONResponse", None),
     ("/healthz", ("GET",), "healthz", "starlette.responses.JSONResponse", None),
     ("/livez", ("GET",), "livez", "starlette.responses.JSONResponse", None),
 ]
@@ -177,7 +199,7 @@ class RouteContractTests(unittest.TestCase):
                 send,
             )
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry):
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             asyncio.run(invoke())
 
         start = next(message for message in messages if message["type"] == "http.response.start")
@@ -193,19 +215,60 @@ class RouteContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"caller-controlled-value", body)
 
-    def test_snapshot_capacity_error_maps_to_retryable_503(self) -> None:
-        response = asyncio.run(
-            app_main.snapshot_state_busy_exception_handler(
-                MagicMock(),
-                SnapshotStateBusyError(),
-            )
+    def test_capacity_errors_map_to_retryable_503_with_their_own_retry_hint(self) -> None:
+        cases = (
+            (SnapshotStateBusyError(), "1", "The server is busy. Try again in a moment."),
+            (SnapshotExportBusyError(), "5", "The server is busy. Try again in a moment."),
         )
+        for error, retry_after, detail in cases:
+            with self.subTest(error=type(error).__name__):
+                self.assertIs(app_main.app.exception_handlers[type(error)], app_main.mapped_exception_handler)
+                response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), error))
 
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.headers["retry-after"], "1")
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.headers["retry-after"], retry_after)
+                self.assertEqual(json.loads(response.body), {"ok": False, "detail": detail})
+
+    def test_unknown_enclosure_maps_to_404_without_a_retry_hint(self) -> None:
+        response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), UnknownEnclosureError()))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("retry-after", response.headers)
         self.assertEqual(
             json.loads(response.body),
-            {"ok": False, "detail": "Snapshot state capacity is temporarily busy; retry later."},
+            {"ok": False, "detail": "Requested enclosure is not available for this system."},
+        )
+
+    def test_slot_bounds_reuse_the_exception_response_table(self) -> None:
+        for error, status_code, retry_after in (
+            (UnknownEnclosureError(), 404, None),
+            (SnapshotStateBusyError(), 503, "1"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                service = SimpleNamespace(get_snapshot=AsyncMock(side_effect=error))
+                with self.assertRaises(app_main.HTTPException) as raised:
+                    asyncio.run(app_route_support.resolve_layout_slots(service, None))
+
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertEqual(raised.exception.detail, str(error))
+                self.assertEqual((raised.exception.headers or {}).get("Retry-After"), retry_after)
+
+    def test_slot_bounds_report_unavailable_when_discovery_found_no_enclosures(self) -> None:
+        unreachable = SimpleNamespace(selected_enclosure_id=None, enclosures=[])
+        wrong_shelf = SimpleNamespace(
+            selected_enclosure_id="enc-b", enclosures=[SimpleNamespace(id="enc-b")]
+        )
+        for snapshot, status_code in ((unreachable, 503), (wrong_shelf, 404)):
+            with self.subTest(selected=snapshot.selected_enclosure_id):
+                service = SimpleNamespace(get_snapshot=AsyncMock(return_value=snapshot))
+                with self.assertRaises(app_main.HTTPException) as raised:
+                    asyncio.run(app_route_support.resolve_layout_slots(service, "enc-a"))
+                self.assertEqual(raised.exception.status_code, status_code)
+
+        service = SimpleNamespace(get_snapshot=AsyncMock(return_value=unreachable))
+        self.assertEqual(
+            asyncio.run(app_route_support.resolve_read_layout_slots(service, "enc-a")),
+            (None, "unavailable"),
         )
 
     def test_admin_route_matrix_is_frozen(self) -> None:
@@ -322,6 +385,18 @@ class RouteContractTests(unittest.TestCase):
                     if isinstance(node, ast.ImportFrom)
                 }
                 self.assertNotIn(forbidden_module, imported_modules)
+        # Route modules import their collaborators, so file-wide lint suppressions
+        # (which would hide a mistyped name) must not come back.
+        for relative_path in (
+            "app/main.py",
+            "app/routes.py",
+            "admin_service/main.py",
+            "admin_service/routes.py",
+        ):
+            with self.subTest(blanket_suppression=relative_path):
+                source = Path(relative_path).read_text(encoding="utf-8")
+                self.assertNotRegex(source, r"(?m)^# ruff: noqa")
+                self.assertNotRegex(source, r"(?m)^# pyright: report")
 
     def test_main_routes_deduplicate_contiguous_service_perf_preambles(self) -> None:
         route_path = Path(__file__).resolve().parents[1] / "app" / "routes.py"
@@ -359,7 +434,7 @@ class RouteContractTests(unittest.TestCase):
                 duplicate_endpoints.append(endpoint.name)
         self.assertEqual(duplicate_endpoints, [])
 
-    def test_main_handler_resolves_main_module_patch_after_app_creation(self) -> None:
+    def test_route_handler_resolves_routes_module_patch_after_app_creation(self) -> None:
         application = app_main.create_app()
         route = cast(
             APIRoute,
@@ -370,8 +445,8 @@ class RouteContractTests(unittest.TestCase):
         registry = MagicMock()
         registry.get_service.return_value = service
 
-        with patch.object(app_main, "get_inventory_registry", return_value=registry) as getter:
-            response = asyncio.run(route.endpoint())
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry) as getter:
+            response = asyncio.run(route.endpoint(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(startup_problems=())))))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.body)["cache_state"], "empty")
@@ -400,8 +475,8 @@ class RouteContractTests(unittest.TestCase):
         sentinel = object()
 
         with (
-            patch.object(admin_main, "get_maintenance_service", return_value=service),
-            patch.object(admin_main, "TemporaryFileResponse", return_value=sentinel) as response_class,
+            patch.object(admin_routes, "get_maintenance_service", return_value=service),
+            patch.object(admin_routes, "TemporaryFileResponse", return_value=sentinel) as response_class,
         ):
             response = asyncio.run(
                 route.endpoint(

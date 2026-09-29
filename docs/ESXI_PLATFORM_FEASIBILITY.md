@@ -279,7 +279,7 @@ shows a real gap that BMC data can fill.
 
 Decision on `2026-05-14`: keep the local ESXi dev entries on password-only
 `root` SSH for this cycle, and keep that secret in the ignored local config or
-the admin sidecar secret flow. Do not commit root credentials to the repo,
+the Admin secret flow. Do not commit root credentials to the repo,
 docs, screenshots, wiki, or test fixtures.
 
 Rationale:

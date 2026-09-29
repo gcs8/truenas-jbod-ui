@@ -26,9 +26,36 @@ Follow recent logs:
 docker compose logs --tail=150 -f
 ```
 
-If `livez` is not `ok`, fix the container/runtime problem first. If `livez` is
-healthy but `healthz` reports a warning or degraded dependency, read that
-payload before chasing layout bugs.
+If `livez` is not `ok`, fix the container/runtime problem first. Then read the
+`status`, `summary` and `problems` fields of `healthz`:
+
+| `status` | HTTP | Meaning |
+| --- | --- | --- |
+| `ok` | 200 | Nothing to act on. Before the first inventory the summary says `Waiting for the first inventory`. |
+| `degraded` | 200 | Something outside the container is unhealthy: the TrueNAS API is unreachable or partial, SSH or the BMC failed, or the history service is unavailable or degraded. The app keeps serving what it has. |
+| `down` | 503 | A local fault the container cannot work through: its data, logs or known-hosts folder is not writable. See [Saves fail and the history service keeps restarting](#saves-fail-and-the-history-service-keeps-restarting). |
+
+A remote system being down never makes `healthz` return 503. The UI re-checks
+its folders at most every 30 seconds, so after a `chown` on the Docker host the
+status returns to `ok` without a restart. The history service `/healthz` uses
+the same words: `down` (HTTP 503) when its database could not be opened,
+`degraded` (HTTP 200) for collection or cleanup failures.
+
+## A container keeps restarting
+
+`docker compose up -d` reports success even when a container fails as soon as
+it starts. Check:
+
+```bash
+docker compose ps
+docker compose logs --tail=50 enclosure-ui
+```
+
+A container that shows `Restarting` in `docker compose ps` has a startup
+error. Read the last line of its log: it names the setting or folder that
+stopped it. Use `enclosure-history` or `enclosure-admin` in place of
+`enclosure-ui` for the other services. The admin container does not restart
+on its own; it shows `Exited` instead.
 
 ## The app starts but the UI looks empty
 
@@ -92,17 +119,18 @@ Do not broaden sudo more than needed.
 
 ## Main-UI writes return 401 or 403
 
-In Basic mode, `Read UI authentication required.` means the page is signed out
+In Basic mode, `Main UI authentication required.` means the page is signed out
 or the credentials are wrong. Sign in again on that page. A cross-origin error
 means `APP_PUBLIC_ORIGIN` does not exactly match the scheme, host, and port in
 the browser address bar.
 
 ## Admin mutations return 403
 
-`Cross-origin admin mutation rejected.` means the browser origin does not match
-`ADMIN_PUBLIC_ORIGIN`. Set it to the exact public address shown in the browser,
-with no path. The admin service requires that setting in both authentication
-modes and refuses to start if it is empty or malformed.
+`This page was opened at ..., but the admin service only accepts changes from
+...` means the browser origin does not match the admin address. The message
+names both addresses. Set `ADMIN_PUBLIC_ORIGIN` to the exact public address
+shown in the browser, with no path. The Admin service requires that setting in
+both authentication modes and refuses to start if it is empty or malformed.
 
 ## Full backup returns 400
 
@@ -111,24 +139,80 @@ without encryption. Enable encryption. Set
 `ADMIN_ALLOW_PLAINTEXT_BACKUP_EXPORT=true` only for an intentional,
 access-restricted workflow; the override does not make the archive safe to share.
 
-## A non-root container gets permission denied
+## Saves fail and the history service keeps restarting
 
-If a source-built non-root UI or history container reports `permission denied`,
-stop the stack and run the bounded ownership helper from the matching source
-checkout:
+Docker creates a missing bind mount as `root:root`. The containers run as uid
+10001, so nothing can be written until the host directories are owned by that
+uid. What you see:
+
+- Every mapping or alias save fails with
+  `Could not save: the data folder is not writable by the app. See
+  Troubleshooting.` (HTTP 503). Before v0.24 this was a generic HTTP 500.
+- The main UI `/healthz` answers HTTP 503 with `status: down` and the same
+  `Cannot write to ...` line in `problems`. The container healthcheck probes
+  `/livez`, so Docker does not restart it or mark it unhealthy for this.
+- The history service logs
+  `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
+  Docker host run: sudo chown -R 10001:10001 ./history`, retries a few times
+  with growing backoff, and then stops with that same line instead of looping a
+  traceback.
+
+The log line already names the host path: the container sees `/app/history`,
+but compose binds `./history` from the directory holding `docker-compose.yml`,
+so that is what you chown. Run it from that directory, for every bound
+directory at once:
 
 ```bash
+sudo chown -R 10001:10001 ./config ./data ./history ./logs ./backup-status
+docker compose up -d
+```
+
+Create the directories before the first `docker compose up -d` to avoid this
+entirely:
+
+```bash
+mkdir -p config/ssh data history logs backup-status
+```
+
+## A non-root container gets permission denied
+
+The default `docker-compose.yml` runs the UI and history as root, so a normal
+image update needs no ownership change. Non-root services come only from the
+optional `docker-compose.nonroot.yml` overlay. If you added that overlay and a
+service now reports `permission denied`, the bind mounts are still owned by
+root. From the folder that holds your Compose files, with a published image and
+no repository checkout:
+
+```bash
+docker compose down
 app_uid="${APP_UID:-10001}"
 app_gid="${APP_GID:-10001}"
+backup_uid="${BACKUP_UID:-1000}"
+sudo find ./config -path ./config/backup-secrets -prune -o -exec chown "$app_uid:$app_gid" {} +
+sudo chown -R "$app_uid:$app_gid" ./data ./logs ./history
+sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
+docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
+```
+
+If `.env` sets `APP_UID`, `APP_GID` or `BACKUP_UID`, set the same values above;
+shell variables do not read `.env`. If `HISTORY_SEGMENT_CATALOG_PATH` is set, do
+not run a recursive change over the segmented history tree; follow
+[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] instead.
+To undo, drop the overlay from the `-f` chain; root-run services still read
+files owned by the app identity.
+
+From a source checkout you can use the bounded helper instead, which also sets
+modes and refuses symlinks and unexpected paths:
+
+```bash
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid"
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. If `.env` overrides `APP_UID` or `APP_GID`, export the
-same values before running the block. Do not use recursive `chmod 777`, and do
-not run this source-build migration against the published v0.22.2 Compose/image
-pair. If SSH then fails to load `known_hosts`, verify that
-`data/known_hosts` is owned by the configured app UID/GID and uses mode `0660`.
+Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
+load `known_hosts`, verify that `data/known_hosts` (or the file named by
+`ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
+configured app UID/GID and uses mode `0660`.
 
 ## SCALE shows a generic runtime profile
 
@@ -188,9 +272,34 @@ docker compose --profile history pull
 docker compose --profile history up -d
 ```
 
+## History says permission denied or readonly database
+
+`Permission denied: '/app/history/history.db'` or `attempt to write a readonly
+database` in the history log means the `history` folder or the database file is
+not writable by the user the container runs as. With the default Compose file
+that is root, so check for a read-only mount or file system first. With the
+non-root overlay it is `APP_UID:APP_GID`; fix ownership as described in
+[A non-root container gets permission denied](#a-non-root-container-gets-permission-denied).
+Do not use `chmod 777`.
+
+## History refuses to start after changing HISTORY_BIND_ADDRESS
+
+`Configuration error: HISTORY_BIND_ADDRESS is not loopback.` in the history log (before v0.24:
+`Non-loopback history exposure requires refresh token mode.`) means `HISTORY_BIND_ADDRESS` is no longer loopback but the token settings are
+missing. Set token mode, a token and `HISTORY_PUBLIC_ORIGIN` together as shown in
+[[Docker and GHCR Deployment|Docker-and-GHCR-Deployment]], then recreate the
+container:
+
+```bash
+docker compose --profile history up -d --force-recreate enclosure-history
+```
+
+To go back to localhost only, remove `HISTORY_BIND_ADDRESS` from `.env` and
+recreate the container the same way.
+
 ## The admin page is missing
 
-The admin sidecar is optional. If you expected it to be running:
+The Admin service is optional. If you expected it to be running:
 
 ```bash
 docker compose --profile admin ps

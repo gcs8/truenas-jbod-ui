@@ -8,7 +8,7 @@ test.use({
 
 async function gotoAdmin(page) {
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "System Setup And Recovery" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Admin", exact: true })).toBeVisible();
   await expect(page.locator("#backup-path-list")).toBeVisible();
   await expect(page.locator("#debug-path-list")).toBeVisible();
 }
@@ -40,7 +40,7 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#debug-scrub-identifiers-toggle")).toBeVisible();
     await expect(page.locator("#setup-create-demo-button")).toBeVisible();
     await expect(page.locator("#setup-result")).toContainText(
-      "restart the read UI after a new system is added"
+      "Saved systems appear after the main UI next handles a page or API request."
     );
   });
 
@@ -58,10 +58,26 @@ test.describe("admin sidecar smoke", () => {
     await expect(lockedPill).toHaveClass(/is-selected/);
     await expect(page.locator("#backup-encrypt-toggle")).toBeChecked();
     await expect(page.locator("#backup-encrypt-toggle")).toBeDisabled();
-    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
     await expect(page.locator("#backup-path-summary")).toContainText(
       `${selectedBefore + 1} of`
     );
+
+    // #397: an encrypted FULL backup with history defaults to tar.zst (TJBENC02)
+    // and keeps 7z selectable; without history the locked selection forces 7z.
+    const historyPill = page.locator('#backup-path-list .path-pill[data-path-key="history_db"]');
+    if (!(await historyPill.getAttribute("class")).includes("is-selected")) {
+      await historyPill.click();
+    }
+    await expect(historyPill).toHaveClass(/is-selected/);
+    await expect(page.locator("#backup-packaging")).toHaveValue("tar.zst");
+    await expect(page.locator("#backup-packaging")).toBeEnabled();
+    await page.locator("#backup-packaging").selectOption("7z");
+    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
+
+    await historyPill.click();
+    await expect(historyPill).not.toHaveClass(/is-selected/);
+    await expect(page.locator("#backup-packaging")).toHaveValue("7z");
+    await expect(page.locator("#backup-packaging")).toBeDisabled();
   });
 
   test("split debug scrub controls gate locked debug paths", async ({ page }) => {
@@ -113,6 +129,9 @@ test.describe("admin sidecar smoke", () => {
     await expect(page.locator("#setup-bootstrap-sudoers-preview")).toContainText(
       "does not use the Linux sudoers/bootstrap flow"
     );
+    await expect(page.locator("#setup-bootstrap-details")).not.toHaveAttribute("open", /.*/);
+    await expect(page.locator("#setup-ha-toggle")).toBeHidden();
+    await page.locator("#setup-ssh-commands-details > summary").click();
     await page.locator("#setup-load-recommended-button").click();
     await expect(page.locator("#setup-ssh-commands")).toHaveValue(/\/opt\/lsi\/storcli64\/storcli64 \/c0\/eall\/sall show all J/);
   });
@@ -194,5 +213,262 @@ test.describe("admin sidecar smoke", () => {
     await page.locator("#setup-storage-view-add-button").click();
 
     await expectTopLoaderPreviewGeometry("#setup-storage-view-preview-grid", page);
+  });
+
+  test("restart choices and failed timing drafts survive refresh", async ({ page }) => {
+    await gotoAdmin(page);
+    for (const prefix of ["backup-export", "backup-import", "debug-export"]) {
+      const stop = page.locator(`#${prefix}-stop-toggle`);
+      const restart = page.locator(`#${prefix}-restart-toggle`);
+      await stop.uncheck();
+      await expect(restart).toBeChecked();
+      await expect(restart).toBeDisabled();
+      await stop.check();
+      await expect(restart).toBeChecked();
+      await restart.uncheck();
+      await stop.uncheck();
+      await stop.check();
+      await expect(restart).not.toBeChecked();
+    }
+    const field = page.locator('input[data-runtime-behavior-key]:enabled').first();
+    await field.fill("99");
+    await field.focus();
+    await page.route("**/api/admin/runtime-behavior", route => route.fulfill({status: 200, contentType: "text/html", body: "<h1>Synthetic gateway response</h1>"}));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(page.locator("#runtime-behavior-result")).toContainText("save outcome is unknown");
+    await expect(page.locator("#runtime-behavior-result")).toContainText("may already have been saved");
+    await expect(page.locator("#runtime-behavior-result")).not.toContainText(/retry/i);
+    await expect(field).toHaveValue("99");
+    await field.focus();
+    await page.locator("#refresh-state-button").evaluate(button => button.click());
+    await expect(page.locator("#admin-status-banner")).toContainText("Refreshed.");
+    await expect(field).toHaveValue("99");
+    await expect(field).toBeFocused();
+  });
+
+  test("a slow history scan runs once per page and never holds up Refreshed.", async ({ page }) => {
+    let scans = 0;
+    let releaseScan;
+    const scanReleased = new Promise(resolve => {
+      releaseScan = resolve;
+    });
+    await page.route("**/api/admin/history/orphaned", async route => {
+      scans += 1;
+      await scanReleased;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, orphaned_systems: [], valid_system_ids: [], purge_preview_token: "synthetic" }),
+      });
+    });
+    await gotoAdmin(page);
+    await expect(page.locator("#history-adopt-result")).toContainText("Scanning");
+    await page.locator("#refresh-state-button").evaluate(button => button.click());
+    await expect(page.locator("#admin-status-banner")).toContainText("Refreshed.", { timeout: 5_000 });
+    expect(scans).toBe(1);
+    releaseScan();
+    await expect(page.locator("#history-adopt-result")).toContainText("No orphaned history rows");
+    expect(scans).toBe(1);
+  });
+
+  test("a hot-reloaded save says applied; a restart-only save offers Restart main UI now", async ({ page }) => {
+    await gotoAdmin(page);
+    const field = page.locator('input[data-runtime-behavior-key]:enabled').first();
+    const result = page.locator("#runtime-behavior-result");
+
+    // A timing change is applied by the main UI itself: no restart button.
+    await field.fill(String(Number(await field.inputValue()) + 1));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(result).toContainText("The main UI applies it when it next handles a page or API request; no restart needed.");
+    await expect(result.getByRole("button", { name: "Restart main UI now" })).toHaveCount(0);
+
+    // A save that touched a restart-only setting: the server says so, and the
+    // button runs the existing restart action and its convergence polling.
+    const uiContainer = (overrides) => ({
+      key: "ui", name: "truenas-jbod-ui", label: "Main UI", description: "Main UI.",
+      status: "running", status_text: "Up (healthy)", running: true, health: "healthy",
+      restart_required: true, lifecycle_state: "normal", lifecycle_label: "Normal",
+      can_stop: true, can_start: false, can_restart: true, ...overrides,
+    });
+    const restartedRuntime = { available: true, detail: null, containers: [uiContainer({ restart_required: false })] };
+    const restartCalls = [];
+    await page.route("**/api/admin/runtime-behavior", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      await route.fulfill({
+        response,
+        json: {
+          ...body,
+          restart_required: ["ui"],
+          restart_settings: ["app.public_origin"],
+          detail: "Timing saved. The main UI needs a restart to apply this.",
+          runtime: { available: true, detail: null, containers: [uiContainer({})] },
+        },
+      });
+    });
+    await page.route("**/api/admin/runtime/containers/ui/restart", async (route) => {
+      restartCalls.push(route.request().method());
+      await route.fulfill({ json: { ok: true, runtime: restartedRuntime } });
+    });
+    await page.route("**/api/admin/runtime", (route) => route.fulfill({ json: { ok: true, runtime: restartedRuntime } }));
+
+    await field.fill(String(Number(await field.inputValue()) + 1));
+    await page.locator("#runtime-behavior-save-button").click();
+    await expect(result).toContainText("Timing saved. The main UI needs a restart to apply this.");
+    const button = result.getByRole("button", { name: "Restart main UI now" });
+    await expect(button).toBeVisible();
+    await button.click();
+    await expect(page.locator("#admin-status-banner")).toContainText("Main UI is running and healthy.");
+    expect(restartCalls).toEqual(["POST"]);
+  });
+
+  test("demo creation preserves a loaded existing synthetic system", async ({ page }) => {
+    test.skip(process.env.PLAYWRIGHT_ADMIN_SYNTHETIC_MUTATIONS !== "1", "Requires the isolated synthetic admin runner.");
+    const created = await page.request.post("/api/admin/system-setup", {data: {
+      system_id: "qa-safety-existing", label: "Synthetic existing system", platform: "linux",
+      truenas_host: "https://synthetic.example.invalid", ssh_enabled: false, make_default: true,
+    }});
+    expect(created.ok()).toBeTruthy();
+    await gotoAdmin(page);
+    const before = await (await page.request.get("/api/admin/state")).json();
+    const original = before.systems[0];
+    expect(original).toBeTruthy();
+    await page.locator("#setup-system-id").fill(original.id);
+    await page.locator("#setup-system-label").fill(original.label);
+    const posted = page.waitForRequest(request => request.url().endsWith("/api/admin/system-setup/demo") && request.method() === "POST");
+    await page.locator("#setup-create-demo-button").click();
+    const request = await posted;
+    expect(request.postDataJSON().replace_existing).toBe(false);
+    expect(request.postDataJSON().system_id).not.toBe(original.id);
+    await expect(page.locator("#setup-result")).toContainText(/created|saved/i);
+    const after = await (await page.request.get("/api/admin/state")).json();
+    expect(after.systems.find(system => system.id === original.id)).toEqual(original);
+    expect(after.systems.length).toBe(before.systems.length + 1);
+  });
+});
+
+// Backups library (#398). The /api/admin/backups* responses are a synthetic
+// fake served by page.route, so the page is exercised without real archives.
+test.describe("admin backups library", () => {
+  const SHA = "b".repeat(64);
+  function library() {
+    return {
+      classes: {
+        config: { enabled: true, debounce_seconds: 60, max_delay_seconds: 900, local_keep: 10, remote_keep: 20, remote_max_age_days: null, pending_changes: 0, last_run: null },
+        full: { enabled: true, schedule: "0 3 * * *", next_run_at: "2026-09-25T03:00:00Z", local_keep: 3, remote_keep: 5, remote_max_age_days: 90, last_run: null },
+      },
+      targets: [
+        { id: "offsite", label: "Offsite SFTP", provider: "sftp", transport_encrypted: true, enabled: true, last_run: { at: "2026-09-20T03:00:00Z", ok: true, detail: "" } },
+        { id: "plain-ftp", label: "Lab FTP", provider: "ftp", transport_encrypted: false, enabled: true, last_run: null },
+      ],
+      artifacts: [
+        { id: "cfg-1", backup_class: "config", location: "local", created_at: "2026-09-21T10:00:00Z", size: 2048, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: false, preserve_reason: null, preserved_by: null, change_count: 1, app_version: "0.23.0" },
+        { id: "full-1", backup_class: "full", location: "local", created_at: "2026-09-21T03:00:00Z", size: 1048576, sha256: SHA, verified: true, restorable: true, state: "ok", preserved: true, preserve_reason: "before upgrade", preserved_by: "admin", change_count: 0, app_version: "0.23.0" },
+        { id: "full-2", backup_class: "full", location: "offsite", created_at: "2026-09-22T03:00:00Z", size: 4096, sha256: null, verified: false, restorable: false, state: "incomplete", preserved: false, change_count: 0, app_version: null },
+      ],
+      storage: { local: { config_bytes: 2048, full_bytes: 1048576, count: 2 }, offsite: { config_bytes: 0, full_bytes: 4096, count: 1 } },
+      available: true,
+      detail: null,
+      running: null,
+    };
+  }
+
+  async function fakeBackupApi(page) {
+    const seen = [];
+    await page.route(/\/api\/admin\/backups(\/|$|\?)/, async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const key = `${request.method()} ${url.pathname}`;
+      seen.push({ key, headers: request.headers(), body: request.postData() });
+      const json = (body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+      switch (key) {
+        case "GET /api/admin/backups": return json(library());
+        case "GET /api/admin/backups/cfg-1": return json({ ...library().artifacts[0], changes: [{ change_id: "c1", at: "2026-09-21T09:59:00Z", action: "system saved", subject: "nas-a.example.test" }] });
+        case "POST /api/admin/backups/full-1/restore/inspect": return json({ ok: true, encryption_mode: "plaintext", inspection_receipt: "synthetic-receipt", aggregate_counts: { systems: 1 } });
+        case "POST /api/admin/backups/full-1/restore/import": return json({ ok: true, systems: [], default_system_id: null, restored_paths: [], restored_history_database: false, stopped_containers: [], restarted_containers: [], restart_failures: {} });
+        case "GET /api/admin/backups/lifecycle/plan": return json({ plan_token: "synthetic-plan", expires_at: "2026-09-24T12:00:00Z", items: [{ id: "full-2", location: "offsite", backup_class: "full", kind: "unverified", reason: "unverified for longer than grace 1d (age 2d)" }], guarded: [] });
+        case "POST /api/admin/backups/lifecycle/apply": return json({ ok: true, deleted: ["full-2"], already_missing: [], failed: null, not_attempted: [] });
+        case "POST /api/admin/backups/targets/plain-ftp/test": return json({ ok: true, detail: "writable", duration_ms: 12 });
+        default: return json({ detail: `synthetic fake has no ${key}` }, 404);
+      }
+    });
+    return seen;
+  }
+
+  async function openBackups(page) {
+    await gotoAdmin(page);
+    const tab = page.locator('[data-admin-view-button="backups"]');
+    await tab.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator('[data-admin-view-panel="backups"]')).toBeVisible();
+    await expect(tab).toHaveAttribute("aria-pressed", "true");
+    await expect(page).toHaveURL(/view=backups/);
+    await expect(page.locator("#backup-library-status")).toHaveText("3 backup copies.");
+  }
+
+  test("lists copies by type with state, kept reason and unencrypted label", async ({ page }) => {
+    await fakeBackupApi(page);
+    await openBackups(page);
+
+    await expect(page.locator("#backup-library-policies")).toContainText("Settings backups");
+    await expect(page.locator("#backup-library-policies")).toContainText("Copies kept on targets20");
+    const ftp = page.locator('#backup-library-targets tr[data-target-id="plain-ftp"]');
+    await expect(ftp.locator(".backup-plain-badge")).toHaveText("Unencrypted");
+    await expect(ftp).toContainText("Not used yet");
+    await ftp.getByRole("button", { name: "Test" }).click();
+    await expect(ftp).toContainText("Works (12 ms).");
+
+    const incomplete = page.locator('tr[data-artifact-id="full-2"]');
+    await expect(incomplete).toContainText("Incomplete, can't restore");
+    await expect(incomplete.getByRole("button", { name: "Restore" })).toBeDisabled();
+    await expect(page.locator('tr[data-artifact-id="full-1"]')).toContainText("Kept before upgrade");
+    await expect(page.locator('tr[data-artifact-id="cfg-1"] a[data-backup-action="download"]'))
+      .toHaveAttribute("href", "/api/admin/backups/cfg-1/download");
+    await expect(page.locator("#backup-library-storage")).toContainText("This server");
+    await expect(page.locator('[data-admin-view-panel="backups"]')).not.toContainText(/\/(?:srv|data|run|home)\//);
+  });
+
+  test("details dialog shows changes and Escape returns focus", async ({ page }) => {
+    await fakeBackupApi(page);
+    await openBackups(page);
+    const details = page.locator('tr[data-artifact-id="cfg-1"]').getByRole("button", { name: "Details" });
+    await details.focus();
+    await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Backup details" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toContainText("system saved: nas-a.example.test");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(details).toBeFocused();
+  });
+
+  test("restore from the server inspects, confirms, then imports without an upload", async ({ page }) => {
+    const seen = await fakeBackupApi(page);
+    await openBackups(page);
+    await page.locator('tr[data-artifact-id="full-1"]').getByRole("button", { name: "Restore" }).click();
+    const dialog = page.getByRole("dialog", { name: "Restore from this backup" });
+    await expect(dialog.locator("#backup-restore-passphrase")).toBeFocused();
+    await dialog.getByRole("button", { name: "Check backup" }).click();
+    await expect(dialog).toContainText("Restoring replaces all current settings, mappings and history with this backup. Continue?");
+    expect(seen.some((call) => call.key.endsWith("/restore/import"))).toBe(false);
+    await dialog.getByRole("button", { name: "Restore", exact: true }).click();
+    await expect(dialog).toContainText("Restored.");
+    const imported = seen.find((call) => call.key.endsWith("/restore/import"));
+    expect(imported.headers["x-backup-inspection-receipt"]).toBe("synthetic-receipt");
+    expect(imported.headers["x-backup-expected-encryption"]).toBe("plaintext");
+    expect(imported.body).toBeNull();
+    await expect(page.locator("#admin-status-banner")).toContainText("Backup restored.");
+  });
+
+  test("clean up previews the plan and applies exactly its token", async ({ page }) => {
+    const seen = await fakeBackupApi(page);
+    await openBackups(page);
+    await page.locator("#backup-library-cleanup-button").click();
+    const dialog = page.getByRole("dialog", { name: "Clean up old backups" });
+    await expect(dialog).toContainText("never verified, and older than 1 day (it is 2 days old)");
+    await dialog.getByRole("button", { name: "Delete 1" }).click();
+    await expect(dialog).toContainText("Deleted 1 copy.");
+    const applied = seen.find((call) => call.key === "POST /api/admin/backups/lifecycle/apply");
+    expect(JSON.parse(applied.body)).toEqual({ plan_token: "synthetic-plan" });
   });
 });

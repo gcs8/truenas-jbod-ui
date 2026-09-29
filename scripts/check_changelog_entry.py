@@ -4,9 +4,10 @@ The gate reads the ``base...head`` diff of one pull request with ``git`` only.
 It never talks to the network. A pull request must either carry the
 ``no-changelog`` or ``dependencies`` escape label, or touch an operator-visible
 path and add at least one bullet under
-``## Unreleased`` in one of the allowed ``### `` subsections whose trailing
-parenthetical names the pull request as ``(#N)``. A pull request labelled
-``breaking`` must add that bullet under ``### Breaking changes`` or
+``## Unreleased``, or under the first SemVer release section when Unreleased has
+been cut for a release candidate, in one of the allowed ``### `` subsections
+whose trailing parenthetical names the pull request as ``(#N)``. A pull request
+labelled ``breaking`` must add that bullet under ``### Breaking changes`` or
 ``### Upgrade notes``.
 
 Usage from a checkout that has both refs::
@@ -16,7 +17,9 @@ Usage from a checkout that has both refs::
 
 In GitHub Actions ``--event "$GITHUB_EVENT_PATH"`` supplies the pull request
 number and labels from the event payload; ``--pr`` and ``--labels`` override
-those values when given.
+those values when given. ``--advisory`` keeps every message but exits 0; the
+workflow passes it for pull requests whose author has no write access and so
+cannot apply the ``no-changelog`` label the failure text asks for.
 """
 
 from __future__ import annotations
@@ -31,6 +34,15 @@ from pathlib import Path
 
 CHANGELOG_PATH = "CHANGELOG.md"
 UNRELEASED_HEADING = "## Unreleased"
+SEMVER_CORE = r"(?:0|[1-9][0-9]*)"
+SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_BUILD_IDENTIFIER = r"[0-9A-Za-z-]+"
+RELEASE_HEADING = re.compile(
+    rf"^## v{SEMVER_CORE}\.{SEMVER_CORE}\.{SEMVER_CORE}"
+    rf"(?:-{SEMVER_PRERELEASE_IDENTIFIER}(?:\.{SEMVER_PRERELEASE_IDENTIFIER})*)?"
+    rf"(?:\+{SEMVER_BUILD_IDENTIFIER}(?:\.{SEMVER_BUILD_IDENTIFIER})*)?"
+    r"(?: - \d{4}-\d{2}-\d{2})?$"
+)
 NO_CHANGELOG_LABEL = "no-changelog"
 # Dependabot pull requests cannot add a changelog line; they still reach the
 # release body under "Dependencies" through .github/release.yml.
@@ -68,6 +80,7 @@ EXCLUDED_PATTERNS = (
     re.compile(r"^CHANGELOG\.md$"),
     re.compile(r"^docs/RELEASE_WRAP_[^/]*$"),
     re.compile(r"^docs/RELEASE_NOTES_[^/]*$"),
+    re.compile(r"^docs/archive/"),
 )
 
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -159,15 +172,23 @@ def _head_changelog_lines(repo: Path, head: str) -> list[str]:
     return text.splitlines()
 
 
-def unreleased_entries(lines: list[str]) -> list[Entry]:
-    """Return every bullet under ``## Unreleased`` with its subsection.
+def current_entries(lines: list[str]) -> tuple[str, list[Entry]]:
+    """Return bullets from Unreleased or the first versioned release section.
 
     Continuation lines (indented, non-empty) are joined to the bullet so a
     trailing ``(#N)`` may sit on a wrapped line.
     """
 
+    headings = [line.strip() for line in lines if line.startswith("## ")]
+    if UNRELEASED_HEADING in headings:
+        selected_heading = UNRELEASED_HEADING
+    else:
+        selected_heading = next(
+            (heading for heading in headings if RELEASE_HEADING.fullmatch(heading)),
+            UNRELEASED_HEADING,
+        )
     entries: list[Entry] = []
-    in_unreleased = False
+    in_current = False
     subsection = ""
     current_lines: list[str] = []
     current_start = 0
@@ -183,10 +204,10 @@ def unreleased_entries(lines: list[str]) -> list[Entry]:
     for number, raw in enumerate(lines, start=1):
         if raw.startswith("## "):
             flush()
-            in_unreleased = raw.strip() == UNRELEASED_HEADING
+            in_current = raw.strip() == selected_heading
             subsection = ""
             continue
-        if not in_unreleased:
+        if not in_current:
             continue
         if raw.startswith("### "):
             flush()
@@ -202,10 +223,40 @@ def unreleased_entries(lines: list[str]) -> list[Entry]:
             continue
         flush()
     flush()
-    return entries
+    return selected_heading, entries
+
+
+ADVISORY_PREFIX = (
+    "Advisory only: this pull request's author cannot apply repository labels, "
+    "so the changelog gate reports instead of blocking. Before merge a "
+    "maintainer either applies the label named below or adds the bullet."
+)
 
 
 def evaluate(
+    repo: Path,
+    *,
+    base: str,
+    head: str,
+    pr_number: int,
+    labels: set[str],
+    advisory: bool = False,
+) -> GateResult:
+    """Decide the gate for one pull request.
+
+    ``advisory`` keeps every message but turns a failure into a pass. It is
+    used for contributors without write access, who cannot apply the
+    ``no-changelog`` label the failure text asks for; a maintainer resolves the
+    reported item before merge.
+    """
+
+    result = _evaluate(repo, base=base, head=head, pr_number=pr_number, labels=labels)
+    if result.ok or not advisory:
+        return result
+    return GateResult(True, [ADVISORY_PREFIX, *result.messages])
+
+
+def _evaluate(
     repo: Path,
     *,
     base: str,
@@ -231,8 +282,19 @@ def evaluate(
             ],
         )
 
+    head_lines = _head_changelog_lines(repo, head)
     added = added_line_numbers(repo, base, head, CHANGELOG_PATH) if CHANGELOG_PATH in paths else set()
-    entries = unreleased_entries(_head_changelog_lines(repo, head)) if added else []
+    selected_heading, entries = current_entries(head_lines) if added else (UNRELEASED_HEADING, [])
+    if selected_heading != UNRELEASED_HEADING and not _heading_was_added(head_lines, selected_heading, added):
+        return GateResult(
+            False,
+            [
+                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section on this branch, so a bullet for "
+                f"#{pr_number} would land in the already shipped '{selected_heading}' section.",
+                f"Insert '{UNRELEASED_HEADING}', a blank line, and a '### <Subsection>' heading directly "
+                f"above '{selected_heading}', then put the bullet there.",
+            ],
+        )
     touched = [
         entry
         for entry in entries
@@ -247,14 +309,19 @@ def evaluate(
             f"CHANGELOG.md needs an entry for #{pr_number}. The diff touches "
             f"operator-visible paths ({', '.join(relevant[:5])}"
             f"{', ...' if len(relevant) > 5 else ''}) but adds no bullet under "
-            f"'{UNRELEASED_HEADING}' that ends with '(#{pr_number})'."
+            f"'{selected_heading}' that ends with '(#{pr_number})'."
         )
         messages.append(
-            "Add one line under '## Unreleased' in one of these subsections: "
+            f"Add one line under '{selected_heading}' in one of these subsections: "
             + ", ".join(f"'### {name}'" for name in ALLOWED_SUBSECTIONS)
             + f". Shape: '- <one sentence in past tense> (#{pr_number})'. "
             "Wrap at about 80 columns; the '(#N)' may sit on the continuation line."
         )
+        if UNRELEASED_HEADING not in {line.strip() for line in head_lines if line.startswith("## ")}:
+            messages.append(
+                f"CHANGELOG.md has no '{UNRELEASED_HEADING}' section yet; insert it directly above the "
+                "top release heading first."
+            )
         messages.append(
             f"If this pull request is intentionally invisible to operators, apply the "
             f"'{NO_CHANGELOG_LABEL}' label and re-run the check instead."
@@ -271,9 +338,20 @@ def evaluate(
 
     subsections = sorted({entry.subsection for entry in touched})
     messages.append(
-        f"CHANGELOG entry for #{pr_number} found under: {', '.join(subsections)}."
+        f"CHANGELOG entry for #{pr_number} found in {selected_heading} under: "
+        f"{', '.join(subsections)}."
     )
     return GateResult(True, messages)
+
+
+def _heading_was_added(lines: list[str], heading: str, added: set[int]) -> bool:
+    """True when this pull request itself introduces ``heading`` (a release cut)."""
+
+    return any(
+        number in added
+        for number, raw in enumerate(lines, start=1)
+        if raw.startswith("## ") and raw.strip() == heading
+    )
 
 
 def _entry_was_added(entry: Entry, entries: list[Entry], added: set[int]) -> bool:
@@ -319,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
         help="GitHub event payload JSON (GITHUB_EVENT_PATH) supplying number and labels.",
     )
     parser.add_argument(
+        "--advisory",
+        action="store_true",
+        help=(
+            "Report a missing entry without failing. Used for pull requests whose "
+            "author cannot apply the 'no-changelog' label."
+        ),
+    )
+    parser.add_argument(
         "--repo",
         type=Path,
         default=Path.cwd(),
@@ -350,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             head=args.head,
             pr_number=pr_number,
             labels=labels,
+            advisory=args.advisory,
         )
     except GateError as exc:
         print(str(exc))

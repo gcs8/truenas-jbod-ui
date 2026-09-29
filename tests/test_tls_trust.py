@@ -299,6 +299,26 @@ class TLSContextTests(unittest.TestCase):
         context.load_verify_locations.assert_called_once_with(cafile="/app/config/tls/archive-core.pem")
         self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
 
+    def test_build_tls_client_context_names_an_unreadable_ca_bundle(self) -> None:
+        # #537: an unreadable bundle raised a bare ENOENT OSError, which the
+        # SMART batch reported as an unusable application data directory.
+        from app.services.tls_context import TlsTrustConfigurationError
+
+        with tempfile.TemporaryDirectory() as raw:
+            missing = Path(raw) / "absent-ca.pem"
+            with self.assertRaises(TlsTrustConfigurationError) as raised:
+                build_tls_client_context(
+                    TrueNASConfig(
+                        host="https://tls.invalid",
+                        api_key="synthetic-ephemeral-token",
+                        verify_ssl=True,
+                        tls_ca_bundle_path=str(missing),
+                    )
+                )
+
+        self.assertIn(str(missing), str(raised.exception))
+        self.assertNotIsInstance(raised.exception, OSError)
+
     @patch("app.services.tls_context.ssl.create_default_context")
     def test_build_tls_client_context_disables_verification_when_requested(
         self,

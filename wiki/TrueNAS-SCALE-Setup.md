@@ -37,6 +37,26 @@ This first connection does not verify the appliance certificate. After the UI
 works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
 verification with the system trust store or a private CA bundle.
 
+### Choose the API dialect per host
+
+`api_dialect` selects the middleware wire protocol for one host. The default
+`ddp` speaks the legacy `/websocket` endpoint that TrueNAS CORE and every SCALE
+release expose. `jsonrpc` speaks the JSON-RPC 2.0 API that SCALE 25.04 and
+newer document as the supported interface. Keep CORE hosts on `ddp`; CORE has
+no JSON-RPC endpoint. `api_version` is read only by the `jsonrpc` dialect:
+`current` follows whatever the appliance serves, and a pinned value such as
+`v25.10.0` targets one documented API version.
+
+```yaml
+truenas:
+  api_dialect: jsonrpc
+  api_version: current
+```
+
+The deprecated REST API alert that SCALE 25.10 and newer raise is about
+`/api/v2.0`, which this app has never called. It is unrelated to this setting
+and to either dialect.
+
 ## 2. Add optional SSH enrichment
 
 Use a dedicated `jbodmap` account, SSH key authentication, strict host-key

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import hmac
 import io
 import json
+import logging
+import mmap
 import os
 import re
 import select
@@ -19,17 +22,22 @@ import time
 import uuid
 import zipfile
 import zlib
-from contextlib import closing, nullcontext
+from collections.abc import Mapping
+from contextlib import closing, contextmanager, nullcontext
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Literal
+from types import MappingProxyType
+from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+from history_service.backup_archive import stream_envelope
 
 try:
     import zstandard as zstd
@@ -44,6 +52,7 @@ from app.config import (
     _derive_runtime_layout_paths,
     _normalize_systems,
     get_settings,
+    load_settings,
 )
 from app.models.domain import ManualMapping, SasFabricAlias
 from app.services.profile_registry import ProfileRegistry
@@ -73,6 +82,8 @@ from history_service.segmented_restore import (
 )
 from history_service.store import SQLITE_CONNECT_TIMEOUT_SECONDS, HistoryStore
 
+
+logger = logging.getLogger(__name__)
 
 BUNDLE_SCHEMA_VERSION = 1
 SUPPORTED_BUNDLE_SCHEMA_VERSIONS = frozenset({1, 2})
@@ -219,6 +230,10 @@ SENSITIVE_GROUP_KEYS: set[str] = {
     for key, item in BACKUP_GROUP_METADATA.items()
     if bool(item["sensitive"])
 }
+STRUCTURED_YAML_GROUP_KEYS = frozenset(
+    {CONFIG_FILE_KEY, RUNTIME_OVERRIDES_FILE_KEY, PROFILE_FILE_KEY}
+)
+
 
 ArchivePackaging = Literal["tar.zst", "zip", "tar.gz", "7z"]
 SUPPORTED_ARCHIVE_PACKAGING: tuple[ArchivePackaging, ...] = ("tar.zst", "zip", "tar.gz", "7z")
@@ -252,12 +267,366 @@ MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES = 4 * 1024 * 1024 * 1024
 MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES = 6 * 1024 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 200
+# Fast encrypted FULL backups (#397): tar.zst inside the chunked TJBENC02 envelope.
+# Level and worker count are fixed, not scaled from the host CPU count.
+STREAM_ENCRYPTED_ZSTD_LEVEL = 3
+STREAM_ENCRYPTED_ZSTD_THREADS = 2
+FULL_ARCHIVE_FORMATS = ("7z", "tar.zst")
 MAX_ARCHIVE_METADATA_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_7Z_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+ZSTD_BOUNDED_INPUT_BYTES = 32
+MAX_STRUCTURED_YAML_MEMBER_BYTES = 2 * 1024 * 1024
+
+JSON_STREAM_CHUNK_CHARS = 64 * 1024
+MAX_JSON_KEY_CHARS = 64 * 1024
+JSON_DUPLICATE_CACHE_KIB = 512
 
 ExtractedMember = bytes | Path
+
+PASSPHRASE_REQUIRED_MESSAGE = "This backup is encrypted. Enter its passphrase to continue."
+EXPORT_PASSPHRASE_REQUIRED_MESSAGE = "Enter a passphrase to encrypt this backup."
+WRONG_PASSPHRASE_MESSAGE = (
+    "The backup could not be decrypted. Check the passphrase and try again."
+)
+SEGMENTED_CATALOG_NOT_SET_MESSAGE = (
+    "This backup contains segmented history but HISTORY_SEGMENT_CATALOG_PATH is not "
+    "set on this deployment."
+)
+V1_HISTORY_ON_SEGMENTED_MESSAGE = (
+    "This history backup is in the old single-file format. This deployment uses "
+    "segmented history; restore a segmented backup, or turn segmented history off first."
+)
+
+
+def _segmented_integrity_message(stage: str) -> str:
+    logger.error("Segmented history restore integrity check failed at stage: %s.", stage)
+    return (
+        "The restore was stopped because a history file changed while it was being "
+        "copied or swapped into place."
+    )
+
+
+class _DiskBackedDuplicateKeyTracker:
+    """Track object-scoped JSON keys without retaining payload keys in Python."""
+
+    __slots__ = ("connection", "cursor", "next_scope", "root")
+
+    def __init__(self) -> None:
+        self.root: Path | None = None
+        self.connection: sqlite3.Connection | None = None
+        self.cursor: sqlite3.Cursor | None = None
+        self.next_scope = 0
+
+    def __enter__(self) -> "_DiskBackedDuplicateKeyTracker":
+        try:
+            self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-json-keys-"))
+            self.root.chmod(0o700)
+            database_path = self.root / "keys.sqlite3"
+            descriptor = os.open(
+                database_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            self.connection = sqlite3.connect(database_path)
+            self.connection.execute("PRAGMA journal_mode = OFF")
+            self.connection.execute("PRAGMA synchronous = OFF")
+            self.connection.execute("PRAGMA temp_store = FILE")
+            self.connection.execute(f"PRAGMA cache_size = -{JSON_DUPLICATE_CACHE_KIB}")
+            self.connection.execute("PRAGMA mmap_size = 0")
+            self.connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+            self.connection.execute(
+                "CREATE TABLE keys (scope INTEGER NOT NULL, value TEXT NOT NULL, "
+                "PRIMARY KEY (scope, value)) WITHOUT ROWID"
+            )
+            self.cursor = self.connection.cursor()
+            return self
+        except BaseException as initialization_error:
+            if isinstance(initialization_error, Exception):
+                primary_error: BaseException = ValueError(
+                    "Temporary files could not be created; check free space in the temp folder."
+                )
+            else:
+                primary_error = initialization_error
+            try:
+                self.close()
+            except RuntimeError as cleanup_error:
+                primary_error.add_note(str(cleanup_error))
+            if primary_error is initialization_error:
+                raise
+            raise primary_error from None
+
+    def new_scope(self) -> int:
+        scope = self.next_scope
+        self.next_scope += 1
+        return scope
+
+    def add(self, scope: int, key: str) -> None:
+        if self.cursor is None:
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
+        try:
+            self.cursor.execute(
+                "INSERT INTO keys (scope, value) VALUES (?, ?)",
+                (scope, key),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("JSON payload contains a duplicate object key.") from None
+        except sqlite3.Error:
+            raise ValueError("JSON duplicate-key validation failed.") from None
+
+    def close(self) -> None:
+        cleanup_failed = False
+        if self.cursor is not None:
+            try:
+                self.cursor.close()
+            except sqlite3.Error:
+                cleanup_failed = True
+            self.cursor = None
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except sqlite3.Error:
+                cleanup_failed = True
+            self.connection = None
+        root = self.root
+        self.root = None
+        self.next_scope = 0
+        if root is not None:
+            try:
+                shutil.rmtree(root)
+            except OSError:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise RuntimeError("JSON duplicate-key tracker cleanup failed.")
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> Literal[False]:
+        try:
+            self.close()
+        except RuntimeError as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note(str(cleanup_error))
+        return False
+
+
+class _StreamingJSONReader:
+    """Small bounded-buffer JSON reader used for file-backed mapping members."""
+
+    def __init__(self, source: Any) -> None:
+        self.source = source
+        self.buffer = ""
+        self.position = 0
+        self.eof = False
+        self.duplicate_keys: _DiskBackedDuplicateKeyTracker | None = None
+
+    def _new_object_scope(self) -> int:
+        if self.duplicate_keys is None:
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
+        return self.duplicate_keys.new_scope()
+
+    def _record_object_key(self, scope: int, key: str) -> None:
+        if self.duplicate_keys is None:
+            raise ValueError("Temporary files could not be created; check free space in the temp folder.")
+        self.duplicate_keys.add(scope, key)
+
+    def _fill(self) -> bool:
+        if self.position < len(self.buffer):
+            return True
+        if self.eof:
+            return False
+        self.buffer = self.source.read(JSON_STREAM_CHUNK_CHARS)
+        self.position = 0
+        if not self.buffer:
+            self.eof = True
+            return False
+        return True
+
+    def peek(self) -> str:
+        return self.buffer[self.position] if self._fill() else ""
+
+    def take(self) -> str:
+        character = self.peek()
+        if character:
+            self.position += 1
+        return character
+
+    def whitespace(self) -> None:
+        while self.peek() in {" ", "\t", "\r", "\n"}:
+            self.position += 1
+
+    def expect(self, expected: str) -> None:
+        self.whitespace()
+        if self.take() != expected:
+            raise ValueError("JSON payload is malformed.")
+
+    def string(self, *, materialize: bool = True) -> str | None:
+        self.whitespace()
+        if self.take() != '"':
+            raise ValueError("JSON payload is malformed.")
+        encoded = ['"'] if materialize else None
+        encoded_chars = 1
+        while True:
+            character = self.take()
+            if not character or ord(character) < 0x20:
+                raise ValueError("JSON payload is malformed.")
+            if encoded is not None:
+                encoded.append(character)
+                encoded_chars += 1
+                if encoded_chars > MAX_JSON_KEY_CHARS:
+                    raise ValueError("JSON scalar exceeds its validation limit.")
+            if character == '"':
+                break
+            if character != "\\":
+                continue
+            escaped = self.take()
+            if escaped not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+                raise ValueError("JSON payload is malformed.")
+            if encoded is not None:
+                encoded.append(escaped)
+                encoded_chars += 1
+            if escaped == "u":
+                digits = "".join(self.take() for _ in range(4))
+                if len(digits) != 4 or any(char not in "0123456789abcdefABCDEF" for char in digits):
+                    raise ValueError("JSON payload is malformed.")
+                if encoded is not None:
+                    encoded.append(digits)
+                    encoded_chars += 4
+        if encoded is None:
+            return None
+        return json.loads("".join(encoded))
+
+    def value(self, *, materialize: bool, depth: int = 0) -> Any:
+        if depth > 64:
+            raise ValueError("JSON payload nesting exceeds its validation limit.")
+        self.whitespace()
+        token = self.peek()
+        if token == '"':
+            return self.string(materialize=materialize)
+        if token == "{":
+            self.take()
+            result: dict[str, Any] | None = {} if materialize else None
+            scope = self._new_object_scope()
+            self.whitespace()
+            if self.peek() == "}":
+                self.take()
+                return result
+            while True:
+                key = self.string()
+                assert isinstance(key, str)
+                self._record_object_key(scope, key)
+                self.expect(":")
+                item = self.value(materialize=materialize, depth=depth + 1)
+                if result is not None:
+                    result[key] = item
+                self.whitespace()
+                separator = self.take()
+                if separator == "}":
+                    return result
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        if token == "[":
+            self.take()
+            result_list: list[Any] | None = [] if materialize else None
+            self.whitespace()
+            if self.peek() == "]":
+                self.take()
+                return result_list
+            while True:
+                item = self.value(materialize=materialize, depth=depth + 1)
+                if result_list is not None:
+                    result_list.append(item)
+                self.whitespace()
+                separator = self.take()
+                if separator == "]":
+                    return result_list
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        scalar = ""
+        while self.peek() and self.peek() not in {" ", "\t", "\r", "\n", ",", "]", "}"}:
+            scalar += self.take()
+            if len(scalar) > 1024:
+                raise ValueError("JSON scalar exceeds its validation limit.")
+        if not scalar:
+            raise ValueError("JSON payload is malformed.")
+        decoded = json.loads(scalar)
+        return decoded if materialize else None
+
+    def validate_mapping_entries(self, target_key: str, model: Any) -> int:
+        result = 0
+        try:
+            with _DiskBackedDuplicateKeyTracker() as duplicate_keys:
+                self.duplicate_keys = duplicate_keys
+                result = self._validate_mapping_entries(target_key, model)
+        finally:
+            self.duplicate_keys = None
+            self.buffer = ""
+            self.position = 0
+            self.eof = True
+        return result
+
+    def _validate_mapping_entries(self, target_key: str, model: Any) -> int:
+        self.expect("{")
+        root_scope = self._new_object_scope()
+        count = 0
+        self.whitespace()
+        if self.peek() == "}":
+            self.take()
+        else:
+            while True:
+                key = self.string()
+                assert isinstance(key, str)
+                self._record_object_key(root_scope, key)
+                self.expect(":")
+                if key == target_key:
+                    count = self._validate_entry_object(model)
+                else:
+                    self.value(materialize=False, depth=1)
+                self.whitespace()
+                separator = self.take()
+                if separator == "}":
+                    break
+                if separator != ",":
+                    raise ValueError("JSON payload is malformed.")
+        self.whitespace()
+        if self.peek():
+            raise ValueError("JSON payload has trailing content.")
+        return count
+
+    def _validate_entry_object(self, model: Any) -> int:
+        self.expect("{")
+        scope = self._new_object_scope()
+        count = 0
+        self.whitespace()
+        if self.peek() == "}":
+            self.take()
+            return 0
+        while True:
+            key = self.string()
+            assert isinstance(key, str)
+            self._record_object_key(scope, key)
+            self.expect(":")
+            model.model_validate(self.value(materialize=True, depth=2))
+            count += 1
+            self.whitespace()
+            separator = self.take()
+            if separator == "}":
+                return count
+            if separator != ",":
+                raise ValueError("JSON payload is malformed.")
 
 
 @dataclass(slots=True)
@@ -341,9 +710,153 @@ class _PreparedSegmentedRestore:
     journal_payload: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _ExportSourceSnapshot:
+    """Invocation-local admission for non-history source discovery and copying."""
+
+    root: Path | None = None
+    member_count: int = 1  # Reserve the manifest before discovering any sources.
+    total_bytes: int = 0
+
+    def admit_entry(self) -> None:
+        self.member_count += 1
+        if self.member_count > MAX_ARCHIVE_MEMBER_COUNT:
+            raise ValueError("Backup bundle archive contains too many members.")
+
+    def admit_bytes(
+        self,
+        content: bytes,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> None:
+        if not entry_admitted:
+            self.admit_entry()
+        size = len(content)
+        if size > MAX_ARCHIVE_MEMBER_BYTES:
+            raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+        if (
+            group_key in STRUCTURED_YAML_GROUP_KEYS
+            and PurePosixPath(archive_path).suffix in {".yaml", ".yml"}
+            and size > MAX_STRUCTURED_YAML_MEMBER_BYTES
+        ):
+            raise ValueError("Structured YAML member exceeds its size limit.")
+        if self.total_bytes + size > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Backup bundle non-history members exceed the expanded byte limit.")
+        self.total_bytes += size
+
+    @contextmanager
+    def _open_source(
+        self,
+        source_path: Path,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Iterator[tuple[int, int] | None]:
+        try:
+            descriptor = os.open(
+                source_path,
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            yield None
+            return
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Backup export source must be a regular file.")
+            if not entry_admitted:
+                self.admit_entry()
+            size = metadata.st_size
+            if size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            if (
+                group_key in STRUCTURED_YAML_GROUP_KEYS
+                and PurePosixPath(archive_path).suffix in {".yaml", ".yml"}
+                and size > MAX_STRUCTURED_YAML_MEMBER_BYTES
+            ):
+                raise ValueError("Structured YAML member exceeds its size limit.")
+            if self.total_bytes + size > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Backup bundle non-history members exceed the expanded byte limit.")
+            self.total_bytes += size
+            yield descriptor, size
+            after = os.fstat(descriptor)
+            if (metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            ):
+                raise ValueError("Backup export source changed during snapshot.")
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _source_chunks(descriptor: int, size: int) -> Iterator[bytes]:
+        remaining = size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, ARCHIVE_READ_CHUNK_BYTES))
+            if not chunk:
+                raise ValueError("Backup export source changed during snapshot.")
+            yield chunk
+            remaining -= len(chunk)
+        # One sentinel byte detects growth without allocating the new body.
+        if os.read(descriptor, 1):
+            raise ValueError("Backup export source changed during snapshot.")
+
+    def copy(
+        self,
+        source_path: Path,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Path | None:
+        assert self.root is not None
+        with self._open_source(
+            source_path, group_key, archive_path, entry_admitted=entry_admitted
+        ) as source:
+            if source is None:
+                return None
+            self.root.mkdir(mode=0o700, exist_ok=True)
+            target = self.root / str(self.member_count)
+            target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(target_descriptor, "wb") as output:
+                for chunk in self._source_chunks(*source):
+                    output.write(chunk)
+            return target
+
+    def copy_bytes(
+        self,
+        content: bytes,
+        group_key: str,
+        archive_path: str,
+        *,
+        entry_admitted: bool = False,
+    ) -> Path:
+        assert self.root is not None
+        self.admit_bytes(
+            content,
+            group_key,
+            archive_path,
+            entry_admitted=entry_admitted,
+        )
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        target = self.root / str(self.member_count)
+        target_descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(target_descriptor, "wb") as output:
+            output.write(content)
+        return target
+
+    def read_yaml_file(self, path: Path) -> bytes | None:
+        # Bootstrap content is YAML regardless of its configured filename.
+        # Reuse descriptor admission without creating a source-copy workspace.
+        with self._open_source(path, CONFIG_FILE_KEY, "settings.yaml") as source:
+            return b"".join(self._source_chunks(*source)) if source is not None else None
+
+
 class _ImportActivationTransaction:
-    _MISSING_FILE_MODE = 0o600
-    _MISSING_DIRECTORY_MODE = 0o700
+    _MISSING_FILE_MODE = 0o660
+    _MISSING_DIRECTORY_MODE = 0o770
 
     def __init__(
         self,
@@ -354,23 +867,21 @@ class _ImportActivationTransaction:
         self.root = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-import-"))
         self.staging_root = self.root / "staged"
         self.rollback_root = self.root / "rollback"
-        self.staging_root.mkdir(parents=True, exist_ok=True)
-        self.rollback_root.mkdir(parents=True, exist_ok=True)
         self._staged_members: dict[str, Path] = {}
         self._journal: dict[str, _ImportRollbackEntry] = {}
         self._journal_order: list[str] = []
         self._created_parents: list[Path] = []
         self._sibling_artifacts: dict[Path, Literal["file", "directory"]] = {}
-        self._protected_history_key = (
-            self._journal_key(history_store.file_path)
-            if history_store is not None
-            else None
+        self._protected_history_keys = (
+            self._history_artifact_keys(history_store) if history_store is not None else frozenset()
         )
         self._committed = False
         self._rollback_completed = False
         self._prepared_segmented_restore: _PreparedSegmentedRestore | None = None
         self._preserve_segmented_evidence = False
         try:
+            self.staging_root.mkdir(parents=True, exist_ok=True)
+            self.rollback_root.mkdir(parents=True, exist_ok=True)
             for member_key, content in sorted(extracted_members.items()):
                 staged_path = self.staging_root / hashlib.sha256(
                     member_key.encode("utf-8")
@@ -393,8 +904,8 @@ class _ImportActivationTransaction:
     def __exit__(self, exc_type, exc, traceback) -> Literal[False]:
         if exc is not None and self._preserve_segmented_evidence:
             raise RuntimeError(
-                "Segmented history restore integrity failed; recovery material was "
-                f"preserved at {self.root}."
+                "The history restore was stopped by an integrity check. Nothing was "
+                f"deleted; the files needed to recover are preserved in {self.root}."
             ) from exc
         if exc is not None and not self._committed:
             try:
@@ -434,6 +945,56 @@ class _ImportActivationTransaction:
     def rollback_completed(self) -> bool:
         return self._rollback_completed
 
+    @staticmethod
+    def _copy_file_to_descriptor(
+        source_path: Path,
+        descriptor: int,
+        *,
+        owner: tuple[int, int] | None,
+        mode: int,
+    ) -> None:
+        source_metadata = source_path.stat(follow_symlinks=False)
+        if source_path.is_symlink() or not stat.S_ISREG(source_metadata.st_mode):
+            raise ValueError("Backup bundle extracted member is not a regular file.")
+        with (
+            source_path.open("rb") as source_handle,
+            os.fdopen(descriptor, "wb", closefd=False) as target_handle,
+        ):
+            shutil.copyfileobj(source_handle, target_handle)
+            target_handle.flush()
+        if owner is not None:
+            os.fchown(descriptor, owner[0], owner[1])
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+
+    @classmethod
+    def _copy_file_exclusive(
+        cls,
+        source_path: Path,
+        target_path: Path,
+        *,
+        owner: tuple[int, int] | None,
+        mode: int,
+    ) -> None:
+        descriptor = os.open(
+            target_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+        )
+        try:
+            cls._copy_file_to_descriptor(
+                source_path,
+                descriptor,
+                owner=owner,
+                mode=mode,
+            )
+        finally:
+            os.close(descriptor)
+
     def activate_file(self, target_path: Path, member_key: str) -> None:
         self._activate_file(target_path, member_key, allow_history=False)
 
@@ -458,8 +1019,6 @@ class _ImportActivationTransaction:
         temp_path = Path(temp_name)
         self._sibling_artifacts[temp_path] = "file"
         try:
-            os.close(file_descriptor)
-            shutil.copyfile(staged_path, temp_path)
             file_owner = self._existing_owner(
                 target_path if entry.kind == "file" else target_path.parent,
                 directory=entry.kind != "file",
@@ -469,15 +1028,25 @@ class _ImportActivationTransaction:
                 if entry.kind == "file"
                 else self._MISSING_FILE_MODE
             )
-            self._apply_owner(temp_path, file_owner)
-            temp_path.chmod(file_mode)
-            self._fsync_file(temp_path)
+            self._copy_file_to_descriptor(
+                staged_path,
+                file_descriptor,
+                owner=file_owner,
+                mode=file_mode,
+            )
+            os.close(file_descriptor)
+            file_descriptor = -1
             self._park_original(entry)
             os.replace(temp_path, target_path)
             self._sibling_artifacts.pop(temp_path, None)
             entry.mutated = True
             self._fsync_directory(target_path.parent)
         finally:
+            if file_descriptor >= 0:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
             self._cleanup_sibling_artifact(temp_path)
 
     def prepare_segmented_history(
@@ -492,7 +1061,7 @@ class _ImportActivationTransaction:
             raise ValueError("Segmented history restore is already prepared.")
         catalog_path = store.segment_catalog_path
         if catalog_path is None:
-            raise ValueError("Segmented history catalog target is not configured.")
+            raise ValueError(SEGMENTED_CATALOG_NOT_SET_MESSAGE)
         store._segment_reader_cache = None
         store._segment_reader_identity = None
         self._checkpoint_hot_database(store.file_path)
@@ -504,6 +1073,7 @@ class _ImportActivationTransaction:
         segments_entry = self._record_target(
             catalog_path.parent,
             expected_kind="directory",
+            allow_history=True,
         )
         if hot_entry.kind not in {"file", "missing"}:
             raise ValueError("Live segmented history hot target is invalid.")
@@ -589,18 +1159,6 @@ class _ImportActivationTransaction:
         target_path: Path,
         entry: _ImportRollbackEntry,
     ) -> None:
-        descriptor = os.open(
-            staged_path,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            self._MISSING_FILE_MODE,
-        )
-        os.close(descriptor)
-        self._sibling_artifacts[staged_path] = "file"
-        shutil.copyfile(source_path, staged_path)
         owner = self._existing_owner(
             target_path if entry.kind == "file" else target_path.parent,
             directory=entry.kind != "file",
@@ -610,9 +1168,13 @@ class _ImportActivationTransaction:
             if entry.kind == "file"
             else self._MISSING_FILE_MODE
         )
-        self._apply_owner(staged_path, owner)
-        staged_path.chmod(mode)
-        self._fsync_file(staged_path)
+        self._copy_file_exclusive(
+            source_path,
+            staged_path,
+            owner=owner,
+            mode=mode,
+        )
+        self._sibling_artifacts[staged_path] = "file"
         self._fsync_directory(staged_path.parent)
 
     def _stage_segmented_directory(
@@ -671,7 +1233,6 @@ class _ImportActivationTransaction:
                     )
                     or self._MISSING_DIRECTORY_MODE
                 )
-            shutil.copyfile(self._staged_member(member_key), staged_target)
             existing_target = (
                 existing_directory / relative_path
                 if existing_directory is not None
@@ -683,15 +1244,19 @@ class _ImportActivationTransaction:
                     staged_target.parent,
                     directory=True,
                 )
-            self._apply_owner(staged_target, target_owner)
-            staged_target.chmod(
-                self._segmented_staging_mode(
-                    target_dir / relative_path,
-                    directory=False,
-                )
-                or self._MISSING_FILE_MODE
+            self._copy_file_exclusive(
+                self._staged_member(member_key),
+                staged_target,
+                owner=target_owner,
+                mode=(
+                    self._segmented_staging_mode(
+                        target_dir / relative_path,
+                        directory=False,
+                    )
+                    or self._MISSING_FILE_MODE
+                ),
             )
-        self._fsync_tree(staged_dir)
+        self._fsync_tree(staged_dir, files_already_synced=True)
         self._fsync_directory(staged_dir.parent)
 
     def _activate_prepared_target(
@@ -711,7 +1276,7 @@ class _ImportActivationTransaction:
         )
         if not prior_matches or not matcher(staged_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError("Segmented history restore prepared artifact integrity failed.")
+            raise ValueError(_segmented_integrity_message("prepared artifact"))
         if entry.kind != "missing":
             if self._path_exists(previous_path):
                 raise ValueError("Segmented history prior restore artifact already exists.")
@@ -722,14 +1287,14 @@ class _ImportActivationTransaction:
             self._fsync_directory(entry.target_path.parent)
             if not matcher(previous_path, prior_record):
                 self._preserve_segmented_evidence = True
-                raise ValueError("Segmented history restore parked prior integrity failed.")
+                raise ValueError(_segmented_integrity_message("parked prior"))
         os.replace(staged_path, entry.target_path)
         self._sibling_artifacts.pop(staged_path, None)
         entry.mutated = True
         self._fsync_directory(entry.target_path.parent)
         if not matcher(entry.target_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError("Segmented history restore activated candidate integrity failed.")
+            raise ValueError(_segmented_integrity_message("activated candidate"))
 
     def activate_segmented_history(
         self,
@@ -851,7 +1416,6 @@ class _ImportActivationTransaction:
                         self._existing_mode(existing_parent, directory=True)
                         or self._MISSING_DIRECTORY_MODE
                     )
-                shutil.copyfile(self._staged_member(member_key), staged_target)
                 existing_target = (
                     existing_directory / relative_path
                     if existing_directory is not None
@@ -863,12 +1427,16 @@ class _ImportActivationTransaction:
                         staged_target.parent,
                         directory=True,
                     )
-                self._apply_owner(staged_target, target_owner)
-                staged_target.chmod(
-                    self._existing_mode(existing_target, directory=False)
-                    or self._MISSING_FILE_MODE
+                self._copy_file_exclusive(
+                    self._staged_member(member_key),
+                    staged_target,
+                    owner=target_owner,
+                    mode=(
+                        self._existing_mode(existing_target, directory=False)
+                        or self._MISSING_FILE_MODE
+                    ),
                 )
-            self._fsync_tree(staged_dir)
+            self._fsync_tree(staged_dir, files_already_synced=True)
             self._park_original(entry)
             os.replace(staged_dir, target_dir)
             self._sibling_artifacts.pop(staged_dir, None)
@@ -963,9 +1531,9 @@ class _ImportActivationTransaction:
         allow_history: bool = False,
     ) -> _ImportRollbackEntry:
         journal_key = self._journal_key(target_path)
-        if not allow_history and self._protected_history_key and self._journal_paths_overlap(
-            journal_key,
-            self._protected_history_key,
+        if not allow_history and any(
+            self._journal_paths_overlap(journal_key, protected_key)
+            for protected_key in self._protected_history_keys
         ):
             raise ValueError(
                 f"Live restore target {target_path} collides with the history database."
@@ -1166,14 +1734,14 @@ class _ImportActivationTransaction:
             hot = prepared.journal_payload["hot"]
             segments = prepared.journal_payload["segments"]
             if not restore_file_matches(prepared.hot_entry.target_path, hot["candidate"]):
-                raise ValueError("Segmented history restore live hot integrity failed.")
+                raise ValueError(_segmented_integrity_message("live hot"))
             if not restore_tree_matches(prepared.segments_entry.target_path, segments["candidate"]):
-                raise ValueError("Segmented history restore live segment tree integrity failed.")
+                raise ValueError(_segmented_integrity_message("live segment tree"))
             if hot["prior"].get("kind") == "missing":
                 if self._path_exists(prepared.previous_hot_path):
                     raise ValueError("Segmented history restore prior hot artifact is unexpected.")
             elif not restore_file_matches(prepared.previous_hot_path, hot["prior"]):
-                raise ValueError("Segmented history restore prior hot integrity failed.")
+                raise ValueError(_segmented_integrity_message("prior hot"))
             if segments["prior"].get("kind") == "missing":
                 if self._path_exists(prepared.previous_segments_path):
                     raise ValueError("Segmented history restore prior segment artifact is unexpected.")
@@ -1181,7 +1749,7 @@ class _ImportActivationTransaction:
                 prepared.previous_segments_path,
                 segments["prior"],
             ):
-                raise ValueError("Segmented history restore prior segment tree integrity failed.")
+                raise ValueError(_segmented_integrity_message("prior segment tree"))
             if hot["prior"].get("kind") != "missing":
                 remove_recorded_restore_file(
                     prepared.previous_hot_path,
@@ -1223,11 +1791,12 @@ class _ImportActivationTransaction:
         if self.root.exists():
             shutil.rmtree(self.root)
 
-    def _fsync_tree(self, root: Path) -> None:
+    def _fsync_tree(self, root: Path, *, files_already_synced: bool = False) -> None:
         paths = list(root.rglob("*"))
-        for path in paths:
-            if path.is_file() and not path.is_symlink():
-                self._fsync_file(path)
+        if not files_already_synced:
+            for path in paths:
+                if path.is_file() and not path.is_symlink():
+                    self._fsync_file(path)
         directories = [path for path in paths if path.is_dir() and not path.is_symlink()]
         for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
             self._fsync_directory(directory)
@@ -1268,6 +1837,20 @@ class _ImportActivationTransaction:
         if owner is not None:
             os.chown(path, owner[0], owner[1], follow_symlinks=False)
 
+    @classmethod
+    def _history_artifact_keys(cls, store: HistoryStore) -> frozenset[str]:
+        hot_path = store.file_path
+        paths = {
+            hot_path,
+            Path(f"{hot_path}-wal"),
+            Path(f"{hot_path}-shm"),
+            Path(f"{hot_path}-journal"),
+            activation_pending_path(hot_path),
+        }
+        if store.segment_catalog_path is not None:
+            paths.add(store.segment_catalog_path.parent)
+        return frozenset(cls._journal_key(path) for path in paths)
+
     @staticmethod
     def _journal_key(target_path: Path) -> str:
         return os.path.normcase(os.path.realpath(os.path.abspath(target_path)))
@@ -1279,18 +1862,6 @@ class _ImportActivationTransaction:
         except ValueError:
             return False
         return common_path == first_path or common_path == second_path
-
-    @staticmethod
-    def _reject_symlinked_history_target(target_path: Path) -> None:
-        cursor = target_path
-        while True:
-            if cursor.is_symlink():
-                raise ValueError(
-                    f"Live history restore target {target_path} uses unsafe symlink component {cursor}."
-                )
-            if cursor == cursor.parent:
-                return
-            cursor = cursor.parent
 
     @staticmethod
     def _new_sibling_path(target_path: Path, artifact_kind: str) -> Path:
@@ -1570,10 +2141,60 @@ class DebugScrubber:
         return f"REDACTED-{category.upper()}"
 
 
+class _PreadView:
+    """Read-only, bounded slice access to a file for the strict TAR preflight.
+
+    ``_preflight_tar_archive`` only slices headers, trailers and PAX records,
+    which are all small. A slice bigger than the TAR metadata limit is refused
+    instead of read, so a crafted archive cannot make it allocate memory.
+    """
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+        self._size = os.fstat(descriptor).st_size
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __bool__(self) -> bool:
+        return self._size > 0
+
+    def __getitem__(self, index: slice) -> bytes:
+        if not isinstance(index, slice) or index.step not in (None, 1):
+            raise TypeError("only contiguous slices are supported")
+        start, stop, _ = index.indices(self._size)
+        length = max(0, stop - start)
+        if length > MAX_ARCHIVE_METADATA_BYTES:
+            raise ValueError("Backup bundle TAR archive has non-zero trailing data.")
+        data = os.pread(self._descriptor, length, start)
+        if len(data) != length:
+            raise ValueError("Backup bundle TAR member data is truncated.")
+        return data
+
+
 class SystemBackupService:
-    def __init__(self, history_settings: HistorySettings, store: HistoryStore) -> None:
+    def __init__(
+        self,
+        history_settings: HistorySettings,
+        store: HistoryStore,
+        app_settings: Settings | None = None,
+    ) -> None:
         self.history_settings = history_settings
         self.store = store
+        self.app_settings = app_settings
+        self._captured_config_files: Mapping[Path, bytes | None] = {}
+
+    def with_captured_config_files(self, files: Mapping[Path, bytes | None]) -> SystemBackupService:
+        """Use one scheduler capture without changing the shared export service.
+
+        Only the hashed documents are pinned; unselected groups and unhashed
+        caches retain the normal collection and validation behavior. ``None``
+        pins an absent document even if it appears before archive construction.
+        """
+
+        captured = copy(self)
+        captured._captured_config_files = MappingProxyType(dict(files))
+        return captured
 
     def validate_scheduled_backup_scope(self, included_paths: list[str]) -> None:
         selected_groups = self._resolve_selected_groups(
@@ -1618,12 +2239,26 @@ class SystemBackupService:
         packaging: ArchivePackaging = "tar.zst",
         included_paths: list[str] | None = None,
     ) -> FileBackupArtifact:
+        """Export a system backup to a private file.
+
+        An encrypted FULL backup (one that includes ``history_db``) requested as
+        ``tar.zst`` is sealed in the chunked TJBENC02 envelope (#397); choose
+        ``7z`` for an archive older app versions and plain 7-Zip can open. Other
+        encrypted exports stay 7z.
+        """
+
+        stream_encrypted = (
+            bool(encrypt)
+            and self._normalize_packaging(packaging) == "tar.zst"
+            and HISTORY_DB_KEY in self._resolve_selected_groups(included_paths, bundle_type="backup")
+        )
         return self._export_bundle_to_file(
             encrypt=encrypt,
             passphrase=passphrase,
             packaging=packaging,
             included_paths=included_paths,
             encrypted_outer_envelope=False,
+            stream_encrypted=stream_encrypted,
         )
 
     def _export_bundle_to_file(
@@ -1634,6 +2269,7 @@ class SystemBackupService:
         packaging: ArchivePackaging = "tar.zst",
         included_paths: list[str] | None = None,
         encrypted_outer_envelope: bool,
+        stream_encrypted: bool = False,
     ) -> FileBackupArtifact:
         app_settings = self._load_app_settings()
         exported_at = datetime.now(timezone.utc)
@@ -1644,8 +2280,17 @@ class SystemBackupService:
         )
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
-        normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
+        if stream_encrypted and not (encrypt and passphrase):
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
+        normalized_packaging: ArchivePackaging = (
+            "tar.zst" if stream_encrypted else ("7z" if encrypt else requested_packaging)
+        )
+        self._require_export_free_space(
+            selected_groups,
+            app_settings=app_settings,
+            packaging=normalized_packaging,
+        )
         workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-export-"))
         try:
             segmented_snapshot: _SegmentedExportSnapshot | None = None
@@ -1664,6 +2309,12 @@ class SystemBackupService:
                 app_settings,
                 history_snapshot_path,
                 selected_groups=selected_groups,
+                source_snapshot=_ExportSourceSnapshot(
+                    workspace / "sources",
+                    member_count=1 + int(history_snapshot_path is not None) + (
+                        len(segmented_snapshot.segment_paths) if segmented_snapshot else 0
+                    ),
+                ),
             )
             if segmented_snapshot is not None:
                 for segment_path in segmented_snapshot.segment_paths:
@@ -1686,6 +2337,7 @@ class SystemBackupService:
                 packaging=normalized_packaging,
                 bundle_groups=bundle_groups,
                 bundle_members=bundle_members,
+                file_backed_history=stream_encrypted,
             )
             if segmented_snapshot is not None:
                 local_segments = segmented_snapshot.catalog.get("segments")
@@ -1731,6 +2383,8 @@ class SystemBackupService:
                 validate_segmented_manifest(manifest)
             stem = f"jbod-system-backup-{exported_at.strftime('%Y%m%dT%H%M%SZ')}"
             filename = f"{stem}{ARCHIVE_FILE_SUFFIXES[normalized_packaging]}"
+            if stream_encrypted:
+                filename = f"{filename}.enc"
             archive_path = workspace / filename
             expanded_archive_size = self._build_archive_to_path(
                 bundle_members,
@@ -1738,17 +2392,24 @@ class SystemBackupService:
                 normalized_packaging,
                 archive_path,
                 passphrase=passphrase if encrypt else None,
+                **({"stream_encrypted": True} if stream_encrypted else {}),
             )
             self._validate_export_archive(
                 archive_path,
                 normalized_packaging,
                 expanded_archive_size=expanded_archive_size,
                 passphrase=passphrase if encrypt else None,
+                manifest=manifest,
+                **({"stream_encrypted": True} if stream_encrypted else {}),
             )
             return FileBackupArtifact(
                 filename=filename,
                 path=archive_path,
-                media_type=ARCHIVE_MEDIA_TYPES[normalized_packaging],
+                media_type=(
+                    "application/octet-stream"
+                    if stream_encrypted
+                    else ARCHIVE_MEDIA_TYPES[normalized_packaging]
+                ),
                 manifest=manifest,
                 cleanup_root=workspace,
             )
@@ -1761,20 +2422,34 @@ class SystemBackupService:
         *,
         passphrase: str,
         included_paths: list[str] | None = None,
+        archive_format: str = "tar.zst",
     ) -> FileBackupArtifact:
+        """Export an encrypted scheduled backup.
+
+        With history, ``archive_format`` picks ``tar.zst`` in the chunked
+        TJBENC02 envelope (the default since #397, much faster for multi-GiB
+        history) or the portable 7z archive that older app versions and plain
+        7-Zip can open. Without history the archive is always tar.zst in the
+        TJBENC01 envelope.
+        """
+
         if not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
+        if archive_format not in FULL_ARCHIVE_FORMATS:
+            raise ValueError("The backup archive format must be 7z or tar.zst.")
         selected_groups = self._resolve_selected_groups(
             included_paths,
             bundle_type="backup",
         )
         uses_file_backed_history = HISTORY_DB_KEY in selected_groups
+        stream_encrypted = uses_file_backed_history and archive_format == "tar.zst"
         artifact = self._export_bundle_to_file(
             encrypt=uses_file_backed_history,
             passphrase=passphrase if uses_file_backed_history else None,
-            packaging="7z" if uses_file_backed_history else "tar.zst",
+            packaging="7z" if uses_file_backed_history and not stream_encrypted else "tar.zst",
             included_paths=included_paths,
             encrypted_outer_envelope=not uses_file_backed_history,
+            stream_encrypted=stream_encrypted,
         )
         if not uses_file_backed_history:
             encrypted_path = artifact.path.with_name(f"{artifact.path.name}.enc")
@@ -1818,7 +2493,7 @@ class SystemBackupService:
         extracted: dict[str, ExtractedMember],
         group_entries: dict[str, dict[str, Any]],
         group_key: str,
-    ) -> bytes | None:
+    ) -> ExtractedMember | None:
         group = group_entries.get(group_key)
         if (
             not self._manifest_group_selected(group)
@@ -1828,7 +2503,7 @@ class SystemBackupService:
         member = self._first_group_member(manifest, group_key)
         if member is None:
             return None
-        return self._extracted_member_bytes(extracted[member["key"]])
+        return extracted[member["key"]]
 
     @staticmethod
     def _inspection_history_member_counts(
@@ -1911,15 +2586,19 @@ class SystemBackupService:
         if config_content is not None:
             merged_config = _deep_merge(
                 Settings().model_dump(),
-                self._load_yaml_mapping(config_content),
+                self._load_yaml_mapping(self._extracted_member_bytes(config_content)),
             )
             if runtime_overrides_content is not None:
                 merged_config = _deep_merge(
                     merged_config,
-                    self._load_yaml_mapping(runtime_overrides_content),
+                    self._load_yaml_mapping(
+                        self._extracted_member_bytes(runtime_overrides_content)
+                    ),
                 )
             if profiles_content is not None:
-                profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+                profile_payload = yaml.safe_load(
+                    self._extracted_member_bytes(profiles_content).decode("utf-8")
+                ) or {}
                 inspected_profiles = (
                     profile_payload
                     if isinstance(profile_payload, list)
@@ -1941,7 +2620,9 @@ class SystemBackupService:
 
         profile_count: int | None = None
         if profiles_content is not None:
-            profile_payload = yaml.safe_load(profiles_content.decode("utf-8")) or {}
+            profile_payload = yaml.safe_load(
+                self._extracted_member_bytes(profiles_content).decode("utf-8")
+            ) or {}
             profiles = (
                 profile_payload
                 if isinstance(profile_payload, list)
@@ -1951,9 +2632,15 @@ class SystemBackupService:
             )
             profile_count = len(profiles) if isinstance(profiles, list) else 0
 
-        def json_entry_count(content: bytes | None, key: str) -> int | None:
+        def json_entry_count(
+            content: ExtractedMember | None,
+            key: str,
+            model: Any,
+        ) -> int | None:
             if content is None:
                 return None
+            if isinstance(content, Path):
+                return self._validate_streaming_json_member(content, key, model)
             entries = self._load_json_mapping(content).get(key)
             return len(entries) if isinstance(entries, dict) else 0
 
@@ -2000,27 +2687,78 @@ class SystemBackupService:
             "systems": system_count,
             "profiles": profile_count,
             "storage_views": storage_view_count,
-            "mappings": json_entry_count(mapping_content, "slot_mappings"),
-            "sas_fabric_aliases": json_entry_count(alias_content, "sas_fabric_aliases"),
-            "slot_details": json_entry_count(slot_detail_content, "slot_details"),
+            "mappings": json_entry_count(mapping_content, "slot_mappings", ManualMapping),
+            "sas_fabric_aliases": json_entry_count(
+                alias_content,
+                "sas_fabric_aliases",
+                SasFabricAlias,
+            ),
+            "slot_details": json_entry_count(
+                slot_detail_content,
+                "slot_details",
+                SlotDetailCacheEntry,
+            ),
             "ssh_keys": directory_member_count(SSH_KEYS_KEY),
             "tls_files": directory_member_count(TLS_TRUST_KEY),
             "known_hosts": directory_member_count(KNOWN_HOSTS_KEY),
             "history": history_counts,
         }
 
+    @staticmethod
+    def _enforce_expected_encryption(
+        archive_meta: dict[str, Any],
+        expected_encrypted: bool | None,
+    ) -> None:
+        if expected_encrypted is None:
+            return
+        observed_encrypted = archive_meta.get("encrypted") is True
+        if observed_encrypted == expected_encrypted:
+            return
+        expected_label = "encrypted" if expected_encrypted else "plaintext"
+        observed_label = "encrypted" if observed_encrypted else "plaintext"
+        raise ValueError(
+            f"Backup import expected {expected_label} content but inspected {observed_label} content."
+        )
+
+    def _admit_restore(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted: dict[str, ExtractedMember],
+        *,
+        history_integrity_checked: bool = False,
+    ) -> tuple[dict[str, _ImportRestoreDestination], bytes | None]:
+        """Check current deployment admission without changing live or extracted files."""
+        self._validate_manifest_member_metadata(manifest, extracted)
+        self._preflight_selected_group_members(manifest, group_entries, extracted)
+        self._preflight_import_members(
+            manifest, group_entries, extracted,
+            history_integrity_checked=history_integrity_checked,
+        )
+        self._require_restore_free_space(manifest, group_entries, extracted)
+        destinations = self._build_restore_destination_graph(manifest, group_entries, extracted)
+        catalog = self._prepare_segmented_history_import(
+            manifest, extracted, history_integrity_checked=history_integrity_checked,
+        )
+        return destinations, catalog
+
     def inspect_bundle_file(
         self,
         archive_path: str | Path,
         *,
         passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+        identity_callback: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = self._read_archive_file(
             Path(archive_path),
             passphrase=passphrase,
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        primary_error: Exception | None = None
         try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
             selected_groups = [
                 key
@@ -2037,13 +2775,12 @@ class SystemBackupService:
                 for key in selected_groups
                 if not self._manifest_group_present(group_entries.get(key))
             ]
-            self._validate_manifest_member_metadata(manifest, extracted)
-            self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
-            return {
+            self._admit_restore(manifest, group_entries, extracted)
+            result = {
                 "ok": True,
                 "schema_version": manifest.get("schema_version"),
                 "app_version": manifest.get("app_version"),
+                "app_version_note": self._app_version_note(manifest),
                 "exported_at": manifest.get("exported_at"),
                 "encrypted": bool(archive_meta.get("encrypted")),
                 "packaging": manifest.get("packaging") or detected_packaging,
@@ -2061,8 +2798,60 @@ class SystemBackupService:
                     group_entries,
                 ),
             }
+            if identity_callback is not None:
+                if not isinstance(archive_digest, str):
+                    raise RuntimeError("Backup archive identity is unavailable.")
+                observed_mode = (
+                    "encrypted" if archive_meta.get("encrypted") is True else "plaintext"
+                )
+                identity_callback(archive_digest, observed_mode)
+            return result
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            self._cleanup_extracted_archive_after(cleanup_root, primary_error)
+
+    def preflight_import_bundle_file(
+        self,
+        archive_path: str | Path,
+        *,
+        passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+        identity_callback: Callable[[str, str], None] | None = None,
+    ) -> str | None:
+        """Run every import check without activating; return the archive SHA-256."""
+        manifest, extracted, _packaging, archive_meta = self._read_archive_file(
+            Path(archive_path),
+            passphrase=passphrase,
+        )
+        cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        primary_error: Exception | None = None
+        try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
+            group_entries = self._manifest_group_entries(manifest)
+            self._admit_restore(manifest, group_entries, extracted)
+            if identity_callback is not None:
+                if not isinstance(archive_digest, str):
+                    raise RuntimeError("Backup archive identity is unavailable.")
+                observed_mode = (
+                    "encrypted" if archive_meta.get("encrypted") is True else "plaintext"
+                )
+                identity_callback(archive_digest, observed_mode)
+            return archive_digest if isinstance(archive_digest, str) else None
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self._cleanup_extracted_archive(cleanup_root)
+            except Exception as cleanup_error:
+                if primary_error is not None:
+                    raise RuntimeError(
+                        f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                    ) from primary_error
+                raise cleanup_error
 
     def preflight_scheduled_bundle_file(
         self,
@@ -2076,6 +2865,7 @@ class SystemBackupService:
             passphrase=passphrase,
         )
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        primary_error: Exception | None = None
         try:
             if not archive_meta.get("encrypted"):
                 raise ValueError("Scheduled backup encryption could not be verified.")
@@ -2100,8 +2890,11 @@ class SystemBackupService:
                 "selected_groups": selected_groups,
                 "absent_groups": absent_groups,
             }
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            self._cleanup_extracted_archive_after(cleanup_root, primary_error)
 
     @staticmethod
     def _scheduled_backup_key(passphrase: str, salt: bytes) -> bytes:
@@ -2139,32 +2932,6 @@ class SystemBackupService:
             raise ValueError(
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
-
-    @classmethod
-    def _decrypt_scheduled_archive(cls, archive_bytes: bytes, passphrase: str | None) -> bytes:
-        header_size = (
-            len(ENCRYPTED_BACKUP_MAGIC)
-            + ENCRYPTED_BACKUP_SALT_BYTES
-            + ENCRYPTED_BACKUP_NONCE_BYTES
-        )
-        if len(archive_bytes) < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
-            raise ValueError("Scheduled backup archive is corrupted.")
-        if not passphrase:
-            raise ValueError("A passphrase is required for this encrypted backup bundle.")
-        header = archive_bytes[:header_size]
-        salt_start = len(ENCRYPTED_BACKUP_MAGIC)
-        nonce_start = salt_start + ENCRYPTED_BACKUP_SALT_BYTES
-        salt = header[salt_start:nonce_start]
-        nonce = header[nonce_start:]
-        ciphertext = archive_bytes[header_size:-ENCRYPTED_BACKUP_TAG_BYTES]
-        tag = archive_bytes[-ENCRYPTED_BACKUP_TAG_BYTES:]
-        key = cls._scheduled_backup_key(passphrase, salt)
-        decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
-        decryptor.authenticate_additional_data(header)
-        try:
-            return decryptor.update(ciphertext) + decryptor.finalize()
-        except InvalidTag as exc:
-            raise ValueError("Scheduled backup archive could not be decrypted.") from exc
 
     def export_debug_bundle(
         self,
@@ -2214,9 +2981,9 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None = None,
         maintenance_payload: dict[str, Any] | None = None,
     ) -> FileBackupArtifact:
-        app_settings = self._load_app_settings()
-        exported_at = datetime.now(timezone.utc)
         selected_groups = self._resolve_selected_groups(included_paths, bundle_type="debug")
+        app_settings = self.app_settings if self.app_settings is not None else self._load_app_settings()
+        exported_at = datetime.now(timezone.utc)
         sensitive_selection = [key for key in selected_groups if key in SENSITIVE_GROUP_KEYS]
         if scrub_secrets and sensitive_selection:
             labels = ", ".join(BACKUP_GROUP_METADATA[key]["label"] for key in sensitive_selection)
@@ -2226,8 +2993,14 @@ class SystemBackupService:
         self._validate_encrypted_scope(selected_groups, encrypt=encrypt)
         requested_packaging = self._normalize_packaging(packaging)
         if encrypt and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
         normalized_packaging: ArchivePackaging = "7z" if encrypt else requested_packaging
+        self._require_export_free_space(
+            selected_groups,
+            app_settings=app_settings,
+            packaging=normalized_packaging,
+            scrub_history=scrub_disk_identifiers or scrub_secrets,
+        )
         scrubber = (
             DebugScrubber(
                 scrub_secrets=scrub_secrets,
@@ -2277,6 +3050,7 @@ class SystemBackupService:
                 runtime_payload=runtime_payload,
                 maintenance_payload=maintenance_payload,
                 exported_at=exported_at,
+                source_snapshot=_ExportSourceSnapshot(workspace / "sources"),
             )
             if segmented_snapshot is not None:
                 bundle_members.append(
@@ -2333,6 +3107,7 @@ class SystemBackupService:
                 normalized_packaging,
                 expanded_archive_size=expanded_archive_size,
                 passphrase=passphrase if encrypt else None,
+                manifest=manifest,
             )
             return FileBackupArtifact(
                 filename=filename,
@@ -2364,23 +3139,59 @@ class SystemBackupService:
             label="activation journal",
         )
 
-    def import_bundle(self, content: bytes, *, passphrase: str | None = None) -> dict[str, Any]:
+    def import_bundle(
+        self,
+        content: bytes,
+        *,
+        passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+    ) -> dict[str, Any]:
+        """Import an in-memory archive through the file-backed pipeline.
+
+        The bytes are spooled to a private temporary file first, so every archive
+        safety rule lives in one place (``_read_archive_file``).
+        """
         if len(content) > MAX_BACKUP_ARCHIVE_BYTES:
             raise ValueError(
                 f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
             )
-        return self._import_parsed_bundle(
-            self._read_archive(content, passphrase=passphrase)
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="truenas-jbod-ui-bytes-import-",
+            suffix=".archive",
         )
+        archive_path = Path(raw_path)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            return self.import_bundle_from_file(
+                archive_path,
+                passphrase=passphrase,
+                expected_encrypted=expected_encrypted,
+            )
+        finally:
+            archive_path.unlink(missing_ok=True)
 
     def import_bundle_from_file(
         self,
         archive_path: str | Path,
         *,
         passphrase: str | None = None,
+        expected_encrypted: bool | None = None,
+        preflighted_archive_sha256: str | None = None,
     ) -> dict[str, Any]:
+        """Import an archive file.
+
+        ``preflighted_archive_sha256`` is the digest returned by
+        ``preflight_import_bundle_file`` for the same staged file. When the bytes
+        read now hash to the same value, the history databases already passed
+        ``PRAGMA quick_check`` and it is not repeated; any mismatch runs it again.
+        """
         return self._import_parsed_bundle(
-            self._read_archive_file(Path(archive_path), passphrase=passphrase)
+            self._read_archive_file(Path(archive_path), passphrase=passphrase),
+            expected_encrypted=expected_encrypted,
+            preflighted_archive_sha256=preflighted_archive_sha256,
         )
 
     def _import_parsed_bundle(
@@ -2391,20 +3202,33 @@ class SystemBackupService:
             ArchivePackaging,
             dict[str, Any],
         ],
+        *,
+        expected_encrypted: bool | None = None,
+        preflighted_archive_sha256: str | None = None,
     ) -> dict[str, Any]:
         manifest, extracted, detected_packaging, archive_meta = parsed
         cleanup_root = archive_meta.pop("_cleanup_root", None)
+        archive_digest = archive_meta.pop("_archive_sha256", None)
+        history_integrity_checked = (
+            isinstance(preflighted_archive_sha256, str)
+            and isinstance(archive_digest, str)
+            and hmac.compare_digest(preflighted_archive_sha256, archive_digest)
+        )
+        primary_error: Exception | None = None
         try:
+            self._enforce_expected_encryption(archive_meta, expected_encrypted)
             group_entries = self._manifest_group_entries(manifest)
-            self._validate_manifest_member_metadata(manifest, extracted)
-            self._preflight_selected_group_members(manifest, group_entries, extracted)
-            self._preflight_import_members(manifest, group_entries, extracted)
-            restore_destinations = self._build_restore_destination_graph(
+            restore_destinations, catalog = self._admit_restore(
                 manifest,
                 group_entries,
                 extracted,
+                history_integrity_checked=history_integrity_checked,
             )
-            self._prepare_segmented_history_import(manifest, extracted)
+            if catalog is not None:
+                extracted[SEGMENTED_CATALOG_STAGING_KEY] = catalog
+            version_note = self._app_version_note(manifest)
+            if version_note is not None:
+                logger.warning("%s", version_note)
             segmented_restore = manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
             segmented_activation = (
                 self._segmented_history_activation_members(
@@ -2420,13 +3244,13 @@ class SystemBackupService:
                 if segmented_restore
                 else nullcontext()
             )
-            transaction = _ImportActivationTransaction(
-                extracted,
-                history_store=self.store,
-            )
             marker: tuple[Path, dict[str, Any]] | None = None
             try:
                 with lock_context:
+                    transaction = _ImportActivationTransaction(
+                        extracted,
+                        history_store=self.store,
+                    )
                     try:
                         with transaction:
                             if segmented_activation is not None:
@@ -2476,8 +3300,18 @@ class SystemBackupService:
             except Exception:
                 get_settings.cache_clear()
                 raise
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._cleanup_extracted_archive(cleanup_root)
+            try:
+                self._cleanup_extracted_archive(cleanup_root)
+            except Exception as cleanup_error:
+                if primary_error is not None:
+                    raise RuntimeError(
+                        f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                    ) from primary_error
+                raise cleanup_error
 
     def _build_restore_destination_graph(
         self,
@@ -2555,16 +3389,22 @@ class SystemBackupService:
             if self._manifest_group_selected(group_entries.get(group_key))
             and bool(self._group_members(manifest, group_key))
         ]
+        restores_history = any(
+            destination.group_key == HISTORY_DB_KEY for destination in active_destinations
+        )
+        if (
+            restores_history
+            and manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION
+            and self.store.segment_catalog_path is not None
+        ):
+            raise ValueError(V1_HISTORY_ON_SEGMENTED_MESSAGE)
         if (
             manifest.get("schema_version") == SEGMENTED_BACKUP_SCHEMA_VERSION
-            and any(
-                destination.group_key == HISTORY_DB_KEY
-                for destination in active_destinations
-            )
+            and restores_history
         ):
             catalog_path = self.store.segment_catalog_path
             if catalog_path is None:
-                raise ValueError("Segmented history catalog target is not configured.")
+                raise ValueError(SEGMENTED_CATALOG_NOT_SET_MESSAGE)
             segmented_destination = _ImportRestoreDestination(
                 SEGMENTED_CATALOG_STAGING_KEY,
                 catalog_path.parent,
@@ -2573,6 +3413,20 @@ class SystemBackupService:
             destinations[SEGMENTED_CATALOG_STAGING_KEY] = segmented_destination
             active_destinations.append(segmented_destination)
 
+        # Activation protects live history even when the archive omits it.
+        # Apply the same rule before inspection/preflight can issue an identity.
+        protected_history_keys = _ImportActivationTransaction._history_artifact_keys(self.store)
+        for destination in active_destinations:
+            if destination.group_key not in {HISTORY_DB_KEY, SEGMENTED_CATALOG_STAGING_KEY} and any(
+                _ImportActivationTransaction._journal_paths_overlap(
+                    _ImportActivationTransaction._journal_key(destination.target_path),
+                    protected_history_key,
+                )
+                for protected_history_key in protected_history_keys
+            ):
+                raise ValueError(
+                    f"Live restore target {destination.target_path} collides with the history database."
+                )
         self._validate_restore_destination_graph(active_destinations)
         return destinations
 
@@ -2668,9 +3522,11 @@ class SystemBackupService:
         self,
         manifest: dict[str, Any],
         extracted: dict[str, ExtractedMember],
-    ) -> None:
+        *,
+        history_integrity_checked: bool = False,
+    ) -> bytes | None:
         if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
-            return
+            return None
         history_catalog = manifest.get("history_catalog")
         generation = manifest.get("generation")
         if not isinstance(history_catalog, dict) or not isinstance(generation, dict):
@@ -2685,7 +3541,10 @@ class SystemBackupService:
             member_key = entry.get("member_key")
             if not isinstance(member_key, str) or member_key not in extracted:
                 raise ValueError("Segmented history archive is missing a required segment.")
-            self._validate_history_member(extracted[member_key])
+            self._validate_history_member(
+                extracted[member_key],
+                integrity_checked=history_integrity_checked,
+            )
             segment_id = entry.get("segment_id")
             local_segments.append(
                 {
@@ -2708,7 +3567,7 @@ class SystemBackupService:
             "segments": local_segments,
             "tombstones": list(history_catalog.get("tombstones") or []),
         }
-        extracted[SEGMENTED_CATALOG_STAGING_KEY] = json.dumps(
+        return json.dumps(
             local_catalog,
             sort_keys=True,
             separators=(",", ":"),
@@ -2878,6 +3737,7 @@ class SystemBackupService:
             elif self._manifest_group_present(history_group):
                 raise ValueError("Backup bundle is missing the selected history database member.")
 
+        get_settings.cache_clear()
         imported_settings = self._load_app_settings()
         return {
             "ok": True,
@@ -2907,8 +3767,18 @@ class SystemBackupService:
         }
 
     def _load_app_settings(self) -> Settings:
-        get_settings.cache_clear()
-        return get_settings()
+        # Bootstrap must obey the same source admission as export, including
+        # unselected config/override/profile files, without activating paths or
+        # replacing the running application's cached settings.
+        snapshot = _ExportSourceSnapshot()
+        for content in self._captured_config_files.values():
+            if content is not None:
+                snapshot.admit_bytes(content, CONFIG_FILE_KEY, "settings.yaml")
+        return load_settings(
+            create_directories=False,
+            read_yaml_file=snapshot.read_yaml_file,
+            captured_files=self._captured_config_files,
+        )
 
     @staticmethod
     def _cleanup_extracted_archive(cleanup_root: Any) -> None:
@@ -2923,11 +3793,27 @@ class SystemBackupService:
                     "Backup bundle extraction workspace cleanup failed."
                 ) from exc
 
+    def _cleanup_extracted_archive_after(
+        self,
+        cleanup_root: Any,
+        primary_error: Exception | None,
+    ) -> None:
+        try:
+            self._cleanup_extracted_archive(cleanup_root)
+        except Exception as cleanup_error:
+            if primary_error is not None:
+                raise RuntimeError(
+                    f"{primary_error} Backup bundle extraction workspace cleanup failed too."
+                ) from primary_error
+            raise cleanup_error
+
     def _preflight_import_members(
         self,
         manifest: dict[str, Any],
         group_entries: dict[str, dict[str, Any]],
         extracted_members: dict[str, ExtractedMember],
+        *,
+        history_integrity_checked: bool = False,
     ) -> None:
         validators: dict[str, Any] = {
             CONFIG_FILE_KEY: self._validate_config_member,
@@ -2953,8 +3839,35 @@ class SystemBackupService:
             try:
                 content = extracted_members[member_key]
                 if group_key == HISTORY_DB_KEY:
-                    self._validate_history_member(content)
+                    self._validate_history_member(
+                        content,
+                        integrity_checked=history_integrity_checked,
+                    )
+                elif isinstance(content, Path) and group_key == MAPPING_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "slot_mappings",
+                        ManualMapping,
+                    )
+                elif isinstance(content, Path) and group_key == SAS_FABRIC_ALIAS_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "sas_fabric_aliases",
+                        SasFabricAlias,
+                    )
+                elif isinstance(content, Path) and group_key == SLOT_DETAIL_FILE_KEY:
+                    self._validate_streaming_json_member(
+                        content,
+                        "slot_details",
+                        SlotDetailCacheEntry,
+                    )
                 else:
+                    if (
+                        group_key in STRUCTURED_YAML_GROUP_KEYS
+                        and self._extracted_member_size(content)
+                        > MAX_STRUCTURED_YAML_MEMBER_BYTES
+                    ):
+                        raise ValueError("Structured YAML member exceeds its size limit.")
                     validator(self._extracted_member_bytes(content))
             except (UnicodeError, yaml.YAMLError, json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
                 raise ValueError(
@@ -3074,6 +3987,15 @@ class SystemBackupService:
         return digest.hexdigest()
 
     @staticmethod
+    def _validate_streaming_json_member(
+        content: Path,
+        target_key: str,
+        model: Any,
+    ) -> int:
+        with content.open("r", encoding="utf-8", buffering=JSON_STREAM_CHUNK_CHARS) as source:
+            return _StreamingJSONReader(source).validate_mapping_entries(target_key, model)
+
+    @staticmethod
     def _load_yaml_mapping(content: bytes) -> dict[str, Any]:
         payload = yaml.safe_load(content.decode("utf-8")) or {}
         if not isinstance(payload, dict):
@@ -3142,8 +4064,201 @@ class SystemBackupService:
         for entry in entries.values():
             SlotDetailCacheEntry.model_validate(entry)
 
+    def _require_restore_free_space(
+        self,
+        manifest: dict[str, Any],
+        group_entries: dict[str, dict[str, Any]],
+        extracted_members: dict[str, ExtractedMember],
+    ) -> None:
+        history_group = group_entries.get(HISTORY_DB_KEY)
+        if not self._manifest_group_selected(history_group) or not self._manifest_group_present(
+            history_group
+        ):
+            return
+        history_group_keys = {HISTORY_DB_KEY, HISTORY_SEGMENT_GROUP_KEY}
+        member_bytes = 0
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict) or entry.get("group_key") not in history_group_keys:
+                continue
+            content = extracted_members.get(str(entry.get("key")))
+            if content is not None:
+                member_bytes += self._extracted_member_size(content)
+        live_bytes = 0
+        if manifest.get("schema_version") != SEGMENTED_BACKUP_SCHEMA_VERSION:
+            try:
+                live_bytes = self.store.file_path.stat().st_size
+            except OSError:
+                live_bytes = 0
+        # A restore holds two staged copies at once: the import transaction stages every
+        # history member under the temp folder, and activation stages the hot database and
+        # segment tree beside the live files. Folders that share a filesystem therefore have
+        # to satisfy both requirements together.
+        requirements = (
+            (Path(tempfile.gettempdir()), member_bytes + live_bytes),
+            (self.store.file_path.parent, member_bytes),
+        )
+        checks: list[tuple[Path, int]] = []
+        checks_by_device: dict[int, int] = {}
+        for folder, needed_bytes in requirements:
+            try:
+                device_id: int | None = os.stat(folder).st_dev
+            except OSError:
+                device_id = None
+            position = checks_by_device.get(device_id) if device_id is not None else None
+            if position is not None:
+                shared_folder, shared_bytes = checks[position]
+                checks[position] = (shared_folder, shared_bytes + needed_bytes)
+                continue
+            if device_id is not None:
+                checks_by_device[device_id] = len(checks)
+            checks.append((folder, needed_bytes))
+        for folder, needed_bytes in checks:
+            try:
+                free_bytes = shutil.disk_usage(folder).free
+            except OSError:
+                continue
+            if free_bytes < needed_bytes:
+                raise ValueError(
+                    f"Restore needs about {self._format_size(needed_bytes)} free in {folder}; "
+                    f"{self._format_size(free_bytes)} is available."
+                )
+
+    def _history_source_bytes(self) -> int:
+        """Size of the live history database plus any segment files."""
+        total = 0
+        try:
+            total += self.store.file_path.stat().st_size
+        except OSError:
+            pass
+        catalog_path = self.store.segment_catalog_path
+        if catalog_path is not None:
+            try:
+                for entry in os.scandir(catalog_path.parent):
+                    if entry.is_file(follow_symlinks=False) and entry.name.endswith(".sqlite3"):
+                        total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+        return total
+
+    def _non_history_source_bytes(
+        self,
+        app_settings: Settings,
+        selected_groups: Any,
+    ) -> int:
+        layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
+        config_root = Path(app_settings.config_file).parent
+        file_sources = {
+            CONFIG_FILE_KEY: Path(app_settings.config_file),
+            RUNTIME_OVERRIDES_FILE_KEY: Path(app_settings.paths.runtime_overrides_file),
+            PROFILE_FILE_KEY: Path(app_settings.paths.profile_file),
+            MAPPING_FILE_KEY: Path(app_settings.paths.mapping_file),
+            SAS_FABRIC_ALIAS_FILE_KEY: Path(app_settings.paths.sas_fabric_alias_file),
+            SLOT_DETAIL_FILE_KEY: Path(app_settings.paths.slot_detail_cache_file),
+            KNOWN_HOSTS_KEY: Path(layout_paths["known_hosts_path"]),
+        }
+        directory_sources = {
+            SSH_KEYS_KEY: config_root / "ssh",
+            TLS_TRUST_KEY: config_root / "tls",
+        }
+        total = 0
+        member_count = 1  # Reserve the manifest while bounding source discovery.
+
+        def admit_entry() -> None:
+            nonlocal member_count
+            member_count += 1
+            if member_count > MAX_ARCHIVE_MEMBER_COUNT:
+                raise ValueError("Backup bundle archive contains too many members.")
+
+        for group_key, source_path in file_sources.items():
+            if group_key not in selected_groups:
+                continue
+            captured_path = source_path.absolute()
+            if captured_path in self._captured_config_files:
+                content = self._captured_config_files[captured_path]
+                if content is not None:
+                    admit_entry()
+                    total += len(content)
+                continue
+            try:
+                metadata = source_path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("Backup export source must be a regular file.")
+            admit_entry()
+            total += metadata.st_size
+        for group_key, source_dir in directory_sources.items():
+            if group_key not in selected_groups:
+                continue
+            try:
+                root_metadata = source_dir.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise ValueError("Backup export source must be a directory without symlinks.")
+            pending = [source_dir]
+            while pending:
+                directory = pending.pop()
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        admit_entry()
+                        if entry.is_symlink():
+                            raise ValueError("Backup export source must not be a symlink.")
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                            continue
+                        metadata = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError("Backup export source must be a regular file.")
+                        total += metadata.st_size
+        return total
+
+    def _require_export_free_space(
+        self,
+        selected_groups: Any,
+        *,
+        app_settings: Settings,
+        packaging: ArchivePackaging,
+        scrub_history: bool = False,
+    ) -> None:
+        """Fail before writing anything when the temp folder cannot hold the export.
+
+        ZIP holds source snapshots and output together. TAR and 7z packaging can
+        additionally hold an uncompressed staging archive. Debug history
+        scrubbing adds one more history-sized file.
+        """
+        history_bytes = self._history_source_bytes() if HISTORY_DB_KEY in selected_groups else 0
+        payload_bytes = history_bytes + self._non_history_source_bytes(app_settings, selected_groups)
+        copies = 2 if packaging == "zip" else 3
+        needed_bytes = copies * payload_bytes
+        if scrub_history:
+            needed_bytes += history_bytes
+        if needed_bytes == 0:
+            return
+        folder = Path(tempfile.gettempdir())
+        try:
+            free_bytes = shutil.disk_usage(folder).free
+        except OSError:
+            return
+        if free_bytes < needed_bytes:
+            raise ValueError(
+                f"Export needs about {self._format_size(needed_bytes)} free in {folder}; "
+                f"{self._format_size(free_bytes)} is available."
+            )
+
     @staticmethod
-    def _validate_history_member(content: ExtractedMember) -> None:
+    def _format_size(size_bytes: int) -> str:
+        for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+            if size_bytes >= scale:
+                return f"{size_bytes / scale:.1f} {unit}"
+        return f"{size_bytes} bytes"
+
+    @staticmethod
+    def _validate_history_member(
+        content: ExtractedMember,
+        *,
+        integrity_checked: bool = False,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             if isinstance(content, Path):
                 candidate_path = content
@@ -3152,7 +4267,11 @@ class SystemBackupService:
                 candidate_path.write_bytes(content)
             database_uri = f"{candidate_path.resolve().as_uri()}?mode=ro"
             with closing(sqlite3.connect(database_uri, uri=True)) as connection:
-                rows = connection.execute("PRAGMA quick_check").fetchall()
+                rows = (
+                    [("ok",)]
+                    if integrity_checked
+                    else connection.execute("PRAGMA quick_check").fetchall()
+                )
                 required_columns = {
                     "slot_state_current": {"system_id", "enclosure_key", "slot"},
                     "slot_events": {"system_id", "enclosure_key", "slot", "observed_at"},
@@ -3336,6 +4455,7 @@ class SystemBackupService:
         history_snapshot_path: Path | None,
         *,
         selected_groups: list[str],
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[list[BundleGroup], list[BundleMember]]:
         layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
         config_root = Path(app_settings.config_file).parent
@@ -3352,36 +4472,42 @@ class SystemBackupService:
                     group_key,
                     Path(app_settings.config_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.runtime_overrides_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == PROFILE_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.profile_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == MAPPING_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.mapping_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.sas_fabric_alias_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(app_settings.paths.slot_detail_cache_file),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == HISTORY_DB_KEY:
                 group, members = self._collect_generated_path_group(
@@ -3395,18 +4521,21 @@ class SystemBackupService:
                     group_key,
                     config_root / "ssh",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == TLS_TRUST_KEY:
                 group, members = self._collect_directory_group(
                     group_key,
                     config_root / "tls",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == KNOWN_HOSTS_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(layout_paths["known_hosts_path"]),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             else:
                 continue
@@ -3425,6 +4554,7 @@ class SystemBackupService:
         runtime_payload: dict[str, Any] | None,
         maintenance_payload: dict[str, Any] | None,
         exported_at: datetime,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[list[BundleGroup], list[BundleMember]]:
         layout_paths = _derive_runtime_layout_paths(app_settings.config_file)
         config_root = Path(app_settings.config_file).parent
@@ -3437,7 +4567,14 @@ class SystemBackupService:
                 continue
             selected = group_key in selected_groups
             if group_key == CONFIG_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.config_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.config_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3445,7 +4582,14 @@ class SystemBackupService:
                     source_path=app_settings.config_file,
                 )
             elif group_key == RUNTIME_OVERRIDES_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.runtime_overrides_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.runtime_overrides_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3453,7 +4597,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.runtime_overrides_file,
                 )
             elif group_key == PROFILE_FILE_KEY:
-                content_bytes = self._read_scrubbed_yaml_file(Path(app_settings.paths.profile_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.profile_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_yaml_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3461,7 +4612,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.profile_file,
                 )
             elif group_key == MAPPING_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.mapping_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.mapping_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3469,7 +4627,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.mapping_file,
                 )
             elif group_key == SAS_FABRIC_ALIAS_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.sas_fabric_alias_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.sas_fabric_alias_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3477,7 +4642,14 @@ class SystemBackupService:
                     source_path=app_settings.paths.sas_fabric_alias_file,
                 )
             elif group_key == SLOT_DETAIL_FILE_KEY:
-                content_bytes = self._read_scrubbed_json_file(Path(app_settings.paths.slot_detail_cache_file), scrubber)
+                snapshot_path = (
+                    source_snapshot.copy(Path(app_settings.paths.slot_detail_cache_file), group_key, metadata["archive_root"])
+                    if selected else None
+                )
+                content_bytes = (
+                    self._read_scrubbed_json_file(snapshot_path, scrubber)
+                    if snapshot_path is not None else b""
+                )
                 group, members = self._collect_generated_file_group(
                     group_key,
                     content_bytes,
@@ -3496,27 +4668,32 @@ class SystemBackupService:
                     group_key,
                     config_root / "ssh",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == TLS_TRUST_KEY:
                 group, members = self._collect_directory_group(
                     group_key,
                     config_root / "tls",
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == KNOWN_HOSTS_KEY:
                 group, members = self._collect_file_group(
                     group_key,
                     Path(layout_paths["known_hosts_path"]),
                     selected=selected,
+                    source_snapshot=source_snapshot,
                 )
             elif group_key == DEBUG_STATE_KEY:
-                content_bytes = self._build_debug_state_bytes(
-                    app_settings,
-                    runtime_payload=runtime_payload,
-                    maintenance_payload=maintenance_payload,
-                    selected_groups=selected_groups,
-                    scrubber=scrubber,
-                    exported_at=exported_at,
+                content_bytes = (
+                    self._build_debug_state_bytes(
+                        app_settings,
+                        runtime_payload=runtime_payload,
+                        maintenance_payload=maintenance_payload,
+                        selected_groups=selected_groups,
+                        scrubber=scrubber,
+                        exported_at=exported_at,
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
@@ -3525,9 +4702,11 @@ class SystemBackupService:
                     source_path=None,
                 )
             elif group_key == DEBUG_README_KEY:
-                content_bytes = self._build_debug_readme_bytes(
-                    scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
-                    scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                content_bytes = (
+                    self._build_debug_readme_bytes(
+                        scrub_secrets=bool(scrubber and scrubber.scrub_secrets),
+                        scrub_disk_identifiers=bool(scrubber and scrubber.scrub_disk_identifiers),
+                    ) if selected else b""
                 )
                 group, members = self._collect_generated_file_group(
                     group_key,
@@ -3548,6 +4727,7 @@ class SystemBackupService:
         source_path: Path,
         *,
         selected: bool,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[BundleGroup, list[BundleMember]]:
         metadata = BACKUP_GROUP_METADATA[group_key]
         if not selected:
@@ -3565,14 +4745,25 @@ class SystemBackupService:
                 [],
             )
 
-        if source_path.exists() and source_path.is_file():
+        captured_path = source_path.absolute()
+        if captured_path in self._captured_config_files:
+            content = self._captured_config_files[captured_path]
+            snapshot_path = (
+                source_snapshot.copy_bytes(content, group_key, metadata["archive_root"])
+                if content is not None
+                else None
+            )
+        else:
+            snapshot_path = source_snapshot.copy(source_path, group_key, metadata["archive_root"])
+        if snapshot_path is not None:
             member = BundleMember(
                 key=group_key,
                 group_key=group_key,
                 archive_path=metadata["archive_root"],
                 source_path=str(source_path),
                 present=True,
-                content=source_path.read_bytes(),
+                content=None,
+                file_path=snapshot_path,
             )
             return (
                 BundleGroup(
@@ -3703,6 +4894,7 @@ class SystemBackupService:
         source_dir: Path,
         *,
         selected: bool,
+        source_snapshot: _ExportSourceSnapshot,
     ) -> tuple[BundleGroup, list[BundleMember]]:
         metadata = BACKUP_GROUP_METADATA[group_key]
         if not selected:
@@ -3721,21 +4913,40 @@ class SystemBackupService:
             )
 
         members: list[BundleMember] = []
-        if source_dir.exists() and source_dir.is_dir():
-            for file_path in sorted(path for path in source_dir.rglob("*") if path.is_file()):
-                relative_path = file_path.relative_to(source_dir).as_posix()
-                member_key = f"{group_key}:{relative_path}"
-                archive_path = f"{metadata['archive_root']}/{relative_path}"
-                members.append(
-                    BundleMember(
-                        key=member_key,
-                        group_key=group_key,
-                        archive_path=archive_path,
-                        source_path=str(file_path),
-                        present=True,
-                        content=file_path.read_bytes(),
+        pending = [source_dir] if source_dir.exists() else []
+        while pending:
+            directory = pending.pop()
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError("Backup export source must be a directory without symlinks.")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    # Charge every entry, including directories, before retaining it.
+                    source_snapshot.admit_entry()
+                    file_path = Path(entry.path)
+                    if entry.is_symlink():
+                        raise ValueError("Backup export source must not be a symlink.")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(file_path)
+                        continue
+                    relative_path = file_path.relative_to(source_dir).as_posix()
+                    archive_path = f"{metadata['archive_root']}/{relative_path}"
+                    snapshot_path = source_snapshot.copy(
+                        file_path, group_key, archive_path, entry_admitted=True,
                     )
-                )
+                    if snapshot_path is None:
+                        raise ValueError("Backup export source changed during snapshot.")
+                    members.append(
+                        BundleMember(
+                            key=f"{group_key}:{relative_path}",
+                            group_key=group_key,
+                            archive_path=archive_path,
+                            source_path=str(file_path),
+                            present=True,
+                            content=None,
+                            file_path=snapshot_path,
+                        )
+                    )
+        members.sort(key=lambda member: member.archive_path)
 
         return (
             BundleGroup(
@@ -3761,10 +4972,13 @@ class SystemBackupService:
         bundle_groups: list[BundleGroup],
         bundle_members: list[BundleMember],
         extra_fields: dict[str, Any] | None = None,
+        file_backed_history: bool = False,
     ) -> dict[str, Any]:
-        member_limit, expanded_limit = self._expanded_limits_for_packaging(packaging)
+        member_limit, expanded_limit = self._expanded_limits_for_packaging(
+            "7z" if file_backed_history else packaging
+        )
         large_member_group_keys = (
-            frozenset({HISTORY_DB_KEY}) if packaging == "7z" else frozenset()
+            frozenset({HISTORY_DB_KEY}) if packaging == "7z" or file_backed_history else frozenset()
         )
         manifest = {
             "schema_version": BUNDLE_SCHEMA_VERSION,
@@ -3817,11 +5031,13 @@ class SystemBackupService:
         member_limit: int = MAX_ARCHIVE_MEMBER_BYTES,
         expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
         large_member_group_keys: frozenset[str] = frozenset(),
+        non_history_expanded_limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
     ) -> list[dict[str, Any]]:
         if len(bundle_members) + 1 > MAX_ARCHIVE_MEMBER_COUNT:
             raise ValueError("Backup bundle archive contains too many members.")
         manifest_files: list[dict[str, Any]] = []
         expanded_total = 0
+        non_history_total = 0
         for member in bundle_members:
             size_bytes, digest = cls._bundle_member_size_and_digest(member)
             effective_member_limit = (
@@ -3831,9 +5047,21 @@ class SystemBackupService:
             )
             if size_bytes > effective_member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            if (
+                member.group_key in STRUCTURED_YAML_GROUP_KEYS
+                and PurePosixPath(member.archive_path).suffix in {".yaml", ".yml"}
+                and size_bytes > MAX_STRUCTURED_YAML_MEMBER_BYTES
+            ):
+                raise ValueError("Structured YAML member exceeds its size limit.")
             expanded_total += size_bytes
             if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+            if member.group_key not in large_member_group_keys:
+                non_history_total += size_bytes
+                if non_history_total > non_history_expanded_limit:
+                    raise ValueError(
+                        "Backup bundle non-history members exceed the expanded byte limit."
+                    )
             manifest_files.append(
                 {
                     "key": member.key,
@@ -3855,6 +5083,37 @@ class SystemBackupService:
             )
         return MAX_ARCHIVE_MEMBER_BYTES, MAX_ARCHIVE_EXPANDED_BYTES
 
+    @classmethod
+    def _validate_export_manifest_non_history_aggregate(
+        cls,
+        manifest: dict[str, Any],
+        *,
+        manifest_size: int,
+        limit: int = MAX_ARCHIVE_EXPANDED_BYTES,
+    ) -> None:
+        non_history_total = manifest_size
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            archive_path = str(entry.get("archive_path") or "")
+            is_history_member = cls._is_declared_history_manifest_member(
+                manifest,
+                key=str(entry.get("key") or ""),
+                group_key=str(entry.get("group_key") or ""),
+                archive_path=archive_path,
+            )
+            if (
+                manifest.get("format") == DEBUG_BUNDLE_FORMAT
+                and entry.get("group_key") == HISTORY_DB_KEY
+            ):
+                is_history_member = True
+            if not is_history_member:
+                non_history_total += int(entry.get("size_bytes") or 0)
+            if non_history_total > limit:
+                raise ValueError(
+                    "Backup bundle non-history members exceed the expanded byte limit."
+                )
+
     def _validate_export_archive(
         self,
         archive_path: Path,
@@ -3862,11 +5121,13 @@ class SystemBackupService:
         *,
         expanded_archive_size: int | None,
         passphrase: str | None,
+        manifest: dict[str, Any],
+        stream_encrypted: bool = False,
     ) -> None:
         archive_size = archive_path.stat().st_size
         archive_limit = (
             MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES
-            if packaging == "7z"
+            if packaging == "7z" or stream_encrypted
             else MAX_BACKUP_ARCHIVE_BYTES
         )
         if archive_size > archive_limit:
@@ -3888,6 +5149,10 @@ class SystemBackupService:
         if packaging in {"tar.gz", "tar.zst"}:
             if expanded_archive_size is None:
                 raise ValueError("Backup bundle TAR archive size could not be verified.")
+            if stream_encrypted:
+                # _write_stream_encrypted_zstd checked the exact compressed
+                # plaintext count. The outer encrypted byte cap is separate above.
+                return
             self._validate_declared_archive_limits(
                 [(archive_size, expanded_archive_size)],
                 compressed_total=archive_size,
@@ -3916,12 +5181,16 @@ class SystemBackupService:
                 list_result.stdout,
                 archive_path,
             )
+            encrypted = self._seven_zip_encryption_mode(listed_entries)
+            if encrypted != bool(passphrase):
+                raise ValueError("The export could not be verified as encrypted. The file was not saved.")
             self._validate_7z_listed_entries(
                 listed_entries,
                 archive_size=archive_size,
                 member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
                 expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
             )
+            self._validate_7z_listing_against_manifest(listed_entries, manifest)
             return
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
 
@@ -3940,25 +5209,6 @@ class SystemBackupService:
         content = member.content or b""
         return len(content), hashlib.sha256(content).hexdigest()
 
-    def _build_archive(
-        self,
-        bundle_members: list[BundleMember],
-        manifest: dict[str, Any],
-        packaging: ArchivePackaging,
-        *,
-        passphrase: str | None = None,
-    ) -> bytes:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / f"bundle{ARCHIVE_FILE_SUFFIXES[packaging]}"
-            self._build_archive_to_path(
-                bundle_members,
-                manifest,
-                packaging,
-                archive_path,
-                passphrase=passphrase,
-            )
-            return archive_path.read_bytes()
-
     def _build_archive_to_path(
         self,
         bundle_members: list[BundleMember],
@@ -3967,11 +5217,18 @@ class SystemBackupService:
         output_path: Path,
         *,
         passphrase: str | None = None,
+        stream_encrypted: bool = False,
     ) -> int | None:
         if passphrase is not None and not passphrase:
-            raise ValueError("A passphrase is required when encryption is enabled.")
+            raise ValueError(EXPORT_PASSPHRASE_REQUIRED_MESSAGE)
+        if stream_encrypted and (packaging != "tar.zst" or not passphrase):
+            raise ValueError("Fast encrypted backups need tar.zst packaging and a passphrase.")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+        self._validate_export_manifest_non_history_aggregate(
+            manifest,
+            manifest_size=len(manifest_bytes),
+        )
         if packaging == "zip":
             with zipfile.ZipFile(
                 output_path,
@@ -4013,6 +5270,9 @@ class SystemBackupService:
                                 compressed,
                                 length=ARCHIVE_READ_CHUNK_BYTES,
                             )
+                elif stream_encrypted:
+                    assert zstd is not None and passphrase
+                    self._write_stream_encrypted_zstd(tar_path, tar_size, output_path, passphrase)
                 else:
                     assert zstd is not None
                     with tar_path.open("rb") as source, output_path.open("wb") as output:
@@ -4030,6 +5290,47 @@ class SystemBackupService:
                 tar_path.unlink(missing_ok=True)
             return tar_size
         raise ValueError(f"Unsupported backup packaging '{packaging}'.")
+
+    @classmethod
+    def _write_stream_encrypted_zstd(
+        cls,
+        tar_path: Path,
+        tar_size: int,
+        output_path: Path,
+        passphrase: str,
+    ) -> None:
+        """Compress and seal in one pass; no plaintext archive is ever written (#397)."""
+
+        assert zstd is not None
+        descriptor = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as output, tar_path.open("rb") as source:
+                sealer = stream_envelope.StreamSealer(output, passphrase)
+                compressor = zstd.ZstdCompressor(
+                    level=STREAM_ENCRYPTED_ZSTD_LEVEL,
+                    threads=STREAM_ENCRYPTED_ZSTD_THREADS,
+                    write_content_size=True,
+                )
+                with compressor.stream_writer(sealer, size=tar_size, closefd=False) as compressed:
+                    shutil.copyfileobj(source, compressed, length=ARCHIVE_READ_CHUNK_BYTES)
+                # Reader admission divides by the decrypted compressed stream, not
+                # by the larger envelope with its header and authentication tags.
+                cls._validate_declared_archive_limits(
+                    [(sealer.bytes_in, tar_size)],
+                    compressed_total=sealer.bytes_in,
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
+                )
+                sealer.close()
+                output.flush()
+                os.fsync(output.fileno())
+        except BaseException:
+            output_path.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def _validate_export_tar_physical_members(cls, tar_path: Path) -> None:
@@ -4140,76 +5441,6 @@ class SystemBackupService:
                 passphrase=passphrase,
             )
 
-    def _read_archive(
-        self,
-        archive_bytes: bytes,
-        *,
-        passphrase: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
-        if archive_bytes.startswith(ENCRYPTED_BACKUP_MAGIC):
-            decrypted = self._decrypt_scheduled_archive(archive_bytes, passphrase)
-            manifest, extracted, packaging, archive_meta = self._read_archive(decrypted)
-            return manifest, extracted, packaging, {
-                **archive_meta,
-                "encrypted": True,
-                "encryption": "aes-256-gcm-scrypt",
-            }
-
-        packaging = self._detect_archive_packaging(archive_bytes)
-        if not packaging:
-            raise ValueError("Backup bundle archive format is not supported.")
-
-        if packaging == "7z":
-            return self._read_7z_archive(archive_bytes, passphrase=passphrase)
-
-        if packaging == "zip":
-            self._preflight_zip_archive(archive_bytes)
-            try:
-                with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as archive:
-                    members = archive.infolist()
-                    self._validate_zip_members(members)
-                    physical_paths = [member.filename for member in members if not member.is_dir()]
-                    self._validate_unique_physical_archive_paths(
-                        physical_paths
-                    )
-                    try:
-                        manifest_member = archive.getinfo("manifest.json")
-                    except KeyError as exc:
-                        raise ValueError("Backup bundle is missing manifest.json.") from exc
-                    if manifest_member.file_size > MAX_MANIFEST_BYTES:
-                        raise ValueError("Backup bundle manifest exceeds its size limit.")
-                    manifest_bytes = archive.read(manifest_member)
-                    manifest = self._load_manifest(manifest_bytes)
-                    self._validate_manifest_before_extraction(manifest)
-                    self._validate_restore_schema_support(manifest)
-                    self._validate_supported_physical_archive_paths(physical_paths, manifest)
-                    extracted = self._extract_manifest_zip_members(archive, manifest)
-            except zipfile.BadZipFile as exc:
-                raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
-            return manifest, extracted, packaging, {"encrypted": False}
-
-        tar_bytes = self._decompress_tar_archive(archive_bytes, packaging)
-        preflight_tar_paths = self._preflight_tar_archive(tar_bytes)
-        try:
-            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
-                members = self._read_bounded_tar_members(archive)
-                physical_paths = [member.name for member in members if member.isfile()]
-                if physical_paths != preflight_tar_paths:
-                    raise ValueError(
-                        "Backup bundle TAR members do not match its physical headers."
-                    )
-                self._validate_unique_physical_archive_paths(
-                    physical_paths
-                )
-                manifest = self._load_manifest(self._read_tar_member(archive, "manifest.json"))
-                self._validate_manifest_before_extraction(manifest)
-                self._validate_restore_schema_support(manifest)
-                self._validate_supported_physical_archive_paths(physical_paths, manifest)
-                extracted = self._extract_manifest_tar_members(archive, manifest)
-        except tarfile.TarError as exc:
-            raise ValueError("Backup bundle TAR archive is corrupted.") from exc
-        return manifest, extracted, packaging, {"encrypted": False}
-
     def _read_archive_file(
         self,
         archive_path: Path,
@@ -4229,67 +5460,317 @@ class SystemBackupService:
                 or metadata.st_size > MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES
             ):
                 raise ValueError("Backup bundle archive exceeds its size or type limits.")
-            prefix = os.pread(descriptor, len(SEVEN_ZIP_SIGNATURE), 0)
-            if prefix.startswith(SEVEN_ZIP_SIGNATURE):
-                workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-"))
-                private_archive = workspace / "bundle.7z"
-                try:
-                    with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
-                        "xb"
-                    ) as destination:
-                        source.seek(0)
-                        shutil.copyfileobj(source, destination, length=ARCHIVE_READ_CHUNK_BYTES)
-                        destination.flush()
-                        os.fsync(destination.fileno())
-                    private_archive.chmod(0o600)
-                    return self._read_7z_archive(
-                        archive_path=private_archive,
-                        passphrase=passphrase,
-                        workspace=workspace,
-                    )
-                except Exception:
-                    shutil.rmtree(workspace, ignore_errors=True)
-                    raise
-            if metadata.st_size > MAX_BACKUP_ARCHIVE_BYTES:
-                raise ValueError(
-                    "Large file-backed backup imports require portable 7z packaging."
+            workspace = Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-file-import-"))
+            workspace.mkdir(mode=0o700, exist_ok=True)
+            private_archive = workspace / "bundle.archive"
+            try:
+                archive_digest = hashlib.sha256()
+                copied_bytes = 0
+                with os.fdopen(os.dup(descriptor), "rb", closefd=True) as source, private_archive.open(
+                    "xb"
+                ) as destination:
+                    source.seek(0)
+                    while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                        copied_bytes += len(chunk)
+                        if copied_bytes > metadata.st_size:
+                            raise ValueError("Backup bundle archive changed while being staged.")
+                        archive_digest.update(chunk)
+                        destination.write(chunk)
+                    if copied_bytes != metadata.st_size:
+                        raise ValueError("Backup bundle archive changed while being staged.")
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                private_archive.chmod(0o600)
+                prefix = os.pread(
+                    descriptor,
+                    max(len(ENCRYPTED_BACKUP_MAGIC), len(SEVEN_ZIP_SIGNATURE)),
+                    0,
                 )
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            chunks: list[bytes] = []
-            remaining = metadata.st_size
-            while remaining:
-                chunk = os.read(descriptor, min(ARCHIVE_READ_CHUNK_BYTES, remaining))
-                if not chunk:
-                    raise ValueError("Backup bundle archive is truncated.")
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            return self._read_archive(b"".join(chunks), passphrase=passphrase)
+                stream_encrypted = stream_envelope.is_stream_envelope(prefix)
+                encrypted_outer = prefix.startswith(ENCRYPTED_BACKUP_MAGIC) or stream_encrypted
+                if stream_encrypted:
+                    decrypted_archive = workspace / "bundle.decrypted"
+                    try:
+                        stream_envelope.decrypt_file(
+                            private_archive,
+                            decrypted_archive,
+                            passphrase,
+                            max_output_bytes=MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES,
+                        )
+                    except stream_envelope.StreamEnvelopeError as exc:
+                        raise ValueError(str(exc)) from None
+                    private_archive.unlink()
+                    private_archive = decrypted_archive
+                elif encrypted_outer:
+                    decrypted_archive = workspace / "bundle.decrypted"
+                    self._decrypt_scheduled_archive_to_file(
+                        private_archive,
+                        decrypted_archive,
+                        passphrase,
+                    )
+                    private_archive = decrypted_archive
+                parsed = self._read_plain_archive_file(
+                    private_archive,
+                    workspace=workspace,
+                    passphrase=passphrase if not encrypted_outer else None,
+                    file_backed_history=stream_encrypted,
+                )
+                manifest, extracted, packaging, archive_meta = parsed
+                if encrypted_outer:
+                    archive_meta.update(
+                        {
+                            "encrypted": True,
+                            "encryption": (
+                                "aes-256-gcm-stream-scrypt" if stream_encrypted else "aes-256-gcm-scrypt"
+                            ),
+                        }
+                    )
+                archive_meta["_archive_sha256"] = archive_digest.hexdigest()
+                return manifest, extracted, packaging, archive_meta
+            except Exception as primary_error:
+                try:
+                    if workspace.exists():
+                        shutil.rmtree(workspace)
+                except Exception:
+                    raise RuntimeError(
+                        f"{primary_error} Backup bundle outer workspace cleanup failed too."
+                    ) from primary_error
+                raise
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def _decrypt_scheduled_archive_to_file(
+        cls,
+        source_path: Path,
+        output_path: Path,
+        passphrase: str | None,
+    ) -> None:
+        header_size = (
+            len(ENCRYPTED_BACKUP_MAGIC)
+            + ENCRYPTED_BACKUP_SALT_BYTES
+            + ENCRYPTED_BACKUP_NONCE_BYTES
+        )
+        source_size = source_path.stat(follow_symlinks=False).st_size
+        if source_size < header_size + ENCRYPTED_BACKUP_TAG_BYTES:
+            raise ValueError("Scheduled backup archive is corrupted.")
+        if not passphrase:
+            raise ValueError(PASSPHRASE_REQUIRED_MESSAGE)
+        with source_path.open("rb", buffering=0) as source:
+            header = source.read(header_size)
+            if not header.startswith(ENCRYPTED_BACKUP_MAGIC) or len(header) != header_size:
+                raise ValueError("Scheduled backup archive is corrupted.")
+            salt_start = len(ENCRYPTED_BACKUP_MAGIC)
+            nonce_start = salt_start + ENCRYPTED_BACKUP_SALT_BYTES
+            salt = header[salt_start:nonce_start]
+            nonce = header[nonce_start:]
+            source.seek(source_size - ENCRYPTED_BACKUP_TAG_BYTES)
+            tag = source.read(ENCRYPTED_BACKUP_TAG_BYTES)
+            key = cls._scheduled_backup_key(passphrase, salt)
+            decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+            decryptor.authenticate_additional_data(header)
+            source.seek(header_size)
+            remaining = source_size - header_size - ENCRYPTED_BACKUP_TAG_BYTES
+            try:
+                with output_path.open("xb") as output:
+                    while remaining:
+                        chunk = source.read(min(ARCHIVE_READ_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise ValueError("Scheduled backup archive is corrupted.")
+                        remaining -= len(chunk)
+                        output.write(decryptor.update(chunk))
+                    output.write(decryptor.finalize())
+                    output.flush()
+                    os.fsync(output.fileno())
+            except InvalidTag as exc:
+                output_path.unlink(missing_ok=True)
+                raise ValueError(WRONG_PASSPHRASE_MESSAGE) from exc
+        output_path.chmod(0o600)
+
+    def _read_plain_archive_file(
+        self,
+        archive_path: Path,
+        *,
+        workspace: Path,
+        passphrase: str | None,
+        file_backed_history: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
+        archive_size = archive_path.stat(follow_symlinks=False).st_size
+        with archive_path.open("rb", buffering=0) as source:
+            prefix = source.read(8)
+        packaging = self._detect_archive_packaging(prefix)
+        if packaging is None:
+            raise ValueError("Backup bundle archive format is not supported.")
+        if file_backed_history:
+            # Only an authenticated TJBENC02 envelope admits multi-GiB history in tar.zst.
+            if packaging != "tar.zst":
+                raise ValueError("Backup bundle archive format is not supported.")
+            return self._read_file_backed_tar_zst(archive_path, workspace=workspace)
+        if packaging == "7z":
+            return self._read_7z_archive(
+                archive_path=archive_path,
+                passphrase=passphrase,
+                workspace=workspace,
+            )
+        if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
+        extract_dir = workspace / "extract"
+        extract_dir.mkdir(mode=0o700)
+        if packaging == "zip":
+            try:
+                with archive_path.open("rb") as raw_archive:
+                    with mmap.mmap(raw_archive.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                        self._preflight_zip_archive(mapped)
+                with zipfile.ZipFile(archive_path, mode="r") as archive:
+                    members = archive.infolist()
+                    self._validate_zip_members(members)
+                    physical_paths = [member.filename for member in members if not member.is_dir()]
+                    self._validate_unique_physical_archive_paths(physical_paths)
+                    try:
+                        manifest_member = archive.getinfo("manifest.json")
+                    except KeyError as exc:
+                        raise ValueError("Backup bundle is missing manifest.json.") from exc
+                    if manifest_member.file_size > MAX_MANIFEST_BYTES:
+                        raise ValueError("Backup bundle manifest exceeds its size limit.")
+                    with archive.open(manifest_member) as manifest_source:
+                        manifest = self._load_manifest(
+                            self._read_bounded_stream(manifest_source, MAX_MANIFEST_BYTES)
+                        )
+                    self._validate_manifest_before_extraction(manifest)
+                    self._validate_restore_schema_support(manifest)
+                    self._validate_supported_physical_archive_paths(physical_paths, manifest)
+                    extracted = self._extract_manifest_zip_members_to_directory(
+                        archive,
+                        manifest,
+                        extract_dir,
+                    )
+            except zipfile.BadZipFile as exc:
+                raise ValueError("Backup bundle ZIP archive is corrupted.") from exc
+            return manifest, extracted, packaging, {
+                "encrypted": False,
+                "_cleanup_root": workspace,
+            }
+
+        tar_path = workspace / "bundle.tar"
+        self._decompress_tar_archive_to_file(archive_path, tar_path, packaging)
+        with tar_path.open("rb") as raw_tar:
+            with mmap.mmap(raw_tar.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                preflight_tar_paths = self._preflight_tar_archive(mapped)
+        try:
+            with tarfile.open(tar_path, mode="r:") as archive:
+                members = self._read_bounded_tar_members(archive)
+                physical_paths = [member.name for member in members if member.isfile()]
+                if physical_paths != preflight_tar_paths:
+                    raise ValueError(
+                        "This backup file is damaged (its contents do not match its index)."
+                    )
+                self._validate_unique_physical_archive_paths(physical_paths)
+                manifest = self._load_manifest(
+                    self._read_tar_member_bounded(archive, "manifest.json", MAX_MANIFEST_BYTES)
+                )
+                self._validate_manifest_before_extraction(manifest)
+                self._validate_restore_schema_support(manifest)
+                self._validate_supported_physical_archive_paths(physical_paths, manifest)
+                extracted = self._extract_manifest_tar_members_to_directory(
+                    archive,
+                    manifest,
+                    extract_dir,
+                )
+        except tarfile.TarError as exc:
+            raise ValueError("Backup bundle TAR archive is corrupted.") from exc
+        return manifest, extracted, packaging, {
+            "encrypted": False,
+            "_cleanup_root": workspace,
+        }
+
+    def _read_file_backed_tar_zst(
+        self,
+        archive_path: Path,
+        *,
+        workspace: Path,
+    ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
+        """Read a decrypted TJBENC02 tar.zst with the same limits as a 7z FULL backup."""
+
+        if archive_path.stat(follow_symlinks=False).st_size > MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES:
+            raise ValueError(
+                f"Backup bundle archive exceeds the {MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES}-byte input limit."
+            )
+        extract_dir = workspace / "extract"
+        extract_dir.mkdir(mode=0o700)
+        tar_path = workspace / "bundle.tar"
+        self._decompress_tar_archive_to_file(
+            archive_path,
+            tar_path,
+            "tar.zst",
+            expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES + MAX_ARCHIVE_METADATA_BYTES,
+        )
+        archive_path.unlink()
+        try:
+            # Positional reads, not mmap: a multi-GiB tar must fit the 1 GiB
+            # restore address-space budget.
+            with tar_path.open("rb", buffering=0) as raw_tar:
+                preflight_tar_paths = self._preflight_tar_archive(
+                    _PreadView(raw_tar.fileno()),
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                )
+            with tarfile.open(tar_path, mode="r:") as archive:
+                members = self._read_bounded_tar_members(
+                    archive,
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                )
+                physical_paths = [member.name for member in members if member.isfile()]
+                if physical_paths != preflight_tar_paths:
+                    raise ValueError("Backup bundle TAR members do not match its physical headers.")
+                self._validate_unique_physical_archive_paths(physical_paths)
+                manifest = self._load_manifest(
+                    self._read_tar_member_bounded(archive, "manifest.json", MAX_MANIFEST_BYTES)
+                )
+                self._validate_manifest_before_extraction(
+                    manifest,
+                    member_limit=MAX_FILE_BACKED_ARCHIVE_MEMBER_BYTES,
+                    expanded_limit=MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES,
+                    large_member_group_keys=frozenset({HISTORY_DB_KEY}),
+                )
+                self._validate_restore_schema_support(manifest)
+                self._validate_supported_physical_archive_paths(physical_paths, manifest)
+                # Same per-member and non-history totals as a 7z FULL backup.
+                self._validate_7z_listing_against_manifest(
+                    [{"Path": member.name, "Size": str(member.size)} for member in members],
+                    manifest,
+                )
+                extracted = self._extract_manifest_tar_members_to_directory(
+                    archive,
+                    manifest,
+                    extract_dir,
+                )
+        except tarfile.TarError as exc:
+            raise ValueError("Backup bundle TAR archive is corrupted.") from exc
+        finally:
+            tar_path.unlink(missing_ok=True)
+        return manifest, extracted, "tar.zst", {
+            "encrypted": False,
+            "_cleanup_root": workspace,
+        }
+
     def _read_7z_archive(
         self,
-        archive_bytes: bytes | None = None,
         *,
-        archive_path: Path | None = None,
+        archive_path: Path,
         passphrase: str | None = None,
         workspace: Path | None = None,
     ) -> tuple[dict[str, Any], dict[str, ExtractedMember], ArchivePackaging, dict[str, Any]]:
-        if (archive_bytes is None) == (archive_path is None):
-            raise ValueError("Exactly one 7z archive source is required.")
         temp_root = (
             Path(tempfile.mkdtemp(prefix="truenas-jbod-ui-7z-import-"))
             if workspace is None
             else workspace
         )
         try:
-            if archive_path is None:
-                archive_path = temp_root / "bundle.7z"
-                archive_path.write_bytes(archive_bytes or b"")
-                archive_size = len(archive_bytes or b"")
-            else:
-                archive_path = Path(archive_path).absolute()
-                archive_size = archive_path.stat(follow_symlinks=False).st_size
+            archive_path = Path(archive_path).absolute()
+            archive_size = archive_path.stat(follow_symlinks=False).st_size
             extract_dir = temp_root / "extract"
             extract_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4327,7 +5808,7 @@ class SystemBackupService:
             self._validate_unique_physical_archive_paths(
                 listed_paths
             )
-            encrypted = "Encrypted = +" in list_result.stdout or "7zAES" in list_result.stdout
+            encrypted = self._seven_zip_encryption_mode(listed_entries)
 
             manifest_entries = [
                 entry
@@ -4437,10 +5918,65 @@ class SystemBackupService:
             raise ValueError("Backup bundle manifest is not valid JSON.")
         return manifest
 
+    @classmethod
+    def _validate_restore_schema_support(cls, manifest: dict[str, Any]) -> None:
+        schema_version = manifest.get("schema_version")
+        if (
+            type(schema_version) is not int
+            or schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS
+        ):
+            raise ValueError(cls._unsupported_schema_message(schema_version))
+        cls._require_app_version_not_newer(manifest)
+
     @staticmethod
-    def _validate_restore_schema_support(manifest: dict[str, Any]) -> None:
-        if manifest.get("schema_version") not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS:
-            raise ValueError("Backup bundle schema is not supported for restore.")
+    def _unsupported_schema_message(schema_version: Any) -> str:
+        if (
+            type(schema_version) is int
+            and schema_version > max(SUPPORTED_BUNDLE_SCHEMA_VERSIONS)
+        ):
+            return (
+                "This backup was made by a newer version of the app "
+                f"(schema version {schema_version}). Upgrade first, then restore."
+            )
+        return (
+            "This backup file is not in a format this app can restore "
+            f"(schema version {schema_version!r})."
+        )
+
+    @staticmethod
+    def _parse_app_version(value: Any) -> tuple[int, int, int] | None:
+        if not isinstance(value, str):
+            return None
+        match = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)", value)
+        if match is None:
+            return None
+        major, minor, patch = (int(part) for part in match.groups())
+        return major, minor, patch
+
+    @classmethod
+    def _require_app_version_not_newer(cls, manifest: dict[str, Any]) -> None:
+        bundle_version = cls._parse_app_version(manifest.get("app_version"))
+        current_version = cls._parse_app_version(__version__)
+        if bundle_version is None or current_version is None:
+            return
+        if bundle_version > current_version:
+            made_by = ".".join(str(part) for part in bundle_version)
+            raise ValueError(
+                f"This backup was made by v{made_by}; this deployment is v{__version__}. "
+                "Upgrade before restoring."
+            )
+
+    @classmethod
+    def _app_version_note(cls, manifest: dict[str, Any]) -> str | None:
+        bundle_version = cls._parse_app_version(manifest.get("app_version"))
+        current_version = cls._parse_app_version(__version__)
+        if bundle_version is None or current_version is None or bundle_version >= current_version:
+            return None
+        made_by = ".".join(str(part) for part in bundle_version)
+        return (
+            f"This backup was made by v{made_by}; settings and history will be "
+            "brought up to date during restore."
+        )
 
     @classmethod
     def _is_declared_history_manifest_member(
@@ -4487,7 +6023,7 @@ class SystemBackupService:
             type(schema_version) is not int
             or schema_version not in SUPPORTED_BUNDLE_SCHEMA_VERSIONS
         ):
-            raise ValueError(f"Unsupported backup schema version {schema_version!r}.")
+            raise ValueError(cls._unsupported_schema_message(schema_version))
         if manifest.get("format") != BUNDLE_FORMAT:
             raise ValueError("Backup bundle format is not recognized.")
         if schema_version == SEGMENTED_BACKUP_SCHEMA_VERSION:
@@ -4632,7 +6168,7 @@ class SystemBackupService:
             extra_cursor += extra_length
 
     @classmethod
-    def _preflight_zip_archive(cls, archive_bytes: bytes) -> None:
+    def _preflight_zip_archive(cls, archive_bytes: Any) -> None:
         eocd_signature = b"PK\x05\x06"
         search_start = max(0, len(archive_bytes) - (65535 + 22))
         candidates: list[tuple[int, tuple[Any, ...]]] = []
@@ -4814,7 +6350,15 @@ class SystemBackupService:
         return cls._normalize_archive_member_path(attributes["path"])
 
     @classmethod
-    def _preflight_tar_archive(cls, tar_bytes: bytes) -> list[str]:
+    def _preflight_tar_archive(
+        cls,
+        tar_bytes: Any,
+        *,
+        member_limit: int | None = None,
+        expanded_limit: int | None = None,
+    ) -> list[str]:
+        member_limit = MAX_ARCHIVE_MEMBER_BYTES if member_limit is None else member_limit
+        expanded_limit = MAX_ARCHIVE_EXPANDED_BYTES if expanded_limit is None else expanded_limit
         if not tar_bytes or len(tar_bytes) % 512:
             raise ValueError("Backup bundle TAR archive framing is invalid.")
         paths: list[str] = []
@@ -4848,10 +6392,10 @@ class SystemBackupService:
                 raise ValueError("Backup bundle TAR archive contains an unsupported member type.")
 
             member_size = cls._parse_tar_octal(header[124:136], label="member size")
-            if member_size > MAX_ARCHIVE_MEMBER_BYTES:
+            if member_size > member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
             expanded_total += member_size
-            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+            if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
 
             physical_count += 1
@@ -4897,7 +6441,15 @@ class SystemBackupService:
         )
 
     @classmethod
-    def _read_bounded_tar_members(cls, archive: tarfile.TarFile) -> list[tarfile.TarInfo]:
+    def _read_bounded_tar_members(
+        cls,
+        archive: tarfile.TarFile,
+        *,
+        member_limit: int | None = None,
+        expanded_limit: int | None = None,
+    ) -> list[tarfile.TarInfo]:
+        member_limit = MAX_ARCHIVE_MEMBER_BYTES if member_limit is None else member_limit
+        expanded_limit = MAX_ARCHIVE_EXPANDED_BYTES if expanded_limit is None else expanded_limit
         members: list[tarfile.TarInfo] = []
         expanded_total = 0
         while True:
@@ -4910,10 +6462,10 @@ class SystemBackupService:
             if not member.isfile():
                 raise ValueError("Backup bundle TAR archive contains an unsupported member type.")
             cls._normalize_archive_member_path(member.name)
-            if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+            if member.size > member_limit:
                 raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
             expanded_total += member.size
-            if expanded_total > MAX_ARCHIVE_EXPANDED_BYTES:
+            if expanded_total > expanded_limit:
                 raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
         return members
 
@@ -5016,7 +6568,16 @@ class SystemBackupService:
                 group_key=str(manifest_entry.get("group_key") or "").strip(),
                 archive_path=archive_path,
             )
-            if manifest_entry.get("group_key") == HISTORY_DB_KEY and not is_history_member:
+            if (
+                manifest.get("format") == DEBUG_BUNDLE_FORMAT
+                and manifest_entry.get("group_key") == HISTORY_DB_KEY
+            ):
+                is_history_member = True
+            if (
+                manifest.get("format") == BUNDLE_FORMAT
+                and manifest_entry.get("group_key") == HISTORY_DB_KEY
+                and not is_history_member
+            ):
                 raise ValueError(
                     "Backup bundle history member does not match its declared backup group."
                 )
@@ -5044,6 +6605,24 @@ class SystemBackupService:
             raise ValueError(
                 "Backup bundle non-history members exceed the expanded byte limit."
             )
+
+    @classmethod
+    def _seven_zip_encryption_mode(cls, entries: list[dict[str, str]]) -> bool:
+        observed: set[bool] = set()
+        for entry in entries:
+            if cls._is_7z_directory_entry(entry):
+                continue
+            if "Encrypted" not in entry:
+                raise ValueError("Backup bundle 7z member encryption metadata is missing.")
+            raw_mode = entry["Encrypted"].strip()
+            if raw_mode not in {"+", "-"}:
+                raise ValueError("Backup bundle 7z member encryption metadata is malformed.")
+            observed.add(raw_mode == "+")
+        if len(observed) > 1:
+            raise ValueError("Backup bundle 7z archive mixes encrypted and plaintext members.")
+        if not observed:
+            raise ValueError("Backup bundle 7z archive contains no regular members.")
+        return observed.pop()
 
     @staticmethod
     def _is_7z_directory_entry(entry: dict[str, str]) -> bool:
@@ -5091,27 +6670,91 @@ class SystemBackupService:
         if not expected_directories.issubset(actual_directories):
             raise ValueError("Backup bundle 7z extracted directories do not match its listing.")
 
-    def _extract_manifest_zip_members(
+    @staticmethod
+    def _read_bounded_stream(source: Any, limit: int) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := source.read(min(ARCHIVE_READ_CHUNK_BYTES, limit - total + 1)):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("Backup bundle archive member exceeds its expanded byte limit.")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    @classmethod
+    def _stage_archive_stream(
+        cls,
+        source: Any,
+        target_path: Path,
+        *,
+        expected_size: int,
+    ) -> Path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        with target_path.open("xb") as output:
+            while chunk := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                total += len(chunk)
+                if total > expected_size:
+                    raise ValueError("Backup bundle archive member exceeds its declared size.")
+                output.write(chunk)
+            if total != expected_size:
+                raise ValueError("Backup bundle archive member is truncated.")
+            output.flush()
+            os.fsync(output.fileno())
+        target_path.chmod(0o600)
+        return target_path
+
+    def _extract_manifest_zip_members_to_directory(
         self,
         archive: zipfile.ZipFile,
         manifest: dict[str, Any],
+        extract_dir: Path,
     ) -> dict[str, ExtractedMember]:
         extracted: dict[str, ExtractedMember] = {}
         for entry in self._manifest_file_entries(manifest):
             try:
-                extracted[entry["key"]] = archive.read(entry["archive_path"])
+                member = archive.getinfo(entry["archive_path"])
             except KeyError as exc:
                 raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
+            target_path = self._safe_child_path(
+                extract_dir,
+                Path(entry["archive_path"]),
+                entry["archive_path"],
+            )
+            with archive.open(member) as source:
+                extracted[entry["key"]] = self._stage_archive_stream(
+                    source,
+                    target_path,
+                    expected_size=member.file_size,
+                )
         return extracted
 
-    def _extract_manifest_tar_members(
+    def _extract_manifest_tar_members_to_directory(
         self,
         archive: tarfile.TarFile,
         manifest: dict[str, Any],
+        extract_dir: Path,
     ) -> dict[str, ExtractedMember]:
         extracted: dict[str, ExtractedMember] = {}
         for entry in self._manifest_file_entries(manifest):
-            extracted[entry["key"]] = self._read_tar_member(archive, entry["archive_path"])
+            try:
+                member = archive.getmember(entry["archive_path"])
+            except KeyError as exc:
+                raise ValueError(f"Backup bundle is missing {entry['archive_path']}.") from exc
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"Backup bundle member {entry['archive_path']} could not be read.")
+            target_path = self._safe_child_path(
+                extract_dir,
+                Path(entry["archive_path"]),
+                entry["archive_path"],
+            )
+            with source:
+                extracted[entry["key"]] = self._stage_archive_stream(
+                    source,
+                    target_path,
+                    expected_size=member.size,
+                )
         return extracted
 
     def _extract_manifest_directory_members(
@@ -5174,6 +6817,8 @@ class SystemBackupService:
             if " = " not in line:
                 continue
             key, value = line.split(" = ", 1)
+            if key in current:
+                raise ValueError("Backup bundle 7z listing contains duplicate metadata keys.")
             current[key] = value
         if current:
             entries.append(current)
@@ -5382,16 +7027,24 @@ class SystemBackupService:
         info.size = len(content)
         archive.addfile(info, io.BytesIO(content))
 
-    @staticmethod
-    def _read_tar_member(archive: tarfile.TarFile, archive_path: str) -> bytes:
+    @classmethod
+    def _read_tar_member_bounded(
+        cls,
+        archive: tarfile.TarFile,
+        archive_path: str,
+        limit: int,
+    ) -> bytes:
         try:
             member = archive.getmember(archive_path)
         except KeyError as exc:
             raise ValueError(f"Backup bundle is missing {archive_path}.") from exc
+        if member.size > limit:
+            raise ValueError("Backup bundle manifest exceeds its size limit.")
         extracted = archive.extractfile(member)
         if extracted is None:
             raise ValueError(f"Backup bundle member {archive_path} could not be read.")
-        return extracted.read()
+        with extracted:
+            return cls._read_bounded_stream(extracted, limit)
 
     @staticmethod
     def _normalize_packaging(packaging: str) -> ArchivePackaging:
@@ -5416,84 +7069,90 @@ class SystemBackupService:
         return None
 
     @classmethod
-    def _decompress_single_gzip_member(cls, archive_bytes: bytes) -> bytes:
-        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        content = bytearray()
-        ratio_limit = MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1)
-        output_limit = min(MAX_ARCHIVE_EXPANDED_BYTES, ratio_limit)
-
-        def reject_output_limit() -> None:
-            if ratio_limit <= MAX_ARCHIVE_EXPANDED_BYTES:
-                raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
-
-        for offset in range(0, len(archive_bytes), ARCHIVE_READ_CHUNK_BYTES):
-            chunk = archive_bytes[offset : offset + ARCHIVE_READ_CHUNK_BYTES]
-            content.extend(
-                decompressor.decompress(
-                    chunk,
-                    output_limit - len(content) + 1,
-                )
-            )
-            if len(content) > output_limit:
-                reject_output_limit()
-            if decompressor.eof:
-                trailing = decompressor.unused_data + archive_bytes[offset + len(chunk) :]
-                if trailing:
-                    raise ValueError("Backup bundle tar.gz archive contains concatenated gzip data.")
-                break
-        if not decompressor.eof:
-            raise ValueError("Backup bundle tar.gz archive is corrupted.")
-        content.extend(decompressor.flush(output_limit - len(content) + 1))
-        if len(content) > output_limit:
-            reject_output_limit()
-        return bytes(content)
-
-    @classmethod
-    def _decompress_single_zstd_frame(cls, archive_bytes: bytes) -> bytes:
-        if zstd is None:
-            raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
-        declared_size = zstd.frame_content_size(archive_bytes)
-        if declared_size in {zstd.CONTENTSIZE_ERROR, zstd.CONTENTSIZE_UNKNOWN}:
-            raise ValueError("Backup bundle tar.zst archive has unsupported frame metadata.")
-        if declared_size > MAX_ARCHIVE_EXPANDED_BYTES:
-            raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
-        if declared_size > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
-            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-        decompressor = zstd.ZstdDecompressor().decompressobj()
-        content = decompressor.decompress(archive_bytes)
-        if not decompressor.eof:
-            raise ValueError("Backup bundle tar.zst archive is corrupted.")
-        if decompressor.unused_data:
-            raise ValueError("Backup bundle tar.zst archive contains concatenated zstd data.")
-        content += decompressor.flush()
-        if len(content) != declared_size:
-            raise ValueError("Backup bundle tar.zst archive size does not match its frame metadata.")
-        return content
-
-    @classmethod
-    def _decompress_tar_archive(
+    def _decompress_tar_archive_to_file(
         cls,
-        archive_bytes: bytes,
+        archive_path: Path,
+        output_path: Path,
         packaging: ArchivePackaging,
-    ) -> bytes:
-        if packaging == "tar.gz":
-            try:
-                tar_bytes = cls._decompress_single_gzip_member(archive_bytes)
-            except zlib.error as exc:
-                raise ValueError("Backup bundle tar.gz archive is corrupted.") from exc
-        elif packaging == "tar.zst":
-            if zstd is None:
-                raise ValueError("tar.zst import requires the optional 'zstandard' dependency.")
-            try:
-                tar_bytes = cls._decompress_single_zstd_frame(archive_bytes)
-            except zstd.ZstdError as exc:
-                raise ValueError("Backup bundle tar.zst archive is corrupted.") from exc
-        else:
-            raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
-        if len(tar_bytes) > MAX_ARCHIVE_COMPRESSION_RATIO * max(len(archive_bytes), 1):
-            raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
-        return tar_bytes
+        *,
+        expanded_limit: int | None = None,
+    ) -> None:
+        expanded_limit = MAX_ARCHIVE_EXPANDED_BYTES if expanded_limit is None else expanded_limit
+        archive_size = archive_path.stat(follow_symlinks=False).st_size
+        output_limit = min(
+            expanded_limit,
+            MAX_ARCHIVE_COMPRESSION_RATIO * max(archive_size, 1),
+        )
+
+        def write_checked(output: Any, chunk: bytes, total: int) -> int:
+            next_total = total + len(chunk)
+            if next_total > output_limit:
+                if output_limit < expanded_limit:
+                    raise ValueError("Backup bundle archive compression ratio exceeds its limit.")
+                raise ValueError("Backup bundle archive expanded data exceeds its byte limit.")
+            output.write(chunk)
+            return next_total
+
+        total = 0
+        try:
+            with archive_path.open("rb", buffering=0) as source, output_path.open("xb") as output:
+                if packaging == "tar.gz":
+                    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    reached_eof = False
+                    while compressed := source.read(ARCHIVE_READ_CHUNK_BYTES):
+                        pending = compressed
+                        while True:
+                            chunk = decompressor.decompress(pending, ARCHIVE_READ_CHUNK_BYTES)
+                            total = write_checked(output, chunk, total)
+                            pending = decompressor.unconsumed_tail
+                            if decompressor.eof:
+                                if decompressor.unused_data or source.read(1):
+                                    raise ValueError(
+                                        "Backup bundle tar.gz archive contains concatenated gzip data."
+                                    )
+                                reached_eof = True
+                                break
+                            if pending:
+                                continue
+                            if len(chunk) == ARCHIVE_READ_CHUNK_BYTES:
+                                pending = b""
+                                continue
+                            break
+                        if reached_eof:
+                            break
+                    if not reached_eof:
+                        raise ValueError("Backup bundle tar.gz archive is corrupted.")
+                    total = write_checked(output, decompressor.flush(), total)
+                elif packaging == "tar.zst":
+                    if zstd is None:
+                        raise ValueError(
+                            "tar.zst import requires the optional 'zstandard' dependency."
+                        )
+                    decompressor = zstd.ZstdDecompressor().decompressobj(
+                        read_across_frames=False
+                    )
+                    reached_eof = False
+                    while compressed := source.read(ZSTD_BOUNDED_INPUT_BYTES):
+                        chunk = decompressor.decompress(compressed)
+                        total = write_checked(output, chunk, total)
+                        if decompressor.eof:
+                            if decompressor.unused_data or source.read(1):
+                                raise ValueError(
+                                    "Backup bundle tar.zst archive contains concatenated zstd data."
+                                )
+                            reached_eof = True
+                            break
+                    if not reached_eof:
+                        raise ValueError("Backup bundle tar.zst archive is corrupted.")
+                    total = write_checked(output, decompressor.flush(), total)
+                else:
+                    raise ValueError(f"Unsupported tar archive packaging '{packaging}'.")
+                output.flush()
+                os.fsync(output.fileno())
+        except (zlib.error, zstd.ZstdError if zstd is not None else zlib.error) as exc:
+            output_path.unlink(missing_ok=True)
+            raise ValueError(f"Backup bundle {packaging} archive is corrupted.") from exc
+        output_path.chmod(0o600)
 
     def _run_7z_command(
         self,
@@ -5613,13 +7272,15 @@ class SystemBackupService:
             os.close(slave_fd)
             slave_fd = -1
             deadline = time.monotonic() + SEVEN_ZIP_TIMEOUT_SECONDS
+            poller = select.poll()
+            poller.register(master_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     process.kill()
                     process.wait()
                     raise subprocess.TimeoutExpired(command, SEVEN_ZIP_TIMEOUT_SECONDS)
-                ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.1))
+                ready = bool(poller.poll(max(1, int(min(remaining, 0.1) * 1000))))
                 if ready:
                     try:
                         chunk = os.read(master_fd, ARCHIVE_READ_CHUNK_BYTES)
@@ -5669,14 +7330,19 @@ class SystemBackupService:
         )
         if "Wrong password?" in combined_output or "Cannot open encrypted archive" in combined_output:
             if passphrase:
-                raise ValueError("Unable to decrypt backup bundle. Check the passphrase and try again.")
-            raise ValueError("This backup is encrypted and requires a passphrase.")
+                raise ValueError(WRONG_PASSPHRASE_MESSAGE)
+            raise ValueError(PASSPHRASE_REQUIRED_MESSAGE)
         if reading_archive and (
             "Headers Error" in combined_output or "Can't open as archive" in combined_output
         ):
-            raise ValueError("Backup bundle 7z archive is corrupted.")
-        detail = f"{message} {combined_output}".strip()
-        raise ValueError(detail)
+            raise ValueError("This backup file is damaged (the 7-Zip archive could not be read).")
+        # Raw 7-Zip output can echo archive member names; keep it in the log only.
+        logger.warning(
+            "7-Zip exited with %s: %s",
+            result.returncode,
+            combined_output[:2000].replace(passphrase, "***") if passphrase else combined_output[:2000],
+        )
+        raise ValueError(f"{message} The 7-Zip step failed (exit {result.returncode}).")
 
     @staticmethod
     def _write_bytes_atomic(target_path: Path, content: bytes) -> None:

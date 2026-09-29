@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import difflib
 import json
+import logging
 import os
 import re
-from functools import lru_cache
+import tempfile
+import threading
+import types
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin
+from weakref import WeakValueDictionary
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from app.config_errors import ConfigurationError, describe_validation_error, format_location
+from app.env_values import annotation_is_text, env_is_set
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
+
+logger = logging.getLogger(__name__)
 
 
 def _standard_runtime_config_path() -> Path:
@@ -78,9 +88,55 @@ def _legacy_container_layout_paths() -> dict[str, str]:
     return _derive_runtime_layout_paths(Path("/app/config/config.yaml"))
 
 
+def known_hosts_placeholder_paths(config_path: str | Path) -> set[str]:
+    """Known-hosts values that are not an operator choice for ``config_path``.
+
+    The shipped default, the legacy container path and the path derived from
+    this config file all mean "use ``<data>/known_hosts``"; admin saves write
+    the derived value into each system, so it must not count as a choice.
+    """
+    return {
+        _default_known_hosts_path(),
+        _legacy_container_layout_paths()["known_hosts_path"],
+        _derive_runtime_layout_paths(config_path)["known_hosts_path"],
+    }
+
+
+def known_hosts_path_for_target(
+    settings: "Settings",
+    *,
+    system_id: str | None = None,
+    target_host: str | None = None,
+) -> str | None:
+    """The known-hosts file a connection to a saved system should use.
+
+    A system may set its own ``ssh.known_hosts_path``; the default system's
+    value is only right for systems that do not. Match the saved system by id
+    first, then by the target host (primary, extra or HA node host), and fall
+    back to the top-level file for unsaved targets.
+    """
+    wanted_id = normalize_text(system_id)
+    wanted_host = (normalize_text(target_host) or "").lower()
+    if wanted_id:
+        for system in settings.systems:
+            if system.id == wanted_id:
+                return system.ssh.known_hosts_path
+    if wanted_host:
+        for system in settings.systems:
+            hosts = [system.ssh.host, *system.ssh.extra_hosts, *(node.host for node in system.ssh.ha_nodes)]
+            if any((normalize_text(candidate) or "").lower() == wanted_host for candidate in hosts):
+                return system.ssh.known_hosts_path
+    return settings.ssh.known_hosts_path
+
+
+def is_placeholder_known_hosts_path(value: Any, placeholders: set[str]) -> bool:
+    """True when ``value`` is unset, blank or one of ``placeholders``."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True
+    return value in placeholders
+
+
 class AppConfig(BaseModel):
-    host: str = "0.0.0.0"
-    port: int = 8080
     public_origin: str | None = None
     refresh_interval_seconds: int = 30
     snapshot_cache_ttl_seconds: int = 10
@@ -108,7 +164,14 @@ class AppConfig(BaseModel):
     export_cache_max_bytes: int = 32 * 1024 * 1024
     log_level: str = "INFO"
     debug: bool = False
-    verify_ssl: bool = True
+
+    @field_validator("log_level")
+    @classmethod
+    def _validate_log_level(cls, value: str) -> str:
+        # Logging consumers uppercase names, including Python's standard aliases.
+        if value.upper() not in {"NOTSET", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"}:
+            raise ValueError("must be one of NOTSET, DEBUG, INFO, WARN, WARNING, ERROR, FATAL, CRITICAL")
+        return value
 
 
 class PerfConfig(BaseModel):
@@ -116,6 +179,12 @@ class PerfConfig(BaseModel):
     log_all_requests: bool = False
     slow_request_ms: int = 1000
     slow_stage_ms: int = 250
+
+
+# The documented TrueNAS JSON-RPC endpoint paths: /api/current follows the
+# appliance, /api/v25.10.0 pins one release. Anything else is refused rather
+# than concatenated into a request URL.
+TRUENAS_API_VERSION_PATTERN = re.compile(r"(current|v\d+\.\d+\.\d+)")
 
 
 class TrueNASConfig(BaseModel):
@@ -126,11 +195,26 @@ class TrueNASConfig(BaseModel):
     api_user: str = ""
     api_password: str = ""
     platform: Literal["core", "scale", "linux", "quantastor", "esxi", "ipmi"] = "core"
+    # Wire protocol for the middleware websocket. "ddp" is the legacy
+    # /websocket endpoint every CORE and SCALE release exposes; "jsonrpc" is
+    # the JSON-RPC 2.0 API that SCALE 25.04+ documents as supported and that
+    # CORE does not have. The default keeps existing hosts on DDP.
+    api_dialect: Literal["ddp", "jsonrpc"] = "ddp"
+    # Only the jsonrpc dialect reads this: "current" follows the appliance,
+    # "v25.10.0" pins one documented API version.
+    api_version: str = "current"
     verify_ssl: bool = False
     tls_ca_bundle_path: str | None = None
     tls_server_name: str | None = None
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
+
+    @field_validator("api_version", mode="after")
+    @classmethod
+    def _validate_api_version(cls, value: str) -> str:
+        if not TRUENAS_API_VERSION_PATTERN.fullmatch(value):
+            raise ValueError('api_version must be "current" or a pinned version such as "v25.10.0"')
+        return value
 
 
 class HANodeConfig(BaseModel):
@@ -141,7 +225,7 @@ class HANodeConfig(BaseModel):
     @field_validator("system_id", "label", "host", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str | None:
-        normalized = normalize_text(str(value) if value is not None else None)
+        normalized = normalize_value_text(value)
         return normalized or None
 
 
@@ -205,7 +289,7 @@ class BMCConfig(BaseModel):
     @field_validator("host", "username", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str:
-        return normalize_text(str(value) if value is not None else None) or ""
+        return normalize_value_text(value) or ""
 
     @field_validator("password", mode="before")
     @classmethod
@@ -304,7 +388,7 @@ class StorageViewLayoutOverridesConfig(BaseModel):
                 raise ValueError("slot label keys must be integers") from exc
             if slot_number < 0:
                 continue
-            label = normalize_text(str(raw_label) if raw_label is not None else None)
+            label = normalize_value_text(raw_label)
             if label:
                 normalized[slot_number] = label[:128]
         return normalized
@@ -326,7 +410,7 @@ class StorageViewLayoutOverridesConfig(BaseModel):
                 raise ValueError("slot size keys must be integers") from exc
             if slot_number < 0:
                 continue
-            size_label = normalize_text(str(raw_size) if raw_size is not None else None)
+            size_label = normalize_value_text(raw_size)
             if size_label in allowed_sizes:
                 normalized[slot_number] = size_label
         return normalized
@@ -347,13 +431,13 @@ class StorageViewConfig(BaseModel):
     @field_validator("id", "label", "template_id", mode="before")
     @classmethod
     def _normalize_text_fields(cls, value: Any) -> str:
-        normalized = normalize_text(str(value) if value is not None else None)
+        normalized = normalize_value_text(value)
         return normalized or ""
 
     @field_validator("profile_id", mode="before")
     @classmethod
     def _normalize_optional_profile_id(cls, value: Any) -> str | None:
-        return normalize_text(str(value) if value is not None else None)
+        return normalize_value_text(value)
 
     @field_validator("order", mode="before")
     @classmethod
@@ -372,7 +456,7 @@ class StorageViewConfig(BaseModel):
             cleaned: list[str] = []
             seen: set[str] = set()
             for item in values or []:
-                normalized = normalize_text(str(item) if item is not None else None)
+                normalized = normalize_value_text(item)
                 if normalized and normalized not in seen:
                     seen.add(normalized)
                     cleaned.append(normalized)
@@ -412,9 +496,6 @@ class HistoryConfig(BaseModel):
 
     service_url: str = ""
     timeout_seconds: int = 10
-    # Upper bound on concurrent per-slot requests when the batched scope endpoint fails
-    # and the client falls back to one request per slot.
-    fallback_max_concurrency: int = 4
     refresh_token: SecretStr | None = None
 
     @field_validator("refresh_token", mode="before")
@@ -463,8 +544,6 @@ class Settings(BaseModel):
 
 
 ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "APP_HOST": ("app", "host"),
-    "APP_PORT": ("app", "port"),
     "APP_PUBLIC_ORIGIN": ("app", "public_origin"),
     "APP_REFRESH_INTERVAL": ("app", "refresh_interval_seconds"),
     "APP_SNAPSHOT_CACHE_TTL_SECONDS": ("app", "snapshot_cache_ttl_seconds"),
@@ -492,7 +571,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "APP_EXPORT_CACHE_MAX_BYTES": ("app", "export_cache_max_bytes"),
     "APP_LOG_LEVEL": ("app", "log_level"),
     "APP_DEBUG": ("app", "debug"),
-    "APP_VERIFY_SSL": ("app", "verify_ssl"),
     "APP_CONFIG_PATH": ("config_file",),
     "PERF_TIMING_ENABLED": ("perf", "enabled"),
     "PERF_LOG_ALL_REQUESTS": ("perf", "log_all_requests"),
@@ -503,6 +581,8 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "TRUENAS_API_USER": ("truenas", "api_user"),
     "TRUENAS_API_PASSWORD": ("truenas", "api_password"),
     "TRUENAS_PLATFORM": ("truenas", "platform"),
+    "TRUENAS_API_DIALECT": ("truenas", "api_dialect"),
+    "TRUENAS_API_VERSION": ("truenas", "api_version"),
     "TRUENAS_VERIFY_SSL": ("truenas", "verify_ssl"),
     "TRUENAS_TLS_CA_BUNDLE_PATH": ("truenas", "tls_ca_bundle_path"),
     "TRUENAS_TLS_SERVER_NAME": ("truenas", "tls_server_name"),
@@ -514,6 +594,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_PORT": ("ssh", "port"),
     "SSH_USER": ("ssh", "user"),
     "SSH_KEY_PATH": ("ssh", "key_path"),
+    "SSH_KNOWN_HOSTS_PATH": ("ssh", "known_hosts_path"),
     "SSH_PASSWORD": ("ssh", "password"),
     "SSH_SUDO_PASSWORD": ("ssh", "sudo_password"),
     "SSH_STRICT_HOST_KEY_CHECKING": ("ssh", "strict_host_key_checking"),
@@ -521,7 +602,6 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "SSH_COMMANDS_JSON": ("ssh", "commands"),
     "HISTORY_BACKEND_URL": ("history", "service_url"),
     "HISTORY_BACKEND_TIMEOUT": ("history", "timeout_seconds"),
-    "HISTORY_BACKEND_FALLBACK_CONCURRENCY": ("history", "fallback_max_concurrency"),
     "HISTORY_REFRESH_TOKEN": ("history", "refresh_token"),
     "ADMIN_SERVICE_URL": ("admin", "service_url"),
     "ADMIN_PUBLIC_URL": ("admin", "public_url"),
@@ -556,40 +636,40 @@ EXACT_STRING_ENV_OVERRIDES = FILE_SECRET_ENV_OVERRIDES | {
 
 RUNTIME_BEHAVIOR_APP_FIELDS: dict[str, dict[str, Any]] = {
     "refresh_interval_seconds": {
-        "label": "UI Auto Refresh",
-        "description": "Default browser auto-refresh cadence.",
+        "label": "Page refresh",
+        "description": "How often the page refreshes by default.",
         "env": ("APP_REFRESH_INTERVAL",),
         "minimum": 5,
         "maximum": 3600,
         "unit": "seconds",
     },
     "snapshot_cache_ttl_seconds": {
-        "label": "Snapshot Cache TTL",
-        "description": "Fresh-cache window before stale-first background refresh begins.",
+        "label": "Inventory reuse",
+        "description": "How long a fetched inventory is reused before it is refreshed in the background.",
         "env": ("APP_SNAPSHOT_CACHE_TTL_SECONDS", "APP_CACHE_TTL"),
         "minimum": 0,
         "maximum": 3600,
         "unit": "seconds",
     },
     "source_bundle_cache_ttl_seconds": {
-        "label": "Source Bundle Cache TTL",
-        "description": "Reuse window for expensive API, SSH, and BMC source reads.",
+        "label": "Appliance query reuse",
+        "description": "How long raw appliance API, SSH, and BMC answers are reused, on every platform.",
         "env": ("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS", "APP_CACHE_TTL"),
         "minimum": 0,
         "maximum": 3600,
         "unit": "seconds",
     },
     "smart_cache_ttl_seconds": {
-        "label": "SMART Cache TTL",
-        "description": "Reuse window for per-slot SMART detail before stale-fill refresh.",
+        "label": "SMART reuse",
+        "description": "How long per-disk SMART details are kept before re-reading.",
         "env": ("APP_SMART_CACHE_TTL_SECONDS",),
         "minimum": 0,
         "maximum": 86400,
         "unit": "seconds",
     },
     "sg_ses_device_cache_ttl_seconds": {
-        "label": "SES Device Path Cache TTL",
-        "description": "Reuse window for validated sg_ses device paths before rediscovery.",
+        "label": "Enclosure path reuse",
+        "description": "How long a discovered enclosure device path is trusted before re-scanning.",
         "env": ("APP_SG_SES_DEVICE_CACHE_TTL_SECONDS",),
         "minimum": 0,
         "maximum": 86400,
@@ -617,8 +697,192 @@ def _parse_scalar(value: str) -> Any:
         return value
 
 
+def _override_target_annotation(path: tuple[str, ...]) -> Any:
+    model: Any = Settings
+    annotation: Any = None
+    for key in path:
+        if not (isinstance(model, type) and issubclass(model, BaseModel)) or key not in model.model_fields:
+            return None
+        annotation = model.model_fields[key].annotation
+        model = annotation
+    return annotation
+
+
+def _override_is_text(path: tuple[str, ...]) -> bool:
+    return annotation_is_text(_override_target_annotation(path))
+
+
+def _model_annotation(annotation: Any) -> type[BaseModel] | None:
+    """Return the settings model behind ``annotation`` (``Model``, ``Model | None``, ``list[Model]``)."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    if origin is list:
+        return _model_annotation(get_args(annotation)[0]) if get_args(annotation) else None
+    if origin is Union or origin is types.UnionType:
+        for member in get_args(annotation):
+            if member is not type(None):
+                nested = _model_annotation(member)
+                if nested is not None:
+                    return nested
+    return None
+
+
+def collect_unknown_config_keys(
+    payload: Any,
+    model: type[BaseModel] = Settings,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    """List YAML keys that no settings model reads, as ``systems[0].truenas.bogus_field`` paths."""
+    return [path for path, _suggestion in collect_unknown_config_key_suggestions(payload, model, prefix=prefix)]
+
+
+def _closest_key(key: str, candidates: Any) -> str | None:
+    matches = difflib.get_close_matches(key, sorted(str(candidate) for candidate in candidates), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+# Keys the backup scheduler reads under ``backups:``. Listed here rather than
+# imported from history_service/backup_archive so the main UI (and the public
+# demo build) does not depend on the backup modules; tests.test_startup_config
+# pins these sets to ConfigClassPolicy, FullClassPolicy and ArchiveTargetSettings.
+_BACKUP_CLASS_KEYS = frozenset({"enabled", "local_keep", "remote_keep", "remote_max_age_days"})
+BACKUPS_SECTION_KEYS: dict[str, frozenset[str]] = {
+    "": frozenset({"config", "full", "targets"}),
+    "config": _BACKUP_CLASS_KEYS | {"debounce_seconds", "max_delay_seconds"},
+    "full": _BACKUP_CLASS_KEYS | {"schedule", "archive_format"},
+    "targets": frozenset(
+        {
+            "target_id", "provider", "root", "hostname", "port", "username", "password_file",
+            "timeout_seconds", "use_tls", "known_hosts_path", "trust_on_first_use",
+            "private_key_file", "private_key_passphrase_file", "share", "domain", "smb_encrypt",
+            "export_path", "mount_options", "mount_parent", "bucket", "region", "endpoint_url",
+            "access_key_id_file", "secret_access_key_file",
+            # Read by the policy loader itself, not the target settings.
+            "label", "enabled",
+        }
+    ),
+}
+
+
+def _collect_unknown_backups_keys(payload: Any, prefix: str) -> list[tuple[str, str | None]]:
+    # The scheduler sidecar rejects these keys when it loads its policy; the
+    # main UI only reports them so a typo is visible without a hard failure.
+    if not isinstance(payload, dict):
+        return []
+    schema = BACKUPS_SECTION_KEYS
+    unknown: list[tuple[str, str | None]] = []
+
+    def check(mapping: Any, allowed: frozenset[str], path_prefix: str) -> None:
+        if not isinstance(mapping, dict):
+            return
+        for raw_key in mapping:
+            key = str(raw_key)
+            if key not in allowed:
+                suggestion = _closest_key(key, allowed)
+                unknown.append((f"{path_prefix}{key}", f"{path_prefix}{suggestion}" if suggestion else None))
+
+    check(payload, schema[""], prefix)
+    check(payload.get("config"), schema["config"], f"{prefix}config.")
+    check(payload.get("full"), schema["full"], f"{prefix}full.")
+    targets = payload.get("targets")
+    if isinstance(targets, list):
+        for index, item in enumerate(targets):
+            check(item, schema["targets"], f"{prefix}targets[{index}].")
+    return unknown
+
+
+def collect_unknown_config_key_suggestions(
+    payload: Any,
+    model: type[BaseModel] = Settings,
+    *,
+    prefix: str = "",
+) -> list[tuple[str, str | None]]:
+    """Like :func:`collect_unknown_config_keys`, paired with the closest valid key path (or None)."""
+    unknown: list[tuple[str, str | None]] = []
+    if not isinstance(payload, dict):
+        return unknown
+    for raw_key, value in payload.items():
+        key = str(raw_key)
+        path = f"{prefix}{key}"
+        field = model.model_fields.get(key)
+        if field is None:
+            if not prefix and model is Settings and key in SIDECAR_OWNED_CONFIG_KEYS:
+                unknown.extend(_collect_unknown_backups_keys(value, prefix=f"{path}."))
+                continue
+            candidates = set(model.model_fields)
+            if not prefix and model is Settings:
+                candidates |= SIDECAR_OWNED_CONFIG_KEYS
+            suggestion = _closest_key(key, candidates)
+            unknown.append((path, f"{prefix}{suggestion}" if suggestion else None))
+            continue
+        nested_model = _model_annotation(field.annotation)
+        if nested_model is None:
+            continue
+        if get_origin(field.annotation) is list:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    unknown.extend(
+                        collect_unknown_config_key_suggestions(item, nested_model, prefix=f"{path}[{index}].")
+                    )
+        else:
+            unknown.extend(collect_unknown_config_key_suggestions(value, nested_model, prefix=f"{path}."))
+    return unknown
+
+
+# Top-level config.yaml sections read by a sidecar, not by these settings
+# models: `backups` is the backup scheduler policy
+# (history_service/backup_archive/policy.py).
+SIDECAR_OWNED_CONFIG_KEYS = frozenset({"backups"})
+
+
+# Keys an older config.yaml may still carry. The container always listens on
+# port 8000; Docker Compose publishes it from APP_BIND_ADDRESS and APP_PORT in
+# .env, so these keys never changed where the UI answers.
+RETIRED_CONFIG_KEYS = frozenset({"app.host", "app.port"})
+
+
+def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = None) -> str:
+    if key in RETIRED_CONFIG_KEYS:
+        return (
+            f"{config_path.name}: `{key}` is no longer used and is ignored; set the main UI port "
+            f"with APP_PORT and its address with APP_BIND_ADDRESS in .env."
+        )
+    if key.startswith(tuple(f"{section}." for section in SIDECAR_OWNED_CONFIG_KEYS)):
+        # The backup scheduler rejects its whole policy on an unknown key (it
+        # does not ignore it); the main UI keeps running either way.
+        hint = f" Did you mean `{suggestion}`?" if suggestion else ""
+        return (
+            f"{config_path.name}: unknown key `{key}`; the backup scheduler will not start "
+            f"until it is fixed.{hint}"
+        )
+    if suggestion:
+        return f"{config_path.name}: unknown key `{key}` is ignored; did you mean `{suggestion}`?"
+    return f"{config_path.name}: unknown key `{key}` is ignored."
+
+
+def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]]:
+    """Describe config file keys the app does not read, for the admin warning banner."""
+    config_path = Path(settings.config_file)
+    try:
+        yaml_config = _load_yaml_config(config_path)
+    except (OSError, ValueError, yaml.YAMLError):
+        return []
+    return [
+        {
+            "code": "unknown_config_key",
+            "key": key,
+            "message": _unknown_key_message(config_path, key, suggestion),
+        }
+        for key, suggestion in collect_unknown_config_key_suggestions(yaml_config)
+    ]
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
+    # Copy nested mappings too: later in-place writes to the result (environment
+    # overrides) must not leak back into the defaults they are compared against.
+    merged = {key: _deep_merge(value, {}) if isinstance(value, dict) else value for key, value in base.items()}
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
@@ -634,19 +898,43 @@ def _set_path_value(target: dict[str, Any], path: tuple[str, ...], value: Any) -
     cursor[path[-1]] = value
 
 
-def _load_yaml_config(config_path: Path) -> dict[str, Any]:
-    if not config_path.exists():
+def _load_yaml_document(
+    path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> Any:
+    absolute_path = path.absolute()
+    if captured_files is not None and absolute_path in captured_files:
+        content = captured_files[absolute_path]
+        return None if content is None else (yaml.safe_load(content.decode("utf-8")) or {})
+    if read_yaml_file is not None:
+        content = read_yaml_file(path)
+        return None if content is None else (yaml.safe_load(content.decode("utf-8")) or {})
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _load_yaml_config(
+    config_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_document(config_path, read_yaml_file, captured_files)
+    if loaded is None:
         return {}
-
-    with config_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
-        return loaded
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config file {config_path} must contain a YAML mapping.")
+    return loaded
 
 
-def _load_runtime_overrides_config(config_path: Path) -> dict[str, Any]:
-    loaded = _load_yaml_config(config_path)
+def _load_runtime_overrides_config(
+    config_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_config(config_path, read_yaml_file, captured_files)
     app_payload = loaded.get("app")
     if not isinstance(app_payload, dict):
         return {}
@@ -670,15 +958,6 @@ def _has_path(source: dict[str, Any], path: tuple[str, ...]) -> bool:
     return True
 
 
-def _get_path_value(source: dict[str, Any], path: tuple[str, ...]) -> Any:
-    cursor: Any = source
-    for key in path:
-        if not isinstance(cursor, dict):
-            return None
-        cursor = cursor.get(key)
-    return cursor
-
-
 def _explicit_app_field(source: dict[str, Any], field_name: str) -> bool:
     return _has_path(source, ("app", field_name))
 
@@ -692,7 +971,7 @@ def _apply_legacy_cache_ttl_compat(
     legacy_explicit = (
         _explicit_app_field(yaml_config, "cache_ttl_seconds")
         or _explicit_app_field(runtime_overrides, "cache_ttl_seconds")
-        or os.getenv("APP_CACHE_TTL") is not None
+        or env_is_set("APP_CACHE_TTL")
     )
     if not legacy_explicit:
         return
@@ -701,13 +980,13 @@ def _apply_legacy_cache_ttl_compat(
     if (
         not _explicit_app_field(yaml_config, "snapshot_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "snapshot_cache_ttl_seconds")
-        and os.getenv("APP_SNAPSHOT_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SNAPSHOT_CACHE_TTL_SECONDS")
     ):
         app_payload["snapshot_cache_ttl_seconds"] = legacy_value
     if (
         not _explicit_app_field(yaml_config, "source_bundle_cache_ttl_seconds")
         and not _explicit_app_field(runtime_overrides, "source_bundle_cache_ttl_seconds")
-        and os.getenv("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS") is None
+        and not env_is_set("APP_SOURCE_BUNDLE_CACHE_TTL_SECONDS")
     ):
         app_payload["source_bundle_cache_ttl_seconds"] = legacy_value
 
@@ -720,7 +999,7 @@ def _runtime_behavior_env_owner(
     metadata = RUNTIME_BEHAVIOR_APP_FIELDS.get(field_name) or {}
     for env_name in metadata.get("env") or ():
         normalized_env_name = str(env_name)
-        if os.getenv(normalized_env_name) is None:
+        if not env_is_set(normalized_env_name):
             continue
         if (
             normalized_env_name == "APP_CACHE_TTL"
@@ -795,12 +1074,42 @@ def runtime_behavior_settings_payload(settings: Settings | None = None) -> dict[
     }
 
 
+_RUNTIME_OVERRIDE_LOCKS_GUARD = threading.Lock()
+_RUNTIME_OVERRIDE_LOCKS: WeakValueDictionary[Path, Any] = WeakValueDictionary()
+
+
+def _runtime_override_lock_key(path: Path) -> Path:
+    # Resolve dot segments and relative roots without following the final
+    # symlink. Atomic replacement may turn that symlink into a regular file;
+    # the pathname must retain the same process-local transaction lock.
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) -> dict[str, Any]:
+    """Serialize partial updates from this process through response construction.
+
+    This is not a revision/conflict policy for stale full-form submissions.
+    """
     if not isinstance(values, dict):
         raise ValueError("Runtime behavior settings payload must be a mapping.")
 
-    yaml_config = _load_yaml_config(Path(settings.config_file))
     runtime_overrides_path = Path(settings.paths.runtime_overrides_file)
+    lock_key = _runtime_override_lock_key(runtime_overrides_path)
+    with _RUNTIME_OVERRIDE_LOCKS_GUARD:
+        lock = _RUNTIME_OVERRIDE_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _RUNTIME_OVERRIDE_LOCKS[lock_key] = lock
+    # Each waiting writer retains the lock, so weak entries cannot expire
+    # while another writer is using or waiting for the same path.
+    with lock:
+        return _save_runtime_behavior_overrides(settings, values, runtime_overrides_path)
+
+
+def _save_runtime_behavior_overrides(
+    settings: Settings, values: dict[str, Any], runtime_overrides_path: Path,
+) -> dict[str, Any]:
+    yaml_config = _load_yaml_config(Path(settings.config_file))
     runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
     clean_values: dict[str, int] = {}
     for field_name, raw_value in values.items():
@@ -826,20 +1135,73 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
     app_payload.update(clean_values)
 
     runtime_overrides_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = runtime_overrides_path.with_suffix(".tmp")
-    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-        yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
-    temp_path.replace(runtime_overrides_path)
-    get_settings.cache_clear()
-    return runtime_behavior_settings_payload(get_settings())
+    # Replacement must retain the readers of an existing file, including a
+    # private file owned by the UI rather than the admin writer. New files stay
+    # owner-only so credentials cannot pass through a broader umask default.
+    # Only POSIX has the UID/GID and permission-bit contract handled here.
+    existing_metadata = None
+    if os.name == "posix":
+        try:
+            existing_metadata = runtime_overrides_path.stat()
+        except FileNotFoundError:
+            pass
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            dir=runtime_overrides_path.parent,
+            prefix=f".{runtime_overrides_path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            yaml.safe_dump(runtime_overrides, handle, sort_keys=False)
+            handle.flush()
+            if os.name == "posix":
+                descriptor = handle.fileno()
+                mode = 0o600
+                if existing_metadata is not None:
+                    staged_metadata = os.fstat(descriptor)
+                    owner = (existing_metadata.st_uid, existing_metadata.st_gid)
+                    if (staged_metadata.st_uid, staged_metadata.st_gid) != owner:
+                        os.fchown(descriptor, *owner)
+                    # YAML is data: preserve read/write permissions, never
+                    # execute, set-ID or sticky bits. Do not widen private files.
+                    mode = existing_metadata.st_mode & 0o666
+                # Serialize and flush privately; admit final metadata before
+                # replace so a permissions failure cannot publish or succeed.
+                os.fchmod(descriptor, mode)
+                os.fsync(descriptor)
+        temp_path.replace(runtime_overrides_path)
+        if os.name == "posix":
+            try:
+                directory = os.open(runtime_overrides_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError as exc:
+                raise OSError(
+                    exc.errno,
+                    "Runtime overrides replaced; directory durability is uncertain.",
+                ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    # Read back the file this transaction owns, not a pending restart-only
+    # path or a shared cache that another path's writer can replace.
+    loaded = load_settings(running_restart_only=settings)
+    effective = with_running_restart_only_settings(settings, loaded)
+    replace_settings(effective)
+    return runtime_behavior_settings_payload(effective)
 
 
-def _load_profile_yaml(profile_path: Path) -> dict[str, Any]:
-    if not profile_path.exists():
+def _load_profile_yaml(
+    profile_path: Path,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> dict[str, Any]:
+    loaded = _load_yaml_document(profile_path, read_yaml_file, captured_files)
+    if loaded is None:
         return {}
-
-    with profile_path.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle) or {}
 
     if isinstance(loaded, list):
         return {"profiles": loaded}
@@ -863,7 +1225,11 @@ def _apply_config_path_relative_defaults(
     legacy = _legacy_container_layout_paths()
     merged["config_file"] = derived["config_file"]
 
-    merged_paths = merged.setdefault("paths", {})
+    merged_paths = merged.get("paths")
+    if not isinstance(merged_paths, dict):
+        # Preserve the invalid shape for Settings validation and its
+        # source-aware ConfigurationError instead of indexing it here.
+        return merged
     for key in (
         "mapping_file",
         "sas_fabric_alias_file",
@@ -872,17 +1238,32 @@ def _apply_config_path_relative_defaults(
         "slot_detail_cache_file",
         "runtime_overrides_file",
     ):
-        if key not in merged_paths or merged_paths.get(key) in {defaults["paths"][key], legacy[key]}:
+        current = merged_paths.get(key)
+        if key not in merged_paths or (
+            isinstance(current, str) and current in {defaults["paths"][key], legacy[key]}
+        ):
             merged_paths[key] = derived[key]
 
+    # A known-hosts path the operator chose (config file, per system, or
+    # SSH_KNOWN_HOSTS_PATH) is honoured, e.g. a host bind mount instead of the
+    # data volume. Unset, default and legacy container values follow the
+    # runtime layout; a system without its own choice follows the top level.
+    placeholder_known_hosts_paths = {
+        defaults["ssh"]["known_hosts_path"],
+        *known_hosts_placeholder_paths(config_path),
+    }
     merged_ssh = merged.setdefault("ssh", {})
-    merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
+    if is_placeholder_known_hosts_path(merged_ssh.get("known_hosts_path"), placeholder_known_hosts_paths):
+        merged_ssh["known_hosts_path"] = derived["known_hosts_path"]
 
     for system_payload in merged.get("systems") or []:
         if not isinstance(system_payload, dict):
             continue
         ssh_payload = system_payload.setdefault("ssh", {})
-        ssh_payload["known_hosts_path"] = derived["known_hosts_path"]
+        if not isinstance(ssh_payload, dict):
+            continue
+        if is_placeholder_known_hosts_path(ssh_payload.get("known_hosts_path"), placeholder_known_hosts_paths):
+            ssh_payload["known_hosts_path"] = merged_ssh["known_hosts_path"]
 
     return merged
 
@@ -900,6 +1281,11 @@ def normalize_text(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def normalize_value_text(value: object) -> str | None:
+    """`normalize_text` for any value: None stays None, anything else is str()-ed first."""
+    return normalize_text(str(value)) if value is not None else None
 
 
 def _normalize_storage_view_id(value: str | None, fallback_index: int) -> str:
@@ -1005,14 +1391,172 @@ def _normalize_systems(settings: Settings) -> Settings:
     )
 
 
-@lru_cache
+# Settings that only take effect when the main UI process starts: values
+# captured while the app object is built (docs routes, the
+# public origin used by write checks, the perf middleware, the release-check
+# task, start-up warm-up) and the file paths behind open log handlers and data
+# stores. Everything else in config.yaml, runtime-overrides.yaml and
+# profiles.yaml is applied by the running main UI when the file changes (#432).
+# Sign-in (ADMIN_AUTH_MODE and its credentials) and every other .env value are
+# process environment, so they also need a restart; they are not listed here
+# because they are not config-file settings.
+RESTART_ONLY_SETTINGS: tuple[tuple[str, ...], ...] = (
+    ("app", "public_origin"),
+    ("app", "debug"),
+    ("app", "startup_warm_cache_enabled"),
+    ("app", "startup_warm_smart_enabled"),
+    ("app", "release_check_enabled"),
+    ("app", "release_check_repo"),
+    ("app", "release_check_interval_seconds"),
+    ("app", "release_check_timeout_seconds"),
+    ("perf",),
+    ("paths",),
+    ("config_file",),
+)
+
+
+def _settings_value(settings: Settings, path: tuple[str, ...]) -> Any:
+    value: Any = settings
+    for part in path:
+        value = getattr(value, part)
+    return value
+
+
+def restart_only_changes(before: Settings, after: Settings) -> list[str]:
+    """Dotted names of restart-only settings that differ between two loads."""
+    return [
+        ".".join(path)
+        for path in RESTART_ONLY_SETTINGS
+        if _settings_value(before, path) != _settings_value(after, path)
+    ]
+
+
+def with_running_restart_only_settings(running: Settings, loaded: Settings) -> Settings:
+    """``loaded`` with every restart-only setting kept at its ``running`` value."""
+    app_fields = {path[1] for path in RESTART_ONLY_SETTINGS if path[0] == "app" and len(path) == 2}
+    return loaded.model_copy(
+        update={
+            "app": loaded.app.model_copy(
+                update={field: getattr(running.app, field) for field in app_fields}
+            ),
+            "perf": running.perf,
+            "paths": running.paths,
+            "config_file": running.config_file,
+        }
+    )
+
+
+def config_watch_paths(settings: Settings) -> tuple[Path, ...]:
+    """The files the main UI watches for changes: config, runtime overrides, profiles."""
+    return (
+        Path(settings.config_file),
+        Path(settings.paths.runtime_overrides_file),
+        Path(settings.paths.profile_file),
+    )
+
+
+_SETTINGS_LOCK = threading.RLock()
+_cached_settings: Settings | None = None
+
+
 def get_settings() -> Settings:
+    """The loaded settings, read from disk once and then reused.
+
+    ``get_settings.cache_clear()`` forces the next call to read the files
+    again, as with the ``lru_cache`` this replaces. ``replace_settings``
+    installs settings that were already loaded and validated elsewhere (the
+    main UI's config reloader), so no caller ever sees a half-loaded value.
+    """
+    cached = _cached_settings
+    if cached is not None:
+        return cached
+    with _SETTINGS_LOCK:
+        if _cached_settings is None:
+            _store_settings(load_settings())
+        return _cached_settings  # type: ignore[return-value]
+
+
+def _store_settings(settings: Settings | None) -> None:
+    global _cached_settings
+    _cached_settings = settings
+
+
+def _clear_settings_cache() -> None:
+    with _SETTINGS_LOCK:
+        _store_settings(None)
+
+
+def replace_settings(settings: Settings) -> None:
+    with _SETTINGS_LOCK:
+        _store_settings(settings)
+
+
+get_settings.cache_clear = _clear_settings_cache  # type: ignore[attr-defined]
+
+
+def load_settings(
+    *,
+    running_restart_only: Settings | None = None,
+    create_directories: bool = True,
+    read_yaml_file: Callable[[Path], bytes | None] | None = None,
+    captured_files: Mapping[Path, bytes | None] | None = None,
+) -> Settings:
+    """Read and validate config.yaml, runtime-overrides.yaml, profiles.yaml and .env.
+
+    During live reload, dependent override and profile content stays on the running
+    restart-only path. The pending path is still validated and reported as a
+    restart-only change, but its content is not combined with the old process's
+    open stores and paths.
+
+    Read-only callers can disable directory creation and supply an admitted
+    YAML reader (bytes, or None for a missing file). A scheduled config export
+    can also supply its hashed documents; captured paths take precedence,
+    including authoritative absence, while uncaptured paths use the admitted
+    reader. All settings parsing and merging remains shared, and these controls
+    do not change the process cache.
+    Secret-file environment overrides retain their own bounded reader.
+    """
     defaults = Settings().model_dump()
     config_path = Path(os.getenv("APP_CONFIG_PATH", defaults["config_file"]))
-    yaml_config = _load_yaml_config(config_path)
-    runtime_overrides_path = Path(_derive_runtime_layout_paths(config_path)["runtime_overrides_file"])
-    runtime_overrides = _load_runtime_overrides_config(runtime_overrides_path)
+    yaml_config = _load_yaml_config(config_path, read_yaml_file, captured_files)
     merged = _deep_merge(defaults, yaml_config)
+    raw_paths = merged.get("paths")
+    configured_overrides_path = (
+        raw_paths.get("runtime_overrides_file")
+        if isinstance(raw_paths, dict)
+        else defaults["paths"]["runtime_overrides_file"]
+    )
+    if not isinstance(configured_overrides_path, str):
+        configured_overrides_path = defaults["paths"]["runtime_overrides_file"]
+    if configured_overrides_path in {
+        defaults["paths"]["runtime_overrides_file"],
+        _legacy_container_layout_paths()["runtime_overrides_file"],
+    }:
+        configured_overrides_path = _derive_runtime_layout_paths(config_path)["runtime_overrides_file"]
+    runtime_overrides_path = Path(
+        running_restart_only.paths.runtime_overrides_file
+        if running_restart_only is not None
+        else configured_overrides_path
+    )
+    runtime_overrides = _load_runtime_overrides_config(
+        runtime_overrides_path, read_yaml_file, captured_files
+    )
+    if running_restart_only is not None and Path(configured_overrides_path) != runtime_overrides_path:
+        try:
+            pending_runtime_overrides = _load_runtime_overrides_config(
+                Path(configured_overrides_path), read_yaml_file, captured_files
+            )
+            Settings.model_validate(_deep_merge(defaults, pending_runtime_overrides))
+        except (OSError, yaml.YAMLError, ValueError, ValidationError) as exc:
+            raise ConfigurationError(
+                [
+                    f"paths.runtime_overrides_file in {config_path}: "
+                    f"the new runtime override file is invalid ({type(exc).__name__})."
+                ]
+            ) from None
+
+    for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
+        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
     merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():
@@ -1023,9 +1567,18 @@ def get_settings() -> Settings:
         )
         if raw_value is None:
             continue
-        parsed_value = (
-            raw_value if env_name in EXACT_STRING_ENV_OVERRIDES else _parse_scalar(raw_value)
-        )
+        if env_name in EXACT_STRING_ENV_OVERRIDES:
+            # A blank ``KEY=`` line copied from .env.example is unset, like
+            # every other key; a ``<KEY>_FILE`` secret is still used exactly.
+            if not raw_value.strip() and os.getenv(f"{env_name}_FILE") is None:
+                continue
+            parsed_value = raw_value
+        elif not raw_value.strip():
+            continue
+        elif _override_is_text(target_path):
+            parsed_value = raw_value.strip()
+        else:
+            parsed_value = _parse_scalar(raw_value)
         _set_path_value(merged, target_path, parsed_value)
     _apply_legacy_cache_ttl_compat(merged, yaml_config, runtime_overrides)
 
@@ -1035,15 +1588,67 @@ def get_settings() -> Settings:
         defaults=defaults,
     )
 
-    profile_path = Path(merged.get("paths", {}).get("profile_file", defaults["paths"]["profile_file"]))
-    if profile_path.exists():
-        profile_config = _load_profile_yaml(profile_path)
-        merged["profiles"] = [*(merged.get("profiles") or []), *(profile_config.get("profiles") or [])]
+    current_paths = merged.get("paths")
+    configured_profile_path = (
+        current_paths.get("profile_file", defaults["paths"]["profile_file"])
+        if isinstance(current_paths, dict)
+        else defaults["paths"]["profile_file"]
+    )
+    profile_path = Path(
+        running_restart_only.paths.profile_file
+        if running_restart_only is not None
+        else configured_profile_path
+    )
+    # Only a list can be merged with file profiles. Any other shape is left
+    # as-is so validation reports it as a configuration error.
+    inline_raw = merged.get("profiles") or []
+    inline_profiles = list(inline_raw) if isinstance(inline_raw, list) else None
+    if inline_profiles is not None:
+        profile_config = _load_profile_yaml(profile_path, read_yaml_file, captured_files)
+        merged["profiles"] = [*inline_profiles, *(profile_config.get("profiles") or [])]
+    # A pending restart-only profile path never supplies live profiles, but
+    # the next start will read it. Refuse the edit now if that file would
+    # stop the restart, instead of accepting it as "restart required".
+    pending_profile_path = Path(configured_profile_path)
+    pending_profiles: list[Any] | None = None
+    if (
+        running_restart_only is not None
+        and pending_profile_path != profile_path
+        and inline_profiles is not None
+    ):
+        try:
+            pending_config = _load_profile_yaml(
+                pending_profile_path, read_yaml_file, captured_files
+            )
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            raise ConfigurationError(
+                [f"paths.profile_file in {config_path}: the new profile file cannot be loaded ({type(exc).__name__})."]
+            ) from None
+        pending_profiles = [*inline_profiles, *(pending_config.get("profiles") or [])]
 
-    settings = _normalize_systems(Settings.model_validate(merged))
-    Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
-    Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)
+    env_by_target = {target_path: env_name for env_name, target_path in ENV_OVERRIDES.items()}
+
+    def resolve_location(location: tuple[int | str, ...]) -> tuple[str, str]:
+        parts = tuple(str(part) for part in location)
+        env_name = env_by_target.get(parts)
+        if env_name is not None and env_is_set(env_name):
+            return env_name, ".env"
+        source = runtime_overrides_path if _has_path(runtime_overrides, parts) else config_path
+        return format_location(location), str(source)
+
+    try:
+        validated = Settings.model_validate(merged)
+        if pending_profiles is not None:
+            Settings.model_validate({**merged, "profiles": pending_profiles})
+    except ValidationError as exc:
+        raise ConfigurationError(
+            describe_validation_error(exc, resolve_location=resolve_location, default_source=str(config_path))
+        ) from None
+    settings = _normalize_systems(validated)
+    if create_directories:
+        Path(settings.paths.mapping_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.sas_fabric_alias_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.log_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.profile_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(settings.paths.slot_detail_cache_file).parent.mkdir(parents=True, exist_ok=True)
     return settings

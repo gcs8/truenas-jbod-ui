@@ -9,10 +9,11 @@ import yaml
 
 from app.config import EnclosureProfileConfig, Settings, _load_profile_yaml, normalize_text
 from app.models.domain import EnclosureProfileRequest
+from app.services.config_change_journal import record_config_change
 from app.services.profile_registry import ProfileRegistry, built_in_profile_ids, default_slot_layout
 
 
-_PROFILE_WRITE_LOCK = threading.Lock()
+_PROFILE_WRITE_LOCK = threading.RLock()
 
 
 def _normalize_profile_id(value: str | None, fallback_index: int) -> str:
@@ -119,6 +120,15 @@ class ProfileBuilderService:
             registry = ProfileRegistry(settings)
             source_profile = registry.get(payload.source_profile_id) if payload.source_profile_id else None
 
+            if "slot_number_base" in payload.model_fields_set:
+                slot_number_base = payload.slot_number_base
+            elif existing_profile is not None:
+                slot_number_base = existing_profile.slot_number_base
+            elif source_profile is not None:
+                slot_number_base = source_profile.slot_number_base
+            else:
+                slot_number_base = None
+
             slot_layout: list[list[int | None]]
             slot_hints: dict[int, list[str]]
             if payload.slot_layout is not None:
@@ -174,6 +184,7 @@ class ProfileBuilderService:
                 slot_layout=slot_layout,
                 row_groups=_normalize_row_groups(payload.row_groups, int(payload.columns)),
                 slot_hints=slot_hints,
+                slot_number_base=slot_number_base,
             )
 
             if existing_index is None:
@@ -182,6 +193,7 @@ class ProfileBuilderService:
                 profiles[existing_index] = profile
 
             self._write_profiles(profiles)
+            record_config_change("profile.save", profile.id)
             return profile, existing_index is not None
 
     def delete_profile(self, profile_id: str, settings: Settings) -> str:
@@ -220,6 +232,7 @@ class ProfileBuilderService:
 
             removed = profiles.pop(existing_index)
             self._write_profiles(profiles)
+            record_config_change("profile.delete", removed.id)
             return removed.label or removed.id
 
     def _load_profiles(self) -> list[EnclosureProfileConfig]:

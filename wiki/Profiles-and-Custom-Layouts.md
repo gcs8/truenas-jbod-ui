@@ -42,7 +42,7 @@ selector IDs use `{enclosure_id}::{profile_id}` with
 
 ## Create a custom profile
 
-The admin sidecar includes an `Enclosure / Profile Builder`. Start from a
+The Admin includes an `Enclosure / Profile Builder`. Start from a
 built-in profile, adjust its face and bay layout, preview the result, then save
 it as a custom profile.
 

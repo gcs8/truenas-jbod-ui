@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from app.models.domain import ManualMapping
+from tests.mapping_fixtures import write_v1_mappings
+from app.models.domain import ManualMapping, SlotView
 from app.services.mapping_store import (
     MappingRevisionConflict,
     MappingScopeConflict,
@@ -139,7 +142,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 serial="ALIAS",
             )
             alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
-            store._write({alias_key: alias})
+            write_v1_mappings(store, {alias_key: alias})
             before = store.file_path.read_bytes()
 
             resolved = store.get_mapping("synthetic-system-a", DRAWER_BOTTOM, 7)
@@ -176,7 +179,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     serial="ALIAS",
                 )
                 alias_key = self.alias_key("synthetic-system-a", DRAWER_TOP, 7)
-                store._write({alias_key: alias})
+                write_v1_mappings(store, {alias_key: alias})
 
                 if operation == "clear":
                     revision = store.clear_revision(
@@ -253,7 +256,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     "enclosure_id": DRAWER_BOTTOM,
                 }
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
                 self.alias_key("synthetic-system-b", DRAWER_BOTTOM, 7): other,
@@ -281,14 +284,14 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                     slot=7,
                     serial="OLD",
                 )
-                store._write({alias_key: alias})
+                write_v1_mappings(store, {alias_key: alias})
                 save_revision = store.save_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
                 clear_revision = store.clear_revision("synthetic-system-a", DRAWER_BOTTOM, 7)
                 incoming = [alias.model_copy(update={"enclosure_id": DRAWER_BOTTOM, "serial": "NEW"})]
                 preview = store.preview_replace_mappings(
                     "synthetic-system-a", DRAWER_BOTTOM, incoming
                 )
-                store._write({alias_key: alias.model_copy(update={"notes": "changed"})})
+                write_v1_mappings(store, {alias_key: alias.model_copy(update={"notes": "changed"})})
                 before = store.file_path.read_bytes()
 
                 with self.assertRaises(MappingRevisionConflict):
@@ -321,7 +324,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             alias = canonical.model_copy(update={"enclosure_id": DRAWER_TOP, "serial": "DIVERGENT"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 self.alias_key("synthetic-system-a", DRAWER_TOP, 7): alias,
             })
@@ -355,7 +358,7 @@ class PhysicalMappingScopeLifecycleTests(unittest.TestCase):
                 slot=7,
                 serial="DIVERGENT",
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("synthetic-system-a", "synthetic-shelf-a", 7): canonical,
                 f"{DRAWER_TOP}:7": admitted_alias,
             })
@@ -386,7 +389,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
         slot: int = SLOT,
     ) -> MappingStore:
         store = self.make_store(root)
-        store._write({
+        write_v1_mappings(store, {
             f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
                 system_id=system_id,
                 enclosure_id=enclosure_id,
@@ -466,7 +469,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as temp_dir,
             ):
                 store = self.make_store(temp_dir)
-                store._write({
+                write_v1_mappings(store, {
                     f"{self.SYSTEM_A}:{keyed_enclosure_id}:{self.SLOT}": ManualMapping(
                         system_id=self.SYSTEM_A,
                         enclosure_id=model_enclosure_id,
@@ -484,7 +487,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
     def test_system_scoped_key_with_legacy_none_model_system_remains_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 f"{self.SYSTEM_A}:{DRAWER_TOP}:{self.SLOT}": ManualMapping(
                     system_id=None,
                     enclosure_id=DRAWER_BOTTOM,
@@ -598,7 +601,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     "serial": "OTHER-PHYSICAL",
                 }
             )
-            store._write(current)
+            write_v1_mappings(store, current)
             before = store.file_path.read_bytes()
 
             self.assertEqual(
@@ -671,7 +674,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                         slot=slot,
                         serial="HIDDEN",
                     )
-                    store._write({
+                    write_v1_mappings(store, {
                         store._slot_key(
                             self.SYSTEM_A, self.SHELF_A, self.SLOT
                         ): valid,
@@ -695,7 +698,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     slot=self.SLOT,
                     serial="VALID",
                 )
-                store._write({
+                write_v1_mappings(store, {
                     store._slot_key(self.SYSTEM_A, self.SHELF_A, self.SLOT): valid,
                 })
                 preview = store.preview_replace_mappings(self.SYSTEM_A, self.SHELF_A, [])
@@ -706,7 +709,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                 current[f"{self.SYSTEM_B}:unknown-shelf:{self.SLOT}"] = valid.model_copy(
                     update={"serial": "HIDDEN"}
                 )
-                store._write(current)
+                write_v1_mappings(store, current)
                 before = store.file_path.read_bytes()
 
                 with self.assertRaises(MappingScopeConflict):
@@ -769,7 +772,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     slot=1,
                     serial="OTHER-SYSTEM",
                 )
-                store._write(rows)
+                write_v1_mappings(store, rows)
                 before = store.file_path.read_bytes()
 
                 result = operation(store)
@@ -795,7 +798,7 @@ class AliasKeyModelConsistencyTests(unittest.TestCase):
                     serial="TEN",
                 ),
             }
-            store._write(rows)
+            write_v1_mappings(store, rows)
 
             self.assertEqual(
                 [mapping.serial for mapping in store.list_mappings()],
@@ -817,7 +820,8 @@ class MappingStoreImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
             slot_count = 347
-            store._write(
+            write_v1_mappings(
+                store,
                 {
                     store._slot_key("system-a", "enc-a", slot): ManualMapping(
                         system_id="system-a",
@@ -1062,9 +1066,9 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-OLD",
             )
-            store._write({"default:0": legacy})
+            write_v1_mappings(store, {"default:0": legacy})
             clear_revision = store.clear_revision("system-a", "enc-a", 0)
-            store._write({"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
+            write_v1_mappings(store, {"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1093,7 +1097,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-ORIGINAL",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             preview = store.preview_replace_mappings("system-a", "enc-a", [])
 
@@ -1128,9 +1132,9 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-OLD",
             )
-            store._write({"default:0": legacy})
+            write_v1_mappings(store, {"default:0": legacy})
             clear_revision = store.clear_revision("system-a", "enc-a", 0)
-            store._write({"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
+            write_v1_mappings(store, {"default:0": legacy.model_copy(update={"serial": "LEGACY-NEW"})})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1159,7 +1163,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             self.assertEqual(store.count_for_system("system-a"), 1)
             self.assertEqual(
@@ -1176,7 +1180,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=3,
                 device_name="sda",
             )
-            store._write({"default:3": legacy})
+            write_v1_mappings(store, {"default:3": legacy})
 
             self.assertIsNone(store.get_mapping("system-b", "enc-b", 3))
             admitted = store.get_mapping(
@@ -1192,7 +1196,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_has_legacy_only_mapping_reports_rows_without_resolving_them(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "default:3": ManualMapping(slot=3, device_name="sda"),
                 store._slot_key("system-a", "enc-a", 4): ManualMapping(
                     system_id="system-a",
@@ -1244,7 +1248,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_exact_key_with_foreign_model_system_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-b", "enc-b", 3): ManualMapping(
                     system_id="system-a",
                     enclosure_id="enc-b",
@@ -1268,7 +1272,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY-COLON",
             )
-            store._write({"sas:enclosure-a:0": legacy})
+            write_v1_mappings(store, {"sas:enclosure-a:0": legacy})
 
             self.assertEqual(
                 [mapping.serial for mapping in store.list_mappings("system-a", "sas:enclosure-a")],
@@ -1284,7 +1288,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=0,
                 serial="LEGACY",
             )
-            store._write({"enc-a:0": legacy})
+            write_v1_mappings(store, {"enc-a:0": legacy})
 
             store.replace_mappings("system-a", "enc-a", [])
 
@@ -1295,7 +1299,7 @@ class MappingStoreImportTests(unittest.TestCase):
             with self.subTest(enclosure_id=enclosure_id), tempfile.TemporaryDirectory() as temp_dir:
                 store = self.make_store(temp_dir)
                 legacy_key = f"{enclosure_id}:0"
-                store._write({
+                write_v1_mappings(store, {
                     legacy_key: ManualMapping(
                         system_id=None,
                         enclosure_id=enclosure_id,
@@ -1325,7 +1329,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_removes_global_legacy_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "default:0": ManualMapping(
                     system_id=None,
                     enclosure_id=None,
@@ -1360,7 +1364,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             legacy = canonical.model_copy(update={"system_id": None, "serial": "LEGACY"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("default", "enc-a", 0): canonical,
                 "enc-a:0": legacy,
             })
@@ -1378,7 +1382,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_invalidates_pre_migration_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 "enc-a:0": ManualMapping(
                     system_id=None,
                     enclosure_id="enc-a",
@@ -1418,7 +1422,7 @@ class MappingStoreImportTests(unittest.TestCase):
                 serial="CANONICAL",
             )
             legacy = canonical.model_copy(update={"system_id": None, "serial": "LEGACY"})
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("default", "enc-a", 0): canonical,
                 "enc-a:0": legacy,
             })
@@ -1438,7 +1442,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_canonical_save_removes_scoped_enclosureless_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-a", None, 5): ManualMapping(
                     system_id="system-a",
                     enclosure_id=None,
@@ -1463,7 +1467,7 @@ class MappingStoreImportTests(unittest.TestCase):
     def test_clear_removes_scoped_enclosureless_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key("system-a", None, 5): ManualMapping(
                     system_id="system-a",
                     enclosure_id=None,
@@ -1507,10 +1511,10 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=5,
                 serial="FALLBACK-OLD",
             )
-            store._write({exact_key: exact, fallback_key: fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: fallback})
             revision = store.save_revision("system-a", "enc-a", 5)
             newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
-            store._write({exact_key: exact, fallback_key: newer_fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: newer_fallback})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.save_mapping(
@@ -1539,10 +1543,10 @@ class MappingStoreImportTests(unittest.TestCase):
                 slot=5,
                 serial="FALLBACK-OLD",
             )
-            store._write({exact_key: exact, fallback_key: fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: fallback})
             revision = store.clear_revision("system-a", "enc-a", 5)
             newer_fallback = fallback.model_copy(update={"serial": "FALLBACK-NEW"})
-            store._write({exact_key: exact, fallback_key: newer_fallback})
+            write_v1_mappings(store, {exact_key: exact, fallback_key: newer_fallback})
 
             with self.assertRaisesRegex(RuntimeError, "revision"):
                 store.clear_mapping(
@@ -1568,7 +1572,7 @@ class MappingStoreImportTests(unittest.TestCase):
             other_mapping = default_mapping.model_copy(
                 update={"system_id": "system-a", "serial": "SYSTEM-A"}
             )
-            store._write({
+            write_v1_mappings(store, {
                 store._slot_key(None, "enc-a", 0): default_mapping,
                 store._slot_key("system-a", "enc-a", 0): other_mapping,
             })
@@ -2025,7 +2029,7 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                     else:
                         self.assertEqual(serials, {original.serial})
 
-    def test_atomic_writer_uses_exclusive_owner_only_temp(self) -> None:
+    def test_atomic_writer_uses_exclusive_shared_group_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self.make_store(temp_dir)
             observed: dict[str, int] = {}
@@ -2039,7 +2043,7 @@ class MappingStoreInjectiveKeyV2Tests(unittest.TestCase):
                     store.save_mapping(ManualMapping(
                         system_id="system-a", enclosure_id="enc-a", slot=1
                     ))
-            self.assertEqual(observed, {"mode": 0o600})
+            self.assertEqual(observed, {"mode": 0o660})
             self.assertFalse(store.file_path.exists())
             self.assertEqual(
                 list(store.file_path.parent.glob(f"{store.file_path.name}.*.tmp")), []
@@ -2425,6 +2429,24 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 [self.mapping("NEW")],
             )
         raise AssertionError(f"unknown authority surface {operation}")
+
+    def test_first_mapping_generation_is_readable_and_writable_by_the_shared_app_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+
+            store.save_mapping(self.mapping())
+
+            self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o660)
+
+    def test_mapping_replacement_upgrades_owner_only_mode_for_admin_backup_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            self.write_valid_document(store, 2)
+            store.file_path.chmod(0o600)
+
+            store.save_mapping(self.mapping("NEW"))
+
+            self.assertEqual(store.file_path.stat().st_mode & 0o777, 0o660)
 
     def test_initial_source_read_errors_fail_closed_for_every_authority_surface(self) -> None:
         original_read_bytes = Path.read_bytes
@@ -2834,7 +2856,7 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                     self.SLOT,
                 )
 
-    def test_saves_publish_exact_owner_only_mode_under_every_umask(self) -> None:
+    def test_saves_publish_exact_shared_group_mode_under_every_umask(self) -> None:
         original_replace = os.replace
         for requested_umask in (0o000, 0o077, 0o777):
             with (
@@ -2861,8 +2883,8 @@ class MappingStoreAuthoritativeLoadTests(unittest.TestCase):
                 finally:
                     os.umask(previous_umask)
 
-                self.assertEqual(provisional_modes, [0o600])
-                self.assertEqual(os.stat(store.file_path).st_mode & 0o777, 0o600)
+                self.assertEqual(provisional_modes, [0o660])
+                self.assertEqual(os.stat(store.file_path).st_mode & 0o777, 0o660)
                 resolved = store.get_mapping(
                     self.SYSTEM_ID,
                     self.ENCLOSURE_ID,
@@ -3571,6 +3593,338 @@ class MappingStoreIdentityBoundTempCleanupTests(unittest.TestCase):
                     {mapping.serial for mapping in store.load_all().values()},
                     {"OLD", "NEW"},
                 )
+
+
+BATCH_SYSTEM = "synthetic-system-a"
+BATCH_SHELF = "synthetic-shelf-a"
+BATCH_DRAWER = f"{BATCH_SHELF}::dell-md1280-drawer-top-42"
+
+
+def batch_mapping(
+    system: str | None = BATCH_SYSTEM, enclosure: str | None = BATCH_SHELF,
+    slot: int = 0, serial: str = "SYNTHETIC",
+) -> ManualMapping:
+    return ManualMapping(
+        system_id=system, enclosure_id=enclosure, slot=slot, serial=serial,
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+
+def write_batch_document(store, version, rows):
+    store.file_path.write_text(json.dumps({
+        "version": version,
+        "slot_mappings": {key: row.model_dump(mode="json") for key, row in rows.items()},
+    }), encoding="utf-8")
+
+
+def batch_parity_rows(store, version):
+    models = [
+        batch_mapping(), batch_mapping(enclosure=BATCH_DRAWER, slot=1),
+        batch_mapping(system=None, slot=2), batch_mapping(enclosure=None, slot=3),
+        batch_mapping(system=None, enclosure=None, slot=4),
+        batch_mapping(system="synthetic-system-b", slot=0),
+        batch_mapping(enclosure=f"{BATCH_SHELF}:neighbor", slot=0),
+    ]
+    if version == 2:
+        models = [store._canonical_mapping(row) for row in models]
+        return {store._encode_v2_key(row.system_id, row.enclosure_id, row.slot): row
+                for row in models}
+    return {(f"{row.enclosure_id or 'default'}:{row.slot}" if row.system_id is None
+             else store._slot_key(row.system_id, row.enclosure_id, row.slot)): row
+            for row in models}
+
+
+class MappingRevisionBatchTests(unittest.TestCase):
+    def test_attachment_reads_and_classifies_once_per_batch(self):
+        from app.config import SystemConfig
+        from app.services.inventory import InventoryService
+
+        for count in (60, 347):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                rows = batch_parity_rows(store, 1)
+                write_batch_document(store, 1, rows)
+                before = store.file_path.read_bytes()
+                service = InventoryService.__new__(InventoryService)
+                service.mapping_store = store
+                service.system = SystemConfig(id=BATCH_SYSTEM)
+                slots = [SlotView(slot=i, slot_label=f"Bay {i}", row_index=0,
+                                  column_index=i, enclosure_id=BATCH_DRAWER) for i in range(count)]
+                expected_save = store.save_revisions(BATCH_SYSTEM, [(BATCH_SHELF, i) for i in range(count)])
+                expected_clear = store.clear_revisions(BATCH_SYSTEM, [(BATCH_SHELF, i) for i in range(count)])
+                with patch.object(store, "_read_document", wraps=store._read_document) as reads, \
+                     patch.object(store, "_classify_row", wraps=store._classify_row) as classifications:
+                    result = InventoryService._attach_mapping_revisions(service, slots)
+                self.assertEqual(len(result), count)
+                self.assertEqual([s.mapping_revision for s in result], list(expected_save.values()))
+                self.assertEqual([s.mapping_clear_revision for s in result], list(expected_clear.values()))
+                self.assertEqual(store.file_path.read_bytes(), before)
+                self.assertLessEqual(reads.call_count, 2)
+                self.assertLessEqual(classifications.call_count, 2 * len(rows))
+
+    def test_batch_tokens_match_pre_optimization_bytes(self):
+        # Fingerprints captured on a98917a before changing production code.
+        expected = {
+            1: "899bcb814d7d8b198dd331f29c479b2db4f8f7bf5415df75d9f2f4b6d8d6016e",
+            2: "84f6ec1948baea449762f584009e149c27c2dc0f7ecadb792659f5b910e81e35",
+        }
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                write_batch_document(store, version, batch_parity_rows(store, version))
+                before = store.file_path.read_bytes()
+                targets = [(scope, slot) for scope in (BATCH_SHELF, BATCH_DRAWER, None, f"{BATCH_SHELF}:neighbor")
+                           for slot in range(6)]
+                tokens = []
+                for system in (BATCH_SYSTEM, None, "synthetic-system-b"):
+                    for operation in ("save", "clear"):
+                        batch = getattr(store, f"{operation}_revisions")(system, targets + targets[:1])
+                        self.assertEqual(list(batch), targets)
+                        singles = {target: getattr(store, f"{operation}_revision")(system, *target)
+                                   for target in targets}
+                        self.assertEqual(batch, singles)
+                        tokens.extend(batch.values())
+                fingerprint = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
+                self.assertEqual(fingerprint, expected[version])
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_conflict_relevance_is_target_specific(self):
+        for kind in ("invalid-v1", "invalid-v2", "duplicate", "legacy-drawer"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                store = MappingStore(str(Path(root) / "mapping.json"))
+                version = 2 if kind == "invalid-v2" else 1
+                if kind.startswith("invalid"):
+                    key = (store._encode_v2_key(BATCH_SYSTEM, BATCH_SHELF, 7) if version == 2
+                           else store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7))
+                    rows = {key: batch_mapping(enclosure=f"{BATCH_SHELF}:neighbor", slot=7)}
+                else:
+                    rows = {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7): batch_mapping(slot=7),
+                            (f"{BATCH_DRAWER}:7" if kind == "legacy-drawer"
+                             else f"{BATCH_SYSTEM}:{BATCH_DRAWER}:7"):
+                            batch_mapping(system=None if kind == "legacy-drawer" else BATCH_SYSTEM,
+                                    enclosure=BATCH_DRAWER, slot=7, serial="DIVERGENT")}
+                write_batch_document(store, version, rows)
+                before = store.file_path.read_bytes()
+                for operation in ("save", "clear"):
+                    batch = getattr(store, f"{operation}_revisions")
+                    single = getattr(store, f"{operation}_revision")
+                    unrelated = [(BATCH_SHELF, 0), (f"{BATCH_SHELF}:other", 7), (BATCH_DRAWER, 8)]
+                    self.assertEqual(batch(BATCH_SYSTEM, unrelated),
+                                     {target: single(BATCH_SYSTEM, *target) for target in unrelated})
+                    for targets in ([(BATCH_DRAWER, 7)], unrelated + [(BATCH_SHELF, 7)], [(BATCH_SHELF, 7)] + unrelated):
+                        with self.assertRaises(MappingScopeConflict):
+                            batch(BATCH_SYSTEM, targets)
+                    self.assertEqual(batch("synthetic-system-c", [(BATCH_SHELF, 0)]),
+                                     {(BATCH_SHELF, 0): single("synthetic-system-c", BATCH_SHELF, 0)})
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_batches_refresh_after_mutation_and_preserve_cas_migration(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = MappingStore(str(Path(root) / "mapping.json"))
+            write_batch_document(store, 1, batch_parity_rows(store, 1))
+            target = (BATCH_DRAWER, 1)
+            save = store.save_revisions(BATCH_SYSTEM, [target])[target]
+            clear = store.clear_revisions(BATCH_SYSTEM, [target])[target]
+            store.save_mapping(batch_mapping(enclosure=BATCH_DRAWER, slot=1, serial="REPLACEMENT"),
+                               expected_revision=save)
+            self.assertEqual(json.loads(store.file_path.read_text())["version"], 2)
+            fresh_save = store.save_revisions(BATCH_SYSTEM, [target])[target]
+            fresh_clear = store.clear_revisions(BATCH_SYSTEM, [target])[target]
+            self.assertNotEqual(save, fresh_save)
+            self.assertNotEqual(clear, fresh_clear)
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(batch_mapping(enclosure=BATCH_DRAWER, slot=1), expected_revision=save)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(BATCH_SYSTEM, *target, expected_revision=clear)
+            self.assertTrue(store.clear_mapping(BATCH_SYSTEM, *target, expected_revision=fresh_clear))
+
+    def test_empty_batches_do_not_read_or_validate_document(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = MappingStore(str(Path(root) / "mapping.json"))
+            store.file_path.write_text("invalid JSON", encoding="utf-8")
+            with patch.object(store, "_read_document", wraps=store._read_document) as reads:
+                self.assertEqual(store.save_revisions(BATCH_SYSTEM, []), {})
+                self.assertEqual(store.clear_revisions(BATCH_SYSTEM, []), {})
+            self.assertEqual(reads.call_count, 0)
+
+
+class MappingLookupSnapshotTests(unittest.TestCase):
+    def make_store(self, root):
+        return MappingStore(Path(root) / "mapping.json")
+
+    def test_snapshot_matches_preloaded_v1_v2_drawer_and_fallback_reads(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as root:
+                store = self.make_store(root)
+                write_batch_document(store, version, batch_parity_rows(store, version))
+                before = store.file_path.read_bytes()
+                loaded = store.load_all()
+                snapshot = store.load_lookup_snapshot()
+                self.assertEqual(dict(snapshot), dict(loaded))
+                for system in (BATCH_SYSTEM, None, "synthetic-other"):
+                    for enclosure in (BATCH_SHELF, BATCH_DRAWER, None, "synthetic-other"):
+                        for slot in range(6):
+                            for fallback in (False, True):
+                                self.assertEqual(
+                                    store.get_mapping(system, enclosure, slot, allow_legacy_fallback=fallback,
+                                                      loaded_entries=snapshot),
+                                    store.get_mapping(system, enclosure, slot, allow_legacy_fallback=fallback,
+                                                      loaded_entries=loaded),
+                                )
+                            self.assertEqual(
+                                store.has_legacy_only_mapping(system, enclosure, slot, loaded_entries=snapshot),
+                                store.has_legacy_only_mapping(system, enclosure, slot, loaded_entries=loaded),
+                            )
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_keeps_v1_document_version_for_v2_prefixed_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = ManualMapping(system_id="v2", enclosure_id="enc:a", slot=1, serial="SYNTHETIC")
+            write_v1_mappings(store, {"v2:enc:a:1": mapping})
+            snapshot = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping("v2", "enc:a", 1, loaded_entries=snapshot), mapping)
+
+    def test_snapshot_is_immutable_and_returned_models_cannot_poison_lookup(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = batch_mapping(slot=1)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: mapping})
+            snapshot = store.load_lookup_snapshot()
+            expected = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            snapshot[key].serial = "POISONED"
+            for value in snapshot.values():
+                value.enclosure_id = "POISONED"
+            returned = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            returned.serial = "POISONED"
+            with self.assertRaises(TypeError):
+                snapshot[key] = returned
+            with self.assertRaises(TypeError):
+                del snapshot[key]
+            with self.assertRaises(AttributeError):
+                snapshot._entries = {}
+            with self.assertRaises(TypeError):
+                snapshot._entries[key] = "POISONED"
+            with self.assertRaises(TypeError):
+                snapshot._mappings[(BATCH_SYSTEM, BATCH_SHELF, 1)] = "POISONED"
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot), expected)
+            self.assertEqual(snapshot[key], mapping)
+
+    def test_read_snapshot_keeps_revision_state_without_exposing_mutable_lookup_models(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = batch_mapping(slot=1)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: mapping})
+
+            snapshot = store.load_read_snapshot()
+            expected = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            snapshot[key].serial = "POISONED"
+
+            self.assertEqual(
+                store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot),
+                expected,
+            )
+            self.assertEqual(store.count_for_system(BATCH_SYSTEM, loaded_entries=snapshot), 1)
+            self.assertIn(
+                (BATCH_SHELF, 1),
+                store.save_revisions(
+                    BATCH_SYSTEM,
+                    [(BATCH_SHELF, 1)],
+                    loaded_entries=snapshot,
+                ),
+            )
+
+    def test_mutable_preloads_are_never_cached(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: batch_mapping(slot=1)})
+            snapshot = store.load_lookup_snapshot()
+            for loaded in (store.load_all(), dict(store.load_all())):
+                original = store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1, loaded_entries=loaded)
+                loaded[key].serial = "CHANGED"
+                self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1,
+                                                   loaded_entries=loaded).serial, "CHANGED")
+                self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1,
+                                                   loaded_entries=snapshot), original)
+                loaded[key].enclosure_id = "synthetic-wrong-shelf"
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1, loaded_entries=loaded)
+
+    def test_new_snapshot_refreshes_after_write_without_changing_retained_pass_or_cas(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            write_v1_mappings(store, {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1): batch_mapping(slot=1)})
+            snapshot = store.load_lookup_snapshot()
+            original = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            revision = store.save_revision(BATCH_SYSTEM, BATCH_DRAWER, 1)
+            clear = store.clear_revision(BATCH_SYSTEM, BATCH_DRAWER, 1)
+            store.save_mapping(batch_mapping(slot=1, serial="NEW"), expected_revision=revision)
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot), original)
+            fresh = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=fresh).serial, "NEW")
+            before = store.file_path.read_bytes()
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(batch_mapping(slot=1), expected_revision=revision)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, expected_revision=clear)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_preserves_preload_conflicts_without_broadening_direct_target_refusal(self):
+        for kind in ("invalid-v1", "invalid-v2", "duplicate"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                store = self.make_store(root)
+                version = 2 if kind == "invalid-v2" else 1
+                key = (store._encode_v2_key(BATCH_SYSTEM, BATCH_SHELF, 7) if version == 2
+                       else store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7))
+                if kind.startswith("invalid"):
+                    rows = {key: batch_mapping(enclosure="synthetic-wrong", slot=7)}
+                else:
+                    rows = {key: batch_mapping(slot=7),
+                            f"{BATCH_SYSTEM}:{BATCH_DRAWER}:7":
+                            batch_mapping(enclosure=BATCH_DRAWER, slot=7, serial="DIVERGENT")}
+                write_batch_document(store, version, rows)
+                before = store.file_path.read_bytes()
+                self.assertIsNone(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0))
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7)
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0, loaded_entries=store.load_all())
+                with self.assertRaises(MappingScopeConflict):
+                    store.load_lookup_snapshot()
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_keeps_legacy_drawer_preload_and_direct_conflict_policies_distinct(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            rows = {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7): batch_mapping(slot=7),
+                    f"{BATCH_DRAWER}:7": batch_mapping(system=None, enclosure=BATCH_DRAWER,
+                                                      slot=7, serial="DIVERGENT")}
+            write_batch_document(store, 1, rows)
+            before = store.file_path.read_bytes()
+            snapshot = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7, loaded_entries=snapshot),
+                             store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7, loaded_entries=store.load_all()))
+            self.assertIsNone(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0))
+            with self.assertRaises(MappingScopeConflict):
+                store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7)
+            with self.assertRaises(MappingScopeConflict):
+                store.save_revision(BATCH_SYSTEM, BATCH_DRAWER, 7)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_retains_tolerant_v1_and_strict_v2_loading(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            for raw in ('not-json', '{"version":1,"slot_mappings":{"bad":false}}'):
+                store.file_path.write_text(raw)
+                self.assertEqual(dict(store.load_lookup_snapshot()), {})
+            for raw in ('{"version":2,"slot_mappings":{"bad":false}}',
+                        '{"version":3,"slot_mappings":{}}'):
+                store.file_path.write_text(raw)
+                with self.assertRaises(MappingScopeConflict):
+                    store.load_lookup_snapshot()
 
 
 if __name__ == "__main__":
