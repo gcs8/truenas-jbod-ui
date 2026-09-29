@@ -115,7 +115,7 @@
       <div class="summary-card compact">
         <span class="summary-label">Contents</span>
         <span class="summary-value">{{ snapshot_export_meta.metric_sample_count or 0 }} samples, {{ snapshot_export_meta.smart_summary_count or 0 }} SMART summaries, {{ snapshot_event_count }} event{% if snapshot_event_count != 1 %}s{% endif %}</span>
-        <span class="summary-note">{% if snapshot_export_meta.downsampling_label and snapshot_export_meta.downsampling_label != "None" %}history thinned: {{ snapshot_export_meta.downsampling_label }}{% else %}full history detail{% endif %}</span>
+        <span class="summary-note">{% if snapshot_export_meta.history_coverage_note %}{{ snapshot_export_meta.history_coverage_note }}{% elif snapshot_export_meta.downsampling_label and snapshot_export_meta.downsampling_label != "None" %}history thinned: {{ snapshot_export_meta.downsampling_label }}{% else %}full history detail{% endif %}</span>
       </div>
       </section>
     </details>
