@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept scheduled full backups running when the config change journal cannot be
+  read, and reported the journal problem as a failed config backup instead of
+  stopping the scheduler. (#835)
 - Let the admin Backups settings editor save again when config.yaml holds a
   quoted port or a bare-number bucket; the endpoint comparison had treated the
   retyped value as a different server. (#836)
