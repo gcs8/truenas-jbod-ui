@@ -259,6 +259,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept grooming the other locations when one remote target cannot be opened,
+  built retention rules only for enabled targets, and reported the grooming
+  outcome in the scheduler status and in backup health. (#797)
 - Matched cron schedules like classic cron when a day field starts with `*`:
   `0 3 */2 * 1` now runs only on Mondays that fall on an odd day of the month,
   not on every Monday plus every second day. Searched a complete Gregorian

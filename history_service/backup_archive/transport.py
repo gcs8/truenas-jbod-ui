@@ -1111,16 +1111,26 @@ def _nfs_encrypted(settings: ArchiveTargetSettings) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _import_boto3() -> tuple[Any, Any, Any]:
+def _import_boto3() -> tuple[Any, Any, Any, tuple[type[BaseException], ...]]:
     try:
         import boto3
+        import botocore.exceptions as botocore_exceptions
         from boto3.s3.transfer import TransferConfig
         from botocore.config import Config
     except ImportError as exc:
         raise DependencyMissingError(
             "S3 archive support requires the boto3 package; install boto3 to use this target."
         ) from exc
-    return boto3, TransferConfig, Config
+    connection_errors = (
+        botocore_exceptions.EndpointConnectionError,
+        botocore_exceptions.ConnectTimeoutError,
+        botocore_exceptions.ReadTimeoutError,
+        botocore_exceptions.ConnectionClosedError,
+        botocore_exceptions.HTTPClientError,
+        botocore_exceptions.ProxyConnectionError,
+        botocore_exceptions.SSLError,
+    )
+    return boto3, TransferConfig, Config, connection_errors
 
 
 def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str, *, multipart: bool) -> str:
@@ -1135,12 +1145,22 @@ def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str, *, multipart: bool
 class S3Target(_TargetBase):
     provider = "s3"
 
-    def __init__(self, client: Any, bucket: str, prefix: str, *, transfer_config: Any, encrypted: bool) -> None:
+    def __init__(
+        self,
+        client: Any,
+        bucket: str,
+        prefix: str,
+        *,
+        transfer_config: Any,
+        encrypted: bool,
+        connection_errors: tuple[type[BaseException], ...],
+    ) -> None:
         self._client = client
         self._bucket = bucket
         self._prefix = prefix
         self._transfer_config = transfer_config
         self._encrypted = encrypted
+        self._connection_errors = connection_errors
 
     @property
     def transport_encrypted(self) -> bool:
@@ -1268,12 +1288,15 @@ class S3Target(_TargetBase):
 
     def delete(self, name: str) -> None:
         validate_object_name(name)
-        self._client.delete_object(Bucket=self._bucket, Key=self._key(name))
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=self._key(name))
+        except self._connection_errors as exc:
+            raise ConnectionError("S3 archive location is unavailable.") from exc
 
 
 @contextmanager
 def _open_s3(settings: ArchiveTargetSettings) -> Iterator[S3Target]:
-    boto3, transfer_config_class, botocore_config_class = _import_boto3()
+    boto3, transfer_config_class, botocore_config_class, connection_errors = _import_boto3()
     client_kwargs: dict[str, Any] = {
         "aws_access_key_id": read_secret_file(settings.access_key_id_file, "S3 access key id"),
         "aws_secret_access_key": read_secret_file(settings.secret_access_key_file, "S3 secret access key"),
@@ -1300,6 +1323,7 @@ def _open_s3(settings: ArchiveTargetSettings) -> Iterator[S3Target]:
             "/".join(normalized_root_parts(settings.root)),
             transfer_config=transfer_config,
             encrypted=not settings.endpoint_url.startswith("http://"),
+            connection_errors=connection_errors,
         )
     finally:
         close = getattr(client, "close", None)

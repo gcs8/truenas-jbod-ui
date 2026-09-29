@@ -230,6 +230,8 @@ class BackupScheduler:
         if payload:
             self._status["classes"] = dict(payload.get("classes") or {})
             self._status["targets"] = dict(payload.get("targets") or {})
+            if isinstance(payload.get("grooming"), dict):
+                self._status["grooming"] = payload["grooming"]
             persisted_receipt = payload.get("verified_full")
             verified_full = self._validated_verified_full_receipt(persisted_receipt)
             if verified_full is not None:
@@ -290,6 +292,8 @@ class BackupScheduler:
                     if self._status["targets"].get(target.target_id)
                 },
             }
+            if self._status.get("grooming"):
+                payload["grooming"] = self._status["grooming"]
             verified_full = self._validated_verified_full_receipt(
                 self._status.get("verified_full")
             )
@@ -509,7 +513,7 @@ class BackupScheduler:
         grooming_succeeded = False
         try:
             grooming = self._groom_locked()
-            grooming_succeeded = grooming is None or not grooming.error
+            grooming_succeeded = grooming is None or grooming.location_complete(LOCAL_LOCATION)
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
         if can_replace_history and grooming_succeeded:
@@ -764,7 +768,7 @@ class BackupScheduler:
             rules.append(RetentionRule(backup_class, LOCAL_LOCATION, keep_count=class_policy.local_keep))
             if class_policy.remote_keep is None and class_policy.remote_max_age_days is None:
                 continue
-            for target in self.policy.targets:
+            for target in self.policy.enabled_targets():
                 rules.append(
                     RetentionRule(
                         backup_class,
@@ -797,12 +801,35 @@ class BackupScheduler:
         manager = self._manager()
         plan = manager.plan(self._clock())
         if not plan.items:
+            self._record_grooming(ok=True, deleted=0, detail=None, failed_locations={})
             return None
         with self._resolver() as resolver:
             result = manager.apply(plan, resolver, actor="scheduler", now=self._clock)
         if result.error:
             logger.warning("Backup grooming stopped early (%s).", result.error.split(":", 1)[0])
+        self._record_grooming(
+            ok=not result.error,
+            deleted=len(result.deleted) + len(result.already_missing),
+            detail=result.error,
+            failed_locations=result.failed_locations,
+        )
         return result
+
+    def _record_grooming(
+        self, *, ok: bool, deleted: int, detail: str | None, failed_locations: Mapping[str, str]
+    ) -> None:
+        def short(text: str | None) -> str | None:
+            return None if text is None else " ".join(text.split())[:MAX_DETAIL_CHARS]
+
+        with self._state_lock:
+            self._status["grooming"] = {
+                "at": _iso(self._clock()),
+                "ok": ok,
+                "deleted": deleted,
+                "detail": short(detail),
+                "failed_locations": {location: short(text) for location, text in failed_locations.items()},
+            }
+        self._write_status()
 
     def plan(self) -> tuple[str, datetime, GroomingPlan]:
         plan = self._manager().plan(self._clock())
