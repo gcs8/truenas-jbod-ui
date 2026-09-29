@@ -1891,7 +1891,7 @@
     if (viewSlot === null) {
       return false;
     }
-    return selectSlot(viewSlot);
+    return selectSlot(viewSlot, { sasFabricSlot: slotNumber });
   }
 
   function sasFabricSelectionTouchesNode(nodeId) {
@@ -9974,7 +9974,7 @@
     renderStorageViewRuntimeStatus();
   }
 
-  function selectSlot(slotNumber) {
+  function selectSlot(slotNumber, { sasFabricSlot = slotNumber } = {}) {
     if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
       && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
@@ -9983,7 +9983,7 @@
     if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
-    syncSasFabricTraceToSlot(slotNumber);
+    syncSasFabricTraceToSlot(sasFabricSlot);
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();

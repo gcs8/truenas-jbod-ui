@@ -1948,7 +1948,6 @@ class InventoryHelpersTests(unittest.TestCase):
             system = SystemConfig(
                 id="generic-esxi",
                 truenas=TrueNASConfig(platform="esxi"),
-                default_profile_id=SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
                 ssh=SSHConfig(enabled=True),
             )
             service = build_inventory_service(
@@ -1976,6 +1975,18 @@ class InventoryHelpersTests(unittest.TestCase):
             )
 
             self.assertEqual(records[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+            candidates = service._build_storage_view_candidate_records(
+                TrueNASRawData(
+                    enclosures=[],
+                    disks=[],
+                    pools=[],
+                    disk_temperatures={},
+                    smart_test_results=[],
+                ),
+                ssh_data,
+                SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+            )
+            self.assertEqual(candidates[0].enclosure_id, SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
 
     def test_build_esxi_topology_members_uses_parsed_virtual_drive_raid_level(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

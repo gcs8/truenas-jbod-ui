@@ -6162,7 +6162,7 @@ class InventoryService:
         if self.system.truenas.platform == "esxi":
             records = self._build_esxi_disk_records(
                 ssh_data,
-                enclosure_id=self.system.default_profile_id,
+                enclosure_id=selected_enclosure_id or self.system.default_profile_id,
             )
             if bmc_inventory is not None:
                 records.extend(self._build_bmc_disk_records(bmc_inventory))

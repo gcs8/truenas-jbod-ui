@@ -433,13 +433,15 @@ test("live enclosure bay selection remains direct and invalid inputs never selec
 
 test("with a storage view selected a bay chip selects the view slot that bay backs", () => {
   const selected = [];
+  const fabricEvents = [];
   const state = { selectedSlot: 0, snapshot: { selected_enclosure_id: "front" } };
   const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
     Number,
     state,
     getSelectedStorageViewRuntime: () => BOOT_VIEW_ON_BAYS,
-    selectSlot(slotNumber) {
+    selectSlot(slotNumber, { sasFabricSlot = slotNumber } = {}) {
       selected.push(slotNumber);
+      fabricEvents.push(`sync:${sasFabricSlot}`);
       state.selectedSlot = slotNumber;
       return true;
     },
@@ -450,6 +452,7 @@ test("with a storage view selected a bay chip selects the view slot that bay bac
   assert.equal(loaded.selectSasFabricSlot(7), true);
   assert.equal(state.selectedSlot, 1, "bay 07 backs view slot 1");
   assert.deepEqual(selected, [1]);
+  assert.deepEqual(fabricEvents, ["sync:7"]);
 });
 
 test("with a storage view selected the chip of the bay backing the selected view slot is lit", () => {
