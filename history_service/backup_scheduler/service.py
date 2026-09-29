@@ -59,7 +59,7 @@ from history_service.backup_archive.policy import (
     BackupPolicy,
     validate_filesystem_target_roots,
 )
-from history_service.backup_archive.transport import open_target, transport_encrypted
+from history_service.backup_archive.transport import ArchiveDownloadTooLargeError, open_target, transport_encrypted
 from history_service.scheduled_backup import ScheduledBackupRunner
 
 logger = logging.getLogger(__name__)
@@ -317,7 +317,19 @@ class BackupScheduler:
         if self._cron is None:
             return None
         local_now = now.astimezone(self._local_tz) if self._local_tz is not None else now.astimezone()
-        return self._cron.next_after(local_now).astimezone(timezone.utc)
+        following = self._cron.next_after(local_now)
+        while True:
+            following_utc = following.astimezone(timezone.utc)
+            round_trip = following_utc.astimezone(following.tzinfo)
+            # Reject a wall-clock time that the zone skips during spring-forward.
+            # Inside a repeated fall-back hour, also skip the first occurrence
+            # once it is already past so a repeated time runs only once.
+            if (
+                round_trip.replace(tzinfo=None) == following.replace(tzinfo=None)
+                and following_utc > now
+            ):
+                return following_utc
+            following = self._cron.next_after(following)
 
     def tick(self) -> None:
         """One scheduler step: config coalescer, then a due full backup."""
@@ -713,6 +725,12 @@ class BackupScheduler:
             try:
                 with self._open_configured_target(target) as remote:
                     stored = remote.put(local_path, record.name)
+                    if not stored.verified:
+                        try:
+                            remote.delete(record.name)
+                        except Exception:  # noqa: BLE001 - cleanup must not mask the verify failure
+                            logger.warning("Unverified remote backup copy on %s could not be removed.", target.target_id)
+                        raise RuntimeError("remote copy could not be verified")
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
                 remote_record = ArtifactRecord(
@@ -982,7 +1000,7 @@ class BackupScheduler:
         try:
             local = workspace / "archive"
             with self._open_configured_target(target) as remote:
-                size, digest = remote.get(record.name, local)
+                size, digest = remote.get(record.name, local, limit=record.size + 1)
             # Never hand out bytes the catalogue did not record: a target (or an
             # on-path attacker for plain FTP/NFS) could substitute another backup.
             _require_match(record, size, digest)
@@ -1002,7 +1020,7 @@ class BackupScheduler:
             self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
             ok = True
             detail = "Readback matched the catalogued size and SHA-256."
-        except ArchiveIntegrityError as exc:
+        except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
             # A copy that no longer matches must stop counting as verified, so it is
             # neither offered for restore nor protected as the newest verified copy.
             self.catalog.mark_unverified(artifact_id)
