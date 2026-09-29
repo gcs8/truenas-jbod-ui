@@ -158,6 +158,23 @@
       ? `${collector.collection_kind || "background"} for ${formatDuration(collector.collection_elapsed_seconds)}: ${collector.collection_activity || "working"}`
       : "no";
     setText("status-current-collection", currentCollection);
+    // Recovery is a separate observation from collector liveness. Missing or
+    // malformed evidence must not turn an accepted poll into a fresh "no".
+    const recoveryRequired = collector.history_recovery_required;
+    setText(
+      "status-history-recovery-required",
+      recoveryRequired === true
+        ? "yes, earlier history was quarantined and this database started empty"
+        : recoveryRequired === false ? "no" : "unknown",
+    );
+    document.getElementById("status-history-recovery-required")?.classList?.toggle("status-error", recoveryRequired !== false);
+    const quarantinedAt = collector.history_quarantined_at;
+    setText(
+      "status-history-quarantined-at",
+      quarantinedAt === null && recoveryRequired === false
+        ? "never"
+        : formatTimestamp(typeof quarantinedAt === "string" ? quarantinedAt : null, "not recorded"),
+    );
     // #417: damage found at run time pauses collection; keep the card current.
     if (typeof collector.history_collection_paused === "boolean") {
       setText(

@@ -27,7 +27,7 @@ from app.config import (
     is_placeholder_known_hosts_path,
     known_hosts_placeholder_paths,
 )
-from app.settings_reload import SettingsGeneration, SettingsRuntime
+from app.settings_reload import SettingsGeneration, SettingsRuntime, config_reload_problems
 from app.services.profile_registry import build_profile_reference_warnings
 from app.http_auth import (
     basic_auth_matches,
@@ -896,8 +896,11 @@ def resolve_admin_launch_url(request: Request, settings: Settings) -> AdminLaunc
     public_url = str(settings.admin.public_url or "").strip()
     if public_url:
         return AdminLaunchState(url=public_url.rstrip("/"), stopped=False)
+    hostname = request.url.hostname
+    # URL.hostname strips the brackets required around an IPv6 authority.
+    authority_host = f"[{hostname}]" if hostname and ":" in hostname else hostname
     return AdminLaunchState(
-        url=f"{request.url.scheme}://{request.url.hostname}:{settings.admin.port}",
+        url=f"{request.url.scheme}://{authority_host}:{settings.admin.port}",
         stopped=False,
     )
 
@@ -966,6 +969,8 @@ def startup_problems_for(request: Request) -> list[str]:
 
 
 STORAGE_REPROBE_SECONDS = 30.0
+# Single-flight: concurrent requests after expiry share one probe run.
+_STORAGE_PROBE_LOCK = threading.Lock()
 
 
 def refresh_storage_problems(request: Request) -> list[str]:
@@ -982,28 +987,47 @@ def refresh_storage_problems(request: Request) -> list[str]:
     previous = tuple(str(problem) for problem in (getattr(app_state, "startup_problems", None) or ()))
     if app_state is None or not directories:
         return list(previous)
-    now = time.monotonic()
-    checked_at = getattr(app_state, "storage_checked_at_monotonic", None)
-    if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
-        return list(previous)
-    known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
-    known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
-    current = tuple([*probe_writable_directories(directories), *known_hosts_problems])
-    for problem in current:
-        if problem not in previous:
-            logger.error("%s", problem)
-    previous_warnings = tuple(getattr(app_state, "known_hosts_warnings", None) or ())
-    for warning in known_hosts_read_only:
-        if warning not in previous_warnings:
-            logger.warning("%s", warning)
-    app_state.known_hosts_warnings = tuple(known_hosts_read_only)
-    if previous and not current and not known_hosts_read_only:
-        logger.info("Data, log and known-hosts folders are writable again.")
-    elif previous_warnings and not known_hosts_read_only:
-        logger.info("Pinned known-hosts files are writable again.")
-    app_state.startup_problems = current
-    app_state.storage_checked_at_monotonic = now
-    return list(current)
+    with _STORAGE_PROBE_LOCK:
+        # Re-read under the lock so a request that waited reuses the fresh result.
+        previous = tuple(str(problem) for problem in (getattr(app_state, "startup_problems", None) or ()))
+        now = time.monotonic()
+        checked_at = getattr(app_state, "storage_checked_at_monotonic", None)
+        if isinstance(checked_at, (int, float)) and now - checked_at < STORAGE_REPROBE_SECONDS:
+            return list(previous)
+        known_hosts_files = tuple(getattr(app_state, "known_hosts_files", None) or ())
+        known_hosts_problems, known_hosts_read_only = check_known_hosts_files(known_hosts_files)
+        current = tuple([*probe_writable_directories(directories), *known_hosts_problems])
+        for problem in current:
+            if problem not in previous:
+                logger.error("%s", problem)
+        previous_warnings = tuple(getattr(app_state, "known_hosts_warnings", None) or ())
+        for warning in known_hosts_read_only:
+            if warning not in previous_warnings:
+                logger.warning("%s", warning)
+        app_state.known_hosts_warnings = tuple(known_hosts_read_only)
+        if previous and not current and not known_hosts_read_only:
+            logger.info("Data, log and known-hosts folders are writable again.")
+        elif previous_warnings and not known_hosts_read_only:
+            logger.info("Pinned known-hosts files are writable again.")
+        app_state.startup_problems = current
+        app_state.storage_checked_at_monotonic = now
+        return list(current)
+
+
+def runtime_warnings_for(request: Request) -> list[str]:
+    """Startup, known-hosts and reload lines shown above the inventory warnings.
+
+    The page and every ``/api/inventory`` refresh prepend the same list, so a
+    refresh does not drop them. The storage probe behind the first two is
+    re-run at most every ``STORAGE_REPROBE_SECONDS``.
+    """
+
+    refresh_storage_problems(request)
+    return [
+        *startup_problems_for(request),
+        *known_hosts_warnings_for(request),
+        *config_reload_problems(request),
+    ]
 
 
 @dataclass(slots=True)

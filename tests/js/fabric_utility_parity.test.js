@@ -69,3 +69,17 @@ test("Storage Fabric utility twins stay textually identical", () => {
     assert.equal(functionSource(APP_SOURCE, name), functionSource(FABRIC_SOURCE, name), name);
   }
 });
+
+for (const label of ["Friendly source", '<img src=x onerror="alert(1)">', undefined, ""]) {
+  test(`main app path member display uses optional escaped label: ${label}`, () => {
+    const escapeHtml = value => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+    const render = new Function("sasFabricNodeMap", "sasFabricList", "sasFabricClassToken", "escapeHtml", "kvRow", "sasFabricDisplayLabel", "formatSasFabricKind", "formatSasFabricSlots", "sasFabricMetricRows", "formatSasFabricValue", "renderSasFabricCompactNodes",
+      `${functionSource(APP_SOURCE, "renderSasFabricTraceInspector")} return renderSasFabricTraceInspector;`)(
+      () => new Map(), value => value || [], value => value, escapeHtml,
+      () => "", () => "", () => "", () => "", () => "", () => "", () => "");
+    const html = render({metrics: {path_states: [{controller: "storage-v2:synthetic", controller_label: label, state: "healthy"}]}});
+    assert.ok(html.includes(`<span>${escapeHtml(label || "storage-v2:synthetic")}</span>`));
+    assert.match(html, /status-healthy/);
+    assert.doesNotMatch(html, /<img/);
+  });
+}

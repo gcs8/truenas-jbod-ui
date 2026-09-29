@@ -549,7 +549,7 @@ def parse_glabel_status(output: str) -> GlabelInfo:
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     info = CamcontrolInfo()
     current_controller: str | None = None
-    grouped_devices: dict[tuple[str, str | None, str | None], list[str]] = {}
+    device_rows: list[list[str]] = []
 
     for line in output.splitlines():
         bus_match = re.match(r"^(?:scbus|umass-sim)\d+\s+on\s+(?P<controller>\S+)\s+bus\s+\d+:", line.strip(), re.IGNORECASE)
@@ -565,11 +565,6 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             continue
 
         model = match.group("model").strip()
-        group_key = (
-            model,
-            normalize_text(match.group("target")),
-            normalize_text(match.group("lun")),
-        )
         parsed_devices: list[str] = []
         for device in match.group("devices").split(","):
             if not DEVICE_REGEX.search(device.strip()):
@@ -581,9 +576,11 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
                 if current_controller:
                     info.controllers[normalized.lower()] = current_controller
         if parsed_devices:
-            grouped_devices.setdefault(group_key, []).extend(parsed_devices)
+            device_rows.append(parsed_devices)
 
-    for devices in grouped_devices.values():
+    # Only aliases explicitly listed on one CAM row describe the same device.
+    # Model/target/LUN repeats across HBAs do not establish disk identity.
+    for devices in device_rows:
         deduped = list(dict.fromkeys(devices))
         if len(deduped) < 2:
             continue
@@ -857,7 +854,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         "ses_element_id_fallback": 1,
         "ses_element_index_invalid_descriptor": 1,
         "ses_description": 2,
-        "ses_device_slot_number": 2,
+        "ses_device_slot_number": 3,
     }
     existing_strength = source_strength.get(existing.slot_number_source, 0)
     incoming_strength = source_strength.get(slot.slot_number_source, 0)
@@ -1136,6 +1133,17 @@ def _finalize_ses_invalid_descriptor_evidence(
         )
 
 
+def _ses_control_slot_number(slot: SESMapSlot, ses_device: str | None) -> int | None:
+    # Display ordinals, SG descriptor labels and inferred invalid-AES bays
+    # are not --dev-slot-num coordinates. CORE retains typed element control.
+    if slot.slot_number_source == "ses_element_id_fallback" or (
+        ses_device and ses_device.startswith("/dev/sg")
+        and slot.slot_number_source in {"ses_description", "ses_element_index_invalid_descriptor"}
+    ):
+        return None
+    return slot.slot_number
+
+
 def _record_ses_slot(
     enclosure: SESMapEnclosure,
     slot: SESMapSlot,
@@ -1180,7 +1188,7 @@ def _record_ses_slot(
             {
                 "ses_device": slot.ses_device or enclosure.ses_device,
                 "ses_element_id": slot.element_id,
-                "ses_slot_number": reported_slot_number,
+                "ses_slot_number": _ses_control_slot_number(slot, slot.ses_device or enclosure.ses_device),
             }
         ],
     )
@@ -1669,11 +1677,16 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
                 element_id=slot_number,
                 ses_device=ses_device,
                 description=f"Slot {slot_number:02d}",
+                slot_number_source="ses_element_id_fallback",
+                slot_number_warning=(
+                    f"SES EC element {slot_number} has no verified device slot number; "
+                    "using element order for status geometry only, not LED control."
+                ),
                 control_targets=[
                     {
                         "ses_device": ses_device,
                         "ses_element_id": slot_number,
-                        "ses_slot_number": slot_number,
+                        "ses_slot_number": None,
                     }
                 ],
             )
@@ -1783,6 +1796,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
                 slot_number=-1,
                 element_id=element_id,
                 ses_device=ses_device,
+                description=descriptor,
             )
             continue
 
@@ -2574,6 +2588,11 @@ def build_slot_candidates_from_ses_enclosures(
                 if combined_slot < 0 or combined_slot >= slot_count:
                     continue
 
+                # Keep display labels separate from control coordinates in
+                # both the target list and the inventory metadata fallback.
+                control_slot_number = _ses_control_slot_number(
+                    slot, slot.ses_device or enclosure.ses_device,
+                )
                 candidates[combined_slot] = {
                     "status": slot.status,
                     "descriptor": slot.description,
@@ -2597,7 +2616,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "enclosure_name": enclosure.enclosure_name,
                     "ses_device": enclosure.ses_device,
                     "ses_element_id": slot.element_id,
-                    "ses_slot_number": slot.slot_number,
+                    "ses_slot_number": control_slot_number,
                     "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
                     "sas_address_source": slot.sas_address_source,
                     "sas_address_conflict": slot.sas_address_conflict,
@@ -2620,7 +2639,7 @@ def build_slot_candidates_from_ses_enclosures(
                             {
                                 "ses_device": slot.ses_device or enclosure.ses_device,
                                 "ses_element_id": slot.element_id,
-                                "ses_slot_number": slot.slot_number,
+                                "ses_slot_number": control_slot_number,
                             }
                         ],
                     ),

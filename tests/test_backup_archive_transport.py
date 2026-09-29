@@ -1105,6 +1105,18 @@ class NfsTargetTests(_TempCase):
 # --------------------------------------------------------------------------
 
 
+class FakeS3ConnectionError(RuntimeError):
+    pass
+
+
+class FakeS3ProxyConnectionError(RuntimeError):
+    pass
+
+
+class FakeS3SSLError(RuntimeError):
+    pass
+
+
 class FakeS3Client:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1114,6 +1126,7 @@ class FakeS3Client:
         self.corrupt_get = False
         self.get_calls = 0
         self.closed = False
+        self.delete_error: Exception | None = None
 
     def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None, Config=None):
         chunks = []
@@ -1151,6 +1164,8 @@ class FakeS3Client:
         return {"Body": io.BytesIO(data[:-1] + b"?" if self.corrupt_get else data)}
 
     def delete_object(self, Bucket, Key):
+        if self.delete_error is not None:
+            raise self.delete_error
         self.objects.pop(Key, None)
 
     def get_paginator(self, name):
@@ -1193,12 +1208,25 @@ def _fake_boto_modules(clients: list[FakeS3Client]) -> dict[str, types.ModuleTyp
     botocore = types.ModuleType("botocore")
     botocore_config = types.ModuleType("botocore.config")
     botocore_config.Config = lambda **kwargs: ("Config", kwargs)
+    botocore_exceptions = types.ModuleType("botocore.exceptions")
+    for name in (
+        "EndpointConnectionError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ConnectionClosedError",
+        "HTTPClientError",
+    ):
+        setattr(botocore_exceptions, name, FakeS3ConnectionError)
+    setattr(botocore_exceptions, "ProxyConnectionError", FakeS3ProxyConnectionError)
+    setattr(botocore_exceptions, "SSLError", FakeS3SSLError)
+    setattr(botocore, "exceptions", botocore_exceptions)
     return {
         "boto3": boto3,
         "boto3.s3": s3,
         "boto3.s3.transfer": s3_transfer,
         "botocore": botocore,
         "botocore.config": botocore_config,
+        "botocore.exceptions": botocore_exceptions,
     }
 
 
@@ -1221,6 +1249,24 @@ class S3TargetTests(_TempCase):
             secret_access_key_file=self.secret("s3-secret", "secretexample"),
             **kw,
         )
+
+    def test_delete_connection_failure_is_reported_as_location_unavailable(self) -> None:
+        with open_target(self.settings()) as target:
+            failure = FakeS3ConnectionError("synthetic endpoint unavailable")
+            self.clients[0].delete_error = failure
+            with self.assertRaisesRegex(ConnectionError, "S3 archive location is unavailable") as caught:
+                target.delete("full/backup.tar.zst")
+        self.assertIs(caught.exception.__cause__, failure)
+
+    def test_delete_proxy_and_tls_failures_are_location_unavailable(self) -> None:
+        for error_type in (FakeS3ProxyConnectionError, FakeS3SSLError):
+            with self.subTest(error_type=error_type.__name__):
+                with open_target(self.settings()) as target:
+                    failure = error_type("synthetic connection setup failure")
+                    self.clients[-1].delete_error = failure
+                    with self.assertRaises(ConnectionError) as caught:
+                        target.delete("full/backup.tar.zst")
+                self.assertIs(caught.exception.__cause__, failure)
 
     def test_missing_dependency_has_install_hint(self) -> None:
         with mock.patch.dict(sys.modules, {"boto3": None}):
@@ -1268,6 +1314,15 @@ class S3TargetTests(_TempCase):
                 target.put(self.source(b"payload"), "a.bin")
         self.assertEqual(client.objects, {})
 
+    def test_failed_re_read_deletes_object_and_raises(self) -> None:
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.etag_override = "kms-opaque"
+            with mock.patch.object(client, "get_object", side_effect=OSError("connection reset")):
+                with self.assertRaises(OSError):
+                    target.put(self.source(b"payload"), "a.bin")
+        self.assertEqual(client.objects, {})
+
     def test_large_multipart_etag_verifies_without_download(self) -> None:
         size = transport.S3_MULTIPART_THRESHOLD + 3
         src = self.tmp / "big.bin"
@@ -1289,12 +1344,81 @@ class S3TargetTests(_TempCase):
         self.assertEqual(self.clients[0].get_calls, 0)
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/threshold.bin"]["etag"].endswith("-1"))
 
-    def test_large_opaque_etag_is_size_checked_but_unverified(self) -> None:
-        with mock.patch.object(transport, "S3_REGET_LIMIT", 4), open_target(self.settings()) as target:
+    def test_opaque_readback_size_bound_and_cleanup(self) -> None:
+        # Finite excess makes the old EOF-only loop fail without a hanging test.
+        for size in (0, 7, transport.S3_MULTIPART_THRESHOLD + 3):
+            for delta in (-1, 0, 3 * transport.CHUNK_SIZE):
+                if size + delta < 0:
+                    continue
+                with self.subTest(size=size, delta=delta):
+                    class Body(io.BytesIO):
+                        consumed = 0
+
+                        def read(self, amount=-1):
+                            self_test.assertGreater(amount, 0)
+                            self_test.assertLessEqual(amount, transport.CHUNK_SIZE)
+                            chunk = super().read(amount)
+                            self.consumed += len(chunk)
+                            return chunk
+
+                    self_test = self
+                    body = Body(b"x" * (size + delta))
+                    with open_target(self.settings()) as target:
+                        client = self.clients[-1]
+                        client.etag_override = "kms-opaque"
+                        with mock.patch.object(client, "get_object", return_value={"Body": body}):
+                            if delta:
+                                with self.assertRaises(ArchiveVerificationError):
+                                    target.put(self.source(b"x" * size), "a.bin")
+                            else:
+                                self.assertTrue(target.put(self.source(b"x" * size), "a.bin").verified)
+                        self.assertTrue(body.closed)
+                        self.assertEqual(bool(client.objects), delta == 0)
+                        self.assertLessEqual(body.consumed, size + transport.CHUNK_SIZE)
+
+    def test_opaque_readback_io_failure_closes_body_and_deletes(self) -> None:
+        for size in (7, transport.S3_MULTIPART_THRESHOLD + 3):
+            with self.subTest(size=size), open_target(self.settings()) as target:
+                body = io.BytesIO()
+                client = self.clients[-1]
+                client.etag_override = "kms-opaque"
+                with mock.patch.object(client, "get_object", return_value={"Body": body}), \
+                        mock.patch.object(body, "read", side_effect=OSError("read failed")):
+                    with self.assertRaises(OSError):
+                        target.put(self.source(b"x" * size), "a.bin")
+                self.assertTrue(body.closed)
+                self.assertEqual(client.objects, {})
+
+    def test_large_opaque_etag_is_verified_by_streaming_readback(self) -> None:
+        src = self.tmp / "large.bin"
+        with open(src, "wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 3)
+        with open_target(self.settings()) as target:
             self.clients[0].etag_override = "kms-opaque"
-            stored = target.put(self.source(b"payload"), "a.bin")
-        self.assertFalse(stored.verified)
-        self.assertEqual(self.clients[0].get_calls, 0)
+            stored = target.put(src, "full/large.bin")
+        self.assertTrue(stored.verified)
+        self.assertEqual(self.clients[0].get_calls, 1)
+
+    def test_get_stops_once_download_exceeds_limit(self) -> None:
+        data = b"x" * (transport.CHUNK_SIZE * 3)
+        reads: list[int] = []
+
+        class Body(io.BytesIO):
+            def read(self, size=-1):
+                chunk = super().read(size)
+                reads.append(len(chunk))
+                return chunk
+
+        body = Body(data)
+        local = self.tmp / "fetched.bin"
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.objects["jbod-ui/archive/full/a.bin"] = {"data": data, "meta": {}, "etag": "e"}
+            client.get_object = lambda Bucket, Key: {"Body": body}
+            with self.assertRaisesRegex(transport.ArchiveDownloadTooLargeError, "larger than expected"):
+                target.get("full/a.bin", local, limit=transport.CHUNK_SIZE + 1)
+        self.assertEqual(sum(reads), transport.CHUNK_SIZE * 2)
+        self.assertFalse(local.exists())
 
     def test_plain_http_endpoint_is_labelled_unencrypted(self) -> None:
         with open_target(self.settings(endpoint_url="http://minio.example.test:9000")) as target:

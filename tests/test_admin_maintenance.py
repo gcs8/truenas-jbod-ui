@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from admin_service.services.runtime_control import (
     CONTAINER_CONTROL_RESPONSE_GRACE_SECONDS,
     DockerRuntimeError,
     DockerRuntimeService,
+    RuntimeBusyError,
 )
 from app.models.domain import DebugBundleExportRequest, SystemBackupExportRequest
 
@@ -113,6 +115,44 @@ def quiesced_import(
 
 
 class MaintenanceQuiesceTests(unittest.TestCase):
+    def test_empty_target_list_still_serializes_maintenance(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        backup = FakeBackupService()
+
+        def blocking_export(**_kwargs: Any) -> str:
+            entered.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the first export")
+            return "artifact"
+
+        backup.export_bundle_to_file = blocking_export  # type: ignore[method-assign]
+        service = AdminMaintenanceService(
+            backup,
+            FakeRuntimeService([]),
+            clean_backup_targets=(),
+        )
+
+        def first_export() -> None:
+            try:
+                service.export_bundle(SystemBackupExportRequest())
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=first_export)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2))
+        try:
+            with self.assertRaises(RuntimeBusyError):
+                service.export_bundle(SystemBackupExportRequest())
+        finally:
+            release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
     def test_archive_snapshot_closes_descriptor_when_workspace_creation_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             archive_path = Path(temporary_directory) / "synthetic.archive"
@@ -471,6 +511,22 @@ class MaintenanceQuiesceTests(unittest.TestCase):
         runtime_payload = backup.debug_calls[0]["runtime_payload"]
         self.assertEqual(runtime_payload["before_stop"]["running"], ["ui", "history"])
         self.assertEqual(runtime_payload["after_stop"]["running"], [])
+        self.assertEqual(runtime.status_calls, 2)
+
+    def test_debug_export_without_debug_state_skips_runtime_snapshots(self) -> None:
+        runtime = FakeRuntimeService(["ui", "history"])
+        backup = FakeBackupService()
+
+        _, outcome = build_service(runtime, backup).export_debug_bundle(
+            DebugBundleExportRequest(included_paths=["debug_readme"]),
+            stop_services=False,
+        )
+
+        self.assertEqual(outcome.stopped_containers, [])
+        self.assertEqual(runtime.status_calls, 0)
+        self.assertEqual(runtime.calls, [])
+        self.assertIsNone(backup.debug_calls[0]["runtime_payload"])
+        self.assertIsNone(backup.debug_calls[0]["maintenance_payload"])
 
 
 class DockerControlTimeoutTests(unittest.TestCase):
