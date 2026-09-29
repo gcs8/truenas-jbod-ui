@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -207,6 +208,8 @@ def _format_traceback_without_exception_value(exc_info: Any) -> str:
 
 
 class JsonFormatter(logging.Formatter):
+    converter = time.gmtime
+
     def __init__(self, *, service_name: str | None = None) -> None:
         super().__init__()
         self.service_name = service_name
