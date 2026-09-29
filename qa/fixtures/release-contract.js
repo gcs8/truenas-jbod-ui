@@ -41,7 +41,7 @@ function buildFixture() {
   }
 }
 
-async function installFixture(page, html, { timing = false, esxi = "fat-twin" } = {}) {
+async function installFixture(page, html, { timing = false, esxi = "fat-twin", emptyInventory = false } = {}) {
   const diagnostics = { errors: [], warnings: [], unexpected: [], inventory: [], runtime: [] };
   const controls = { holdInventory: null, holdRuntime: null };
   page.on("pageerror", error => diagnostics.errors.push(error.message));
@@ -50,7 +50,7 @@ async function installFixture(page, html, { timing = false, esxi = "fat-twin" } 
     if (message.type() === "warning") diagnostics.warnings.push(message.text());
   });
   // Only bootstrap DATA changes. The complete template and all script bytes are current source.
-  await page.addInitScript(({ timing, esxi }) => {
+  await page.addInitScript(({ timing, esxi, emptyInventory }) => {
     Object.defineProperty(window, "APP_BOOTSTRAP", { configurable: true, set(value) {
       value.uiPerfEnabled = timing;
       value.initialSelectedSlot = null;
@@ -61,9 +61,16 @@ async function installFixture(page, html, { timing = false, esxi = "fat-twin" } 
         label: "Synthetic ESXi", platform: "esxi",
       });
       value.snapshot.enclosures.push({ ...value.snapshot.enclosures[0], id: "enc-b", label: "Second Shelf" });
+      if (emptyInventory) {
+        value.snapshot.enclosures = [];
+        value.snapshot.selected_enclosure_id = null;
+        value.snapshot.selected_enclosure_label = null;
+        value.snapshot.slots = [];
+        value.storageViewsRuntime = { system_id: "synthetic-system", views: [] };
+      }
       Object.defineProperty(window, "APP_BOOTSTRAP", { value, writable: true, configurable: true });
     } });
-  }, { timing, esxi });
+  }, { timing, esxi, emptyInventory });
   let initialSnapshot;
   await page.route("**/*", async route => {
     const url = new URL(route.request().url());

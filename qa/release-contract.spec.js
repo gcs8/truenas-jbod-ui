@@ -245,18 +245,7 @@ for (const timing of [false, true]) {
 // Supported empty inventory uses an empty selector and omits both URL scope keys.
 // Keep the real template/assets; change only synthetic bootstrap/HTTP data.
 async function installEmptyInventory(page, timing) {
-  const fixture = await installFixture(page, html, { timing });
-  await page.addInitScript(() => {
-    const bootstrap = Object.getOwnPropertyDescriptor(window, "APP_BOOTSTRAP");
-    Object.defineProperty(window, "APP_BOOTSTRAP", { configurable: true, set(value) {
-      bootstrap.set(value);
-      value.snapshot.enclosures = [];
-      value.snapshot.selected_enclosure_id = null;
-      value.snapshot.selected_enclosure_label = null;
-      value.snapshot.slots = [];
-      value.storageViewsRuntime = { system_id: "synthetic-system", views: [] };
-    } });
-  });
+  const fixture = await installFixture(page, html, { timing, emptyInventory: true });
   await page.route("**/api/storage-views?**", route => route.fulfill({
     json: { system_id: "synthetic-system", views: [] },
   }));
@@ -359,7 +348,9 @@ for (const timing of [false, true]) {
     try {
       const inventoryCount = diagnostics.inventory.length;
       await readiness.switchSelectedScope(page, "#enclosure-select", "view:saved-chassis");
-      await readiness.waitForSelectedScope(page, { enclosureValue: "view:saved-chassis", timeout: negativeTimeout });
+      await readiness.waitForSelectedScope(page, {
+        enclosureValue: "view:saved-chassis", backingEnclosureId: "enc-a", timeout: negativeTimeout,
+      });
       expect(diagnostics.inventory).toHaveLength(inventoryCount);
       const params = new URL(page.url()).searchParams;
       expect(params.get("system_id")).toBe("synthetic-system");
@@ -372,11 +363,20 @@ for (const timing of [false, true]) {
         history.replaceState({}, "", url);
       });
       await expect(readiness.waitForSelectedScope(page, {
-        enclosureValue: "view:saved-chassis", timeout: negativeTimeout,
+        enclosureValue: "view:saved-chassis", backingEnclosureId: "enc-a", timeout: negativeTimeout,
       })).rejects.toThrow(predicateTimeout);
       await page.evaluate(() => {
         const url = new URL(location.href);
         url.searchParams.set("storage_view_id", "saved-chassis");
+        url.searchParams.set("enclosure_id", "enc-b");
+        history.replaceState({}, "", url);
+      });
+      await expect(readiness.waitForSelectedScope(page, {
+        enclosureValue: "view:saved-chassis", backingEnclosureId: "enc-a", timeout: negativeTimeout,
+      })).rejects.toThrow(predicateTimeout);
+      await page.evaluate(() => {
+        const url = new URL(location.href);
+        url.searchParams.set("enclosure_id", "enc-a");
         history.replaceState({}, "", url);
       });
       await readiness.switchSelectedScope(page, "#enclosure-select", "enclosure:enc-a");

@@ -3,12 +3,15 @@
 const { expect } = require("@playwright/test");
 const settleTimeout = Number.parseInt(process.env.PLAYWRIGHT_SYSTEM_SETTLE_TIMEOUT_MS || "90000", 10);
 
-async function waitForSelectedScope(page, { systemId, enclosureValue, timeout = settleTimeout } = {}) {
+async function waitForSelectedScope(
+  page,
+  { systemId, enclosureValue, backingEnclosureId = null, timeout = settleTimeout } = {},
+) {
   systemId ??= await page.locator("#system-select").inputValue();
   enclosureValue ??= await page.locator("#enclosure-select").inputValue();
   // Read the complete visible contract together. Sequential locator assertions
   // can combine an old hidden runtime note with a new settled countdown.
-  await expect.poll(() => page.evaluate(async ([system, enclosure]) => {
+  await expect.poll(() => page.evaluate(async ([system, enclosure, backingEnclosure]) => {
     const visible = node => Boolean(node && getComputedStyle(node).visibility !== "hidden"
       && node.getBoundingClientRect().width && node.getBoundingClientRect().height);
     const ready = () => {
@@ -30,13 +33,14 @@ async function waitForSelectedScope(page, { systemId, enclosureValue, timeout = 
           ? !params.has("enclosure_id") && !params.has("storage_view_id")
           : enclosure.startsWith("view:")
             ? `view:${params.get("storage_view_id")}` === enclosure
+              && (backingEnclosure == null || params.get("enclosure_id") === backingEnclosure)
             : `enclosure:${params.get("enclosure_id")}` === enclosure && !params.has("storage_view_id"));
     };
     if (!ready()) return false;
     // Recheck across a real paint opportunity, not a timer or network-idle guess.
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     return ready();
-  }, [systemId, enclosureValue]), { timeout }).toBe(true);
+  }, [systemId, enclosureValue, backingEnclosureId]), { timeout }).toBe(true);
 }
 
 async function refreshSelectedScope(page, action, { systemId, enclosureId, force = false, viewId = null, timeout = settleTimeout }) {
@@ -71,7 +75,8 @@ async function refreshSelectedScope(page, action, { systemId, enclosureId, force
     expect(snapshot.selected_system_id).toBe(systemId);
     const requestedEnclosure = new URL(response.url()).searchParams.get("enclosure_id");
     if (requestedEnclosure) expect(snapshot.selected_enclosure_id).toBe(requestedEnclosure);
-    await waitForSelectedScope(page, { systemId, timeout, enclosureValue: viewId
+    await waitForSelectedScope(page, { systemId, timeout, backingEnclosureId: snapshot.selected_enclosure_id,
+      enclosureValue: viewId
       ? `view:${viewId}` : snapshot.selected_enclosure_id == null || snapshot.selected_enclosure_id === ""
         ? "" : `enclosure:${snapshot.selected_enclosure_id}` });
     // Any later inventory refresh supersedes this operation, even if its final
@@ -87,8 +92,9 @@ async function switchSelectedScope(page, selector, value) {
   if (await page.locator(selector).inputValue() === value) return;
   const systemId = selector === "#system-select" ? value : await page.locator("#system-select").inputValue();
   if (selector === "#enclosure-select" && value.startsWith("view:")) {
+    const backingEnclosureId = new URL(page.url()).searchParams.get("enclosure_id");
     await page.locator(selector).selectOption(value);
-    await waitForSelectedScope(page, { systemId, enclosureValue: value });
+    await waitForSelectedScope(page, { systemId, enclosureValue: value, backingEnclosureId });
     return;
   }
   await refreshSelectedScope(page, () => page.locator(selector).selectOption(value), {
