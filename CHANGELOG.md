@@ -259,6 +259,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Exclude display labels from disk-retention identity so distinct disks sharing
+  a label remain separate while genuine persistent aliases still deduplicate. (#758)
 - Prevented a delayed page load from restoring a dismissed upgrade notice
   by serializing notice state transitions within the server process. (#761)
 - Preserved physical bay-label numbering when cloning or editing enclosure
