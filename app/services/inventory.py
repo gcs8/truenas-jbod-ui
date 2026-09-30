@@ -5383,6 +5383,8 @@ class InventoryService:
                     nvme_summary = self._parse_linux_nvme_enrichment_results(
                         nvme_parsers,
                         result_by_command,
+                        slot_view=slot_view,
+                        primary_summary=summary,
                     )
                     if nvme_summary is not None:
                         summary = self._merge_missing_smart_fields(summary, nvme_summary)
@@ -5453,6 +5455,9 @@ class InventoryService:
         self,
         command_parsers: Iterable[tuple[str, Any]],
         results: dict[str, SSHCommandResult],
+        *,
+        slot_view: SlotView | None = None,
+        primary_summary: SmartSummaryView | None = None,
     ) -> SmartSummaryView | None:
         summary: SmartSummaryView | None = None
         for command, parser in command_parsers:
@@ -5461,7 +5466,30 @@ class InventoryService:
                 continue
             if not result.stdout.strip():
                 continue
+            if parser is parse_nvme_id_ctrl_summary and slot_view is not None:
+                # id-ctrl's serial is lost in the display summary. Validate the
+                # producer payload before any supplement can reach the cache.
+                try:
+                    raw = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    raw = None
+                serial = normalize_text(raw.get("sn")) if isinstance(raw, dict) else None
+                expected_serial = normalize_text(slot_view.serial)
+                if expected_serial and serial and expected_serial.lower() != serial.lower():
+                    raise _SmartIdentityConflict()
             parsed = SmartSummaryView.model_validate(parser(result.stdout))
+            if parser is parse_nvme_id_ns_summary and primary_summary is not None:
+                # Namespace IDs are not the controller serial or the slot LUN.
+                # Compare only overlapping evidence for the same namespace key.
+                for field in ("namespace_eui64", "namespace_nguid"):
+                    expected = getattr(primary_summary, field)
+                    returned = getattr(parsed, field)
+                    # All-zero namespace identifiers mean unassigned, not a
+                    # different namespace. Preserve the existing missing-ID path.
+                    expected_id = (expected or "").removeprefix("eui.").strip("0")
+                    returned_id = (returned or "").removeprefix("eui.").strip("0")
+                    if expected_id and returned_id and expected != returned:
+                        raise _SmartIdentityConflict()
             if summary is None:
                 summary = parsed
             else:

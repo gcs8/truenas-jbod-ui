@@ -303,6 +303,141 @@ class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(bool(service._smart_cache), matching)
                     self.assertEqual(bool(service.slot_detail_store.load_all()), matching)
 
+    def linux_nvme_fixture(self, controller_identity, *, namespace_identity=None,
+                           primary_namespace=False, slot_serial="SANITIZED-A", sibling=False):
+        service = self.service("linux")
+        slot = self.smart_slot().model_copy(update={
+            "device_name": "nvme0n1", "smart_device_names": ["nvme0n1"], "serial": slot_serial,
+        })
+        slots = [slot]
+        if sibling:
+            slots.append(slot.model_copy(update={
+                "slot": 1, "device_name": "nvme1n1", "smart_device_names": ["nvme1n1"],
+                "serial": "SANITIZED-C",
+            }))
+        service.get_snapshot = AsyncMock(return_value=MagicMock(slots=slots))
+        service._observe_smart_disk_identities(slots)
+        commands_seen = []
+
+        async def planned(planner, initial_commands, **kwargs):
+            results = []
+            for _ in range(20):
+                commands = planner(results)
+                if not commands:
+                    return results
+                for command in commands:
+                    commands_seen.append(command)
+                    other = "/dev/nvme1" in command
+                    if "smart-log" in command:
+                        payload = {"temperature": 303 if other else 339, "power_on_hours": 20,
+                                   "percent_used": 1}
+                    elif "id-ctrl" in command:
+                        payload = {"fr": "SYNTHETIC-FW", "ver": 66304, "wctemp": 350, "cctemp": 360,
+                                   **({"sn": "SANITIZED-C"} if other else controller_identity)}
+                    elif "id-ns" in command:
+                        payload = ({"eui64": "0000000000000001",
+                                    "nguid": "00000000000000000000000000000002"}
+                                   if other or namespace_identity is None else namespace_identity)
+                    else:
+                        self.assertIn("smartctl", command)
+                        self.assertIn("-j", command)
+                        payload = {"serial_number": "SANITIZED-C" if other else "SANITIZED-A",
+                                   "device": {"protocol": "NVMe"}, "smart_status": {"passed": True}}
+                        if primary_namespace:
+                            payload["nvme_namespaces"] = [{"eui64": {"oui": 0, "ext_id": 1}}]
+                    results.append(SSHCommandResult(command=command, ok=True, exit_code=0,
+                                                    stdout=json.dumps(payload)))
+            self.fail("synthetic NVMe planner did not terminate")
+
+        service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+        return service, slots, commands_seen
+
+    async def test_linux_public_smart_rejects_nvme_controller_serial_before_admission(self):
+        service, slots, commands = self.linux_nvme_fixture({"sn": "SANITIZED-B"})
+        for _ in range(2):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertFalse(summary.available)
+            self.assertIsNone(summary.temperature_c)
+            self.assertIsNone(summary.firmware_version)
+            self.assertIsNone(summary.namespace_eui64)
+        self.assertIn("sudo -n /usr/sbin/nvme id-ctrl -o json /dev/nvme0", commands)
+        self.assertIn("sudo -n /usr/sbin/nvme id-ns -o json /dev/nvme0n1", commands)
+        self.assertEqual(service._smart_cache, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+        self.assertEqual(service._run_ssh_planned_commands.await_count, 2)
+
+    async def test_linux_public_smart_preserves_missing_matching_nvme_identities(self):
+        for controller, namespace, primary_namespace, serial in (
+            ({}, {}, False, "SANITIZED-A"),
+            ({}, {}, True, "SANITIZED-A"),
+            ({}, {"eui64": "0000000000000000", "nguid": "00000000000000000000000000000000"},
+             True, "SANITIZED-A"),
+            ({"sn": ""}, {}, False, "SANITIZED-A"),
+            ({"sn": "  sanitized-a  "}, None, True, "SANITIZED-A"),
+            ({"sn": "SANITIZED-B"}, None, True, None),
+        ):
+            with self.subTest(controller=controller, namespace=namespace, serial=serial):
+                service, _, commands = self.linux_nvme_fixture(
+                    controller, namespace_identity=namespace, primary_namespace=primary_namespace,
+                    slot_serial=serial)
+                for _ in range(2):
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertTrue(summary.available)
+                    self.assertEqual(summary.temperature_c, 66)
+                    self.assertEqual(summary.firmware_version, "SYNTHETIC-FW")
+                    self.assertEqual(summary.logical_unit_id, "0x5eeeee01")
+                    if primary_namespace or namespace != {}:
+                        self.assertEqual(summary.namespace_eui64, "eui.0000000000000001")
+                    if namespace != {}:
+                        self.assertEqual(summary.namespace_nguid,
+                                         namespace["nguid"] if namespace is not None
+                                         else "00000000000000000000000000000002")
+                self.assertTrue(any("id-ctrl" in command for command in commands))
+                self.assertTrue(any("id-ns" in command for command in commands))
+                self.assertEqual(service._run_ssh_planned_commands.await_count, 1)
+                self.assertEqual(len(service._smart_cache), 1)
+                entries = service.slot_detail_store.load_all()
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(next(iter(entries.values())).smart_fields["firmware_version"], "SYNTHETIC-FW")
+
+    async def test_linux_public_smart_rejects_contradictory_nvme_namespace_eui64(self):
+        service, _, commands = self.linux_nvme_fixture(
+            {"sn": "SANITIZED-A"}, namespace_identity={"eui64": "0000000000000002"},
+            primary_namespace=True)
+        for _ in range(2):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertFalse(summary.available)
+            self.assertIsNone(summary.temperature_c)
+        self.assertTrue(any("id-ns" in command for command in commands))
+        self.assertEqual(service._smart_cache, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertEqual(service._run_ssh_planned_commands.await_count, 2)
+
+    async def test_linux_public_smart_grid_isolates_nvme_identity_conflicts(self):
+        for controller, namespace, primary_namespace in (
+            ({"sn": "SANITIZED-B"}, None, False),
+            ({"sn": "SANITIZED-A"}, {"eui64": "0000000000000002"}, True),
+        ):
+            with self.subTest(controller=controller, namespace=namespace):
+                service, slots, commands = self.linux_nvme_fixture(
+                    controller, namespace_identity=namespace, primary_namespace=primary_namespace,
+                    sibling=True)
+                for _ in range(2):
+                    results = await service.get_slot_smart_summaries([0, 1], selected_enclosure_id="shelf-a")
+                    self.assertEqual([item.summary.available for item in results], [False, True])
+                    self.assertEqual([item.summary.temperature_c for item in results], [None, 30])
+                self.assertEqual(service._run_ssh_planned_commands.await_count, 3)
+                self.assertTrue(any("id-ctrl" in command for command in commands))
+                self.assertTrue(any("id-ns" in command for command in commands))
+                self.assertEqual(set(service._smart_cache), {service._smart_cache_key(slots[1])})
+                self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+                entries = service.slot_detail_store.load_all()
+                self.assertEqual(len(entries), 1)
+                entry = next(iter(entries.values()))
+                self.assertEqual(entry.slot_fields["serial"], "SANITIZED-C")
+                self.assertEqual(entry.smart_fields["firmware_version"], "SYNTHETIC-FW")
+
     def test_detail_entry_refuses_a_contradictory_smart_identifier(self):
         service = self.service()
         self.assertIsNone(service._build_slot_detail_entry(self.smart_slot(), loaded_entries={},
