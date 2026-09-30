@@ -63,6 +63,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Completed credential scrubbing in shared debug exports, bounded archive
+  upload verification reads and persisted newly created archive directories before
+  granting verified publication credit. (#878)
 - Backup-scheduler connection failures no longer copy exception text into the
   admin API response; the public answer is a fixed message. (#621)
 - Restored the read-only `./config:/app/config:ro` mount for the read UI in the
