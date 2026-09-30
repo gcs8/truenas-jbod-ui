@@ -265,6 +265,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept disk measurements and locate-light targets bound to qualified disk and
+  enclosure identities across merged SES paths, and withheld obsolete snapshot
+  detail side effects through the final write guard, including initial
+  discovery and SMART identity observation. (#874)
 - Refuse aliased filesystem backup targets and failed directory persistence,
   and recover or account for scheduler-owned publications after catalog failure. (#839)
 - Recovered default inventory selection after topology changes, fenced stale
@@ -296,6 +300,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   modes with 422. (#744)
 - Made interrupted rotation-recovery cleanup resumable by persisting its
   selected generation before retiring rollback evidence. (#751)
+- Kept history bundles on one mutable-source read snapshot, retained distinct
+  replacement-disk rollups, and reported storage failures separately from invalid
+  requests. Added five chronological indexes for hot and newly sealed history
+  and qualified the complete real-startup delta; existing immutable segments
+  retain their older query path without reindexing. (#875)
 - Complete retained segmented rollup points across all eligible sources before
   returning bounded results, preserving counts, extrema and weighted values. (#755)
 - Keep required QuantaStor inventory available when optional REST endpoints
