@@ -44,6 +44,26 @@ from app.services.parsers import (
 
 
 class ParserTests(unittest.TestCase):
+    def test_ses_merge_never_overrides_contradictory_explicit_enclosure_ids(self):
+        for reverse in (False, True):
+            rows = [SESMapEnclosure(enclosure_id=name, ses_device="/dev/sg2",
+                                   slots={0: SESMapSlot(slot_number=0, serial=f"SANITIZED-{name}")})
+                    for name in ("shelf-a", "shelf-b")]
+            merged = _merge_ses_enclosures(rows[::-1] if reverse else rows)
+            self.assertEqual({row.enclosure_id for row in merged}, {"shelf-a", "shelf-b"})
+            self.assertEqual({row.slots[0].serial for row in merged}, {"SANITIZED-shelf-a", "SANITIZED-shelf-b"})
+
+    def test_ses_merge_keeps_partial_same_host_pages_and_same_enclosure_paths(self):
+        for enclosure_id in (None, "shelf-a"):
+            first = SESMapEnclosure(enclosure_id=enclosure_id, ses_device="/dev/sg2",
+                                    slots={0: SESMapSlot(slot_number=0, serial="SANITIZED-A")})
+            second = SESMapEnclosure(enclosure_id="shelf-a", ses_device="/dev/sg9" if enclosure_id else "/dev/sg2",
+                                     slots={0: SESMapSlot(slot_number=0, model="SYNTHETIC")})
+            merged = _merge_ses_enclosures([first, second])
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(merged[0].slots[0].serial, "SANITIZED-A")
+            self.assertEqual(merged[0].slots[0].model, "SYNTHETIC")
+
     def test_normalize_device_name_does_not_read_a_freebsd_disk_out_of_a_linux_partition(self) -> None:
         # `sda1` used to normalize to `da1` because the FreeBSD `da<N>` token
         # matched inside the Linux partition name (issue #173).
