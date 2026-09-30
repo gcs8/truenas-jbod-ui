@@ -590,6 +590,85 @@ class SchedulerPreservationTests(SchedulerTestBase):
         self.assertTrue((second / records[1].name).exists())
         self.assertEqual(len(result.deleted), 1)
 
+    def test_first_class_ancestor_eio_preserves_uncertain_copy_without_success_credit(self):
+        import errno
+
+        remote = self.root / "first-use-remote"
+        remote.mkdir()
+        scheduler = self.real_scheduler([{**TARGET, "root": str(remote)}]).service
+        original = os.fsync
+
+        def synced(fd):
+            info, parent = os.fstat(fd), remote.stat()
+            if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
+                raise OSError(errno.EIO, "synthetic ancestor barrier failure")
+            return original(fd)
+
+        with patch.object(os, "fsync", side_effect=synced):
+            local = scheduler.run_now("full")
+        remote_records = scheduler.catalog.list(location="nas")
+        self.assertEqual(len(remote_records), 1)
+        uncertain = remote_records[0]
+        self.assertTrue(uncertain.preserved)
+        self.assertFalse(uncertain.verified)
+        self.assertIn("directory durability", uncertain.preserve_reason)
+        self.assertTrue((remote / uncertain.name).exists())
+        self.assertTrue((self._paths.local_dir / local.name).exists())
+        self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+        # A failed target upload must release the scheduler job reservation.
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
+        self.assertTrue((remote / uncertain.name).exists())
+
+    def test_oversized_upload_readback_releases_job_and_refuses_remote_credit(self):
+        self._check_upload_readback_job("sftp")
+
+    def test_oversized_smb_upload_readback_releases_job_and_refuses_remote_credit(self):
+        self._check_upload_readback_job("smb")
+
+    def _check_upload_readback_job(self, provider):
+        from history_service.backup_archive import transport
+        from tests.test_backup_archive_transport import FakeSFTP, FakeSmbClient, _UploadReadback
+
+        scheduler = self.real_scheduler([{**TARGET, "root": str(self.root / provider)}]).service
+        body = _UploadReadback(self, len(b"synthetic archive payload"), "excess")
+        if provider == "sftp":
+            peer = FakeSFTP()
+            target = transport.SftpTarget(peer, "/synthetic")
+            original = peer.open
+
+            def opened_sftp(path, mode):
+                return body if mode == "rb" else original(path, mode)
+
+            patcher = patch.object(peer, "open", side_effect=opened_sftp)
+        else:
+            peer = FakeSmbClient()
+            target = transport.SmbTarget(peer, "\\\\peer.example.test\\backups", encrypted=True)
+            original = peer.open_file
+
+            @contextlib.contextmanager
+            def opened_smb(path, mode="rb"):
+                if mode == "rb":
+                    with body:
+                        yield body
+                else:
+                    with original(path, mode=mode) as stream:
+                        yield stream
+
+            patcher = patch.object(peer, "open_file", side_effect=opened_smb)
+        with patch.object(scheduler, "_open_configured_target", return_value=contextlib.nullcontext(target)):
+            with patcher:
+                local = scheduler.run_now("full")
+            self.assertEqual(scheduler.catalog.list(location="nas"), [])
+            self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+            self.assertEqual(peer.files, {})
+            self.assertTrue(body.closed)
+            self.assertLessEqual(body.consumed, local.size + transport.CHUNK_SIZE)
+            self.now += timedelta(hours=1)
+            scheduler.run_now("full")
+            self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
+
     def test_directory_eio_does_not_replace_remote_retention_copy(self):
         import errno
 

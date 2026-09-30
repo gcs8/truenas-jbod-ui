@@ -1980,6 +1980,7 @@ class DebugScrubber:
     SECRET_FIELD_NAMES = {
         "api_key",
         "api_password",
+        "refresh_token",
         "password",
         "sudo_password",
         "passphrase",

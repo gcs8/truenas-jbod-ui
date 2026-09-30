@@ -367,6 +367,9 @@ class LocalDirectoryTarget(_TargetBase):
         self._confine_to = Path(confine_to) if confine_to is not None else None
         self._local_archive_root = Path(local_archive_root) if local_archive_root is not None else None
         self._root_real: Path | None = None
+        # Keep these until a complete publication barrier succeeds, including
+        # across failed uploads and retries on this target.
+        self._pending_directory_entries: list[Path] = []
         # The scheduler supplies policy-wide identity admission. It must run at
         # each mutation, including when lifecycle reuses an already-open target.
         self.before_mutation: Callable[[], None] = lambda: None
@@ -379,7 +382,19 @@ class LocalDirectoryTarget(_TargetBase):
     def _ensure_root(self) -> Path:
         if self._root_real is not None:
             return self._root_real
-        self._root.mkdir(parents=True, exist_ok=True)
+        missing = []
+        current = self._root.absolute()
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory)
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+            else:
+                self._pending_directory_entries.append(directory.parent)
         if not self._root.is_dir():
             raise ArchiveTransportError("Archive root is not a directory.")
         real = Path(os.path.realpath(self._root))
@@ -410,6 +425,8 @@ class LocalDirectoryTarget(_TargetBase):
                     os.mkdir(current, 0o750)
                 except FileExistsError:
                     pass
+                else:
+                    self._pending_directory_entries.append(current.parent)
             try:
                 metadata = os.lstat(current)
             except FileNotFoundError:
@@ -439,7 +456,7 @@ class LocalDirectoryTarget(_TargetBase):
                     target.flush()
                     os.fsync(target.fileno())
                 with open(partial, "rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback(self.provider, size, sha, back_size, back_sha)
                 self.before_mutation()
                 os.replace(partial, final)
@@ -451,9 +468,14 @@ class LocalDirectoryTarget(_TargetBase):
                 raise
         stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
         try:
+            # Persist every newly created ancestor's name in its containing
+            # directory, in creation order, before granting copy/retention credit.
+            for parent in self._pending_directory_entries:
+                self._fsync_dir(parent)
             self._fsync_dir(final.parent)
         except OSError as exc:
             raise ArchivePublicationUncertainError(stored) from exc
+        self._pending_directory_entries.clear()
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
 
     @staticmethod
@@ -778,7 +800,7 @@ class SftpTarget(_TargetBase):
                     size, sha = _copy_stream(source, remote.write)
                 with self._sftp.open(partial, "rb") as readback:
                     readback.prefetch(size, max_concurrent_requests=SFTP_PREFETCH_MAX_REQUESTS)
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SFTP", size, sha, back_size, back_sha)
                 try:
                     self._sftp.posix_rename(partial, final)
@@ -912,7 +934,7 @@ class SmbTarget(_TargetBase):
                 with self._client.open_file(partial, mode="wb") as remote:
                     size, sha = _copy_stream(source, remote.write)
                 with self._client.open_file(partial, mode="rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SMB", size, sha, back_size, back_sha)
                 self._client.replace(partial, final)
             except BaseException:
