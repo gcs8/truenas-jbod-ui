@@ -116,9 +116,15 @@ catalog generation plus exact catalog and segment digests, and requires the
 same identity and combined history view after upgrade and rollback. v0.22.2
 already has the current table layout and logical schema-version marker, so
 the image-upgrade run checks that the candidate accepts and preserves them.
-Startup adds three chronological indexes to the hot database. Existing
-immutable segments retain their exact bytes and older query path; newly
-sealed segments include the indexes. Index construction time and disk
+Startup adds five chronological indexes to the hot database: three from the
+schema SQL and two disk-identity chronological indexes from startup's identity
+index step. The two nonchronological identity indexes already exist in a
+database started by v0.22.2; a released-SQL-only fixture also gains those two.
+The real `HistoryStore` constructor test checks this complete delta, released
+definitions and rows, unchanged logical schema version, and idempotent restart.
+Executing the schema SQL alone does not qualify startup. Existing immutable
+segments retain their exact bytes without reindexing and their older query path;
+newly sealed segments include the indexes. Index construction time and disk
 headroom on production-scale databases remain unqualified.
 It does not exercise a schema transition. The interrupted run kills each
 migration-capable startup seam while it is idempotent on this input; the next
