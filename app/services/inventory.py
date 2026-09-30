@@ -10469,9 +10469,10 @@ class InventoryService:
                 continue
             supplemental_candidates: dict[int, dict[str, Any]] = {}
             for slot, primary in authoritative.ses_slot_candidates.items():
+                # A merged same-host enclosure can retain a slot on another SES path.
                 primary_enclosure = next((enclosure for enclosure in authoritative_enclosures
                     if enclosure.enclosure_id == primary.get("enclosure_id")
-                    and enclosure.ses_device == primary.get("ses_device")), None)
+                    and primary.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
                 if primary_enclosure is None:
                     continue
                 for payload in overlay.ses_slot_candidates.values():
@@ -10479,7 +10480,7 @@ class InventoryService:
                         continue
                     other_enclosure = next((enclosure for enclosure in overlay.ses_enclosures
                         if enclosure.enclosure_id == payload.get("enclosure_id")
-                        and enclosure.ses_device == payload.get("ses_device")), None)
+                        and payload.get("ses_device") in [enclosure.ses_device, *enclosure.ses_devices]), None)
                     if (other_enclosure is None
                         or not _ses_enclosures_share_identity(primary_enclosure, other_enclosure)
                         or primary.get("ses_slot_number") != payload.get("ses_slot_number")):

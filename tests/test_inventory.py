@@ -177,6 +177,79 @@ class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
                                      {"node-b.example.test"})
 
     @staticmethod
+    def partial_path_overlay(host, *, alternate=False, enclosure_id: str | None = "5eeeee10",
+                             bay=0, sas="5eeeee01", auxiliary_sas="5eeeee02", identify=False):
+        """Parse partial same-host pages before constructing control candidates."""
+        outputs = {}
+        for device, bays in (("/dev/sg2", [1]), ("/dev/sg9", [bay])) if alternate else (
+            ("/dev/sg2", [bay, 1]),
+        ):
+            header = "Synthetic shelf\n"
+            if enclosure_id:
+                header += f"Primary enclosure logical identifier (hex): {enclosure_id}\n"
+            aes = header + "Additional element status diagnostic page:\n"
+            aes += "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+            ec = header + "Enclosure status diagnostic page:\n"
+            ec += "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+            for number in bays:
+                aes += (f"    Element index: {number} eiioe=0\n"
+                        f"      device slot number: {number}\n"
+                        "      SAS device type: end device\n"
+                        "      attached SAS address: 0x5eeeee10\n"
+                        f"      SAS address: 0x{sas if number == bay else auxiliary_sas}\n")
+                ec += (f"    Element {number} descriptor:\n"
+                       "      Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+                       f"      Ident={int(identify and number == bay)}\n")
+            outputs[f"sg_ses aes {device}"] = aes
+            outputs[f"sg_ses ec {device}"] = ec
+        overlay = parse_ssh_outputs(outputs, slot_count=3, enclosure_filter=None)
+        InventoryService._tag_ses_overlay(overlay, host)
+        return overlay
+
+    def test_redundant_ses_targets_admit_slot_specific_merged_paths(self):
+        for primary_alternate, other_alternate in ((True, False), (False, True), (True, True)):
+            with self.subTest(primary=primary_alternate, supplemental=other_alternate):
+                first = self.partial_path_overlay("node-a.example.test", alternate=primary_alternate)
+                other = self.partial_path_overlay("node-b.example.test", alternate=other_alternate,
+                                                  identify=True)
+                for overlay, alternate in ((first, primary_alternate), (other, other_alternate)):
+                    self.assertEqual(len(overlay.ses_enclosures), 1)
+                    self.assertEqual(overlay.ses_enclosures[0].ses_device, "/dev/sg2")
+                    self.assertEqual(overlay.ses_slot_candidates[0]["ses_device"],
+                                     "/dev/sg9" if alternate else "/dev/sg2")
+                    if alternate:
+                        self.assertEqual(overlay.ses_enclosures[0].ses_devices, ["/dev/sg2", "/dev/sg9"])
+                self.assertFalse(first.ses_slot_candidates[0]["identify_active"])
+                self.assertTrue(other.ses_slot_candidates[0]["identify_active"])
+                expected_targets = [*first.ses_slot_candidates[0]["ses_targets"],
+                                    *other.ses_slot_candidates[0]["ses_targets"]]
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                candidate = merged.ses_slot_candidates[0]
+                self.assertCountEqual(candidate["ses_targets"], expected_targets)
+                self.assertTrue(candidate["identify_active"])
+                self.assertEqual(candidate["ses_slot_number"], 0)
+
+    def test_redundant_ses_merged_paths_keep_identity_and_bay_gates(self):
+        for kind in ("conflicting-identity", "duplicate-local-labels", "mismatched-bay"):
+            with self.subTest(kind=kind):
+                unkeyed = kind == "duplicate-local-labels"
+                first = self.partial_path_overlay("node-a.example.test", alternate=True,
+                                                  enclosure_id=None if unkeyed else "5eeeee10")
+                other = self.partial_path_overlay(
+                    "node-b.example.test", alternate=True, identify=True,
+                    enclosure_id=None if unkeyed else "5eeeee20" if kind == "conflicting-identity" else "5eeeee10",
+                    sas="5eeeee03" if unkeyed else "5eeeee01",
+                    auxiliary_sas="5eeeee04" if unkeyed else "5eeeee02",
+                    bay=2 if kind == "mismatched-bay" else 0,
+                )
+                # Identical host-local names and paths do not establish cross-host identity.
+                self.assertEqual(first.ses_enclosures[0].enclosure_name, other.ses_enclosures[0].enclosure_name)
+                self.assertEqual(first.ses_enclosures[0].ses_devices, other.ses_enclosures[0].ses_devices)
+                expected = copy.deepcopy(first.ses_slot_candidates[0])
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                self.assertEqual(merged.ses_slot_candidates[0], expected)
+
+    @staticmethod
     def drive(controller="c0", serial="SANITIZED-HOST", slot=2, enclosure="252"):
         return {"controller_id": controller, "enclosure_id": enclosure, "slot": slot,
                 "slot_key": f"{enclosure}:{slot}", "serial": serial, "model": "SYNTHETIC",
