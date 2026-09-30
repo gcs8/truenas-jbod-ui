@@ -7,7 +7,9 @@ import itertools
 import inspect
 import json
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -110,6 +112,1006 @@ def build_inventory_service(
 
 
 OVERLAY_STATUS_MODES = ("throw", "empty_failure", "rows_failure", "success", "empty_success")
+
+
+class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """Public-safe regressions for enclosure, disk and publication ownership."""
+
+    def service(self, platform="core", profile=None):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(
+            id="qualified-inventory", default_profile_id=profile,
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="host.example.test", commands=[]),
+        )
+        return build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name, MagicMock())
+
+    @staticmethod
+    def overlay(host, enclosure_id, device, *, bay=0, sas="0x5eeeee01"):
+        enclosure = SESMapEnclosure(
+            enclosure_id=enclosure_id, ses_device=device, enclosure_name="Synthetic shelf",
+            slots={bay: SESMapSlot(
+                slot_number=bay, element_id=bay, ses_device=device,
+                slot_number_source="ses_device_slot_number", present=True,
+                sas_address=sas, attached_sas_address="0x5eeeee10",
+                control_targets=[{"ssh_host": host, "ses_device": device,
+                                  "ses_element_id": bay, "ses_slot_number": bay}],
+            )},
+        )
+        candidates, meta = build_slot_candidates_from_ses_enclosures([enclosure], 2, None)
+        overlay = ParsedSSHData(ses_enclosures=[enclosure], ses_slot_candidates=candidates, ses_selected_meta=meta)
+        InventoryService._tag_ses_overlay(overlay, host)
+        return overlay
+
+    async def test_foreign_shelves_never_become_redundant_led_targets(self):
+        for device in ("/dev/sg2", "/dev/sg9"):
+            with self.subTest(device=device):
+                service = self.service("quantastor")
+                first = self.overlay("node-a.example.test", "shelf-a", "/dev/sg2")
+                other = self.overlay("node-b.example.test", "shelf-b", device)
+                merged = service._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                self.assertEqual({item.enclosure_id for item in merged.ses_enclosures}, {"shelf-a", "shelf-b"})
+                for candidate in (merged.ses_slot_candidates[0],
+                                  build_slot_candidates_from_ses_enclosures(merged.ses_enclosures, 1, None, "shelf-a")[0][0]):
+                    slot = service._build_slot_view(0, 0, 0, {"id": "shelf-a"}, candidate,
+                                                    None, None, ParsedSSHData(), {}, set())
+                    service._run_ssh_command = AsyncMock(side_effect=lambda command, host=None: SSHCommandResult(
+                        command=command, ok=True, stdout="", stderr="", exit_code=0))
+                    await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                    self.assertTrue(service._run_ssh_command.await_count)
+                    self.assertTrue(all(call.args[1] != "node-b.example.test"
+                                        for call in service._run_ssh_command.await_args_list))
+
+    def test_redundant_same_shelf_requires_the_same_physical_bay(self):
+        for second_bay, expected in ((0, 2), (1, 1)):
+            with self.subTest(bay=second_bay):
+                first = self.overlay("node-a.example.test", "shelf-a", "/dev/sg2")
+                other = self.overlay("node-b.example.test", "shelf-a", "/dev/sg9", bay=second_bay)
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                targets = merged.ses_slot_candidates[0]["ses_targets"]
+                self.assertEqual(len(targets), expected)
+                self.assertTrue(all(target["ses_slot_number"] == 0 for target in targets))
+                if second_bay == 1:
+                    candidates, _ = build_slot_candidates_from_ses_enclosures(merged.ses_enclosures, 2, None, "shelf-a")
+                    self.assertEqual(candidates[1]["ses_device"], "/dev/sg9")
+                    self.assertEqual({target["ssh_host"] for target in candidates[1]["ses_targets"]},
+                                     {"node-b.example.test"})
+
+    @staticmethod
+    def partial_path_overlay(host, *, alternate=False, enclosure_id: str | None = "5eeeee10",
+                             bay=0, sas="5eeeee01", auxiliary_sas="5eeeee02", identify=False):
+        """Parse partial same-host pages before constructing control candidates."""
+        outputs = {}
+        for device, bays in (("/dev/sg2", [1]), ("/dev/sg9", [bay])) if alternate else (
+            ("/dev/sg2", [bay, 1]),
+        ):
+            header = "Synthetic shelf\n"
+            if enclosure_id:
+                header += f"Primary enclosure logical identifier (hex): {enclosure_id}\n"
+            aes = header + "Additional element status diagnostic page:\n"
+            aes += "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+            ec = header + "Enclosure status diagnostic page:\n"
+            ec += "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+            for number in bays:
+                aes += (f"    Element index: {number} eiioe=0\n"
+                        f"      device slot number: {number}\n"
+                        "      SAS device type: end device\n"
+                        "      attached SAS address: 0x5eeeee10\n"
+                        f"      SAS address: 0x{sas if number == bay else auxiliary_sas}\n")
+                ec += (f"    Element {number} descriptor:\n"
+                       "      Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+                       f"      Ident={int(identify and number == bay)}\n")
+            outputs[f"sg_ses aes {device}"] = aes
+            outputs[f"sg_ses ec {device}"] = ec
+        overlay = parse_ssh_outputs(outputs, slot_count=3, enclosure_filter=None)
+        InventoryService._tag_ses_overlay(overlay, host)
+        return overlay
+
+    def test_redundant_ses_targets_admit_slot_specific_merged_paths(self):
+        for primary_alternate, other_alternate in ((True, False), (False, True), (True, True)):
+            with self.subTest(primary=primary_alternate, supplemental=other_alternate):
+                first = self.partial_path_overlay("node-a.example.test", alternate=primary_alternate)
+                other = self.partial_path_overlay("node-b.example.test", alternate=other_alternate,
+                                                  identify=True)
+                for overlay, alternate in ((first, primary_alternate), (other, other_alternate)):
+                    self.assertEqual(len(overlay.ses_enclosures), 1)
+                    self.assertEqual(overlay.ses_enclosures[0].ses_device, "/dev/sg2")
+                    self.assertEqual(overlay.ses_slot_candidates[0]["ses_device"],
+                                     "/dev/sg9" if alternate else "/dev/sg2")
+                    if alternate:
+                        self.assertEqual(overlay.ses_enclosures[0].ses_devices, ["/dev/sg2", "/dev/sg9"])
+                self.assertFalse(first.ses_slot_candidates[0]["identify_active"])
+                self.assertTrue(other.ses_slot_candidates[0]["identify_active"])
+                expected_targets = [*first.ses_slot_candidates[0]["ses_targets"],
+                                    *other.ses_slot_candidates[0]["ses_targets"]]
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                candidate = merged.ses_slot_candidates[0]
+                self.assertCountEqual(candidate["ses_targets"], expected_targets)
+                self.assertTrue(candidate["identify_active"])
+                self.assertEqual(candidate["ses_slot_number"], 0)
+
+    def test_redundant_ses_merged_paths_keep_identity_and_bay_gates(self):
+        for kind in ("conflicting-identity", "duplicate-local-labels", "mismatched-bay"):
+            with self.subTest(kind=kind):
+                unkeyed = kind == "duplicate-local-labels"
+                first = self.partial_path_overlay("node-a.example.test", alternate=True,
+                                                  enclosure_id=None if unkeyed else "5eeeee10")
+                other = self.partial_path_overlay(
+                    "node-b.example.test", alternate=True, identify=True,
+                    enclosure_id=None if unkeyed else "5eeeee20" if kind == "conflicting-identity" else "5eeeee10",
+                    sas="5eeeee03" if unkeyed else "5eeeee01",
+                    auxiliary_sas="5eeeee04" if unkeyed else "5eeeee02",
+                    bay=2 if kind == "mismatched-bay" else 0,
+                )
+                # Identical host-local names and paths do not establish cross-host identity.
+                self.assertEqual(first.ses_enclosures[0].enclosure_name, other.ses_enclosures[0].enclosure_name)
+                self.assertEqual(first.ses_enclosures[0].ses_devices, other.ses_enclosures[0].ses_devices)
+                expected = copy.deepcopy(first.ses_slot_candidates[0])
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                self.assertEqual(merged.ses_slot_candidates[0], expected)
+
+    @staticmethod
+    def drive(controller="c0", serial="SANITIZED-HOST", slot=2, enclosure="252"):
+        return {"controller_id": controller, "enclosure_id": enclosure, "slot": slot,
+                "slot_key": f"{enclosure}:{slot}", "serial": serial, "model": "SYNTHETIC",
+                "size": "1 TB", "interface": "SAS", "state": "JBOD"}
+
+    def test_unkeyed_cross_host_ses_paths_need_independent_identity_evidence(self):
+        for shared_identity in (False, True):
+            first = self.overlay("node-a.example.test", None, "/dev/sg2")
+            other = self.overlay("node-b.example.test", None, "/dev/sg2",
+                                 sas="0x5eeeee01" if shared_identity else "0x5eeeee02")
+            merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+            self.assertEqual(len(merged.ses_enclosures), 1 if shared_identity else 2)
+            self.assertEqual(len(merged.ses_slot_candidates[0]["ses_targets"]), 2 if shared_identity else 1)
+
+    def test_esxi_equal_coordinates_are_unplaced_in_both_orders(self):
+        from app.services.inventory_accounting import build_disk_retention_accounting
+        from app.services.parsers import parse_storcli_physical_drives
+        payload = {"Controllers": [{"Command Status": {"Controller": number, "Status": "Success"},
+                    "Response Data": {"Drive Information": [{"EID:Slt": "252:0", "DID": number + 10,
+                    "State": "JBOD", "Intf": "NVMe", "SN": f"SANITIZED-C{number}",
+                    "Model": "SYNTHETIC", "Size": "1 TB"}]}} for number in (0, 1)]}
+        rows = parse_storcli_physical_drives(json.dumps(payload))
+        for ordered in (rows, rows[::-1]):
+            service = self.service("esxi", ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            parsed = ParsedSSHData(esxi_storcli_physical_drives=ordered)
+            slots, *_ = service._correlate_esxi_host(parsed, [], None)
+            self.assertFalse(any(slot.present for slot in slots))
+            records = service._build_storage_view_candidate_records(
+                TrueNASRawData(enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[]),
+                parsed, ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            self.assertEqual({disk.serial for disk in records}, {"SANITIZED-C0", "SANITIZED-C1"})
+            accounting = build_disk_retention_accounting(source_disks=records, slots=slots)
+            self.assertEqual(accounting.source_disk_count, 2)
+            self.assertEqual(accounting.unplaced_disk_count, 2)
+
+    def test_esxi_bmc_controls_require_a_unique_coherent_identity(self):
+        for kind in ("conflict", "repeated-host-bay", "duplicate-host-serial", "repeated-bmc-bay",
+                     "duplicate-bmc-serial", "coherent", "bmc-only"):
+            with self.subTest(kind=kind):
+                service = self.service("esxi", SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+                rows = [] if kind == "bmc-only" else [self.drive()]
+                if kind in {"repeated-host-bay", "duplicate-host-serial"}:
+                    rows.append(self.drive("c1", "SANITIZED-HOST" if kind == "duplicate-host-serial"
+                                           else "SANITIZED-OTHER", slot=3 if kind == "duplicate-host-serial" else 2))
+                bmc_rows = [BMCDriveRecord(controller_id=1, physical_index=7, slot_number=2,
+                            enclosure_id="252", serial="SANITIZED-BMC" if kind == "conflict" else "SANITIZED-HOST")]
+                if kind in {"repeated-bmc-bay", "duplicate-bmc-serial"}:
+                    bmc_rows.append(BMCDriveRecord(controller_id=2, physical_index=8,
+                                    slot_number=2 if kind == "repeated-bmc-bay" else 3,
+                                    enclosure_id="253", serial="SANITIZED-HOST"))
+                slots, *_ = service._correlate_esxi_host(ParsedSSHData(esxi_storcli_physical_drives=rows),
+                                                       [], None, BMCInventory(drives=bmc_rows))
+                slot = next(item for item in slots if item.slot == 2)
+                admitted = kind in {"coherent", "bmc-only"}
+                self.assertEqual(slot.led_backend == "supermicro_bmc", admitted)
+                self.assertEqual(slot.led_supported, admitted)
+                if not admitted:
+                    self.assertIsNone(slot.raw_status.get("bmc_physical_index"))
+                if kind == "conflict":
+                    self.assertEqual(slot.serial, "SANITIZED-HOST")
+
+    @staticmethod
+    def smart_slot():
+        return SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+                        present=True, state=SlotState.healthy, device_name="da0", smart_device_names=["da0"],
+                        serial="SANITIZED-A", logical_unit_id="0x5eeeee01")
+
+    async def test_public_smart_rejects_returned_identity_before_cache_and_persistence(self):
+        for field, value in (("logical_unit_id", "0x5eeeee02"), ("serial_number", "SANITIZED-B")):
+            with self.subTest(field=field):
+                service = self.service()
+                slot = self.smart_slot()
+                service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                service._observe_smart_disk_identities([slot])
+                service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                    {field: value, "smart_status": {"passed": True}, "temperature": {"current": 66}}))
+                service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+                for _ in range(2):
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertFalse(summary.available)
+                    self.assertIsNone(summary.temperature_c)
+                self.assertEqual(service._smart_cache, {})
+                self.assertEqual(service.slot_detail_store.load_all(), {})
+
+    async def test_public_smart_accepts_matching_or_missing_identifiers(self):
+        for identity in ({}, {"serial_number": "SANITIZED-A", "logical_unit_id": "0x5eeeee01"}):
+            service = self.service()
+            slot = self.smart_slot()
+            service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+            service._observe_smart_disk_identities([slot])
+            service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                {**identity, "temperature": {"current": 30}, "smart_status": {"passed": True}}))
+            service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 30)
+            self.assertTrue(service._smart_cache)
+            self.assertTrue(service.slot_detail_store.load_all())
+
+    async def test_ssh_primary_and_text_enrichment_reject_contradictory_identity(self):
+        for phase in ("json", "text"):
+            for matching in (False, True):
+                with self.subTest(phase=phase, matching=matching):
+                    service = self.service("linux")
+                    slot = self.smart_slot()
+                    service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                    service._observe_smart_disk_identities([slot])
+                    identity = "SANITIZED-A" if matching else "SANITIZED-B"
+                    async def planned(planner, initial_commands, **kwargs):
+                        results = []
+                        for _ in range(20):
+                            commands = planner(results)
+                            if not commands:
+                                return results
+                            for command in commands:
+                                stdout = json.dumps({"serial_number": identity if phase == "json" else "SANITIZED-A",
+                                                     "temperature": {"current": 30}}) if "-j" in command else (
+                                    f"Serial number: {identity}\nLogical Unit id: 0x5eeeee01\n")
+                                results.append(SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0))
+                        self.fail("synthetic planner did not terminate")
+                    service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertEqual(summary.available, matching)
+                    self.assertEqual(bool(service._smart_cache), matching)
+                    self.assertEqual(bool(service.slot_detail_store.load_all()), matching)
+
+    def linux_nvme_fixture(self, controller_identity, *, namespace_identity=None,
+                           primary_namespace=False, slot_serial="SANITIZED-A", sibling=False):
+        service = self.service("linux")
+        slot = self.smart_slot().model_copy(update={
+            "device_name": "nvme0n1", "smart_device_names": ["nvme0n1"], "serial": slot_serial,
+        })
+        slots = [slot]
+        if sibling:
+            slots.append(slot.model_copy(update={
+                "slot": 1, "device_name": "nvme1n1", "smart_device_names": ["nvme1n1"],
+                "serial": "SANITIZED-C",
+            }))
+        service.get_snapshot = AsyncMock(return_value=MagicMock(slots=slots))
+        service._observe_smart_disk_identities(slots)
+        commands_seen = []
+
+        async def planned(planner, initial_commands, **kwargs):
+            results = []
+            for _ in range(20):
+                commands = planner(results)
+                if not commands:
+                    return results
+                for command in commands:
+                    commands_seen.append(command)
+                    other = "/dev/nvme1" in command
+                    if "smart-log" in command:
+                        payload = {"temperature": 303 if other else 339, "power_on_hours": 20,
+                                   "percent_used": 1}
+                    elif "id-ctrl" in command:
+                        payload = {"fr": "SYNTHETIC-FW", "ver": 66304, "wctemp": 350, "cctemp": 360,
+                                   **({"sn": "SANITIZED-C"} if other else controller_identity)}
+                    elif "id-ns" in command:
+                        payload = ({"eui64": "0000000000000001",
+                                    "nguid": "00000000000000000000000000000002"}
+                                   if other or namespace_identity is None else namespace_identity)
+                    else:
+                        self.assertIn("smartctl", command)
+                        self.assertIn("-j", command)
+                        payload = {"serial_number": "SANITIZED-C" if other else "SANITIZED-A",
+                                   "device": {"protocol": "NVMe"}, "smart_status": {"passed": True}}
+                        if primary_namespace:
+                            payload["nvme_namespaces"] = [{"eui64": {"oui": 0, "ext_id": 1}}]
+                    results.append(SSHCommandResult(command=command, ok=True, exit_code=0,
+                                                    stdout=json.dumps(payload)))
+            self.fail("synthetic NVMe planner did not terminate")
+
+        service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+        return service, slots, commands_seen
+
+    async def test_linux_public_smart_rejects_nvme_controller_serial_before_admission(self):
+        service, slots, commands = self.linux_nvme_fixture({"sn": "SANITIZED-B"})
+        for _ in range(2):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertFalse(summary.available)
+            self.assertIsNone(summary.temperature_c)
+            self.assertIsNone(summary.firmware_version)
+            self.assertIsNone(summary.namespace_eui64)
+        self.assertIn("sudo -n /usr/sbin/nvme id-ctrl -o json /dev/nvme0", commands)
+        self.assertIn("sudo -n /usr/sbin/nvme id-ns -o json /dev/nvme0n1", commands)
+        self.assertEqual(service._smart_cache, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+        self.assertEqual(service._run_ssh_planned_commands.await_count, 2)
+
+    async def test_linux_public_smart_preserves_missing_matching_nvme_identities(self):
+        for controller, namespace, primary_namespace, serial in (
+            ({}, {}, False, "SANITIZED-A"),
+            ({}, {}, True, "SANITIZED-A"),
+            ({}, {"eui64": "0000000000000000", "nguid": "00000000000000000000000000000000"},
+             True, "SANITIZED-A"),
+            ({"sn": ""}, {}, False, "SANITIZED-A"),
+            ({"sn": "  sanitized-a  "}, None, True, "SANITIZED-A"),
+            ({"sn": "SANITIZED-B"}, None, True, None),
+        ):
+            with self.subTest(controller=controller, namespace=namespace, serial=serial):
+                service, _, commands = self.linux_nvme_fixture(
+                    controller, namespace_identity=namespace, primary_namespace=primary_namespace,
+                    slot_serial=serial)
+                for _ in range(2):
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertTrue(summary.available)
+                    self.assertEqual(summary.temperature_c, 66)
+                    self.assertEqual(summary.firmware_version, "SYNTHETIC-FW")
+                    self.assertEqual(summary.logical_unit_id, "0x5eeeee01")
+                    if primary_namespace or namespace != {}:
+                        self.assertEqual(summary.namespace_eui64, "eui.0000000000000001")
+                    if namespace != {}:
+                        self.assertEqual(summary.namespace_nguid,
+                                         namespace["nguid"] if namespace is not None
+                                         else "00000000000000000000000000000002")
+                self.assertTrue(any("id-ctrl" in command for command in commands))
+                self.assertTrue(any("id-ns" in command for command in commands))
+                self.assertEqual(service._run_ssh_planned_commands.await_count, 1)
+                self.assertEqual(len(service._smart_cache), 1)
+                entries = service.slot_detail_store.load_all()
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(next(iter(entries.values())).smart_fields["firmware_version"], "SYNTHETIC-FW")
+
+    async def test_linux_public_smart_rejects_contradictory_nvme_namespace_eui64(self):
+        service, _, commands = self.linux_nvme_fixture(
+            {"sn": "SANITIZED-A"}, namespace_identity={"eui64": "0000000000000002"},
+            primary_namespace=True)
+        for _ in range(2):
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertFalse(summary.available)
+            self.assertIsNone(summary.temperature_c)
+        self.assertTrue(any("id-ns" in command for command in commands))
+        self.assertEqual(service._smart_cache, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertEqual(service._run_ssh_planned_commands.await_count, 2)
+
+    async def test_linux_public_smart_grid_isolates_nvme_identity_conflicts(self):
+        for controller, namespace, primary_namespace in (
+            ({"sn": "SANITIZED-B"}, None, False),
+            ({"sn": "SANITIZED-A"}, {"eui64": "0000000000000002"}, True),
+        ):
+            with self.subTest(controller=controller, namespace=namespace):
+                service, slots, commands = self.linux_nvme_fixture(
+                    controller, namespace_identity=namespace, primary_namespace=primary_namespace,
+                    sibling=True)
+                for _ in range(2):
+                    results = await service.get_slot_smart_summaries([0, 1], selected_enclosure_id="shelf-a")
+                    self.assertEqual([item.summary.available for item in results], [False, True])
+                    self.assertEqual([item.summary.temperature_c for item in results], [None, 30])
+                self.assertEqual(service._run_ssh_planned_commands.await_count, 3)
+                self.assertTrue(any("id-ctrl" in command for command in commands))
+                self.assertTrue(any("id-ns" in command for command in commands))
+                self.assertEqual(set(service._smart_cache), {service._smart_cache_key(slots[1])})
+                self.assertNotIn(service._smart_cache_key(slots[0]), service._smart_negative_cache)
+                entries = service.slot_detail_store.load_all()
+                self.assertEqual(len(entries), 1)
+                entry = next(iter(entries.values()))
+                self.assertEqual(entry.slot_fields["serial"], "SANITIZED-C")
+                self.assertEqual(entry.smart_fields["firmware_version"], "SYNTHETIC-FW")
+
+    def test_detail_entry_refuses_a_contradictory_smart_identifier(self):
+        service = self.service()
+        self.assertIsNone(service._build_slot_detail_entry(self.smart_slot(), loaded_entries={},
+                          smart_summary=SmartSummaryView(available=True, temperature_c=66,
+                                                        logical_unit_id="0x5eeeee02")))
+
+    async def test_api_and_core_ssh_enrichment_cannot_replace_the_api_occupant(self):
+        for enrichment in ("api-text", "ssh-json"):
+            for matching in (False, True):
+                with self.subTest(enrichment=enrichment, matching=matching):
+                    service = self.service()
+                    slot = self.smart_slot()
+                    service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                    service._observe_smart_disk_identities([slot])
+                    identity = "SANITIZED-A" if matching else "SANITIZED-B"
+                    api_json = json.dumps({"serial_number": "SANITIZED-A", "temperature": {"current": 30}})
+                    service.truenas_client.fetch_disk_smartctl = AsyncMock(side_effect=[api_json,
+                        f"Serial Number: {identity if enrichment == 'api-text' else 'SANITIZED-A'}\n"])
+                    async def planned(planner, initial_commands, **kwargs):
+                        return [SSHCommandResult(command=initial_commands[0], ok=True, exit_code=0,
+                                stdout=json.dumps({"serial_number": identity, "temperature": {"current": 66}}))]
+                    service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+                    service._summary_prefers_core_ssh_json = MagicMock(return_value=enrichment == "ssh-json")
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertEqual(summary.available, matching)
+                    self.assertEqual(bool(service._smart_cache), matching)
+                    self.assertEqual(bool(service.slot_detail_store.load_all()), matching)
+
+    async def test_core_batch_identity_conflict_is_isolated_to_its_disk(self):
+        from app.services.truenas_ws import TrueNASWebsocketClient
+        service = self.service()
+        service.truenas_client = MagicMock(spec=TrueNASWebsocketClient)
+        first = self.smart_slot()
+        second = first.model_copy(update={"slot": 1, "device_name": "da1", "smart_device_names": ["da1"],
+                                           "serial": "SANITIZED-C", "logical_unit_id": "0x5eeeee03"})
+        service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[first, second]))
+        service._observe_smart_disk_identities([first, second])
+        async def batch(devices, args, **kwargs):
+            if "-j" not in args:
+                return ["" for _ in devices]
+            return [json.dumps({"serial_number": "SANITIZED-B" if device == "da0" else "SANITIZED-C",
+                                "logical_unit_id": "0x5eeeee02" if device == "da0" else "0x5eeeee03",
+                                "smart_status": {"passed": True}, "temperature": {"current": 30}})
+                    for device in devices]
+        service.truenas_client.smartctl_batch = AsyncMock(side_effect=batch)
+        service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+        results = await service.get_slot_smart_summaries([0, 1], selected_enclosure_id="shelf-a")
+        self.assertEqual([item.summary.available for item in results], [False, True])
+        self.assertEqual(len(service._smart_cache), 1)
+        self.assertEqual({entry.slot_fields.get("serial") for entry in service.slot_detail_store.load_all().values()},
+                         {"SANITIZED-C"})
+
+    async def test_redirected_snapshot_side_effects_belong_only_to_the_published_winner(self):
+        for newer_first in (True, False):
+            with self.subTest(newer_first=newer_first):
+                service = self.service()
+                service._canonical_enclosure_options = {name: EnclosureOption(id=name, label=name, slot_count=1)
+                                                       for name in ("shelf-a", "shelf-b")}
+                service._canonical_default_enclosure_id = "shelf-a"
+                started, release = asyncio.Event(), asyncio.Event()
+                def bundle(serial):
+                    raw = TrueNASRawData(
+                        enclosures=[{"id": "shelf-b", "name": "Synthetic shelf", "elements": [
+                            {"slot": 1, "descriptor": "Slot 1", "dev": "da0", "status": "OK"}]}],
+                        disks=[{"name": "da0", "serial": serial, "size": 1000,
+                                "enclosure": {"id": "shelf-b", "slot": 0}}], pools=[],
+                        disk_temperatures={}, smart_test_results=[])
+                    return InventorySourceBundle(raw_data=raw, ssh_outputs={}, ssh_collected=False,
+                        warnings=[], sources={"api": SourceStatus(enabled=True, ok=True)},
+                        scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData())
+                calls = 0
+                async def source(**kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return bundle("SANITIZED-OLD")
+                    return bundle("SANITIZED-NEW")
+                service._get_inventory_source_bundle = AsyncMock(side_effect=source)
+                original_apply = service._apply_and_persist_snapshot_slot_details
+                async def paused_detail_apply(slots):
+                    if any(slot.serial == "SANITIZED-OLD" for slot in slots):
+                        started.set()
+                        await release.wait()
+                    await original_apply(slots)
+                service._apply_and_persist_snapshot_slot_details = paused_detail_apply
+                saved_serials = []
+                original_save = service.slot_detail_store.save_entries
+                def save(entries, **kwargs):
+                    result = original_save(entries, **kwargs)
+                    saved_serials.extend(entry.slot_fields.get("serial") for entry in entries)
+                    return result
+                service.slot_detail_store.save_entries = save
+                old = asyncio.create_task(service.get_snapshot(force_refresh=True))
+                await asyncio.wait_for(started.wait(), 5)
+                try:
+                    if not newer_first:
+                        release.set()
+                        await old
+                    new = await service.get_snapshot(force_refresh=True, selected_enclosure_id="shelf-b")
+                finally:
+                    release.set()
+                if newer_first:
+                    try:
+                        await old
+                    except inventory_module.SnapshotStateBusyError:
+                        pass
+                slot = next(item for item in new.slots if item.present)
+                service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                    {"serial_number": "SANITIZED-NEW", "temperature": {"current": 30}}))
+                service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+                summary = await service.get_slot_smart_summary(slot.slot, selected_enclosure_id="shelf-b")
+                self.assertTrue(summary.available)
+                service.truenas_client.fetch_disk_smartctl.assert_awaited()
+                self.assertTrue(service._smart_disk_is_current(service._smart_cache_key(slot)))
+                stored = service.slot_detail_store.load_all()
+                self.assertEqual({entry.slot_fields.get("serial") for entry in stored.values()}, {"SANITIZED-NEW"})
+                if newer_first:
+                    self.assertNotIn("SANITIZED-OLD", saved_serials)
+
+
+class InventoryDiscoveryDetailPublicationTests(unittest.IsolatedAsyncioTestCase):
+    """Cold requests use real collection, correlation, detail I/O and admission."""
+
+    def service(self, *, with_store=True):
+        directory = tempfile.TemporaryDirectory(prefix="")
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(id="discovery-publication", truenas=TrueNASConfig(platform="core"),
+                              ssh=SSHConfig(enabled=False))
+        api = AsyncMock()
+        api.fetch_all.return_value = self.raw("SANITIZED-NEW")
+        service = build_inventory_service(Settings(), system, api, AsyncMock(), directory.name)
+        if not with_store:
+            service.slot_detail_store = None
+        return service
+
+    @staticmethod
+    def raw(serial, *, shelves=("shelf-a",)):
+        return TrueNASRawData(
+            enclosures=[{"id": shelf, "name": "Synthetic shelf", "elements": [
+                {"slot": 1, "descriptor": "Slot 1", "dev": f"da{i}", "status": "OK"}]}
+                for i, shelf in enumerate(shelves)],
+            disks=[{"name": f"da{i}", "serial": serial, "size": 1000,
+                    "enclosure": {"id": shelf, "slot": 0}} for i, shelf in enumerate(shelves)],
+            pools=[], disk_temperatures={}, smart_test_results=[])
+
+    def trace_saves(self, service):
+        saved = []
+        if service.slot_detail_store is not None:
+            original = service.slot_detail_store.save_entries
+            def save(entries, **kwargs):
+                result = original(entries, **kwargs)
+                saved.extend((entry.enclosure_id, entry.slot_fields.get("serial")) for entry in entries)
+                return result
+            service.slot_detail_store.save_entries = save
+        return saved
+
+    def pause_after_details(self, service):
+        started, release = asyncio.Event(), asyncio.Event()
+        original = service._apply_and_persist_snapshot_slot_details
+        calls = 0
+        async def apply(slots):
+            nonlocal calls
+            calls += 1
+            await original(slots)
+            if calls == 1:
+                started.set()
+                await release.wait()
+        service._apply_and_persist_snapshot_slot_details = apply
+        return started, release
+
+    async def test_rejected_cold_candidate_cannot_poison_retry_identity_or_store(self):
+        for with_store in (True, False):
+            with self.subTest(with_store=with_store):
+                service = self.service(with_store=with_store)
+                service.truenas_client.fetch_all.side_effect = [self.raw("SANITIZED-OLD"),
+                                                               self.raw("SANITIZED-NEW")]
+                current = SlotView(slot=0, slot_label="00", row_index=0, column_index=0,
+                                   enclosure_id="shelf-a", present=True, state=SlotState.healthy,
+                                   device_name="da0", serial="SANITIZED-NEW")
+                service._observe_smart_disk_identities([current])
+                baseline = copy.deepcopy(service._smart_disk_identities)
+                key = service._smart_cache_key(current)
+                summary = SmartSummaryView(available=True, temperature_c=30)
+                service._smart_cache[key] = summary
+                saved = self.trace_saves(service)
+                started, release = self.pause_after_details(service)
+                task = asyncio.create_task(service.get_snapshot(force_refresh=True))
+                try:
+                    await asyncio.wait_for(started.wait(), 5)
+                    before_retry = copy.deepcopy(service._smart_disk_identities)
+                    service.invalidate_snapshot_cache(reason="test.discovery.retry", cache_keys=["other-shelf"])
+                finally:
+                    release.set()
+                snapshot = await asyncio.wait_for(task, 5)
+                self.assertEqual(snapshot.slots[0].serial, "SANITIZED-NEW")
+                self.assertEqual(service.truenas_client.fetch_all.await_count, 2)
+                self.assertEqual(before_retry, baseline)
+                self.assertEqual(service._smart_disk_identities, baseline)
+                self.assertIs(service._smart_cache[key], summary)
+                self.assertIs(service._cache["shelf-a"], snapshot)
+                self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+                if with_store:
+                    self.assertEqual(saved, [("shelf-a", "SANITIZED-NEW")])
+                    entries = service.slot_detail_store.load_all()
+                    self.assertEqual({entry.slot_fields["serial"] for entry in entries.values()}, {"SANITIZED-NEW"})
+
+    async def test_accepted_cold_candidate_commits_its_backfilled_view(self):
+        service = self.service()
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+                        present=True, state=SlotState.healthy, device_name="da0", serial="SANITIZED-NEW",
+                        model="Synthetic persisted model")
+        entry = service._build_slot_detail_entry(slot, smart_summary=None, loaded_entries={})
+        service.slot_detail_store.save_entries([entry])
+        service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW")
+        saved = self.trace_saves(service)
+        snapshot = await service.get_snapshot()
+        published = snapshot.slots[0]
+        self.assertEqual(published.serial, "SANITIZED-NEW")
+        self.assertEqual(published.model, "Synthetic persisted model")
+        self.assertEqual(published.identity_state, "known")
+        key = service._smart_cache_key(published)
+        self.assertEqual(service._smart_disk_identities[key[:4]], (key[5], 0))
+        self.assertEqual(saved, [("shelf-a", "SANITIZED-NEW")])
+        self.assertIs(await service.get_snapshot(), snapshot)
+        self.assertEqual(service.truenas_client.fetch_all.await_count, 1)
+        self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+
+    async def test_cold_selection_rejection_discards_default_details(self):
+        for selection in ("missing-shelf", "shelf-b"):
+            with self.subTest(selection=selection):
+                service = self.service()
+                service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW", shelves=("shelf-a", "shelf-b"))
+                saved = self.trace_saves(service)
+                if selection == "missing-shelf":
+                    with self.assertRaises(inventory_module.UnknownEnclosureError):
+                        await service.get_snapshot(selected_enclosure_id=selection)
+                    self.assertEqual(service._smart_disk_identities, {})
+                    self.assertEqual(service.slot_detail_store.load_all(), {})
+                    self.assertEqual(saved, [])
+                else:
+                    snapshot = await service.get_snapshot(selected_enclosure_id=selection)
+                    self.assertEqual(snapshot.selected_enclosure_id, "shelf-b")
+                    self.assertEqual(saved, [("shelf-b", "SANITIZED-NEW")])
+                    self.assertEqual({key[2] for key in service._smart_disk_identities}, {"shelf-b"})
+                self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+
+    async def test_cancellation_before_cold_admission_discards_details(self):
+        for with_store in (True, False):
+            with self.subTest(with_store=with_store):
+                service = self.service(with_store=with_store)
+                saved = self.trace_saves(service)
+                started, release = self.pause_after_details(service)
+                async def request():
+                    try:
+                        await service.get_snapshot()
+                    finally:
+                        self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+                task = asyncio.create_task(request())
+                try:
+                    await asyncio.wait_for(started.wait(), 5)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                finally:
+                    release.set()
+                self.assertEqual(saved, [])
+                self.assertEqual(service._smart_disk_identities, {})
+                self.assertEqual(service._identity_unknown_slots, set())
+                self.assertEqual(service._cache, {})
+                # A successor must not inherit the cancelled request's staging.
+                snapshot = await service.get_snapshot()
+                key = service._smart_cache_key(snapshot.slots[0])
+                self.assertEqual(service._smart_disk_identities[key[:4]], (key[5], 0))
+                if with_store:
+                    self.assertEqual(saved, [("shelf-a", "SANITIZED-NEW")])
+
+    async def test_cold_candidate_retired_while_waiting_for_publication_has_no_details(self):
+        service = self.service()
+        saved = self.trace_saves(service)
+        lock = service._get_snapshot_lock("shelf-a")
+        await lock.acquire()
+        task = asyncio.create_task(service.get_snapshot())
+        try:
+            async def waiting():
+                while not service._snapshot_activity.get("shelf-a"):
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(waiting(), 5)
+            service.invalidate_snapshot_cache(reason="test.discovery.retirement", cache_keys=["shelf-a"])
+        finally:
+            lock.release()
+        with self.assertRaises(inventory_module.SnapshotStateBusyError):
+            await asyncio.wait_for(task, 5)
+        self.assertEqual(saved, [])
+        self.assertEqual(service._smart_disk_identities, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertEqual(service._cache, {})
+
+    async def test_cold_older_sequence_cannot_commit_after_other_shelf_wins(self):
+        for with_store in (True, False):
+            with self.subTest(with_store=with_store):
+                service = self.service(with_store=with_store)
+                service.truenas_client.fetch_all.side_effect = [
+                    self.raw("SANITIZED-OLD", shelves=("shelf-a", "shelf-b")),
+                    self.raw("SANITIZED-NEW", shelves=("shelf-a", "shelf-b"))]
+                saved = self.trace_saves(service)
+                lock = service._get_snapshot_lock("shelf-a")
+                await lock.acquire()
+                task = asyncio.create_task(service.get_snapshot())
+                try:
+                    async def waiting():
+                        while not service._snapshot_activity.get("shelf-a"):
+                            await asyncio.sleep(0)
+                    await asyncio.wait_for(waiting(), 5)
+                    winner = await service.get_snapshot(force_refresh=True, selected_enclosure_id="shelf-b")
+                finally:
+                    lock.release()
+                with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                    await asyncio.wait_for(task, 5)
+                self.assertEqual(winner.slots[0].serial, "SANITIZED-NEW")
+                self.assertEqual({key[2] for key in service._smart_disk_identities}, {"shelf-b"})
+                self.assertEqual(set(service._cache), {"shelf-b"})
+                if with_store:
+                    self.assertEqual(saved, [("shelf-b", "SANITIZED-NEW")])
+                    self.assertEqual({entry.enclosure_id for entry in service.slot_detail_store.load_all().values()},
+                                     {"shelf-b"})
+
+    async def test_cold_empty_source_keeps_trust_and_rediscovery_controls(self):
+        for available in (True, False):
+            with self.subTest(available=available):
+                service = self.service()
+                if available:
+                    service.truenas_client.fetch_all.return_value = self.raw(None, shelves=())
+                else:
+                    service.truenas_client.fetch_all.side_effect = TrueNASAPIError("Synthetic source unavailable")
+                saved = self.trace_saves(service)
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.enclosures, [])
+                self.assertEqual(service._snapshot_has_trusted_topology(snapshot), available)
+                self.assertEqual(service._canonical_enclosure_options, {} if available else None)
+                if available:
+                    # Trusted empty topology still publishes the fallback empty bays.
+                    self.assertEqual(set(service._smart_disk_identities),
+                                     {service._smart_cache_key(slot)[:4] for slot in snapshot.slots})
+                else:
+                    self.assertEqual(service._smart_disk_identities, {})
+                self.assertEqual(service.slot_detail_store.load_all(), {})
+                self.assertEqual(saved, [])
+                self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+
+    def seed_detail_identity(self, service, serial="SANITIZED-NEW"):
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+                        present=True, state=SlotState.healthy, device_name="da0", serial=serial)
+        service._mark_slot_identity_states([slot])
+        service._observe_smart_disk_identities([slot])
+        key = service._smart_cache_key(slot)
+        summary = SmartSummaryView(available=True, temperature_c=30)
+        until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        service._smart_cache[key] = summary
+        service._smart_cache_until[key] = until
+        service._smart_negative_cache[key] = (SmartSummaryView(available=False), until)
+        return slot, key, summary
+
+    @staticmethod
+    def detail_owned_state(service):
+        return (dict(service._smart_disk_identities), dict(service._smart_cache),
+                dict(service._smart_cache_until), dict(service._smart_negative_cache),
+                dict(service._smart_load_tasks), dict(service._smart_refresh_tasks),
+                set(service._identity_unknown_slots))
+
+    def pause_detail_write(self, service, *, after_commit=False, fail=False):
+        reached, release, finished = threading.Event(), threading.Event(), threading.Event()
+        guards = []
+        original = service.slot_detail_store._write
+
+        def write(entries, *, commit_guard=None):
+            @contextmanager
+            def recorded_guard():
+                with commit_guard() as valid:
+                    guards.append(valid)
+                    yield valid
+            try:
+                if after_commit:
+                    original(entries, commit_guard=recorded_guard)
+                reached.set()
+                if not release.wait(5):
+                    raise RuntimeError("Synthetic detail write barrier timed out")
+                if fail:
+                    raise OSError("Synthetic detail write failure")
+                if not after_commit:
+                    original(entries, commit_guard=recorded_guard)
+            finally:
+                finished.set()
+
+        service.slot_detail_store._write = write
+        self.addCleanup(release.set)
+        return reached, release, finished, guards
+
+    async def detail_request_service(self, warm, serial):
+        service = self.service()
+        if warm:
+            service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-BASE")
+            await service.get_snapshot()
+        service.truenas_client.fetch_all.return_value = self.raw(serial)
+        return service
+
+    async def test_final_guard_rejection_preserves_cold_and_warm_owned_state(self):
+        for warm in (False, True):
+            for current_serial, candidate in (("SANITIZED-NEW", "SANITIZED-OLD"),
+                                              (None, "SANITIZED-OLD"), ("SANITIZED-NEW", None)):
+                with self.subTest(warm=warm, candidate=candidate, current=current_serial):
+                    service = await self.detail_request_service(warm, candidate)
+                    current, key, summary = self.seed_detail_identity(service, current_serial)
+                    if candidate is None and not warm:
+                        service.slot_detail_store.save_entries([service._build_slot_detail_entry(
+                            current, smart_summary=None, loaded_entries={})])
+                    retained = asyncio.create_task(asyncio.Event().wait())
+                    service._smart_load_tasks[key] = retained
+                    service._smart_refresh_tasks[key] = retained
+                    baseline = self.detail_owned_state(service)
+                    disk_before = service.slot_detail_store.load_all()
+                    reached, release, finished, guards = self.pause_detail_write(service)
+                    task = asyncio.create_task(service.get_snapshot(force_refresh=warm))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                        before_guard = self.detail_owned_state(service)
+                        service.invalidate_snapshot_cache(reason="test.detail.final_guard", cache_keys=["other-shelf"])
+                        release.set()
+                        with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                            await asyncio.wait_for(task, 5)
+                        self.assertEqual(guards, [False])
+                        self.assertTrue(finished.is_set())
+                        self.assertEqual(service.slot_detail_store.load_all(), disk_before)
+                        self.assertEqual(before_guard, baseline)
+                        self.assertEqual(self.detail_owned_state(service), baseline)
+                        self.assertIs(service._smart_cache[key], summary)
+                        self.assertIs(service._smart_load_tasks[key], retained)
+                        self.assertFalse(retained.cancelled())
+                        self.assertFalse(service.slot_detail_store.file_path.with_suffix(".tmp").exists())
+                        self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)
+                        retained.cancel()
+                        await asyncio.gather(retained, return_exceptions=True)
+
+    async def test_accepted_final_guard_observes_only_after_cold_and_warm_save(self):
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                service = await self.detail_request_service(warm, "SANITIZED-NEW")
+                old, key, _ = self.seed_detail_identity(service, "SANITIZED-OLD")
+                generation = service._smart_cache_generation_token(key)
+                baseline = self.detail_owned_state(service)
+                reached, release, _, guards = self.pause_detail_write(service)
+                task = asyncio.create_task(service.get_snapshot(force_refresh=warm))
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    before_guard = self.detail_owned_state(service)
+                    release.set()
+                    snapshot = await asyncio.wait_for(task, 5)
+                    self.assertEqual(guards, [True])
+                    self.assertEqual(before_guard, baseline)
+                    new_key = service._smart_cache_key(snapshot.slots[0])
+                    self.assertEqual(service._smart_disk_identities[new_key[:4]], (new_key[5], generation[2] + 1))
+                    self.assertFalse(service._smart_request_is_current(service._smart_cache_key(old), generation))
+                    self.assertNotIn(key, service._smart_cache)
+                    self.assertEqual({row.slot_fields["serial"] for row in service.slot_detail_store.load_all().values()},
+                                     {"SANITIZED-NEW"})
+                    self.assertEqual(snapshot.slots[0].identity_state, "known")
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_newer_identity_owner_survives_before_and_after_final_write(self):
+        for after_commit in (False, True):
+            with self.subTest(after_commit=after_commit):
+                service = await self.detail_request_service(False, "SANITIZED-OLD")
+                self.seed_detail_identity(service)
+                reached, release, _, guards = self.pause_detail_write(service, after_commit=after_commit)
+                task = asyncio.create_task(service.get_snapshot())
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    _, key, summary = self.seed_detail_identity(service, "SANITIZED-SUCCESSOR")
+                    successor = self.detail_owned_state(service)
+                    release.set()
+                    with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                        await asyncio.wait_for(task, 5)
+                    self.assertEqual(guards, [after_commit])
+                    self.assertEqual(self.detail_owned_state(service), successor)
+                    self.assertIs(service._smart_cache[key], summary)
+                    self.assertEqual(service._cache, {})
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_target_invalidation_is_not_undone_by_rejected_detail_save(self):
+        service = await self.detail_request_service(False, "SANITIZED-OLD")
+        _, key, _ = self.seed_detail_identity(service)
+        reached, release, _, guards = self.pause_detail_write(service)
+        task = asyncio.create_task(service.get_snapshot())
+        try:
+            self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+            service.invalidate_snapshot_cache(reason="test.detail.target", cache_keys=["shelf-a"])
+            invalidated = self.detail_owned_state(service)
+            generation = service._smart_cache_generation_token(key)
+            release.set()
+            with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                await asyncio.wait_for(task, 5)
+            self.assertEqual(guards, [False])
+            self.assertEqual(self.detail_owned_state(service), invalidated)
+            self.assertEqual(service._smart_cache_generation_token(key), generation)
+            self.assertNotIn(key, service._smart_cache)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_or_failed_detail_writer_drains_without_observation(self):
+        for cancel, fail in ((False, True), (True, False), (True, True)):
+            with self.subTest(cancel=cancel, fail=fail):
+                service = await self.detail_request_service(False, "SANITIZED-OLD")
+                self.seed_detail_identity(service)
+                baseline = self.detail_owned_state(service)
+                reached, release, finished, _ = self.pause_detail_write(service, fail=fail)
+                task = asyncio.create_task(service.get_snapshot())
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    if cancel:
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        self.assertTrue(service._get_snapshot_lock("shelf-a").locked())
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError if cancel else OSError):
+                        await asyncio.wait_for(task, 5)
+                    self.assertTrue(finished.is_set())
+                    self.assertEqual(self.detail_owned_state(service), baseline)
+                    self.assertFalse(service._get_snapshot_lock("shelf-a").locked())
+                    self.assertEqual(service._cache, {})
+                    # No cancelled owner may detach a writer that races this retry.
+                    service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW")
+                    service.slot_detail_store._write = SlotDetailStore._write.__get__(service.slot_detail_store)
+                    successor = await service.get_snapshot(force_refresh=True)
+                    self.assertEqual(successor.slots[0].serial, "SANITIZED-NEW")
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_old_public_smart_cannot_overwrite_details_between_save_and_observation(self):
+        service = self.service()
+        service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-OLD")
+        old = await service.get_snapshot()
+        old_key = service._smart_cache_key(old.slots[0])
+        old_generation = service._smart_cache_generation_token(old_key)
+        service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW")
+        service.truenas_client.fetch_disk_smartctl.return_value = json.dumps({
+            "serial_number": "SANITIZED-OLD", "temperature": {"current": 66}})
+        reached, release, _, guards = self.pause_detail_write(service, after_commit=True)
+        task = asyncio.create_task(service.get_snapshot(force_refresh=True))
+        try:
+            self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+            # The public cached OLD view remains available while the NEW save
+            # worker drains. Its fresh read loads the already replaced real file.
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            rows = service.slot_detail_store.load_all()
+            release.set()
+            snapshot = await asyncio.wait_for(task, 5)
+            self.assertEqual(guards, [True])
+            self.assertTrue(summary.available)
+            self.assertEqual({row.slot_fields["serial"] for row in rows.values()}, {"SANITIZED-NEW"})
+            self.assertEqual(snapshot.slots[0].serial, "SANITIZED-NEW")
+            self.assertFalse(service._smart_request_is_current(old_key, old_generation))
+            self.assertNotIn(old_key, service._smart_cache)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cold_untrusted_quantastor_options_do_not_commit_details(self):
+        service = self.service()
+        service.system.truenas.platform = "quantastor"
+        systems = [{"id": "node-a", "name": "Synthetic node"}]
+        service.truenas_client.fetch_all.return_value = TrueNASRawData(
+            enclosures=systems, systems=systems,
+            disks=[{"id": "disk-a", "storageSystemId": "node-a", "devicePath": "/dev/sda",
+                    "serialNumber": "SANITIZED-NEW"}],
+            hw_disks=[{"id": "hw-a", "physicalDiskId": "disk-a", "storageSystemId": "node-a",
+                       "enclosureId": "shelf-a", "slot": "01", "serialNum": "SANITIZED-NEW"}],
+            hw_enclosures=[{"id": "shelf-a", "name": "Synthetic shelf", "storageSystemId": "node-a"}],
+            pools=[], pool_devices=[], disk_temperatures={}, smart_test_results=[])
+        saved = self.trace_saves(service)
+        snapshot = await service.get_snapshot()
+        self.assertTrue(snapshot.enclosures)
+        self.assertTrue(any(slot.serial == "SANITIZED-NEW" for slot in snapshot.slots))
+        self.assertFalse(service._snapshot_has_trusted_topology(snapshot))
+        self.assertEqual(service._smart_disk_identities, {})
+        self.assertEqual(service.slot_detail_store.load_all(), {})
+        self.assertEqual(saved, [])
+        self.assertEqual(service._cache, {})
+        self.assertIsNone(inventory_module._snapshot_detail_commits.get())
 
 
 class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -375,14 +1377,13 @@ class InventoryHelpersTests(unittest.TestCase):
                 self.assertIn("_warn_unmatched_mapping(", source)
                 self.assertIn("frame.result(", source)
 
-        for method_name in ("_correlate", "_correlate_scale_linux"):
+        for method_name in ("_correlate", "_correlate_scale_linux", "_correlate_esxi_host"):
             with self.subTest(shared_disk_index=method_name):
                 source = inspect.getsource(getattr(InventoryService, method_name))
                 self.assertIn("_index_disk_records(", source)
 
         for method_name in (
             "_correlate_linux_host",
-            "_correlate_esxi_host",
             "_correlate_bmc_host",
             "_correlate_quantastor",
         ):
@@ -16350,12 +17351,14 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             )
             discovery_command = service._build_sg_ses_discovery_command()
             aes_output = """  SMCDRS2U  SAS3x40           0701
-Array device slot element:
+  Primary enclosure logical identifier (hex): 5eeeee10
+Additional element status diagnostic page:
   Element type: Array device slot, subenclosure id: 0 [ti=0]
-    Element 0 descriptor:
-      device slot number: 0
-      sas address: 0x5002538b496a5512
-      attached sas address: 0x5003048026b2ff7f
+    Element index: 0  eiioe=0
+      number of phys: 1, device slot number: 0
+      phy index: 0
+        SAS address: 0x5002538b496a5512
+        attached SAS address: 0x5003048026b2ff7f
 """
             ec_off_output = """  SMCDRS2U  SAS3x40           0701
 Enclosure Status diagnostic page:

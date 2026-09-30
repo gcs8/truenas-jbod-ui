@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,239 @@ def freeze_operation_bounds_now(now: datetime):
 
     with patch("history_service.operation_bounds.datetime", FrozenDateTime):
         yield
+
+
+class HistoryReadConsistencyTests(unittest.TestCase):
+    def test_followed_counter_rollups_use_bucket_and_interval_identity(self) -> None:
+        point = {
+            "id": None, "observed_at": "2025-01-02T00:30:00+00:00",
+            "metric_name": "bytes_read", "system_id": "system-1",
+            "enclosure_key": "enclosure-1", "slot": 1, "value": 100,
+            "disk_identity_key": "disk-a", "sample_count": 2,
+        }
+        points = [
+            {**point, "bucket_start": bucket, "rollup_seconds": interval}
+            for bucket, interval in (
+                ("2025-01-02T00:00:00+00:00", 3600),
+                ("2025-01-02T00:00:00+00:00", 86400),
+                ("2025-01-01T00:00:00+00:00", 86400),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hot.sqlite3"
+            store = HistoryStore(str(path), recover_unreadable_database=False)
+            for reader in (store, SegmentedHistoryReader(hot_path=path)):
+                with (
+                    self.subTest(reader=type(reader).__name__),
+                    patch.object(reader, "list_disk_metric_samples", return_value=[points[0]]),
+                    patch.object(reader, "list_metric_samples", return_value=points),
+                ):
+                    followed = reader.list_followed_metric_samples(
+                        "system-1", "enclosure-1", 1, "disk-a", limit=10,
+                    )
+                    self.assertEqual(len(followed), 3)
+
+    def test_sealed_indexes_and_legacy_unindexed_read_compatibility(self) -> None:
+        from history_service.segment_sealer import seal_history_segment
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite3"
+            hot = root / "hot.sqlite3"
+            HistoryStore(str(source), recover_unreadable_database=False)
+            HistoryStore(str(hot), recover_unreadable_database=False)
+            with closing(sqlite3.connect(source)) as connection, connection:
+                connection.execute("""INSERT INTO slot_events (
+                    observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                ) VALUES ('2025-01-01T23:30:00-12:00', 'system-1', 'enclosure-1', 1, 'slot-1', 'state', '{}')""")
+                connection.execute("""INSERT INTO metric_samples (
+                    observed_at, system_id, enclosure_key, slot, slot_label,
+                    metric_name, value_integer, disk_identity_key
+                ) VALUES ('2025-01-01T23:30:00-12:00', 'system-1', 'enclosure-1', 1, 'slot-1', 'temperature', 30, 'disk-a')""")
+            result = seal_history_segment(
+                source=source, output_directory=root / "segments",
+                segment_id="segment-0001", cutoff="2025-01-03T00:00:00+00:00", key_id="synthetic-key",
+            )
+            segment = Path(result["path"])
+            with closing(sqlite3.connect(segment)) as connection, connection:
+                indexes = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%chronological'")]
+                self.assertEqual(len(indexes), 5)
+                # A synthetic old immutable source lacks all new indexes.
+                for index in indexes:
+                    connection.execute(f"DROP INDEX {index}")
+            before = segment.read_bytes()
+            reader = SegmentedHistoryReader(hot_path=hot, segment_paths=[segment])
+            samples = reader.list_metric_samples("system-1", "enclosure-1", 1, limit=1,
+                                                 since="2025-01-02T11:00:00+00:00")
+            events = reader.list_slot_events("system-1", "enclosure-1", 1, limit=1,
+                                             since="2025-01-02T11:00:00+00:00")
+            self.assertEqual(samples[0]["value"], 30)
+            self.assertEqual(events[0]["id"], 1)
+            self.assertEqual(segment.read_bytes(), before)
+
+    def test_indexed_sources_bound_chronological_tiny_limit_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("hot.sqlite3", "segment-0001.sqlite3")]
+            for path in paths:
+                HistoryStore(str(path), recover_unreadable_database=False)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    # Constant local-time prefixes include mixed offsets. Absolute
+                    # ordering must find the newest instant, not the largest text.
+                    connection.executemany("""INSERT INTO metric_samples (
+                        observed_at, system_id, enclosure_key, slot, slot_label,
+                        metric_name, value_integer, disk_identity_key
+                    ) VALUES (?, 'system-1', 'enclosure-1', 1, 'slot-1', 'temperature', ?, 'disk-a')""",
+                        [("2025-01-01T23:30:00-12:00" if i % 2 else "2025-01-02T10:00:00+00:00", i)
+                         for i in range(20_000)])
+                    connection.execute("""INSERT INTO slot_events (
+                        observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                    ) SELECT observed_at, system_id, enclosure_key, slot, slot_label, 'state', '{}'
+                      FROM metric_samples""")
+            reader = SegmentedHistoryReader(hot_path=paths[0], segment_paths=paths[1:])
+            original_query = reader._query_connection
+            counts = []
+            plans = []
+
+            @contextmanager
+            def counted_query(path, hot_connection=None):
+                query_context = (original_query(path) if hot_connection is None else
+                                 original_query(path, hot_connection))
+                with query_context as connection:
+                    work = 0
+
+                    def progress():
+                        nonlocal work
+                        work += 100
+                        return 0
+
+                    connection.set_progress_handler(progress, 100)
+                    yield connection
+                    counts.append(work)
+                    connection.set_progress_handler(None, 0)
+                    for table, extra in (("slot_events", ""), ("metric_samples", "AND metric_name='temperature'")):
+                        plans.extend(row[3] for row in connection.execute(f"""EXPLAIN QUERY PLAN
+                            SELECT * FROM {table}
+                            WHERE system_id='system-1' AND enclosure_key='enclosure-1' AND slot=1 {extra}
+                              AND julianday(observed_at) >= julianday('2025-01-02T11:00:00+00:00')
+                            ORDER BY julianday(observed_at) DESC, id DESC LIMIT 1"""))
+
+            with patch.object(reader, "_query_connection", side_effect=counted_query):
+                for since in (None, "2025-01-02T11:00:00+00:00", "2025-01-03T00:00:00+00:00"):
+                    for query in (
+                        lambda: reader.list_slot_events("system-1", "enclosure-1", 1, limit=1, since=since),
+                        lambda: reader.list_raw_metric_samples("system-1", "enclosure-1", 1, limit=1, since=since),
+                        lambda: reader.list_raw_metric_samples("system-1", "enclosure-1", 1, metric_name="temperature", limit=1, since=since),
+                        lambda: reader.list_disk_metric_samples("disk-a", metric_name="temperature", limit=1, since=since),
+                        lambda: reader.list_disk_metric_samples("disk-a", limit=1, since=since),
+                    ):
+                        counts.clear()
+                        rows = query()
+                        self.assertEqual(len(rows), 0 if since == "2025-01-03T00:00:00+00:00" else 1)
+                        if rows:
+                            self.assertEqual(rows[0]["observed_at"], "2025-01-01T23:30:00-12:00")
+                        self.assertLess(sum(counts), 2_000, f"SQLite VM work {counts}, since={since}")
+            self.assertFalse(any("TEMP B-TREE" in plan for plan in plans), plans)
+
+    def test_bundle_pins_hot_snapshot_across_committed_replacement(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "hot.sqlite3"
+                SegmentedHistoryReaderCliTests._create_database(
+                    path, [(1, "2025-01-01T00:00:00+00:00")],
+                    [(1, "2025-01-01T00:00:00+00:00", 10)],
+                )
+                original_connect = sqlite3.connect
+                with closing(original_connect(path)) as writer, writer:
+                    writer.execute("PRAGMA journal_mode=WAL")
+                    writer.execute("UPDATE metric_samples SET disk_identity_key='disk-a'")
+                    writer.execute("""INSERT INTO slot_state_current (
+                        system_id, enclosure_key, slot, slot_label, present,
+                        identify_active, last_seen_at, serial, disk_identity_key
+                    ) VALUES ('system-1', 'enclosure-1', 1, 'slot-1', 1, 0,
+                              '2025-01-01T00:00:00+00:00', 'SANITIZED-A', 'disk-a')""")
+                reader = (SegmentedHistoryReader(hot_path=path) if segmented else
+                          HistoryStore(str(path), recover_unreadable_database=False))
+                replaced = False
+
+                def replace():
+                    nonlocal replaced
+                    if replaced:
+                        return
+                    replaced = True
+                    with closing(original_connect(path)) as writer, writer:
+                        writer.execute("UPDATE slot_state_current SET serial='SANITIZED-B', disk_identity_key='disk-b'")
+                        writer.execute("""INSERT INTO metric_samples (
+                            observed_at, system_id, enclosure_key, slot, slot_label,
+                            metric_name, value_integer, disk_identity_key
+                        ) VALUES ('2025-01-02T00:00:00+00:00', 'system-1',
+                                  'enclosure-1', 1, 'slot-1', 'temperature', 90, 'disk-b')""")
+                        writer.execute("""INSERT INTO slot_events (
+                            observed_at, system_id, enclosure_key, slot, slot_label,
+                            event_type, details_json
+                        ) VALUES ('2025-01-02T00:00:00+00:00', 'system-1',
+                                  'enclosure-1', 1, 'slot-1', 'replacement', '{}')""")
+
+                class ReplacingCursor(sqlite3.Cursor):
+                    def fetchone(self):
+                        row = super().fetchone()
+                        replace()
+                        return row
+
+                class ReplacingConnection(sqlite3.Connection):
+                    def execute(self, sql, parameters=()):
+                        if sql.lstrip().startswith("SELECT") and "FROM slot_state_current" in sql:
+                            return self.cursor(factory=ReplacingCursor).execute(sql, parameters)
+                        return super().execute(sql, parameters)
+
+                def connect(database, *args, **kwargs):
+                    kwargs["factory"] = ReplacingConnection
+                    return original_connect(database, *args, **kwargs)
+
+                with patch.object(sqlite3, "connect", side_effect=connect):
+                    bundle = reader.get_slot_history_bundle(
+                        "system-1", "enclosure-1", 1,
+                        event_limit=10, metric_limits={"temperature": 10},
+                    )
+                self.assertTrue(replaced)
+                self.assertEqual(bundle["disk_history"]["serial"], "SANITIZED-A")
+                self.assertEqual(bundle["latest_values"]["temperature"], 10)
+                self.assertEqual([row["id"] for row in bundle["events"]], [1])
+                self.assertEqual(bundle["disk_history"]["current_home"]["sample_count"], 1)
+                fresh = reader.get_slot_history_bundle(
+                    "system-1", "enclosure-1", 1, metric_limits={"temperature": 10},
+                )
+                self.assertEqual(fresh["disk_history"]["serial"], "SANITIZED-B")
+                self.assertEqual(fresh["latest_values"]["temperature"], 90)
+
+    def test_followed_rollups_retain_equal_value_replacement_identities(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "hot.sqlite3"
+                SegmentedHistoryReaderCliTests._create_database(path, [])
+                for disk in ("disk-a", "disk-b"):
+                    SegmentedHistoryReaderCliTests._insert_rollup(
+                        path, bucket_start="2025-01-01T00:00:00+00:00",
+                        value_sum=60, disk_identity_key=disk,
+                    )
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute("UPDATE metric_rollups SET sample_count=3, value_sum=90 WHERE disk_identity_key='disk-b'")
+                    connection.execute("""INSERT INTO slot_state_current (
+                        system_id, enclosure_key, slot, slot_label, present,
+                        identify_active, last_seen_at, disk_identity_key
+                    ) VALUES ('system-1', 'enclosure-1', 1, 'slot-1', 1, 0,
+                              '2025-01-01T00:00:00+00:00', 'disk-b')""")
+                reader = (SegmentedHistoryReader(hot_path=path) if segmented else
+                          HistoryStore(str(path), recover_unreadable_database=False))
+                followed = reader.list_followed_metric_samples(
+                    "system-1", "enclosure-1", 1, "disk-b", metric_name="temperature", limit=10,
+                )
+                self.assertEqual(len(followed), 2)
+                self.assertEqual({row["disk_identity_key"]: row["sample_count"] for row in followed},
+                                 {"disk-a": 2, "disk-b": 3})
+                bundle = reader.get_slot_history_bundle(
+                    "system-1", "enclosure-1", 1, metric_limits={"temperature": 10},
+                )
+                self.assertEqual(bundle["sample_counts"], {"temperature": 2})
 
 
 class SegmentedHistoryReaderCliTests(unittest.TestCase):
@@ -999,8 +1232,8 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             case = self
 
             @contextmanager
-            def observed_connection(path):
-                with original(path) as connection:
+            def observed_connection(path, hot_connection=None):
+                with original(path, hot_connection) as connection:
                     connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
 
                     class ObservedConnection:
@@ -1127,8 +1360,8 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             parameter_counts = []
 
             @contextmanager
-            def observed_connection(path):
-                with original(path) as connection:
+            def observed_connection(path, hot_connection=None):
+                with original(path, hot_connection) as connection:
                     connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
 
                     def count_row(cursor, row):
@@ -2361,7 +2594,7 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
         last_observed_at = (
             datetime.fromisoformat(bucket_start) + timedelta(seconds=bucket_seconds // 2)
         ).isoformat()
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO metric_rollups (
@@ -2422,7 +2655,7 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
         events: list[tuple[int, str]],
         samples: list[tuple[int, str, int]] = [],
     ) -> None:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.executescript(SCHEMA)
             for event_id, observed_at in events:
                 connection.execute(

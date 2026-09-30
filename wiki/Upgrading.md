@@ -103,7 +103,7 @@ treat it as unverified, not as broken.
 | Local state | Bind mounts on a local POSIX filesystem, owned by root; or, with the hardening overlay, handed to uid 10001 by the one-time ownership step in [[Troubleshooting]] | Network filesystems, read-only or full disks |
 | Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml` | Admin and backup services during an upgrade |
 | Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d`, with the same `-f` files each time | Releases before v0.22.2, skipping several releases |
-| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity and schema compatibility checks pass; the report says `schema_transition=none` because v0.22.2 and the candidate use the same schema; a v0.22.2 segmented catalog keeps the exact generation, catalog bytes and referenced segment bytes; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures |
+| After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity and schema compatibility checks pass; the report says `schema_transition=none` because the table layout and logical schema-version marker remain unchanged, while startup adds chronological indexes to the hot database; a v0.22.2 segmented catalog keeps the exact generation, catalog bytes and referenced segment bytes; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures, production-scale index construction time and headroom |
 | Rollback | Pin back to v0.22.2 with the same two commands, on base, hardened and segmented-history deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
 | Recovery | The new history container killed (`SIGKILL`) inside each schema-initialization step on v0.22.2 data, one after another; the next `up -d` comes up healthy with no restarts, integrity check `ok`, no rows lost, nothing quarantined, and the same database an uninterrupted start produces | A killed restore, a killed data backfill at runtime (v0.22.2 data needs none; see below), an encrypted restore on a clean host, a full disk |
 
@@ -114,8 +114,18 @@ separate steps of the `Hardened, interrupted and segmented upgrade smoke` job.
 The segmented run uses v0.22.2's own migration module and reader, captures the
 catalog generation plus exact catalog and segment digests, and requires the
 same identity and combined history view after upgrade and rollback. v0.22.2
-already has the current history schema, so the image-upgrade run proves that
-the candidate accepts and preserves it.
+already has the current table layout and logical schema-version marker, so
+the image-upgrade run checks that the candidate accepts and preserves them.
+Startup adds five chronological indexes to the hot database: three from the
+schema SQL and two disk-identity chronological indexes from startup's identity
+index step. The two nonchronological identity indexes already exist in a
+database started by v0.22.2; a released-SQL-only fixture also gains those two.
+The real `HistoryStore` constructor test checks this complete delta, released
+definitions and rows, unchanged logical schema version, and idempotent restart.
+Executing the schema SQL alone does not qualify startup. Existing immutable
+segments retain their exact bytes without reindexing and their older query path;
+newly sealed segments include the indexes. Index construction time and disk
+headroom on production-scale databases remain unqualified.
 It does not exercise a schema transition. The interrupted run kills each
 migration-capable startup seam while it is idempotent on this input; the next
 start must open the same database as an uninterrupted start.

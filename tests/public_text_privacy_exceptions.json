@@ -455,10 +455,10 @@
         "sha256:12c01b41995df68196d0f7811b34603c9222d1e26c3448ee6dd9d001b9fdde2a": 116
       },
       "sas_wwn_identifier": {
-        "sha256:b59327a6567c9a9516a7d4461cc97033a99bdbba1a16525cc557724ff61f9754": 205
+        "sha256:2c8dbc70a37989b3cc35308223030ceb38c3689e2a711d7afa09e9054ff6b308": 210
       }
     },
-    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+    "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. PR874 adds five literal occurrences of invented NVMe namespace EUI64 values zero, one and two, including a normalized eui. value; no captured device identity is added."
   },
   "tests/test_parsers.py": {
     "findings": {
