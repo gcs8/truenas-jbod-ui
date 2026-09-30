@@ -112,6 +112,317 @@ def build_inventory_service(
 OVERLAY_STATUS_MODES = ("throw", "empty_failure", "rows_failure", "success", "empty_success")
 
 
+class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """Public-safe regressions for enclosure, disk and publication ownership."""
+
+    def service(self, platform="core", profile=None):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(
+            id="qualified-inventory", default_profile_id=profile,
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="host.example.test", commands=[]),
+        )
+        return build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name, MagicMock())
+
+    @staticmethod
+    def overlay(host, enclosure_id, device, *, bay=0, sas="0x5eeeee01"):
+        enclosure = SESMapEnclosure(
+            enclosure_id=enclosure_id, ses_device=device, enclosure_name="Synthetic shelf",
+            slots={bay: SESMapSlot(
+                slot_number=bay, element_id=bay, ses_device=device,
+                slot_number_source="ses_device_slot_number", present=True,
+                sas_address=sas, attached_sas_address="0x5eeeee10",
+                control_targets=[{"ssh_host": host, "ses_device": device,
+                                  "ses_element_id": bay, "ses_slot_number": bay}],
+            )},
+        )
+        candidates, meta = build_slot_candidates_from_ses_enclosures([enclosure], 2, None)
+        overlay = ParsedSSHData(ses_enclosures=[enclosure], ses_slot_candidates=candidates, ses_selected_meta=meta)
+        InventoryService._tag_ses_overlay(overlay, host)
+        return overlay
+
+    async def test_foreign_shelves_never_become_redundant_led_targets(self):
+        for device in ("/dev/sg2", "/dev/sg9"):
+            with self.subTest(device=device):
+                service = self.service("quantastor")
+                first = self.overlay("node-a.example.test", "shelf-a", "/dev/sg2")
+                other = self.overlay("node-b.example.test", "shelf-b", device)
+                merged = service._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                self.assertEqual({item.enclosure_id for item in merged.ses_enclosures}, {"shelf-a", "shelf-b"})
+                for candidate in (merged.ses_slot_candidates[0],
+                                  build_slot_candidates_from_ses_enclosures(merged.ses_enclosures, 1, None, "shelf-a")[0][0]):
+                    slot = service._build_slot_view(0, 0, 0, {"id": "shelf-a"}, candidate,
+                                                    None, None, ParsedSSHData(), {}, set())
+                    service._run_ssh_command = AsyncMock(side_effect=lambda command, host=None: SSHCommandResult(
+                        command=command, ok=True, stdout="", stderr="", exit_code=0))
+                    await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                    self.assertTrue(service._run_ssh_command.await_count)
+                    self.assertTrue(all(call.args[1] != "node-b.example.test"
+                                        for call in service._run_ssh_command.await_args_list))
+
+    def test_redundant_same_shelf_requires_the_same_physical_bay(self):
+        for second_bay, expected in ((0, 2), (1, 1)):
+            with self.subTest(bay=second_bay):
+                first = self.overlay("node-a.example.test", "shelf-a", "/dev/sg2")
+                other = self.overlay("node-b.example.test", "shelf-a", "/dev/sg9", bay=second_bay)
+                merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+                targets = merged.ses_slot_candidates[0]["ses_targets"]
+                self.assertEqual(len(targets), expected)
+                self.assertTrue(all(target["ses_slot_number"] == 0 for target in targets))
+                if second_bay == 1:
+                    candidates, _ = build_slot_candidates_from_ses_enclosures(merged.ses_enclosures, 2, None, "shelf-a")
+                    self.assertEqual(candidates[1]["ses_device"], "/dev/sg9")
+                    self.assertEqual({target["ssh_host"] for target in candidates[1]["ses_targets"]},
+                                     {"node-b.example.test"})
+
+    @staticmethod
+    def drive(controller="c0", serial="SANITIZED-HOST", slot=2, enclosure="252"):
+        return {"controller_id": controller, "enclosure_id": enclosure, "slot": slot,
+                "slot_key": f"{enclosure}:{slot}", "serial": serial, "model": "SYNTHETIC",
+                "size": "1 TB", "interface": "SAS", "state": "JBOD"}
+
+    def test_unkeyed_cross_host_ses_paths_need_independent_identity_evidence(self):
+        for shared_identity in (False, True):
+            first = self.overlay("node-a.example.test", None, "/dev/sg2")
+            other = self.overlay("node-b.example.test", None, "/dev/sg2",
+                                 sas="0x5eeeee01" if shared_identity else "0x5eeeee02")
+            merged = InventoryService._augment_ses_targets_from_redundant_hosts(first, [first, other])
+            self.assertEqual(len(merged.ses_enclosures), 1 if shared_identity else 2)
+            self.assertEqual(len(merged.ses_slot_candidates[0]["ses_targets"]), 2 if shared_identity else 1)
+
+    def test_esxi_equal_coordinates_are_unplaced_in_both_orders(self):
+        from app.services.inventory_accounting import build_disk_retention_accounting
+        from app.services.parsers import parse_storcli_physical_drives
+        payload = {"Controllers": [{"Command Status": {"Controller": number, "Status": "Success"},
+                    "Response Data": {"Drive Information": [{"EID:Slt": "252:0", "DID": number + 10,
+                    "State": "JBOD", "Intf": "NVMe", "SN": f"SANITIZED-C{number}",
+                    "Model": "SYNTHETIC", "Size": "1 TB"}]}} for number in (0, 1)]}
+        rows = parse_storcli_physical_drives(json.dumps(payload))
+        for ordered in (rows, rows[::-1]):
+            service = self.service("esxi", ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            parsed = ParsedSSHData(esxi_storcli_physical_drives=ordered)
+            slots, *_ = service._correlate_esxi_host(parsed, [], None)
+            self.assertFalse(any(slot.present for slot in slots))
+            records = service._build_storage_view_candidate_records(
+                TrueNASRawData(enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[]),
+                parsed, ESXI_AOC_SLG4_2H8M2_PROFILE_ID)
+            self.assertEqual({disk.serial for disk in records}, {"SANITIZED-C0", "SANITIZED-C1"})
+            accounting = build_disk_retention_accounting(source_disks=records, slots=slots)
+            self.assertEqual(accounting.source_disk_count, 2)
+            self.assertEqual(accounting.unplaced_disk_count, 2)
+
+    def test_esxi_bmc_controls_require_a_unique_coherent_identity(self):
+        for kind in ("conflict", "repeated-host-bay", "duplicate-host-serial", "repeated-bmc-bay",
+                     "duplicate-bmc-serial", "coherent", "bmc-only"):
+            with self.subTest(kind=kind):
+                service = self.service("esxi", SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID)
+                rows = [] if kind == "bmc-only" else [self.drive()]
+                if kind in {"repeated-host-bay", "duplicate-host-serial"}:
+                    rows.append(self.drive("c1", "SANITIZED-HOST" if kind == "duplicate-host-serial"
+                                           else "SANITIZED-OTHER", slot=3 if kind == "duplicate-host-serial" else 2))
+                bmc_rows = [BMCDriveRecord(controller_id=1, physical_index=7, slot_number=2,
+                            enclosure_id="252", serial="SANITIZED-BMC" if kind == "conflict" else "SANITIZED-HOST")]
+                if kind in {"repeated-bmc-bay", "duplicate-bmc-serial"}:
+                    bmc_rows.append(BMCDriveRecord(controller_id=2, physical_index=8,
+                                    slot_number=2 if kind == "repeated-bmc-bay" else 3,
+                                    enclosure_id="253", serial="SANITIZED-HOST"))
+                slots, *_ = service._correlate_esxi_host(ParsedSSHData(esxi_storcli_physical_drives=rows),
+                                                       [], None, BMCInventory(drives=bmc_rows))
+                slot = next(item for item in slots if item.slot == 2)
+                admitted = kind in {"coherent", "bmc-only"}
+                self.assertEqual(slot.led_backend == "supermicro_bmc", admitted)
+                self.assertEqual(slot.led_supported, admitted)
+                if not admitted:
+                    self.assertIsNone(slot.raw_status.get("bmc_physical_index"))
+                if kind == "conflict":
+                    self.assertEqual(slot.serial, "SANITIZED-HOST")
+
+    @staticmethod
+    def smart_slot():
+        return SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+                        present=True, state=SlotState.healthy, device_name="da0", smart_device_names=["da0"],
+                        serial="SANITIZED-A", logical_unit_id="0x5eeeee01")
+
+    async def test_public_smart_rejects_returned_identity_before_cache_and_persistence(self):
+        for field, value in (("logical_unit_id", "0x5eeeee02"), ("serial_number", "SANITIZED-B")):
+            with self.subTest(field=field):
+                service = self.service()
+                slot = self.smart_slot()
+                service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                service._observe_smart_disk_identities([slot])
+                service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                    {field: value, "smart_status": {"passed": True}, "temperature": {"current": 66}}))
+                service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+                for _ in range(2):
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertFalse(summary.available)
+                    self.assertIsNone(summary.temperature_c)
+                self.assertEqual(service._smart_cache, {})
+                self.assertEqual(service.slot_detail_store.load_all(), {})
+
+    async def test_public_smart_accepts_matching_or_missing_identifiers(self):
+        for identity in ({}, {"serial_number": "SANITIZED-A", "logical_unit_id": "0x5eeeee01"}):
+            service = self.service()
+            slot = self.smart_slot()
+            service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+            service._observe_smart_disk_identities([slot])
+            service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                {**identity, "temperature": {"current": 30}, "smart_status": {"passed": True}}))
+            service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            self.assertTrue(summary.available)
+            self.assertEqual(summary.temperature_c, 30)
+            self.assertTrue(service._smart_cache)
+            self.assertTrue(service.slot_detail_store.load_all())
+
+    async def test_ssh_primary_and_text_enrichment_reject_contradictory_identity(self):
+        for phase in ("json", "text"):
+            for matching in (False, True):
+                with self.subTest(phase=phase, matching=matching):
+                    service = self.service("linux")
+                    slot = self.smart_slot()
+                    service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                    service._observe_smart_disk_identities([slot])
+                    identity = "SANITIZED-A" if matching else "SANITIZED-B"
+                    async def planned(planner, initial_commands, **kwargs):
+                        results = []
+                        for _ in range(20):
+                            commands = planner(results)
+                            if not commands:
+                                return results
+                            for command in commands:
+                                stdout = json.dumps({"serial_number": identity if phase == "json" else "SANITIZED-A",
+                                                     "temperature": {"current": 30}}) if "-j" in command else (
+                                    f"Serial number: {identity}\nLogical Unit id: 0x5eeeee01\n")
+                                results.append(SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0))
+                        self.fail("synthetic planner did not terminate")
+                    service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertEqual(summary.available, matching)
+                    self.assertEqual(bool(service._smart_cache), matching)
+                    self.assertEqual(bool(service.slot_detail_store.load_all()), matching)
+
+    def test_detail_entry_refuses_a_contradictory_smart_identifier(self):
+        service = self.service()
+        self.assertIsNone(service._build_slot_detail_entry(self.smart_slot(), loaded_entries={},
+                          smart_summary=SmartSummaryView(available=True, temperature_c=66,
+                                                        logical_unit_id="0x5eeeee02")))
+
+    async def test_api_and_core_ssh_enrichment_cannot_replace_the_api_occupant(self):
+        for enrichment in ("api-text", "ssh-json"):
+            for matching in (False, True):
+                with self.subTest(enrichment=enrichment, matching=matching):
+                    service = self.service()
+                    slot = self.smart_slot()
+                    service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[slot]))
+                    service._observe_smart_disk_identities([slot])
+                    identity = "SANITIZED-A" if matching else "SANITIZED-B"
+                    api_json = json.dumps({"serial_number": "SANITIZED-A", "temperature": {"current": 30}})
+                    service.truenas_client.fetch_disk_smartctl = AsyncMock(side_effect=[api_json,
+                        f"Serial Number: {identity if enrichment == 'api-text' else 'SANITIZED-A'}\n"])
+                    async def planned(planner, initial_commands, **kwargs):
+                        return [SSHCommandResult(command=initial_commands[0], ok=True, exit_code=0,
+                                stdout=json.dumps({"serial_number": identity, "temperature": {"current": 66}}))]
+                    service._run_ssh_planned_commands = AsyncMock(side_effect=planned)
+                    service._summary_prefers_core_ssh_json = MagicMock(return_value=enrichment == "ssh-json")
+                    summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+                    self.assertEqual(summary.available, matching)
+                    self.assertEqual(bool(service._smart_cache), matching)
+                    self.assertEqual(bool(service.slot_detail_store.load_all()), matching)
+
+    async def test_core_batch_identity_conflict_is_isolated_to_its_disk(self):
+        from app.services.truenas_ws import TrueNASWebsocketClient
+        service = self.service()
+        service.truenas_client = MagicMock(spec=TrueNASWebsocketClient)
+        first = self.smart_slot()
+        second = first.model_copy(update={"slot": 1, "device_name": "da1", "smart_device_names": ["da1"],
+                                           "serial": "SANITIZED-C", "logical_unit_id": "0x5eeeee03"})
+        service.get_snapshot = AsyncMock(return_value=MagicMock(slots=[first, second]))
+        service._observe_smart_disk_identities([first, second])
+        async def batch(devices, args, **kwargs):
+            if "-j" not in args:
+                return ["" for _ in devices]
+            return [json.dumps({"serial_number": "SANITIZED-B" if device == "da0" else "SANITIZED-C",
+                                "logical_unit_id": "0x5eeeee02" if device == "da0" else "0x5eeeee03",
+                                "smart_status": {"passed": True}, "temperature": {"current": 30}})
+                    for device in devices]
+        service.truenas_client.smartctl_batch = AsyncMock(side_effect=batch)
+        service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+        results = await service.get_slot_smart_summaries([0, 1], selected_enclosure_id="shelf-a")
+        self.assertEqual([item.summary.available for item in results], [False, True])
+        self.assertEqual(len(service._smart_cache), 1)
+        self.assertEqual({entry.slot_fields.get("serial") for entry in service.slot_detail_store.load_all().values()},
+                         {"SANITIZED-C"})
+
+    async def test_redirected_snapshot_side_effects_belong_only_to_the_published_winner(self):
+        for newer_first in (True, False):
+            with self.subTest(newer_first=newer_first):
+                service = self.service()
+                service._canonical_enclosure_options = {name: EnclosureOption(id=name, label=name, slot_count=1)
+                                                       for name in ("shelf-a", "shelf-b")}
+                service._canonical_default_enclosure_id = "shelf-a"
+                started, release = asyncio.Event(), asyncio.Event()
+                def bundle(serial):
+                    raw = TrueNASRawData(
+                        enclosures=[{"id": "shelf-b", "name": "Synthetic shelf", "elements": [
+                            {"slot": 1, "descriptor": "Slot 1", "dev": "da0", "status": "OK"}]}],
+                        disks=[{"name": "da0", "serial": serial, "size": 1000,
+                                "enclosure": {"id": "shelf-b", "slot": 0}}], pools=[],
+                        disk_temperatures={}, smart_test_results=[])
+                    return InventorySourceBundle(raw_data=raw, ssh_outputs={}, ssh_collected=False,
+                        warnings=[], sources={"api": SourceStatus(enabled=True, ok=True)},
+                        scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData())
+                calls = 0
+                async def source(**kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return bundle("SANITIZED-OLD")
+                    return bundle("SANITIZED-NEW")
+                service._get_inventory_source_bundle = AsyncMock(side_effect=source)
+                original_apply = service._apply_and_persist_snapshot_slot_details
+                async def paused_detail_apply(slots):
+                    if any(slot.serial == "SANITIZED-OLD" for slot in slots):
+                        started.set()
+                        await release.wait()
+                    await original_apply(slots)
+                service._apply_and_persist_snapshot_slot_details = paused_detail_apply
+                saved_serials = []
+                original_save = service.slot_detail_store.save_entries
+                def save(entries, **kwargs):
+                    result = original_save(entries, **kwargs)
+                    saved_serials.extend(entry.slot_fields.get("serial") for entry in entries)
+                    return result
+                service.slot_detail_store.save_entries = save
+                old = asyncio.create_task(service.get_snapshot(force_refresh=True))
+                await asyncio.wait_for(started.wait(), 5)
+                try:
+                    if not newer_first:
+                        release.set()
+                        await old
+                    new = await service.get_snapshot(force_refresh=True, selected_enclosure_id="shelf-b")
+                finally:
+                    release.set()
+                if newer_first:
+                    try:
+                        await old
+                    except inventory_module.SnapshotStateBusyError:
+                        pass
+                slot = next(item for item in new.slots if item.present)
+                service.truenas_client.fetch_disk_smartctl = AsyncMock(return_value=json.dumps(
+                    {"serial_number": "SANITIZED-NEW", "temperature": {"current": 30}}))
+                service._fetch_smart_summary_over_ssh = AsyncMock(return_value=(None, None))
+                summary = await service.get_slot_smart_summary(slot.slot, selected_enclosure_id="shelf-b")
+                self.assertTrue(summary.available)
+                service.truenas_client.fetch_disk_smartctl.assert_awaited()
+                self.assertTrue(service._smart_disk_is_current(service._smart_cache_key(slot)))
+                stored = service.slot_detail_store.load_all()
+                self.assertEqual({entry.slot_fields.get("serial") for entry in stored.values()}, {"SANITIZED-NEW"})
+                if newer_first:
+                    self.assertNotIn("SANITIZED-OLD", saved_serials)
+
+
 class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
     def make_service(self, platform):
         directory = tempfile.TemporaryDirectory()
@@ -375,14 +686,13 @@ class InventoryHelpersTests(unittest.TestCase):
                 self.assertIn("_warn_unmatched_mapping(", source)
                 self.assertIn("frame.result(", source)
 
-        for method_name in ("_correlate", "_correlate_scale_linux"):
+        for method_name in ("_correlate", "_correlate_scale_linux", "_correlate_esxi_host"):
             with self.subTest(shared_disk_index=method_name):
                 source = inspect.getsource(getattr(InventoryService, method_name))
                 self.assertIn("_index_disk_records(", source)
 
         for method_name in (
             "_correlate_linux_host",
-            "_correlate_esxi_host",
             "_correlate_bmc_host",
             "_correlate_quantastor",
         ):
@@ -16350,12 +16660,14 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             )
             discovery_command = service._build_sg_ses_discovery_command()
             aes_output = """  SMCDRS2U  SAS3x40           0701
-Array device slot element:
+  Primary enclosure logical identifier (hex): 5eeeee10
+Additional element status diagnostic page:
   Element type: Array device slot, subenclosure id: 0 [ti=0]
-    Element 0 descriptor:
-      device slot number: 0
-      sas address: 0x5002538b496a5512
-      attached sas address: 0x5003048026b2ff7f
+    Element index: 0  eiioe=0
+      number of phys: 1, device slot number: 0
+      phy index: 0
+        SAS address: 0x5002538b496a5512
+        attached SAS address: 0x5003048026b2ff7f
 """
             ec_off_output = """  SMCDRS2U  SAS3x40           0701
 Enclosure Status diagnostic page:

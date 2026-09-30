@@ -12,7 +12,7 @@ import time
 import threading
 from contextlib import contextmanager, nullcontext
 from collections import Counter, OrderedDict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -98,7 +98,9 @@ from app.services.parsers import (
     ParsedSSHData,
     ZpoolMember,
     _extract_slot_number,
+    _merge_control_targets,
     _merge_ses_enclosures,
+    _ses_enclosures_share_identity,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
     extract_nvme_controller_name,
@@ -845,6 +847,10 @@ class SnapshotStateBusyError(Exception):
         super().__init__("The server is busy. Try again in a moment.")
 
 
+class _SmartIdentityConflict(ValueError):
+    """Returned SMART evidence identifies a different disk from the request."""
+
+
 @dataclass(slots=True)
 class InventorySourceBundle:
     raw_data: TrueNASRawData
@@ -864,6 +870,9 @@ RetainedResultT = TypeVar("RetainedResultT")
 # changing standalone correlator callers or sharing a read across generations.
 _snapshot_read_inputs: ContextVar[tuple[Any, Any, list[SasFabricAlias]] | None] = ContextVar(
     "snapshot_read_inputs", default=None,
+)
+_snapshot_detail_commits: ContextVar[list[Callable[[Callable[[], bool]], Awaitable[None]]] | None] = ContextVar(
+    "snapshot_detail_commits", default=None,
 )
 
 
@@ -1383,11 +1392,16 @@ class InventoryService:
                     platform=self.system.truenas.platform,
                 )
                 build_started = time.perf_counter()
-                with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
-                    snapshot = await self._build_snapshot(
-                        selected_enclosure_id=selected_enclosure_id,
-                        force_source_refresh=refresh_sources,
-                    )
+                detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
+                detail_token = _snapshot_detail_commits.set(detail_commits)
+                try:
+                    with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
+                        snapshot = await self._build_snapshot(
+                            selected_enclosure_id=selected_enclosure_id,
+                            force_source_refresh=refresh_sources,
+                        )
+                finally:
+                    _snapshot_detail_commits.reset(detail_token)
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and cache_key in self._snapshot_invalidated:
                     raise SnapshotStateBusyError()
@@ -1443,6 +1457,20 @@ class InventoryService:
                         or publication_key in self._snapshot_invalidated
                     ):
                         raise SnapshotStateBusyError()
+                    def publication_is_current():
+                        return (topology_generation == self._snapshot_topology_generation
+                                and cache_key not in self._snapshot_invalidated
+                                and publication_key not in self._snapshot_invalidated
+                                and self._snapshot_published_sequence.get(publication_key, -1) <= request_sequence
+                                and self._canonical_options_request_sequence <= request_sequence)
+                    if publication_is_current():
+                        # Observe only an eligible view while holding its actual
+                        # destination lock. Retain every writer through caller
+                        # cancellation and recheck at the final file commit.
+                        for commit_details in detail_commits:
+                            await commit_details(publication_is_current)
+                        if not publication_is_current():
+                            raise SnapshotStateBusyError()
                     snapshot, published = self._publish_snapshot_locked(
                         publication_key,
                         snapshot,
@@ -1453,6 +1481,7 @@ class InventoryService:
                             snapshot,
                             request_sequence=request_sequence,
                         )
+
             finally:
                 if redirected_publication:
                     self._finish_snapshot_activity(publication_key)
@@ -3586,17 +3615,30 @@ class InventoryService:
 
     async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
         store = self.slot_detail_store
+        staged_commits = _snapshot_detail_commits.get()
         if store is None or not slots:
+            if staged_commits is not None:
+                async def observe_if_published(is_current):
+                    if is_current():
+                        self._mark_slot_identity_states(slots)
+                        self._observe_smart_disk_identities(slots)
+                staged_commits.append(observe_if_published)
+                for slot in slots:
+                    slot.identity_state = self._slot_identity_state(slot)
+                return
             self._mark_slot_identity_states(slots)
             self._observe_smart_disk_identities(slots)
             return
         loaded: Mapping[str, SlotDetailCacheEntry] = {}
         generations: list[tuple[SmartCacheKey, SmartCacheGenerationToken]] = []
+        def publication_is_current() -> bool:
+            return True
 
         @contextmanager
         def commit_guard():
             with self._smart_persistence_lock:
-                yield all(self._smart_request_is_current(key, generation) for key, generation in generations)
+                yield publication_is_current() and all(
+                    self._smart_request_is_current(key, generation) for key, generation in generations)
 
         def apply():
             nonlocal loaded
@@ -3619,6 +3661,18 @@ class InventoryService:
 
         async def apply_observe_and_save():
             await asyncio.to_thread(apply)
+            if staged_commits is not None:
+                staged_commits.append(observe_and_save)
+                for slot in slots:
+                    slot.identity_state = self._slot_identity_state(slot)
+                return
+            await observe_and_save(publication_is_current)
+
+        async def observe_and_save(is_current):
+            nonlocal publication_is_current
+            publication_is_current = is_current
+            if not is_current():
+                return
             self._mark_slot_identity_states(slots)
             # Record identity from the published view, the same view every later
             # SMART request keys off. Observing the pre-backfill view instead
@@ -3631,7 +3685,7 @@ class InventoryService:
                 (key, self._smart_cache_generation_token(key))
                 for key in (self._smart_cache_key(slot) for slot in slots)
             )
-            await asyncio.to_thread(save)
+            await _drain_inventory_worker(asyncio.get_running_loop().run_in_executor(None, save))
 
         # The worker owns these request-local slots until it finishes. Retain the
         # caller's snapshot lock/activity through repeated cancellation, including
@@ -3779,6 +3833,8 @@ class InventoryService:
                 return None
             return stored.model_copy(update={"identity_unknown": True})
 
+        if smart_summary is not None and self._smart_summary_identity_conflicts(slot_view, smart_summary):
+            return None
         identifiers = sorted(self._slot_detail_identifiers(slot_view))
         if not identifiers:
             return None
@@ -4723,16 +4779,19 @@ class InventoryService:
                 # A prime that could not finish leaves this slot on the per-slot
                 # path; only a programming error is allowed to fail the request.
                 payloads = None
-        async with (request_semaphore or nullcontext()), self._smart_operation_semaphore:
-            summary = await self._load_uncached_smart_summary(
-                slot_view,
-                cache_key=cache_key,
-                candidates=candidates,
-                generation_token=generation_token,
-                allow_stale_cache=allow_stale_cache,
-                detail_batch=detail_batch,
-                core_payloads=payloads,
-            )
+        try:
+            async with (request_semaphore or nullcontext()), self._smart_operation_semaphore:
+                summary = await self._load_uncached_smart_summary(
+                    slot_view,
+                    cache_key=cache_key,
+                    candidates=candidates,
+                    generation_token=generation_token,
+                    allow_stale_cache=allow_stale_cache,
+                    detail_batch=detail_batch,
+                    core_payloads=payloads,
+                )
+        except _SmartIdentityConflict:
+            return SmartSummaryView(available=False, message="SMART response identifies a different disk; refresh inventory and retry.")
         if not self._smart_request_is_current(cache_key, generation_token):
             return self._replaced_disk_smart_summary()
         if summary.available is False:
@@ -4894,7 +4953,7 @@ class InventoryService:
 
             api_summary = self._merge_smart_summary(
                 slot_view,
-                SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
+                self._parse_smart_payload_for_slot(slot_view, payload),
             )
             api_candidate = candidate
             break
@@ -4913,9 +4972,7 @@ class InventoryService:
                 else:
                     api_summary = self._merge_missing_smart_fields(
                         api_summary,
-                        SmartSummaryView.model_validate(
-                            parse_smartctl_text_enrichment(enrichment_payload)
-                        ),
+                        self._parse_smart_payload_for_slot(slot_view, enrichment_payload, text=True),
                     )
             if self._summary_prefers_core_ssh_json(api_summary, slot_view, candidates):
                 ssh_summary, _ssh_error = await self._fetch_smart_summary_over_ssh(
@@ -5040,9 +5097,14 @@ class InventoryService:
                                     # is opened for - cost more than v0.23.0 did.
                                     continue
                                 payloads[future] = (payload, None)
-                                summary = self._merge_smart_summary(
-                                    slot, SmartSummaryView.model_validate(parse_smartctl_summary(payload)),
-                                )
+                                try:
+                                    summary = self._merge_smart_summary(
+                                        slot, self._parse_smart_payload_for_slot(slot, payload),
+                                    )
+                                except _SmartIdentityConflict:
+                                    # The slot loader rejects this raw payload;
+                                    # it must not retry or poison its batch peers.
+                                    continue
                                 if "smartctl-text" in self._smart_enrichment_plan(summary, slot, candidates)[1]:
                                     text_selected.append(item)
                             if text_selected:
@@ -5215,9 +5277,7 @@ class InventoryService:
         def parse_primary(result: SSHCommandResult | None) -> SmartSummaryView | None:
             if result is None or not result.stdout.strip():
                 return None
-            candidate_summary = SmartSummaryView.model_validate(
-                parse_smartctl_summary(result.stdout)
-            )
+            candidate_summary = self._parse_smart_payload_for_slot(slot_view, result.stdout)
             # smartctl commonly returns advisory non-zero exit codes even when
             # the JSON payload is intact and contains useful SMART data.
             if (
@@ -5318,9 +5378,7 @@ class InventoryService:
                     if text_result is not None and text_result.stdout.strip():
                         summary = self._merge_missing_smart_fields(
                             summary,
-                            SmartSummaryView.model_validate(
-                                parse_smartctl_text_enrichment(text_result.stdout)
-                            ),
+                            self._parse_smart_payload_for_slot(slot_view, text_result.stdout, text=True),
                         )
                     nvme_summary = self._parse_linux_nvme_enrichment_results(
                         nvme_parsers,
@@ -6814,32 +6872,34 @@ class InventoryService:
             ssh_data,
             enclosure_id=selected_option.id,
         )
-        disks_by_key: dict[str, DiskRecord] = {}
-        disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
-        disks_by_bmc_slot: dict[int, DiskRecord] = {}
-        disks_by_bmc_enclosure_slot: dict[tuple[str | None, int], DiskRecord] = {}
+        # A profile describes geometry, not a controller namespace. Keep every
+        # record, but admit only unique keys into the physical-placement indexes.
+        disks_by_key, disks_by_slot, _ = _index_disk_records(disk_records, "esxi")
+        key_counts = Counter(key for disk in disk_records for key in disk.lookup_keys)
+        disks_by_key = {key: disk for key, disk in disks_by_key.items() if key_counts[key] == 1}
+        physical_coordinates: dict[tuple[str | None, str | None, int], list[DiskRecord]] = {}
         for disk in disk_records:
-            for key in disk.lookup_keys:
-                disks_by_key[key] = disk
             if disk.slot is not None:
-                disks_by_slot[(selected_option.id, disk.slot)] = disk
-                disks_by_slot[(None, disk.slot)] = disk
-                disks_by_bmc_slot[disk.slot] = disk
-                enclosure_id = normalize_text(
-                    disk.raw.get("storcli_enclosure_id")
-                    or disk.raw.get("bmc_enclosure_id")
-                )
-                if enclosure_id:
-                    disks_by_bmc_enclosure_slot[(enclosure_id, disk.slot)] = disk
+                coordinate = (normalize_text(disk.raw.get("controller_id")),
+                              normalize_text(disk.raw.get("storcli_enclosure_id")), disk.slot)
+                physical_coordinates.setdefault(coordinate, []).append(disk)
+        disks_by_bmc_slot = {slot: disk for (enclosure, slot), disk in disks_by_slot.items() if enclosure is None}
+        if len(disks_by_bmc_slot) < len({disk.slot for disk in disk_records if disk.slot is not None}):
+            warnings.append("ESXi controller/enclosure coordinates overlap; ambiguous disks remain unplaced.")
 
         esxi_topology_members = self._build_esxi_topology_members(disk_records)
         slot_hints = selected_profile.slot_hints or {}
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
         bmc_disk_records = self._build_bmc_disk_records(bmc_inventory)
+        bmc_slot_counts = Counter(disk.slot for disk in bmc_disk_records)
+        bmc_serial_counts = Counter(key for disk in bmc_disk_records
+                                    for key in self._disk_record_serial_identity_keys(disk))
+        host_serial_counts = Counter(key for disk in disk_records
+                                     for key in self._disk_record_serial_identity_keys(disk))
         bmc_disks_by_slot = {
             disk.slot: disk
             for disk in bmc_disk_records
-            if isinstance(disk.slot, int)
+            if isinstance(disk.slot, int) and bmc_slot_counts[disk.slot] == 1
         }
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
@@ -6865,18 +6925,22 @@ class InventoryService:
                 "present": False if isinstance(bmc_slot_number, int) else None,
             }
             bmc_disk = bmc_disks_by_slot.get(bmc_slot_number) if isinstance(bmc_slot_number, int) else None
-            if bmc_disk is not None:
-                self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, bmc_disk)
-
+            if bmc_disk is None and bmc_slot_counts[bmc_slot_number] > 1:
+                raw_slot_status["bmc_observations"] = [
+                    {"source": "supermicro_bmc", "serial": observed.serial,
+                     "enclosure_id": observed.raw.get("bmc_enclosure_id"), "slot": observed.slot,
+                     "admission": "ambiguous-bay"}
+                    for observed in bmc_disk_records if observed.slot == bmc_slot_number
+                ]
             disk = None
             if bmc_disk is not None and isinstance(bmc_disk.slot, int):
                 bmc_enclosure_id = normalize_text(bmc_disk.raw.get("bmc_enclosure_id"))
-                if bmc_enclosure_id:
-                    disk = disks_by_bmc_enclosure_slot.get((bmc_enclosure_id, bmc_disk.slot))
-                if disk is None:
-                    disk = disks_by_bmc_slot.get(bmc_disk.slot)
-                if disk is None and bmc_disk.serial:
-                    disk = disks_by_key.get(bmc_disk.serial.lower())
+                # BMC controller numbers are not StorCLI controller numbers.
+                disk = disks_by_bmc_slot.get(bmc_disk.slot)
+                if disk is not None and bmc_enclosure_id and (
+                    normalize_text(disk.raw.get("storcli_enclosure_id")) != bmc_enclosure_id
+                ):
+                    disk = None
 
             if disk is None and isinstance(bmc_slot_number, int):
                 disk = disks_by_bmc_slot.get(bmc_slot_number)
@@ -6943,6 +7007,30 @@ class InventoryService:
                     ssh_data,
                 )
                 disk = resolution.disk
+            if bmc_disk is not None:
+                bmc_keys = self._disk_record_serial_identity_keys(bmc_disk)
+                host_keys = self._disk_record_serial_identity_keys(disk)
+                host_bay_rows = [rows for coordinate, rows in physical_coordinates.items()
+                                 if coordinate[2] == bmc_disk.slot]
+                coherent_match = (
+                    disk is not None and len(bmc_keys) == 1 and bmc_keys == host_keys
+                    and all(bmc_serial_counts[key] == host_serial_counts[key] == 1 for key in bmc_keys)
+                    and normalize_text(bmc_disk.raw.get("bmc_enclosure_id")) in {
+                        None, normalize_text(disk.raw.get("storcli_enclosure_id"))}
+                )
+                bmc_only = disk is None and not host_bay_rows and all(
+                    bmc_serial_counts[key] == 1 for key in bmc_keys)
+                if coherent_match or bmc_only:
+                    if disk is None:
+                        self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, bmc_disk)
+                    else:
+                        self._apply_bmc_serial_match_to_raw_slot_status(raw_slot_status, bmc_disk, disk)
+                else:
+                    raw_slot_status["bmc_observation"] = {
+                        "source": "supermicro_bmc", "serial": bmc_disk.serial,
+                        "enclosure_id": bmc_disk.raw.get("bmc_enclosure_id"),
+                        "slot": bmc_disk.slot, "admission": "identity-conflict-or-ambiguous",
+                    }
             raw_slot_status["mapping_resolution_source"] = resolution.source
             raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
             slot_view = self._build_slot_view(
@@ -10316,9 +10404,10 @@ class InventoryService:
                 tagged["ssh_host"] = tagged_host
                 tagged_targets.append(tagged)
             if tagged_targets:
-                payload["ses_targets"] = tagged_targets
+                payload["ses_targets"] = _merge_control_targets(tagged_targets, [])
 
         for enclosure in ssh_data.ses_enclosures:
+            enclosure.ssh_host = tagged_host
             for slot in enclosure.slots.values():
                 tagged_targets: list[dict[str, Any]] = []
                 for item in slot.control_targets:
@@ -10328,13 +10417,14 @@ class InventoryService:
                     tagged["ssh_host"] = tagged_host
                     tagged_targets.append(tagged)
                 if tagged_targets:
-                    slot.control_targets = tagged_targets
+                    slot.control_targets = _merge_control_targets(tagged_targets, [])
 
     @staticmethod
     def _augment_ses_targets_from_redundant_hosts(
         authoritative: ParsedSSHData,
         overlays: list[ParsedSSHData],
     ) -> ParsedSSHData:
+        authoritative_enclosures = list(authoritative.ses_enclosures)
         authoritative.ses_enclosures = _merge_ses_enclosures(
             [
                 *authoritative.ses_enclosures,
@@ -10350,16 +10440,26 @@ class InventoryService:
             if overlay is authoritative:
                 continue
             supplemental_candidates: dict[int, dict[str, Any]] = {}
-            for slot, payload in overlay.ses_slot_candidates.items():
-                if not isinstance(payload, dict):
+            for slot, primary in authoritative.ses_slot_candidates.items():
+                primary_enclosure = next((enclosure for enclosure in authoritative_enclosures
+                    if enclosure.enclosure_id == primary.get("enclosure_id")
+                    and enclosure.ses_device == primary.get("ses_device")), None)
+                if primary_enclosure is None:
                     continue
-                supplemental: dict[str, Any] = {}
-                if isinstance(payload.get("ses_targets"), list) and payload.get("ses_targets"):
-                    supplemental["ses_targets"] = payload.get("ses_targets")
-                if isinstance(payload.get("identify_active"), bool):
-                    supplemental["identify_active"] = payload.get("identify_active")
-                if supplemental:
-                    supplemental_candidates[slot] = supplemental
+                for payload in overlay.ses_slot_candidates.values():
+                    if not isinstance(payload, dict) or primary.get("ses_slot_number") is None:
+                        continue
+                    other_enclosure = next((enclosure for enclosure in overlay.ses_enclosures
+                        if enclosure.enclosure_id == payload.get("enclosure_id")
+                        and enclosure.ses_device == payload.get("ses_device")), None)
+                    if (other_enclosure is None
+                        or not _ses_enclosures_share_identity(primary_enclosure, other_enclosure)
+                        or primary.get("ses_slot_number") != payload.get("ses_slot_number")):
+                        continue
+                    supplemental_candidates[slot] = {
+                        "ses_targets": payload.get("ses_targets", []),
+                        "identify_active": payload.get("identify_active", False),
+                    }
             if supplemental_candidates:
                 authoritative.ses_slot_candidates = merge_slot_candidate_maps(
                     authoritative.ses_slot_candidates,
@@ -13855,7 +13955,44 @@ class InventoryService:
         )
 
     @staticmethod
+    def _smart_summary_identity_conflicts(slot_view: SlotView, summary: SmartSummaryView) -> bool:
+        # SAS addresses describe a path/port, not necessarily the disk's LUN.
+        # Compare overlapping disk identifiers; absence is not contradiction.
+        expected = slot_view.logical_unit_id
+        returned = summary.logical_unit_id
+        return bool(expected and returned and
+                    normalize_hex_identifier(expected) != normalize_hex_identifier(returned))
+
+    @staticmethod
+    def _parse_smart_payload_for_slot(
+        slot_view: SlotView | None, payload: str, *, text: bool = False,
+    ) -> SmartSummaryView:
+        parsed = parse_smartctl_text_enrichment(payload) if text else parse_smartctl_summary(payload)
+        summary = SmartSummaryView.model_validate(parsed)
+        if slot_view is None:
+            return summary
+        serial = None
+        if text:
+            match = re.search(r"^\s*Serial [Nn]umber:\s*(.+)$", payload, re.MULTILINE)
+            serial = normalize_text(match.group(1)) if match else None
+        else:
+            try:
+                raw = json.loads(payload)
+            except json.JSONDecodeError:
+                raw = None
+            if isinstance(raw, dict):
+                serial = normalize_text(raw.get("serial_number"))
+        expected_serial = normalize_text(slot_view.serial)
+        if (expected_serial and serial and expected_serial.lower() != serial.lower()) or (
+            InventoryService._smart_summary_identity_conflicts(slot_view, summary)
+        ):
+            raise _SmartIdentityConflict()
+        return summary
+
+    @staticmethod
     def _merge_smart_summary(slot_view: SlotView, summary: SmartSummaryView) -> SmartSummaryView:
+        if InventoryService._smart_summary_identity_conflicts(slot_view, summary):
+            raise _SmartIdentityConflict()
         summary.temperature_c = summary.temperature_c or slot_view.temperature_c
         summary.last_test_type = summary.last_test_type or slot_view.last_smart_test_type
         summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
