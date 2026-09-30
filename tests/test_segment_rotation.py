@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib
 import importlib.util
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -38,6 +41,40 @@ def _short_checkpoint_busy_wait():
 
 
 class LaterGenerationRotationRedTests(unittest.TestCase):
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux descriptor accounting")
+    def test_row_counts_close_connections_on_repeated_success_and_error_without_gc(self) -> None:
+        rotation = self._rotation_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for fail in (False, True):
+                with self.subTest(fail=fail):
+                    source = root / f"counts-{fail}.sqlite3"
+                    with closing(sqlite3.connect(source)) as connection:
+                        connection.executescript(SCHEMA)
+                        if fail:
+                            connection.execute("DROP TABLE metric_samples")
+                    gc.collect()
+                    was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        before = len(list(Path("/proc/self/fd").iterdir()))
+                        for _ in range(20):
+                            if fail:
+                                with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+                                    rotation._history_row_counts(source)
+                            else:
+                                self.assertEqual(rotation._history_row_counts(source), {
+                                    "slot_events": 0, "metric_samples": 0, "metric_rollups": 0,
+                                })
+                        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+                    finally:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always", ResourceWarning)
+                            gc.collect()
+                        if was_enabled:
+                            gc.enable()
+                    self.assertEqual([warning for warning in caught if warning.category is ResourceWarning], [])
+
     EXPECTED_PHASES = (
         "prepared",
         "segment-published",
