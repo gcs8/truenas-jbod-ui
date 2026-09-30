@@ -498,7 +498,7 @@ class SegmentedHistoryReader:
             or segment.coverage_end >= since_timestamp
         )
         if len(candidates) > self.max_segments_per_query:
-            raise ValueError("Segmented history query exceeds its segment limit.")
+            raise HistoryStorageUnavailableError("Segmented history query exceeds its segment limit.")
         return tuple(segment.path for segment in candidates)
 
     @contextmanager

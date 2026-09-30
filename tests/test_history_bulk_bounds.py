@@ -133,6 +133,92 @@ class HistoryBulkRouteBoundsTests(unittest.TestCase):
                 activation_pending_path(hot).unlink(missing_ok=True)
                 (root / MIGRATION_PENDING_MARKER).unlink(missing_ok=True)
 
+    def test_public_reads_report_selected_catalog_segment_cap_as_storage_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot = root / "hot.sqlite3"
+            catalog = root / "catalog.json"
+            hot_store = HistoryStore(str(hot), recover_unreadable_database=False)
+            now = datetime.now(timezone.utc)
+            segments = []
+            for index, age in enumerate((12, 1), start=1):
+                segment = root / f"segment-{index:04d}.sqlite3"
+                HistoryStore(str(segment), recover_unreadable_database=False)
+                observed = (now - timedelta(hours=age)).isoformat()
+                with closing(sqlite3.connect(segment)) as connection, connection:
+                    connection.execute("""INSERT INTO metric_samples (
+                        observed_at, system_id, enclosure_key, slot, slot_label,
+                        metric_name, value_integer
+                    ) VALUES (?, 'synthetic', 'front', 0, '0', 'temperature_c', 30)""", (observed,))
+                segments.append({
+                    "segment_id": segment.stem, "file_name": segment.name,
+                    "size_bytes": segment.stat().st_size,
+                    "sha256": hashlib.sha256(segment.read_bytes()).hexdigest(),
+                    "coverage_start": observed, "coverage_end": observed,
+                })
+            catalog.write_text(json.dumps({
+                "catalog_version": 1, "generation_id": "generation-0001", "complete": True,
+                "segments": segments,
+            }), encoding="utf-8")
+            hot_store.segment_catalog_path = catalog
+            reader = hot_store._segmented_reader()
+            self.assertIsNotNone(reader)
+            assert reader is not None
+            reader.max_segments_per_query = 1
+            document = {
+                "scopes": [{"system_id": "synthetic", "enclosure_id": "front", "slots": [0]}],
+                "metrics": ["temperature_c"], "event_limit": 0, "metric_limit": 1,
+            }
+            params = {
+                "system_id": "synthetic", "enclosure_id": "front", "slots": [0],
+                "metrics": ["temperature_c"], "event_limit": 0, "metric_limit": 1,
+            }
+            # Use the real cached reader and public ASGI routes, not a forced exception.
+            with patch.object(history_main, "store", hot_store):
+                for cap, window, since in (
+                    (1, "omitted", None),
+                    (1, "broad", (now - timedelta(hours=24)).isoformat()),
+                    (1, "narrow", (now - timedelta(hours=2)).isoformat()),
+                    (2, "restored", (now - timedelta(hours=24)).isoformat()),
+                ):
+                    reader.max_segments_per_query = cap
+                    since_params = {} if since is None else {"since": since}
+                    slot_params = {"system_id": "synthetic", "enclosure_id": "front"}
+                    requests = [
+                        ("GET", "/api/history/slots/0/metrics", {
+                            "params": {**slot_params, **since_params, "metric_name": "temperature_c", "limit": 1}}),
+                    ]
+                    # Events, including the slot bundle's events, always select all segments.
+                    if window != "narrow":
+                        requests.extend([
+                            ("GET", "/api/history/slots/0/events", {"params": slot_params}),
+                            ("GET", "/api/history/slots/0/bundle", {
+                                "params": {**slot_params, **since_params, "event_limit": 1}}),
+                        ])
+                    if since is not None:
+                        requests.extend([
+                            ("GET", "/api/history/scopes/slots", {"params": {**params, **since_params}}),
+                            ("POST", "/api/history/scopes/bundle", {"json": {**document, **since_params}}),
+                        ])
+                    expected = 503 if window in ("omitted", "broad") else 200
+                    for method, url, kwargs in requests:
+                        with self.subTest(cap=cap, window=window, method=method, url=url):
+                            response = self._http_request(method, url, **kwargs)
+                            self.assertEqual(response.status_code, expected, response.text)
+                            if expected == 503:
+                                self.assertEqual(response.json(), {"detail": history_main.HISTORY_UNAVAILABLE_DETAIL})
+                                self.assertNotIn(str(root), response.text)
+                                self.assertNotIn("segment limit", response.text)
+                    if cap == 1:
+                        invalid = self._http_request("POST", "/api/history/scopes/bundle", json={
+                            **document, "since": SINCE, "metrics": ["unknown"],
+                        })
+                        self.assertEqual(invalid.status_code, 422)
+                        oversized = self._http_request("POST", "/api/history/scopes/bundle", json={
+                            **document, "since": SINCE, "padding": "x" * 65536,
+                        })
+                        self.assertEqual(oversized.status_code, 413)
+
     @staticmethod
     def _request(body: bytes, *, content_type: bytes = b"application/json") -> Request:
         sent = False
