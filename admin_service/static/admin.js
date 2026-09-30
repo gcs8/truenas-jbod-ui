@@ -7844,14 +7844,22 @@
       const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true });
       if (!owner.owns()) return;
       if (refreshed === false) {
-        const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
         // Reconcile only the catalog captured before DELETE. A successful
         // state read replaces that object, even for an equal snapshot, and
         // takes precedence over this fallback, including a recreated same ID.
         if (state.profiles === submittedCatalog) {
           state.profiles = payload.profiles;
-          renderProfileCatalog();
         }
+      }
+      // Both admitted readback paths must invalidate the deleted selection
+      // before previewing or submitting this draft. Advance only after our
+      // synchronous edit, so it cannot retire this operation's own finalizer.
+      const draftBefore = setupDraftSnapshot();
+      renderProfileSetupDependencies();
+      recordSetupDraftChange(draftBefore);
+      owner.advance();
+      if (refreshed === false) {
+        const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
         renderSaveResult(elements.profileBuilderResult, message, payload);
         setBanner(message, "info");
         return;
@@ -7870,6 +7878,17 @@
     } finally {
       if (owner.owns()) renderProfileBuilder();
     }
+  }
+
+  function renderProfileSetupDependencies() {
+    renderProfileOptions();
+    renderProfilePreview();
+    renderProfileCatalog();
+    // Refresh catalog-derived storage choices/geometry, not the full editor:
+    // syncStorageViewEditorFromState would replace unrelated raw input drafts.
+    renderStorageViewTemplateOptions();
+    renderStorageViewList();
+    renderStorageViewPreview();
   }
 
   function renderAll({ trackSetupDraft = true } = {}) {

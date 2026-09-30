@@ -23,7 +23,7 @@ function deferred() {
 const helpers = ["captureAdminEditorOperation", "retireAdminEditorControls", "recordAdminEditorOutcome",
   "validBootstrapResult", "validSystemDeleteResult", "validGeneratedKeyResult", "validHaNodesResult",
   "validProfileDeleteResult", "fetchBootstrapResult", "isNonEmptyString", "requireMutationResult",
-  "describeMutationFailure", "adminRequestError", "validProfileSaveResult"];
+  "describeMutationFailure", "adminRequestError", "validProfileSaveResult", "renderProfileSetupDependencies"];
 const methods = ["saveCustomProfile", "bootstrapServiceAccount", "generateSshKey", "discoverQuantastorHaNodes", "deleteSelectedSystem", "deleteCustomProfile"];
 const transportHelpers = ["fetchJson", "fetchOrReportStopped", "sessionRemainingMs", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
 function fixture(method, { realTransport = false } = {}) {
@@ -76,6 +76,7 @@ function fixture(method, { realTransport = false } = {}) {
     getSystemById: id => state.systems.find(item => item.id === id), historyRowCountForSystem: () => 0,
     loadHistoryRowCounts: async () => {}, renderExistingSystems() {}, renderExistingSystemCatalog() {},
     renderProfileOptions() {}, renderProfilePreview() {}, renderProfileCatalog() {},
+    renderStorageViewTemplateOptions() {}, renderStorageViewList() {}, renderStorageViewPreview() {},
     loadProfileIntoBuilder: profile => { builderLoads++; elements.profileBuilderId.value = profile.id; state.profileBuilderGeneration++; },
     resetProfileBuilder: () => { builderLoads++; elements.profileBuilderId.value = ""; state.profileBuilderGeneration++; },
     renderProfileBuilder: () => renders.push("builder"), renderAll: () => renders.push("all"),
