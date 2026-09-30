@@ -293,6 +293,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   modes with 422. (#744)
 - Made interrupted rotation-recovery cleanup resumable by persisting its
   selected generation before retiring rollback evidence. (#751)
+- Kept history bundles on one mutable-source read snapshot, retained distinct
+  replacement-disk rollups, and reported storage failures separately from invalid
+  requests. Added chronological indexes for hot and newly sealed history; existing
+  immutable segments retain their older query path. (#875)
 - Complete retained segmented rollup points across all eligible sources before
   returning bounded results, preserving counts, extrema and weighted values. (#755)
 - Keep required QuantaStor inventory available when optional REST endpoints
