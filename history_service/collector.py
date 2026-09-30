@@ -135,6 +135,7 @@ class HistoryCollector:
         self.last_fast_metrics_at: str | None = None
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
+        self._startup_collection_attempted = False
         self.last_backup_at: str | None = None
         self.last_retention_at: str | None = None
         self.last_retention_backup_at: str | None = None
@@ -278,6 +279,10 @@ class HistoryCollector:
         cached_root_only: bool = False,
     ) -> None:
         self._raise_if_stopping()
+        if self.current_collection_kind == "background":
+            # Spend the startup shortcut only on an admitted background attempt.
+            # Failure must not trap healthy siblings behind an untrusted root.
+            self._startup_collection_attempted = True
         run_started = utcnow()
         observed_at = isoformat_utc(run_started)
         collect_fast = force_fast or (
@@ -783,7 +788,9 @@ class HistoryCollector:
                 continue
             started_monotonic = time.perf_counter()
             try:
-                force_startup_collection = self.last_success_at is None
+                force_startup_collection = (
+                    self.last_success_at is None and not self._startup_collection_attempted
+                )
                 self.next_collection_at = None
                 run_kwargs = (
                     {

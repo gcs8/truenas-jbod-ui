@@ -11566,6 +11566,232 @@ class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
 
 
+class HistoryStartupProgressTests(unittest.IsolatedAsyncioTestCase):
+    """Drive real background passes with synthetic transport and a virtual clock."""
+
+    async def asyncSetUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.settings = HistorySettings(
+            sqlite_path=str(root / "history.db"), backup_dir=str(root / "backups"),
+            startup_grace_seconds=0, poll_interval_seconds=60,
+            failure_backoff_initial_seconds=5, failure_backoff_max_seconds=12,
+        )
+        self.store = HistoryStore(self.settings.sqlite_path)
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.untrusted_systems: set[str] = set()
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.stop_on_inventory = False
+        self.collector = HistoryCollector(self.settings, self.store)
+        transport = patch.object(HistoryCollector, "_fetch_json_sync", side_effect=self._source)
+        transport.start()
+        self.addCleanup(transport.stop)
+        # Seed only synthetic history through the real collection/store path.
+        with patch("history_service.collector.utcnow", return_value=self.now - timedelta(minutes=5)):
+            await self.collector.run_once(force_fast=True, force_slow=True, include_due_intervals=False)
+        self.before_counts = self.store.counts()
+        self.before_records = self._records()
+        self.collector = HistoryCollector(self.settings, self.store)
+        self.calls.clear()
+
+    def _source(self, path, params, method, body, headers, timeout):
+        self.calls.append((path, dict(params)))
+        if path == "/api/inventory":
+            if self.stop_on_inventory:
+                self.collector._stopping.set()
+            system = params.get("system_id", "system-a")
+            trusted = system not in self.untrusted_systems
+            return {
+                "systems": [{"id": "system-a"}, {"id": "system-b"}],
+                "selected_system_id": system, "selected_system_platform": "core",
+                "sources": {"api": {"enabled": True, "ok": trusted}},
+                "slots": [{"slot": 0, "present": trusted,
+                           "serial": f"SANITIZED-{system}" if trusted else None,
+                           "state": "healthy" if trusted else "empty"}],
+            }
+        if path == "/api/storage-views":
+            return {"views": []}
+        if path.endswith("smart-batch"):
+            return {"summaries": [{"slot": 0, "summary": {
+                "available": True, "smart_health_status": "PASSED", "temperature_c": 30,
+                "power_on_hours": 100,
+            }}]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    def _records(self):
+        return {system: self.store.get_slot_state(system, None, 0)
+                for system in ("system-a", "system-b")}
+
+    async def _background_passes(self, count, after_wait=None):
+        frames = []
+
+        async def wait_for_next_pass():
+            frames.append({
+                "at": isoformat_utc(self.now), "status": self.collector.status(),
+                "counts": self.store.counts(), "records": self._records(),
+                "degraded": self.collector.degraded_reason(), "calls": list(self.calls),
+            })
+            if after_wait:
+                after_wait(len(frames))
+            if len(frames) == count:
+                self.collector._stopping.set()
+                return
+            # Advance to the real scheduler's deadline, not past its backoff gate.
+            if self.collector.next_collection_at is None:
+                # The busy pre-check sleeps without publishing a deadline.
+                self.assertEqual(self.calls, [])
+                self.now += timedelta(seconds=min(self.settings.poll_interval_seconds, 30))
+            else:
+                self.assertGreater(self.collector.next_collection_at, self.now)
+                self.now = self.collector.next_collection_at
+            raise asyncio.TimeoutError
+
+        with (
+            patch("history_service.collector.utcnow", side_effect=lambda: self.now),
+            patch("history_service.collector.time.perf_counter", return_value=100.0),
+            patch.object(self.collector._stopping, "wait", side_effect=wait_for_next_pass),
+        ):
+            await self.collector._run_loop()
+        self.assertFalse(self.collector.collection_running)
+        return frames
+
+    def _root_modes(self, frames):
+        return [next(stage["cached_root_only"]
+                     for stage in frame["status"]["collection_stage_timings"]
+                     if stage["stage"] == "inventory.root") for frame in frames]
+
+    def _assert_rejected(self, frame, failures, delay):
+        status = frame["status"]
+        for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at",
+                      "last_slow_metrics_at", "last_backup_at", "last_retention_attempt_at",
+                      "last_smart_evidence_at"):
+            self.assertIsNone(status[field], field)
+        self.assertEqual(status["last_error_kind"], "source_error_reply")
+        self.assertEqual(status["last_error_summary"], "The main UI reported an error for this request.")
+        self.assertEqual(status["background_consecutive_failures"], failures)
+        self.assertEqual(status["background_backoff_delay_seconds"], delay)
+        self.assertEqual(status["background_backoff_seconds_remaining"], delay)
+        deadline = isoformat_utc(datetime.fromisoformat(frame["at"]) + timedelta(seconds=delay))
+        self.assertEqual(status["background_backoff_until"], deadline)
+        self.assertEqual(status["next_collection_at"], deadline)
+        self.assertEqual(frame["counts"], self.before_counts)
+        self.assertEqual(frame["records"], self.before_records)
+        self.assertIsNotNone(frame["degraded"])
+        self.assertFalse(any(stage["stage"].startswith("db.")
+                             for stage in status["collection_stage_timings"]))
+
+    async def test_untrusted_startup_root_retries_full_fleet_and_collects_healthy_sibling(self):
+        self.untrusted_systems = {"system-a"}
+        frames = await self._background_passes(2)
+        self._assert_rejected(frames[0], 1, 5)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        self.assertEqual(frames[0]["calls"], [("/api/inventory", {})])
+        status = frames[1]["status"]
+        self.assertEqual(status["last_success_at"], frames[1]["at"])
+        for field in ("last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at"):
+            self.assertEqual(status[field], frames[1]["at"])
+        self.assertEqual(status["background_consecutive_failures"], 0)
+        self.assertIsNone(status["background_backoff_until"])
+        self.assertIsNone(status["last_error_summary"])
+        self.assertEqual(frames[1]["degraded"],
+                         "Some history inventory scopes were unavailable; collection was partial.")
+        self.assertGreater(frames[1]["counts"]["metric_sample_count"], self.before_counts["metric_sample_count"])
+        self.assertEqual(frames[1]["records"]["system-a"], self.before_records["system-a"])
+        self.assertEqual([stage["system_id"] for stage in status["collection_stage_timings"]
+                          if stage["stage"] == "db.slot_state"], ["system-b"])
+        for system in self.before_records:
+            self.assertEqual(self.store.list_slot_events(system, None, 0), [])
+
+    async def test_all_untrusted_startup_retries_preserve_history_and_backoff_until_recovery(self):
+        self.untrusted_systems = {"system-a", "system-b"}
+
+        def recover_after_third_failure(wait_count):
+            if wait_count == 3:
+                self.untrusted_systems.clear()
+
+        frames = await self._background_passes(4, recover_after_third_failure)
+        for frame, failures, delay in zip(frames[:3], (1, 2, 3), (5, 10, 12), strict=True):
+            self._assert_rejected(frame, failures, delay)
+        self.assertEqual(self._root_modes(frames), [True, False, False, False])
+        recovered = frames[3]["status"]
+        self.assertEqual(recovered["last_success_at"], frames[3]["at"])
+        self.assertEqual(recovered["background_consecutive_failures"], 0)
+        self.assertEqual(recovered["background_backoff_delay_seconds"], 0)
+        self.assertIsNone(recovered["background_backoff_until"])
+        self.assertIsNone(recovered["last_error_summary"])
+        self.assertIsNone(frames[3]["degraded"])
+        self.assertEqual(recovered["last_smart_evidence_at"], frames[3]["at"])
+        self.assertGreater(frames[3]["counts"]["metric_sample_count"], self.before_counts["metric_sample_count"])
+        for system in self.before_records:
+            self.assertEqual(self.store.list_slot_events(system, None, 0), [])
+
+    async def test_healthy_startup_root_stays_cached_fast_only_before_full_fleet(self):
+        frames = await self._background_passes(2)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        first = frames[0]["status"]
+        self.assertEqual(first["last_success_at"], frames[0]["at"])
+        self.assertEqual(first["last_fast_metrics_at"], frames[0]["at"])
+        self.assertIsNone(first["last_slow_metrics_at"])
+        self.assertFalse(first["last_collection_inventory_forced"])
+        self.assertEqual([params for path, params in frames[0]["calls"] if path == "/api/inventory"], [{}])
+        self.assertEqual(first["background_consecutive_failures"], 0)
+        self.assertIsNone(frames[1]["degraded"])
+        self.assertEqual(frames[1]["status"]["last_slow_metrics_at"], frames[1]["at"])
+
+    async def test_failed_manual_pass_does_not_consume_background_startup_attempt(self):
+        self.untrusted_systems = {"system-a", "system-b"}
+        with self.assertRaises(HistorySourceError):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False)
+        self.assertIsNone(self.collector.last_success_at)
+        self.assertEqual(self.collector.background_consecutive_failures, 0)
+        self.untrusted_systems = {"system-a"}
+        self.calls.clear()
+        frames = await self._background_passes(2)
+        self._assert_rejected(frames[0], 1, 5)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        self.assertEqual(frames[1]["status"]["last_success_at"], frames[1]["at"])
+
+    async def test_busy_and_paused_skips_leave_first_real_background_attempt_cached(self):
+        self.collector._run_lock.acquire()
+
+        def release_after_busy_then_acknowledge_pause(wait_count):
+            if wait_count == 1:
+                self.collector._run_lock.release()
+                self.store.record_collection_pause(self.now)
+            elif wait_count == 2:
+                self.store.clear_collection_pause()
+
+        frames = await self._background_passes(3, release_after_busy_then_acknowledge_pause)
+        for frame in frames[:2]:
+            self.assertEqual(frame["calls"], [])
+            self.assertEqual(frame["counts"], self.before_counts)
+            self.assertIsNone(frame["status"]["last_success_at"])
+            self.assertEqual(frame["status"]["background_consecutive_failures"], 0)
+        self.assertEqual(self._root_modes(frames[2:]), [True])
+        self.assertEqual(frames[2]["status"]["last_success_at"], frames[2]["at"])
+
+    async def test_successful_manual_pass_bypasses_cached_background_startup(self):
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False)
+        self.assertEqual(self.collector.last_success_at, isoformat_utc(self.now))
+        self.calls.clear()
+        frames = await self._background_passes(1)
+        self.assertEqual(self._root_modes(frames), [False])
+        self.assertEqual(frames[0]["status"]["last_success_at"], frames[0]["at"])
+
+    async def test_stop_after_root_transport_prevents_writes_and_does_not_record_failure(self):
+        self.stop_on_inventory = True
+        await self.collector._run_loop()
+        self.assertEqual(self.calls, [("/api/inventory", {})])
+        self.assertEqual(self.store.counts(), self.before_counts)
+        self.assertEqual(self._records(), self.before_records)
+        self.assertIsNone(self.collector.last_success_at)
+        self.assertIsNone(self.collector.last_error_kind)
+        self.assertEqual(self.collector.background_consecutive_failures, 0)
+        self.assertFalse(self.collector.collection_running)
+
+
 class HistoryFleetSweepStatusTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory()

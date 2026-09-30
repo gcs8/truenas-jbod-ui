@@ -321,7 +321,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   from the scheduler and refused a short or altered transfer instead of
   passing it on. (#818)
 - Reported all-failed fleet history sweeps as failures and partially collected
-  sweeps as degraded, without losing healthy empty-fleet operation. (#876)
+  sweeps as degraded, without losing healthy empty-fleet operation; retried the
+  full fleet after an untrusted startup root instead of starving healthy systems.
+  (#876)
 - Kept scheduled full backups running when the config change journal cannot be
   read, and reported the journal problem as a failed config backup instead of
   stopping the scheduler. (#835)
