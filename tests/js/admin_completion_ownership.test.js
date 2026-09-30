@@ -115,7 +115,7 @@ function valid(method) {
   if (method === "deleteCustomProfile") return { ok: true, profile_id: "custom-a", deleted_label: "Custom A", profiles: [] };
   if (method === "generateSshKey") return { ok: true, key: { name: "key-a", runtime_private_path: "/app/data/ssh/key-a" }, keys: [{ name: "key-a" }] };
   if (method === "discoverQuantastorHaNodes") return { ok: true, nodes: [{ system_id: "node-a", label: "Node A", host: "node-a.example.test" }], host_discovery: { attempted: true, ok: false, message: "SSH enrichment unavailable." } };
-  if (method === "bootstrapServiceAccount") return { ok: true, host: "host-a.example.test", platform: "quantastor", service_user: "service-a", sudo_rules_installed: true, key_source: "synthetic", detail: "Provisioned service-a.", authorized_keys_path: "/home/service-a/.ssh/authorized_keys" };
+  if (method === "bootstrapServiceAccount") return { ok: true, host: "host-a.example.test", platform: "quantastor", service_user: "service-a", sudo_rules_installed: true, key_source: "synthetic", detail: "Provisioned service-a.", authorized_keys_path: "/path/to/service-a/.ssh/authorized_keys" };
   return { ok: true, system_id: "system-a", deleted_label: "System A", systems: [{ id: "system-b", label: "System B" }], default_system_id: "system-b", history_purge: { requested: false, ok: true, summary: null, detail: "Saved history left in place." } };
 }
 async function settle(probe, result) {
