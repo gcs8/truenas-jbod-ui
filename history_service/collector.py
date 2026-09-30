@@ -316,6 +316,12 @@ class HistoryCollector:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        # HTTP success does not make a failed platform inventory authoritative.
+        untrusted_scopes = [scope for scope in scopes if not self._should_record_scope_snapshot(scope.snapshot)]
+        for scope in untrusted_scopes:
+            self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
+        if untrusted_scopes:
+            self._scope_enumeration_complete = False
         smart_scope_unavailable = not self._scope_enumeration_complete
         self._raise_if_stopping()
         self._record_collection_stage(
@@ -326,7 +332,9 @@ class HistoryCollector:
         )
         self.last_scope_count = len(scopes)
         # A deliberately selected cached root is not a failed fleet census.
-        enumeration_failed = not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
+        enumeration_failed = bool(untrusted_scopes) or (
+            not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
+        )
         if enumeration_failed:
             if not any(self._should_record_scope_snapshot(scope.snapshot) for scope in scopes):
                 self._scope_collection_degraded_reason = "No trusted history inventory scopes were available."
@@ -341,7 +349,6 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
-                self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
                 smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
