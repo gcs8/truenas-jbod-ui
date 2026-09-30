@@ -332,6 +332,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Checked the length and SHA-256 of a backup copy the admin service downloads
   from the scheduler and refused a short or altered transfer instead of
   passing it on. (#818)
+- Reported all-failed fleet history sweeps as failures and partially collected
+  sweeps as degraded, without losing healthy empty-fleet operation; retried the
+  full fleet after an untrusted startup root instead of starving healthy systems.
+  (#876)
 - Kept scheduled full backups running when the config change journal cannot be
   read, and reported the journal problem as a failed config backup instead of
   stopping the scheduler. (#835)
@@ -854,6 +858,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Closed owned SQLite connections explicitly during history rotation, migration
+  and sealing, including fault paths. (#877)
 - The release QA scripts run end to end again. The Compose runtime matrix
   maps a slot with the system scope alone when the smoke fixture's unreachable
   source yields no enclosure, instead of stopping with "physical mapping scope

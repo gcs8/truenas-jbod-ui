@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sqlite3
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +23,93 @@ class SimulatedMigrationCrash(BaseException):
 
 
 class SegmentedHistoryMigrationCliTests(unittest.TestCase):
+    def test_schema_contract_closes_owned_memory_connections_on_success_and_error_without_gc(self) -> None:
+        real_connect = sqlite3.connect
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                connections = []
+
+                def connect(*args, **kwargs):
+                    connection = real_connect(*args, **kwargs)
+                    connections.append(connection)
+                    return connection
+
+                was_enabled = gc.isenabled()
+                gc.disable()
+                try:
+                    with patch.object(sqlite3, "connect", side_effect=connect), patch.object(
+                        segment_migration, "SCHEMA", SCHEMA + ("\nINVALID SQL;" if fail else ""),
+                    ):
+                        for _ in range(10):
+                            segment_migration._current_history_schema_contract.cache_clear()
+                            if fail:
+                                with self.assertRaises(sqlite3.OperationalError):
+                                    segment_migration._current_history_schema_contract()
+                            else:
+                                tables, triggers = segment_migration._current_history_schema_contract()
+                                self.assertIn("slot_events", dict(tables))
+                                self.assertIsInstance(triggers, tuple)
+                            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+                                connections[-1].execute("SELECT 1")
+                finally:
+                    for connection in connections:
+                        connection.close()
+                    segment_migration._current_history_schema_contract.cache_clear()
+                    if was_enabled:
+                        gc.enable()
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux descriptor accounting")
+    def test_hot_staging_closes_connections_on_repeated_success_and_faults_without_gc(self) -> None:
+        cutoff = "2025-01-02T00:00:00+00:00"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for fault in (None, "destination-open", "prune"):
+                with self.subTest(fault=fault):
+                    source = root / f"stage-{fault}.sqlite3"
+                    self._create_source_database(source)
+                    if fault == "prune":
+                        with closing(sqlite3.connect(source)) as connection:
+                            connection.executescript("""
+                                CREATE TRIGGER refuse_prune BEFORE DELETE ON metric_samples
+                                BEGIN SELECT RAISE(ABORT, 'synthetic prune fault'); END;
+                            """)
+                    original = source.read_bytes()
+                    real_connect = sqlite3.connect
+
+                    def connect(database, *args, **kwargs):
+                        if fault == "destination-open" and isinstance(database, Path):
+                            raise sqlite3.OperationalError("synthetic destination fault")
+                        return real_connect(database, *args, **kwargs)
+
+                    gc.collect()
+                    was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        before = len(list(Path("/proc/self/fd").iterdir()))
+                        with patch.object(sqlite3, "connect", side_effect=connect):
+                            for _ in range(10):
+                                if fault is not None:
+                                    with self.assertRaisesRegex(sqlite3.Error, "synthetic .* fault"):
+                                        segment_migration._stage_hot_replacement(source, cutoff)
+                                else:
+                                    staged = segment_migration._stage_hot_replacement(source, cutoff)
+                                    with closing(real_connect(staged)) as connection:
+                                        self.assertEqual(connection.execute(
+                                            "SELECT observed_at FROM slot_events",
+                                        ).fetchall(), [(cutoff,)])
+                                        self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
+                                    staged.unlink()
+                                self.assertEqual(list(root.glob(f".{source.name}.segmented-*")), [])
+                                self.assertEqual(source.read_bytes(), original)
+                        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+                    finally:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always", ResourceWarning)
+                            gc.collect()
+                        if was_enabled:
+                            gc.enable()
+                    self.assertEqual([warning for warning in caught if warning.category is ResourceWarning], [])
+
     def test_future_schema_refused_before_artifacts_for_api_and_cli(self) -> None:
         for cli in (False, True):
             for apply in (False, True):

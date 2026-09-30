@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -173,9 +174,9 @@ def _copy_and_prune(source: Path, destination: Path, cutoff: str) -> dict[str, i
     # The source is quiesced and sidecar-free by contract. immutable=1 keeps a
     # WAL-header hot from growing -wal/-shm that the next preflight would refuse.
     source_uri = f"{source.resolve().as_uri()}?mode=ro&immutable=1"
-    with sqlite3.connect(source_uri, uri=True) as source_connection:
+    with closing(sqlite3.connect(source_uri, uri=True)) as source_connection:
         source_connection.execute("PRAGMA query_only = ON")
-        with sqlite3.connect(destination) as destination_connection:
+        with closing(sqlite3.connect(destination)) as destination_connection:
             source_connection.backup(destination_connection)
             destination_connection.execute("PRAGMA journal_mode = DELETE")
             _history_coverage(destination_connection)
@@ -199,7 +200,7 @@ def _copy_and_prune(source: Path, destination: Path, cutoff: str) -> dict[str, i
 
 
 def _segment_coverage(path: Path) -> tuple[str, str]:
-    with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as connection:
         coverage = _history_coverage(connection)
     if coverage is None:
         raise ValueError("History segment contains no historical rows before the cutoff.")

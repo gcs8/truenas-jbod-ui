@@ -49,7 +49,7 @@ def _current_history_schema_contract() -> tuple[
     tuple[tuple[str, tuple[str, ...]], ...],
     tuple[str, ...],
 ]:
-    with sqlite3.connect(":memory:") as connection:
+    with closing(sqlite3.connect(":memory:")) as connection:
         connection.executescript(SCHEMA)
         table_names = tuple(
             str(row[0])
@@ -351,9 +351,11 @@ def _stage_hot_replacement(source: Path, cutoff: str) -> Path:
         descriptor = -1
         # The source is quiesced and sidecar-free by contract. immutable=1 keeps a
         # WAL-header hot from growing -wal/-shm that the next preflight would refuse.
-        with sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as source_connection:
+        with closing(sqlite3.connect(
+            f"{source.resolve().as_uri()}?mode=ro&immutable=1", uri=True,
+        )) as source_connection:
             source_connection.execute("PRAGMA query_only = ON")
-            with sqlite3.connect(temporary_path) as replacement_connection:
+            with closing(sqlite3.connect(temporary_path)) as replacement_connection:
                 source_connection.backup(replacement_connection)
                 replacement_connection.execute("PRAGMA journal_mode = DELETE")
                 with replacement_connection:
