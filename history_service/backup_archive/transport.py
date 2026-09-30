@@ -367,9 +367,6 @@ class LocalDirectoryTarget(_TargetBase):
         self._confine_to = Path(confine_to) if confine_to is not None else None
         self._local_archive_root = Path(local_archive_root) if local_archive_root is not None else None
         self._root_real: Path | None = None
-        # Keep these until a complete publication barrier succeeds, including
-        # across failed uploads and retries on this target.
-        self._pending_directory_entries: list[Path] = []
         # The scheduler supplies policy-wide identity admission. It must run at
         # each mutation, including when lifecycle reuses an already-open target.
         self.before_mutation: Callable[[], None] = lambda: None
@@ -393,8 +390,7 @@ class LocalDirectoryTarget(_TargetBase):
             except FileExistsError:
                 if not directory.is_dir():
                     raise
-            else:
-                self._pending_directory_entries.append(directory.parent)
+
         if not self._root.is_dir():
             raise ArchiveTransportError("Archive root is not a directory.")
         real = Path(os.path.realpath(self._root))
@@ -425,8 +421,6 @@ class LocalDirectoryTarget(_TargetBase):
                     os.mkdir(current, 0o750)
                 except FileExistsError:
                     pass
-                else:
-                    self._pending_directory_entries.append(current.parent)
             try:
                 metadata = os.lstat(current)
             except FileNotFoundError:
@@ -468,14 +462,16 @@ class LocalDirectoryTarget(_TargetBase):
                 raise
         stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
         try:
-            # Persist every newly created ancestor's name in its containing
-            # directory, in creation order, before granting copy/retention credit.
-            for parent in self._pending_directory_entries:
-                self._fsync_dir(parent)
-            self._fsync_dir(final.parent)
+            # Existence is not durability evidence: a previous job/target may
+            # have left this hierarchy after a rejected or uncertain upload.
+            # Re-establish every containing-directory barrier for each put,
+            # from the filesystem root (or confined mount) through the leaf.
+            boundary = Path(os.path.realpath(self._confine_to)) if self._confine_to is not None else Path(final.anchor)
+            for directory in (*reversed(final.parent.parents), final.parent):
+                if directory == boundary or boundary in directory.parents:
+                    self._fsync_dir(directory)
         except OSError as exc:
             raise ArchivePublicationUncertainError(stored) from exc
-        self._pending_directory_entries.clear()
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
 
     @staticmethod

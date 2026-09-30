@@ -218,37 +218,39 @@ class SettingsTests(_TempCase):
 
 
 class FilesystemTargetTests(_TempCase):
-    def test_first_publication_persists_every_created_directory_entry(self) -> None:
+    def test_publication_rechecks_every_containing_directory_on_fresh_targets(self) -> None:
         for new_root in (False, True):
-            with self.subTest(new_root=new_root):
-                base = self.tmp / str(new_root)
-                base.mkdir()
-                root = base / "namespace" / "archive" if new_root else base
-                target = transport.LocalDirectoryTarget(root)
-                expected = [base, base / "namespace"] if new_root else []
-                expected += [root, root / "full", root / "full/nested"]
-                barriers = []
-                original = os.fsync
+            for confined in (False, True):
+                with self.subTest(new_root=new_root, confined=confined):
+                    base = self.tmp / f"{new_root}-{confined}"
+                    base.mkdir()
+                    root = base / "namespace" / "archive" if new_root else base
+                    boundary = base if confined else None
+                    leaf = root / "full/nested"
+                    expected = [*reversed(leaf.parents), leaf]
+                    if confined:
+                        expected = expected[expected.index(base):]
+                    barriers = []
+                    original = os.fsync
 
-                def synced(fd):
-                    info = os.fstat(fd)
-                    if stat.S_ISDIR(info.st_mode):
-                        for path in expected:
-                            meta = path.stat()
-                            if (info.st_dev, info.st_ino) == (meta.st_dev, meta.st_ino):
-                                barriers.append(path)
-                    return original(fd)
+                    def synced(fd):
+                        info = os.fstat(fd)
+                        if stat.S_ISDIR(info.st_mode):
+                            # Include ancestors above the fixture, so a confined
+                            # mount must prove it never syncs outside the export.
+                            for path in [*reversed(leaf.parents), leaf]:
+                                meta = path.stat()
+                                if (info.st_dev, info.st_ino) == (meta.st_dev, meta.st_ino):
+                                    barriers.append(path)
+                        return original(fd)
 
-                with mock.patch.object(os, "fsync", side_effect=synced):
-                    stored = target.put(self.source(b"synthetic"), "full/nested/first.enc")
-                self.assertTrue(stored.verified)
-                self.assertEqual(barriers, expected)
-                # An already-established hierarchy needs only the leaf barrier.
-                barriers.clear()
-                target = transport.LocalDirectoryTarget(root)
-                with mock.patch.object(os, "fsync", side_effect=synced):
-                    self.assertTrue(target.put(self.source(b"retry"), "full/nested/second.enc").verified)
-                self.assertEqual(barriers, [root / "full/nested"])
+                    for run in range(2):
+                        barriers.clear()
+                        target = transport.LocalDirectoryTarget(root, confine_to=boundary)
+                        with mock.patch.object(os, "fsync", side_effect=synced):
+                            stored = target.put(self.source(b"synthetic"), f"full/nested/copy-{run}.enc")
+                        self.assertTrue(stored.verified)
+                        self.assertEqual(barriers, expected)
 
     def test_each_first_use_barrier_failure_accounts_for_published_bytes(self) -> None:
         import errno
@@ -265,7 +267,7 @@ class FilesystemTargetTests(_TempCase):
                     attempted = []
 
                     def opened(path, flags, *args, **kwargs):
-                        if flags & os.O_DIRECTORY:
+                        if flags & os.O_DIRECTORY and Path(path) in required:
                             attempted.append(Path(path))
                             if operation == "open" and Path(path) == required[fail_index]:
                                 raise OSError(errno.EIO, "synthetic barrier failure")
@@ -282,26 +284,75 @@ class FilesystemTargetTests(_TempCase):
                     with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
                         with self.assertRaises(ArchivePublicationUncertainError) as caught:
                             target.put(self.source(b"synthetic"), "full/nested/first.enc")
-                    self.assertEqual(attempted, required[:fail_index + 1])
-                    self.assertEqual(caught.exception.stored, StoredObject("full/nested/first.enc", 9, _sha(b"synthetic"), False))
+                        self.assertEqual(attempted, required[:fail_index + 1])
+                        self.assertEqual(caught.exception.stored, StoredObject("full/nested/first.enc", 9, _sha(b"synthetic"), False))
+                        # A fresh target must retry the still-failing ancestor,
+                        # not reinterpret visible directories as durable ones.
+                        target = transport.LocalDirectoryTarget(root)
+                        with self.assertRaises(ArchivePublicationUncertainError) as retried:
+                            target.put(self.source(b"retry"), "full/nested/uncertain.enc")
+                        self.assertFalse(retried.exception.stored.verified)
+                        self.assertEqual(attempted, required[:fail_index + 1] * 2)
                     self.assertEqual((root / "full/nested/first.enc").read_bytes(), b"synthetic")
-                    self.assertFalse((root / "full/nested/first.enc.partial").exists())
-                    # Reusing a target must not forget an unconfirmed barrier.
+                    self.assertEqual((root / "full/nested/uncertain.enc").read_bytes(), b"retry")
+                    self.assertFalse(list((root / "full/nested").glob("*.partial")))
+                    # Same-instance recovery also rechecks the complete chain.
                     with mock.patch.object(target, "_fsync_dir", wraps=target._fsync_dir) as sync:
                         self.assertTrue(target.put(self.source(b"retry"), "full/nested/retry.enc").verified)
-                    self.assertEqual([call.args[0] for call in sync.call_args_list], required)
+                    leaf = root / "full/nested"
+                    self.assertEqual([call.args[0] for call in sync.call_args_list], [*reversed(leaf.parents), leaf])
 
-    def test_failed_upload_retains_pending_first_use_barriers_for_retry(self) -> None:
-        root = self.tmp / "namespace/archive"
-        target = transport.LocalDirectoryTarget(root)
-        with mock.patch.object(transport, "_hash_stream", return_value=(1, "0" * 64)):
-            with self.assertRaises(ArchiveVerificationError):
-                target.put(self.source(b"synthetic"), "full/first.enc")
-        self.assertEqual(list((root / "full").iterdir()), [])
-        with mock.patch.object(target, "_fsync_dir", wraps=target._fsync_dir) as sync:
-            self.assertTrue(target.put(self.source(b"retry"), "full/retry.enc").verified)
-        self.assertEqual([call.args[0] for call in sync.call_args_list],
-                         [self.tmp, self.tmp / "namespace", root, root / "full"])
+    def test_fresh_target_after_readback_rejection_rechecks_containing_barriers(self) -> None:
+        import errno
+
+        for fail_index in range(5):
+            for operation in ("open", "fsync"):
+                with self.subTest(fail_index=fail_index, operation=operation):
+                    base = self.tmp / f"rejected-{fail_index}-{operation}"
+                    base.mkdir()
+                    root = base / "namespace/archive"
+                    settings = ArchiveTargetSettings(target_id="local", provider="filesystem", root=str(root))
+                    required = [base, base / "namespace", root, root / "full", root / "full/nested"]
+                    with open_target(settings) as rejected:
+                        with mock.patch.object(transport, "_hash_stream", return_value=(1, "0" * 64)):
+                            with self.assertRaises(ArchiveVerificationError):
+                                rejected.put(self.source(b"synthetic"), "full/nested/first.enc")
+                    self.assertEqual(list((root / "full/nested").iterdir()), [])
+                    original_open, original_sync = os.open, os.fsync
+                    attempted = []
+
+                    def opened(path, flags, *args, **kwargs):
+                        if flags & os.O_DIRECTORY and Path(path) in required:
+                            attempted.append(Path(path))
+                            if operation == "open" and Path(path) == required[fail_index]:
+                                raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    def synced(fd):
+                        info, failed = os.fstat(fd), required[fail_index].stat()
+                        if (operation == "fsync" and stat.S_ISDIR(info.st_mode)
+                                and (info.st_dev, info.st_ino) == (failed.st_dev, failed.st_ino)):
+                            raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_sync(fd)
+
+                    # Keep the same fault active across two genuinely fresh connections.
+                    with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
+                        for run in range(2):
+                            with open_target(settings) as retry:
+                                self.assertIsNot(retry, rejected)
+                                with self.assertRaises(ArchivePublicationUncertainError) as caught:
+                                    retry.put(self.source(b"retry"), f"full/nested/retry-{run}.enc")
+                            self.assertFalse(caught.exception.stored.verified)
+                            self.assertEqual((root / caught.exception.stored.name).read_bytes(), b"retry")
+                            self.assertEqual(attempted, required[:fail_index + 1] * (run + 1))
+                    # No process-local memory is needed when the barrier recovers.
+                    with open_target(settings) as recovered:
+                        assert isinstance(recovered, transport.LocalDirectoryTarget)
+                        with mock.patch.object(recovered, "_fsync_dir", wraps=recovered._fsync_dir) as sync:
+                            self.assertTrue(recovered.put(self.source(b"recovered"), "full/nested/recovered.enc").verified)
+                    self.assertEqual([call.args[0] for call in sync.call_args_list if call.args[0] in required], required)
+                    self.assertEqual(sorted(p.name for p in (root / "full/nested").iterdir()),
+                                     ["recovered.enc", "retry-0.enc", "retry-1.enc"])
 
     def test_local_upload_readback_rejects_excess_before_publication(self) -> None:
         root = self.tmp / "local-readback"
