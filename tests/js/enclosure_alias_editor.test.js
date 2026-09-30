@@ -254,6 +254,148 @@ test("live navigation closes an alias draft before changing selection", () => {
   );
 });
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function aliasCompletionFixture() {
+  const post = deferred();
+  const effects = { statuses: [], rejections: [], refreshes: [], inputFocus: 0, buttonFocus: 0 };
+  const state = {
+    snapshotMode: false, selectedStorageViewRuntimeId: "",
+    selectedSystemId: "system-a", selectedEnclosureId: "enc-a",
+    snapshot: { selected_system_id: "system-a", selected_enclosure_id: "enc-a" },
+    latestRefreshToken: 0, selectionEpoch: 0, mappingDraftRevision: 0,
+    enclosureAliasEditorOpen: false, enclosureAliasEditorScopeKey: null,
+    snapshotReuseCache: {
+      a: { selected_system_id: "system-a" },
+      sibling: { selected_system_id: "system-a" },
+      b: { selected_system_id: "system-b" },
+    },
+  };
+  const input = { value: "", focus() { effects.inputFocus += 1; }, select() {} };
+  const names = ["currentEnclosureAliasScopeKey", "enclosureAliasEditorAvailable",
+    "openEnclosureAliasEditor", "closeEnclosureAliasEditor", "submitEnclosureAlias"];
+  const fns = loadFunctions(names, {
+    state, enclosureAliasInput: input,
+    enclosureAliasForm: { classList: classList() },
+    enclosureAliasEditButton: { classList: classList([]), focus() { effects.buttonFocus += 1; } },
+    enclosureAliasRawHint: null,
+    getSelectedEnclosureOption: () => ({ id: state.selectedEnclosureId, alias: "Original" }),
+    currentLiveEnclosureId: () => state.selectedEnclosureId,
+    writeBlockedByPolicy: () => false,
+    fetchJson: () => post.promise,
+    handleWriteRejection: error => effects.rejections.push(error.message),
+    setStatus: (message, tone) => effects.statuses.push({ message, tone }),
+    refreshSnapshot: async (force, reason, ownsCompletion) => {
+      effects.refreshes.push({ force, reason, ownsCompletion });
+      state.latestRefreshToken += 1;
+    },
+  });
+  fns.openEnclosureAliasEditor();
+  input.value = "Submitted";
+  effects.inputFocus = 0;
+  return { state, input, effects, post, ...fns };
+}
+
+test("owned alias success closes the editor and invalidates only the source system cache", async () => {
+  const h = aliasCompletionFixture();
+  const pending = h.submitEnclosureAlias();
+  h.post.resolve({ ok: true });
+  await pending;
+  assert.equal(h.state.enclosureAliasEditorOpen, false);
+  assert.equal(h.effects.buttonFocus, 1);
+  assert.deepEqual(h.effects.statuses, [{ message: "Enclosure name saved.", tone: undefined }]);
+  assert.equal(h.effects.refreshes.length, 1);
+  assert.equal(h.effects.refreshes[0].force, true);
+  assert.deepEqual(Object.keys(h.state.snapshotReuseCache), ["b"]);
+});
+
+for (const outcome of ["success", "error"]) {
+  for (const successor of ["other-system", "other-enclosure", "return-to-A", "reopened-editor",
+    "later-typing", "refresh", "mapping-draft", "saved-view", "cancel", "offline-snapshot"]) {
+    test(`stale alias ${outcome} leaves ${successor} ownership untouched`, async () => {
+      const h = aliasCompletionFixture();
+      const pending = h.submitEnclosureAlias();
+      if (["other-system", "other-enclosure", "return-to-A"].includes(successor)) {
+        h.closeEnclosureAliasEditor();
+        h.state.selectionEpoch += 1;
+        h.state.selectedSystemId = successor === "other-system" ? "system-b" : "system-a";
+        h.state.selectedEnclosureId = "enc-b";
+        if (successor === "return-to-A") {
+          h.state.selectionEpoch += 1;
+          h.state.selectedEnclosureId = "enc-a";
+        }
+        h.openEnclosureAliasEditor();
+        h.input.value = "Successor draft";
+      } else if (successor === "reopened-editor") {
+        h.closeEnclosureAliasEditor();
+        h.openEnclosureAliasEditor();
+        // Even an identical draft belongs to the newer editor visit.
+        h.input.value = "Submitted";
+      } else if (successor === "later-typing") h.input.value = "Later typing";
+      else if (successor === "refresh") h.state.latestRefreshToken += 1;
+      else if (successor === "mapping-draft") {
+        h.state.mappingDraftRevision += 1;
+        h.state.mappingFormDirty = true;
+      } else if (successor === "cancel") h.closeEnclosureAliasEditor();
+      else if (successor === "offline-snapshot") h.state.snapshotMode = true;
+      else h.state.selectedStorageViewRuntimeId = "saved-chassis";
+      const before = { open: h.state.enclosureAliasEditorOpen, value: h.input.value,
+        inputFocus: h.effects.inputFocus, buttonFocus: h.effects.buttonFocus };
+      if (outcome === "success") h.post.resolve({ ok: true });
+      else h.post.reject(new Error("Synthetic alias refusal"));
+      await pending;
+      assert.deepEqual({ open: h.state.enclosureAliasEditorOpen, value: h.input.value,
+        inputFocus: h.effects.inputFocus, buttonFocus: h.effects.buttonFocus }, before);
+      assert.deepEqual(h.effects.statuses, []);
+      assert.deepEqual(h.effects.rejections, []);
+      assert.deepEqual(h.effects.refreshes, []);
+      assert.deepEqual(Object.keys(h.state.snapshotReuseCache), outcome === "success" ? ["b"] : ["a", "sibling", "b"]);
+    });
+  }
+}
+
+test("alias readback admission retires when a newer editor opens", async () => {
+  const h = aliasCompletionFixture();
+  const pending = h.submitEnclosureAlias();
+  h.post.resolve({ ok: true });
+  await pending;
+  const guard = h.effects.refreshes[0].ownsCompletion;
+  assert.equal(typeof guard, "function");
+  assert.equal(guard(), true);
+  h.openEnclosureAliasEditor();
+  h.input.value = "Submitted";
+  assert.equal(guard(), false);
+});
+
+test("a newer alias submission owns completion even with an identical draft", async () => {
+  const h = aliasCompletionFixture();
+  const first = h.submitEnclosureAlias();
+  const second = h.submitEnclosureAlias();
+  h.post.resolve({ ok: true });
+  await Promise.all([first, second]);
+  assert.equal(h.effects.buttonFocus, 1);
+  assert.equal(h.effects.statuses.length, 1);
+  assert.equal(h.effects.refreshes.length, 1);
+});
+
+test("owned alias success does not force-refresh an already dirty mapping form", async () => {
+  const h = aliasCompletionFixture();
+  h.state.mappingFormDirty = true;
+  const pending = h.submitEnclosureAlias();
+  h.post.resolve({ ok: true });
+  await pending;
+  assert.equal(h.state.enclosureAliasEditorOpen, false);
+  assert.equal(h.effects.statuses[0].message, "Enclosure name saved.");
+  assert.deepEqual(h.effects.refreshes, []);
+  assert.equal(h.state.mappingFormDirty, true);
+  assert.deepEqual(Object.keys(h.state.snapshotReuseCache), ["b"]);
+});
+
 test("blank submit clears the base enclosure alias and refreshes the live snapshot", async () => {
   const requests = [];
   let refreshed = 0;
@@ -263,8 +405,10 @@ test("blank submit clears the base enclosure alias and refreshes the live snapsh
     selectedStorageViewRuntimeId: "",
     selectedSystemId: "system-a",
     selectedEnclosureId: "enc-a::drawer-top",
+    enclosureAliasEditorOpen: true,
+    enclosureAliasEditorScopeKey: JSON.stringify(["system-a", "enc-a"]),
   };
-  const { submitEnclosureAlias } = loadFunctions(["submitEnclosureAlias"], {
+  const { submitEnclosureAlias } = loadFunctions(["submitEnclosureAlias", "currentEnclosureAliasScopeKey", "enclosureAliasEditorAvailable"], {
     state,
     enclosureAliasInput: { value: "   " },
     getSelectedEnclosureOption: () => ({ id: "enc-a::drawer-top" }),
@@ -312,10 +456,12 @@ test("a rejected alias write reports the server detail and keeps the editor open
     selectedStorageViewRuntimeId: "",
     selectedSystemId: "system-a",
     selectedEnclosureId: "enc-a",
+    enclosureAliasEditorOpen: true,
+    enclosureAliasEditorScopeKey: JSON.stringify(["system-a", "enc-a"]),
     writePolicy: { enabled: true, mode: "basic", reason: "" },
   };
   const { submitEnclosureAlias, writeBlockedByPolicy, writePolicyAllowsWrites, writePolicyReason } = loadFunctions(
-    ["submitEnclosureAlias", "writeBlockedByPolicy", "writePolicyAllowsWrites", "writePolicyReason"],
+    ["submitEnclosureAlias", "currentEnclosureAliasScopeKey", "enclosureAliasEditorAvailable", "writeBlockedByPolicy", "writePolicyAllowsWrites", "writePolicyReason"],
     {
       state,
       enclosureAliasInput: { value: "Archive East", focus() { focused += 1; } },
