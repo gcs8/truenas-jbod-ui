@@ -257,8 +257,8 @@ test("catalog-only readback does not run form renderers or successor discovery",
   p.requests[1].resolve({ profiles: [valid("saveCustomProfile").profile], systems: [{ id: "system-a", label: "System A" }] });
   await run; assert.equal(p.snapshot(), before); assert.ok(!p.renders.includes("all"));
 });
-test("setup and builder input listeners advance revisions even when edits return to the original value", () => {
-  const p = fixture("saveCustomProfile"), setupHandlers = {}, builderHandlers = {};
+function bindEditorInputs(p) {
+  const setupHandlers = {}, builderHandlers = {};
   p.elements.adminViewButtons = []; p.elements.adminViewSwitches = [];
   p.elements.setupPanel = { addEventListener: (name, fn) => { setupHandlers[name] = fn; } };
   p.elements.profileBuilderLabel.matches = () => false;
@@ -272,6 +272,12 @@ test("setup and builder input listeners advance revisions even when edits return
   p.state.storageViewTemplates = [];
   const bindSource = source.slice(source.indexOf("  function bindEvents() {"), source.indexOf("\n  if (elements.backupExportStopToggle)"));
   vm.runInContext(`${bindSource}\nbindEvents();`, p.context);
+  return { setupHandlers, builderHandlers };
+}
+
+test("setup and builder input listeners advance revisions even when edits return to the original value", () => {
+  const p = fixture("saveCustomProfile");
+  const { setupHandlers, builderHandlers } = bindEditorInputs(p);
   setupHandlers.input({ target: {} }); setupHandlers.input({ target: {} });
   assert.equal(p.state.setupDraftRevision, 2);
   builderHandlers.input(); builderHandlers.input(); assert.equal(p.state.profileBuilderRevision, 2);
@@ -322,6 +328,91 @@ test("bootstrap finalizer does not release a newer same-visit bootstrap", async 
   p.requests[1].resolve(valid("bootstrapServiceAccount")); await second;
   assert.equal(p.elements.setupBootstrapButton.disabled, false);
 });
+function profileDeleteInputFixture() {
+  const p = fixture("deleteCustomProfile");
+  p.state.profiles = [{ id: "custom-a", label: "Custom A", is_custom: true, reference_count: 0 }];
+  vm.runInContext(["getProfileById", "profileReferenceCount", "describeProfileReferences"]
+    .map(name => functionSource(name)).join("\n"), p.context);
+  const { setupHandlers } = bindEditorInputs(p);
+  p.elements.setupSystemLabel = { value: "System A" };
+  p.editSetupLabel = () => {
+    p.elements.setupSystemLabel.value = "Later system label";
+    setupHandlers.input({ target: p.elements.setupSystemLabel });
+  };
+  return p;
+}
+
+for (const phase of ["DELETE", "readback"]) {
+  for (const failed of [false, true]) {
+    test(`profile delete setup input: ${phase} ${failed ? "refusal" : "success"} retires synchronously without stale finalizer`, async () => {
+      const p = profileDeleteInputFixture(), run = p.api.deleteCustomProfile();
+      assert.equal(p.requests.length, 1);
+      assert.equal(p.elements.profileBuilderDeleteButton.disabled, true);
+      if (phase === "readback") {
+        p.requests[0].resolve(valid("deleteCustomProfile"));
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+        assert.equal(p.refreshes.length, 1);
+      }
+      p.editSetupLabel();
+      assert.equal(p.state.setupDraftRevision, 1, "real setup input advances ownership");
+      assert.equal(p.state.profileBuilderRevision, 0, "builder was not edited");
+      assert.equal(p.elements.profileBuilderDeleteButton.disabled, false, "eligible Delete retires before any async completion");
+      const before = p.snapshot(), banners = p.banners.length, renders = p.renders.length;
+      if (phase === "DELETE") {
+        if (failed) p.requests[0].reject(new Error("Synthetic definite delete refusal"));
+        else await settle(p, valid("deleteCustomProfile"));
+      } else if (failed) p.refreshes[0].resolve(false); // Real refreshState reports failed reads as false.
+      else p.refreshes[0].resolve();
+      await run;
+      assert.equal(p.snapshot(), before, "no stale draft/result/control mutation");
+      assert.equal(p.state.loadedBuilderProfileId, "custom-a");
+      assert.equal(p.state.profiles.length, 1, "synthetic catalog retained");
+      assert.equal(p.banners.length, banners); assert.equal(p.renders.length, renders);
+      assert.equal(p.counts().builderLoads, 0);
+      assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome,
+        phase === "DELETE" && failed ? "error" : "success");
+    });
+  }
+}
+
+for (const failed of [false, true]) {
+  test(`profile delete setup input: successor action keeps controls through retired ${failed ? "refusal" : "success"}`, async () => {
+    const p = profileDeleteInputFixture(), first = p.api.deleteCustomProfile();
+    p.editSetupLabel();
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, false);
+    const second = p.api.deleteCustomProfile();
+    assert.equal(p.requests.length, 2, "eligible successor can dispatch");
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, true);
+    const before = p.snapshot(), banners = p.banners.length, renders = p.renders.length;
+    if (failed) p.requests[0].reject(new Error("Retired delete refusal"));
+    else await settle(p, valid("deleteCustomProfile"));
+    await first;
+    assert.equal(p.snapshot(), before); assert.equal(p.banners.length, banners); assert.equal(p.renders.length, renders);
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, true, "old finalizer cannot release successor work");
+    p.requests[1].resolve(valid("deleteCustomProfile"));
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    p.refreshes.at(-1).resolve(); await second;
+    assert.equal(p.counts().builderLoads, 1, "current successor applies its own success");
+    assert.equal(p.banners.at(-1).tone, "success");
+  });
+}
+
+for (const capability of ["eligible", "referenced", "built-in", "absent", "not loaded", "stopped session"]) {
+  test(`profile delete setup input: preserves ${capability} capability`, () => {
+    const p = profileDeleteInputFixture();
+    if (capability === "referenced") p.state.profiles[0].reference_count = 1;
+    if (capability === "built-in") p.state.profiles[0].is_custom = false;
+    if (capability === "absent") p.state.profiles = [];
+    if (capability === "not loaded") p.state.loadedBuilderProfileId = "";
+    if (capability === "stopped session") p.state.sessionStopped = true;
+    // Negative controls start enabled, so merely preserving stale disabled state cannot pass.
+    p.elements.profileBuilderDeleteButton.disabled = capability === "eligible";
+    p.editSetupLabel();
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, capability !== "eligible");
+    assert.equal(p.requests.length, 0); assert.equal(p.renders.length, 0);
+  });
+}
+
 test("saved custom profile options exist before auto-selection", async () => {
   const p = fixture("saveCustomProfile"); let value = "profile-a", refreshedOptions = false;
   p.context.renderProfileOptions = () => { refreshedOptions = true; };

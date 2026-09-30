@@ -5408,6 +5408,11 @@
       }
     }
     if (elements.profileBuilderSaveButton) elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
+    if (elements.profileBuilderDeleteButton) {
+      const loadedProfile = state.loadedBuilderProfileId ? getProfileById(state.loadedBuilderProfileId) : null;
+      elements.profileBuilderDeleteButton.disabled = Boolean(state.sessionStopped)
+        || !loadedProfile?.is_custom || profileReferenceCount(loadedProfile) > 0;
+    }
   }
 
   function recordAdminEditorOutcome(operation, target, outcome) {
