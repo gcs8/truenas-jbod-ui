@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -9,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 from unittest.mock import patch
@@ -19,6 +22,95 @@ from history_service.store import SCHEMA
 
 
 class SegmentSealerCliTests(unittest.TestCase):
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux descriptor accounting")
+    def test_copy_closes_connections_on_repeated_success_and_faults_without_gc(self) -> None:
+        cutoff = "2025-01-02T00:00:00+00:00"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for fault in (None, "destination-open", "prune"):
+                with self.subTest(fault=fault):
+                    source = root / f"source-{fault}.sqlite3"
+                    self._create_source_database(source)
+                    if fault == "prune":
+                        with closing(sqlite3.connect(source)) as connection:
+                            connection.executescript("""
+                                CREATE TRIGGER refuse_prune BEFORE DELETE ON metric_samples
+                                BEGIN SELECT RAISE(ABORT, 'synthetic prune fault'); END;
+                            """)
+                    original = source.read_bytes()
+                    real_connect = sqlite3.connect
+
+                    def connect(database, *args, **kwargs):
+                        if fault == "destination-open" and isinstance(database, Path):
+                            raise sqlite3.OperationalError("synthetic destination fault")
+                        return real_connect(database, *args, **kwargs)
+
+                    gc.collect()
+                    was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        before = len(list(Path("/proc/self/fd").iterdir()))
+                        with patch.object(sqlite3, "connect", side_effect=connect):
+                            for index in range(10):
+                                destination = root / f"copy-{fault}-{index}.sqlite3"
+                                if fault is not None:
+                                    with self.assertRaisesRegex(sqlite3.Error, "synthetic .* fault"):
+                                        segment_sealer._copy_and_prune(source, destination, cutoff)
+                                else:
+                                    self.assertEqual(segment_sealer._copy_and_prune(source, destination, cutoff), {
+                                        "slot_events": 1, "metric_samples": 1, "metric_rollups": 1,
+                                    })
+                                if destination.exists():
+                                    with closing(real_connect(destination)) as connection:
+                                        # A mid-prune fault must roll back the earlier slot-event deletion.
+                                        self.assertEqual(connection.execute(
+                                            "SELECT COUNT(*) FROM slot_events",
+                                        ).fetchone(), (2 if fault else 1,))
+                                        self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
+                                    destination.unlink()
+                                self.assertEqual(source.read_bytes(), original)
+                        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+                    finally:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always", ResourceWarning)
+                            gc.collect()
+                        if was_enabled:
+                            gc.enable()
+                    self.assertEqual([warning for warning in caught if warning.category is ResourceWarning], [])
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux descriptor accounting")
+    def test_coverage_closes_connections_on_repeated_success_and_error_without_gc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for invalid in (False, True):
+                with self.subTest(invalid=invalid):
+                    source = root / f"coverage-{invalid}.sqlite3"
+                    self._create_source_database(source)
+                    if invalid:
+                        with closing(sqlite3.connect(source)) as connection, connection:
+                            connection.execute("UPDATE slot_events SET observed_at = 'invalid'")
+                    gc.collect()
+                    was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        before = len(list(Path("/proc/self/fd").iterdir()))
+                        for _ in range(20):
+                            if invalid:
+                                with self.assertRaisesRegex(ValueError, "row timestamp"):
+                                    segment_sealer._segment_coverage(source)
+                            else:
+                                self.assertEqual(segment_sealer._segment_coverage(source), (
+                                    "2025-01-01T00:00:00+00:00", "2025-01-02T00:00:00+00:00",
+                                ))
+                        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+                    finally:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always", ResourceWarning)
+                            gc.collect()
+                        if was_enabled:
+                            gc.enable()
+                    self.assertEqual([warning for warning in caught if warning.category is ResourceWarning], [])
+
     def test_help_describes_value_shapes_without_creating_output(self) -> None:
         script = Path(__file__).resolve().parents[1] / "scripts/seal_history_segment.py"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -400,7 +492,7 @@ class SegmentSealerCliTests(unittest.TestCase):
 
     @staticmethod
     def _create_source_database(path: Path) -> None:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.executescript(SCHEMA)
             connection.execute(
                 """
