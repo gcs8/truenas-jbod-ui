@@ -842,6 +842,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Closed owned SQLite connections explicitly during history rotation, migration
+  and sealing, including fault paths. (#877)
 - The release QA scripts run end to end again. The Compose runtime matrix
   maps a slot with the system scope alone when the smoke fixture's unreachable
   source yields no enclosure, instead of stopping with "physical mapping scope
