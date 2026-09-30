@@ -48,7 +48,8 @@ function fixture(method, { realTransport = false } = {}) {
     profileBuilderGeneration: 1, profileBuilderRevision: 0, loadedBuilderProfileId: "custom-a",
     selectedProfileId: "profile-a", selectedExistingSystemId: "system-a", defaultSystemId: "system-a",
     haNodes: [{ system_id: "node-a", host: "node-a.example.test", label: "Node A" }], haNodesLoading: false,
-    systems: [{ id: "system-a", label: "System A" }, { id: "system-b", label: "System B" }], sshKeys: [], historyRowCounts: {} };
+    systems: [{ id: "system-a", label: "System A" }, { id: "system-b", label: "System B" }], sshKeys: [], historyRowCounts: {},
+    storageViews: [] };
   const draft = () => ({ id: elements.profileBuilderId.value, label: elements.profileBuilderLabel.value,
     source_profile_id: "base", rows: 1, columns: 2, slot_count: 2 });
   const bindings = { state, elements, URLSearchParams, AbortController, setTimeout, clearTimeout,
@@ -111,6 +112,22 @@ function fixture(method, { realTransport = false } = {}) {
   return { api: context.api, state, elements, requests, banners, refreshes, renders, change, snapshot,
     context, counts: () => ({ resets, builderLoads }) };
 }
+test("profile deletion fallback reconciles nonselected storage pins using the current catalog", async () => {
+  const p = fixture("deleteCustomProfile");
+  p.state.profiles = [{ id: "custom-a", label: "Custom A", is_custom: true }, { id: "custom-b", label: "Custom B" }];
+  p.state.storageViews = ["custom-a", "custom-b", "", "custom-a"].map((id, index) =>
+    ({ id: `view-${index}`, profile_id: id, label: `Unchanged ${index}` }));
+  // Use the production catalog lookup, not the fixture's permissive capability lookup.
+  vm.runInContext(functionSource("getProfileById"), p.context);
+  const run = p.api.deleteCustomProfile();
+  p.requests[0].resolve({ ...valid("deleteCustomProfile"), profiles: [p.state.profiles[1]] });
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  p.refreshes[0].resolve(false); await run;
+  assert.deepEqual(p.state.storageViews.map(view => view.profile_id), ["", "custom-b", "", ""]);
+  assert.deepEqual(p.state.storageViews.map(view => view.label), ["Unchanged 0", "Unchanged 1", "Unchanged 2", "Unchanged 3"]);
+  assert.equal(p.banners.at(-1).tone, "info");
+});
+
 function valid(method) {
   if (method === "saveCustomProfile") return { ok: true, profile: { id: "custom-a", label: "Custom A" }, profiles: [] };
   if (method === "deleteCustomProfile") return { ok: true, profile_id: "custom-a", deleted_label: "Custom A", profiles: [] };
