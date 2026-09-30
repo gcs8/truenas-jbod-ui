@@ -24,7 +24,12 @@ from history_service.segment_catalog import (
     activation_pending_path,
     path_entry_exists,
 )
-from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
+from history_service.segment_reader import (
+    MAX_HISTORY_QUERY_LIMIT,
+    HistoryStorageUnavailableError,
+    SegmentedHistoryReader,
+    metric_sample_identity,
+)
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
 logger = logging.getLogger(__name__)
@@ -453,6 +458,18 @@ CREATE INDEX IF NOT EXISTS idx_slot_events_scope
 CREATE INDEX IF NOT EXISTS idx_metric_samples_scope
     ON metric_samples (system_id, enclosure_key, slot, metric_name, observed_at DESC);
 
+-- Absolute-time ordering cannot use the older text-time indexes. These
+-- additive indexes are copied into newly sealed sources by SQLite backup.
+-- Already immutable segments retain their old schema and correct scan path.
+CREATE INDEX IF NOT EXISTS idx_slot_events_scope_chronological
+    ON slot_events (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_metric_samples_slot_chronological
+    ON metric_samples (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_metric_samples_scope_chronological
+    ON metric_samples (system_id, enclosure_key, slot, metric_name, julianday(observed_at) DESC, id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_slot_events_observed_at
     ON slot_events (observed_at, id);
 
@@ -714,6 +731,13 @@ class HistoryStore:
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
         if self.segment_catalog_path is None:
             return None
+        try:
+            return self._load_segmented_reader()
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise HistoryStorageUnavailableError(str(exc)) from exc
+
+    def _load_segmented_reader(self) -> SegmentedHistoryReader:
+        assert self.segment_catalog_path is not None
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise ValueError("Segmented history activation is pending.")
         pending_path = self.segment_catalog_path.parent / MIGRATION_PENDING_MARKER
@@ -1817,6 +1841,15 @@ class HistoryStore:
                 ON metric_samples (disk_identity_key, metric_name, observed_at DESC)
             """
         )
+        # Legacy sources can lack disk_identity_key until column admission.
+        for name, columns in (
+            ("idx_metric_samples_disk_chronological", "disk_identity_key"),
+            ("idx_metric_samples_disk_metric_chronological", "disk_identity_key, metric_name"),
+        ):
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS {name} ON metric_samples "
+                f"({columns}, julianday(observed_at) DESC, id DESC)"
+            )
 
     @staticmethod
     def _ensure_columns(
@@ -3062,6 +3095,7 @@ class HistoryStore:
             rows = connection.execute(
                 f"""
                 SELECT
+                    bucket_start,
 {ROLLUP_TO_SAMPLE_PROJECTION}
                 FROM metric_rollups
                 WHERE {' AND '.join(rollup_where)}
@@ -3213,19 +3247,7 @@ class HistoryStore:
         )
         merged_by_key: dict[Any, dict[str, Any]] = {}
         for item in [*disk_samples, *local_samples]:
-            item_id = item.get("id")
-            if item_id is not None:
-                key: Any = ("id", item_id)
-            else:
-                key = (
-                    item.get("observed_at"),
-                    item.get("metric_name"),
-                    item.get("system_id"),
-                    item.get("enclosure_key"),
-                    item.get("slot"),
-                    item.get("value"),
-                )
-            merged_by_key[key] = item
+            merged_by_key[metric_sample_identity(item)] = item
 
         return sorted(
             merged_by_key.values(),
@@ -3255,6 +3277,7 @@ class HistoryStore:
             )
         metric_limits = metric_limits or {}
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             return self._build_slot_history_bundle(
                 connection,
                 system_id,

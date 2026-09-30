@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
@@ -61,6 +62,7 @@ from history_service.startup import (
     open_history_store_with_retries,
 )
 from history_service.startup_migration import open_history_store_after_recovery
+from history_service.segment_reader import HistoryStorageUnavailableError
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -459,6 +461,13 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version=__version__, lifespan=lifespan)
+
+
+@app.exception_handler(HistoryStorageUnavailableError)
+@app.exception_handler(sqlite3.Error)
+async def history_storage_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    logger.warning("History storage read failed: %s", type(exc).__name__)
+    return JSONResponse({"detail": HISTORY_UNAVAILABLE_DETAIL}, status_code=503)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 install_metrics(app, service_name="enclosure-history", version=__version__)
 
@@ -837,15 +846,17 @@ async def scopes_history_bundle(request: Request) -> JSONResponse:
             event_limit=document["event_limit"],
             metric_limit=document["metric_limit"],
         )
-        scope_payloads, returned_rows = await _execute_admitted_history_plan(plan)
-    except HistoryReadBusy:
-        return _history_read_busy_response()
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         if isinstance(exc, HistoryBudgetExceeded):
             return _history_error_response(exc)
         return _history_error_response(
             exc if isinstance(exc, HistoryRequestShapeError) else HistoryRequestShapeError("invalid document")
         )
+    # Execution failures are storage/server failures, never document admission.
+    try:
+        scope_payloads, returned_rows = await _execute_admitted_history_plan(plan)
+    except HistoryReadBusy:
+        return _history_read_busy_response()
     budget = plan.with_result(returned_row_count=returned_rows, response_bytes=0).budget_metadata()
     return bounded_history_json_response({"scopes": scope_payloads, "budget": budget})
 
