@@ -264,7 +264,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Kept disk measurements and locate-light targets bound to qualified disk and
   enclosure identities across merged SES paths, and withheld obsolete snapshot
-  detail side effects, including initial discovery. (#874)
+  detail side effects through the final write guard, including initial
+  discovery and SMART identity observation. (#874)
 - Refuse aliased filesystem backup targets and failed directory persistence,
   and recover or account for scheduler-owned publications after catalog failure. (#839)
 - Recovered default inventory selection after topology changes, fenced stale

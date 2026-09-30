@@ -7,7 +7,9 @@ import itertools
 import inspect
 import json
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -859,6 +861,234 @@ class InventoryDiscoveryDetailPublicationTests(unittest.IsolatedAsyncioTestCase)
                 self.assertEqual(service.slot_detail_store.load_all(), {})
                 self.assertEqual(saved, [])
                 self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+
+    def seed_detail_identity(self, service, serial="SANITIZED-NEW"):
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+                        present=True, state=SlotState.healthy, device_name="da0", serial=serial)
+        service._mark_slot_identity_states([slot])
+        service._observe_smart_disk_identities([slot])
+        key = service._smart_cache_key(slot)
+        summary = SmartSummaryView(available=True, temperature_c=30)
+        until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        service._smart_cache[key] = summary
+        service._smart_cache_until[key] = until
+        service._smart_negative_cache[key] = (SmartSummaryView(available=False), until)
+        return slot, key, summary
+
+    @staticmethod
+    def detail_owned_state(service):
+        return (dict(service._smart_disk_identities), dict(service._smart_cache),
+                dict(service._smart_cache_until), dict(service._smart_negative_cache),
+                dict(service._smart_load_tasks), dict(service._smart_refresh_tasks),
+                set(service._identity_unknown_slots))
+
+    def pause_detail_write(self, service, *, after_commit=False, fail=False):
+        reached, release, finished = threading.Event(), threading.Event(), threading.Event()
+        guards = []
+        original = service.slot_detail_store._write
+
+        def write(entries, *, commit_guard=None):
+            @contextmanager
+            def recorded_guard():
+                with commit_guard() as valid:
+                    guards.append(valid)
+                    yield valid
+            try:
+                if after_commit:
+                    original(entries, commit_guard=recorded_guard)
+                reached.set()
+                if not release.wait(5):
+                    raise RuntimeError("Synthetic detail write barrier timed out")
+                if fail:
+                    raise OSError("Synthetic detail write failure")
+                if not after_commit:
+                    original(entries, commit_guard=recorded_guard)
+            finally:
+                finished.set()
+
+        service.slot_detail_store._write = write
+        self.addCleanup(release.set)
+        return reached, release, finished, guards
+
+    async def detail_request_service(self, warm, serial):
+        service = self.service()
+        if warm:
+            service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-BASE")
+            await service.get_snapshot()
+        service.truenas_client.fetch_all.return_value = self.raw(serial)
+        return service
+
+    async def test_final_guard_rejection_preserves_cold_and_warm_owned_state(self):
+        for warm in (False, True):
+            for current_serial, candidate in (("SANITIZED-NEW", "SANITIZED-OLD"),
+                                              (None, "SANITIZED-OLD"), ("SANITIZED-NEW", None)):
+                with self.subTest(warm=warm, candidate=candidate, current=current_serial):
+                    service = await self.detail_request_service(warm, candidate)
+                    current, key, summary = self.seed_detail_identity(service, current_serial)
+                    if candidate is None and not warm:
+                        service.slot_detail_store.save_entries([service._build_slot_detail_entry(
+                            current, smart_summary=None, loaded_entries={})])
+                    retained = asyncio.create_task(asyncio.Event().wait())
+                    service._smart_load_tasks[key] = retained
+                    service._smart_refresh_tasks[key] = retained
+                    baseline = self.detail_owned_state(service)
+                    disk_before = service.slot_detail_store.load_all()
+                    reached, release, finished, guards = self.pause_detail_write(service)
+                    task = asyncio.create_task(service.get_snapshot(force_refresh=warm))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                        before_guard = self.detail_owned_state(service)
+                        service.invalidate_snapshot_cache(reason="test.detail.final_guard", cache_keys=["other-shelf"])
+                        release.set()
+                        with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                            await asyncio.wait_for(task, 5)
+                        self.assertEqual(guards, [False])
+                        self.assertTrue(finished.is_set())
+                        self.assertEqual(service.slot_detail_store.load_all(), disk_before)
+                        self.assertEqual(before_guard, baseline)
+                        self.assertEqual(self.detail_owned_state(service), baseline)
+                        self.assertIs(service._smart_cache[key], summary)
+                        self.assertIs(service._smart_load_tasks[key], retained)
+                        self.assertFalse(retained.cancelled())
+                        self.assertFalse(service.slot_detail_store.file_path.with_suffix(".tmp").exists())
+                        self.assertIsNone(inventory_module._snapshot_detail_commits.get())
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)
+                        retained.cancel()
+                        await asyncio.gather(retained, return_exceptions=True)
+
+    async def test_accepted_final_guard_observes_only_after_cold_and_warm_save(self):
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                service = await self.detail_request_service(warm, "SANITIZED-NEW")
+                old, key, _ = self.seed_detail_identity(service, "SANITIZED-OLD")
+                generation = service._smart_cache_generation_token(key)
+                baseline = self.detail_owned_state(service)
+                reached, release, _, guards = self.pause_detail_write(service)
+                task = asyncio.create_task(service.get_snapshot(force_refresh=warm))
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    before_guard = self.detail_owned_state(service)
+                    release.set()
+                    snapshot = await asyncio.wait_for(task, 5)
+                    self.assertEqual(guards, [True])
+                    self.assertEqual(before_guard, baseline)
+                    new_key = service._smart_cache_key(snapshot.slots[0])
+                    self.assertEqual(service._smart_disk_identities[new_key[:4]], (new_key[5], generation[2] + 1))
+                    self.assertFalse(service._smart_request_is_current(service._smart_cache_key(old), generation))
+                    self.assertNotIn(key, service._smart_cache)
+                    self.assertEqual({row.slot_fields["serial"] for row in service.slot_detail_store.load_all().values()},
+                                     {"SANITIZED-NEW"})
+                    self.assertEqual(snapshot.slots[0].identity_state, "known")
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_newer_identity_owner_survives_before_and_after_final_write(self):
+        for after_commit in (False, True):
+            with self.subTest(after_commit=after_commit):
+                service = await self.detail_request_service(False, "SANITIZED-OLD")
+                self.seed_detail_identity(service)
+                reached, release, _, guards = self.pause_detail_write(service, after_commit=after_commit)
+                task = asyncio.create_task(service.get_snapshot())
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    _, key, summary = self.seed_detail_identity(service, "SANITIZED-SUCCESSOR")
+                    successor = self.detail_owned_state(service)
+                    release.set()
+                    with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                        await asyncio.wait_for(task, 5)
+                    self.assertEqual(guards, [after_commit])
+                    self.assertEqual(self.detail_owned_state(service), successor)
+                    self.assertIs(service._smart_cache[key], summary)
+                    self.assertEqual(service._cache, {})
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_target_invalidation_is_not_undone_by_rejected_detail_save(self):
+        service = await self.detail_request_service(False, "SANITIZED-OLD")
+        _, key, _ = self.seed_detail_identity(service)
+        reached, release, _, guards = self.pause_detail_write(service)
+        task = asyncio.create_task(service.get_snapshot())
+        try:
+            self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+            service.invalidate_snapshot_cache(reason="test.detail.target", cache_keys=["shelf-a"])
+            invalidated = self.detail_owned_state(service)
+            generation = service._smart_cache_generation_token(key)
+            release.set()
+            with self.assertRaises(inventory_module.SnapshotStateBusyError):
+                await asyncio.wait_for(task, 5)
+            self.assertEqual(guards, [False])
+            self.assertEqual(self.detail_owned_state(service), invalidated)
+            self.assertEqual(service._smart_cache_generation_token(key), generation)
+            self.assertNotIn(key, service._smart_cache)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_or_failed_detail_writer_drains_without_observation(self):
+        for cancel, fail in ((False, True), (True, False), (True, True)):
+            with self.subTest(cancel=cancel, fail=fail):
+                service = await self.detail_request_service(False, "SANITIZED-OLD")
+                self.seed_detail_identity(service)
+                baseline = self.detail_owned_state(service)
+                reached, release, finished, _ = self.pause_detail_write(service, fail=fail)
+                task = asyncio.create_task(service.get_snapshot())
+                try:
+                    self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+                    if cancel:
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        task.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(task.done())
+                        self.assertTrue(service._get_snapshot_lock("shelf-a").locked())
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError if cancel else OSError):
+                        await asyncio.wait_for(task, 5)
+                    self.assertTrue(finished.is_set())
+                    self.assertEqual(self.detail_owned_state(service), baseline)
+                    self.assertFalse(service._get_snapshot_lock("shelf-a").locked())
+                    self.assertEqual(service._cache, {})
+                    # No cancelled owner may detach a writer that races this retry.
+                    service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW")
+                    service.slot_detail_store._write = SlotDetailStore._write.__get__(service.slot_detail_store)
+                    successor = await service.get_snapshot(force_refresh=True)
+                    self.assertEqual(successor.slots[0].serial, "SANITIZED-NEW")
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    async def test_old_public_smart_cannot_overwrite_details_between_save_and_observation(self):
+        service = self.service()
+        service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-OLD")
+        old = await service.get_snapshot()
+        old_key = service._smart_cache_key(old.slots[0])
+        old_generation = service._smart_cache_generation_token(old_key)
+        service.truenas_client.fetch_all.return_value = self.raw("SANITIZED-NEW")
+        service.truenas_client.fetch_disk_smartctl.return_value = json.dumps({
+            "serial_number": "SANITIZED-OLD", "temperature": {"current": 66}})
+        reached, release, _, guards = self.pause_detail_write(service, after_commit=True)
+        task = asyncio.create_task(service.get_snapshot(force_refresh=True))
+        try:
+            self.assertTrue(await asyncio.to_thread(reached.wait, 5))
+            # The public cached OLD view remains available while the NEW save
+            # worker drains. Its fresh read loads the already replaced real file.
+            summary = await service.get_slot_smart_summary(0, selected_enclosure_id="shelf-a")
+            rows = service.slot_detail_store.load_all()
+            release.set()
+            snapshot = await asyncio.wait_for(task, 5)
+            self.assertEqual(guards, [True])
+            self.assertTrue(summary.available)
+            self.assertEqual({row.slot_fields["serial"] for row in rows.values()}, {"SANITIZED-NEW"})
+            self.assertEqual(snapshot.slots[0].serial, "SANITIZED-NEW")
+            self.assertFalse(service._smart_request_is_current(old_key, old_generation))
+            self.assertNotIn(old_key, service._smart_cache)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_cold_untrusted_quantastor_options_do_not_commit_details(self):
         service = self.service()

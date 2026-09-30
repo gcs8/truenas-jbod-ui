@@ -934,7 +934,7 @@ class SmartDetailBatch:
         service = self.generations[0][0]
         with service._smart_persistence_lock:
             yield all(
-                owner._smart_request_is_current(key, generation)
+                owner._smart_detail_request_is_current(key, generation)
                 for owner, key, generation in self.generations
             )
 
@@ -1103,6 +1103,9 @@ class InventoryService:
             tuple[SmartSummaryView, datetime],
         ] = OrderedDict()
         self._smart_persistence_lock = threading.Lock()
+        # A pending snapshot fences conflicting disk writes without observing
+        # its identity or detaching SMART owners before publication succeeds.
+        self._snapshot_detail_owners: dict[tuple, tuple[object, tuple[str, str]]] = {}
         # Bays whose most recently published view carried no strong identifier.
         # The layout-less SMART fallback has no slot view to gate on, so
         # it reads this instead of serving the previous occupant's data.
@@ -3655,14 +3658,21 @@ class InventoryService:
             return
         loaded: Mapping[str, SlotDetailCacheEntry] = {}
         generations: list[tuple[SmartCacheKey, SmartCacheGenerationToken]] = []
+        identities: dict[tuple, tuple[tuple[str, str], int] | None] = {}
         def publication_is_current() -> bool:
             return True
+
+        def ownership_is_current() -> bool:
+            return publication_is_current() and all(
+                self._smart_cache_generation_token(key) == generation
+                and self._smart_disk_identities.get(key[:4]) == identities[key[:4]]
+                for key, generation in generations
+            )
 
         @contextmanager
         def commit_guard():
             with self._smart_persistence_lock:
-                yield publication_is_current() and all(
-                    self._smart_request_is_current(key, generation) for key, generation in generations)
+                yield ownership_is_current()
 
         def apply():
             nonlocal loaded
@@ -3697,19 +3707,31 @@ class InventoryService:
             publication_is_current = is_current
             if not is_current():
                 return
-            self._mark_slot_identity_states(slots)
-            # Record identity from the published view, the same view every later
-            # SMART request keys off. Observing the pre-backfill view instead
-            # makes every slot whose serial came from the cache read as
-            # identity-changed for the rest of its life. Still on the loop, so
-            # the final-write fence is shared with retained SMART writers without
-            # being held over disk I/O.
-            self._observe_smart_disk_identities(slots)
-            generations.extend(
-                (key, self._smart_cache_generation_token(key))
-                for key in (self._smart_cache_key(slot) for slot in slots)
-            )
-            await _drain_inventory_worker(asyncio.get_running_loop().run_in_executor(None, save))
+            owner = object()
+            keys = [self._smart_cache_key(slot) for slot in slots]
+            with self._smart_persistence_lock:
+                if any(key[:4] in self._snapshot_detail_owners for key in keys):
+                    raise SnapshotStateBusyError()
+                for key in keys:
+                    identities[key[:4]] = self._smart_disk_identities.get(key[:4])
+                    generations.append((key, self._smart_cache_generation_token(key)))
+                    self._snapshot_detail_owners[key[:4]] = (owner, key[5])
+            try:
+                await _drain_inventory_worker(asyncio.get_running_loop().run_in_executor(None, save))
+                # A refused write, newer identity owner, invalidation or cancelled
+                # waiter cannot observe this candidate. No rollback is needed.
+                if not ownership_is_current():
+                    raise SnapshotStateBusyError()
+                # Observe the admitted, backfilled view on the loop. There is no
+                # suspension between this ownership check and observation.
+                self._mark_slot_identity_states(slots)
+                self._observe_smart_disk_identities(slots)
+            finally:
+                with self._smart_persistence_lock:
+                    for key in keys:
+                        pending = self._snapshot_detail_owners.get(key[:4])
+                        if pending is not None and pending[0] is owner:
+                            self._snapshot_detail_owners.pop(key[:4])
 
         # The worker owns these request-local slots until it finishes. Retain the
         # caller's snapshot lock/activity through repeated cancellation, including
@@ -4548,8 +4570,8 @@ class InventoryService:
         return ("unknown", normalize_text(slot_view.device_name) or "")
 
     def _observe_smart_disk_identities(self, slots: list[SlotView]) -> None:
-        # Observe before snapshot persistence can yield. Share the final-write
-        # fence with retained SMART writers, without holding it over disk I/O.
+        # Only admitted views observe identity. Share the final-write fence with
+        # retained SMART writers, without holding it over disk I/O.
         changed = set()
         with self._smart_persistence_lock:
             for slot in slots:
@@ -4573,6 +4595,12 @@ class InventoryService:
 
     def _smart_request_is_current(self, key: SmartCacheKey, generation: SmartCacheGenerationToken) -> bool:
         return self._smart_disk_is_current(key) and self._smart_cache_generation_token(key) == generation
+
+    def _smart_detail_request_is_current(self, key: SmartCacheKey, generation: SmartCacheGenerationToken) -> bool:
+        # The observed view may still be served during a snapshot save. It must
+        # not overwrite the candidate's file between replacement and observation.
+        pending = self._snapshot_detail_owners.get(key[:4])
+        return self._smart_request_is_current(key, generation) and (pending is None or pending[1] == key[5])
 
     @staticmethod
     def _replaced_disk_smart_summary() -> SmartSummaryView:
