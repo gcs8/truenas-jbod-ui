@@ -113,7 +113,7 @@ function fixture(selection = "custom-a", running = true) {
     "setup-storage-view-template-badge", "setup-storage-view-kind-badge", "setup-storage-view-preview-summary",
     "setup-storage-view-preview-grid", "setup-storage-view-preview-meta", "setup-storage-view-label",
     "setup-storage-view-id", "setup-storage-view-serials", "setup-storage-view-slot-labels",
-    "setup-create-button", "setup-result", "admin-banner"];
+    "setup-create-button", "setup-result", "admin-status-banner"];
   for (const id of new Set([...Object.keys(values), ...visual,
     "setup-ssh-enabled", "setup-verify-ssl", "setup-ssh-strict-host-key", "setup-make-default", "setup-ha-enabled"])) {
     const field = new Field(values[id] || "", selectIds.has(id) ? "select" : "input");
@@ -143,7 +143,7 @@ function fixture(selection = "custom-a", running = true) {
     cancelAnimationFrame: id => frames.delete(id),
     fetch: (url, options = {}) => {
       if (url === "/api/admin/history/orphaned") return Promise.resolve(response(200, { orphaned_systems: [] }));
-      assert.ok(url === "/api/admin/state" || url === "/api/admin/system-setup" || url === "/api/admin/profiles/custom-a",
+      assert.ok(url === "/api/admin/state" || url === "/api/admin/system-setup" || url === "/api/admin/profiles/custom-a" || url === "/api/admin/profiles",
         `unexpected synthetic transport path: ${url}`);
       return new Promise((resolve, reject) => requests.push({ url, options,
         reply: (body, status = 200) => resolve(response(status, body)), reject }));
@@ -180,12 +180,13 @@ function fixture(selection = "custom-a", running = true) {
 
 async function drain() { for (let i = 0; i < 80; i++) await Promise.resolve(); }
 async function completeDelete(p, readback, catalog = remainingProfiles()) {
+  const offset = p.requests.length;
   p.clickDelete();
-  assert.equal(p.requests[0].options.method, "DELETE", "real registered delete callback dispatched");
-  p.requests[0].reply(deleteResult()); await drain();
-  assert.equal(p.requests[1].url, "/api/admin/state", "real catalog-only readback dispatched");
-  if (readback === "success") p.requests[1].reply(p.statePayload(catalog));
-  else p.requests[1].reject(new Error("Synthetic readback failure"));
+  assert.equal(p.requests[offset].options.method, "DELETE", "real registered delete callback dispatched");
+  p.requests[offset].reply(deleteResult()); await drain();
+  assert.equal(p.requests[offset + 1].url, "/api/admin/state", "real catalog-only readback dispatched");
+  if (readback === "success") p.requests[offset + 1].reply(p.statePayload(catalog));
+  else p.requests[offset + 1].reject(new Error("Synthetic readback failure"));
   await drain(); p.paint();
   assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
   assert.match(p.elements.profileBuilderResult.textContent, readback === "success" ? /Deleted/ : /catalog refresh is unavailable/);
@@ -194,11 +195,124 @@ async function submittedSetup(p) {
   p.elements.setupCreateButton.dispatch("click"); await drain();
   const request = p.requests.find(item => item.url === "/api/admin/system-setup");
   assert.ok(request, "real registered save callback dispatched the actual payload");
+  assert.equal(request.options.method, "POST");
   const payload = JSON.parse(request.options.body);
   // Refuse the synthetic save, avoiding unrelated successful-save refresh work.
   request.reply({ detail: "Synthetic save refusal" }, 400); await drain();
   return payload;
 }
+
+function pinStorageProfile(p, selection) {
+  p.elements.setupStorageViewProfile.value = selection;
+  p.elements.setupStorageViewProfile.dispatch("change");
+  p.paint();
+  assert.equal(p.state.storageViews[0].profile_id, selection,
+    "real registered storage editor change recorded the explicit pin");
+  // Keep raw inputs newer than the normalized model after the change's paint.
+  p.elements.setupStorageViewLabel.value = "  New raw view label  ";
+  p.elements.setupStorageViewSlotLabels.value = "0: New raw slot label  \n";
+}
+
+for (const readback of ["success", "fallback"]) {
+  for (const selection of ["custom-a", "custom-b", ""]) {
+    for (const running of [true, false]) {
+      test(`profile delete storage: ${readback}, ${selection || "auto"}, runtime ${running ? "running" : "stopped"} actual POST agrees with model and preview`, async () => {
+        const p = fixture("custom-b", running);
+        pinStorageProfile(p, selection);
+        const raw = p.rawSnapshot(), revision = p.state.setupDraftRevision;
+        await completeDelete(p, readback);
+        const expected = selection === "custom-a" ? "" : selection;
+        const payload = await submittedSetup(p);
+        assert.equal(payload.storage_views[0].profile_id, expected || null,
+          "actual registered Create/Save POST cannot submit the deleted storage pin");
+        assert.equal(p.state.storageViews[0].profile_id, expected, "submitted model agrees with selector");
+        assert.equal(p.elements.setupStorageViewProfile.value, expected);
+        assert.match(p.elements.setupStorageViewPreviewSummary.textContent,
+          expected ? /saved chassis layout Readback B/ : /current live profile Readback B/);
+        assert.match(p.elements.setupStorageViewPreviewMeta.innerHTML, /4 slots/);
+        assert.equal(payload.default_profile_id, "custom-b");
+        assert.equal(payload.ssh_password, "  SYNTHETIC-SSH  ");
+        assert.equal(p.rawSnapshot(), raw, "catalog reconciliation preserves every unrelated raw draft field");
+        assert.equal(p.state.setupDraftRevision, revision + (selection === "custom-a" ? 1 : 0),
+          "storage-only submitted model changes advance ownership once");
+        assert.equal(p.elements.profileBuilderDeleteButton.disabled, true, "originating finalizer remains admitted");
+      });
+    }
+  }
+  for (const selected of ["custom-a", "custom-b"]) {
+    test(`profile delete storage: ${readback} clears nonselected pins while selected ${selected} and unrelated model fields survive`, async () => {
+      const p = fixture("custom-b"); pinStorageProfile(p, selected);
+      const view = p.state.storageViews[0];
+      p.state.storageViews.push(...["custom-a", "custom-b", ""].map((profileId, index) => ({
+        ...JSON.parse(JSON.stringify(view)), id: `other-view-${index}`, label: `Other view ${index}`,
+        profile_id: profileId, order: (index + 2) * 10,
+        layout_overrides: { slot_labels: { 0: "SANITIZED-SLOT" }, slot_sizes: {} },
+      })));
+      const before = JSON.parse(JSON.stringify(p.state.storageViews)), raw = p.rawSnapshot();
+      const revision = p.state.setupDraftRevision;
+      await completeDelete(p, readback);
+      const payload = await submittedSetup(p);
+      const expected = before.map(view => ({ ...view, profile_id: view.profile_id === "custom-a" ? "" : view.profile_id }));
+      assert.deepEqual(payload.storage_views.map(view => view.profile_id), expected.map(view => view.profile_id || null),
+        "actual POST reconciles all submitted views, not only the selected editor");
+      assert.deepEqual(JSON.parse(JSON.stringify(p.state.storageViews)), expected,
+        "only catalog-invalid model profile IDs change");
+      assert.equal(p.elements.setupStorageViewProfile.value, selected === "custom-a" ? "" : selected);
+      assert.equal(p.rawSnapshot(), raw);
+      assert.equal(p.state.setupDraftRevision, revision + 1, "multiple invalid pins are one synchronous draft change");
+    });
+  }
+  test(`profile delete storage: ${readback} later registered editor change cannot restore the deleted pin`, async () => {
+    const p = fixture(); pinStorageProfile(p, "custom-a");
+    await completeDelete(p, readback);
+    p.elements.setupStorageViewLabel.value = "Later edited label";
+    p.elements.setupStorageViewLabel.dispatch("change"); p.paint();
+    assert.equal((await submittedSetup(p)).storage_views[0].profile_id, null,
+      "normal editor save/normalization cannot resurrect a removed profile ID");
+    assert.equal(p.state.storageViews[0].profile_id, "");
+    assert.equal(p.elements.setupStorageViewProfile.value, "");
+    assert.match(p.elements.setupStorageViewPreviewSummary.textContent, /current live profile Readback B/);
+  });
+  test(`profile delete storage: ${readback} model-only invalidation retires an older registered profile save`, async () => {
+    const p = fixture("custom-b"); pinStorageProfile(p, "custom-a");
+    p.elements.profileBuilderSaveButton.dispatch("click"); await drain();
+    assert.equal(p.requests[0].url, "/api/admin/profiles");
+    assert.equal(p.requests[0].options.method, "POST", "real registered older profile save is pending");
+    await completeDelete(p, readback);
+    const before = p.controlsSnapshot(), banner = p.elements.banner.textContent;
+    p.requests[0].reply({ detail: "Synthetic older save refusal" }, 400); await drain(); p.paint();
+    assert.equal(p.controlsSnapshot(), before, "model revision fences the older error/result/finalizer");
+    assert.equal(p.elements.banner.textContent, banner, "older save cannot replace the deletion notification");
+    assert.equal((await submittedSetup(p)).storage_views[0].profile_id, null);
+  });
+}
+
+test("profile delete storage: model-only invalidation retires queued catalog read notification ownership", async () => {
+  const p = fixture("custom-b"); pinStorageProfile(p, "custom-a");
+  p.clickDelete(); p.requests[0].reply(deleteResult()); await drain();
+  const queued = p.api.refreshState({ quiet: false, catalogOnly: true });
+  p.requests[1].reject(new Error("Synthetic deletion readback failure")); await drain();
+  assert.equal(p.requests[2].url, "/api/admin/state", "real queued read starts after the deletion readback");
+  const banner = p.elements.banner.textContent;
+  assert.match(banner, /Deleted.*catalog refresh is unavailable/);
+  p.requests[2].reject(new Error("Synthetic queued read failure"));
+  assert.equal(await queued, false); await drain(); p.paint();
+  assert.equal(p.elements.banner.textContent, banner, "queued caller captured before the model revision cannot publish over it");
+  assert.equal((await submittedSetup(p)).storage_views[0].profile_id, null);
+});
+
+test("profile delete storage: successful current same-ID recreation preserves the explicit pin", async () => {
+  const p = fixture(); pinStorageProfile(p, "custom-a");
+  const revision = p.state.setupDraftRevision, raw = p.rawSnapshot();
+  await completeDelete(p, "success", [profile("custom-a", 5, "Recreated A"), ...remainingProfiles()]);
+  assert.equal((await submittedSetup(p)).storage_views[0].profile_id, "custom-a");
+  assert.equal(p.state.storageViews[0].profile_id, "custom-a");
+  assert.equal(p.elements.setupStorageViewProfile.value, "custom-a");
+  assert.match(p.elements.setupStorageViewPreviewSummary.textContent, /saved chassis layout Recreated A/);
+  assert.match(p.elements.setupStorageViewPreviewMeta.innerHTML, /5 slots/);
+  assert.equal(p.state.setupDraftRevision, revision);
+  assert.equal(p.rawSnapshot(), raw);
+});
 
 for (const readback of ["success", "fallback"]) {
   test(`profile delete setup: ${readback} actual registered save never submits deleted profile`, async () => {
@@ -247,7 +361,7 @@ for (const readback of ["success", "fallback"]) {
     assert.equal(p.rawSnapshot(), raw);
   });
   test(`profile delete setup: ${readback} empty catalog clears geometry and permits automatic submission`, async () => {
-    const p = fixture();
+    const p = fixture(); pinStorageProfile(p, "custom-a");
     p.clickDelete(); p.requests[0].reply({ ...deleteResult(), profiles: [] }); await drain();
     if (readback === "success") p.requests[1].reply(p.statePayload([]));
     else p.requests[1].reject(new Error("Synthetic readback failure"));
@@ -255,13 +369,17 @@ for (const readback of ["success", "fallback"]) {
     assert.equal(p.elements.setupProfile.value, "");
     assert.equal(p.elements.profilePreviewGrid.innerHTML, "");
     assert.equal(p.elements.profilePreviewBadge.textContent, "No profiles");
-    assert.equal((await submittedSetup(p)).default_profile_id, null);
+    const payload = await submittedSetup(p);
+    assert.equal(payload.default_profile_id, null);
+    assert.equal(payload.storage_views[0].profile_id, null);
+    assert.equal(p.state.storageViews[0].profile_id, "");
   });
 }
 
 for (const replacement of ["different entries", "equal snapshot", "same-ID recreation"]) {
   test(`profile delete setup: newer ${replacement} admitted during DELETE survives fallback`, async () => {
-    const p = fixture(), raw = p.rawSnapshot();
+    const p = fixture(); pinStorageProfile(p, "custom-a");
+    const raw = p.rawSnapshot();
     p.clickDelete();
     const read = p.api.refreshState({ quiet: true, catalogOnly: true });
     const catalog = replacement === "equal snapshot" ? originalProfiles()
@@ -277,18 +395,24 @@ for (const replacement of ["different entries", "equal snapshot", "same-ID recre
     assert.equal(p.state.selectedProfileId, expected);
     assert.equal(p.elements.profilePreviewSummary.textContent, catalog[0].summary);
     assert.equal(p.rawSnapshot(), raw);
-    assert.equal((await submittedSetup(p)).default_profile_id, expected || null);
+    const payload = await submittedSetup(p);
+    assert.equal(payload.default_profile_id, expected || null);
+    assert.equal(payload.storage_views[0].profile_id, expected || null, "storage pin follows the current admitted catalog, not DELETE's older fallback");
+    assert.equal(p.state.storageViews[0].profile_id, expected);
+    assert.equal(p.elements.setupStorageViewProfile.value, expected);
   });
 }
 
 for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
   ["success", "fallback"].map(completion => [phase, completion]))) {
-  for (const move of ["setup edit", "new builder", "same builder revisit", "successor delete"]) {
+  for (const move of ["setup edit", "storage edit", "new builder", "same builder revisit", "successor delete"]) {
     test(`profile delete setup: retired ${phase} ${move} does not overwrite successor controls on ${completion}`, async () => {
-      const p = fixture(); p.clickDelete();
+      const p = fixture(); pinStorageProfile(p, "custom-a"); p.clickDelete();
       if (phase === "readback") { p.requests[0].reply(deleteResult()); await drain(); }
       if (move === "setup edit") {
         p.elements.setupSystemLabel.value = "  Successor draft  "; p.elements.setupSystemLabel.dispatch("input");
+      } else if (move === "storage edit") {
+        p.elements.setupStorageViewProfile.value = "custom-b"; p.elements.setupStorageViewProfile.dispatch("change");
       } else if (move === "new builder") {
         p.elements.setupProfile.value = "custom-b"; p.elements.setupProfile.dispatch("change");
         p.elements.profileBuilderLoadButton.dispatch("click");
@@ -300,6 +424,7 @@ for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
       }
       p.paint();
       const before = p.controlsSnapshot(), catalog = p.state.profiles;
+      const model = JSON.stringify(p.state.storageViews), revision = p.state.setupDraftRevision;
       if (phase === "DELETE") { p.requests[0].reply(deleteResult()); await drain(); }
       const readback = p.requests.find(item => item.url === "/api/admin/state");
       assert.ok(readback);
@@ -307,6 +432,8 @@ for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
       else readback.reject(new Error("Synthetic retired readback failure"));
       await drain(); p.paint();
       assert.equal(p.controlsSnapshot(), before, "stale completion does not render/reset successor controls");
+      assert.equal(JSON.stringify(p.state.storageViews), model, "retired deletion cannot edit the successor storage model");
+      assert.equal(p.state.setupDraftRevision, revision);
       if (completion === "fallback") assert.equal(p.state.profiles, catalog, "retired fallback cannot replace a successor catalog");
       else assert.deepEqual(JSON.parse(JSON.stringify(p.state.profiles)), remainingProfiles(),
         "new server-admitted catalog remains authoritative even when editor ownership retired");
@@ -320,13 +447,15 @@ for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
 
 for (const invalid of ["refusal", "ok only", "wrong target", "deleted ID remains"]) {
   test(`profile delete setup: ${invalid} cannot reconcile setup controls`, async () => {
-    const p = fixture(), catalog = p.state.profiles, raw = p.rawSnapshot(); p.clickDelete();
+    const p = fixture(); pinStorageProfile(p, "custom-a");
+    const catalog = p.state.profiles, raw = p.rawSnapshot(); p.clickDelete();
     const body = invalid === "ok only" ? { ok: true } : invalid === "wrong target" ? { ...deleteResult(), profile_id: "custom-b" }
       : invalid === "deleted ID remains" ? { ...deleteResult(), profiles: originalProfiles() } : { detail: "Synthetic refusal" };
     p.requests[0].reply(body, invalid === "refusal" ? 400 : 200); await drain(); p.paint();
     assert.equal(p.requests.length, 1, "unvalidated deletion cannot read or reconcile catalogs");
     assert.equal(p.state.profiles, catalog);
     assert.equal(p.elements.setupProfile.value, "custom-a");
+    assert.equal(p.state.storageViews[0].profile_id, "custom-a", "invalid mutation cannot invalidate storage pins");
     assert.equal(p.rawSnapshot(), raw);
     assert.equal(p.elements.profileBuilderDeleteButton.disabled, false);
   });
@@ -343,7 +472,7 @@ test("profile delete setup: invalid state read admits validated fallback and cle
 
 test("profile delete setup: referenced/built-in/absent profiles stay ineligible and stopped sessions lock controls", async () => {
   for (const capability of ["referenced", "built-in", "absent", "session stopped"]) {
-    const p = fixture();
+    const p = fixture(); pinStorageProfile(p, "custom-a");
     if (capability === "referenced") p.state.profiles[0].reference_count = 1;
     if (capability === "built-in") p.state.profiles[0].is_custom = false;
     if (capability === "absent") p.state.profiles.shift();
@@ -351,5 +480,6 @@ test("profile delete setup: referenced/built-in/absent profiles stay ineligible 
     p.elements.profileBuilderLabel.dispatch("input");
     assert.equal(p.elements.profileBuilderDeleteButton.disabled, true, capability);
     p.clickDelete(); await drain(); assert.equal(p.requests.length, 0);
+    assert.equal(p.state.storageViews[0].profile_id, "custom-a");
   }
 });

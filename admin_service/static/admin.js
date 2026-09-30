@@ -7881,6 +7881,14 @@
   }
 
   function renderProfileSetupDependencies() {
+    // Every unsaved view is submitted, including views outside the editor.
+    // Reconcile only missing IDs against the admitted catalog; a newer read
+    // may have recreated the deleted ID. Keep all unrelated model/raw fields.
+    state.storageViews.forEach((storageView) => {
+      if (storageView.profile_id && !getProfileById(storageView.profile_id)) {
+        storageView.profile_id = "";
+      }
+    });
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
