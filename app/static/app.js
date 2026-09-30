@@ -10332,7 +10332,12 @@
         setStatus("Up to date.");
       }
     } catch (error) {
-      if (completionIsCurrent && !completionIsCurrent()) return;
+      if (completionIsCurrent && !completionIsCurrent()) {
+        if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+          archiveUiPerfRun(perfRun, "superseded");
+        }
+        return;
+      }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
       }

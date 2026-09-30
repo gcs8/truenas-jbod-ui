@@ -372,6 +372,194 @@ test("alias readback admission retires when a newer editor opens", async () => {
   assert.equal(guard(), false);
 });
 
+async function aliasReadbackFixture(enabled = true) {
+  const inventory = deferred();
+  const admitted = deferred();
+  const effects = { statuses: [], ui: [], schedules: 0, cancellations: 0, archives: [], focus: 0 };
+  const state = {
+    snapshotMode: false, selectedStorageViewRuntimeId: "",
+    selectedSystemId: "system-a", selectedEnclosureId: "enc-a",
+    snapshot: { selected_system_id: "system-a", selected_enclosure_id: "enc-a" },
+    latestRefreshToken: 0, refreshesInFlight: 0, selectionEpoch: 0, mappingDraftRevision: 0,
+    enclosureAliasEditorOpen: false, enclosureAliasEditorScopeKey: null,
+    snapshotReuseCache: { a: { selected_system_id: "system-a" }, b: { selected_system_id: "system-b" } },
+    storageViewsRuntimeLoading: true, storageViewsRuntimeError: "successor freshness",
+    uiPerf: { enabled, currentRun: null, recentRuns: [], runCounter: 0 },
+  };
+  const input = { value: "", focus() { effects.focus += 1; }, select() {} };
+  const form = { classList: classList() };
+  const panel = { classList: classList() };
+  const summary = { textContent: "" };
+  const recent = { innerHTML: "" };
+  const window = { performance: { now: () => 100 } };
+  const names = ["currentEnclosureAliasScopeKey", "enclosureAliasEditorAvailable",
+    "openEnclosureAliasEditor", "closeEnclosureAliasEditor", "submitEnclosureAlias",
+    "refreshSnapshot", "beginUiPerfRun", "archiveUiPerfRun", "buildUiPerfSummary",
+    "uiPerfNow", "uiPerfRound", "uiPerfElapsed", "uiPerfReasonLabel", "uiPerfScopeLabel",
+    "uiPerfMetricDisplay", "renderUiPerfCard", "renderUiPerfPanel", "syncUiPerfGlobal"];
+  const fns = loadFunctions(names, {
+    state, window, UI_PERF_HISTORY_LIMIT: 8,
+    console: { info: (tag, run) => effects.archives.push(run) },
+    uiPerfPanel: panel, uiPerfSummary: summary, uiPerfRecent: recent,
+    setTextIfChanged: (element, text) => { element.textContent = text; },
+    escapeHtml: value => String(value),
+    enclosureAliasInput: input, enclosureAliasForm: form,
+    enclosureAliasEditButton: { classList: classList([]), focus() { effects.focus += 1; } },
+    enclosureAliasRawHint: null,
+    getSelectedEnclosureOption: () => ({ id: state.selectedEnclosureId, alias: "Original" }),
+    currentLiveEnclosureId: () => state.selectedEnclosureId,
+    writeBlockedByPolicy: () => false,
+    fetchJson(url, options) {
+      if (options?.method === "POST") {
+        assert.match(url, /^\/api\/sas-fabric\/aliases\?/);
+        return Promise.resolve({ ok: true });
+      }
+      assert.match(url, /^\/api\/inventory\?/);
+      assert.equal(new URLSearchParams(url.split("?")[1]).get("force"), "true");
+      admitted.resolve();
+      return inventory.promise;
+    },
+    handleWriteRejection: () => effects.ui.push("write-rejection"),
+    setStatus: (message, tone) => effects.statuses.push({ message, tone }),
+    cancelAutoRefreshTimer: () => { effects.cancellations += 1; },
+    scheduleAutoRefresh: () => { effects.schedules += 1; },
+    refreshStatusMessage: () => "Refreshing...",
+    buildSelectionParams: () => new URLSearchParams(),
+    applySnapshot(snapshot) { state.snapshot = snapshot; effects.ui.push("apply-snapshot"); },
+    invalidateHistoryCaches: () => effects.ui.push("invalidate-history"),
+    renderAll: () => effects.ui.push("render-all"),
+    renderStorageViewRuntimeStatus: () => effects.ui.push("storage-status"),
+    markHistoryCachesStale: () => effects.ui.push("stale-history"),
+    renderHistoryPanel: () => effects.ui.push("history-panel"),
+    renderHeatmapControls: () => effects.ui.push("heatmap-controls"),
+  });
+  fns.openEnclosureAliasEditor();
+  input.value = "Submitted";
+  const pending = fns.submitEnclosureAlias();
+  await admitted.promise;
+  assert.equal(state.enclosureAliasEditorOpen, false);
+  assert.equal(state.refreshesInFlight, 1);
+  assert.equal(state.latestRefreshToken, 1);
+  assert.equal(effects.cancellations, 1);
+  assert.equal(effects.schedules, 0);
+  assert.deepEqual(Object.keys(state.snapshotReuseCache), ["b"]);
+  if (enabled) {
+    assert.equal(state.uiPerf.currentRun.reason, "enclosure-alias");
+    assert.equal(state.uiPerf.currentRun.status, "running");
+    assert.match(recent.innerHTML, /running/);
+  }
+  return { state, input, effects, inventory, pending, form, summary, recent, window, ...fns };
+}
+
+function readbackUiState(h) {
+  return {
+    snapshot: h.state.snapshot, statuses: [...h.effects.statuses], ui: [...h.effects.ui],
+    loading: h.state.storageViewsRuntimeLoading, error: h.state.storageViewsRuntimeError,
+    draft: h.input.value, open: h.state.enclosureAliasEditorOpen,
+    formHidden: h.form.classList.contains("hidden"), focus: h.effects.focus,
+    token: h.state.latestRefreshToken,
+  };
+}
+
+for (const retirement of ["reopened-editor", "later-typing"]) {
+  test(`retired alias readback failure archives its active performance run after ${retirement}`, async () => {
+    const h = await aliasReadbackFixture();
+    const run = h.state.uiPerf.currentRun;
+    if (retirement === "reopened-editor") h.openEnclosureAliasEditor();
+    h.input.value = "Successor draft";
+    const before = readbackUiState(h);
+    h.inventory.reject(new Error("Synthetic inventory refusal"));
+    await h.pending;
+    assert.deepEqual(readbackUiState(h), before, "retired failures must not publish into successor UI");
+    assert.equal(h.state.refreshesInFlight, 0);
+    assert.equal(h.effects.schedules, 1);
+    assert.equal(run.status, "superseded", "retired readback must not leave its own run running");
+    assert.equal(h.state.uiPerf.currentRun, null);
+    assert.equal(h.state.uiPerf.recentRuns.length, 1);
+    assert.equal(h.state.uiPerf.recentRuns[0].id, run.id);
+    assert.equal(h.state.uiPerf.recentRuns[0].status, "superseded");
+    assert.equal(h.state.uiPerf.recentRuns[0].error, null);
+    assert.equal(h.effects.archives.length, 1);
+    assert.equal(h.window.__JBOD_UI_PERF.current, null);
+    assert.match(h.recent.innerHTML, /superseded/);
+    assert.doesNotMatch(h.recent.innerHTML, /running|Synthetic inventory refusal/);
+  });
+}
+
+test("retired alias readback failure with instrumentation disabled leaves successor UI untouched", async () => {
+  const h = await aliasReadbackFixture(false);
+  h.openEnclosureAliasEditor();
+  h.input.value = "Successor draft";
+  const before = readbackUiState(h);
+  h.inventory.reject(new Error("Synthetic inventory refusal"));
+  await h.pending;
+  assert.deepEqual(readbackUiState(h), before);
+  assert.equal(h.state.uiPerf.currentRun, null);
+  assert.equal(h.state.uiPerf.recentRuns.length, 0);
+  assert.equal(h.effects.archives.length, 0);
+  assert.equal(h.state.refreshesInFlight, 0);
+  assert.equal(h.effects.schedules, 1);
+});
+
+test("owned alias readback failure archives an error and reports inventory freshness", async () => {
+  const h = await aliasReadbackFixture();
+  const run = h.state.uiPerf.currentRun;
+  h.inventory.reject(new Error("Synthetic inventory refusal"));
+  await h.pending;
+  assert.equal(h.state.uiPerf.currentRun, null);
+  assert.equal(run.status, "error");
+  assert.equal(h.state.uiPerf.recentRuns.length, 1);
+  assert.equal(h.state.uiPerf.recentRuns[0].error, "Synthetic inventory refusal");
+  assert.equal(h.effects.archives.length, 1);
+  assert.deepEqual(h.effects.statuses.at(-1), { message: "Refresh failed: Synthetic inventory refusal", tone: "error" });
+  assert.deepEqual(h.effects.ui, ["storage-status", "stale-history", "history-panel", "heatmap-controls"]);
+  assert.equal(h.state.storageViewsRuntimeLoading, false);
+  assert.match(h.state.storageViewsRuntimeError, /Inventory refresh failed/);
+  assert.match(h.recent.innerHTML, /error: Synthetic inventory refusal/);
+  assert.equal(h.state.refreshesInFlight, 0);
+  assert.equal(h.effects.schedules, 1);
+});
+
+test("retired alias readback success archives as superseded without applying its snapshot", async () => {
+  const h = await aliasReadbackFixture();
+  h.openEnclosureAliasEditor();
+  const before = readbackUiState(h);
+  h.inventory.resolve({ selected_system_id: "stale-system" });
+  await h.pending;
+  assert.deepEqual(readbackUiState(h), before);
+  assert.equal(h.state.uiPerf.currentRun, null);
+  assert.equal(h.state.uiPerf.recentRuns.length, 1);
+  assert.equal(h.state.uiPerf.recentRuns[0].status, "superseded");
+  assert.equal(h.effects.archives.length, 1);
+  assert.equal(h.state.refreshesInFlight, 0);
+  assert.equal(h.effects.schedules, 1);
+});
+
+for (const outcome of ["failure", "success"]) {
+  test(`retired alias readback ${outcome} preserves a newer active performance run`, async () => {
+    const h = await aliasReadbackFixture();
+    h.openEnclosureAliasEditor();
+    h.input.value = "Successor draft";
+    const successor = h.beginUiPerfRun("manual-refresh", { systemId: "system-b", enclosureId: "enc-b" });
+    const before = readbackUiState(h);
+    const perfBefore = JSON.stringify(h.window.__JBOD_UI_PERF);
+    const panelBefore = { summary: h.summary.textContent, recent: h.recent.innerHTML };
+    assert.equal(h.effects.archives.length, 1, "beginning the successor already retired the alias run");
+    if (outcome === "failure") h.inventory.reject(new Error("Synthetic inventory refusal"));
+    else h.inventory.resolve({ selected_system_id: "stale-system" });
+    await h.pending;
+    assert.deepEqual(readbackUiState(h), before);
+    assert.equal(h.state.uiPerf.currentRun, successor);
+    assert.equal(successor.status, "running");
+    assert.equal(h.state.uiPerf.recentRuns.length, 1, "do not archive either run again");
+    assert.equal(h.effects.archives.length, 1);
+    assert.equal(JSON.stringify(h.window.__JBOD_UI_PERF), perfBefore);
+    assert.deepEqual({ summary: h.summary.textContent, recent: h.recent.innerHTML }, panelBefore);
+    assert.equal(h.state.refreshesInFlight, 0);
+    assert.equal(h.effects.schedules, 1);
+  });
+}
+
 test("a newer alias submission owns completion even with an identical draft", async () => {
   const h = aliasCompletionFixture();
   const first = h.submitEnclosureAlias();
