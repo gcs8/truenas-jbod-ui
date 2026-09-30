@@ -590,6 +590,96 @@ class SchedulerPreservationTests(SchedulerTestBase):
         self.assertTrue((second / records[1].name).exists())
         self.assertEqual(len(result.deleted), 1)
 
+    def test_first_class_ancestor_eio_preserves_uncertain_copy_without_success_credit(self):
+        import errno
+
+        remote = self.root / "first-use-remote"
+        remote.mkdir()
+        scheduler = self.real_scheduler([{**TARGET, "root": str(remote)}]).service
+        original = os.fsync
+        ancestor_attempts = []
+
+        def synced(fd):
+            info, parent = os.fstat(fd), remote.stat()
+            if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (parent.st_dev, parent.st_ino):
+                ancestor_attempts.append((info.st_dev, info.st_ino))
+                raise OSError(errno.EIO, "synthetic ancestor barrier failure")
+            return original(fd)
+
+        locals_kept = []
+        # The real shipping path opens a fresh target each job. Keep EIO active
+        # throughout both runs; directory existence cannot grant durability.
+        with patch.object(os, "fsync", side_effect=synced):
+            for run in range(2):
+                locals_kept.append(scheduler.run_now("full"))
+                remote_records = scheduler.catalog.list(location="nas")
+                self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+                self.assertEqual(len(ancestor_attempts), run + 1)
+                self.assertEqual(len(remote_records), run + 1)
+                self.assertFalse(any(record.verified for record in remote_records))
+                for uncertain in remote_records:
+                    self.assertTrue(uncertain.preserved)
+                    self.assertIn("directory durability", uncertain.preserve_reason)
+                    self.assertEqual((remote / uncertain.name).read_bytes(), b"synthetic archive payload")
+                self.assertTrue((self._paths.local_dir / locals_kept[-1].name).exists())
+                self.now += timedelta(hours=1)
+        # Only a later healthy barrier can earn new remote retention credit.
+        scheduler.run_now("full")
+        self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
+        remote_records = scheduler.catalog.list(location="nas")
+        self.assertEqual(sum(record.verified for record in remote_records), 1)
+        self.assertEqual(sum(record.preserved for record in remote_records), 2)
+        for local in locals_kept:
+            self.assertTrue((remote / local.name).exists())
+
+    def test_oversized_upload_readback_releases_job_and_refuses_remote_credit(self):
+        self._check_upload_readback_job("sftp")
+
+    def test_oversized_smb_upload_readback_releases_job_and_refuses_remote_credit(self):
+        self._check_upload_readback_job("smb")
+
+    def _check_upload_readback_job(self, provider):
+        from history_service.backup_archive import transport
+        from tests.test_backup_archive_transport import FakeSFTP, FakeSmbClient, _UploadReadback
+
+        scheduler = self.real_scheduler([{**TARGET, "root": str(self.root / provider)}]).service
+        body = _UploadReadback(self, len(b"synthetic archive payload"), "excess")
+        if provider == "sftp":
+            peer = FakeSFTP()
+            target = transport.SftpTarget(peer, "/synthetic")
+            original = peer.open
+
+            def opened_sftp(path, mode):
+                return body if mode == "rb" else original(path, mode)
+
+            patcher = patch.object(peer, "open", side_effect=opened_sftp)
+        else:
+            peer = FakeSmbClient()
+            target = transport.SmbTarget(peer, "\\\\peer.example.test\\backups", encrypted=True)
+            original = peer.open_file
+
+            @contextlib.contextmanager
+            def opened_smb(path, mode="rb"):
+                if mode == "rb":
+                    with body:
+                        yield body
+                else:
+                    with original(path, mode=mode) as stream:
+                        yield stream
+
+            patcher = patch.object(peer, "open_file", side_effect=opened_smb)
+        with patch.object(scheduler, "_open_configured_target", return_value=contextlib.nullcontext(target)):
+            with patcher:
+                local = scheduler.run_now("full")
+            self.assertEqual(scheduler.catalog.list(location="nas"), [])
+            self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+            self.assertEqual(peer.files, {})
+            self.assertTrue(body.closed)
+            self.assertLessEqual(body.consumed, local.size + transport.CHUNK_SIZE)
+            self.now += timedelta(hours=1)
+            scheduler.run_now("full")
+            self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
+
     def test_directory_eio_does_not_replace_remote_retention_copy(self):
         import errno
 
@@ -602,23 +692,27 @@ class SchedulerPreservationTests(SchedulerTestBase):
 
         def synced(fd):
             metadata = os.fstat(fd)
-            parent = remote / "full"
+            parent = remote
             if stat.S_ISDIR(metadata.st_mode) and (metadata.st_dev, metadata.st_ino) == (parent.stat().st_dev, parent.stat().st_ino):
-                raise OSError(errno.EIO, "synthetic directory EIO")
+                raise OSError(errno.EIO, "synthetic ancestor EIO")
             return original(fd)
 
+        # Even a previously verified hierarchy is re-admitted for each job.
         with patch.object(os, "fsync", side_effect=synced):
-            scheduler.run_now("full")
-        remote_records = scheduler.catalog.list(location="nas")
-        self.assertEqual(len(remote_records), 2)
-        uncertain = next(record for record in remote_records if record.name != old.name)
-        self.assertTrue(uncertain.preserved)
-        self.assertFalse(uncertain.verified)
-        self.assertIn("directory durability", uncertain.preserve_reason)
-        self.assertTrue((remote / old.name).exists())
-        self.assertTrue((remote / uncertain.name).exists())
-        self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
-        self.now += timedelta(hours=1)
+            for run in range(2):
+                local = scheduler.run_now("full")
+                remote_records = scheduler.catalog.list(location="nas")
+                self.assertEqual(len(remote_records), run + 2)
+                self.assertEqual(sum(record.verified for record in remote_records), 1)
+                for uncertain in (record for record in remote_records if record.name != old.name):
+                    self.assertTrue(uncertain.preserved)
+                    self.assertFalse(uncertain.verified)
+                    self.assertIn("directory durability", uncertain.preserve_reason)
+                    self.assertTrue((remote / uncertain.name).exists())
+                self.assertTrue((remote / old.name).exists())
+                self.assertTrue((self._paths.local_dir / local.name).exists())
+                self.assertFalse(scheduler.library()["targets"][0]["last_run"]["ok"])
+                self.now += timedelta(hours=1)
         scheduler.run_now("full")
         self.assertTrue(scheduler.library()["targets"][0]["last_run"]["ok"])
         self.assertFalse((remote / old.name).exists())

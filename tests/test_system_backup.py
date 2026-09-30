@@ -7396,6 +7396,166 @@ sys.stdout.flush()
             self.assertNotIn("SERIAL-0", scrubbed_mapping)
             self.assertIn("serial-", scrubbed_mapping)
 
+class SchemaDebugExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from typing import get_args
+        from pydantic import BaseModel, SecretStr
+
+        self.scratch = tempfile.TemporaryDirectory(prefix="schema-debug-")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.credentials = {}
+
+        def fixture(model, prefix=()):
+            payload = {}
+            for name, field in model.model_fields.items():
+                annotation = field.annotation
+                args = get_args(annotation)
+                path = (*prefix, name)
+                if (annotation is SecretStr or SecretStr in args or name == "api_key"
+                        or name == "password" or name.endswith(("_password", "_token"))):
+                    value = "synthetic-credential-" + "-".join(path)
+                    self.credentials[path] = value
+                    payload[name] = value
+                elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                    child = fixture(annotation, path)
+                    if child:
+                        payload[name] = child
+                elif name == "systems":
+                    payload[name] = [{"id": "synthetic", **fixture(args[0], (*path, "0"))}]
+            return payload
+
+        self.payload = fixture(Settings)
+        # Independent inventory: an added credential needs an explicit coverage review.
+        self.assertEqual(set(self.credentials), {
+            ("truenas", "api_key"), ("truenas", "api_password"),
+            ("ssh", "password"), ("ssh", "sudo_password"), ("history", "refresh_token"),
+            ("systems", "0", "truenas", "api_key"), ("systems", "0", "truenas", "api_password"),
+            ("systems", "0", "ssh", "password"), ("systems", "0", "ssh", "sudo_password"),
+            ("systems", "0", "bmc", "password"),
+        })
+        self.config = self.root / "config.yaml"
+        environment = patch.dict(os.environ, {"APP_CONFIG_PATH": str(self.config), "TMPDIR": str(self.root)}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        get_settings.cache_clear()
+        self.addCleanup(get_settings.cache_clear)
+        self.payload["config_file"] = str(self.config)
+        self.payload["paths"] = {
+            key: str(self.root / filename) for key, filename in {
+                "runtime_overrides_file": "runtime-overrides.yaml", "profile_file": "profiles.yaml",
+                "mapping_file": "mapping.json", "sas_fabric_alias_file": "aliases.json",
+                "slot_detail_cache_file": "slot-details.json", "log_file": "synthetic.log",
+            }.items()
+        }
+        self.settings = Settings.model_validate(self.payload)
+        write_yaml(self.config, self.payload)
+        write_yaml(Path(self.payload["paths"]["runtime_overrides_file"]), self.payload)
+        write_yaml(Path(self.payload["paths"]["profile_file"]), {"profiles": [], "debug": self.payload})
+        for key in ("mapping_file", "sas_fabric_alias_file", "slot_detail_cache_file"):
+            Path(self.payload["paths"][key]).write_text(json.dumps(self.payload), encoding="utf-8")
+        self.store = HistoryStore(str(self.root / "history.sqlite3"))
+        from history_service.domain import SlotEvent
+
+        self.store.insert_events([SlotEvent(
+            observed_at="2026-01-01T00:00:00+00:00", system_id="synthetic", system_label="Synthetic",
+            enclosure_key="synthetic", enclosure_id=None, enclosure_label=None, slot=0, slot_label="00",
+            event_type="synthetic", previous_value=None, current_value=None, device_name=None, serial=None,
+            details_json=json.dumps(self.payload),
+        )])
+        self.service = SystemBackupService(
+            HistorySettings(sqlite_path=str(self.store.file_path), backup_dir=str(self.root / "backups")),
+            self.store, app_settings=self.settings,
+        )
+
+    def test_complete_debug_archive_scrubs_every_schema_credential(self) -> None:
+        for packaging in ("zip", "tar.zst"):
+            for scrub_identifiers in (False, True):
+                with self.subTest(packaging=packaging, scrub_identifiers=scrub_identifiers):
+                    artifact = self.service.export_debug_bundle_to_file(
+                        packaging=packaging, scrub_secrets=True, scrub_disk_identifiers=scrub_identifiers,
+                        runtime_payload=self.payload, maintenance_payload=self.payload,
+                    )
+                    try:
+                        with ExitStack() as stack:
+                            source = stack.enter_context(artifact.path.open("rb"))
+                            if packaging == "zip":
+                                archive = stack.enter_context(zipfile.ZipFile(source))
+                                members = {name: archive.read(name) for name in archive.namelist()}
+                            else:
+                                reader = stack.enter_context(system_backup_module.zstd.ZstdDecompressor().stream_reader(source))
+                                archive = stack.enter_context(tarfile.open(fileobj=reader, mode="r|"))
+                                members = {entry.name: archive.extractfile(entry).read() for entry in archive if entry.isfile()}
+                        self.assertIn("config/config.yaml", members)
+                        self.assertIn("debug/state.json", members)
+                        self.assertIn("history/history.sqlite3", members)
+                        for name, content in members.items():
+                            for path, value in self.credentials.items():
+                                with self.subTest(member=name, field=".".join(path)):
+                                    self.assertNotIn(value.encode(), content)
+                    finally:
+                        artifact.cleanup()
+
+    def test_unscrubbed_encrypted_export_restores_exact_config(self) -> None:
+        original = self.config.read_bytes()
+        passphrase = "synthetic schema fidelity passphrase"
+        artifact = self.service.export_scheduled_bundle_to_file(
+            passphrase=passphrase, included_paths=[CONFIG_FILE_KEY],
+        )
+        try:
+            self.assertTrue(artifact.path.read_bytes().startswith(ENCRYPTED_BACKUP_MAGIC))
+            for value in self.credentials.values():
+                self.assertNotIn(value.encode(), artifact.path.read_bytes())
+            write_yaml(self.config, {**self.payload, "history": {"refresh_token": "synthetic-replacement"}})
+            result = self.service.import_bundle_from_file(artifact.path, passphrase=passphrase, expected_encrypted=True)
+            self.assertTrue(result["encrypted"])
+            self.assertEqual(self.config.read_bytes(), original)
+        finally:
+            artifact.cleanup()
+
+    def test_excluded_schema_secret_files_are_never_opened(self) -> None:
+        from dataclasses import fields
+        from history_service.backup_archive.settings import ArchiveTargetSettings
+
+        excluded = set()
+        references = {}
+        for field in fields(ArchiveTargetSettings):
+            if field.name.endswith("_file"):
+                path = self.root / (field.name + ".txt")
+                path.write_text("synthetic-excluded-" + field.name, encoding="utf-8")
+                excluded.add(path)
+                references[field.name] = str(path)
+        self.assertEqual(set(references), {
+            "password_file", "private_key_file", "private_key_passphrase_file",
+            "access_key_id_file", "secret_access_key_file",
+        })
+        write_yaml(self.config, {**self.payload, "backups": {"targets": [references]}})
+        for directory, filename in (("ssh", "id_synthetic"), ("tls", "synthetic.pem")):
+            parent = self.root / directory
+            parent.mkdir()
+            path = parent / filename
+            path.write_text("synthetic-excluded-" + directory, encoding="utf-8")
+            excluded.add(path)
+        known_hosts = self.root / "known_hosts"
+        known_hosts.write_text("synthetic-excluded-known-hosts", encoding="utf-8")
+        excluded.add(known_hosts)
+        original = os.open
+
+        def opened(path, *args, **kwargs):
+            self.assertNotIn(Path(path), excluded, "excluded secret file was opened")
+            return original(path, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=opened):
+            artifact = self.service.export_debug_bundle_to_file(packaging="zip", included_paths=[CONFIG_FILE_KEY])
+        try:
+            with zipfile.ZipFile(artifact.path) as archive:
+                self.assertEqual(set(archive.namelist()), {"manifest.json", "config/config.yaml"})
+                for name in archive.namelist():
+                    self.assertNotIn(b"synthetic-excluded-", archive.read(name))
+        finally:
+            artifact.cleanup()
+
+
 class SecretWhitespaceModelTests(unittest.TestCase):
     def test_backup_export_request_preserves_padded_passphrase(self) -> None:
         payload = SystemBackupExportRequest(encrypt=True, passphrase="padded secret   ")
