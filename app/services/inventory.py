@@ -1320,10 +1320,12 @@ class InventoryService:
         self._snapshot_request_sequence += 1
         request_sequence = self._snapshot_request_sequence
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
+        discovery_detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
         cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
             selected_enclosure_id,
             force_source_refresh=bool(refresh_sources),
             request_sequence=request_sequence,
+            detail_commits=discovery_detail_commits,
         )
         topology_generation = self._snapshot_topology_generation
         self._admit_snapshot_key(cache_key)
@@ -1339,6 +1341,19 @@ class InventoryService:
                         or cache_key in self._snapshot_invalidated
                     ):
                         raise SnapshotStateBusyError()
+                    def discovery_publication_is_current():
+                        return (topology_generation == self._snapshot_topology_generation
+                                and cache_key not in self._snapshot_invalidated
+                                and self._snapshot_published_sequence.get(cache_key, -1) <= request_sequence
+                                and self._canonical_options_request_sequence <= request_sequence)
+                    if (self._snapshot_has_trusted_topology(discovered_snapshot)
+                            and discovery_publication_is_current()):
+                        # Discovery details belong to this candidate, not merely
+                        # to the canonical options learned before admission.
+                        for commit_details in discovery_detail_commits:
+                            await commit_details(discovery_publication_is_current)
+                        if not discovery_publication_is_current():
+                            raise SnapshotStateBusyError()
                     discovered_snapshot, published = self._publish_snapshot_locked(
                         cache_key,
                         discovered_snapshot,
@@ -1610,6 +1625,7 @@ class InventoryService:
         *,
         force_source_refresh: bool,
         request_sequence: int,
+        detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]],
     ) -> tuple[str, InventorySnapshot | None]:
         self._learn_canonical_options_from_cache()
         options = self._canonical_enclosure_options
@@ -1619,10 +1635,18 @@ class InventoryService:
                 options = self._canonical_enclosure_options
                 while options is None:
                     generation = self._snapshot_topology_generation
-                    candidate = await self._build_snapshot(
-                        selected_enclosure_id=None,
-                        force_source_refresh=force_source_refresh,
-                    )
+                    # Each retry replaces the rejected candidate's side effects.
+                    # Backfill remains local to the build; observation and writes
+                    # wait for the same candidate's authoritative publication.
+                    detail_commits.clear()
+                    detail_token = _snapshot_detail_commits.set(detail_commits)
+                    try:
+                        candidate = await self._build_snapshot(
+                            selected_enclosure_id=None,
+                            force_source_refresh=force_source_refresh,
+                        )
+                    finally:
+                        _snapshot_detail_commits.reset(detail_token)
                     if generation != self._snapshot_topology_generation:
                         continue
                     discovered_snapshot = candidate
