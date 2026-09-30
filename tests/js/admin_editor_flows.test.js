@@ -386,7 +386,8 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
   });
   const state = { haNodes: [], haNodesLoading: false };
   const { discoverQuantastorHaNodes } = loadFunctions(
-    [discoverSource],
+    [discoverSource, sourceBetween("  function requireMutationResult", "\n  async function fetchJson"),
+      sourceBetween("  function adminRequestError", "\n  function classifyTransportFailure")],
     ["discoverQuantastorHaNodes"],
     {
       collectSetupPayload: (options) => {
@@ -398,7 +399,7 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
       elements,
       fetchJson: async (_url, options) => {
         requestBody = JSON.parse(options.body);
-        return { nodes: [], host_discovery: {} };
+        return { ok: true, nodes: [], host_discovery: { attempted: false, ok: true } };
       },
       normalizeHaNodes: (nodes) => nodes,
       renderQuantastorHaSection: () => {},
