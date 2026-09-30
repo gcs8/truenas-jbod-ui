@@ -391,6 +391,137 @@ test("late LED completion cannot replace a newer shelf or its draft", async ({pa
  expect(errors).toEqual([]);
 });
 
+async function openAliasFixture(page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "APP_BOOTSTRAP", {configurable: true, set(value) {
+      value.writePolicy = {enabled: true, mode: "network", reason: "Synthetic fixture write policy"};
+      value.snapshot.write_policy = value.writePolicy;
+      value.snapshot.enclosures.push({...value.snapshot.enclosures[0], id: "enc-b", label: "Second Shelf"});
+      Object.defineProperty(window, "APP_BOOTSTRAP", {value, writable: true, configurable: true});
+    }});
+  });
+  const errors = await openFixture(page);
+  await page.locator("#auto-refresh-toggle").uncheck();
+  const snapshot = await page.evaluate(() => structuredClone(window.APP_BOOTSTRAP.snapshot));
+  const inventory = [];
+  await page.route("**/api/inventory?**", route => {
+    inventory.push(route.request().url());
+    const enclosureId = new URL(route.request().url()).searchParams.get("enclosure_id") || "enc-a";
+    const next = structuredClone(snapshot);
+    next.selected_enclosure_id = enclosureId;
+    next.selected_enclosure_label = enclosureId === "enc-b" ? "Second Shelf" : snapshot.selected_enclosure_label;
+    next.slots[0].enclosure_id = enclosureId;
+    return route.fulfill({contentType: "application/json", body: JSON.stringify(next)});
+  });
+  const input = page.locator("#enclosure-alias-input");
+  await page.locator("#enclosure-alias-edit-button").click();
+  await input.fill("Submitted name");
+  return {errors, snapshot, inventory, input};
+}
+
+async function settleAliasResponse(page, route, outcome) {
+  const response = page.waitForResponse(candidate => candidate.url() === route.request().url()
+    && candidate.request().method() === route.request().method());
+  await route.fulfill({status: outcome === "error" ? 401 : 200, contentType: "application/json",
+    body: JSON.stringify(outcome === "error" ? {detail: "Synthetic alias refusal"} : {ok: true})});
+  await (await response).finished();
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+
+for (const outcome of ["success", "error"]) {
+  for (const successor of ["shelf-B", "A-B-A", "later-typing", "retyped-identical-draft", "mapping-draft", "refresh"]) {
+    test(`main alias stale ${outcome} preserves ${successor}`, async ({page}) => {
+      const h = await openAliasFixture(page);
+      let post;
+      await page.route("**/api/sas-fabric/aliases?**", route => { post = route; });
+      await page.locator('#enclosure-alias-form button[type="submit"]').click();
+      await expect.poll(() => Boolean(post)).toBe(true);
+      if (["shelf-B", "A-B-A"].includes(successor)) {
+        await page.locator("#enclosure-select").selectOption("enclosure:enc-b");
+        await expect(page.locator("#status-text")).toHaveText("Up to date.");
+        if (successor === "A-B-A") {
+          await page.locator("#enclosure-select").selectOption("enclosure:enc-a");
+          await expect(page.locator("#status-text")).toHaveText("Up to date.");
+        }
+        // Scope loading leaves this opener disabled on the inherited source.
+        // Dispatch its real registered handler without repairing that sibling bug.
+        await page.locator("#enclosure-alias-edit-button").dispatchEvent("click");
+        await h.input.fill("Successor name");
+        await page.locator('#slot-grid [data-slot="0"]').click();
+        await page.locator('#mapping-form [name="notes"]').fill("Successor bay draft");
+      } else if (successor === "mapping-draft") {
+        await page.locator('#mapping-form [name="notes"]').fill("Successor bay draft");
+      } else if (successor === "refresh") {
+        const response = page.waitForResponse(candidate => candidate.url().includes("/api/inventory?"));
+        await page.locator("#refresh-button").click();
+        await (await response).finished();
+        await expect(page.locator("#status-text")).toHaveText("Up to date.");
+      } else {
+        await h.input.fill("Later name");
+        if (successor === "retyped-identical-draft") await h.input.fill("Submitted name");
+      }
+      const value = await h.input.inputValue();
+      const status = await page.locator("#status-text").textContent();
+      const activeId = await page.evaluate(() => document.activeElement.id);
+      const count = h.inventory.length;
+      await settleAliasResponse(page, post, outcome);
+      await expect(page.locator("#enclosure-alias-form")).toBeVisible();
+      await expect(h.input).toHaveValue(value);
+      await expect(page.locator("#status-text")).toHaveText(status);
+      expect(await page.evaluate(() => document.activeElement.id)).toBe(activeId);
+      expect(h.inventory).toHaveLength(count);
+      if (["shelf-B", "A-B-A", "mapping-draft"].includes(successor)) {
+        await expect(page.locator('#mapping-form [name="notes"]')).toHaveValue("Successor bay draft");
+      }
+      // A stale authentication error must not revoke the successor's controls.
+      await expect(page.locator('#enclosure-alias-form button[type="submit"]')).toBeEnabled();
+      expect(h.errors).toEqual([]);
+    });
+  }
+}
+
+test("main alias owned success reads back the source selection and closes its editor", async ({page}) => {
+  const h = await openAliasFixture(page);
+  await page.route("**/api/sas-fabric/aliases?**", route => route.fulfill({contentType: "application/json", body: '{"ok":true}'}));
+  await page.locator('#enclosure-alias-form button[type="submit"]').click();
+  await expect(page.locator("#enclosure-alias-form")).toBeHidden();
+  await expect(page.locator("#status-text")).toHaveText("Up to date.");
+  expect(h.inventory).toHaveLength(1);
+  const params = new URL(h.inventory[0]).searchParams;
+  expect(params.get("enclosure_id")).toBe("enc-a");
+  expect(params.get("force")).toBe("true");
+  expect(h.errors).toEqual([]);
+});
+
+for (const outcome of ["success", "error"]) {
+  test(`main alias stale readback ${outcome} cannot publish into a reopened editor`, async ({page}) => {
+    const h = await openAliasFixture(page);
+    let readback;
+    await page.route("**/api/inventory?**", route => { readback = route; });
+    await page.route("**/api/sas-fabric/aliases?**", route => route.fulfill({contentType: "application/json", body: '{"ok":true}'}));
+    await page.locator('#enclosure-alias-form button[type="submit"]').click();
+    await expect.poll(() => Boolean(readback)).toBe(true);
+    await page.locator("#enclosure-alias-edit-button").click();
+    await h.input.fill("Successor readback draft");
+    const status = await page.locator("#status-text").textContent();
+    const response = page.waitForResponse(candidate => candidate.url() === readback.request().url());
+    const staleSnapshot = structuredClone(h.snapshot);
+    staleSnapshot.enclosures[0].label = "Unowned readback name";
+    await readback.fulfill({status: outcome === "error" ? 500 : 200, contentType: "application/json",
+      body: JSON.stringify(outcome === "error" ? {detail: "Synthetic readback refusal"} : staleSnapshot)});
+    await (await response).finished();
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(h.input).toHaveValue("Successor readback draft");
+    await expect(h.input).toBeFocused();
+    await expect(page.locator("#enclosure-alias-form")).toBeVisible();
+    await expect(page.locator("#status-text")).toHaveText(status);
+    await expect(page.locator("#enclosure-select")).not.toContainText("Unowned readback name");
+    // Retired readbacks must still release their own global refresh bookkeeping.
+    await expect(page.locator("#refresh-countdown-label")).toHaveText("Auto refresh off");
+    expect(h.errors).toEqual([]);
+  });
+}
+
 // The browser runs the complete current app asset and submits its real form.
 // Only the HTTP boundary is synthetic: captured writes go through MappingStore
 // in a disposable directory, not through a replacement CAS implementation.
