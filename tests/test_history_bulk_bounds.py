@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
 import unittest
 import tempfile
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlencode
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
@@ -16,6 +20,7 @@ from starlette.requests import Request
 
 from history_service import main as history_main
 from history_service.operation_bounds import MAX_RESPONSE_BYTES
+from history_service.segment_catalog import MIGRATION_PENDING_MARKER, activation_pending_path
 from history_service.store import HistoryStore
 
 
@@ -23,6 +28,111 @@ SINCE = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
 
 class HistoryBulkRouteBoundsTests(unittest.TestCase):
+    @staticmethod
+    def _http_request(method, path, *, params=None, **kwargs):
+        async def invoke():
+            messages = []
+            sent = False
+
+            async def receive():
+                nonlocal sent
+                if sent:
+                    await asyncio.Event().wait()
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            scope = {
+                "type": "http", "http_version": "1.1", "method": method,
+                "scheme": "http", "path": path, "raw_path": path.encode(),
+                "query_string": urlencode(params or {}, doseq=True).encode(),
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 12345), "server": ("testserver", 80),
+            }
+            try:
+                await history_main.app(scope, receive, send)
+            except Exception:
+                if not any(message["type"] == "http.response.start" for message in messages):
+                    raise
+            return messages
+
+        document = kwargs.get("json")
+        body = json.dumps(document).encode() if document is not None else b""
+        messages = asyncio.run(invoke())
+        status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+        text = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body").decode()
+        return SimpleNamespace(status_code=status, text=text, json=lambda: json.loads(text))
+
+    def test_valid_get_and_post_report_storage_failures_not_input_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot = root / "hot.sqlite3"
+            segment = root / "segment-0001.sqlite3"
+            catalog = root / "catalog.json"
+            hot_store = HistoryStore(str(hot), recover_unreadable_database=False)
+            HistoryStore(str(segment), recover_unreadable_database=False)
+            observed = datetime.now(timezone.utc).isoformat()
+            with closing(sqlite3.connect(segment)) as connection, connection:
+                connection.execute("""INSERT INTO metric_samples (
+                    observed_at, system_id, enclosure_key, slot, slot_label,
+                    metric_name, value_integer
+                ) VALUES (?, 'synthetic', 'front', 0, '0', 'temperature_c', 30)""", (observed,))
+            digest = hashlib.sha256(segment.read_bytes()).hexdigest()
+            document = {
+                "scopes": [{"system_id": "synthetic", "enclosure_id": "front", "slots": [0]}],
+                "metrics": ["temperature_c"], "since": SINCE,
+                "event_limit": 0, "metric_limit": 1,
+            }
+            catalog_document = {
+                "catalog_version": 1, "generation_id": "generation-0001", "complete": True,
+                "segments": [{"segment_id": "segment-0001", "file_name": segment.name,
+                              "size_bytes": segment.stat().st_size, "sha256": digest,
+                              "coverage_start": observed, "coverage_end": observed}],
+            }
+            hot_store.segment_catalog_path = catalog
+            # Drive ASGI directly, without the operator-configured lifespan.
+            client = SimpleNamespace(request=self._http_request)
+            try:
+                with patch.object(history_main, "store", hot_store):
+                    for state in ("good", "corrupt", "activation", "migration", "good-again"):
+                        activation_pending_path(hot).unlink(missing_ok=True)
+                        (root / MIGRATION_PENDING_MARKER).unlink(missing_ok=True)
+                        catalog_document["segments"][0]["sha256"] = "0" * 64 if state == "corrupt" else digest
+                        catalog.write_text(json.dumps(catalog_document), encoding="utf-8")
+                        hot_store._segment_reader_cache = None
+                        if state == "activation":
+                            activation_pending_path(hot).write_text("synthetic", encoding="utf-8")
+                        if state == "migration":
+                            (root / MIGRATION_PENDING_MARKER).write_text("synthetic", encoding="utf-8")
+                        expected = 200 if state.startswith("good") else 503
+                        requests = [
+                            ("GET", "/api/history/scopes/slots", {
+                                "params": {"system_id": "synthetic", "enclosure_id": "front", "slots": [0],
+                                           "metrics": ["temperature_c"], "since": SINCE,
+                                           "event_limit": 0, "metric_limit": 1}}),
+                            ("POST", "/api/history/scopes/bundle", {"json": document}),
+                            ("GET", "/api/history/slots/0/events", {"params": {"system_id": "synthetic"}}),
+                            ("GET", "/api/history/slots/0/metrics", {
+                                "params": {"system_id": "synthetic", "enclosure_id": "front"}}),
+                            ("GET", "/api/history/slots/0/bundle", {
+                                "params": {"system_id": "synthetic", "enclosure_id": "front"}}),
+                        ]
+                        for method, url, kwargs in requests:
+                            with self.subTest(state=state, method=method, url=url):
+                                response = client.request(method, url, **kwargs)
+                                self.assertEqual(response.status_code, expected, response.text)
+                                if expected == 503:
+                                    self.assertEqual(response.json(), {"detail": history_main.HISTORY_UNAVAILABLE_DETAIL})
+                                    self.assertNotIn(str(root), response.text)
+                        with self.subTest(state=state, invalid=True):
+                            invalid = client.request("POST", "/api/history/scopes/bundle", json={**document, "metrics": ["unknown"]})
+                            self.assertEqual(invalid.status_code, 422)
+            finally:
+                activation_pending_path(hot).unlink(missing_ok=True)
+                (root / MIGRATION_PENDING_MARKER).unlink(missing_ok=True)
+
     @staticmethod
     def _request(body: bytes, *, content_type: bytes = b"application/json") -> Request:
         sent = False
