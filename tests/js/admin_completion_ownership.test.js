@@ -422,3 +422,155 @@ test("saved custom profile options exist before auto-selection", async () => {
   const run = p.api.saveCustomProfile(); await settle(p, valid("saveCustomProfile")); await run;
   assert.equal(value, "custom-a"); assert.equal(p.banners.at(-1).tone, "success");
 });
+
+// Use the real renderer, ownership helpers, input callbacks, JSON transport and
+// refresh failure path. Preview inputs are synthetic; Delete eligibility must
+// not be hidden behind the generic fixture's renderProfileBuilder spy.
+function profileDeleteReadbackFixture() {
+  const p = fixture("deleteCustomProfile", { realTransport: true });
+  const node = () => ({ textContent: "", innerHTML: "", dataset: {}, style: {},
+    classList: { add() {}, remove() {}, toggle() {} } });
+  for (const name of ["PreviewSummary", "PreviewGrid", "PreviewMeta", "PreviewBadge", "Badge", "LayoutEditor"]) {
+    p.elements[`profileBuilder${name}`] = node();
+  }
+  p.elements.profileBuilderOrdering = { ...node(), value: "source-layout" };
+  p.state.profiles = [
+    { id: "custom-a", label: "Custom A", is_custom: true, reference_count: 0 },
+    { id: "custom-b", label: "Custom B", is_custom: true, reference_count: 0 },
+  ];
+  p.state.setupDirty = true;
+  p.state.selectedBackupPaths = []; p.state.selectedDebugPaths = []; p.state.backupDefaults = {};
+  const readDraft = p.context.readProfileBuilderDraft;
+  p.context.readProfileBuilderDraft = () => ({ ...readDraft(), row_groups: [], ordering_preset: "source-layout" });
+  p.context.resolveBuilderDraftLayout = () => ({ previewRows: [[0, 1]], badge: "Draft", summary: "Synthetic layout" });
+  p.context.currentStagedEsxiHostPrepPackages = () => [];
+  p.context.renderRuntimeCards = () => {}; p.context.loadOrphanedHistory = () => {};
+  const realHelpers = ["getProfileById", "profileReferenceCount", "describeProfileReferences",
+    "renderProfileBuilder", "resetProfileBuilder", "lockActionsIfStopped", "escapeHtml",
+    "buildProfilePreviewGeometry", "normalizeProfilePreviewRows", "normalizeProfilePreviewRowGroups",
+    "inferProfilePreviewDriveScale", "inferProfilePreviewLayoutMode", "applyProfilePreviewGeometry",
+    "clearProfilePreviewGeometry", "renderProfilePreviewCells", "defaultProfilePreviewCell",
+    "splitProfilePreviewRowIntoGroups", "profilePreviewBreakpoints", "profilePreviewFlatGroupedTemplate",
+    "refreshState", "startRefreshState", "runRefreshState"];
+  vm.runInContext(realHelpers.map(name => functionSource(name)).join("\n"), p.context);
+  const { setupHandlers, builderHandlers } = bindEditorInputs(p);
+  p.editSetup = () => setupHandlers.input({ target: {} });
+  p.editBuilder = () => builderHandlers.input();
+  p.renderBuilder = () => p.context.renderProfileBuilder();
+  p.renderBuilder();
+  assert.equal(p.elements.profileBuilderDeleteButton.disabled, false, "real renderer initially admits the saved custom profile");
+  return p;
+}
+
+async function drainDeleteMicrotasks() {
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+}
+
+function remainingProfiles() {
+  return [{ id: "custom-b", label: "Authoritative B", is_custom: true, reference_count: 0 }];
+}
+
+for (const failure of ["rejected read", "invalid state"]) {
+  test(`profile delete eligibility: confirmed DELETE with ${failure} reconciles catalog and cannot dispatch twice`, async () => {
+    const p = profileDeleteReadbackFixture(), catalog = remainingProfiles();
+    p.elements.profileBuilderLabel.value = "Retained dirty builder label";
+    const run = p.api.deleteCustomProfile();
+    p.requests[0].resolve({ ...valid("deleteCustomProfile"), profiles: catalog });
+    await drainDeleteMicrotasks();
+    assert.equal(p.requests[1].url, "/api/admin/state");
+    if (failure === "rejected read") p.requests[1].reject(new Error("Synthetic readback rejection"));
+    else p.requests[1].resolve({ profiles: catalog, systems: null });
+    await run;
+    assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+    assert.match(p.banners.at(-1).message, /Deleted.*catalog refresh is unavailable/);
+    assert.equal(p.banners.at(-1).tone, "info");
+    assert.equal(p.state.loadedBuilderProfileId, "custom-a", "retain the draft's original identity");
+    assert.equal(p.elements.profileBuilderLabel.value, "Retained dirty builder label");
+    assert.equal(p.state.setupDirty, true);
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, true, "confirmed missing profile cannot regain Delete eligibility");
+    assert.equal(JSON.stringify(p.state.profiles), JSON.stringify(catalog), "validated deletion catalog replaces only the stale catalog");
+    // A programmatic second handler call is stricter than a disabled DOM click.
+    await p.api.deleteCustomProfile();
+    assert.equal(p.requests.filter(request => request.options.method === "DELETE").length, 1);
+    p.editSetup(); p.editBuilder(); p.renderBuilder();
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, true, "real retirement and input renderers cannot reenable deletion");
+    assert.equal(p.elements.profileBuilderLabel.value, "Retained dirty builder label");
+    assert.equal(p.state.setupDirty, true);
+  });
+}
+
+test("profile delete eligibility: healthy readback takes precedence and resets the originating builder", async () => {
+  const p = profileDeleteReadbackFixture(), run = p.api.deleteCustomProfile();
+  p.requests[0].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+  await drainDeleteMicrotasks();
+  const catalog = [{ ...remainingProfiles()[0], label: "Newer readback B" }, { id: "custom-c", is_custom: true }];
+  p.requests[1].resolve({ profiles: catalog, systems: p.state.systems });
+  await run;
+  assert.equal(JSON.stringify(p.state.profiles), JSON.stringify(catalog));
+  assert.equal(p.state.loadedBuilderProfileId, "");
+  assert.equal(p.elements.profileBuilderLabel.value, "");
+  assert.equal(p.elements.profileBuilderDeleteButton.disabled, true);
+  assert.equal(p.banners.at(-1).tone, "success");
+  assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+});
+
+for (const failure of ["refusal", "ok only", "wrong target", "includes deleted profile", "invalid catalog"]) {
+  test(`profile delete eligibility: ${failure} does not confirm or reconcile deletion`, async () => {
+    const p = profileDeleteReadbackFixture(), catalog = p.state.profiles;
+    const run = p.api.deleteCustomProfile();
+    if (failure === "refusal") p.requests[0].reject(new Error("Synthetic delete refusal"));
+    else {
+      const body = { ...valid("deleteCustomProfile"), profiles: remainingProfiles() };
+      if (failure === "wrong target") body.profile_id = "custom-b";
+      if (failure === "includes deleted profile") body.profiles = catalog;
+      if (failure === "invalid catalog") body.profiles = [{}];
+      p.requests[0].resolve(failure === "ok only" ? { ok: true } : body);
+    }
+    await run;
+    assert.equal(p.state.profiles, catalog);
+    assert.notEqual(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+    assert.equal(p.requests.length, 1, "unconfirmed mutation cannot trigger catalog readback");
+    assert.equal(p.state.loadedBuilderProfileId, "custom-a");
+    assert.equal(p.elements.profileBuilderDeleteButton.disabled, false);
+    assert.equal(p.state.setupDirty, true);
+    assert.equal(p.banners.at(-1).tone, "error");
+  });
+}
+
+for (const phase of ["DELETE", "readback"]) {
+  for (const move of ["different profile", "same-profile revisit", "builder draft", "setup draft"]) {
+    test(`profile delete eligibility: ${phase} completion preserves successor ${move} controls and catalog`, async () => {
+      const p = profileDeleteReadbackFixture(), run = p.api.deleteCustomProfile();
+      if (phase === "readback") {
+        p.requests[0].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+        await drainDeleteMicrotasks();
+        assert.equal(p.requests.length, 2);
+      }
+      if (move === "different profile") {
+        p.state.profileBuilderGeneration++;
+        p.state.loadedBuilderProfileId = "custom-b";
+        p.elements.profileBuilderId.value = "custom-b";
+      } else if (move === "same-profile revisit") p.state.profileBuilderGeneration += 2;
+      else if (move === "builder draft") p.editBuilder();
+      else p.editSetup();
+      p.elements.profileBuilderLabel.value = "Successor dirty label";
+      const catalog = [{ id: "custom-a", is_custom: true }, { id: "custom-b", label: "Successor B", is_custom: true }];
+      p.state.profiles = catalog;
+      p.renderBuilder();
+      p.elements.profileBuilderDeleteButton.disabled = true;
+      p.elements.profileBuilderSaveButton.disabled = true;
+      const before = p.snapshot(), bannerCount = p.banners.length;
+      if (phase === "DELETE") {
+        p.requests[0].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+        await drainDeleteMicrotasks();
+      }
+      assert.equal(p.requests.length, 2, "source read still runs for the confirmed mutation");
+      p.requests[1].reject(new Error("Synthetic retired readback rejection"));
+      await run;
+      assert.equal(p.snapshot(), before, "retired completion cannot mutate successor fields or controls");
+      assert.equal(p.state.profiles, catalog, "old deletion payload cannot replace a successor catalog");
+      assert.equal(p.banners.length, bannerCount);
+      assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+    });
+  }
+}

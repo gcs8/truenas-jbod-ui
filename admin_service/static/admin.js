@@ -7844,6 +7844,10 @@
       if (!owner.owns()) return;
       if (refreshed === false) {
         const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
+        // The validated DELETE catalog excludes this ID. Keep the draft, but
+        // do not let a failed readback restore eligibility from the old catalog.
+        state.profiles = payload.profiles;
+        renderProfileCatalog();
         renderSaveResult(elements.profileBuilderResult, message, payload);
         setBanner(message, "info");
         return;
