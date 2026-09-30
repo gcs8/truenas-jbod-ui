@@ -364,6 +364,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   save/readback completions from replacing newer graphs or editor drafts. (#769)
 - Refresh clean mapping forms with current values while keeping dirty drafts
   bound to their original revision, preventing stale values from gaining a fresh CAS token. (#770)
+- Kept delayed admin completions out of successor editors and preserved drafts
+  when mutation responses did not establish a known outcome, and kept confirmed
+  profile deletions unavailable after a failed catalog readback without replacing
+  a newer admitted catalog, and synchronized profile-dependent setup controls
+  after deletion without resetting unrelated draft fields. (#879)
 - Preserve IPv6 brackets in derived System Setup links while retaining explicit
   public-URL precedence and existing admin reachability behavior. (#771)
 - Ran each click inside the admin Backups dialog once; two listeners had

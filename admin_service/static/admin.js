@@ -1687,6 +1687,12 @@
         .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
         .join("");
     }
+    renderExistingSystemCatalog();
+  }
+
+  function renderExistingSystemCatalog() {
+    if (!elements.currentSystemsList || !elements.currentDefaultSystem) return;
+    elements.currentDefaultSystem.textContent = state.defaultSystemId ? `Default: ${state.defaultSystemId}` : "No default";
     elements.currentSystemsList.innerHTML = state.systems.length
       ? state.systems
           .map((system) => {
@@ -2298,6 +2304,8 @@
   }
 
   function resetProfileBuilder({ keepResult = false } = {}) {
+    state.profileBuilderGeneration = (state.profileBuilderGeneration || 0) + 1;
+    retireAdminEditorControls({ builderOnly: true });
     state.loadedBuilderProfileId = "";
     if (elements.profileBuilderId) {
       elements.profileBuilderId.value = "";
@@ -2356,6 +2364,8 @@
       return;
     }
     state.loadedBuilderProfileId = profile.is_custom ? profile.id : "";
+    state.profileBuilderGeneration = (state.profileBuilderGeneration || 0) + 1;
+    retireAdminEditorControls({ builderOnly: true });
     if (elements.profileBuilderId) {
       elements.profileBuilderId.value = profile.is_custom ? profile.id : suggestedCustomProfileId(profile);
     }
@@ -4872,6 +4882,7 @@
   }
 
   function resetSetupForm() {
+    retireAdminEditorControls();
     state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.loadedSystemId = null;
     state.selectedProfileId = "";
@@ -5036,6 +5047,7 @@
     if (!system) {
       return;
     }
+    retireAdminEditorControls();
     state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.setupDirty = false;
     state.loadedSystemId = system.id || null;
@@ -5340,7 +5352,74 @@
     if (before !== setupDraftSnapshot()) {
       state.setupDirty = true;
       state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      retireAdminEditorControls();
     }
+  }
+
+  // No credential snapshots: visits and monotonic revisions retire typed edits,
+  // while the non-secret target also catches programmatic endpoint changes.
+  function captureAdminEditorOperation(name, { builder = false, selection = false } = {}) {
+    state.adminEditorOperationSeq = state.adminEditorOperationSeq || {};
+    const sequence = (state.adminEditorOperationSeq[name] || 0) + 1;
+    state.adminEditorOperationSeq[name] = sequence;
+    const target = () => JSON.stringify([
+      state.loadedSystemId, elements.setupSystemId?.value, elements.setupPlatform?.value,
+      elements.setupTruenasHost?.value, elements.setupSshHost?.value, elements.setupSshUser?.value,
+      elements.setupBootstrapHost?.value, elements.setupProfile?.value,
+      ...(selection ? [state.selectedExistingSystemId, elements.existingSystemSelect?.value,
+        elements.existingSystemDeleteHistoryToggle?.checked] : []),
+    ]);
+    // Use raw builder fields, not readProfileBuilderDraft's catalog-dependent
+    // fallbacks: a refreshed/deleted source profile is not a user edit.
+    const builderDraft = () => JSON.stringify([state.loadedBuilderProfileId,
+      ...Object.entries(elements).filter(([key, field]) => key.startsWith("profileBuilder")
+        && field && "value" in field).map(([key, field]) => [key, field.value])]);
+    const snapshot = () => ({ generation: state.setupEditorGeneration, revision: state.setupDraftRevision,
+      target: target(), builderGeneration: state.profileBuilderGeneration,
+      builderRevision: state.profileBuilderRevision,
+      builderDraft: builder ? builderDraft() : null });
+    let submitted = snapshot();
+    const owns = () => state.adminEditorOperationSeq[name] === sequence
+      && state.setupEditorGeneration === submitted.generation
+      && state.setupDraftRevision === submitted.revision && target() === submitted.target
+      && (!builder || (state.profileBuilderGeneration === submitted.builderGeneration
+        && state.profileBuilderRevision === submitted.builderRevision
+        && builderDraft() === submitted.builderDraft));
+    // Only call after an admitted, synchronous change made by this operation.
+    return { owns, advance: () => { submitted = snapshot(); } };
+  }
+
+  function retireAdminEditorControls({ builderOnly = false } = {}) {
+    // Retire loading synchronously on navigation/edit, never from a stale
+    // finalizer. A later operation can then acquire these controls itself.
+    if (!builderOnly) {
+      state.haNodesLoading = false;
+      if (elements.setupDiscoverHaNodesButton) {
+        elements.setupDiscoverHaNodesButton.disabled = Boolean(state.sessionStopped)
+          || currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked;
+      }
+      if (elements.setupBootstrapButton) {
+        elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
+      }
+      const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
+      const selected = state.systems?.some((system) => system.id === selectedId);
+      for (const control of [elements.existingSystemDeleteButton, elements.existingSystemDeleteHistoryToggle]) {
+        if (control) control.disabled = !selected || Boolean(state.sessionStopped);
+      }
+    }
+    if (elements.profileBuilderSaveButton) elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
+    if (elements.profileBuilderDeleteButton) {
+      const loadedProfile = state.loadedBuilderProfileId ? getProfileById(state.loadedBuilderProfileId) : null;
+      elements.profileBuilderDeleteButton.disabled = Boolean(state.sessionStopped)
+        || !loadedProfile?.is_custom || profileReferenceCount(loadedProfile) > 0;
+    }
+  }
+
+  function recordAdminEditorOutcome(operation, target, outcome) {
+    // Keep only target/status, not credentials, raw provisioning output or a
+    // foreign operation's result in the currently visible form.
+    state.adminEditorOutcomes = state.adminEditorOutcomes || {};
+    state.adminEditorOutcomes[operation] = { target, outcome };
   }
 
   async function discoverQuantastorHaNodes() {
@@ -5352,10 +5431,12 @@
     syncHaNodesFromInputs();
     const setupPayload = collectSetupPayload({ preserveRedactedSecrets: true });
     renderQuantastorHaSection();
+    const owner = captureAdminEditorOperation("ha-discovery");
     renderStorageViews();
     try {
       const payload = await fetchJson("/api/admin/system-setup/quantastor-nodes", {
         method: "POST",
+        validateResult: validHaNodesResult,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           system_id: setupPayload.system_id,
@@ -5376,9 +5457,13 @@
           ha_nodes: setupPayload.ha_nodes,
         }),
       });
+      requireMutationResult(validHaNodesResult(payload), "QuantaStor node discovery");
+      recordAdminEditorOutcome("ha-discovery", setupPayload.system_id, "success");
+      if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
-      state.haNodes = normalizeHaNodes(payload.nodes || []);
+      state.haNodes = normalizeHaNodes(payload.nodes);
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       renderQuantastorHaSection();
       renderStorageViews();
       const hostDiscovery = payload.host_discovery || {};
@@ -5388,10 +5473,13 @@
         hostDiscovery.attempted && hostDiscovery.ok === false ? "info" : "success"
       );
     } catch (error) {
-      setBanner(`Unable to load nodes from QuantaStor: ${error.message || error}`, "error");
+      recordAdminEditorOutcome("ha-discovery", setupPayload.system_id, error.adminOutcome || "error");
+      if (owner.owns()) setBanner(describeMutationFailure("QuantaStor node discovery", error), "error");
     } finally {
-      state.haNodesLoading = false;
-      renderQuantastorHaSection();
+      if (owner.owns()) {
+        state.haNodesLoading = false;
+        renderQuantastorHaSection();
+      }
     }
   }
 
@@ -5514,7 +5602,7 @@
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
       const rawId = validatedRequestId(response.headers?.get?.("X-Request-ID"));
       const requestId = rawId ? ` (request id ${rawId})` : "";
-      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Retry or check the admin connection.${requestId}`);
+      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Check the admin connection.${requestId}`);
       error.requestId = requestId;
       throw error;
     }
@@ -5824,6 +5912,54 @@
       && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
   }
 
+  function validSystemDeleteResult(result, systemId, purgeHistory) {
+    const purge = result?.history_purge;
+    return Boolean(result && result.ok === true && result.system_id === systemId
+      && typeof result.deleted_label === "string" && Array.isArray(result.systems)
+      && result.systems.every((system) => system && isNonEmptyString(system.id)
+        && system.id !== systemId && typeof system.label === "string")
+      && (result.default_system_id === null || (isNonEmptyString(result.default_system_id)
+        && result.systems.some((system) => system.id === result.default_system_id)))
+      && purge && purge.requested === purgeHistory && typeof purge.ok === "boolean"
+      && typeof purge.detail === "string"
+      && (purge.summary === null || (purge.summary && Number.isInteger(purge.summary.total_rows)
+        && purge.summary.total_rows >= 0))
+      && (!purge.requested || !purge.ok || purge.summary !== null));
+  }
+
+  function validBootstrapResult(result, submitted) {
+    // account_bootstrap.py can return HTTP 200/ok:false after account setup
+    // when the requested sudo policy is unverified. That is not a refusal.
+    return Boolean(result && typeof result.ok === "boolean" && result.host === submitted.host
+      && result.platform === submitted.platform && result.service_user === submitted.service_user
+      && typeof result.sudo_rules_installed === "boolean" && isNonEmptyString(result.key_source)
+      && isNonEmptyString(result.detail)
+      && (result.authorized_keys_path === null || isNonEmptyString(result.authorized_keys_path))
+      && result.ok === (!submitted.install_sudo_rules || result.sudo_rules_installed)
+      && (!result.sudo_rules_installed || submitted.install_sudo_rules));
+  }
+
+  function validGeneratedKeyResult(result, name) {
+    return Boolean(result && result.ok === true && result.key?.name === name
+      && isNonEmptyString(result.key.runtime_private_path) && Array.isArray(result.keys)
+      && result.keys.every((key) => key && isNonEmptyString(key.name))
+      && result.keys.some((key) => key.name === name));
+  }
+
+  function validHaNodesResult(result) {
+    return Boolean(result && result.ok === true && Array.isArray(result.nodes)
+      && result.nodes.every((node) => node && typeof node.system_id === "string"
+        && typeof node.label === "string" && (node.host === null || typeof node.host === "string"))
+      && result.host_discovery && typeof result.host_discovery.attempted === "boolean"
+      && typeof result.host_discovery.ok === "boolean");
+  }
+
+  function validProfileDeleteResult(result, profileId) {
+    return Boolean(result && result.ok === true && result.profile_id === profileId
+      && typeof result.deleted_label === "string" && Array.isArray(result.profiles)
+      && result.profiles.every((profile) => profile && isNonEmptyString(profile.id) && profile.id !== profileId));
+  }
+
   // Confirmed refusals say "failed"; an unknown outcome says so and keeps the
   // draft so the operator re-checks instead of saving the same change twice.
   function describeMutationFailure(action, error) {
@@ -5835,12 +5971,13 @@
   }
 
   async function fetchJson(url, options = {}) {
+    const { acceptPartialResult = null, validateResult = null, ...requestOptions } = options;
     const mutating = isMutatingRequest(options);
     // An offline hint must not veto a request to a reachable local sidecar.
     const offlineHint = browserIsOffline();
     try {
       const { body } = await fetchOrReportStopped(url, {
-        ...options,
+        ...requestOptions,
         readBody: async (response, signal) => {
           let payload;
           try {
@@ -5859,7 +5996,8 @@
             error.protocolError = true;
             throw error;
           }
-          if (!response.ok || payload.ok === false) {
+          if (response.ok && validateResult) requireMutationResult(validateResult(payload), "submitted operation");
+          if (!response.ok || (payload.ok === false && !acceptPartialResult?.(payload))) {
             const outcome = classifyResponseFailure(response?.status, mutating);
             const error = adminRequestError(
               describeResponseFailure(describeRequestFailure(payload, response), outcome), outcome
@@ -6313,13 +6451,13 @@
     }
   }
 
-  function refreshState({ quiet = false, canPublish = null, failureMessage = null } = {}) {
+  function refreshState({ quiet = false, canPublish = null, failureMessage = null, catalogOnly = false } = {}) {
     // Capture notification ownership now, even if this read must queue. A quiet
     // post-write refresh still runs after its dialog closes, but cannot borrow
     // a successor's banner or editor intent when it eventually completes.
     const admitted = !canPublish || canPublish();
     if (admitted) state.bannerRevision = (state.bannerRevision || 0) + 1;
-    const options = { quiet, canPublish, failureMessage,
+    const options = { quiet, canPublish, failureMessage, catalogOnly,
       bannerRevision: state.bannerRevision,
       editorGeneration: state.setupEditorGeneration,
       draftRevision: state.setupDraftRevision,
@@ -6357,7 +6495,7 @@
 
   async function runRefreshState({ quiet = false, canPublish = null, failureMessage = null,
     bannerRevision = state.bannerRevision, editorGeneration = state.setupEditorGeneration,
-    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId } = {}) {
+    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId, catalogOnly = false } = {}) {
     const ownsBanner = () => (!canPublish || canPublish()) && state.bannerRevision === bannerRevision
       && state.setupEditorGeneration === editorGeneration && state.setupDraftRevision === draftRevision
       && state.selectedStorageViewId === storageViewId;
@@ -6400,8 +6538,14 @@
       }
       // Paint the fresh admin state first; the removed-system history scan hits SQLite
       // and must not hold up container status or the saved-system lists.
-      renderAll();
-      if (state.loadedSystemId) {
+      if (catalogOnly) {
+        renderExistingSystemCatalog();
+        renderProfileCatalog();
+        renderRuntimeCards();
+      } else {
+        renderAll();
+      }
+      if (!catalogOnly && state.loadedSystemId) {
         void fetchLiveEnclosures({ quiet: true });
         void fetchStorageViewCandidates({ quiet: true });
       }
@@ -6411,10 +6555,12 @@
       if (!quiet && ownsBanner()) {
         setBanner("Refreshed.", "success");
       }
+      return true;
     } catch (error) {
       if (ownsBanner()) {
         setBanner(failureMessage || `Unable to refresh admin state: ${error.message || error}`, "error");
       }
+      return false;
     } finally {
       if (elements.refreshStateButton) {
         elements.refreshStateButton.disabled = Boolean(state.sessionStopped);
@@ -7225,14 +7371,19 @@
       elements.setupGenerateKeyName.value = desiredName;
     }
     setBanner(`Generating SSH key pair ${desiredName}...`);
+    const owner = captureAdminEditorOperation("key-generation");
     try {
       const payload = await fetchJson("/api/admin/ssh-keys/generate", {
         method: "POST",
+        validateResult: (value) => validGeneratedKeyResult(value, desiredName),
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: desiredName }),
       });
+      requireMutationResult(validGeneratedKeyResult(payload, desiredName), "SSH key generation");
+      recordAdminEditorOutcome("key-generation", desiredName, "success");
+      state.sshKeys = payload.keys;
+      if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
-      state.sshKeys = Array.isArray(payload.keys) ? payload.keys : state.sshKeys;
       renderSshKeyOptions(payload.key?.name || desiredName);
       if (elements.setupSshKeyMode) {
         elements.setupSshKeyMode.value = "reuse";
@@ -7245,8 +7396,21 @@
       recordSetupDraftChange(draftBefore);
       setBanner(`SSH key pair ${desiredName} generated.`, "success");
     } catch (error) {
-      setBanner(`SSH key generation failed: ${error.message || error}`, "error");
+      recordAdminEditorOutcome("key-generation", desiredName, error.adminOutcome || "error");
+      if (owner.owns()) setBanner(describeMutationFailure("SSH key generation", error), "error");
     }
+  }
+
+  async function fetchBootstrapResult(payload) {
+    const result = await fetchJson("/api/admin/system-setup/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      acceptPartialResult: (value) => validBootstrapResult(value, payload) && value.ok === false,
+      validateResult: (value) => validBootstrapResult(value, payload),
+    });
+    requireMutationResult(validBootstrapResult(result, payload), "service-account bootstrap");
+    return result;
   }
 
   async function bootstrapServiceAccount() {
@@ -7261,6 +7425,7 @@
       return;
     }
 
+    const owner = captureAdminEditorOperation("bootstrap");
     if (elements.setupBootstrapButton) {
       elements.setupBootstrapButton.disabled = true;
     }
@@ -7269,11 +7434,15 @@
     }
 
     try {
-      const result = await fetchJson("/api/admin/system-setup/bootstrap", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const result = await fetchBootstrapResult(payload);
+      recordAdminEditorOutcome("bootstrap", payload.host, result.ok ? "success" : "partial");
+      if (!owner.owns()) return;
+      if (!result.ok) {
+        if (elements.setupBootstrapResult) elements.setupBootstrapResult.textContent = result.detail;
+        if (elements.setupResult) elements.setupResult.textContent = "Account setup may have completed, but permissions are unverified. Check the host before retrying.";
+        setBanner(`Bootstrap partially completed on ${payload.host}. ${result.detail} Check the host before retrying.`, "error");
+        return;
+      }
       const draftBefore = setupDraftSnapshot();
       if (elements.setupSshEnabled) {
         elements.setupSshEnabled.checked = true;
@@ -7302,6 +7471,7 @@
       syncSshFields();
       maybeLoadRecommendedCommands();
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       scheduleSudoersPreviewRefresh(0);
       if (elements.setupBootstrapResult) {
         const sudoState = result.sudo_rules_installed
@@ -7314,12 +7484,14 @@
       }
       setBanner(`Bootstrap complete for ${result.service_user || payload.service_user}.`, "success");
     } catch (error) {
-      if (elements.setupBootstrapResult) {
-        elements.setupBootstrapResult.textContent = `Bootstrap failed: ${error.message || error}`;
+      recordAdminEditorOutcome("bootstrap", payload.host, error.adminOutcome || "error");
+      const message = describeMutationFailure("Bootstrap", error);
+      if (owner.owns() && elements.setupBootstrapResult) {
+        elements.setupBootstrapResult.textContent = message;
       }
-      setBanner(`Bootstrap failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      if (elements.setupBootstrapButton) {
+      if (owner.owns() && elements.setupBootstrapButton) {
         elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -7407,8 +7579,10 @@
     const deletingLoadedSystem = selectedSystem.id === state.loadedSystemId;
     const deletingDefaultSystem = selectedSystem.id === state.defaultSystemId;
     const purgeHistory = Boolean(elements.existingSystemDeleteHistoryToggle?.checked);
+    const owner = captureAdminEditorOperation("system-delete", { selection: true });
     if (purgeHistory && historyRowCountForSystem(selectedSystem.id) === null) {
       await loadHistoryRowCounts({ quiet: true });
+      if (!owner.owns()) return;
       renderExistingSystems();
     }
     const historyRows = historyRowCountForSystem(selectedSystem.id);
@@ -7450,20 +7624,29 @@
         `/api/admin/system-setup/${encodeURIComponent(selectedSystem.id)}${params.size ? `?${params.toString()}` : ""}`,
         {
           method: "DELETE",
+          validateResult: (value) => validSystemDeleteResult(value, selectedSystem.id, purgeHistory),
         }
       );
-      state.systems = Array.isArray(payload.systems) ? payload.systems : [];
-      state.defaultSystemId = payload.default_system_id || null;
+      requireMutationResult(validSystemDeleteResult(payload, selectedSystem.id, purgeHistory), "system delete");
+      recordAdminEditorOutcome("system-delete", selectedSystem.id, "success");
+      const ownsDraft = owner.owns();
+      state.systems = payload.systems;
+      state.defaultSystemId = payload.default_system_id;
       state.runtime = payload.runtime || state.runtime;
 
-      if (deletingLoadedSystem) {
+      if (deletingLoadedSystem && ownsDraft) {
         resetSetupForm();
+        owner.advance();
       } else {
-        if (state.selectedExistingSystemId === selectedSystem.id) {
+        if (ownsDraft && state.selectedExistingSystemId === selectedSystem.id) {
           state.selectedExistingSystemId = state.defaultSystemId || state.systems[0]?.id || "";
         }
-        renderAll();
+        if (ownsDraft) renderExistingSystems();
+        else renderExistingSystemCatalog();
       }
+
+      if (state.historyRowCounts) delete state.historyRowCounts[selectedSystem.id];
+      if (!ownsDraft) return;
 
       renderSaveResult(
         elements.setupResult,
@@ -7473,9 +7656,7 @@
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
-      if (state.historyRowCounts) {
-        delete state.historyRowCounts[selectedSystem.id];
-      }
+      owner.advance();
       if (payload.history_purge?.requested && !payload.history_purge.ok) {
         setBanner(
           `Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}, but its history could not be deleted: ${payload.history_purge.detail || "unknown error"}`,
@@ -7491,16 +7672,18 @@
         setBanner(`Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Its history is kept.`, "success");
       }
     } catch (error) {
-      if (elements.setupResult) {
-        elements.setupResult.textContent = `System delete failed: ${error.message || error}`;
+      recordAdminEditorOutcome("system-delete", selectedSystem.id, error.adminOutcome || "error");
+      const message = describeMutationFailure("System delete", error);
+      if (owner.owns() && elements.setupResult) {
+        elements.setupResult.textContent = message;
       }
-      setBanner(`System delete failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
       const currentSelectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
-      if (elements.existingSystemDeleteButton) {
+      if (owner.owns() && elements.existingSystemDeleteButton) {
         elements.existingSystemDeleteButton.disabled = !currentSelectedSystem || Boolean(state.sessionStopped);
       }
-      if (elements.existingSystemDeleteHistoryToggle) {
+      if (owner.owns() && elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.disabled = !currentSelectedSystem;
         if (!currentSelectedSystem) {
           elements.existingSystemDeleteHistoryToggle.checked = false;
@@ -7551,6 +7734,7 @@
       slot_layout: layoutResolution.slotLayoutForSave,
     };
 
+    const owner = captureAdminEditorOperation("profile-save", { builder: true });
     if (elements.profileBuilderSaveButton) {
       elements.profileBuilderSaveButton.disabled = true;
     }
@@ -7565,23 +7749,37 @@
         body: JSON.stringify(payloadBody),
       });
       requireMutationResult(validProfileSaveResult(payload), "custom profile save");
+      recordAdminEditorOutcome("profile-save", draft.id, "success");
       const savedProfileId = payload.profile.id;
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true });
+      if (!owner.owns()) return;
+      if (refreshed === false) {
+        const message = `Saved custom profile ${savedProfileId}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
+        renderSaveResult(elements.profileBuilderResult, message, payload);
+        setBanner(message, "info");
+        return;
+      }
       {
         const draftBefore = setupDraftSnapshot();
+        renderProfileOptions();
         state.loadedBuilderProfileId = savedProfileId;
         state.selectedProfileId = savedProfileId;
         if (elements.setupProfile) {
           elements.setupProfile.value = savedProfileId;
         }
         recordSetupDraftChange(draftBefore);
+        owner.advance();
       }
-      await refreshState({ quiet: true });
       const refreshedProfile = getProfileById(savedProfileId);
       if (refreshedProfile) {
         loadProfileIntoBuilder(refreshedProfile);
       } else {
         renderProfileBuilder();
       }
+      owner.advance();
+      renderProfilePreview();
+      renderProfileCatalog();
+      renderStorageViews();
       renderSaveResult(elements.profileBuilderResult, payload.detail || `Saved custom profile ${savedProfileId}.`, payload);
       setBanner(
         payload.updated_existing
@@ -7590,13 +7788,14 @@
         "success"
       );
     } catch (error) {
+      recordAdminEditorOutcome("profile-save", draft.id, error.adminOutcome || "error");
       const message = describeMutationFailure("Custom profile save", error);
-      if (elements.profileBuilderResult) {
+      if (owner.owns() && elements.profileBuilderResult) {
         elements.profileBuilderResult.textContent = message;
       }
-      setBanner(message, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      if (elements.profileBuilderSaveButton) {
+      if (owner.owns() && elements.profileBuilderSaveButton) {
         elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -7626,6 +7825,8 @@
       return;
     }
 
+    const owner = captureAdminEditorOperation("profile-delete", { builder: true });
+    const submittedCatalog = state.profiles;
     if (elements.profileBuilderDeleteButton) {
       elements.profileBuilderDeleteButton.disabled = true;
     }
@@ -7636,20 +7837,58 @@
     try {
       const payload = await fetchJson(`/api/admin/profiles/${encodeURIComponent(profile.id)}`, {
         method: "DELETE",
+        validateResult: (value) => validProfileDeleteResult(value, profile.id),
       });
-      state.loadedBuilderProfileId = "";
-      await refreshState({ quiet: true });
+      requireMutationResult(validProfileDeleteResult(payload, profile.id), "custom profile delete");
+      recordAdminEditorOutcome("profile-delete", profile.id, "success");
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true });
+      if (!owner.owns()) return;
+      if (refreshed === false) {
+        // Reconcile only the catalog captured before DELETE. A successful
+        // state read replaces that object, even for an equal snapshot, and
+        // takes precedence over this fallback, including a recreated same ID.
+        if (state.profiles === submittedCatalog) {
+          state.profiles = payload.profiles;
+        }
+      }
+      // Both admitted readback paths must invalidate the deleted selection
+      // before previewing or submitting this draft. Advance only after our
+      // synchronous edit, so it cannot retire this operation's own finalizer.
+      const draftBefore = setupDraftSnapshot();
+      renderProfileSetupDependencies();
+      recordSetupDraftChange(draftBefore);
+      owner.advance();
+      if (refreshed === false) {
+        const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
+        renderSaveResult(elements.profileBuilderResult, message, payload);
+        setBanner(message, "info");
+        return;
+      }
       resetProfileBuilder({ keepResult: true });
+      owner.advance();
       renderSaveResult(elements.profileBuilderResult, payload.detail || `Deleted custom profile ${profile.label || profile.id}.`, payload);
       setBanner(`Deleted custom profile ${profile.label || profile.id}.`, "success");
     } catch (error) {
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = `Custom profile delete failed: ${error.message || error}`;
+      recordAdminEditorOutcome("profile-delete", profile.id, error.adminOutcome || "error");
+      const message = describeMutationFailure("Custom profile delete", error);
+      if (owner.owns() && elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = message;
       }
-      setBanner(`Custom profile delete failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      renderProfileBuilder();
+      if (owner.owns()) renderProfileBuilder();
     }
+  }
+
+  function renderProfileSetupDependencies() {
+    renderProfileOptions();
+    renderProfilePreview();
+    renderProfileCatalog();
+    // Refresh catalog-derived storage choices/geometry, not the full editor:
+    // syncStorageViewEditorFromState would replace unrelated raw input drafts.
+    renderStorageViewTemplateOptions();
+    renderStorageViewList();
+    renderStorageViewPreview();
   }
 
   function renderAll({ trackSetupDraft = true } = {}) {
@@ -7930,10 +8169,14 @@
       }
       const eventName = field.matches("select") ? "change" : "input";
       field.addEventListener(eventName, () => {
+        state.profileBuilderRevision = (state.profileBuilderRevision || 0) + 1;
+        retireAdminEditorControls({ builderOnly: true });
         renderProfileBuilder();
       });
     });
     elements.profileBuilderOrdering?.addEventListener("change", () => {
+      state.profileBuilderRevision = (state.profileBuilderRevision || 0) + 1;
+      retireAdminEditorControls({ builderOnly: true });
       if (!elements.profileBuilderOrdering || !elements.profileBuilderLayoutText) {
         renderProfileBuilder();
         return;
@@ -8030,6 +8273,7 @@
       }
       state.setupDirty = true;
       state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      retireAdminEditorControls();
     };
     elements.setupPanel?.addEventListener("input", markSetupDraftChanged);
     elements.setupPanel?.addEventListener("change", markSetupDraftChanged);

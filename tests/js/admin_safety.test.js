@@ -12,7 +12,7 @@ function extract(name) {
   return source.slice(start, next < 0 ? undefined : start + 3 + next);
 }
 const FETCH_JSON_HELPERS = ["fetchJson", "fetchOrReportStopped", "sessionRemainingMs", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "adminRequestError", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
-const MUTATION_RESULT_HELPERS = ["requireMutationResult", "isNonEmptyString", "validSystemSaveResult", "validDemoSystemResult", "validProfileSaveResult", "describeMutationFailure", "adminRequestError"];
+const MUTATION_RESULT_HELPERS = ["requireMutationResult", "isNonEmptyString", "validSystemSaveResult", "validDemoSystemResult", "validProfileSaveResult", "describeMutationFailure", "adminRequestError", "captureAdminEditorOperation", "retireAdminEditorControls", "recordAdminEditorOutcome"];
 const SYNTHETIC_REQUEST_ID = "0123456789abcdef0123456789abcdef";
 function load(names, bindings = {}) {
   const context = vm.createContext({console, URLSearchParams, setTimeout, clearTimeout, state: {admin: {}}, renderSaveResult(target, detail) {if (target) target.textContent = detail;}, AbortController, DEFAULT_REQUEST_TIMEOUT_MS: 60000, ...bindings});
@@ -228,6 +228,7 @@ function mutationProbe(name, fetchResult, extra = {}) {
     readProfileBuilderDraft: () => ({id: "custom-draft", label: "Custom Draft", source_profile_id: "source", rows: 1, columns: 2, slot_count: 2}),
     resolveBuilderDraftLayout: () => ({slotLayoutForSave: [[0, 1]]}),
     getProfileById: () => null, loadProfileIntoBuilder() {}, renderProfileBuilder() {},
+    renderProfileOptions() {}, renderProfilePreview() {}, renderProfileCatalog() {}, renderStorageViews() {},
     ...extra,
   };
   const api = load([name, "setupDraftSnapshot", "recordSetupDraftChange", ...MUTATION_RESULT_HELPERS], bindings);
@@ -241,6 +242,10 @@ const MUTATIONS = [
   ["createDemoSystem", "setupResult", {ok: true, system: {id: "demo-builder-lab", label: "Demo"}, systems: [], profile: {id: "demo-builder-lab-chassis"}, profiles: []}],
   ["saveCustomProfile", "profileBuilderResult", {ok: true, profile: {id: "custom-draft", label: "Custom Draft"}, profiles: []}],
 ];
+function draftState(state) {
+  const { adminEditorOperationSeq, adminEditorOutcomes, ...draft } = state;
+  return JSON.stringify(draft);
+}
 for (const [name, resultKey, valid] of MUTATIONS) {
   for (const [label, body] of [
     ["unexpected object", {unexpected: true}],
@@ -250,9 +255,9 @@ for (const [name, resultKey, valid] of MUTATIONS) {
   ]) {
     test(`${name} treats a 2xx ${label} as an unknown outcome, not success`, async () => {
       const probe = mutationProbe(name, body);
-      const before = JSON.stringify(probe.state);
+      const before = draftState(probe.state);
       await probe.api[name]();
-      assert.equal(JSON.stringify(probe.state), before, "no result state applied");
+      assert.equal(draftState(probe.state), before, "no draft state applied; operation bookkeeping is separate");
       assert.equal(probe.counts().refreshes, 0);
       assert.equal(probe.counts().fetches, 1, "no automatic retry");
       assert.ok(probe.banners.every((banner) => banner.kind !== "success"));
