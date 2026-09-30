@@ -525,12 +525,32 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertEqual(smoke.schema_evidence(predecessor, candidate)["transition"], "none")
 
     def test_upgrade_evidence_and_docs_do_not_claim_an_equal_schema_was_migrated(self):
-        from history_service.store import SCHEMA
+        import sqlite3
+        from contextlib import closing
+
+        from history_service.store import CURRENT_SCHEMA_VERSION, SCHEMA
 
         released_schema = (
             self.ROOT / "tests" / "fixtures" / "history_released_schemas" / "v0.22.2.sql"
         ).read_text(encoding="utf-8")
-        self.assertEqual(SCHEMA, released_schema, "update the evidence when the candidate schema changes")
+        # Index-only startup work is not a logical schema-version transition.
+        # Keep this gate strict about table/trigger changes and the exact new
+        # index set rather than claiming the released SQL bytes are unchanged.
+        with closing(sqlite3.connect(":memory:")) as predecessor, closing(sqlite3.connect(":memory:")) as candidate:
+            predecessor.executescript(released_schema)
+            candidate.executescript(SCHEMA)
+            definitions = "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type != 'index' ORDER BY type, name"
+            self.assertEqual(candidate.execute(definitions).fetchall(), predecessor.execute(definitions).fetchall())
+            indexes = "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+            released_indexes = dict(predecessor.execute(indexes))
+            current_indexes = dict(candidate.execute(indexes))
+            self.assertEqual({name: current_indexes.get(name) for name in released_indexes}, released_indexes)
+            self.assertEqual(set(current_indexes) - set(released_indexes), {
+                "idx_slot_events_scope_chronological",
+                "idx_metric_samples_slot_chronological",
+                "idx_metric_samples_scope_chronological",
+            })
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 1, "update the qualification when the logical schema version changes")
         source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
         upgrade = source.split("def upgrade_and_rollback", 1)[1].split("\ndef ", 1)[0]
         interrupted = source.split("def interrupted_migration", 1)[1].split("\ndef ", 1)[0]
@@ -551,6 +571,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("schema_after={schema['after']}", interrupted)
         self.assertIn("schema_transition={schema['transition']}", interrupted)
         self.assertIn("does not exercise a schema transition", matrix)
+        self.assertIn("chronological indexes", matrix)
+        self.assertIn("chronological indexes", scripts_guide)
         self.assertRegex(
             changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
             r"\(#637(?:, #\d+)*\)",
