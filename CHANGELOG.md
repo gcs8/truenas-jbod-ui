@@ -262,6 +262,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept disk measurements and locate-light targets bound to qualified disk and
+  enclosure identities, and withheld obsolete snapshot detail side effects. (#874)
 - Refuse aliased filesystem backup targets and failed directory persistence,
   and recover or account for scheduler-owned publications after catalog failure. (#839)
 - Recovered default inventory selection after topology changes, fenced stale
