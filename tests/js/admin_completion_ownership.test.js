@@ -470,6 +470,146 @@ function remainingProfiles() {
   return [{ id: "custom-b", label: "Authoritative B", is_custom: true, reference_count: 0 }];
 }
 
+function profileDeleteCatalogFixture() {
+  const p = profileDeleteReadbackFixture();
+  p.elements.profileCatalog = { innerHTML: "" };
+  p.elements.profileCatalogCount = { textContent: "" };
+  vm.runInContext(["currentPinnedProfileId", "currentPinnedProfile", "previewProfile",
+    "currentBuilderSourceProfile", "renderProfileCatalog"].map(functionSource).join("\n"), p.context);
+  p.elements.profileBuilderLabel.value = "  Retained dirty label  ";
+  return p;
+}
+
+function assertRetainedDeleteCatalog(p, catalog, { includesDeletedId = false } = {}) {
+  assert.equal(p.state.profiles, catalog, "failed follow-up must retain the admitted catalog object");
+  assert.equal(p.state.loadedBuilderProfileId, "custom-a", "retain original dirty draft identity");
+  assert.equal(p.elements.profileBuilderLabel.value, "  Retained dirty label  ");
+  assert.equal(p.state.setupDirty, true);
+  assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+  assert.match(p.banners.at(-1).message, /Deleted.*catalog refresh is unavailable/);
+  assert.equal(p.banners.at(-1).tone, "info");
+  for (const profile of catalog) {
+    assert.ok(p.elements.profileCatalog.innerHTML.includes(`data-profile-id="${profile.id}"`));
+    assert.ok(p.elements.profileCatalog.innerHTML.includes(profile.label));
+  }
+  assert.equal(p.elements.profileCatalogCount.textContent, `${catalog.length} profiles`);
+  assert.equal(p.requests.filter(request => request.options.method === "DELETE").length, 1,
+    "catalog publication never dispatches another deletion");
+  p.editSetup(); p.editBuilder(); p.renderBuilder();
+  const deletable = includesDeletedId && catalog.find(profile => profile.id === "custom-a")?.reference_count === 0;
+  assert.equal(p.elements.profileBuilderDeleteButton.disabled, !deletable,
+    "eligibility follows the admitted snapshot, not historical deletion evidence");
+}
+
+for (const presence of ["absent", "referenced same ID", "recreated same ID"]) {
+  test(`profile delete catalog precedence: failed queued read retains newer ${presence} snapshot`, async () => {
+    const p = profileDeleteCatalogFixture();
+    const priorRead = p.context.refreshState({ quiet: true, catalogOnly: true });
+    const run = p.api.deleteCustomProfile();
+    p.requests[1].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+    await drainDeleteMicrotasks();
+    assert.equal(p.requests.length, 2, "real post-delete read queues behind the existing read");
+    assert.ok(p.state.refreshQueued);
+    const catalog = [
+      { id: "custom-b", label: "Newer B", is_custom: true, reference_count: 0 },
+      { id: "custom-c", label: "Newer C", is_custom: true, reference_count: 0 },
+    ];
+    if (presence !== "absent") catalog.unshift({ id: "custom-a", label: "Newly admitted A",
+      is_custom: true, reference_count: presence === "referenced same ID" ? 1 : 0 });
+    p.requests[0].resolve({ profiles: catalog, systems: p.state.systems });
+    assert.equal(await priorRead, true);
+    await drainDeleteMicrotasks();
+    assert.equal(p.state.profiles, catalog, "real successful GET published before queued failure");
+    assert.match(p.elements.profileCatalog.innerHTML, /data-profile-id="custom-c"/);
+    assert.equal(p.requests.length, 3);
+    p.requests[2].reject(new Error("Synthetic queued readback failure"));
+    await run;
+    assertRetainedDeleteCatalog(p, catalog, { includesDeletedId: presence !== "absent" });
+    if (presence !== "recreated same ID") {
+      await p.api.deleteCustomProfile();
+      assert.equal(p.requests.filter(request => request.options.method === "DELETE").length, 1);
+    }
+  });
+}
+
+for (const replacement of ["newer entries", "fresh equal snapshot", "multiple publications"]) {
+  test(`profile delete catalog precedence: ${replacement} during DELETE survives failed readback`, async () => {
+    const p = profileDeleteCatalogFixture(), oldCatalog = p.state.profiles;
+    const priorRead = p.context.refreshState({ quiet: true, catalogOnly: true });
+    const run = p.api.deleteCustomProfile();
+    let catalog = replacement === "fresh equal snapshot" ? oldCatalog.map(profile => ({ ...profile })) : [
+      { id: "custom-b", label: "Newer B", is_custom: true, reference_count: 0 },
+      { id: "custom-c", label: "Newer C", is_custom: true, reference_count: 0 },
+    ];
+    const overlapping = replacement === "multiple publications"
+      ? [p.context.refreshState({ quiet: true, catalogOnly: true }), p.context.refreshState({ quiet: true, catalogOnly: true })]
+      : [];
+    if (overlapping.length) assert.equal(overlapping[0], overlapping[1], "overlapping callers share the real queue");
+    p.requests[0].resolve({ profiles: catalog, systems: p.state.systems });
+    assert.equal(await priorRead, true);
+    await drainDeleteMicrotasks();
+    if (overlapping.length) {
+      catalog = [...catalog, { id: "custom-d", label: "Newest D", is_custom: true, reference_count: 0 }];
+      p.requests[2].resolve({ profiles: catalog, systems: p.state.systems });
+      assert.equal(await overlapping[0], true); assert.equal(await overlapping[1], true);
+    }
+    assert.notEqual(p.state.profiles, oldCatalog, "even an equal snapshot is a fresh publication");
+    p.requests[1].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+    await drainDeleteMicrotasks();
+    p.requests.at(-1).reject(new Error("Synthetic post-delete readback failure"));
+    await run;
+    assertRetainedDeleteCatalog(p, catalog, { includesDeletedId: replacement === "fresh equal snapshot" });
+  });
+}
+
+test("profile delete catalog precedence: successful queued follow-up supersedes both earlier snapshots", async () => {
+  const p = profileDeleteCatalogFixture();
+  const priorRead = p.context.refreshState({ quiet: true, catalogOnly: true });
+  const run = p.api.deleteCustomProfile();
+  p.requests[1].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+  await drainDeleteMicrotasks();
+  p.requests[0].resolve({ profiles: remainingProfiles(), systems: p.state.systems });
+  assert.equal(await priorRead, true); await drainDeleteMicrotasks();
+  const catalog = [...remainingProfiles(), { id: "custom-c", label: "Newest C", is_custom: true }];
+  p.requests[2].resolve({ profiles: catalog, systems: p.state.systems });
+  await run;
+  assert.equal(p.state.profiles, catalog);
+  assert.match(p.elements.profileCatalog.innerHTML, /Newest C/);
+  assert.equal(p.state.loadedBuilderProfileId, "");
+  assert.equal(p.elements.profileBuilderDeleteButton.disabled, true);
+  assert.equal(p.banners.at(-1).tone, "success");
+});
+
+for (const move of ["different profile", "same-profile revisit", "builder draft", "setup draft"]) {
+  test(`profile delete catalog precedence: retired queued failure preserves successor ${move}`, async () => {
+    const p = profileDeleteCatalogFixture();
+    const priorRead = p.context.refreshState({ quiet: true, catalogOnly: true });
+    const run = p.api.deleteCustomProfile();
+    p.requests[1].resolve({ ...valid("deleteCustomProfile"), profiles: remainingProfiles() });
+    await drainDeleteMicrotasks();
+    const catalog = [...remainingProfiles(), { id: "custom-c", label: "Successor C", is_custom: true }];
+    p.requests[0].resolve({ profiles: catalog, systems: p.state.systems });
+    assert.equal(await priorRead, true); await drainDeleteMicrotasks();
+    if (move === "different profile") {
+      p.state.profileBuilderGeneration++;
+      p.state.loadedBuilderProfileId = "custom-b"; p.elements.profileBuilderId.value = "custom-b";
+    } else if (move === "same-profile revisit") p.state.profileBuilderGeneration += 2;
+    else if (move === "builder draft") p.editBuilder();
+    else p.editSetup();
+    p.elements.profileBuilderLabel.value = "Successor label";
+    p.elements.profileBuilderResult.textContent = "Successor status";
+    p.elements.profileBuilderDeleteButton.disabled = true;
+    p.elements.profileBuilderSaveButton.disabled = true;
+    const before = p.snapshot(), banners = p.banners.length;
+    p.requests[2].reject(new Error("Synthetic retired queued failure"));
+    await run;
+    assert.equal(p.state.profiles, catalog);
+    assert.equal(p.snapshot(), before, "no retired catalog, control, raw field or status render");
+    assert.equal(p.banners.length, banners);
+    assert.equal(p.state.adminEditorOutcomes["profile-delete"].outcome, "success");
+  });
+}
+
 for (const failure of ["rejected read", "invalid state"]) {
   test(`profile delete eligibility: confirmed DELETE with ${failure} reconciles catalog and cannot dispatch twice`, async () => {
     const p = profileDeleteReadbackFixture(), catalog = remainingProfiles();

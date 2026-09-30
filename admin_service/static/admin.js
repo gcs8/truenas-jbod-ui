@@ -7826,6 +7826,7 @@
     }
 
     const owner = captureAdminEditorOperation("profile-delete", { builder: true });
+    const submittedCatalog = state.profiles;
     if (elements.profileBuilderDeleteButton) {
       elements.profileBuilderDeleteButton.disabled = true;
     }
@@ -7844,10 +7845,13 @@
       if (!owner.owns()) return;
       if (refreshed === false) {
         const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
-        // The validated DELETE catalog excludes this ID. Keep the draft, but
-        // do not let a failed readback restore eligibility from the old catalog.
-        state.profiles = payload.profiles;
-        renderProfileCatalog();
+        // Reconcile only the catalog captured before DELETE. A successful
+        // state read replaces that object, even for an equal snapshot, and
+        // takes precedence over this fallback, including a recreated same ID.
+        if (state.profiles === submittedCatalog) {
+          state.profiles = payload.profiles;
+          renderProfileCatalog();
+        }
         renderSaveResult(elements.profileBuilderResult, message, payload);
         setBanner(message, "info");
         return;
