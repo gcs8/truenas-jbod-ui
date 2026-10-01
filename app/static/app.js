@@ -102,6 +102,7 @@
     selectedEnclosureId: bootstrap.snapshot?.selected_enclosure_id || null,
     enclosureAliasEditorOpen: false,
     enclosureAliasEditorScopeKey: null,
+    enclosureAliasEditorGeneration: 0,
     mappingFormScopeKey: null,
     mappingFormValuesKey: null,
     mappingFormBaseRevision: null,
@@ -1241,6 +1242,7 @@
     const available = enclosureAliasEditorAvailable();
     const scopeKey = currentEnclosureAliasScopeKey();
     if (!available || (state.enclosureAliasEditorOpen && state.enclosureAliasEditorScopeKey !== scopeKey)) {
+      state.enclosureAliasEditorGeneration = (state.enclosureAliasEditorGeneration || 0) + 1;
       state.enclosureAliasEditorOpen = false;
       state.enclosureAliasEditorScopeKey = null;
     }
@@ -1258,6 +1260,7 @@
     }
     const enclosure = getSelectedEnclosureOption();
     state.enclosureAliasEditorOpen = true;
+    state.enclosureAliasEditorGeneration = (state.enclosureAliasEditorGeneration || 0) + 1;
     state.enclosureAliasEditorScopeKey = currentEnclosureAliasScopeKey();
     enclosureAliasInput.value = enclosure?.alias || "";
     if (enclosureAliasRawHint) {
@@ -1270,6 +1273,7 @@
   }
 
   function closeEnclosureAliasEditor(restoreFocus = false) {
+    state.enclosureAliasEditorGeneration = (state.enclosureAliasEditorGeneration || 0) + 1;
     state.enclosureAliasEditorOpen = false;
     state.enclosureAliasEditorScopeKey = null;
     enclosureAliasForm?.classList.add("hidden");
@@ -1295,7 +1299,9 @@
       return;
     }
     const enclosure = getSelectedEnclosureOption();
-    if (!enclosure || !enclosureAliasInput) {
+    const scopeKey = currentEnclosureAliasScopeKey();
+    if (!enclosure || !enclosureAliasInput || !enclosureAliasEditorAvailable()
+      || !state.enclosureAliasEditorOpen || state.enclosureAliasEditorScopeKey !== scopeKey) {
       return;
     }
     const baseEnclosureId = String(enclosure.id || "").split("::", 1)[0];
@@ -1308,7 +1314,23 @@
     const liveEnclosureId = currentLiveEnclosureId();
     if (systemId) params.set("system_id", systemId);
     if (liveEnclosureId) params.set("enclosure_id", liveEnclosureId);
-    const label = enclosureAliasInput.value.trim() || null;
+    const draft = enclosureAliasInput.value;
+    const label = draft.trim() || null;
+    const selectionEpoch = state.selectionEpoch || 0;
+    const mappingDraft = state.mappingDraftRevision || 0;
+    let refreshToken = state.latestRefreshToken || 0;
+    let editorGeneration = (state.enclosureAliasEditorGeneration || 0) + 1;
+    state.enclosureAliasEditorGeneration = editorGeneration;
+    let editorOpen = true;
+    const ownsCompletion = () => scopeKey === currentEnclosureAliasScopeKey()
+      && liveEnclosureId === currentLiveEnclosureId() && enclosureAliasEditorAvailable()
+      && selectionEpoch === (state.selectionEpoch || 0)
+      && refreshToken === (state.latestRefreshToken || 0)
+      && mappingDraft === (state.mappingDraftRevision || 0)
+      && editorGeneration === (state.enclosureAliasEditorGeneration || 0)
+      && state.enclosureAliasEditorOpen === editorOpen
+      && state.enclosureAliasEditorScopeKey === (editorOpen ? scopeKey : null)
+      && enclosureAliasInput.value === draft;
     try {
       await fetchJson(`/api/sas-fabric/aliases?${params.toString()}`, {
         method: "POST",
@@ -1321,10 +1343,22 @@
           scope: "system",
         }),
       });
+      // The write still changes A after navigation. Retire A's cached labels,
+      // but do not close, report into, or force-refresh a successor scope/draft.
+      for (const [key, snapshot] of Object.entries(state.snapshotReuseCache || {})) {
+        if (snapshot.selected_system_id === systemId) delete state.snapshotReuseCache[key];
+      }
+      if (!ownsCompletion()) return;
       closeEnclosureAliasEditor(true);
+      editorGeneration = state.enclosureAliasEditorGeneration || 0;
+      editorOpen = false;
       setStatus(label ? "Enclosure name saved." : "Enclosure name cleared.");
-      await refreshSnapshot(true, "enclosure-alias");
+      if (state.mappingFormDirty) return;
+      // Admit the readback's own refresh token; all other ownership stays pinned.
+      refreshToken += 1;
+      await refreshSnapshot(true, "enclosure-alias", ownsCompletion);
     } catch (error) {
+      if (!ownsCompletion()) return;
       handleWriteRejection(error);
       setStatus(error?.message || "Enclosure name could not be saved.", "error");
       enclosureAliasInput.focus();
@@ -10216,7 +10250,7 @@
     }
   }
 
-  async function refreshSnapshot(force = false, reason = force ? "manual-refresh" : "auto-refresh") {
+  async function refreshSnapshot(force = false, reason = force ? "manual-refresh" : "auto-refresh", completionIsCurrent = null) {
     if (state.snapshotMode) {
       setStatus("Offline snapshot export. Live refresh is disabled.", "error");
       return;
@@ -10239,7 +10273,7 @@
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
       const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
-      if (refreshToken !== state.latestRefreshToken) {
+      if (refreshToken !== state.latestRefreshToken || (completionIsCurrent && !completionIsCurrent())) {
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "superseded");
         }
@@ -10268,7 +10302,7 @@
         void fetchSasFabric(force, true);
       }
       await waitForNextPaint();
-      if (refreshToken !== state.latestRefreshToken) {
+      if (refreshToken !== state.latestRefreshToken || (completionIsCurrent && !completionIsCurrent())) {
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "superseded");
         }
@@ -10298,6 +10332,12 @@
         setStatus("Up to date.");
       }
     } catch (error) {
+      if (completionIsCurrent && !completionIsCurrent()) {
+        if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
+          archiveUiPerfRun(perfRun, "superseded");
+        }
+        return;
+      }
       if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
         archiveUiPerfRun(perfRun, "error", error.message || String(error));
       }
@@ -11156,6 +11196,11 @@
   }
   if (enclosureAliasEditButton) {
     enclosureAliasEditButton.addEventListener("click", openEnclosureAliasEditor);
+  }
+  if (enclosureAliasInput) {
+    enclosureAliasInput.addEventListener("input", () => {
+      state.enclosureAliasEditorGeneration = (state.enclosureAliasEditorGeneration || 0) + 1;
+    });
   }
   if (enclosureAliasCancel) {
     enclosureAliasCancel.addEventListener("click", () => closeEnclosureAliasEditor(true));
