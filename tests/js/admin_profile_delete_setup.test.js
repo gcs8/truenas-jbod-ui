@@ -170,9 +170,15 @@ function fixture(selection = "custom-a", running = true) {
   const dependentSelects = new Set(["setup-profile", "setup-storage-view-template", "setup-storage-view-profile"]);
   const rawSnapshot = () => JSON.stringify([...nodes].filter(([id]) => id.startsWith("setup-") && !dependentSelects.has(id))
     .map(([id, field]) => [id, field.value, field.checked]));
-  const controlsSnapshot = () => JSON.stringify([...nodes].filter(([id]) => id.startsWith("setup-") || id.startsWith("profile-builder-"))
+  const controlsSnapshot = ({ catalogEffects = false } = {}) => JSON.stringify([...nodes]
+    .filter(([id]) => id.startsWith("setup-") || id.startsWith("profile-builder-"))
+    .filter(([id]) => !catalogEffects || !(dependentSelects.has(id)
+      || id === "setup-storage-view-template-select" || id === "setup-storage-view-list"
+      || id === "setup-storage-view-count" || id.startsWith("setup-storage-view-preview-")))
     .map(([id, field]) =>
-    [id, field.value, field.checked, field.disabled, field.textContent, field.innerHTML, field.style]));
+    [id, field.value, field.checked,
+      catalogEffects && id === "profile-builder-delete-button" ? null : field.disabled,
+      field.textContent, field.innerHTML, field.style]));
   return { api, state, elements, requests, nodes, panel, statePayload, rawSnapshot, controlsSnapshot,
     paint: () => api.flushStorageViewRender(),
     clickDelete: () => elements.profileBuilderDeleteButton.dispatch("click") };
@@ -423,17 +429,28 @@ for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
         assert.equal(p.elements.profileBuilderDeleteButton.disabled, true);
       }
       p.paint();
-      const before = p.controlsSnapshot(), catalog = p.state.profiles;
-      const model = JSON.stringify(p.state.storageViews), revision = p.state.setupDraftRevision;
+      const catalogEffects = completion === "success";
+      const before = p.controlsSnapshot({ catalogEffects }), catalog = p.state.profiles;
+      const raw = p.rawSnapshot(), banner = p.elements.banner.textContent;
+      const model = JSON.parse(JSON.stringify(p.state.storageViews)), revision = p.state.setupDraftRevision;
+      const selected = p.elements.setupProfile.value;
       if (phase === "DELETE") { p.requests[0].reply(deleteResult()); await drain(); }
       const readback = p.requests.find(item => item.url === "/api/admin/state");
       assert.ok(readback);
       if (completion === "success") readback.reply(p.statePayload(remainingProfiles()));
       else readback.reject(new Error("Synthetic retired readback failure"));
       await drain(); p.paint();
-      assert.equal(p.controlsSnapshot(), before, "stale completion does not render/reset successor controls");
-      assert.equal(JSON.stringify(p.state.storageViews), model, "retired deletion cannot edit the successor storage model");
-      assert.equal(p.state.setupDraftRevision, revision);
+      const expectedModel = model.map(view => ({ ...view,
+        profile_id: catalogEffects && view.profile_id === "custom-a" ? "" : view.profile_id }));
+      const expectedDefault = catalogEffects && selected === "custom-a" ? "" : selected;
+      assert.equal(p.controlsSnapshot({ catalogEffects }), before,
+        "read-owned catalog choices cannot reset unrelated successor controls/results");
+      assert.equal(p.rawSnapshot(), raw, "all unrelated raw fields remain exact");
+      assert.equal(p.elements.banner.textContent, banner, "retired mutation cannot publish its banner");
+      assert.deepEqual(JSON.parse(JSON.stringify(p.state.storageViews)), expectedModel,
+        "successful current catalog clears only absent successor model IDs");
+      assert.equal(p.state.setupDraftRevision, revision + (catalogEffects ? 1 : 0));
+      assert.equal(p.elements.setupProfile.value, expectedDefault);
       if (completion === "fallback") assert.equal(p.state.profiles, catalog, "retired fallback cannot replace a successor catalog");
       else assert.deepEqual(JSON.parse(JSON.stringify(p.state.profiles)), remainingProfiles(),
         "new server-admitted catalog remains authoritative even when editor ownership retired");
@@ -441,9 +458,138 @@ for (const [phase, completion] of ["DELETE", "readback"].flatMap(phase =>
         const successor = p.requests.filter(item => item.options.method === "DELETE")[1];
         successor.reply({ detail: "Synthetic successor refusal" }, 400); await drain();
       }
+      const payload = await submittedSetup(p);
+      assert.equal(payload.default_profile_id, expectedDefault || null, "fresh actual POST uses current default validity");
+      assert.deepEqual(payload.storage_views.map(view => view.profile_id), expectedModel.map(view => view.profile_id || null),
+        "fresh actual POST uses every current model pin");
     });
   }
 }
+
+// Read-owned validity is independent of the initiating mutation's retirement.
+for (const move of ["setup input", "storage input", "builder revisit"]) {
+  for (const membership of ["removed", "surviving", "recreated", "invalid read", "failed read"]) {
+    test(`current catalog validity: retired ${move}, ${membership}, actual POST and raw drafts`, async () => {
+      const selection = membership === "surviving" ? "custom-b" : "custom-a";
+      const p = fixture(selection); pinStorageProfile(p, selection);
+      p.state.storageViews.push(...["custom-a", "custom-b", ""].map((id, index) => ({
+        ...JSON.parse(JSON.stringify(p.state.storageViews[0])), id: `hidden-${index}`,
+        profile_id: id, enabled: index !== 0, order: (index + 2) * 10,
+      })));
+      // Surviving/recreated controls must be true no-ops, including hidden pins.
+      if (membership === "surviving") p.state.storageViews[1].profile_id = "custom-b";
+      p.clickDelete(); p.requests[0].reply(deleteResult()); await drain();
+      assert.equal(p.requests[1].url, "/api/admin/state");
+      if (move === "setup input") {
+        p.elements.setupSystemLabel.value = "  Successor raw label  "; p.elements.setupSystemLabel.dispatch("input");
+      } else if (move === "storage input") {
+        p.elements.setupStorageViewId.value = "  Successor-RAW-ID  "; p.elements.setupStorageViewId.dispatch("input");
+      } else p.elements.profileBuilderLoadButton.dispatch("click");
+      p.paint();
+      const raw = p.rawSnapshot(), revision = p.state.setupDraftRevision;
+      const model = JSON.parse(JSON.stringify(p.state.storageViews)), catalog = p.state.profiles;
+      const controls = p.controlsSnapshot({ catalogEffects: membership === "removed" || membership === "surviving" || membership === "recreated" });
+      const banner = p.elements.banner.textContent;
+      if (membership === "failed read") p.requests[1].reject(new Error("Synthetic retired read failure"));
+      else if (membership === "invalid read") p.requests[1].reply({ profiles: [], systems: null });
+      else p.requests[1].reply(p.statePayload(membership === "recreated"
+        ? [profile("custom-a", 5, "Recreated A"), ...remainingProfiles()] : remainingProfiles()));
+      await drain(); p.paint();
+      const expected = model.map(view => ({ ...view,
+        profile_id: membership === "removed" && view.profile_id === "custom-a" ? "" : view.profile_id }));
+      assert.equal(p.controlsSnapshot({ catalogEffects: membership === "removed" || membership === "surviving" || membership === "recreated" }), controls,
+        "retired mutation does not reset raw builder, results or unrelated controls");
+      assert.equal(p.elements.banner.textContent, banner, "retired read/mutation cannot publish a successor banner");
+      // Check the real outbound consumer first, so baseline RED proves the leak.
+      const payload = await submittedSetup(p);
+      assert.equal(payload.default_profile_id, membership === "removed" ? null : selection,
+        "fresh registered POST cannot submit a default absent from the admitted current catalog");
+      assert.deepEqual(payload.storage_views.map(view => view.profile_id), expected.map(view => view.profile_id || null),
+        "fresh registered POST includes valid selected, nonselected and disabled pins only");
+      assert.deepEqual(JSON.parse(JSON.stringify(p.state.storageViews)), expected);
+      assert.equal(p.state.setupDraftRevision, revision + (membership === "removed" ? 1 : 0));
+      assert.equal(p.state.setupDirty, true);
+      assert.equal(p.rawSnapshot(), raw, "raw SSH/platform/storage label/ID/serial/slot drafts survive");
+      // submittedSetup's synthetic refusal owns setup feedback, not the old DELETE.
+      assert.equal(p.elements.profileBuilderResult.textContent, JSON.parse(controls)
+        .find(row => row[0] === "profile-builder-result")[4]);
+      if (membership === "invalid read" || membership === "failed read") assert.equal(p.state.profiles, catalog);
+      assert.doesNotMatch(banner, /^Deleted/, "retired DELETE never owns successor notification");
+    });
+  }
+}
+
+for (const membership of ["surviving", "recreated", "automatic"]) {
+  test(`current catalog validity: ${membership} standalone read leaves clean draft revision unchanged`, async () => {
+    const selection = membership === "automatic" ? "" : membership === "recreated" ? "custom-a" : "custom-b";
+    const p = fixture(selection); pinStorageProfile(p, selection);
+    const raw = p.rawSnapshot(), model = JSON.stringify(p.state.storageViews), revision = p.state.setupDraftRevision;
+    p.state.setupDirty = false;
+    const read = p.api.refreshState({ quiet: true, catalogOnly: true });
+    p.requests[0].reply(p.statePayload(membership === "recreated"
+      ? [profile("custom-a", 5, "Recreated A"), ...remainingProfiles()] : remainingProfiles()));
+    assert.equal(await read, true); await drain(); p.paint();
+    assert.equal(p.state.setupDraftRevision, revision);
+    assert.equal(p.state.setupDirty, false, "catalog geometry/options alone do not dirty a valid payload");
+    assert.equal(JSON.stringify(p.state.storageViews), model);
+    assert.equal(p.rawSnapshot(), raw);
+    const payload = await submittedSetup(p);
+    assert.equal(payload.default_profile_id, selection || null);
+    assert.equal(payload.storage_views[0].profile_id, selection || null);
+  });
+}
+
+test("current catalog validity: model-only correction fences older registered save success and queued read", async () => {
+  const p = fixture("custom-b"); pinStorageProfile(p, "custom-a");
+  p.elements.profileBuilderSaveButton.dispatch("click"); await drain();
+  assert.equal(p.requests[0].url, "/api/admin/profiles");
+  const first = p.api.refreshState({ quiet: true, catalogOnly: true });
+  const queued = p.api.refreshState({ quiet: true, catalogOnly: true });
+  const coalesced = p.api.refreshState({ quiet: true, catalogOnly: true });
+  assert.equal(queued, coalesced);
+  const revision = p.state.setupDraftRevision, raw = p.rawSnapshot();
+  p.state.setupDirty = false;
+  p.requests[1].reply(p.statePayload(remainingProfiles())); assert.equal(await first, true); await drain();
+  assert.equal(p.state.setupDirty, true, "catalog correction makes a clean submitted model dirty");
+  assert.equal(p.state.setupDraftRevision, revision + 1, "model-only correction advances once");
+  assert.equal(p.state.storageViews[0].profile_id, "");
+  const before = p.controlsSnapshot(), banner = p.elements.banner.textContent;
+  p.requests[0].reply({ ok: true, profile: profile("custom-a", 2), profiles: originalProfiles() }); await drain();
+  p.requests[2].reply(p.statePayload(remainingProfiles())); assert.equal(await queued, true); await drain();
+  assert.equal(p.requests[3].url, "/api/admin/state", "older save still gets its required queued read");
+  p.requests[3].reply(p.statePayload(remainingProfiles())); await drain(); p.paint();
+  assert.equal(p.controlsSnapshot(), before, "older acknowledgement cannot load builder, select saved ID or publish result");
+  assert.equal(p.elements.banner.textContent, banner);
+  assert.equal(p.state.setupDraftRevision, revision + 1, "equal later catalog admissions are no-ops");
+  assert.equal(p.rawSnapshot(), raw);
+  assert.equal((await submittedSetup(p)).storage_views[0].profile_id, null);
+});
+
+test("current catalog validity: owned registered profile save survives its own catalog correction", async () => {
+  const p = fixture(); pinStorageProfile(p, "custom-a");
+  p.api.loadProfileIntoBuilder(p.state.profiles[1]);
+  p.elements.profileBuilderSaveButton.dispatch("click"); await drain();
+  p.requests[0].reply({ ok: true, profile: profile("custom-b", 4), profiles: remainingProfiles() }); await drain();
+  p.requests[1].reply(p.statePayload(remainingProfiles())); await drain(); p.paint();
+  assert.equal(p.state.loadedBuilderProfileId, "custom-b", "legitimate save loads its own builder");
+  assert.match(p.elements.profileBuilderResult.textContent, /Saved custom profile/);
+  assert.match(p.elements.banner.textContent, /Saved custom profile/);
+  assert.equal(p.elements.profileBuilderSaveButton.disabled, false, "current finalizer releases its own control");
+  assert.equal(p.state.storageViews[0].profile_id, "");
+  const payload = await submittedSetup(p);
+  assert.equal(payload.default_profile_id, "custom-b");
+  assert.equal(payload.storage_views[0].profile_id, null);
+});
+
+test("current catalog validity: ordinary full read corrects every submitted model pin", async () => {
+  const p = fixture("custom-b"); pinStorageProfile(p, "custom-a");
+  const revision = p.state.setupDraftRevision;
+  const read = p.api.refreshState({ quiet: true });
+  p.requests[0].reply(p.statePayload(remainingProfiles())); assert.equal(await read, true); await drain(); p.paint();
+  assert.equal(p.state.storageViews[0].profile_id, "", "full read also reconciles the submitted model");
+  assert.equal(p.state.setupDraftRevision, revision + 1);
+  assert.equal((await submittedSetup(p)).storage_views[0].profile_id, null);
+});
 
 for (const invalid of ["refusal", "ok only", "wrong target", "deleted ID remains"]) {
   test(`profile delete setup: ${invalid} cannot reconcile setup controls`, async () => {

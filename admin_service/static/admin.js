@@ -6451,13 +6451,13 @@
     }
   }
 
-  function refreshState({ quiet = false, canPublish = null, failureMessage = null, catalogOnly = false } = {}) {
+  function refreshState({ quiet = false, canPublish = null, failureMessage = null, catalogOnly = false, catalogOwner = null } = {}) {
     // Capture notification ownership now, even if this read must queue. A quiet
     // post-write refresh still runs after its dialog closes, but cannot borrow
     // a successor's banner or editor intent when it eventually completes.
     const admitted = !canPublish || canPublish();
     if (admitted) state.bannerRevision = (state.bannerRevision || 0) + 1;
-    const options = { quiet, canPublish, failureMessage, catalogOnly,
+    const options = { quiet, canPublish, failureMessage, catalogOnly, catalogOwner,
       bannerRevision: state.bannerRevision,
       editorGeneration: state.setupEditorGeneration,
       draftRevision: state.setupDraftRevision,
@@ -6495,7 +6495,7 @@
 
   async function runRefreshState({ quiet = false, canPublish = null, failureMessage = null,
     bannerRevision = state.bannerRevision, editorGeneration = state.setupEditorGeneration,
-    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId, catalogOnly = false } = {}) {
+    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId, catalogOnly = false, catalogOwner = null } = {}) {
     const ownsBanner = () => (!canPublish || canPublish()) && state.bannerRevision === bannerRevision
       && state.setupEditorGeneration === editorGeneration && state.setupDraftRevision === draftRevision
       && state.selectedStorageViewId === storageViewId;
@@ -6539,8 +6539,15 @@
       // Paint the fresh admin state first; the removed-system history scan hits SQLite
       // and must not hold up container status or the saved-system lists.
       if (catalogOnly) {
+        // Current catalog admission owns pin validity, even if its initiating
+        // mutation retired. Preserve only a still-current mutation across this
+        // synchronous delta; never advance an owner that retired during the GET.
+        const ownsCatalogDraft = catalogOwner?.owns() === true;
+        const draftBefore = setupDraftSnapshot();
+        renderProfileSetupDependencies();
+        recordSetupDraftChange(draftBefore);
+        if (ownsCatalogDraft) catalogOwner.advance();
         renderExistingSystemCatalog();
-        renderProfileCatalog();
         renderRuntimeCards();
       } else {
         renderAll();
@@ -7751,7 +7758,7 @@
       requireMutationResult(validProfileSaveResult(payload), "custom profile save");
       recordAdminEditorOutcome("profile-save", draft.id, "success");
       const savedProfileId = payload.profile.id;
-      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true });
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true, catalogOwner: owner });
       if (!owner.owns()) return;
       if (refreshed === false) {
         const message = `Saved custom profile ${savedProfileId}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
@@ -7841,7 +7848,7 @@
       });
       requireMutationResult(validProfileDeleteResult(payload, profile.id), "custom profile delete");
       recordAdminEditorOutcome("profile-delete", profile.id, "success");
-      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true });
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true, catalogOwner: owner });
       if (!owner.owns()) return;
       if (refreshed === false) {
         // Reconcile only the catalog captured before DELETE. A successful
@@ -7851,9 +7858,9 @@
           state.profiles = payload.profiles;
         }
       }
-      // Both admitted readback paths must invalidate the deleted selection
-      // before previewing or submitting this draft. Advance only after our
-      // synchronous edit, so it cannot retire this operation's own finalizer.
+      // The successful read already reconciled its catalog. A current-owner
+      // fallback must do the same against whichever catalog remains authoritative.
+      // Advance only after our synchronous edit, preserving our own finalizer.
       const draftBefore = setupDraftSnapshot();
       renderProfileSetupDependencies();
       recordSetupDraftChange(draftBefore);
@@ -7880,7 +7887,7 @@
     }
   }
 
-  function renderProfileSetupDependencies() {
+  function reconcileStorageViewProfilePins() {
     // Every unsaved view is submitted, including views outside the editor.
     // Reconcile only missing IDs against the admitted catalog; a newer read
     // may have recreated the deleted ID. Keep all unrelated model/raw fields.
@@ -7889,6 +7896,10 @@
         storageView.profile_id = "";
       }
     });
+  }
+
+  function renderProfileSetupDependencies() {
+    reconcileStorageViewProfilePins();
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
@@ -7911,6 +7922,7 @@
     renderRuntimeCards();
     renderRuntimeBehaviorSettings();
     renderExistingSystems();
+    reconcileStorageViewProfilePins();
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();

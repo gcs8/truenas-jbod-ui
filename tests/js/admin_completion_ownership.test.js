@@ -20,10 +20,11 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
-const helpers = ["captureAdminEditorOperation", "retireAdminEditorControls", "recordAdminEditorOutcome",
+const helpers = ["captureAdminEditorOperation", "retireAdminEditorControls", "recordAdminEditorOutcome", "recordSetupDraftChange",
   "validBootstrapResult", "validSystemDeleteResult", "validGeneratedKeyResult", "validHaNodesResult",
   "validProfileDeleteResult", "fetchBootstrapResult", "isNonEmptyString", "requireMutationResult",
-  "describeMutationFailure", "adminRequestError", "validProfileSaveResult", "renderProfileSetupDependencies"];
+  "describeMutationFailure", "adminRequestError", "validProfileSaveResult", "renderProfileSetupDependencies",
+  "reconcileStorageViewProfilePins"];
 const methods = ["saveCustomProfile", "bootstrapServiceAccount", "generateSshKey", "discoverQuantastorHaNodes", "deleteSelectedSystem", "deleteCustomProfile"];
 const transportHelpers = ["fetchJson", "fetchOrReportStopped", "sessionRemainingMs", "fetchWithTimeout", "requestTimeoutError", "readJsonResponse", "describeApiError", "validatedRequestId", "describeRequestFailure", "isMutatingRequest", "browserIsOffline", "classifyTransportFailure", "describeTransportFailure", "classifyResponseFailure", "describeResponseFailure"];
 function fixture(method, { realTransport = false } = {}) {
@@ -64,7 +65,7 @@ function fixture(method, { realTransport = false } = {}) {
       platform: elements.setupPlatform.value, ssh_host: elements.setupSshHost.value, ssh_user: elements.setupSshUser.value }),
     collectBootstrapPayload: () => ({ host: elements.setupBootstrapHost.value, platform: "quantastor", service_user: elements.setupSshUser.value, install_sudo_rules: true }),
     bootstrapEnabledForSession: () => Boolean(elements.setupBootstrapEnabled.checked),
-    setupDraftSnapshot: () => JSON.stringify([elements.setupProfile.value, elements.setupSshUser.value, state.haNodes]),
+    setupDraftSnapshot: () => JSON.stringify([elements.setupProfile.value, elements.setupSshUser.value, state.haNodes, state.storageViews]),
     recordSetupDraftChange: () => { state.setupDirty = true; state.setupDraftRevision++; },
     currentSetupPlatform: () => elements.setupPlatform.value, syncHaNodesFromInputs() {}, normalizeHaNodes: value => value,
     renderQuantastorHaSection: () => renders.push("ha"), renderStorageViews: () => renders.push("views"),
@@ -260,20 +261,39 @@ test("system deletion accepts successful history purge row counts", async () => 
   const run = p.api.deleteSelectedSystem(); await settle(p, body); await run;
   assert.equal(p.counts().resets, 1); assert.match(p.banners.at(-1).message, /history \(3 rows\)/);
 });
-test("catalog-only readback does not run form renderers or successor discovery", async () => {
+test("catalog-only readback reconciles invalid successor pins without full hydration or discovery", async () => {
   const p = fixture("saveCustomProfile");
-  const methods = ["refreshState", "startRefreshState", "runRefreshState"];
+  const methods = ["refreshState", "startRefreshState", "runRefreshState", "renderProfileOptions", "getProfileById"];
   p.state.selectedBackupPaths = []; p.state.selectedDebugPaths = []; p.state.backupDefaults = {};
   p.context.currentStagedEsxiHostPrepPackages = () => []; p.context.renderProfileCatalog = () => {};
+  p.context.escapeHtml = value => value;
   p.context.renderRuntimeCards = () => {}; p.context.loadOrphanedHistory = () => {};
   p.context.fetchLiveEnclosures = () => assert.fail("foreign enclosure discovery");
   p.context.fetchStorageViewCandidates = () => assert.fail("foreign candidate discovery");
+  p.context.syncStorageViewEditorFromState = () => assert.fail("full storage editor hydration");
   vm.runInContext(methods.map(name => functionSource(name)).join("\n"), p.context);
   const run = p.api.saveCustomProfile(); p.requests[0].resolve(valid("saveCustomProfile"));
   for (let i = 0; i < 8; i++) await Promise.resolve();
-  p.change("A-B-A"); const before = p.snapshot();
+  p.change("A-B-A");
+  // The successor visit has no pending actions. Catalog validity retires older
+  // operations but must not hydrate any of its raw fields or feedback.
+  p.state.haNodesLoading = false;
+  p.elements.setupBootstrapButton.disabled = false;
+  p.elements.existingSystemDeleteButton.disabled = false;
+  p.elements.profileBuilderSaveButton.disabled = false;
+  p.elements.profileBuilderDeleteButton.disabled = true;
+  p.state.storageViews = [{ id: "hidden", profile_id: "profile-b", enabled: false, label: "Raw model" }];
+  const expected = JSON.parse(p.snapshot()), revision = p.state.setupDraftRevision;
   p.requests[1].resolve({ profiles: [valid("saveCustomProfile").profile], systems: [{ id: "system-a", label: "System A" }] });
-  await run; assert.equal(p.snapshot(), before); assert.ok(!p.renders.includes("all"));
+  await run;
+  expected.selected = ""; expected.fields.setupProfile.value = "";
+  expected.fields.setupProfile.innerHTML = '<option value="">Detect automatically</option><option value="custom-a">Custom A</option>';
+  assert.equal(p.snapshot(), JSON.stringify(expected), "only the absent default and its catalog options change among successor controls");
+  assert.equal(p.state.storageViews[0].profile_id, "", "real helper clears an absent disabled/nonselected pin");
+  assert.equal(p.state.storageViews[0].label, "Raw model");
+  assert.equal(p.state.setupDraftRevision, revision + 1, "one combined read-owned validity delta");
+  assert.equal(p.counts().builderLoads, 0); assert.equal(p.banners.length, 0);
+  assert.ok(!p.renders.includes("all"));
 });
 function bindEditorInputs(p) {
   const setupHandlers = {}, builderHandlers = {};
