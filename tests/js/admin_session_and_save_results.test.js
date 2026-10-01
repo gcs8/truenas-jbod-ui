@@ -469,7 +469,7 @@ test("a system delete that finds admin stopped leaves Delete disabled", async ()
   const state = stoppedSessionState({ selectedExistingSystemId: system.id });
   let functions = null;
   functions = loadFunctions(
-    [...SESSION_FUNCTIONS, "deleteSelectedSystem"],
+    [...SESSION_FUNCTIONS, "deleteSelectedSystem", "captureAdminEditorOperation", "recordAdminEditorOutcome", "describeMutationFailure"],
     {
       state,
       elements: sparseElements({ sessionBanner: new FakeElement({ classes: ["hidden"] }), existingSystemDeleteButton: deleteButton }),

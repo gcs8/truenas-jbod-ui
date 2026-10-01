@@ -881,6 +881,7 @@ for (const operation of ["trust", "import", "HA discovery", "key refresh", "key 
       if (operation === "bootstrap") {
         await page.locator("#setup-ssh-user").fill("synthetic-before");
         await page.locator("#setup-bootstrap-enabled").check();
+        await page.locator("#setup-ssh-password").fill("synthetic-test-placeholder");
       }
     }
     if (operation === "import") await page.locator("#setup-tls-ca-file").setInputFiles({name: "synthetic.pem", mimeType: "text/plain", buffer: Buffer.from("Synthetic transport-only certificate fixture")});
@@ -912,16 +913,19 @@ for (const operation of ["trust", "import", "HA discovery", "key refresh", "key 
         await edit.respond({bundle_path: "/synthetic/ca.pem", certificate_count: 1});
         field = page.locator("#setup-tls-ca-bundle-path"); expected = "/synthetic/ca.pem";
       } else if (operation === "HA discovery") {
-        await edit.respond({nodes: [{system_id: "node-c", label: "Synthetic C", host: "node-c.example.test"}]});
+        await edit.respond({ok: true, nodes: [{system_id: "node-c", label: "Synthetic C", host: "node-c.example.test"}], host_discovery: {attempted: false, ok: false}});
         field = page.locator('[data-ha-node-system-id="0"]'); expected = "node-c";
       } else if (operation === "key generation") {
-        const key = {name: "synthetic-new", runtime_private_path: "/synthetic/new-key"};
+        const key = {name: edit.body.name, runtime_private_path: "/synthetic/new-key"};
         p.state.ssh_keys = [key];
-        await edit.respond({key, keys: [key]});
+        await edit.respond({ok: true, key, keys: [key]});
         field = page.locator("#setup-ssh-key-path"); expected = "/synthetic/new-key";
       } else if (operation === "bootstrap") {
-        await edit.respond({service_user: "synthetic-service"});
-        field = page.locator("#setup-ssh-user"); expected = "synthetic-service";
+        await edit.respond({ok: true, host: edit.body.host, platform: edit.body.platform,
+          service_user: edit.body.service_user, sudo_rules_installed: edit.body.install_sudo_rules,
+          key_source: "synthetic", detail: "Synthetic bootstrap completed.", authorized_keys_path: null});
+        // Successful bootstrap clears the submitted SSH fixture value without a new input event.
+        field = page.locator("#setup-ssh-password"); expected = "";
       } else {
         const profile = {...p.state.profiles[0], id: "synthetic-custom", label: "Synthetic custom"};
         p.state.profiles.push(profile);
