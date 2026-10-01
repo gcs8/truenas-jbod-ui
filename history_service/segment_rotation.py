@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import tempfile
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -564,7 +565,7 @@ def _require_repeated_quiescence(
 def _history_row_counts(path: Path) -> dict[str, int]:
     # The source is quiesced and sidecar-free by contract. immutable=1 keeps a
     # WAL-header hot from growing -wal/-shm that the next preflight would refuse.
-    with sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro&immutable=1", uri=True) as connection:
+    with closing(sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro&immutable=1", uri=True)) as connection:
         connection.execute("PRAGMA query_only = ON")
         return {
             table_name: int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])

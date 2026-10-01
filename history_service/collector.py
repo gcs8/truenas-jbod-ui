@@ -135,6 +135,7 @@ class HistoryCollector:
         self.last_fast_metrics_at: str | None = None
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
+        self._startup_collection_attempted = False
         self.last_backup_at: str | None = None
         self.last_retention_at: str | None = None
         self.last_retention_backup_at: str | None = None
@@ -178,6 +179,7 @@ class HistoryCollector:
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
         self._scope_enumeration_complete = True
+        self._scope_collection_degraded_reason: str | None = None
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -277,6 +279,10 @@ class HistoryCollector:
         cached_root_only: bool = False,
     ) -> None:
         self._raise_if_stopping()
+        if self.current_collection_kind == "background":
+            # Spend the startup shortcut only on an admitted background attempt.
+            # Failure must not trap healthy siblings behind an untrusted root.
+            self._startup_collection_attempted = True
         run_started = utcnow()
         observed_at = isoformat_utc(run_started)
         collect_fast = force_fast or (
@@ -315,6 +321,12 @@ class HistoryCollector:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        # HTTP success does not make a failed platform inventory authoritative.
+        untrusted_scopes = [scope for scope in scopes if not self._should_record_scope_snapshot(scope.snapshot)]
+        for scope in untrusted_scopes:
+            self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
+        if untrusted_scopes:
+            self._scope_enumeration_complete = False
         smart_scope_unavailable = not self._scope_enumeration_complete
         self._raise_if_stopping()
         self._record_collection_stage(
@@ -324,6 +336,17 @@ class HistoryCollector:
             scope_count=len(scopes),
         )
         self.last_scope_count = len(scopes)
+        # A deliberately selected cached root is not a failed fleet census.
+        enumeration_failed = bool(untrusted_scopes) or (
+            not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
+        )
+        if enumeration_failed:
+            if not any(self._should_record_scope_snapshot(scope.snapshot) for scope in scopes):
+                self._scope_collection_degraded_reason = "No trusted history inventory scopes were available."
+                raise HistorySourceError.error_reply(self._scope_collection_degraded_reason)
+            self._scope_collection_degraded_reason = (
+                "Some history inventory scopes were unavailable; collection was partial."
+            )
         self.last_inventory_at = observed_at
 
         for scope_index, scope in enumerate(scopes, start=1):
@@ -331,7 +354,6 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
-                self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
                 smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
@@ -566,6 +588,8 @@ class HistoryCollector:
             backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
+        if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
+            self._scope_collection_degraded_reason = None
         self.clear_failure_diagnostics()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
@@ -573,10 +597,11 @@ class HistoryCollector:
     def degraded_reason(self) -> str | None:
         """Why /healthz reports ``degraded``, or None when the service is healthy.
 
-        Degraded means one of: the last background collection pass failed, the
-        history database is read-only, or cleanup failed twice in a row. A failed
-        manual refresh alone does not count; it is shown in "Last error" and
-        cleared by the next successful pass.
+        Degraded means one of: the last background collection pass failed, an
+        inventory sweep had unavailable scopes, the history database is read-only,
+        or cleanup failed twice in a row. Other manual refresh failures alone do
+        not count; they are shown in "Last error" and cleared by the next
+        successful pass. Inventory degradation clears after a complete sweep.
         """
 
         if self.collection_pause()[0]:
@@ -587,7 +612,7 @@ class HistoryCollector:
             return "The history database is read-only."
         if self.retention_consecutive_failures >= 2:
             return "History cleanup has failed twice in a row."
-        return None
+        return self._scope_collection_degraded_reason
 
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
@@ -763,7 +788,9 @@ class HistoryCollector:
                 continue
             started_monotonic = time.perf_counter()
             try:
-                force_startup_collection = self.last_success_at is None
+                force_startup_collection = (
+                    self.last_success_at is None and not self._startup_collection_attempted
+                )
                 self.next_collection_at = None
                 run_kwargs = (
                     {

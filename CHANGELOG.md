@@ -63,6 +63,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Completed credential scrubbing in shared debug exports, bounded archive
+  upload verification reads and persisted newly created archive directories before
+  granting verified publication credit. (#878)
 - Backup-scheduler connection failures no longer copy exception text into the
   admin API response; the public answer is a fixed message. (#621)
 - Restored the read-only `./config:/app/config:ro` mount for the read UI in the
@@ -329,6 +332,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Checked the length and SHA-256 of a backup copy the admin service downloads
   from the scheduler and refused a short or altered transfer instead of
   passing it on. (#818)
+- Reported all-failed fleet history sweeps as failures and partially collected
+  sweeps as degraded, without losing healthy empty-fleet operation; retried the
+  full fleet after an untrusted startup root instead of starving healthy systems.
+  (#876)
 - Kept scheduled full backups running when the config change journal cannot be
   read, and reported the journal problem as a failed config backup instead of
   stopping the scheduler. (#835)
@@ -857,6 +864,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Closed owned SQLite connections explicitly during history rotation, migration
+  and sealing, including fault paths. (#877)
 - The release QA scripts run end to end again. The Compose runtime matrix
   maps a slot with the system scope alone when the smoke fixture's unreachable
   source yields no enclosure, instead of stopping with "physical mapping scope
