@@ -170,6 +170,7 @@ test("loading a saved system paints the storage-view panel once, not four times"
   const functions = loadFunctions(
     [
       "loadSystemIntoForm",
+      "retireAdminEditorControls",
       "replaceStorageViewState",
       "renderStorageViews",
       "renderStorageViewsNow",
@@ -190,6 +191,8 @@ test("loading a saved system paints the storage-view panel once, not four times"
       cancelAnimationFrame: frames.cancelAnimationFrame,
       normalizeStorageViews: (views) => views,
       normalizeHaNodes: (nodes) => nodes || [],
+      currentSetupPlatform: () => "core",
+      bootstrapEnabledForSession: () => false,
       renderStorageViewTemplateOptions: stub("renderStorageViewTemplateOptions"),
       renderStorageViewList: stub("renderStorageViewList"),
       syncStorageViewEditorFromState: stub("syncStorageViewEditorFromState"),

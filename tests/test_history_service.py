@@ -9458,7 +9458,8 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
         with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
-            asyncio.run(collector.run_once())
+            with self.assertRaises(HistorySourceError):
+                asyncio.run(collector.run_once())
 
         record_updates.assert_not_called()
         self.assertNotIn(key, collector._pending_topology_changes)
@@ -9626,7 +9627,8 @@ class HistoryCollectorTests(unittest.TestCase):
         )
 
         with patch.object(store, "record_slot_updates", wraps=store.record_slot_updates) as record_updates:
-            asyncio.run(collector.run_once())
+            with self.assertRaises(HistorySourceError):
+                asyncio.run(collector.run_once())
 
         record_updates.assert_not_called()
         self.assertNotIn(key, collector._pending_topology_changes)
@@ -10995,7 +10997,8 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
 
-        asyncio.run(collector.run_once())
+        with self.assertRaises(HistorySourceError):
+            asyncio.run(collector.run_once())
 
         events = store.list_slot_events("archive-core", "enc-a", 30)
         loaded = store.get_slot_state("archive-core", "enc-a", 30)
@@ -11093,7 +11096,8 @@ class HistoryCollectorTests(unittest.TestCase):
 
         collector._enumerate_scopes = enumerate_scopes  # type: ignore[method-assign]
 
-        asyncio.run(collector.run_once())
+        with self.assertRaises(HistorySourceError):
+            asyncio.run(collector.run_once())
 
         events = store.list_slot_events("qs-cryostorage", "node-a", 0)
         loaded = store.get_slot_state("qs-cryostorage", "node-a", 0)
@@ -11231,7 +11235,11 @@ class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
         for state in ("untrusted", "topology-incomplete", "failed", "missing"):
             with self.subTest(state=state):
                 self.view_state = state
-                await self._pass()
+                if state in {"untrusted", "topology-incomplete"}:
+                    with self.assertRaises(HistorySourceError):
+                        await self._pass()
+                else:
+                    await self._pass()
                 self.assertTrue(self.store.get_slot_state("system-a", "storage-view:view-a", 0).present)
                 self.assertEqual(self.store.list_slot_events("system-a", "storage-view:view-a", 0), [])
 
@@ -11322,7 +11330,8 @@ class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
                 inventory, runtime = await self._producer_empty_view(platform, ssh_failed=True)
                 key, healthy_inventory, occupied_runtime = await self._seed_producer_view(inventory, runtime)
                 previous = self.store.get_slot_state(*key)
-                await self._collect_producer_view(inventory, runtime)
+                with self.assertRaises(HistorySourceError):
+                    await self._collect_producer_view(inventory, runtime)
                 self.assertEqual(self.store.get_slot_state(*key), previous,
                                  "Failed authoritative SSH must preserve the occupied slot")
                 self.assertEqual(self.store.list_slot_events(*key), [])
@@ -11555,6 +11564,535 @@ class HistoryCollectorContractTests(unittest.IsolatedAsyncioTestCase):
                     finally:
                         release.set()
                         await asyncio.gather(worker, *([stopping] if stopping else []), return_exceptions=True)
+
+
+class HistoryStartupProgressTests(unittest.IsolatedAsyncioTestCase):
+    """Drive real background passes with synthetic transport and a virtual clock."""
+
+    async def asyncSetUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.settings = HistorySettings(
+            sqlite_path=str(root / "history.db"), backup_dir=str(root / "backups"),
+            startup_grace_seconds=0, poll_interval_seconds=60,
+            failure_backoff_initial_seconds=5, failure_backoff_max_seconds=12,
+        )
+        self.store = HistoryStore(self.settings.sqlite_path)
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.untrusted_systems: set[str] = set()
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.stop_on_inventory = False
+        self.collector = HistoryCollector(self.settings, self.store)
+        transport = patch.object(HistoryCollector, "_fetch_json_sync", side_effect=self._source)
+        transport.start()
+        self.addCleanup(transport.stop)
+        # Seed only synthetic history through the real collection/store path.
+        with patch("history_service.collector.utcnow", return_value=self.now - timedelta(minutes=5)):
+            await self.collector.run_once(force_fast=True, force_slow=True, include_due_intervals=False)
+        self.before_counts = self.store.counts()
+        self.before_records = self._records()
+        self.collector = HistoryCollector(self.settings, self.store)
+        self.calls.clear()
+
+    def _source(self, path, params, method, body, headers, timeout):
+        self.calls.append((path, dict(params)))
+        if path == "/api/inventory":
+            if self.stop_on_inventory:
+                self.collector._stopping.set()
+            system = params.get("system_id", "system-a")
+            trusted = system not in self.untrusted_systems
+            return {
+                "systems": [{"id": "system-a"}, {"id": "system-b"}],
+                "selected_system_id": system, "selected_system_platform": "core",
+                "sources": {"api": {"enabled": True, "ok": trusted}},
+                "slots": [{"slot": 0, "present": trusted,
+                           "serial": f"SANITIZED-{system}" if trusted else None,
+                           "state": "healthy" if trusted else "empty"}],
+            }
+        if path == "/api/storage-views":
+            return {"views": []}
+        if path.endswith("smart-batch"):
+            return {"summaries": [{"slot": 0, "summary": {
+                "available": True, "smart_health_status": "PASSED", "temperature_c": 30,
+                "power_on_hours": 100,
+            }}]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    def _records(self):
+        return {system: self.store.get_slot_state(system, None, 0)
+                for system in ("system-a", "system-b")}
+
+    async def _background_passes(self, count, after_wait=None):
+        frames = []
+
+        async def wait_for_next_pass():
+            frames.append({
+                "at": isoformat_utc(self.now), "status": self.collector.status(),
+                "counts": self.store.counts(), "records": self._records(),
+                "degraded": self.collector.degraded_reason(), "calls": list(self.calls),
+            })
+            if after_wait:
+                after_wait(len(frames))
+            if len(frames) == count:
+                self.collector._stopping.set()
+                return
+            # Advance to the real scheduler's deadline, not past its backoff gate.
+            if self.collector.next_collection_at is None:
+                # The busy pre-check sleeps without publishing a deadline.
+                self.assertEqual(self.calls, [])
+                self.now += timedelta(seconds=min(self.settings.poll_interval_seconds, 30))
+            else:
+                self.assertGreater(self.collector.next_collection_at, self.now)
+                self.now = self.collector.next_collection_at
+            raise asyncio.TimeoutError
+
+        with (
+            patch("history_service.collector.utcnow", side_effect=lambda: self.now),
+            patch("history_service.collector.time.perf_counter", return_value=100.0),
+            patch.object(self.collector._stopping, "wait", side_effect=wait_for_next_pass),
+        ):
+            await self.collector._run_loop()
+        self.assertFalse(self.collector.collection_running)
+        return frames
+
+    def _root_modes(self, frames):
+        return [next(stage["cached_root_only"]
+                     for stage in frame["status"]["collection_stage_timings"]
+                     if stage["stage"] == "inventory.root") for frame in frames]
+
+    def _assert_rejected(self, frame, failures, delay):
+        status = frame["status"]
+        for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at",
+                      "last_slow_metrics_at", "last_backup_at", "last_retention_attempt_at",
+                      "last_smart_evidence_at"):
+            self.assertIsNone(status[field], field)
+        self.assertEqual(status["last_error_kind"], "source_error_reply")
+        self.assertEqual(status["last_error_summary"], "The main UI reported an error for this request.")
+        self.assertEqual(status["background_consecutive_failures"], failures)
+        self.assertEqual(status["background_backoff_delay_seconds"], delay)
+        self.assertEqual(status["background_backoff_seconds_remaining"], delay)
+        deadline = isoformat_utc(datetime.fromisoformat(frame["at"]) + timedelta(seconds=delay))
+        self.assertEqual(status["background_backoff_until"], deadline)
+        self.assertEqual(status["next_collection_at"], deadline)
+        self.assertEqual(frame["counts"], self.before_counts)
+        self.assertEqual(frame["records"], self.before_records)
+        self.assertIsNotNone(frame["degraded"])
+        self.assertFalse(any(stage["stage"].startswith("db.")
+                             for stage in status["collection_stage_timings"]))
+
+    async def test_untrusted_startup_root_retries_full_fleet_and_collects_healthy_sibling(self):
+        self.untrusted_systems = {"system-a"}
+        frames = await self._background_passes(2)
+        self._assert_rejected(frames[0], 1, 5)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        self.assertEqual(frames[0]["calls"], [("/api/inventory", {})])
+        status = frames[1]["status"]
+        self.assertEqual(status["last_success_at"], frames[1]["at"])
+        for field in ("last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at"):
+            self.assertEqual(status[field], frames[1]["at"])
+        self.assertEqual(status["background_consecutive_failures"], 0)
+        self.assertIsNone(status["background_backoff_until"])
+        self.assertIsNone(status["last_error_summary"])
+        self.assertEqual(frames[1]["degraded"],
+                         "Some history inventory scopes were unavailable; collection was partial.")
+        self.assertGreater(frames[1]["counts"]["metric_sample_count"], self.before_counts["metric_sample_count"])
+        self.assertEqual(frames[1]["records"]["system-a"], self.before_records["system-a"])
+        self.assertEqual([stage["system_id"] for stage in status["collection_stage_timings"]
+                          if stage["stage"] == "db.slot_state"], ["system-b"])
+        for system in self.before_records:
+            self.assertEqual(self.store.list_slot_events(system, None, 0), [])
+
+    async def test_all_untrusted_startup_retries_preserve_history_and_backoff_until_recovery(self):
+        self.untrusted_systems = {"system-a", "system-b"}
+
+        def recover_after_third_failure(wait_count):
+            if wait_count == 3:
+                self.untrusted_systems.clear()
+
+        frames = await self._background_passes(4, recover_after_third_failure)
+        for frame, failures, delay in zip(frames[:3], (1, 2, 3), (5, 10, 12), strict=True):
+            self._assert_rejected(frame, failures, delay)
+        self.assertEqual(self._root_modes(frames), [True, False, False, False])
+        recovered = frames[3]["status"]
+        self.assertEqual(recovered["last_success_at"], frames[3]["at"])
+        self.assertEqual(recovered["background_consecutive_failures"], 0)
+        self.assertEqual(recovered["background_backoff_delay_seconds"], 0)
+        self.assertIsNone(recovered["background_backoff_until"])
+        self.assertIsNone(recovered["last_error_summary"])
+        self.assertIsNone(frames[3]["degraded"])
+        self.assertEqual(recovered["last_smart_evidence_at"], frames[3]["at"])
+        self.assertGreater(frames[3]["counts"]["metric_sample_count"], self.before_counts["metric_sample_count"])
+        for system in self.before_records:
+            self.assertEqual(self.store.list_slot_events(system, None, 0), [])
+
+    async def test_healthy_startup_root_stays_cached_fast_only_before_full_fleet(self):
+        frames = await self._background_passes(2)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        first = frames[0]["status"]
+        self.assertEqual(first["last_success_at"], frames[0]["at"])
+        self.assertEqual(first["last_fast_metrics_at"], frames[0]["at"])
+        self.assertIsNone(first["last_slow_metrics_at"])
+        self.assertFalse(first["last_collection_inventory_forced"])
+        self.assertEqual([params for path, params in frames[0]["calls"] if path == "/api/inventory"], [{}])
+        self.assertEqual(first["background_consecutive_failures"], 0)
+        self.assertIsNone(frames[1]["degraded"])
+        self.assertEqual(frames[1]["status"]["last_slow_metrics_at"], frames[1]["at"])
+
+    async def test_failed_manual_pass_does_not_consume_background_startup_attempt(self):
+        self.untrusted_systems = {"system-a", "system-b"}
+        with self.assertRaises(HistorySourceError):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False)
+        self.assertIsNone(self.collector.last_success_at)
+        self.assertEqual(self.collector.background_consecutive_failures, 0)
+        self.untrusted_systems = {"system-a"}
+        self.calls.clear()
+        frames = await self._background_passes(2)
+        self._assert_rejected(frames[0], 1, 5)
+        self.assertEqual(self._root_modes(frames), [True, False])
+        self.assertEqual(frames[1]["status"]["last_success_at"], frames[1]["at"])
+
+    async def test_busy_and_paused_skips_leave_first_real_background_attempt_cached(self):
+        self.collector._run_lock.acquire()
+
+        def release_after_busy_then_acknowledge_pause(wait_count):
+            if wait_count == 1:
+                self.collector._run_lock.release()
+                self.store.record_collection_pause(self.now)
+            elif wait_count == 2:
+                self.store.clear_collection_pause()
+
+        frames = await self._background_passes(3, release_after_busy_then_acknowledge_pause)
+        for frame in frames[:2]:
+            self.assertEqual(frame["calls"], [])
+            self.assertEqual(frame["counts"], self.before_counts)
+            self.assertIsNone(frame["status"]["last_success_at"])
+            self.assertEqual(frame["status"]["background_consecutive_failures"], 0)
+        self.assertEqual(self._root_modes(frames[2:]), [True])
+        self.assertEqual(frames[2]["status"]["last_success_at"], frames[2]["at"])
+
+    async def test_successful_manual_pass_bypasses_cached_background_startup(self):
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False)
+        self.assertEqual(self.collector.last_success_at, isoformat_utc(self.now))
+        self.calls.clear()
+        frames = await self._background_passes(1)
+        self.assertEqual(self._root_modes(frames), [False])
+        self.assertEqual(frames[0]["status"]["last_success_at"], frames[0]["at"])
+
+    async def test_stop_after_root_transport_prevents_writes_and_does_not_record_failure(self):
+        self.stop_on_inventory = True
+        await self.collector._run_loop()
+        self.assertEqual(self.calls, [("/api/inventory", {})])
+        self.assertEqual(self.store.counts(), self.before_counts)
+        self.assertEqual(self._records(), self.before_records)
+        self.assertIsNone(self.collector.last_success_at)
+        self.assertIsNone(self.collector.last_error_kind)
+        self.assertEqual(self.collector.background_consecutive_failures, 0)
+        self.assertFalse(self.collector.collection_running)
+
+
+class HistoryFleetSweepStatusTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.store = HistoryStore(str(root / "history.db"))
+        self.collector = HistoryCollector(
+            HistorySettings(sqlite_path=str(root / "history.db"),
+                            backup_dir=str(root / "backups"), startup_grace_seconds=0),
+            self.store,
+        )
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.failed_systems = {"system-a", "system-b"}
+        self.empty = False
+        self.untrusted = False
+        self.untrusted_systems: set[str] = set()
+        self.platform = "core"
+        self.calls = []
+        transport = patch.object(self.collector, "_fetch_json_sync", side_effect=self._source)
+        transport.start()
+        self.addCleanup(transport.stop)
+
+    def _source(self, path, params, method, body, headers, timeout):
+        self.calls.append((path, dict(params)))
+        if path == "/api/inventory":
+            system = params.get("system_id")
+            if system in self.failed_systems:
+                raise HistorySourceError.unreachable("Synthetic host.example.test unavailable")
+            trusted = not self.untrusted and system not in self.untrusted_systems
+            return {
+                "systems": [] if self.empty else [{"id": "system-a"}, {"id": "system-b"}],
+                "selected_system_id": system or "default",
+                "selected_system_platform": self.platform,
+                "platform_context": {"topology_complete": trusted},
+                "sources": {
+                    "api": {"enabled": self.platform not in {"linux", "esxi", "ipmi"},
+                            "ok": trusted if self.platform != "quantastor" else True},
+                    "ssh": {"enabled": True, "ok": trusted},
+                    "bmc": {"enabled": self.platform == "ipmi", "ok": trusted},
+                },
+                "slots": [] if self.empty or system is None else [{
+                    "slot": 0, "present": trusted, "serial": f"SANITIZED-{system}" if trusted else None,
+                    "state": "healthy" if trusted else "empty",
+                }],
+            }
+        if path == "/api/storage-views":
+            return {"views": []}
+        if path.endswith("smart-batch"):
+            return {"summaries": [{"slot": 0, "summary": {
+                "available": True, "smart_health_status": "PASSED", "temperature_c": 30,
+            }}]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    def _seed_failure(self):
+        old = isoformat_utc(self.now - timedelta(minutes=5))
+        for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at"):
+            setattr(self.collector, field, old)
+        self.collector.last_error = "Synthetic previous failure"
+        self.collector.record_failure_diagnostics(HistorySourceError.unreachable("Synthetic previous failure"))
+        self.collector._record_background_failure(self.now)
+        return self.collector.status()
+
+    async def _pass(self):
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, force_slow=True, include_due_intervals=False)
+        return self.collector.status()
+
+    async def test_all_failed_sweep_preserves_success_times_and_failure_backoff(self):
+        before = self._seed_failure()
+        counts = self.store.counts()
+        with self.assertRaises(HistorySourceError) as caught:
+            await self._pass()
+        self.assertEqual(caught.exception.kind, "source_error_reply")
+        after = self.collector.status()
+        for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at",
+                      "last_error", "last_error_kind", "last_error_summary", "background_consecutive_failures",
+                      "background_backoff_until", "background_backoff_delay_seconds"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(after["last_scope_count"], 0)
+        self.assertFalse(after["collection_running"])
+        self.assertIsNotNone(self.collector.degraded_reason())
+        self.assertEqual(self.store.counts(), counts)
+        self.assertEqual(sum(e["stage"] == "inventory.system_failed"
+                             for e in after["collection_stage_timings"]), 2)
+        self.assertFalse(any(e["stage"].startswith("db.") for e in after["collection_stage_timings"]))
+
+    async def test_all_untrusted_successful_responses_preserve_failure_state_and_history(self):
+        self.failed_systems.clear()
+        for platform in ("core", "linux", "esxi", "ipmi", "quantastor"):
+            with self.subTest(platform=platform):
+                self.platform, self.untrusted = platform, False
+                await self._pass()
+                previous = {system: self.store.get_slot_state(system, None, 0)
+                            for system in ("system-a", "system-b")}
+                before = self._seed_failure()
+                counts = self.store.counts()
+                self.untrusted = True
+                self.calls.clear()
+                with (
+                    patch.object(self.store, "record_slot_updates", wraps=self.store.record_slot_updates) as slots,
+                    patch.object(self.store, "insert_metric_samples", wraps=self.store.insert_metric_samples) as metrics,
+                    patch.object(self.store, "create_backup", wraps=self.store.create_backup) as backup,
+                    patch.object(self.store, "maintain_retention", wraps=self.store.maintain_retention) as retention,
+                    self.assertRaises(HistorySourceError) as caught,
+                ):
+                    await self._pass()
+                self.assertEqual(caught.exception.kind, "source_error_reply")
+                after = self.collector.status()
+                for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at",
+                              "last_error", "last_error_kind", "last_error_summary", "background_consecutive_failures",
+                              "background_backoff_until", "background_backoff_delay_seconds", "last_backup_at",
+                              "last_retention_attempt_at", "last_smart_evidence_at"):
+                    self.assertEqual(after[field], before[field], field)
+                self.assertEqual(after["last_scope_count"], 2)
+                self.assertFalse(after["collection_running"])
+                self.assertFalse(self.collector._scope_enumeration_complete)
+                self.assertIsNotNone(self.collector.degraded_reason())
+                self.assertEqual(self.store.counts(), counts)
+                for system, record in previous.items():
+                    self.assertEqual(self.store.get_slot_state(system, None, 0), record)
+                    self.assertEqual(self.store.list_slot_events(system, None, 0), [])
+                for write in (slots, metrics, backup, retention):
+                    write.assert_not_called()
+                self.assertEqual(sum(path == "/api/inventory" for path, _ in self.calls), 3)
+                self.assertFalse(any(stage["stage"].endswith("failed")
+                                     for stage in after["collection_stage_timings"]))
+
+    async def test_mixed_untrusted_successful_responses_persist_healthy_scope_as_partial(self):
+        self.failed_systems.clear()
+        for platform in ("core", "linux", "esxi", "ipmi", "quantastor"):
+            with self.subTest(platform=platform):
+                self.platform = platform
+                self.untrusted_systems.clear()
+                await self._pass()
+                rejected_previous = self.store.get_slot_state("system-b", None, 0)
+                counts = self.store.counts()
+                self._seed_failure()
+                self.untrusted_systems.add("system-b")
+                self.now += timedelta(minutes=5)
+                status = await self._pass()
+                self.assertEqual(self.collector.degraded_reason(),
+                                 "Some history inventory scopes were unavailable; collection was partial.")
+                self.assertFalse(self.collector._scope_enumeration_complete)
+                self.assertEqual(status["last_scope_count"], 2)
+                self.assertEqual(status["last_success_at"], isoformat_utc(self.now))
+                self.assertEqual(status["background_consecutive_failures"], 0)
+                self.assertIsNone(status["background_backoff_until"])
+                self.assertIsNone(status["last_error_summary"])
+                self.assertIsNotNone(self.store.get_slot_state("system-a", None, 0))
+                self.assertEqual(self.store.get_slot_state("system-b", None, 0), rejected_previous)
+                self.assertEqual(self.store.list_slot_events("system-b", None, 0), [])
+                self.assertGreater(self.store.counts()["metric_sample_count"], counts["metric_sample_count"])
+                self.assertEqual([stage["system_id"] for stage in status["collection_stage_timings"]
+                                  if stage["stage"] == "db.slot_state"], ["system-a"])
+                self.assertEqual([stage["system_id"] for stage in status["collection_stage_timings"]
+                                  if stage["stage"] == "scope.skipped"], ["system-b"])
+                self.assertFalse(any(stage["stage"].endswith("failed")
+                                     for stage in status["collection_stage_timings"]))
+
+    async def test_prior_partial_sweep_cannot_be_cleared_by_all_untrusted_responses(self):
+        self.failed_systems = {"system-b"}
+        before = await self._pass()
+        self.assertIsNotNone(self.collector.degraded_reason())
+        counts = self.store.counts()
+        self.failed_systems.clear()
+        self.untrusted = True
+        self.now += timedelta(minutes=5)
+        with self.assertRaises(HistorySourceError):
+            await self._pass()
+        after = self.collector.status()
+        for field in ("last_success_at", "last_inventory_at", "last_fast_metrics_at", "last_slow_metrics_at"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertIsNotNone(self.collector.degraded_reason())
+        self.assertEqual(self.store.counts(), counts)
+
+        self.untrusted = False
+        self.now += timedelta(minutes=5)
+        recovered = await self._pass()
+        self.assertTrue(self.collector._scope_enumeration_complete)
+        self.assertIsNone(self.collector.degraded_reason())
+        self.assertEqual(recovered["last_success_at"], isoformat_utc(self.now))
+        self.assertEqual(recovered["last_smart_evidence_at"], isoformat_utc(self.now))
+        self.assertEqual(recovered["background_consecutive_failures"], 0)
+        self.assertIsNone(recovered["last_error_summary"])
+        self.assertIsNotNone(self.store.get_slot_state("system-b", None, 0))
+
+    async def test_background_all_untrusted_successful_responses_record_error_and_backoff(self):
+        self.failed_systems.clear()
+        self.untrusted = True
+        old = isoformat_utc(self.now - timedelta(days=1))
+        self.collector.last_success_at = old
+
+        async def stop_after_pass():
+            self.collector._stopping.set()
+
+        with (
+            patch("history_service.collector.utcnow", return_value=self.now),
+            patch.object(self.collector._stopping, "wait", side_effect=stop_after_pass),
+            patch("history_service.collector.observe_history_collection_run") as observe,
+        ):
+            await self.collector._run_loop()
+        status = self.collector.status()
+        self.assertEqual(status["last_success_at"], old)
+        self.assertEqual(status["last_error_kind"], "source_error_reply")
+        self.assertEqual(status["last_error_summary"], "The main UI reported an error for this request.")
+        self.assertEqual(status["background_consecutive_failures"], 1)
+        self.assertEqual(status["background_backoff_delay_seconds"], 30)
+        self.assertEqual(observe.call_args.kwargs["result"], "error")
+        self.assertEqual(self.store.counts()["tracked_slots"], 0)
+
+    async def test_partial_sweep_persists_healthy_scope_and_reports_degradation(self):
+        self.failed_systems = {"system-b"}
+        status = await self._pass()
+        self.assertEqual(status["last_scope_count"], 1)
+        self.assertEqual(status["last_success_at"], isoformat_utc(self.now))
+        self.assertIsNotNone(self.store.get_slot_state("system-a", None, 0))
+        self.assertIsNone(self.store.get_slot_state("system-b", None, 0))
+        self.assertGreater(self.store.counts()["metric_sample_count"], 0)
+        self.assertEqual(self.collector.degraded_reason(),
+                         "Some history inventory scopes were unavailable; collection was partial.")
+
+    async def test_authoritative_empty_sweep_succeeds_and_clears_backoff(self):
+        self._seed_failure()
+        self.empty = True
+        status = await self._pass()
+        self.assertEqual(status["last_success_at"], isoformat_utc(self.now))
+        self.assertEqual(status["last_fast_metrics_at"], isoformat_utc(self.now))
+        self.assertEqual(status["last_slow_metrics_at"], isoformat_utc(self.now))
+        self.assertIsNone(status["last_error"])
+        self.assertEqual(status["background_consecutive_failures"], 0)
+        self.assertIsNone(status["background_backoff_until"])
+        self.assertIsNone(self.collector.degraded_reason())
+        self.assertEqual(self.store.counts()["tracked_slots"], 0)
+
+    async def test_failed_enumeration_with_only_untrusted_survivor_does_not_succeed(self):
+        self.failed_systems = {"system-b"}
+        self.untrusted = True
+        before = self._seed_failure()
+        with self.assertRaises(HistorySourceError):
+            await self._pass()
+        status = self.collector.status()
+        self.assertEqual(status["last_scope_count"], 1)
+        self.assertEqual(status["last_success_at"], before["last_success_at"])
+        self.assertEqual(status["last_inventory_at"], before["last_inventory_at"])
+        self.assertEqual(status["background_consecutive_failures"], 1)
+        self.assertEqual(self.store.counts()["tracked_slots"], 0)
+
+    async def test_background_all_failed_sweep_records_error_and_backoff(self):
+        old = isoformat_utc(self.now - timedelta(days=1))
+        self.collector.last_success_at = old
+
+        async def stop_after_pass():
+            self.collector._stopping.set()
+
+        with (
+            patch("history_service.collector.utcnow", return_value=self.now),
+            patch.object(self.collector._stopping, "wait", side_effect=stop_after_pass),
+            patch("history_service.collector.observe_history_collection_run") as observe,
+        ):
+            await self.collector._run_loop()
+        status = self.collector.status()
+        self.assertEqual(status["last_success_at"], old)
+        self.assertEqual(status["last_error_kind"], "source_error_reply")
+        self.assertEqual(status["last_error_summary"], "The main UI reported an error for this request.")
+        self.assertEqual(status["background_consecutive_failures"], 1)
+        self.assertEqual(status["background_backoff_delay_seconds"], 30)
+        self.assertEqual(observe.call_args.kwargs["result"], "error")
+
+    async def test_cached_root_selection_is_not_a_failed_fleet_sweep(self):
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False, cached_root_only=True)
+        self.assertIsNone(self.collector.degraded_reason())
+        self.assertEqual(self.collector.last_success_at, isoformat_utc(self.now))
+        self.assertEqual(len(self.calls), 1)
+
+        self.failed_systems = {"system-b"}
+        await self._pass()
+        reason = self.collector.degraded_reason()
+        self.assertIsNotNone(reason)
+        self.calls.clear()
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(force_fast=True, include_due_intervals=False, cached_root_only=True)
+        self.assertEqual(self.collector.degraded_reason(), reason)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_recovered_sweep_clears_failure_and_partial_degradation(self):
+        self._seed_failure()
+        with self.assertRaises(HistorySourceError):
+            await self._pass()
+        self.failed_systems = {"system-b"}
+        await self._pass()
+        self.assertIsNotNone(self.collector.degraded_reason())
+        self.failed_systems.clear()
+        self.now += timedelta(minutes=5)
+        status = await self._pass()
+        self.assertEqual(status["last_scope_count"], 2)
+        self.assertEqual(status["last_success_at"], isoformat_utc(self.now))
+        self.assertIsNone(status["last_error_summary"])
+        self.assertEqual(status["background_consecutive_failures"], 0)
+        self.assertIsNone(self.collector.degraded_reason())
+        self.assertIsNotNone(self.store.get_slot_state("system-b", None, 0))
 
 
 class HistoryCollectorDiagnosticsTests(unittest.TestCase):

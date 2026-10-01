@@ -379,7 +379,18 @@ class LocalDirectoryTarget(_TargetBase):
     def _ensure_root(self) -> Path:
         if self._root_real is not None:
             return self._root_real
-        self._root.mkdir(parents=True, exist_ok=True)
+        missing = []
+        current = self._root.absolute()
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory)
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+
         if not self._root.is_dir():
             raise ArchiveTransportError("Archive root is not a directory.")
         real = Path(os.path.realpath(self._root))
@@ -439,7 +450,7 @@ class LocalDirectoryTarget(_TargetBase):
                     target.flush()
                     os.fsync(target.fileno())
                 with open(partial, "rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback(self.provider, size, sha, back_size, back_sha)
                 self.before_mutation()
                 os.replace(partial, final)
@@ -451,7 +462,14 @@ class LocalDirectoryTarget(_TargetBase):
                 raise
         stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
         try:
-            self._fsync_dir(final.parent)
+            # Existence is not durability evidence: a previous job/target may
+            # have left this hierarchy after a rejected or uncertain upload.
+            # Re-establish every containing-directory barrier for each put,
+            # from the filesystem root (or confined mount) through the leaf.
+            boundary = Path(os.path.realpath(self._confine_to)) if self._confine_to is not None else Path(final.anchor)
+            for directory in (*reversed(final.parent.parents), final.parent):
+                if directory == boundary or boundary in directory.parents:
+                    self._fsync_dir(directory)
         except OSError as exc:
             raise ArchivePublicationUncertainError(stored) from exc
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
@@ -778,7 +796,7 @@ class SftpTarget(_TargetBase):
                     size, sha = _copy_stream(source, remote.write)
                 with self._sftp.open(partial, "rb") as readback:
                     readback.prefetch(size, max_concurrent_requests=SFTP_PREFETCH_MAX_REQUESTS)
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SFTP", size, sha, back_size, back_sha)
                 try:
                     self._sftp.posix_rename(partial, final)
@@ -912,7 +930,7 @@ class SmbTarget(_TargetBase):
                 with self._client.open_file(partial, mode="wb") as remote:
                     size, sha = _copy_stream(source, remote.write)
                 with self._client.open_file(partial, mode="rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SMB", size, sha, back_size, back_sha)
                 self._client.replace(partial, final)
             except BaseException:
