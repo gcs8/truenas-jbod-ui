@@ -61,7 +61,8 @@ class TrueNASAPIBusyError(TrueNASAPIError):
     retryable = True
 
 
-# Custom JSON-RPC codes documented by the TrueNAS middleware.
+# Standard JSON-RPC missing-method code and TrueNAS middleware custom codes.
+JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_TOO_MANY_CONCURRENT_CALLS = -32000
 JSONRPC_METHOD_CALL_ERROR = -32001
 
@@ -86,6 +87,9 @@ def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
         if isinstance(data, dict):
             errname = str(data.get("errname") or "").strip()
             reason = str(data.get("reason") or "").strip()
+    if code == JSONRPC_METHOD_NOT_FOUND and not errname:
+        errname = "ENOMETHOD"
+        reason = reason or message_text
     detail = ": ".join(part for part in (errname, reason) if part) or message_text
     if not detail:
         detail = f"code {code}" if code is not None else "unspecified middleware error"
