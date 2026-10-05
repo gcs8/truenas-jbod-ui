@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Checked the checked-in public demo against the parity rules of the revision
+  it was built from, so a later schema or offline-image change no longer fails
+  it between releases. (#886)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
