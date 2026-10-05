@@ -5499,6 +5499,48 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         self.assertEqual(target, (0, "storage-view:boot-doms"))
 
+    def test_resolve_storage_view_slot_history_target_ignores_bay_number_from_another_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [("bmc-encl-2", 3, "SANITIZED-REAR-3")],
+            )
+            for selected_enclosure_id in ("front-a", None):
+                with self.subTest(selected_enclosure_id=selected_enclosure_id):
+                    target = asyncio.run(
+                        service.resolve_storage_view_slot_history_target(
+                            "rear-bays",
+                            0,
+                            selected_enclosure_id=selected_enclosure_id,
+                        )
+                    )
+                    # Bay 3 of front-a is a different disk; read the view's own scope.
+                    self.assertEqual(target, (0, "storage-view:rear-bays"))
+
+    def test_resolve_storage_view_slot_history_target_keys_a_bay_only_in_its_own_enclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._ipmi_storage_view_service_with_candidates(
+                temp_dir,
+                [("bmc-encl-2", 3, "SANITIZED-REAR-3"), ("front-a", 5, "SANITIZED-FRONT-5")],
+            )
+            for selected_enclosure_id, slot_index, expected in (
+                ("front-a", 0, (0, "storage-view:rear-bays")),
+                ("front-a", 1, (5, "front-a")),
+                (None, 0, (0, "storage-view:rear-bays")),
+                (None, 1, (5, "front-a")),
+                ("bmc-encl-2", 0, (3, "bmc-encl-2")),
+                ("bmc-encl-2", 1, (1, "storage-view:rear-bays")),
+            ):
+                with self.subTest(selected_enclosure_id=selected_enclosure_id, slot_index=slot_index):
+                    target = asyncio.run(
+                        service.resolve_storage_view_slot_history_target(
+                            "rear-bays",
+                            slot_index,
+                            selected_enclosure_id=selected_enclosure_id,
+                        )
+                    )
+                    self.assertEqual(target, expected)
+
     def test_resolve_persistent_id_prefers_partuuid_leaf(self) -> None:
         value, label = resolve_persistent_id("/dev/disk/by-partuuid/83672e59-1b7c-40a0-970a-15ad0776ddda")
 

@@ -251,3 +251,59 @@ test("runtime removal of selected view rerenders the now-live grid", async () =>
  await c.fetchStorageViewRuntime(false,true);
  assert.equal(rendered,1);
 });
+
+// #837: a storage-view candidate's bay number only names a disk inside its own
+// enclosure. Front and rear enclosures both have a bay 3 holding different disks.
+const BAY_SCOPE_FUNCTIONS = ["storageViewSlotBayInEnclosure", "isLiveStyledStorageView", "getLiveBackedStorageViewSlot", "buildStorageViewHistoryContextSlot"];
+function bayScopeFixture({ liveEnclosureId, selectedEnclosureId = liveEnclosureId }) {
+  const bays = {
+    front: { slot: 3, enclosure_id: "front", serial: "SANITIZED-FRONT-3" },
+    rear: { slot: 3, enclosure_id: "rear", serial: "SANITIZED-REAR-3" },
+    unscoped: { slot: 3, enclosure_id: null, serial: "SANITIZED-UNSCOPED-3" },
+  };
+  const state = { selectedEnclosureId, snapshot: { selected_enclosure_id: liveEnclosureId } };
+  return load(BAY_SCOPE_FUNCTIONS.filter(n => source.includes(`function ${n}(`)), {
+    state,
+    Number,
+    Boolean,
+    getSlotById: (slotNumber) => (slotNumber === 3 ? bays[state.snapshot.selected_enclosure_id ?? "unscoped"] || null : null),
+    currentLiveEnclosureId: () => state.selectedEnclosureId || state.snapshot.selected_enclosure_id || null,
+  });
+}
+const rearCandidate = { slot_index: 0, slot_label: "R0", snapshot_slot: 3, snapshot_enclosure_id: "rear", serial: "SANITIZED-REAR-3" };
+const frontCandidate = { slot_index: 1, slot_label: "R1", snapshot_slot: 3, snapshot_enclosure_id: "front", serial: "SANITIZED-FRONT-3" };
+for (const [name, liveEnclosureId, slot, expectedSerial] of [
+  ["foreign rear bay on the front shelf", "front", rearCandidate, null],
+  ["own front bay on the front shelf", "front", frontCandidate, "SANITIZED-FRONT-3"],
+  ["foreign front bay on the rear shelf", "rear", frontCandidate, null],
+  ["own rear bay on the rear shelf", "rear", rearCandidate, "SANITIZED-REAR-3"],
+  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, "SANITIZED-FRONT-3"],
+  ["bay with null recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3, snapshot_enclosure_id: null }, "SANITIZED-FRONT-3"],
+  ["recorded enclosure with no rendered enclosure", undefined, frontCandidate, null],
+]) {
+  test(`live-backed storage view slot stays in its own enclosure: ${name}`, () => {
+    const c = bayScopeFixture({ liveEnclosureId });
+    const view = { id: "chassis", kind: "ses_enclosure", backing_enclosure_id: liveEnclosureId || null };
+    const liveSlot = c.getLiveBackedStorageViewSlot(view, slot);
+    assert.equal(liveSlot?.serial ?? null, expectedSerial);
+  });
+}
+for (const [name, backing, slot, expected] of [
+  ["foreign rear bay on a front-backed view", "front", rearCandidate, { slot: 0, enclosure_id: "storage-view:boot", history_source_label: null }],
+  ["own front bay on a front-backed view", "front", frontCandidate, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
+  ["own rear bay on a rear-backed view", "rear", rearCandidate, { slot: 3, enclosure_id: "rear", history_source_label: "Backing Shelf" }],
+  ["foreign front bay on a rear-backed view", "rear", frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
+  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
+  ["recorded enclosure with no backing or live enclosure", null, frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
+]) {
+  test(`storage view history target stays in its own enclosure: ${name}`, () => {
+    const c = bayScopeFixture({ liveEnclosureId: backing || undefined, selectedEnclosureId: backing || null });
+    const view = { id: "boot", label: "Boot", kind: "boot_devices", backing_enclosure_id: backing, backing_enclosure_label: "Backing Shelf" };
+    const target = c.buildStorageViewHistoryContextSlot(view, slot);
+    assert.deepEqual(
+      { slot: target.slot, enclosure_id: target.enclosure_id, history_source_label: target.history_source_label },
+      expected,
+    );
+    assert.equal(target.enclosure_label, expected.enclosure_id.startsWith("storage-view:") ? "Boot" : "Backing Shelf");
+  });
+}

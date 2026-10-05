@@ -125,8 +125,8 @@ class AppHistoryBoundsTests(unittest.TestCase):
             id="view-a",
             backing_enclosure_id="front",
             slots=[
-                SimpleNamespace(slot_index=0, snapshot_slot=5),
-                SimpleNamespace(slot_index=1, snapshot_slot=None),
+                SimpleNamespace(slot_index=0, snapshot_slot=5, snapshot_enclosure_id=None),
+                SimpleNamespace(slot_index=1, snapshot_slot=None, snapshot_enclosure_id=None),
             ],
         )
         service = Mock()
@@ -163,6 +163,81 @@ class AppHistoryBoundsTests(unittest.TestCase):
         sent_scopes = backend.get_scopes_history.await_args.kwargs["scopes"]
         self.assertEqual(len(sent_scopes), 2)
         self.assertEqual(json.loads(response.body)["histories"], {"0": {"available": True}, "1": {"available": True}})
+
+    def test_storage_view_history_keys_a_bay_only_in_its_own_enclosure(self) -> None:
+        route = self._route("/api/storage-views/{view_id}/history")
+        # Front and rear enclosures both have a bay 3 holding different disks.
+        runtime_view = SimpleNamespace(
+            id="view-a",
+            backing_enclosure_id="front",
+            slots=[
+                SimpleNamespace(slot_index=0, snapshot_slot=3, snapshot_enclosure_id="rear"),
+                SimpleNamespace(slot_index=1, snapshot_slot=3, snapshot_enclosure_id="front"),
+                SimpleNamespace(slot_index=2, snapshot_slot=5, snapshot_enclosure_id=None),
+            ],
+        )
+        service = Mock()
+        service.system = SimpleNamespace(id="synthetic", truenas=SimpleNamespace(platform="ipmi"))
+        service.get_storage_view_runtime = AsyncMock(return_value=SimpleNamespace(views=[runtime_view]))
+        registry = Mock()
+        registry.get_service.return_value = service
+        for enclosure_id, expected_scopes, expected_histories in (
+            (
+                None,
+                {"front": [3, 5], "storage-view:view-a": [0]},
+                {"0": "view-a slot 0", "1": "front bay 3", "2": "front bay 5"},
+            ),
+            (
+                "rear",
+                {"rear": [3, 5], "storage-view:view-a": [1]},
+                {"0": "rear bay 3", "1": "view-a slot 1", "2": "rear bay 5"},
+            ),
+        ):
+            with self.subTest(enclosure_id=enclosure_id):
+                backend = Mock(configured=True)
+
+                async def scopes_history(*, scopes, **_kwargs):
+                    return {
+                        "scopes": [
+                            {
+                                "system_id": scope["system_id"],
+                                "enclosure_id": scope["enclosure_id"],
+                                "histories": {
+                                    str(slot): {
+                                        "marker": (
+                                            f"view-a slot {slot}"
+                                            if scope["enclosure_id"].startswith("storage-view:")
+                                            else f"{scope['enclosure_id']} bay {slot}"
+                                        )
+                                    }
+                                    for slot in scope["slots"]
+                                },
+                            }
+                            for scope in scopes
+                        ]
+                    }
+
+                backend.get_scopes_history = AsyncMock(side_effect=scopes_history)
+                with (
+                    patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                    patch.object(app_routes, "get_history_backend", return_value=backend),
+                ):
+                    response = asyncio.run(
+                        route.endpoint(
+                            view_id="view-a",
+                            system_id=None,
+                            enclosure_id=enclosure_id,
+                            window_hours=24,
+                            metrics=["temperature_c"],
+                            event_limit=0,
+                            metric_limit=24,
+                        )
+                    )
+                self.assertEqual(response.status_code, 200)
+                sent_scopes = backend.get_scopes_history.await_args.kwargs["scopes"]
+                self.assertEqual({scope["enclosure_id"]: scope["slots"] for scope in sent_scopes}, expected_scopes)
+                histories = json.loads(response.body)["histories"]
+                self.assertEqual({slot: payload["marker"] for slot, payload in histories.items()}, expected_histories)
 
     def test_main_refresh_proxy_uses_internal_backend_client(self) -> None:
         route = self._route("/api/history/refresh")
@@ -245,7 +320,7 @@ class AppHistoryBoundsTests(unittest.TestCase):
         runtime_view = SimpleNamespace(
             id="view-a",
             backing_enclosure_id="front",
-            slots=[SimpleNamespace(slot_index=0, snapshot_slot=0)],
+            slots=[SimpleNamespace(slot_index=0, snapshot_slot=0, snapshot_enclosure_id=None)],
         )
         service = Mock()
         service.system = SimpleNamespace(id="synthetic", truenas=SimpleNamespace(platform="core"))
