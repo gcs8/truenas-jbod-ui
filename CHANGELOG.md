@@ -265,6 +265,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Listed every saved system in `/healthz` with its cached status while keeping
+  the overall status and HTTP code scoped to the default system. (#885)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
