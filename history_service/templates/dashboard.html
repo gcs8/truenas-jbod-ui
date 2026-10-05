@@ -30,6 +30,7 @@
         {% endif %}
       </div>
       <div id="collector-activity-banner" class="collector-banner" role="status" aria-live="polite"{% if not collector_banner_text %} hidden{% endif %}>{{ collector_banner_text | replace('History background collection is backed off for', 'History collection paused for') }}</div>
+      <div id="history-storage-degraded" class="collector-banner" role="status" aria-live="polite"{% if not degraded_reason %} hidden{% endif %}>{{ degraded_reason or '' }}</div>
 
       <p id="history-collector-freshness" class="note-text" role="status" aria-live="polite">Last checked: page load. Collector status snapshot; live checks require JavaScript.</p>
       <p id="history-overview-freshness" class="note-text" role="status" aria-live="polite">Last checked: page load. Overview snapshot; live checks require JavaScript.</p>
@@ -130,7 +131,11 @@
               <td>{{ timestamp(scope.get('last_seen_at')) }}</td>
             </tr>
             {% else %}
+            {% if degraded_reason %}
+            <tr><td colspan="6">Systems and enclosures are unavailable until stored history can be read.</td></tr>
+            {% else %}
             <tr><td colspan="6">No slot history has been collected yet.</td></tr>
+            {% endif %}
             {% endfor %}
           </tbody>
         </table>
