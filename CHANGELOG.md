@@ -268,6 +268,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Gave the admin orphaned-history preview, adopt scan and purge the long
   30-minute request limit, reported a timed-out purge as an unknown outcome,
   and kept Purge disabled when nothing is left to purge. (#883)
+- Treated a standard JSON-RPC "method not found" reply from SCALE as an
+  unavailable middleware method, so SMART batches fail fast and optional SMART
+  test results stop warning on every refresh. (#881)
 - Kept disk measurements and locate-light targets bound to qualified disk and
   enclosure identities across merged SES paths, and withheld obsolete snapshot
   detail side effects through the final write guard, including initial
