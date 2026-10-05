@@ -32,7 +32,13 @@ class OwnershipEntries(list[tuple[Path, os.stat_result]]):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Preflight or apply bounded non-root bind-mount ownership on a POSIX deployment host.",
-        epilog="Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; --apply requires root.",
+        epilog=(
+            "Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; "
+            "--apply requires root. Stop every writer first (docker compose down, plus any host job that writes under "
+            "the deployment root) and keep them stopped until --apply finishes. The hard-link and descriptor checks "
+            "are point-in-time: a process that creates hard links or renames files during the run can still steer a "
+            "mode or ownership change onto an excluded file."
+        ),
     )
     parser.add_argument("root", type=Path, help="Deployment directory containing config, data, history and logs, e.g. /srv/enclosure.")
     parser.add_argument("--uid", type=int, default=10001, help="Target numeric user ID, e.g. 10001 (default: 10001).")

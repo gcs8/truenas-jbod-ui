@@ -211,7 +211,11 @@ sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$a
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. Do not use recursive `chmod 777`. If SSH then fails to
+Run the dry check first. Stop every writer before `--apply` (`docker compose
+down` above, plus any host job that writes under this folder) and keep them
+stopped until it finishes: the helper's hard link checks are point-in-time and
+do not protect against files linked or renamed during the run. Do not use
+recursive `chmod 777`. If SSH then fails to
 load `known_hosts`, verify that `data/known_hosts` (or the file named by
 `ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
 configured app UID/GID and uses mode `0660`.

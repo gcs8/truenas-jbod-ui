@@ -266,7 +266,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Rejected multiply-linked regular files before non-root ownership migration,
-  preserving excluded files' ownership and modes. (#742)
+  preserving excluded files' ownership and modes, and documented that every
+  writer must stay stopped while `--apply` runs. (#742)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)

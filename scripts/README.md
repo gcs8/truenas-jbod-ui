@@ -29,6 +29,12 @@ local deployment directory:
 python scripts/prepare_nonroot_bind_mounts.py /srv/enclosure --uid 10001 --gid 10001
 ```
 
+Stop every writer before `--apply` (`docker compose down`, plus any host job that
+writes under the deployment directory) and keep them stopped until it finishes.
+The helper refuses multiply-linked files, but that check is point-in-time: a
+process that adds a hard link or renames a file during the run can still steer a
+mode or ownership change onto an excluded file.
+
 Review the bounded path selection before considering `--apply`. The helper covers
 `data`, `history`, `logs`, and selected `config` entries, not every deployment
 secret or mount. It is not a recursive `chown` substitute and must not be used as
