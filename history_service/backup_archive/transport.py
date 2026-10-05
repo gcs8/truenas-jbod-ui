@@ -13,9 +13,11 @@ defects found in review fixed (see #573 and gcs8/switch-explorer#179):
   fails unless trust-on-first-use is explicitly enabled for that target.
 * Uploads go to ``<name>.partial``, are verified, and are then renamed into
   place (S3: a single put or multipart upload, then verify).
-* Every upload is streamed from disk and read back: size plus SHA-256 where the
-  protocol allows it (FTP: size only; S3: stored SHA-256 metadata plus ETag, or
-  a re-GET for small objects).
+* Every upload is streamed from disk and checked: size plus SHA-256 read back
+  where the protocol allows it (S3: stored SHA-256 metadata plus ETag, or a
+  streamed re-GET). FTP checks the remote size only; its SHA-256 is the hash of
+  the bytes sent, and ``StoredObject.upload_check`` is ``"size"`` so callers
+  never describe it as a content readback (#722).
 * Object names are validated and every target stays below its app-owned root.
 * Credentials come from private ``*_file`` secret files only.
 * "Ensure directory" loops only tolerate "already exists" and then confirm the
@@ -112,6 +114,12 @@ class StoredObject:
     size: int
     sha256: str
     verified: bool
+    # How ``verified`` was established at upload (#722): "readback" means the
+    # stored content was read back and hashed (or the provider confirmed the
+    # SHA-256); "size" means only the remote size was compared, and ``sha256``
+    # is the hash of the bytes sent. An explicit verify always downloads and
+    # checks size and SHA-256.
+    upload_check: str = "readback"
 
 
 class ArchivePublicationUncertainError(ArchiveTransportError):
@@ -329,11 +337,22 @@ class _TargetBase:
                 self.delete(probe)
             except Exception as exc:  # report the failed cleanup, do not mask it
                 raise ArchiveTransportError(f"Probe written but could not be deleted: {exc}") from exc
+            upload_check = stored.upload_check
             detail = f"{self.provider} archive destination is writable"
-            detail += " and readback matched." if stored.verified else "; readback could not confirm the content."
+            if not stored.verified:
+                detail += "; readback could not confirm the content."
+            elif upload_check == "size":
+                # #722: no content was read back; say exactly what was checked.
+                detail += (
+                    "; the remote size matched and SHA-256 was computed on the bytes sent"
+                    " (the content was not read back)."
+                )
+            else:
+                detail += " and readback matched."
             ok = True
         except Exception as exc:  # the probe reports any failure instead of raising
             ok = False
+            upload_check = None
             detail = str(exc) or exc.__class__.__name__
         return {
             "ok": ok,
@@ -341,6 +360,7 @@ class _TargetBase:
             "duration_ms": round((time.monotonic() - started) * 1000),
             "provider": self.provider,
             "transport_encrypted": self.transport_encrypted,
+            "upload_check": upload_check,
         }
 
 
@@ -605,7 +625,7 @@ class FtpTarget(_TargetBase):
                 logger.warning("FTP archive could not remove an incomplete upload.")
             raise
         # FTP offers size only; SHA-256 is the hash of the bytes sent.
-        return StoredObject(name=name, size=size, sha256=sha, verified=True)
+        return StoredObject(name=name, size=size, sha256=sha, verified=True, upload_check="size")
 
     def list(self, prefix: str = "") -> list[RemoteObject]:
         prefix = _validate_prefix(prefix)

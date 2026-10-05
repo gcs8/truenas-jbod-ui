@@ -2186,6 +2186,40 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_size_only_remote_copy_says_so_and_explicit_verify_fails_closed(self) -> None:
+        # #722: an FTP-style target checks size only at upload. The artifact
+        # detail must say so, and an explicit Verify (download, size and
+        # SHA-256) must catch a same-length change and stop counting the copy.
+        import dataclasses
+
+        class SizeOnlyTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), upload_check="size")
+
+        def open_target(settings):
+            @contextlib.contextmanager
+            def opened():
+                yield SizeOnlyTarget(self.remote_root / settings.target_id)
+
+            return opened()
+
+        self.open_target = open_target  # type: ignore[method-assign]
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        local = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        self.assertTrue(remote.verified)
+        self.assertEqual(scheduler.detail(remote.artifact_id)["upload_check"], "size")
+        self.assertIsNone(scheduler.detail(local.artifact_id)["upload_check"])
+
+        stored = self.remote_root / "nas" / remote.name
+        data = stored.read_bytes()
+        stored.write_bytes(bytes([data[0] ^ 0xFF]) + data[1:])
+        result = scheduler.verify(remote.artifact_id)
+        self.assertFalse(result["ok"])
+        self.assertIn("SHA-256", result["detail"])
+        self.assertFalse(scheduler.catalog.get(remote.artifact_id).verified)
+        self.assertFalse(scheduler.serialize(scheduler.get(remote.artifact_id))["restorable"])
+
     def test_disabled_target_gets_no_retention_rule(self) -> None:
         disabled = {**TARGET, "target_id": "cloud", "label": "Cloud", "enabled": False}
         scheduler = self.make({"full": {"enabled": True, "remote_keep": 3}, "targets": [TARGET, disabled]})

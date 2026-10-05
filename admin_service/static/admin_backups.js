@@ -271,6 +271,17 @@
     };
   }
 
+  // #722: an FTP copy was checked by size only at upload. Until an explicit
+  // Verify downloads it and matches size and SHA-256, say exactly that.
+  function verifiedDetailText(item) {
+    if (!item?.verified) return "Not yet";
+    const explicitlyVerified = Boolean(item.last_verify && typeof item.last_verify === "object" && item.last_verify.ok);
+    if (item.upload_check === "size" && !explicitlyVerified) {
+      return "Size only at upload; Verify re-reads and hashes it";
+    }
+    return "Yes";
+  }
+
   function lastRunSummary(lastRun) {
     if (!lastRun || typeof lastRun !== "object") {
       return { tone: "", text: "Not used yet" };
@@ -990,7 +1001,7 @@
           ["Taken", fmtTime(item.created_at)],
           ["Size", fmtBytes(item.size)],
           ["Location", locationLabel(item.location, targets())],
-          ["Verified", item.verified ? "Yes" : "Not yet"],
+          ["Verified", verifiedDetailText(item)],
           ["State", stateLabel(item)],
           ["App version", item.app_version ? scrubText(item.app_version) : "Unknown"],
           ["Checksum", shortHash(item.sha256) || "Unknown"],
@@ -1141,9 +1152,11 @@
             body: "{}",
           });
           const ms = Number(result.duration_ms);
+          // #722: FTP compares only the remote size at upload; say so.
+          const sizeOnly = result.upload_check === "size" ? " Size checked only; Verify re-reads a backup." : "";
           state.targetResults.set(id, result.ok === false
             ? { ok: false, text: `Failed: ${scrubText(result.detail || "no detail")}` }
-            : { ok: true, text: `Works${Number.isFinite(ms) ? ` (${ms} ms)` : ""}.` });
+            : { ok: true, text: `Works${Number.isFinite(ms) ? ` (${ms} ms)` : ""}.${sizeOnly}` });
         } catch (error) {
           state.targetResults.set(id, { ok: false, text: `Failed: ${errorText(error)}` });
         }
