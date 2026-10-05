@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept storage-view history on a candidate's own enclosure, so a disk recorded
+  in another enclosure no longer shows the history of a same-numbered local
+  bay, in the live view, the history route and offline exports. (#888)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
