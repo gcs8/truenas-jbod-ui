@@ -419,10 +419,15 @@ journal. Restart the scheduler to apply a save:
   for example `/run/backup-secrets/archive_sftp_key`. The path must be inside
   `/run/backup-secrets` and cannot be the archive passphrase file. Leaving the
   field empty keeps the current file.
+- Each secret file belongs to one target credential. The editor refuses a path
+  that another target or another field already uses, including the S3 keys, so
+  one target cannot send another target's secret to its own server. Targets
+  that already share a file in `config.yaml` keep working until you name a
+  secret path again.
 - Renaming a target keeps its secret files. Changing where it points (provider,
   host, port, user name, share, bucket, endpoint and similar settings) means you
-  must choose its secret files again or clear them, so a saved credential is
-  never sent to a new server by accident.
+  must name new secret files or clear them; entering the old path again is
+  refused, so a saved credential is never sent to a new server by accident.
 
 ### Targets
 
