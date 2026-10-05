@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refused a backup target secret file that another target or field already
+  uses, and required a new secret file once a target points somewhere else, so
+  one target cannot send another's credential to its server. (#887)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
