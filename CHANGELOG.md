@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Gave the admin orphaned-history preview, adopt scan and purge the long
+  30-minute request limit, reported a timed-out purge as an unknown outcome,
+  and kept Purge disabled when nothing is left to purge. (#883)
 - Kept disk measurements and locate-light targets bound to qualified disk and
   enclosure identities across merged SES paths, and withheld obsolete snapshot
   detail side effects through the final write guard, including initial
