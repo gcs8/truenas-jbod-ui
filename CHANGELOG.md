@@ -265,6 +265,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Described FTP upload checks as size only: the target test and a copy's
+  details no longer claim the content was read back, until an explicit Verify
+  downloads the copy and matches its size and SHA-256. (#890)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
