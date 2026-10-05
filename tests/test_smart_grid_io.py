@@ -1160,6 +1160,188 @@ class SmartGridIOTests(unittest.IsolatedAsyncioTestCase):
             self.assert_other(store, changed)
 
 
+
+
+class SnapshotStoreLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    fixture = SmartGridIOTests.fixture
+    setUp = SmartGridIOTests.setUp
+
+    async def test_mapping_read_version_survives_concurrent_writer(self):
+        from app.models.domain import ManualMapping
+        from app.services.mapping_store import MappingRevisionConflict
+        with self.fixture(1) as (service, api, store, other):
+            mapping = service.mapping_store
+            baseline = await service.get_snapshot()
+            entered, release = asyncio.Event(), threading.Event()
+            loop = asyncio.get_running_loop()
+            load = mapping.load_read_snapshot
+
+            def blocked():
+                entries = load()
+                loop.call_soon_threadsafe(entered.set)
+                if not release.wait(3):
+                    raise AssertionError("mapping read release deadline")
+                return entries
+
+            with patch.object(mapping, "load_read_snapshot", side_effect=blocked):
+                owner = asyncio.create_task(service.get_snapshot(force_refresh=True))
+                try:
+                    await asyncio.wait_for(entered.wait(), 3)
+                    # A separate store owner writes after the snapshot's read.
+                    writer = MappingStore(mapping.file_path)
+                    await asyncio.to_thread(writer.save_mapping, ManualMapping(
+                        system_id=service.system.id, enclosure_id="synthetic-enclosure", slot=0,
+                        serial="INVENTED-000", device_name="da0"))
+                    release.set()
+                    snapshot = await asyncio.wait_for(owner, 3)
+                finally:
+                    release.set()
+                    await asyncio.gather(owner, return_exceptions=True)
+            self.assertEqual(snapshot.summary.manual_mapping_count, 0)
+            self.assertEqual(snapshot.slots[0].mapping_revision, baseline.slots[0].mapping_revision)
+            self.assertEqual(snapshot.slots[0].mapping_clear_revision, baseline.slots[0].mapping_clear_revision)
+            before = mapping.file_path.read_bytes()
+            with self.assertRaises(MappingRevisionConflict):
+                await service.save_mapping(0, {"device_name": "da0"},
+                                           expected_revision=snapshot.slots[0].mapping_revision)
+            self.assertEqual(mapping.file_path.read_bytes(), before)
+            fresh = await service.get_snapshot(force_refresh=True)
+            self.assertEqual(fresh.summary.manual_mapping_count, 1)
+            self.assertNotEqual(fresh.slots[0].mapping_revision, snapshot.slots[0].mapping_revision)
+
+    async def test_mapping_read_cancellation_retains_worker_and_discards_version(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), self.fixture(1) as (service, api, store, other):
+                entered, release = asyncio.Event(), threading.Event()
+                loop = asyncio.get_running_loop()
+                errors = []
+                handler = loop.get_exception_handler()
+                loop.set_exception_handler(lambda _loop, context: errors.append(context))
+                load = service.mapping_store.load_read_snapshot
+                calls = []
+
+                def blocked():
+                    entries = load()
+                    calls.append(entries)
+                    if len(calls) == 1:
+                        loop.call_soon_threadsafe(entered.set)
+                        if not release.wait(3):
+                            raise AssertionError("mapping read release deadline")
+                        if fail:
+                            raise RuntimeError("synthetic mapping read failure")
+                    return entries
+
+                baseline = asyncio.all_tasks()
+                with patch.object(service.mapping_store, "load_read_snapshot", side_effect=blocked):
+                    owner = asyncio.create_task(service.get_snapshot())
+                    successor = None
+                    try:
+                        await asyncio.wait_for(entered.wait(), 3)
+                        owner.cancel()
+                        await asyncio.sleep(0)
+                        owner.cancel()
+                        await asyncio.sleep(0)
+                        self.assertFalse(owner.done())
+                        successor = asyncio.create_task(service.get_snapshot())
+                        await asyncio.sleep(0)
+                        self.assertEqual(len(calls), 1)
+                        release.set()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(owner, 3)
+                        await asyncio.wait_for(successor, 3)
+                        self.assertEqual(len(calls), 2)
+                        self.assertIsNot(calls[0], calls[1])
+                        await asyncio.sleep(0)
+                        self.assertEqual(asyncio.all_tasks() - baseline, set())
+                        self.assertEqual(errors, [])
+                    finally:
+                        release.set()
+                        await asyncio.gather(*(task for task in (owner, successor) if task), return_exceptions=True)
+                        loop.set_exception_handler(handler)
+
+    async def test_all_snapshot_store_reads_and_parses_off_loop(self):
+        import os
+        from app.services.sas_fabric_alias_store import SasFabricAliasStore
+        for count in (1, 60, 84):
+            with self.subTest(slots=count), self.fixture(count) as (service, api, store, other):
+                service.mapping_store.file_path.write_text('{"version":2,"slot_mappings":{}}')
+                aliases = SasFabricAliasStore(store.file_path.parent / "aliases.json")
+                aliases.file_path.write_text('{"version":1,"sas_fabric_aliases":{}}')
+                service.sas_fabric_alias_store = aliases
+                paths = {service.mapping_store.file_path: "mapping", aliases.file_path: "alias",
+                         store.file_path: "slot-detail"}
+                loop_thread = threading.get_ident()
+                for phase in ("cold", "forced", "warm"):
+                    operations = Counter()
+                    descriptors = {}
+                    lock = threading.Lock()
+                    real_open, real_read, real_close = os.open, os.read, os.close
+                    path_open, loads = Path.open, json.loads
+
+                    def record(store_name, operation):
+                        with lock:
+                            category = "loop" if threading.get_ident() == loop_thread else "worker"
+                            operations[store_name, operation, category] += 1
+
+                    class Handle:
+                        def __init__(self, handle, name):
+                            self.handle, self.store_name = handle, name
+                        def __getattr__(self, key):
+                            return getattr(self.handle, key)
+                        def __enter__(self):
+                            self.handle.__enter__()
+                            return self
+                        def __exit__(self, *args):
+                            return self.handle.__exit__(*args)
+                        def read(self, *args, **kwargs):
+                            record(self.store_name, "read")
+                            return self.handle.read(*args, **kwargs)
+
+                    def opened(path, *args, **kwargs):
+                        fd = real_open(path, *args, **kwargs)
+                        name = paths.get(Path(path))
+                        if name:
+                            descriptors[fd] = name
+                            record(name, "open")
+                        return fd
+                    def read(fd, *args):
+                        if fd in descriptors:
+                            record(descriptors[fd], "read")
+                        return real_read(fd, *args)
+                    def close(fd):
+                        descriptors.pop(fd, None)
+                        return real_close(fd)
+                    def path_opened(path, mode="r", *args, **kwargs):
+                        handle = path_open(path, mode, *args, **kwargs)
+                        if path in paths and "r" in mode:
+                            record(paths[path], "open")
+                            return Handle(handle, paths[path])
+                        return handle
+                    def parsed(payload, *args, **kwargs):
+                        text = payload.decode() if isinstance(payload, bytes) else payload
+                        for marker, name in (("slot_mappings", "mapping"), ("sas_fabric_aliases", "alias"),
+                                             ("slot_details", "slot-detail")):
+                            if '"' + marker + '"' in text:
+                                record(name, "parse")
+                        return loads(payload, *args, **kwargs)
+
+                    with patch.object(os, "open", opened), patch.object(os, "read", read), \
+                         patch.object(os, "close", close), patch.object(Path, "open", path_opened), \
+                         patch.object(json, "loads", parsed):
+                        snapshot = await service.get_snapshot(force_refresh=phase == "forced")
+                    print(json.dumps({"phase": phase, "slots": count,
+                                      "io": {":".join(key): value for key, value in operations.items()}}, sort_keys=True))
+                    self.assertEqual(len(snapshot.slots), count)
+                    self.assertEqual(sum(value for (_, _, category), value in operations.items() if category == "loop"), 0)
+                    for name in ("mapping", "alias"):
+                        expected = 0 if phase == "warm" else 1
+                        self.assertEqual(operations[name, "open", "worker"], expected)
+                        self.assertEqual(operations[name, "parse", "worker"], expected)
+                        self.assertEqual(operations[name, "read", "worker"] > 0, phase != "warm")
+                    if phase == "warm":
+                        self.assertEqual(operations, Counter())
+
+
 class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
     fixture = SmartGridIOTests.fixture
     setUp = SmartGridIOTests.setUp

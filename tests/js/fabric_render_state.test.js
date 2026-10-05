@@ -136,7 +136,8 @@ function makeElement(id, focusLog) {
         }));
     },
     setAttribute() {},
-    addEventListener() {},
+    eventHandlers: new Map(),
+    addEventListener(type, handler) { this.eventHandlers.set(type, handler); },
   };
   Object.defineProperty(element, "innerHTML", {
     get() { return element._innerHTML; },
@@ -150,7 +151,7 @@ function makeElement(id, focusLog) {
   return element;
 }
 
-function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLink = null } = {}) {
+function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLink = null, controlled = false } = {}) {
   const fabric = buildFabric();
   const elements = new Map();
   const handlers = new Map();
@@ -158,7 +159,9 @@ function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLi
   const fetchLog = [];
   const replaceStateLog = [];
   const pending = [];
+  const requests = [];
   const counters = { renders: 0 };
+  class HTMLFormElement {}
   class HTMLInputElement {}
   class HTMLDetailsElement {}
   class Element {}
@@ -178,14 +181,22 @@ function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLi
     },
   };
   const sandbox = vm.createContext({
-    URLSearchParams, URL, TextEncoder, console, Date, Math, Number, String, Array, Object, Set, Map, WeakMap, JSON, Boolean, Error, Promise,
+    AbortSignal, URLSearchParams, URL, TextEncoder, console, Date, Math, Number, String, Array, Object, Set, Map, WeakMap, JSON, Boolean, Error, Promise,
     encodeURIComponent,
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
     setTimeout,
-    HTMLInputElement, HTMLFormElement: class {}, HTMLSelectElement: class {}, HTMLDetailsElement, Element,
+    HTMLInputElement, HTMLFormElement, HTMLSelectElement: class {}, HTMLDetailsElement, Element,
     __counters: counters,
-    fetch(url) {
+    fetch(url, options = {}) {
       fetchLog.push(String(url));
+      if (controlled) {
+        return new Promise((resolve, reject) => requests.push({
+          url: String(url), options, reject,
+          resolve(payload, status = 200) {
+            resolve({ ok: status < 400, status, json: async () => payload });
+          },
+        }));
+      }
       return new Promise((resolve) => {
         pending.push(() => resolve({ ok: true, status: 200, json: async () => ({ available: true, smart_health_status: "PASSED", temperature_c: 31 }) }));
       });
@@ -197,6 +208,7 @@ function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLi
       scrollX: 0,
       scrollY: 0,
       SAS_FABRIC_BOOTSTRAP: {
+        ...(controlled ? { writePolicy: { enabled: true, mode: "network" } } : {}),
         snapshot: { slots: fabric.snapshot.slots, systems: [{ id: "demo", label: "nas.example.test" }], enclosures: [{ id: "enc-1", label: "Demo JBOD" }], selected_system_id: "demo", selected_enclosure_id: "enc-1" },
         fabric,
       },
@@ -212,7 +224,7 @@ function loadFabricPage({ baseURI = "http://nas.example.test/sas-fabric", backLi
   return {
     ...sandbox.window.__fabricTest,
     fabric, elements, handlers, focusLog, fetchLog, replaceStateLog, counters, document,
-    HTMLInputElement, HTMLDetailsElement, Element,
+    HTMLInputElement, HTMLFormElement, HTMLDetailsElement, Element, requests,
     resolvePending() {
       pending.splice(0).forEach((resolve) => resolve());
       return new Promise((resolve) => setTimeout(resolve, 5));
@@ -444,4 +456,279 @@ test("kind labels come from a table and dead label branches are gone", () => {
   assert.match(FABRIC_SOURCE, /const KIND_LABELS = \{/);
   assert.doesNotMatch(functionSource("diskPathLabels"), /"Host" : storageFabric \? "Host"/);
   assert.doesNotMatch(functionSource("traceKindRank"), /backplane|storage-enclosure|mpr-enclosure/);
+});
+
+// Request-order tests run the complete asset and its registered DOM callbacks.
+// Only transport and DOM primitives are synthetic; no handler is extracted.
+const drainFabricTasks = () => new Promise((resolve) => setImmediate(resolve));
+
+function clickFabricMarkup(page, attribute, value) {
+  const markup = [...page.elements.values()].map((element) => element.innerHTML).join("\n");
+  assert.ok(markup.includes(value === "" ? attribute : `${attribute}="${value}"`), `rendered ${attribute}=${value}`);
+  const key = attribute.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+  const target = new page.Element();
+  Object.assign(target, activationTarget(attribute, { [key]: value }, { scrollIntoView() {} }));
+  page.handlers.get("click")({ target });
+}
+
+function aliasForm(page, label = "First draft") {
+  const markup = page.elements.get("fabric-inspector-body").innerHTML;
+  const tag = markup.match(/<input\b[^>]*data-fabric-alias-input[^>]*>/)?.[0];
+  assert.ok(tag, "the real renderer opened an alias input");
+  const input = new page.HTMLInputElement();
+  input.dataset = Object.fromEntries([...tag.matchAll(/data-([\w-]+)="([^"]*)"/g)]
+    .map(([, name, value]) => [name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), value]));
+  input.value = label;
+  input.matches = (selector) => selector === "[data-fabric-alias-input]";
+  page.handlers.get("input")({ target: input });
+  const form = new page.HTMLFormElement();
+  form.querySelector = () => input;
+  form.matches = (selector) => selector === "[data-fabric-alias-form]";
+  form.classList = { add() {}, remove() {} };
+  return { form, input };
+}
+
+function openFabricAlias(page, objectId = "expander:0:1", label) {
+  if (page.state.aliasEditObjectId) clickFabricMarkup(page, "data-fabric-alias-cancel", "");
+  clickFabricMarkup(page, "data-fabric-node", objectId);
+  clickFabricMarkup(page, "data-fabric-alias-edit", objectId);
+  return aliasForm(page, label);
+}
+
+function submitFabricAlias(page, form, clear = false) {
+  if (clear) {
+    const target = new page.Element();
+    Object.assign(target, activationTarget("data-fabric-alias-clear", {}, { closest: () => form }));
+    page.handlers.get("click")({ target });
+  } else {
+    page.handlers.get("submit")({ target: form, preventDefault() {} });
+  }
+}
+
+function navigateFabric(page, kind, value) {
+  const select = page.elements.get(`fabric-${kind}-select`);
+  select.value = value;
+  select.eventHandlers.get("change")();
+}
+
+function fabricResponse(system = "demo", enclosure = "enc-1", label = "Fresh graph") {
+  const fabric = buildFabric();
+  fabric.system_id = system;
+  fabric.selected_enclosure_id = enclosure;
+  fabric.nodes.find((node) => node.id === "expander:0:1").label = label;
+  return fabric;
+}
+
+function resolveFabricRefresh(page, fabric) {
+  const requests = page.requests.filter((request) => request.url.includes("force=false") && !request.settled);
+  assert.equal(requests.length, 2, "one complete refresh is pending");
+  for (const request of requests) {
+    request.settled = true;
+    request.resolve(request.url.includes("/api/inventory") ? {
+      selected_system_id: fabric.system_id, selected_enclosure_id: fabric.selected_enclosure_id,
+      systems: [{ id: "demo", label: "First System" }, { id: "second", label: "Second System" }],
+      enclosures: [{ id: "enc-1", label: "First Shelf" }, { id: "enc-2", label: "Second Shelf" }],
+      slots: fabric.snapshot.slots,
+    } : fabric);
+  }
+}
+
+for (const kind of ["enclosure", "system"]) {
+  test(`alias ownership: retained ${kind} graph cannot reopen or submit while loading or after failure`, async () => {
+    const page = loadFabricPage({ controlled: true });
+    const { form } = openFabricAlias(page);
+    navigateFabric(page, kind, kind === "system" ? "second" : "enc-2");
+    assert.equal(page.state.aliasEditObjectId, null, "switch already clears the old editor");
+    if (kind === "system") assert.equal(page.state.selectedEnclosureId, null);
+    // Reenter through the old graph card, not an editor supposedly kept open.
+    clickFabricMarkup(page, "data-fabric-node", "expander:0:1");
+    const target = new page.Element();
+    Object.assign(target, activationTarget("data-fabric-alias-edit", { fabricAliasEdit: "expander:0:1" }));
+    page.handlers.get("click")({ target });
+    assert.equal(page.state.aliasEditObjectId, null, "retained graph cannot reopen an alias editor");
+    submitFabricAlias(page, form);
+    submitFabricAlias(page, form, true);
+    assert.equal(page.requests.filter((request) => request.options.method === "POST").length, 0);
+    page.requests.filter((request) => request.url.includes("force=false")).forEach((request) => {
+      request.settled = true;
+      request.reject(new Error("Synthetic refresh failure"));
+    });
+    await drainFabricTasks();
+    page.handlers.get("click")({ target });
+    submitFabricAlias(page, form);
+    assert.equal(page.state.aliasEditObjectId, null, "failed refresh does not restore old graph authority");
+    assert.equal(page.requests.filter((request) => request.options.method === "POST").length, 0);
+    assert.match(page.state.error, /Synthetic refresh failure/);
+    page.elements.get("fabric-refresh-button").eventHandlers.get("click")();
+    resolveFabricRefresh(page, fabricResponse(kind === "system" ? "second" : "demo", "enc-2"));
+    await drainFabricTasks();
+    const fresh = openFabricAlias(page, "expander:0:1", "New scope label");
+    submitFabricAlias(page, fresh.form);
+    const post = page.requests.find((request) => request.options.method === "POST");
+    assert.ok(post, "successful refresh reactivates the complete editor-to-POST path");
+    assert.equal(new URL(post.url, "https://synthetic.invalid").searchParams.get("enclosure_id"), "enc-2");
+    post.resolve({ ok: true });
+    await drainFabricTasks();
+    const readback = page.requests.at(-1);
+    readback.resolve(fabricResponse(kind === "system" ? "second" : "demo", "enc-2", "New scope label"));
+    await drainFabricTasks();
+    assert.equal(page.state.aliasEditObjectId, null);
+    assert.match(page.elements.get("fabric-inspector-body").innerHTML, /New scope label/);
+  });
+
+  for (const phase of ["POST", "readback"]) {
+    test(`alias ownership: late ${phase} cannot replace a newer ${kind} graph or draft`, async () => {
+      const page = loadFabricPage({ controlled: true });
+      const original = openFabricAlias(page);
+      submitFabricAlias(page, original.form);
+      const post = page.requests.find((request) => request.options.method === "POST");
+      assert.match(post.url, /system_id=demo&enclosure_id=enc-1/);
+      let delayed = post;
+      if (phase === "readback") {
+        post.resolve({ ok: true });
+        await drainFabricTasks();
+        delayed = page.requests.at(-1);
+        assert.equal(delayed.url, "/api/sas-fabric?system_id=demo&enclosure_id=enc-1");
+      }
+      navigateFabric(page, kind, kind === "system" ? "second" : "enc-2");
+      resolveFabricRefresh(page, fabricResponse(kind === "system" ? "second" : "demo", "enc-2", "New graph"));
+      await drainFabricTasks();
+      openFabricAlias(page, "expander:0:1", "Newer draft");
+      const requestCount = page.requests.length;
+      delayed.resolve(phase === "POST" ? { ok: true } : fabricResponse("demo", "enc-1", "Stale graph"));
+      await drainFabricTasks();
+      assert.equal(page.requests.length, requestCount, "stale POST cannot launch a readback in the new scope");
+      assert.equal(page.state.fabric.selected_enclosure_id, "enc-2");
+      assert.equal(page.state.fabric.nodes.find((node) => node.id === "expander:0:1").label, "New graph");
+      assert.equal(page.state.aliasEditObjectId, "expander:0:1");
+      assert.equal(page.state.aliasDraft, "Newer draft");
+    });
+  }
+}
+
+for (const phase of ["POST", "readback"]) {
+  for (const successor of ["input", "reopen", "refresh", "roundtrip"]) {
+    test(`alias ownership: ${phase} completion preserves same-view ${successor} ownership`, async () => {
+      const page = loadFabricPage({ controlled: true });
+      const original = openFabricAlias(page);
+      submitFabricAlias(page, original.form);
+      const post = page.requests.find((request) => request.options.method === "POST");
+      let delayed = post;
+      if (phase === "readback") {
+        post.resolve({ ok: true });
+        await drainFabricTasks();
+        delayed = page.requests.at(-1);
+      }
+      if (successor === "refresh" || successor === "roundtrip") {
+        if (successor === "roundtrip") {
+          navigateFabric(page, "enclosure", "enc-2");
+          resolveFabricRefresh(page, fabricResponse("demo", "enc-2"));
+          await drainFabricTasks();
+          navigateFabric(page, "enclosure", "enc-1");
+        } else {
+          page.elements.get("fabric-refresh-button").eventHandlers.get("click")();
+        }
+        resolveFabricRefresh(page, fabricResponse("demo", "enc-1", "Newest graph"));
+        await drainFabricTasks();
+      }
+      if (successor === "input") {
+        // Some predecessors close on POST rather than readback. Reopen only if needed.
+        if (!page.state.aliasEditObjectId) openFabricAlias(page);
+        aliasForm(page, "Newer draft");
+      } else {
+        openFabricAlias(page, "expander:0:1", "Newer draft");
+      }
+      const graph = page.state.fabric;
+      const count = page.requests.length;
+      delayed.resolve(phase === "POST" ? { ok: true } : fabricResponse("demo", "enc-1", "Stale graph"));
+      await drainFabricTasks();
+      assert.equal(page.state.aliasDraft, "Newer draft", "completion cannot clear a newer draft");
+      assert.equal(page.state.aliasEditObjectId, "expander:0:1");
+      assert.ok(page.state.fabric === graph, "stale readback cannot replace even a same-scope graph");
+      assert.equal(page.requests.length, count);
+    });
+  }
+}
+
+for (const clear of [false, true]) {
+  test(`alias ownership: current ${clear ? "clear" : "save"} captures scope and updates through readback`, async () => {
+    const page = loadFabricPage({ controlled: true });
+    const { form } = openFabricAlias(page, "expander:0:1", " Current label ");
+    submitFabricAlias(page, form, clear);
+    const post = page.requests.find((request) => request.options.method === "POST");
+    assert.equal(JSON.parse(post.options.body).label, clear ? "" : "Current label");
+    assert.equal(JSON.parse(post.options.body).object_id, "expander:0:1");
+    post.resolve({ ok: true });
+    await drainFabricTasks();
+    assert.equal(page.requests.at(-1).url, "/api/sas-fabric?system_id=demo&enclosure_id=enc-1");
+    page.requests.at(-1).resolve(fabricResponse("demo", "enc-1", clear ? "Original label" : "Current label"));
+    await drainFabricTasks();
+    assert.equal(page.state.aliasEditObjectId, null);
+    assert.match(page.elements.get("fabric-inspector-body").innerHTML, clear ? /Original label/ : /Current label/);
+  });
+}
+
+for (const phase of ["POST", "readback"]) {
+  test(`alias ownership: same-scope refresh alone fences ${phase} without a newer editor`, async () => {
+    const page = loadFabricPage({ controlled: true });
+    const { form } = openFabricAlias(page);
+    submitFabricAlias(page, form);
+    let delayed = page.requests.find((request) => request.options.method === "POST");
+    if (phase === "readback") {
+      delayed.resolve({ ok: true });
+      await drainFabricTasks();
+      delayed = page.requests.at(-1);
+    }
+    page.elements.get("fabric-refresh-button").eventHandlers.get("click")();
+    resolveFabricRefresh(page, fabricResponse("demo", "enc-1", "Latest refresh"));
+    await drainFabricTasks();
+    const count = page.requests.length;
+    delayed.resolve(phase === "POST" ? { ok: true } : fabricResponse("demo", "enc-1", "Stale readback"));
+    await drainFabricTasks();
+    assert.equal(page.requests.length, count, "refresh generation retires the prior alias operation");
+    assert.equal(page.state.fabric.nodes.find((node) => node.id === "expander:0:1").label, "Latest refresh");
+    assert.equal(page.state.aliasDraft, "First draft");
+  });
+}
+
+for (const status of [401, 403, 500]) {
+  for (const stale of [false, true]) {
+    test(`alias ownership: ${stale ? "stale" : "current"} POST ${status} preserves error ownership`, async () => {
+      const page = loadFabricPage({ controlled: true });
+      const { form } = openFabricAlias(page);
+      submitFabricAlias(page, form);
+      const post = page.requests.find((request) => request.options.method === "POST");
+      if (stale) openFabricAlias(page, "expander:0:1", "Newer draft");
+      post.resolve({ detail: "Synthetic write refusal" }, status);
+      await drainFabricTasks();
+      assert.equal(page.state.aliasDraft, stale ? "Newer draft" : "First draft");
+      assert.equal(page.state.writePolicy.enabled, stale || status === 500);
+      assert.equal(page.state.error, stale ? null : "Synthetic write refusal");
+      assert.equal(page.requests.filter((request) => request.url.startsWith("/api/sas-fabric?")).length, 0);
+    });
+  }
+}
+
+test("alias ownership: failed same-scope refresh stays inert and mismatched successful payload does not grant writes", async () => {
+  const page = loadFabricPage({ controlled: true });
+  const { form } = openFabricAlias(page);
+  page.elements.get("fabric-refresh-button").eventHandlers.get("click")();
+  page.requests.filter((request) => request.url.includes("force=false")).forEach((request) => {
+    request.settled = true;
+    request.reject(new Error("Synthetic refresh failure"));
+  });
+  await drainFabricTasks();
+  submitFabricAlias(page, form);
+  assert.equal(page.requests.filter((request) => request.options.method === "POST").length, 0);
+  assert.equal(page.elements.get("fabric-map-panel").inert, true);
+  navigateFabric(page, "enclosure", "enc-2");
+  const pending = page.requests.filter((request) => request.url.includes("force=false") && !request.settled);
+  pending.find((request) => request.url.includes("inventory")).resolve({
+    ...page.state.snapshot, selected_system_id: "demo", selected_enclosure_id: "enc-2",
+  });
+  pending.find((request) => request.url.includes("sas-fabric")).resolve(fabricResponse("demo", "enc-1"));
+  await drainFabricTasks();
+  assert.equal(page.elements.get("fabric-map-panel").inert, true, "displayed and selected enclosure must agree");
+  submitFabricAlias(page, form);
+  assert.equal(page.requests.filter((request) => request.options.method === "POST").length, 0);
 });

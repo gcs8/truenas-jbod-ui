@@ -31,6 +31,7 @@ from history_service.backup_archive.settings import (
     read_secret_file,
 )
 from history_service.backup_archive.transport import (
+    ArchivePublicationUncertainError,
     ArchiveTarget,
     ArchiveTransportError,
     ArchiveVerificationError,
@@ -46,6 +47,31 @@ from history_service.backup_archive.transport import (
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+class _UploadReadback(io.RawIOBase):
+    """Finite, read-on-demand peer; no large response is preallocated."""
+
+    def __init__(self, case, size, kind):
+        super().__init__()
+        self.case, self.kind = case, kind
+        self.remaining = size + {"short": -1, "excess": 4 * transport.CHUNK_SIZE}.get(kind, 0)
+        self.consumed = 0
+
+    def prefetch(self, size=None, max_concurrent_requests=None):
+        self.case.assertEqual(max_concurrent_requests, transport.SFTP_PREFETCH_MAX_REQUESTS)
+
+    def read(self, amount=-1):
+        self.case.assertGreater(amount, 0)
+        self.case.assertLessEqual(amount, transport.CHUNK_SIZE)
+        if self.kind == "io":
+            raise OSError("synthetic read failure")
+        if self.kind == "cancel":
+            raise KeyboardInterrupt("synthetic cancellation")
+        count = min(amount, self.remaining)
+        self.remaining -= count
+        self.consumed += count
+        return (b"?" if self.kind == "wrong" else b"x") * count
 
 
 class _TempCase(unittest.TestCase):
@@ -192,6 +218,189 @@ class SettingsTests(_TempCase):
 
 
 class FilesystemTargetTests(_TempCase):
+    def test_publication_rechecks_every_containing_directory_on_fresh_targets(self) -> None:
+        for new_root in (False, True):
+            for confined in (False, True):
+                with self.subTest(new_root=new_root, confined=confined):
+                    base = self.tmp / f"{new_root}-{confined}"
+                    base.mkdir()
+                    root = base / "namespace" / "archive" if new_root else base
+                    boundary = base if confined else None
+                    leaf = root / "full/nested"
+                    expected = [*reversed(leaf.parents), leaf]
+                    if confined:
+                        expected = expected[expected.index(base):]
+                    barriers = []
+                    original = os.fsync
+
+                    def synced(fd):
+                        info = os.fstat(fd)
+                        if stat.S_ISDIR(info.st_mode):
+                            # Include ancestors above the fixture, so a confined
+                            # mount must prove it never syncs outside the export.
+                            for path in [*reversed(leaf.parents), leaf]:
+                                meta = path.stat()
+                                if (info.st_dev, info.st_ino) == (meta.st_dev, meta.st_ino):
+                                    barriers.append(path)
+                        return original(fd)
+
+                    for run in range(2):
+                        barriers.clear()
+                        target = transport.LocalDirectoryTarget(root, confine_to=boundary)
+                        with mock.patch.object(os, "fsync", side_effect=synced):
+                            stored = target.put(self.source(b"synthetic"), f"full/nested/copy-{run}.enc")
+                        self.assertTrue(stored.verified)
+                        self.assertEqual(barriers, expected)
+
+    def test_each_first_use_barrier_failure_accounts_for_published_bytes(self) -> None:
+        import errno
+
+        for fail_index in range(5):
+            for operation in ("open", "fsync"):
+                with self.subTest(fail_index=fail_index, operation=operation):
+                    base = self.tmp / f"case-{fail_index}-{operation}"
+                    base.mkdir()
+                    root = base / "namespace/archive"
+                    required = [base, base / "namespace", root, root / "full", root / "full/nested"]
+                    target = transport.LocalDirectoryTarget(root)
+                    original_open, original_sync = os.open, os.fsync
+                    attempted = []
+
+                    def opened(path, flags, *args, **kwargs):
+                        if flags & os.O_DIRECTORY and Path(path) in required:
+                            attempted.append(Path(path))
+                            if operation == "open" and Path(path) == required[fail_index]:
+                                raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    def synced(fd):
+                        info = os.fstat(fd)
+                        failed = required[fail_index].stat()
+                        if (operation == "fsync" and stat.S_ISDIR(info.st_mode)
+                                and (info.st_dev, info.st_ino) == (failed.st_dev, failed.st_ino)):
+                            raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_sync(fd)
+
+                    with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
+                        with self.assertRaises(ArchivePublicationUncertainError) as caught:
+                            target.put(self.source(b"synthetic"), "full/nested/first.enc")
+                        self.assertEqual(attempted, required[:fail_index + 1])
+                        self.assertEqual(caught.exception.stored, StoredObject("full/nested/first.enc", 9, _sha(b"synthetic"), False))
+                        # A fresh target must retry the still-failing ancestor,
+                        # not reinterpret visible directories as durable ones.
+                        target = transport.LocalDirectoryTarget(root)
+                        with self.assertRaises(ArchivePublicationUncertainError) as retried:
+                            target.put(self.source(b"retry"), "full/nested/uncertain.enc")
+                        self.assertFalse(retried.exception.stored.verified)
+                        self.assertEqual(attempted, required[:fail_index + 1] * 2)
+                    self.assertEqual((root / "full/nested/first.enc").read_bytes(), b"synthetic")
+                    self.assertEqual((root / "full/nested/uncertain.enc").read_bytes(), b"retry")
+                    self.assertFalse(list((root / "full/nested").glob("*.partial")))
+                    # Same-instance recovery also rechecks the complete chain.
+                    with mock.patch.object(target, "_fsync_dir", wraps=target._fsync_dir) as sync:
+                        self.assertTrue(target.put(self.source(b"retry"), "full/nested/retry.enc").verified)
+                    leaf = root / "full/nested"
+                    self.assertEqual([call.args[0] for call in sync.call_args_list], [*reversed(leaf.parents), leaf])
+
+    def test_fresh_target_after_readback_rejection_rechecks_containing_barriers(self) -> None:
+        import errno
+
+        for fail_index in range(5):
+            for operation in ("open", "fsync"):
+                with self.subTest(fail_index=fail_index, operation=operation):
+                    base = self.tmp / f"rejected-{fail_index}-{operation}"
+                    base.mkdir()
+                    root = base / "namespace/archive"
+                    settings = ArchiveTargetSettings(target_id="local", provider="filesystem", root=str(root))
+                    required = [base, base / "namespace", root, root / "full", root / "full/nested"]
+                    with open_target(settings) as rejected:
+                        with mock.patch.object(transport, "_hash_stream", return_value=(1, "0" * 64)):
+                            with self.assertRaises(ArchiveVerificationError):
+                                rejected.put(self.source(b"synthetic"), "full/nested/first.enc")
+                    self.assertEqual(list((root / "full/nested").iterdir()), [])
+                    original_open, original_sync = os.open, os.fsync
+                    attempted = []
+
+                    def opened(path, flags, *args, **kwargs):
+                        if flags & os.O_DIRECTORY and Path(path) in required:
+                            attempted.append(Path(path))
+                            if operation == "open" and Path(path) == required[fail_index]:
+                                raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    def synced(fd):
+                        info, failed = os.fstat(fd), required[fail_index].stat()
+                        if (operation == "fsync" and stat.S_ISDIR(info.st_mode)
+                                and (info.st_dev, info.st_ino) == (failed.st_dev, failed.st_ino)):
+                            raise OSError(errno.EIO, "synthetic barrier failure")
+                        return original_sync(fd)
+
+                    # Keep the same fault active across two genuinely fresh connections.
+                    with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
+                        for run in range(2):
+                            with open_target(settings) as retry:
+                                self.assertIsNot(retry, rejected)
+                                with self.assertRaises(ArchivePublicationUncertainError) as caught:
+                                    retry.put(self.source(b"retry"), f"full/nested/retry-{run}.enc")
+                            self.assertFalse(caught.exception.stored.verified)
+                            self.assertEqual((root / caught.exception.stored.name).read_bytes(), b"retry")
+                            self.assertEqual(attempted, required[:fail_index + 1] * (run + 1))
+                    # No process-local memory is needed when the barrier recovers.
+                    with open_target(settings) as recovered:
+                        assert isinstance(recovered, transport.LocalDirectoryTarget)
+                        with mock.patch.object(recovered, "_fsync_dir", wraps=recovered._fsync_dir) as sync:
+                            self.assertTrue(recovered.put(self.source(b"recovered"), "full/nested/recovered.enc").verified)
+                    self.assertEqual([call.args[0] for call in sync.call_args_list if call.args[0] in required], required)
+                    self.assertEqual(sorted(p.name for p in (root / "full/nested").iterdir()),
+                                     ["recovered.enc", "retry-0.enc", "retry-1.enc"])
+
+    def test_local_upload_readback_rejects_excess_before_publication(self) -> None:
+        root = self.tmp / "local-readback"
+        root.mkdir()
+        target = transport.LocalDirectoryTarget(root)
+        body = _UploadReadback(self, 7, "excess")
+        with mock.patch("history_service.backup_archive.transport.open", return_value=body):
+            with self.assertRaises(ArchiveVerificationError):
+                target.put(self.source(b"x" * 7), "first.enc")
+        self.assertTrue(body.closed)
+        self.assertLessEqual(body.consumed, 7 + transport.CHUNK_SIZE)
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_directory_persistence_errors_refuse_publication(self) -> None:
+        import errno
+
+        for operation in ("open", "fsync"):
+            # No documented weaker barrier policy: unsupported is also a refusal.
+            for error in (errno.EIO, errno.EINVAL, errno.ENOTSUP):
+                with self.subTest(operation=operation, error=error):
+                    root = self.tmp / f"target-{operation}-{error}"
+                    root.mkdir()
+                    target = transport.LocalDirectoryTarget(root)
+                    original_open, original_fsync = os.open, os.fsync
+
+                    def opened(path, flags, *args, **kwargs):
+                        if operation == "open" and Path(path) == root and flags & os.O_DIRECTORY:
+                            raise OSError(error, "synthetic directory barrier failure")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    def synced(fd):
+                        if operation == "fsync" and stat.S_ISDIR(os.fstat(fd).st_mode):
+                            raise OSError(error, "synthetic directory barrier failure")
+                        return original_fsync(fd)
+
+                    with mock.patch.object(os, "open", side_effect=opened), mock.patch.object(os, "fsync", side_effect=synced):
+                        with self.assertRaises(ArchivePublicationUncertainError) as caught:
+                            target.put(self.source(b"synthetic archive"), "copy.enc")
+                    cause = caught.exception.__cause__
+                    self.assertIsInstance(cause, OSError)
+                    assert isinstance(cause, OSError)
+                    self.assertEqual(cause.errno, error)
+                    self.assertEqual(caught.exception.stored.name, "copy.enc")
+                    self.assertFalse(caught.exception.stored.verified)
+                    self.assertEqual((root / "copy.enc").read_bytes(), b"synthetic archive")
+                    self.assertFalse((root / "copy.enc.partial").exists())
+                    self.assertTrue(target.put(self.source(b"retry"), "retry.enc").verified)
+
     def settings(self) -> ArchiveTargetSettings:
         return ArchiveTargetSettings(target_id="local", provider="filesystem", root=str(self.tmp / "archive"))
 
@@ -643,6 +852,33 @@ OTHER_KEY = paramiko.ECDSAKey.generate()
 
 
 class SftpTargetTests(_TempCase):
+    def test_upload_readback_is_size_bounded_and_closes_owned_streams(self) -> None:
+        self.pin_key()
+        for size in (0, 7, transport.CHUNK_SIZE + 3):
+            for kind in ("exact", "short", "wrong", "excess", "io", "cancel"):
+                if size == 0 and kind in {"short", "wrong"}:
+                    continue
+                with self.subTest(size=size, kind=kind):
+                    body = _UploadReadback(self, size, kind)
+                    with open_target(self.settings()) as target:
+                        client = FakeSSHClient.instances[-1]
+                        original = client.sftp.open
+
+                        def opened(path, mode):
+                            return body if mode == "rb" else original(path, mode)
+
+                        with mock.patch.object(client.sftp, "open", side_effect=opened):
+                            if kind == "exact":
+                                self.assertTrue(target.put(self.source(b"x" * size), "a.bin").verified)
+                            else:
+                                error = {"io": OSError, "cancel": KeyboardInterrupt}.get(kind, ArchiveVerificationError)
+                                with self.assertRaises(error):
+                                    target.put(self.source(b"x" * size), "a.bin")
+                        self.assertEqual(bool(client.sftp.files), kind == "exact")
+                    self.assertTrue(body.closed)
+                    self.assertLessEqual(body.consumed, size + transport.CHUNK_SIZE)
+                    self.assertTrue(client.sftp.closed and client.closed)
+
     def setUp(self) -> None:
         super().setUp()
         FakeSSHClient.instances = []
@@ -819,6 +1055,38 @@ class _SmbEntry:
 
 
 class SmbTargetTests(_TempCase):
+    def test_upload_readback_is_size_bounded_and_closes_owned_streams(self) -> None:
+        for size in (0, 7, transport.CHUNK_SIZE + 3):
+            for kind in ("exact", "short", "wrong", "excess", "io", "cancel"):
+                if size == 0 and kind in {"short", "wrong"}:
+                    continue
+                with self.subTest(size=size, kind=kind):
+                    fake = FakeSmbClient()
+                    body = _UploadReadback(self, size, kind)
+                    original = fake.open_file
+
+                    @contextmanager
+                    def opened(path, mode="rb"):
+                        if mode == "rb":
+                            with body:
+                                yield body
+                        else:
+                            with original(path, mode=mode) as stream:
+                                yield stream
+
+                    with mock.patch.dict(sys.modules, {"smbclient": fake}), mock.patch.object(fake, "open_file", side_effect=opened):
+                        with open_target(self.settings()) as target:
+                            if kind == "exact":
+                                self.assertTrue(target.put(self.source(b"x" * size), "a.bin").verified)
+                            else:
+                                error = {"io": OSError, "cancel": KeyboardInterrupt}.get(kind, ArchiveVerificationError)
+                                with self.assertRaises(error):
+                                    target.put(self.source(b"x" * size), "a.bin")
+                            self.assertEqual(bool(fake.files), kind == "exact")
+                    self.assertTrue(body.closed)
+                    self.assertLessEqual(body.consumed, size + transport.CHUNK_SIZE)
+                    self.assertEqual(fake.log[-1], "delete_session nas.example.test")
+
     def settings(self, **kw) -> ArchiveTargetSettings:
         return ArchiveTargetSettings(
             target_id="smb1",
@@ -1069,6 +1337,18 @@ class NfsTargetTests(_TempCase):
 # --------------------------------------------------------------------------
 
 
+class FakeS3ConnectionError(RuntimeError):
+    pass
+
+
+class FakeS3ProxyConnectionError(RuntimeError):
+    pass
+
+
+class FakeS3SSLError(RuntimeError):
+    pass
+
+
 class FakeS3Client:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1078,6 +1358,7 @@ class FakeS3Client:
         self.corrupt_get = False
         self.get_calls = 0
         self.closed = False
+        self.delete_error: Exception | None = None
 
     def upload_fileobj(self, fileobj, bucket, key, ExtraArgs=None, Config=None):
         chunks = []
@@ -1115,6 +1396,8 @@ class FakeS3Client:
         return {"Body": io.BytesIO(data[:-1] + b"?" if self.corrupt_get else data)}
 
     def delete_object(self, Bucket, Key):
+        if self.delete_error is not None:
+            raise self.delete_error
         self.objects.pop(Key, None)
 
     def get_paginator(self, name):
@@ -1157,12 +1440,25 @@ def _fake_boto_modules(clients: list[FakeS3Client]) -> dict[str, types.ModuleTyp
     botocore = types.ModuleType("botocore")
     botocore_config = types.ModuleType("botocore.config")
     botocore_config.Config = lambda **kwargs: ("Config", kwargs)
+    botocore_exceptions = types.ModuleType("botocore.exceptions")
+    for name in (
+        "EndpointConnectionError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ConnectionClosedError",
+        "HTTPClientError",
+    ):
+        setattr(botocore_exceptions, name, FakeS3ConnectionError)
+    setattr(botocore_exceptions, "ProxyConnectionError", FakeS3ProxyConnectionError)
+    setattr(botocore_exceptions, "SSLError", FakeS3SSLError)
+    setattr(botocore, "exceptions", botocore_exceptions)
     return {
         "boto3": boto3,
         "boto3.s3": s3,
         "boto3.s3.transfer": s3_transfer,
         "botocore": botocore,
         "botocore.config": botocore_config,
+        "botocore.exceptions": botocore_exceptions,
     }
 
 
@@ -1185,6 +1481,24 @@ class S3TargetTests(_TempCase):
             secret_access_key_file=self.secret("s3-secret", "secretexample"),
             **kw,
         )
+
+    def test_delete_connection_failure_is_reported_as_location_unavailable(self) -> None:
+        with open_target(self.settings()) as target:
+            failure = FakeS3ConnectionError("synthetic endpoint unavailable")
+            self.clients[0].delete_error = failure
+            with self.assertRaisesRegex(ConnectionError, "S3 archive location is unavailable") as caught:
+                target.delete("full/backup.tar.zst")
+        self.assertIs(caught.exception.__cause__, failure)
+
+    def test_delete_proxy_and_tls_failures_are_location_unavailable(self) -> None:
+        for error_type in (FakeS3ProxyConnectionError, FakeS3SSLError):
+            with self.subTest(error_type=error_type.__name__):
+                with open_target(self.settings()) as target:
+                    failure = error_type("synthetic connection setup failure")
+                    self.clients[-1].delete_error = failure
+                    with self.assertRaises(ConnectionError) as caught:
+                        target.delete("full/backup.tar.zst")
+                self.assertIs(caught.exception.__cause__, failure)
 
     def test_missing_dependency_has_install_hint(self) -> None:
         with mock.patch.dict(sys.modules, {"boto3": None}):
@@ -1232,6 +1546,15 @@ class S3TargetTests(_TempCase):
                 target.put(self.source(b"payload"), "a.bin")
         self.assertEqual(client.objects, {})
 
+    def test_failed_re_read_deletes_object_and_raises(self) -> None:
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.etag_override = "kms-opaque"
+            with mock.patch.object(client, "get_object", side_effect=OSError("connection reset")):
+                with self.assertRaises(OSError):
+                    target.put(self.source(b"payload"), "a.bin")
+        self.assertEqual(client.objects, {})
+
     def test_large_multipart_etag_verifies_without_download(self) -> None:
         size = transport.S3_MULTIPART_THRESHOLD + 3
         src = self.tmp / "big.bin"
@@ -1253,12 +1576,81 @@ class S3TargetTests(_TempCase):
         self.assertEqual(self.clients[0].get_calls, 0)
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/threshold.bin"]["etag"].endswith("-1"))
 
-    def test_large_opaque_etag_is_size_checked_but_unverified(self) -> None:
-        with mock.patch.object(transport, "S3_REGET_LIMIT", 4), open_target(self.settings()) as target:
+    def test_opaque_readback_size_bound_and_cleanup(self) -> None:
+        # Finite excess makes the old EOF-only loop fail without a hanging test.
+        for size in (0, 7, transport.S3_MULTIPART_THRESHOLD + 3):
+            for delta in (-1, 0, 3 * transport.CHUNK_SIZE):
+                if size + delta < 0:
+                    continue
+                with self.subTest(size=size, delta=delta):
+                    class Body(io.BytesIO):
+                        consumed = 0
+
+                        def read(self, amount=-1):
+                            self_test.assertGreater(amount, 0)
+                            self_test.assertLessEqual(amount, transport.CHUNK_SIZE)
+                            chunk = super().read(amount)
+                            self.consumed += len(chunk)
+                            return chunk
+
+                    self_test = self
+                    body = Body(b"x" * (size + delta))
+                    with open_target(self.settings()) as target:
+                        client = self.clients[-1]
+                        client.etag_override = "kms-opaque"
+                        with mock.patch.object(client, "get_object", return_value={"Body": body}):
+                            if delta:
+                                with self.assertRaises(ArchiveVerificationError):
+                                    target.put(self.source(b"x" * size), "a.bin")
+                            else:
+                                self.assertTrue(target.put(self.source(b"x" * size), "a.bin").verified)
+                        self.assertTrue(body.closed)
+                        self.assertEqual(bool(client.objects), delta == 0)
+                        self.assertLessEqual(body.consumed, size + transport.CHUNK_SIZE)
+
+    def test_opaque_readback_io_failure_closes_body_and_deletes(self) -> None:
+        for size in (7, transport.S3_MULTIPART_THRESHOLD + 3):
+            with self.subTest(size=size), open_target(self.settings()) as target:
+                body = io.BytesIO()
+                client = self.clients[-1]
+                client.etag_override = "kms-opaque"
+                with mock.patch.object(client, "get_object", return_value={"Body": body}), \
+                        mock.patch.object(body, "read", side_effect=OSError("read failed")):
+                    with self.assertRaises(OSError):
+                        target.put(self.source(b"x" * size), "a.bin")
+                self.assertTrue(body.closed)
+                self.assertEqual(client.objects, {})
+
+    def test_large_opaque_etag_is_verified_by_streaming_readback(self) -> None:
+        src = self.tmp / "large.bin"
+        with open(src, "wb") as handle:
+            handle.truncate(16 * 1024 * 1024 + 3)
+        with open_target(self.settings()) as target:
             self.clients[0].etag_override = "kms-opaque"
-            stored = target.put(self.source(b"payload"), "a.bin")
-        self.assertFalse(stored.verified)
-        self.assertEqual(self.clients[0].get_calls, 0)
+            stored = target.put(src, "full/large.bin")
+        self.assertTrue(stored.verified)
+        self.assertEqual(self.clients[0].get_calls, 1)
+
+    def test_get_stops_once_download_exceeds_limit(self) -> None:
+        data = b"x" * (transport.CHUNK_SIZE * 3)
+        reads: list[int] = []
+
+        class Body(io.BytesIO):
+            def read(self, size=-1):
+                chunk = super().read(size)
+                reads.append(len(chunk))
+                return chunk
+
+        body = Body(data)
+        local = self.tmp / "fetched.bin"
+        with open_target(self.settings()) as target:
+            client = self.clients[0]
+            client.objects["jbod-ui/archive/full/a.bin"] = {"data": data, "meta": {}, "etag": "e"}
+            client.get_object = lambda Bucket, Key: {"Body": body}
+            with self.assertRaisesRegex(transport.ArchiveDownloadTooLargeError, "larger than expected"):
+                target.get("full/a.bin", local, limit=transport.CHUNK_SIZE + 1)
+        self.assertEqual(sum(reads), transport.CHUNK_SIZE * 2)
+        self.assertFalse(local.exists())
 
     def test_plain_http_endpoint_is_labelled_unencrypted(self) -> None:
         with open_target(self.settings(endpoint_url="http://minio.example.test:9000")) as target:

@@ -135,6 +135,7 @@ class HistoryCollector:
         self.last_fast_metrics_at: str | None = None
         self.last_slow_metrics_at: str | None = None
         self.last_success_at: str | None = None
+        self._startup_collection_attempted = False
         self.last_backup_at: str | None = None
         self.last_retention_at: str | None = None
         self.last_retention_backup_at: str | None = None
@@ -178,6 +179,7 @@ class HistoryCollector:
         self.last_temperature_evidence_at: str | None = None
         self.last_smart_evidence_at: str | None = None
         self._scope_enumeration_complete = True
+        self._scope_collection_degraded_reason: str | None = None
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -277,6 +279,10 @@ class HistoryCollector:
         cached_root_only: bool = False,
     ) -> None:
         self._raise_if_stopping()
+        if self.current_collection_kind == "background":
+            # Spend the startup shortcut only on an admitted background attempt.
+            # Failure must not trap healthy siblings behind an untrusted root.
+            self._startup_collection_attempted = True
         run_started = utcnow()
         observed_at = isoformat_utc(run_started)
         collect_fast = force_fast or (
@@ -315,6 +321,12 @@ class HistoryCollector:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        # HTTP success does not make a failed platform inventory authoritative.
+        untrusted_scopes = [scope for scope in scopes if not self._should_record_scope_snapshot(scope.snapshot)]
+        for scope in untrusted_scopes:
+            self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
+        if untrusted_scopes:
+            self._scope_enumeration_complete = False
         smart_scope_unavailable = not self._scope_enumeration_complete
         self._raise_if_stopping()
         self._record_collection_stage(
@@ -324,6 +336,17 @@ class HistoryCollector:
             scope_count=len(scopes),
         )
         self.last_scope_count = len(scopes)
+        # A deliberately selected cached root is not a failed fleet census.
+        enumeration_failed = bool(untrusted_scopes) or (
+            not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
+        )
+        if enumeration_failed:
+            if not any(self._should_record_scope_snapshot(scope.snapshot) for scope in scopes):
+                self._scope_collection_degraded_reason = "No trusted history inventory scopes were available."
+                raise HistorySourceError.error_reply(self._scope_collection_degraded_reason)
+            self._scope_collection_degraded_reason = (
+                "Some history inventory scopes were unavailable; collection was partial."
+            )
         self.last_inventory_at = observed_at
 
         for scope_index, scope in enumerate(scopes, start=1):
@@ -331,7 +354,6 @@ class HistoryCollector:
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             if not self._should_record_scope_snapshot(scope.snapshot):
-                self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
                 smart_scope_unavailable = True
                 logger.warning(
                     "Skipping history capture for %s%s because the inventory snapshot is degraded or untrusted.",
@@ -380,6 +402,8 @@ class HistoryCollector:
             smart_started = time.perf_counter()
             try:
                 summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
+            except HistoryCollectionStopping:
+                raise
             except Exception as exc:  # noqa: BLE001 - one slow scope should not fail the whole fleet pass.
                 logger.warning(
                     "Skipping history SMART metrics for %s: %s",
@@ -564,6 +588,8 @@ class HistoryCollector:
             backup_at=retention_backup_at,
         )
         self.last_success_at = observed_at
+        if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
+            self._scope_collection_degraded_reason = None
         self.clear_failure_diagnostics()
         self._set_collection_activity("collection completed")
         self._clear_background_failure_backoff()
@@ -571,10 +597,11 @@ class HistoryCollector:
     def degraded_reason(self) -> str | None:
         """Why /healthz reports ``degraded``, or None when the service is healthy.
 
-        Degraded means one of: the last background collection pass failed, the
-        history database is read-only, or cleanup failed twice in a row. A failed
-        manual refresh alone does not count; it is shown in "Last error" and
-        cleared by the next successful pass.
+        Degraded means one of: the last background collection pass failed, an
+        inventory sweep had unavailable scopes, the history database is read-only,
+        or cleanup failed twice in a row. Other manual refresh failures alone do
+        not count; they are shown in "Last error" and cleared by the next
+        successful pass. Inventory degradation clears after a complete sweep.
         """
 
         if self.collection_pause()[0]:
@@ -585,7 +612,7 @@ class HistoryCollector:
             return "The history database is read-only."
         if self.retention_consecutive_failures >= 2:
             return "History cleanup has failed twice in a row."
-        return None
+        return self._scope_collection_degraded_reason
 
     def status(self) -> dict[str, Any]:
         collection_started_at = self.current_collection_started_at
@@ -761,7 +788,9 @@ class HistoryCollector:
                 continue
             started_monotonic = time.perf_counter()
             try:
-                force_startup_collection = self.last_success_at is None
+                force_startup_collection = (
+                    self.last_success_at is None and not self._startup_collection_attempted
+                )
                 self.next_collection_at = None
                 run_kwargs = (
                     {
@@ -786,7 +815,7 @@ class HistoryCollector:
                     service_name=HISTORY_METRICS_SERVICE_NAME,
                     result="success",
                     duration_seconds=time.perf_counter() - started_monotonic,
-                    status=self.status(),
+                    status=await asyncio.to_thread(self.status),
                     counts=await asyncio.to_thread(self.store.estimated_counts),
                 )
             except HistoryCollectionAlreadyRunning:
@@ -805,7 +834,7 @@ class HistoryCollector:
                     service_name=HISTORY_METRICS_SERVICE_NAME,
                     result="error",
                     duration_seconds=time.perf_counter() - started_monotonic,
-                    status=self.status(),
+                    status=await asyncio.to_thread(self.status),
                     counts=None,
                 )
 
@@ -1579,7 +1608,18 @@ class HistoryCollector:
         api_source = sources.get("api")
         if isinstance(api_source, dict) and api_source.get("enabled") and not api_source.get("ok"):
             return False
-        if normalize_text(snapshot.get("selected_system_platform")) == "quantastor":
+        platform = normalize_text(snapshot.get("selected_system_platform"))
+        if platform in {"linux", "esxi"}:
+            # These host inventories come from SSH, not the disabled API.
+            # SSH remains optional enrichment on API-backed platforms.
+            ssh_source = sources.get("ssh")
+            if isinstance(ssh_source, dict) and ssh_source.get("enabled") and not ssh_source.get("ok"):
+                return False
+        if platform == "ipmi":
+            bmc_source = sources.get("bmc")
+            if isinstance(bmc_source, dict) and bmc_source.get("enabled") and not bmc_source.get("ok"):
+                return False
+        if platform == "quantastor":
             platform_context = snapshot.get("platform_context")
             if isinstance(platform_context, dict) and platform_context.get("topology_complete") is False:
                 return False
@@ -1690,7 +1730,8 @@ class HistoryCollector:
         force_inventory: bool = True,
         cached_root_only: bool = False,
     ) -> list[ScopeSnapshot]:
-        self._scope_enumeration_complete = True
+        # A selected root is not a fleet census, even when its sources are healthy.
+        self._scope_enumeration_complete = not cached_root_only
         root_started = time.perf_counter()
         root_snapshot = await self._fetch_inventory(force=force_inventory)
         self._record_collection_stage(
@@ -1756,6 +1797,8 @@ class HistoryCollector:
             system_scope_start = len(scopes)
             try:
                 system_snapshot = await self._fetch_inventory(system_id=system_id, force=force_inventory)
+            except HistoryCollectionStopping:
+                raise
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
                 self._scope_enumeration_complete = False
                 self._clear_pending_topology_changes_for_system(system_id)
@@ -1820,6 +1863,8 @@ class HistoryCollector:
                             enclosure_id=enclosure_id,
                             force=force_inventory,
                         )
+                    except HistoryCollectionStopping:
+                        raise
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
                         self._scope_enumeration_complete = False
                         self._clear_pending_topology_changes_for_scope(system_id, enclosure_id)
@@ -1882,6 +1927,8 @@ class HistoryCollector:
                 system_snapshot,
                 force_inventory=force_inventory,
             )
+        except HistoryCollectionStopping:
+            raise
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
             self._scope_enumeration_complete = False
             self._clear_pending_topology_changes_for_storage_views(system_id)
@@ -1954,7 +2001,6 @@ class HistoryCollector:
             if not view_id or not view_label:
                 continue
             slot_payloads = []
-            occupied_count = 0
             for slot_payload in view_payload.get("slots") or []:
                 if not isinstance(slot_payload, dict):
                     continue
@@ -1963,8 +2009,6 @@ class HistoryCollector:
                 except (TypeError, ValueError):
                     continue
                 occupied = bool(slot_payload.get("occupied"))
-                if occupied:
-                    occupied_count += 1
                 slot_payloads.append(
                     {
                         "slot": slot_index,
@@ -1988,7 +2032,7 @@ class HistoryCollector:
                         or normalize_text(slot_payload.get("placement_key")),
                     }
                 )
-            if not slot_payloads or occupied_count == 0:
+            if not slot_payloads:
                 continue
             scopes.append(
                 ScopeSnapshot(
@@ -2005,6 +2049,7 @@ class HistoryCollector:
                         "storage_view_id": view_id,
                         "storage_view_backing_enclosure_id": normalize_text(view_payload.get("backing_enclosure_id")),
                         "sources": sources,
+                        "platform_context": system_snapshot.get("platform_context"),
                         "slots": slot_payloads,
                     },
                 )
@@ -2113,15 +2158,21 @@ class HistoryCollector:
         headers: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._fetch_json_sync,
-            path,
-            params or {},
-            method,
-            body,
-            headers or {},
-            timeout_seconds,
-        )
+        self._raise_if_stopping()
+        try:
+            return await asyncio.to_thread(
+                self._fetch_json_sync,
+                path,
+                params or {},
+                method,
+                body,
+                headers or {},
+                timeout_seconds,
+            )
+        finally:
+            # Finish the in-flight request, but do not start another request or
+            # treat shutdown as a recoverable failure of this source.
+            self._raise_if_stopping()
 
     def _fetch_json_sync(
         self,
@@ -2132,6 +2183,7 @@ class HistoryCollector:
         headers: dict[str, str],
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
+        self._raise_if_stopping()
         filtered_params = {key: value for key, value in params.items() if value not in {None, ""}}
         query = urllib.parse.urlencode(filtered_params, doseq=True)
         url = f"{self.settings.source_base_url.rstrip('/')}{path}"

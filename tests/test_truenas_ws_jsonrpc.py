@@ -8,11 +8,14 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from tests import test_truenas_ws as ddp_tests
+
 from app.config import TrueNASConfig
 from app.services.truenas_ws import (
     TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASWebsocketClient,
+    build_jsonrpc_error,
     build_jsonrpc_url,
     build_websocket_url,
 )
@@ -128,6 +131,152 @@ class SyntheticJsonRpcPeer:
         if isinstance(message, Exception):
             raise message
         return json.dumps(message)
+
+
+class MissingMethodJsonRpcPeer(SyntheticJsonRpcPeer):
+    """Return a standard missing-method response only for the selected method."""
+
+    def __init__(self, method: str, error: dict | None = None) -> None:
+        super().__init__()
+        self.method = method
+        self.error = {"code": -32601, "message": "Method not found"} if error is None else error
+
+    async def send(self, raw: str) -> None:
+        message = json.loads(raw)
+        if message["method"] != self.method:
+            await super().send(raw)
+            return
+        self.sent.append(message)
+        assert self.authenticated, "middleware method call before authentication"
+        self.queue.put_nowait({"jsonrpc": "2.0", "id": message["id"], "error": self.error})
+
+    def _result_for(self, message: dict):
+        results = {
+            "enclosure2.query": [{"id": "synthetic-enclosure"}],
+            "disk.query": [{"name": "sda"}],
+            "disk.details": {"used": [], "unused": []},
+            "pool.query": [{"name": "synthetic-pool"}],
+            "disk.temperatures": {"sda": 30},
+        }
+        return results.get(message["method"], super()._result_for(message))
+
+
+class JsonRpcMissingMethodTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.baseline_tasks = set(asyncio.all_tasks())
+        self.loop_errors = []
+        loop = asyncio.get_running_loop()
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: self.loop_errors.append(context))
+        self.addCleanup(loop.set_exception_handler, old_handler)
+        for target in ("socket.create_connection", "socket.socket.connect", "socket.getaddrinfo"):
+            blocker = patch(target, side_effect=AssertionError("unexpected network access"))
+            blocker.start()
+            self.addCleanup(blocker.stop)
+
+    async def asyncTearDown(self) -> None:
+        import gc
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertEqual(self.loop_errors, [])
+        self.assertEqual([
+            task for task in asyncio.all_tasks() - self.baseline_tasks
+            if task is not asyncio.current_task() and not task.done()
+        ], [])
+
+    def test_standard_error_maps_to_enomethod_without_a_named_error(self) -> None:
+        for data in (None, {}, {"reason": "Unavailable here", "trace": SECRET_TRACE_MARKER}):
+            with self.subTest(data=data):
+                error = {"code": -32601, "message": "Method not found", "data": data}
+                exception = build_jsonrpc_error("disk.smartctl", error)
+                self.assertEqual(exception.code, -32601)
+                self.assertEqual(exception.errname, "ENOMETHOD")
+                self.assertFalse(exception.retryable)
+                self.assertIn("ENOMETHOD", str(exception))
+                self.assertIn("Unavailable here" if data else "Method not found", str(exception))
+                self.assertNotIn(SECRET_TRACE_MARKER, str(exception))
+
+    def test_other_codes_and_explicit_errnames_keep_their_existing_meaning(self) -> None:
+        for code in (-32600, -32602, -32603, -32001, "-32601", -32601.0, True, None):
+            with self.subTest(code=code):
+                exception = build_jsonrpc_error("disk.smartctl", {"code": code, "message": "Rejected"})
+                self.assertIsNone(exception.errname)
+                self.assertNotIn("ENOMETHOD", str(exception))
+        exception = build_jsonrpc_error("disk.smartctl", {
+            "code": -32601, "message": "Method not found",
+            "data": {"errname": "EXPLICIT", "reason": "Provider reason"},
+        })
+        self.assertEqual(exception.errname, "EXPLICIT")
+        self.assertEqual(exception.reason, "Provider reason")
+        self.assertNotIn("ENOMETHOD", str(exception))
+
+    async def test_scale_single_smart_uses_the_existing_unavailable_message(self) -> None:
+        peer = MissingMethodJsonRpcPeer("disk.smartctl")
+        client = TrueNASWebsocketClient(jsonrpc_config())
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            with self.assertRaisesRegex(TrueNASAPIError, "not available through the SCALE websocket API") as caught:
+                await client.fetch_disk_smartctl("sda")
+        cause = caught.exception.__cause__
+        assert isinstance(cause, TrueNASAPIError)
+        self.assertEqual(cause.code, -32601)
+        self.assertEqual(cause.errname, "ENOMETHOD")
+        self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+
+    async def test_scale_batch_missing_method_fails_globally_even_with_partial_results(self) -> None:
+        for return_exceptions in (False, True):
+            with self.subTest(return_exceptions=return_exceptions):
+                peer = MissingMethodJsonRpcPeer("disk.smartctl")
+                client = TrueNASWebsocketClient(jsonrpc_config())
+                with patch("app.services.truenas_ws.connect", peer.connect):
+                    with self.assertRaisesRegex(TrueNASAPIError, "not available through the SCALE websocket API"):
+                        await client.smartctl_batch(["sda", "sdb", "sdc"], max_concurrency=1,
+                                                    return_exceptions=return_exceptions)
+                self.assertEqual([message["params"][0] for message in peer.sent
+                                  if message["method"] == "disk.smartctl"], ["sda"])
+                self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+
+    async def test_optional_smart_history_logs_unavailability_without_a_warning(self) -> None:
+        peer = MissingMethodJsonRpcPeer("smart.test.results")
+        client = TrueNASWebsocketClient(jsonrpc_config())
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            with self.assertLogs("app.services.truenas_ws", level="INFO") as logs:
+                payload = await client.fetch_all()
+        self.assertEqual(payload.smart_test_results, [])
+        self.assertEqual(payload.disks, [{"name": "sda"}])
+        self.assertEqual(payload.enclosures, [{"id": "synthetic-enclosure"}])
+        self.assertEqual(payload.pools, [{"name": "synthetic-pool"}])
+        self.assertEqual(payload.disk_temperatures, {"sda": 30})
+        self.assertFalse(payload.enclosure_query_failed)
+        self.assertEqual([record.levelname for record in logs.records], ["INFO"])
+        self.assertIn("smart.test.results is unavailable", logs.output[0])
+        self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+
+    async def test_non_missing_method_error_stays_a_per_disk_failure(self) -> None:
+        peer = MissingMethodJsonRpcPeer("disk.smartctl", {
+            "code": -32001, "message": "Method call error",
+            "data": {"errname": "EINVAL", "reason": "Cannot open this disk"},
+        })
+        client = TrueNASWebsocketClient(jsonrpc_config())
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            results = await client.smartctl_batch(["sda", "sdb"], max_concurrency=1, return_exceptions=True)
+        self.assertEqual(len(results), 2)
+        for result in results:
+            self.assertIsInstance(result, TrueNASAPIError)
+            assert isinstance(result, TrueNASAPIError)
+            self.assertEqual(result.errname, "EINVAL")
+            self.assertEqual(result.code, -32001)
+        self.assertEqual(len([message for message in peer.sent if message["method"] == "disk.smartctl"]), 2)
+        self.assertEqual((peer.connections, peer.logins, peer.closes), (1, 1, 1))
+
+    async def test_non_scale_missing_method_does_not_claim_a_scale_capability(self) -> None:
+        peer = MissingMethodJsonRpcPeer("disk.smartctl")
+        client = TrueNASWebsocketClient(jsonrpc_config(platform="core"))
+        with patch("app.services.truenas_ws.connect", peer.connect):
+            with self.assertRaises(TrueNASAPIError) as caught:
+                await client.fetch_disk_smartctl("sda")
+        self.assertEqual(caught.exception.code, -32601)
+        self.assertNotIn("SCALE", str(caught.exception))
 
 
 class JsonRpcUrlTests(unittest.TestCase):
@@ -283,6 +432,18 @@ class JsonRpcTransportTests(unittest.IsolatedAsyncioTestCase):
         client = TrueNASWebsocketClient(TrueNASConfig(host="https://jsonrpc.invalid", api_key="token"))
 
         self.assertEqual(client._endpoint_url(), "wss://jsonrpc.invalid/websocket")
+
+
+class JsonRpcNormalOperationDeadlineTests(ddp_tests.NormalOperationDeadlineChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
+
+
+class JsonRpcCompletedReplyTests(ddp_tests.CompletedReplyChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
+
+
+class JsonRpcRealWebsocketCloseTests(ddp_tests.RealWebsocketCloseChecks, unittest.IsolatedAsyncioTestCase):
+    dialect = "jsonrpc"
 
 
 if __name__ == "__main__":

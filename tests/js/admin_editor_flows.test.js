@@ -353,11 +353,12 @@ test("a clone sends its source system id whatever happens to the SSH commands", 
 
 test("Quantastor discovery uses canonical preserved secrets and SSH timeout", async () => {
   const discoverSource = sourceBetween(
-    "  async function discoverQuantastorHaNodes",
+    "  function setupDraftSnapshot",
     "\n  function resolveBootstrapServiceKey"
   );
-  let collectOptions;
+  const collectOptions = [];
   let requestBody;
+  const banners = [];
   const setupPayload = {
     system_id: "saved-quantastor",
     truenas_host: "https://192.0.2.30",
@@ -385,11 +386,12 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
   });
   const state = { haNodes: [], haNodesLoading: false };
   const { discoverQuantastorHaNodes } = loadFunctions(
-    [discoverSource],
+    [discoverSource, sourceBetween("  function requireMutationResult", "\n  async function fetchJson"),
+      sourceBetween("  function adminRequestError", "\n  function classifyTransportFailure")],
     ["discoverQuantastorHaNodes"],
     {
       collectSetupPayload: (options) => {
-        collectOptions = options;
+        collectOptions.push(options);
         return setupPayload;
       },
       collectTlsServerName: () => null,
@@ -397,12 +399,12 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
       elements,
       fetchJson: async (_url, options) => {
         requestBody = JSON.parse(options.body);
-        return { nodes: [], host_discovery: {} };
+        return { ok: true, nodes: [], host_discovery: { attempted: false, ok: true } };
       },
       normalizeHaNodes: (nodes) => nodes,
       renderQuantastorHaSection: () => {},
       renderStorageViews: () => {},
-      setBanner: () => {},
+      setBanner: (message, kind) => banners.push({ message, kind }),
       state,
       syncHaNodesFromInputs: () => {},
     }
@@ -410,11 +412,14 @@ test("Quantastor discovery uses canonical preserved secrets and SSH timeout", as
 
   await discoverQuantastorHaNodes();
 
-  assert.deepEqual(JSON.parse(JSON.stringify(collectOptions)), { preserveRedactedSecrets: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(collectOptions[0])), { preserveRedactedSecrets: true });
+  assert.deepEqual(collectOptions.slice(1), [undefined, undefined], "local comparisons do not request preservation authority");
   assert.equal(requestBody.system_id, "saved-quantastor");
   assert.equal(requestBody.api_password, PRESERVE_SECRET_SENTINEL);
   assert.equal(requestBody.ssh_password, PRESERVE_SECRET_SENTINEL);
   assert.equal(requestBody.ssh_timeout_seconds, 45);
+  assert.equal(banners.at(-1).kind, "success", "the response path must finish, not swallow a missing helper");
+  assert.equal(state.setupDirty, undefined, "unchanged node discovery is not a submitted-value edit");
 });
 
 test("failed ESXi install refreshes packages before restoring controls", async () => {

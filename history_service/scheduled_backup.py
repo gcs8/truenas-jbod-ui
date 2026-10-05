@@ -260,6 +260,7 @@ class ScheduledBackupRunner:
         clock: Callable[[], datetime] | None = None,
         apply_retention: bool = True,
         archive_format: str = DEFAULT_FULL_ARCHIVE_FORMAT,
+        before_publish: Callable[[Path, Path], None] | None = None,
     ) -> None:
         self.backup_service = backup_service
         self.destination_dir = Path(destination_dir)
@@ -274,6 +275,7 @@ class ScheduledBackupRunner:
         self.apply_retention = bool(apply_retention)
         self.archive_format = archive_format
         self.last_manifest: dict[str, Any] | None = None
+        self.before_publish = before_publish
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -572,6 +574,10 @@ class ScheduledBackupRunner:
                 expected_groups=list(self.included_groups),
             )
             source_metadata = temporary.lstat()
+            # Scheduler ownership must be durable before the final name exists.
+            # The standalone runner keeps its existing retention/status contract.
+            if self.before_publish is not None:
+                self.before_publish(temporary, target)
             os.link(temporary, target, follow_symlinks=False)
             target_descriptor: int | None = None
             try:

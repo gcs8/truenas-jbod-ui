@@ -524,13 +524,110 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         candidate = {"user_version": 1, "current_schema": current_store.CURRENT_SCHEMA_VERSION}
         self.assertEqual(smoke.schema_evidence(predecessor, candidate)["transition"], "none")
 
-    def test_upgrade_evidence_and_docs_do_not_claim_an_equal_schema_was_migrated(self):
-        from history_service.store import SCHEMA
+    def test_operator_index_count_matches_real_released_startup(self):
+        import sqlite3
+        from contextlib import closing
 
+        from history_service.store import CURRENT_SCHEMA_VERSION, HistoryStore
+        from tests.test_history_released_schema_upgrades import build_released_database
+
+        # v0.22.2's _ensure_identity_indexes adds these outside its SCHEMA.
+        # Cover both the released SQL fixture and an already-started release.
+        identity_indexes = {
+            "idx_slot_state_disk_identity": "slot_state_current (disk_identity_key)",
+            "idx_metric_samples_disk_identity":
+                "metric_samples (disk_identity_key, metric_name, observed_at DESC)",
+        }
+        chronological_indexes = {
+            "idx_slot_events_scope_chronological":
+                "slot_events (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC)",
+            "idx_metric_samples_slot_chronological":
+                "metric_samples (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC)",
+            "idx_metric_samples_scope_chronological":
+                "metric_samples (system_id, enclosure_key, slot, metric_name, julianday(observed_at) DESC, id DESC)",
+            "idx_metric_samples_disk_chronological":
+                "metric_samples (disk_identity_key, julianday(observed_at) DESC, id DESC)",
+            "idx_metric_samples_disk_metric_chronological":
+                "metric_samples (disk_identity_key, metric_name, julianday(observed_at) DESC, id DESC)",
+        }
+
+        def state(path):
+            with closing(sqlite3.connect(path)) as connection:
+                return {
+                    "definitions": connection.execute(
+                        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                        "WHERE type != 'index' ORDER BY type, name"
+                    ).fetchall(),
+                    "indexes": dict(connection.execute(
+                        "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+                    )),
+                    "rows": {
+                        table: connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid').fetchall()
+                        for (table,) in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        ).fetchall()
+                    },
+                    "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
+                    "quick_check": connection.execute("PRAGMA quick_check").fetchone()[0],
+                }
+
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
         released_schema = (
             self.ROOT / "tests" / "fixtures" / "history_released_schemas" / "v0.22.2.sql"
         ).read_text(encoding="utf-8")
-        self.assertEqual(SCHEMA, released_schema, "update the evidence when the candidate schema changes")
+        with tempfile.TemporaryDirectory() as directory:
+            for already_started in (False, True):
+                with self.subTest(released_identity_indexes=already_started):
+                    path = Path(directory) / f"history-{already_started}.sqlite3"
+                    build_released_database(path, "v0.22.2", stamp_like_release=True)
+                    if already_started:
+                        with closing(sqlite3.connect(path)) as connection, connection:
+                            for name, target in identity_indexes.items():
+                                connection.execute(f"CREATE INDEX {name} ON {target}")
+                    before = state(path)
+
+                    # No startup mocks: the constructor runs version admission,
+                    # SCHEMA, identity indexes, backfill and counter synchronization.
+                    HistoryStore(str(path), recover_unreadable_database=False)
+                    after = state(path)
+                    for key in ("definitions", "rows", "user_version", "quick_check"):
+                        self.assertEqual(after[key], before[key], key)
+                    self.assertEqual(after["user_version"], CURRENT_SCHEMA_VERSION)
+                    self.assertEqual(after["quick_check"], "ok")
+                    self.assertEqual(
+                        {name: after["indexes"].get(name) for name in before["indexes"]},
+                        before["indexes"],
+                    )
+                    added = set(after["indexes"]) - set(before["indexes"])
+                    expected = dict(chronological_indexes)
+                    if not already_started:
+                        expected.update(identity_indexes)
+                    self.assertEqual(added, set(expected))
+                    for name, target in expected.items():
+                        self.assertEqual(" ".join(after["indexes"][name].split()),
+                                         f"CREATE INDEX {name} ON {target}")
+                    added_chronological = {name for name in added if name.endswith("_chronological")}
+                    self.assertEqual(added_chronological, set(chronological_indexes))
+                    self.assertEqual(len(added_chronological), 5)
+                    self.assertEqual(self.load_smoke().schema_evidence(
+                        {"user_version": before["user_version"], "current_schema": 1},
+                        {"user_version": after["user_version"], "current_schema": CURRENT_SCHEMA_VERSION},
+                    )["transition"], "none")
+
+                    HistoryStore(str(path), recover_unreadable_database=False)
+                    self.assertEqual(state(path), after, "restart must preserve the complete state")
+                    with closing(sqlite3.connect(path)) as connection:
+                        connection.executescript(released_schema)
+                    self.assertEqual(state(path), after, "released SQL must still accept the database")
+                    self.assertIn("Startup adds five chronological indexes", guide,
+                                  f"real startup added {sorted(added_chronological)}")
+
+    def test_upgrade_evidence_and_docs_do_not_claim_an_equal_schema_was_migrated(self):
+        from history_service.store import CURRENT_SCHEMA_VERSION
+
+        # The real-constructor test above qualifies the complete startup delta;
+        # executing SCHEMA alone omits the two disk chronological indexes.
+        self.assertEqual(CURRENT_SCHEMA_VERSION, 1, "update the qualification when the logical schema version changes")
         source = (self.ROOT / "scripts" / "run_image_upgrade_smoke.py").read_text(encoding="utf-8")
         upgrade = source.split("def upgrade_and_rollback", 1)[1].split("\ndef ", 1)[0]
         interrupted = source.split("def interrupted_migration", 1)[1].split("\ndef ", 1)[0]
@@ -551,6 +648,11 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("schema_after={schema['after']}", interrupted)
         self.assertIn("schema_transition={schema['transition']}", interrupted)
         self.assertIn("does not exercise a schema transition", matrix)
+        self.assertIn("Executing the schema SQL alone does not qualify startup", matrix)
+        self.assertIn("exact bytes without reindexing", matrix)
+        self.assertIn("headroom on production-scale databases remain unqualified", matrix)
+        self.assertIn("chronological indexes", matrix)
+        self.assertIn("chronological indexes", scripts_guide)
         self.assertRegex(
             changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
             r"\(#637(?:, #\d+)*\)",
@@ -729,6 +831,33 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertIn("history_api_view((1, 2, 3))", source)
         self.assertIn("history_api_view((1, 2, 3, 4))", source)
         self.assertIn("catalog_identity=ok", source)
+
+    def test_segmented_catalog_cutoff_survives_midnight_rounding(self):
+        # Since v0.23.0 the migration rounds its cutoff down to midnight UTC.
+        # The rounded cutoff must still fall after every row seeded just before.
+        import contextlib
+        import io
+        import sys
+        import types
+        from datetime import datetime, timezone
+
+        from history_service.segment_sealer import normalize_history_cutoff
+
+        smoke = self.load_smoke()
+        captured = {}
+
+        def migrate_segmented_history(**kwargs):
+            captured.update(kwargs)
+            return {"apply": True, "segment": {"segment_id": "segment-0001"}}
+
+        stub = types.ModuleType("history_service.segment_migration")
+        stub.migrate_segmented_history = migrate_segmented_history
+        seeded_by = datetime.now(timezone.utc)
+        with mock.patch.dict(sys.modules, {"history_service.segment_migration": stub}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(compile(smoke.CREATE_SEGMENTED_CATALOG, "create_segmented_catalog", "exec"), {})
+        rounded = datetime.fromisoformat(normalize_history_cutoff(captured["cutoff"]))
+        self.assertGreater(rounded, seeded_by)
 
     def test_hardened_scenario_requires_the_overlay_fixture(self):
         smoke = self.load_smoke()

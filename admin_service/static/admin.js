@@ -44,6 +44,9 @@
     storageViewCandidates: [],
     storageViewCandidatesLoading: false,
     storageViewCandidatesSystemId: null,
+    storageViewCandidatesTargetSystemId: null,
+    storageViewCandidatesScope: null,
+    storageViewCandidatesRequestScope: null,
     liveEnclosures: [],
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
@@ -57,6 +60,8 @@
       || (Array.isArray(bootstrap.systems) && bootstrap.systems[0]?.id)
       || "",
     loadedSystemId: null,
+    setupEditorGeneration: 0,
+    setupDraftRevision: 0,
     sshCommandsAutoPlatform: null,
     sshUserAutoPlatform: null,
     sshUserEdited: false,
@@ -68,11 +73,13 @@
     runtimeBehaviorSaving: false,
     refreshPromise: null,
     refreshQueued: null,
-    refreshQueuedQuiet: true,
+    refreshQueuedOptions: null,
+    bannerRevision: 0,
     runtimeActionPromises: new Map(),
     runtimeActionControllers: new Map(),
     countdownTimerId: null,
     sessionStopped: false,
+    sessionBannerPhase: null,
     sudoersPreviewTimerId: null,
     sudoersPreviewRequestSeq: 0,
     liveEnclosuresRequestSeq: 0,
@@ -335,6 +342,7 @@
   }
 
   function setBanner(message, tone = "info") {
+    state.bannerRevision = (state.bannerRevision || 0) + 1;
     if (!elements.banner) {
       return;
     }
@@ -584,6 +592,16 @@
     });
   }
 
+  function lockActionsIfStopped() {
+    // Renders re-enable buttons from their own rules; once admin has stopped, keep every action locked.
+    if (!state.sessionStopped) {
+      return;
+    }
+    document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
   function syncSessionBanner() {
     if (!elements.sessionBanner || state.sessionStopped) {
       return;
@@ -618,9 +636,9 @@
     try {
       return await fetchWithTimeout(url, options);
     } catch (error) {
-      const remainingMs = sessionRemainingMs();
-      if (error?.name === "TypeError" && remainingMs !== null && remainingMs <= 0) {
-        markAdminStopped();
+      if (error?.name === "TypeError") {
+        const remainingMs = sessionRemainingMs();
+        if (remainingMs !== null && remainingMs <= 0) markAdminStopped();
       }
       throw error;
     }
@@ -647,7 +665,16 @@
   }
 
   function tickCountdown() {
-    // Only the countdown changes between ticks; the rest of the hero is rendered by refreshes.
+    // Only the countdown and the auto-stop banner change between ticks; the rest of the hero is
+    // rendered by refreshes. The banner is re-synced only when its wording would change.
+    const remainingMs = sessionRemainingMs();
+    const bannerPhase = remainingMs === null || remainingMs > SESSION_WARNING_MS
+      ? "hidden"
+      : remainingMs <= 0 ? "passed" : String(Math.ceil(remainingMs / 60000));
+    if (state.sessionBannerPhase !== bannerPhase) {
+      state.sessionBannerPhase = bannerPhase;
+      syncSessionBanner();
+    }
     if (!elements.countdown) {
       return;
     }
@@ -1126,7 +1153,7 @@
       setBanner(message, "error");
     } finally {
       state.runtimeBehaviorSaving = false;
-      elements.runtimeBehaviorSaveButton.disabled = false;
+      elements.runtimeBehaviorSaveButton.disabled = Boolean(state.sessionStopped);
     }
   }
 
@@ -1660,6 +1687,12 @@
         .map((item) => `<span class="meta-chip">${escapeHtml(item)}</span>`)
         .join("");
     }
+    renderExistingSystemCatalog();
+  }
+
+  function renderExistingSystemCatalog() {
+    if (!elements.currentSystemsList || !elements.currentDefaultSystem) return;
+    elements.currentDefaultSystem.textContent = state.defaultSystemId ? `Default: ${state.defaultSystemId}` : "No default";
     elements.currentSystemsList.innerHTML = state.systems.length
       ? state.systems
           .map((system) => {
@@ -2271,6 +2304,8 @@
   }
 
   function resetProfileBuilder({ keepResult = false } = {}) {
+    state.profileBuilderGeneration = (state.profileBuilderGeneration || 0) + 1;
+    retireAdminEditorControls({ builderOnly: true });
     state.loadedBuilderProfileId = "";
     if (elements.profileBuilderId) {
       elements.profileBuilderId.value = "";
@@ -2329,6 +2364,8 @@
       return;
     }
     state.loadedBuilderProfileId = profile.is_custom ? profile.id : "";
+    state.profileBuilderGeneration = (state.profileBuilderGeneration || 0) + 1;
+    retireAdminEditorControls({ builderOnly: true });
     if (elements.profileBuilderId) {
       elements.profileBuilderId.value = profile.is_custom ? profile.id : suggestedCustomProfileId(profile);
     }
@@ -2453,6 +2490,7 @@
     const referenceCount = profileReferenceCount(loadedProfile);
     elements.profileBuilderDeleteButton.disabled = !(loadedProfile && loadedProfile.is_custom) || referenceCount > 0;
     elements.profileBuilderDeleteButton.title = referenceCount > 0 ? describeProfileReferences(referenceCount) : "";
+    lockActionsIfStopped();
   }
 
   function profileReferenceCount(profile) {
@@ -3412,6 +3450,12 @@
   }
 
   function renderStorageViews() {
+    // Invalidate on the selection change, not the next paint. A -> B -> A in
+    // one frame must not revive the first visit's pending request or hints.
+    if (state.storageViewCandidatesRequestScope
+      && state.storageViewCandidatesRequestScope !== currentStorageViewCandidateScope()) {
+      resetStorageViewCandidateState();
+    }
     scheduleStorageViewRender({ full: true });
   }
 
@@ -3438,6 +3482,8 @@
       return;
     }
     const preferredId = mutator(selected) || selected.id || state.selectedStorageViewId;
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews(state.storageViews);
     state.selectedStorageViewId =
       state.storageViews.find((storageView) => storageView.id === preferredId)?.id
@@ -3505,10 +3551,25 @@
     state.liveEnclosuresError = null;
   }
 
+  function currentStorageViewCandidateScope() {
+    return JSON.stringify([
+      currentStorageViewSystemId(), currentStorageViewTargetSystemId(),
+      state.selectedStorageViewId || "", state.setupEditorGeneration || 0,
+    ]);
+  }
+
+  function storageViewCandidatesReady() {
+    return !state.storageViewCandidatesLoading
+      && state.storageViewCandidatesScope === currentStorageViewCandidateScope();
+  }
+
   function resetStorageViewCandidateState() {
     state.storageViewCandidatesRequestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
     state.storageViewCandidates = [];
     state.storageViewCandidatesSystemId = null;
+    state.storageViewCandidatesTargetSystemId = null;
+    state.storageViewCandidatesScope = null;
+    state.storageViewCandidatesRequestScope = null;
     state.storageViewCandidatesLoading = false;
   }
 
@@ -3559,7 +3620,8 @@
   }
 
   function candidateBindingAlreadyAttached(candidate, storageView = getSelectedStorageView()) {
-    if (!candidate || !storageView) {
+    if (!candidate || !storageView
+      || currentStorageViewTargetSystemId(storageView) !== state.storageViewCandidatesTargetSystemId) {
       return false;
     }
     const recommended = candidate.recommended_binding || {};
@@ -3577,7 +3639,7 @@
   }
 
   function visibleStorageViewCandidates(storageView = getSelectedStorageView()) {
-    if (!storageView) {
+    if (!storageView || !storageViewCandidatesReady()) {
       return [];
     }
     return state.storageViewCandidates.filter((candidate) => {
@@ -3591,7 +3653,7 @@
   }
 
   function applyStorageViewCandidate(candidate) {
-    if (!candidate) {
+    if (!candidate || !storageViewCandidatesReady() || !visibleStorageViewCandidates().includes(candidate)) {
       return;
     }
     updateSelectedStorageView((storageView) => {
@@ -3607,6 +3669,9 @@
   }
 
   function applyAllStorageViewCandidates() {
+    if (!storageViewCandidatesReady()) {
+      return;
+    }
     const selectedStorageView = getSelectedStorageView();
     if (!selectedStorageView) {
       setBanner("Select a storage view first so the candidate bindings know where to land.", "error");
@@ -3633,8 +3698,14 @@
     const systemId = currentStorageViewSystemId();
     const targetSystemId = currentStorageViewTargetSystemId(selectedStorageView);
     const targetLabel = haTargetOptions().find((node) => node.system_id === targetSystemId)?.label || targetSystemId;
+    // All view-selection paths converge here, including add/remove/duplicate.
+    // Action guards compare the scope synchronously, before this queued paint.
+    if (systemId && selectedStorageView && state.storageViewCandidatesRequestScope !== currentStorageViewCandidateScope()) {
+      void fetchStorageViewCandidates({ quiet: true });
+    }
     const availableCandidates = visibleStorageViewCandidates(selectedStorageView);
-    const claimedElsewhereCount = state.storageViewCandidates.length - availableCandidates.length;
+    const claimedElsewhereCount = storageViewCandidatesReady()
+      ? state.storageViewCandidates.length - availableCandidates.length : 0;
     elements.setupStorageViewCandidatesAddAllButton.disabled =
       !selectedStorageView || !availableCandidates.some((candidate) => !candidateBindingAlreadyAttached(candidate, selectedStorageView));
     const where = `${systemId}${targetLabel ? ` (${targetLabel})` : ""}`;
@@ -3705,7 +3776,13 @@
       return;
     }
     const requestSeq = (state.storageViewCandidatesRequestSeq || 0) + 1;
+    const scope = currentStorageViewCandidateScope();
+    const ownsRequest = () => requestSeq === state.storageViewCandidatesRequestSeq
+      && scope === currentStorageViewCandidateScope();
     state.storageViewCandidatesRequestSeq = requestSeq;
+    state.storageViewCandidatesRequestScope = scope;
+    state.storageViewCandidatesScope = null;
+    state.storageViewCandidates = [];
     state.storageViewCandidatesLoading = true;
     scheduleStorageViewRender({ full: false });
     try {
@@ -3717,18 +3794,22 @@
         params.set("force", "true");
       }
       const payload = await fetchJson(`/api/admin/storage-views/candidates?${params.toString()}`);
-      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
-        // A newer request (fast system switch) owns the state now; drop this response.
+      if (!ownsRequest()) {
         return;
       }
+      if (payload.system_id && payload.system_id !== systemId) {
+        throw new Error("Candidate response does not match the selected system.");
+      }
       state.storageViewCandidates = Array.isArray(payload.candidates) ? payload.candidates : [];
-      state.storageViewCandidatesSystemId = payload.system_id || systemId;
+      state.storageViewCandidatesSystemId = systemId;
+      state.storageViewCandidatesTargetSystemId = targetSystemId;
+      state.storageViewCandidatesScope = scope;
       if (!quiet) {
         const targetSuffix = targetSystemId ? ` targeting ${targetSystemId}` : "";
         setBanner(`Loaded ${state.storageViewCandidates.length} unmapped inventory candidate${state.storageViewCandidates.length === 1 ? "" : "s"} for ${state.storageViewCandidatesSystemId}${targetSuffix}.`, "success");
       }
     } catch (error) {
-      if (requestSeq !== state.storageViewCandidatesRequestSeq) {
+      if (!ownsRequest()) {
         return;
       }
       state.storageViewCandidates = [];
@@ -3737,7 +3818,7 @@
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
     } finally {
-      if (requestSeq === state.storageViewCandidatesRequestSeq) {
+      if (ownsRequest()) {
         state.storageViewCandidatesLoading = false;
         scheduleStorageViewRender({ full: false });
       }
@@ -3772,6 +3853,8 @@
       }
       return;
     }
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews([...state.storageViews, storageView]);
     state.selectedStorageViewId = storageView.id;
     renderStorageViews();
@@ -3786,6 +3869,8 @@
     if (!selectedId) {
       return;
     }
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = state.storageViews.filter((storageView) => storageView.id !== selectedId);
     state.selectedStorageViewId = state.storageViews[0]?.id || "";
     renderStorageViews();
@@ -3800,6 +3885,8 @@
     duplicated.id = uniqueStorageViewId(`${selected.id}-copy`);
     duplicated.label = `${selected.label} Copy`;
     duplicated.order = nextStorageViewOrder();
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews([...state.storageViews, duplicated]);
     state.selectedStorageViewId = duplicated.id;
     renderStorageViews();
@@ -3822,6 +3909,8 @@
     const currentOrder = ordered[currentIndex].order;
     ordered[currentIndex].order = ordered[targetIndex].order;
     ordered[targetIndex].order = currentOrder;
+    state.setupDirty = true;
+    state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = normalizeStorageViews(ordered);
     state.selectedStorageViewId = selected.id;
     renderStorageViews();
@@ -4793,6 +4882,8 @@
   }
 
   function resetSetupForm() {
+    retireAdminEditorControls();
+    state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.loadedSystemId = null;
     state.selectedProfileId = "";
     state.tlsInspection = null;
@@ -4956,6 +5047,8 @@
     if (!system) {
       return;
     }
+    retireAdminEditorControls();
+    state.setupEditorGeneration = (state.setupEditorGeneration || 0) + 1;
     state.setupDirty = false;
     state.loadedSystemId = system.id || null;
     state.selectedExistingSystemId = system.id || state.selectedExistingSystemId;
@@ -5246,6 +5339,89 @@
     };
   }
 
+  // Programmatic edits do not emit input/change. Compare only submitted values,
+  // synchronously around each mutation, so same-value suggestions remain no-ops.
+  // Never retain this snapshot across an await or use it to replace visit/revision
+  // ownership: changing away and back still advances setupDraftRevision.
+  function setupDraftSnapshot() {
+    // This is a local comparison, not a write: do not request secret-preservation sentinels.
+    return JSON.stringify(collectSetupPayload());
+  }
+
+  function recordSetupDraftChange(before) {
+    if (before !== setupDraftSnapshot()) {
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      retireAdminEditorControls();
+    }
+  }
+
+  // No credential snapshots: visits and monotonic revisions retire typed edits,
+  // while the non-secret target also catches programmatic endpoint changes.
+  function captureAdminEditorOperation(name, { builder = false, selection = false } = {}) {
+    state.adminEditorOperationSeq = state.adminEditorOperationSeq || {};
+    const sequence = (state.adminEditorOperationSeq[name] || 0) + 1;
+    state.adminEditorOperationSeq[name] = sequence;
+    const target = () => JSON.stringify([
+      state.loadedSystemId, elements.setupSystemId?.value, elements.setupPlatform?.value,
+      elements.setupTruenasHost?.value, elements.setupSshHost?.value, elements.setupSshUser?.value,
+      elements.setupBootstrapHost?.value, elements.setupProfile?.value,
+      ...(selection ? [state.selectedExistingSystemId, elements.existingSystemSelect?.value,
+        elements.existingSystemDeleteHistoryToggle?.checked] : []),
+    ]);
+    // Use raw builder fields, not readProfileBuilderDraft's catalog-dependent
+    // fallbacks: a refreshed/deleted source profile is not a user edit.
+    const builderDraft = () => JSON.stringify([state.loadedBuilderProfileId,
+      ...Object.entries(elements).filter(([key, field]) => key.startsWith("profileBuilder")
+        && field && "value" in field).map(([key, field]) => [key, field.value])]);
+    const snapshot = () => ({ generation: state.setupEditorGeneration, revision: state.setupDraftRevision,
+      target: target(), builderGeneration: state.profileBuilderGeneration,
+      builderRevision: state.profileBuilderRevision,
+      builderDraft: builder ? builderDraft() : null });
+    let submitted = snapshot();
+    const owns = () => state.adminEditorOperationSeq[name] === sequence
+      && state.setupEditorGeneration === submitted.generation
+      && state.setupDraftRevision === submitted.revision && target() === submitted.target
+      && (!builder || (state.profileBuilderGeneration === submitted.builderGeneration
+        && state.profileBuilderRevision === submitted.builderRevision
+        && builderDraft() === submitted.builderDraft));
+    // Only call after an admitted, synchronous change made by this operation.
+    return { owns, advance: () => { submitted = snapshot(); } };
+  }
+
+  function retireAdminEditorControls({ builderOnly = false } = {}) {
+    // Retire loading synchronously on navigation/edit, never from a stale
+    // finalizer. A later operation can then acquire these controls itself.
+    if (!builderOnly) {
+      state.haNodesLoading = false;
+      if (elements.setupDiscoverHaNodesButton) {
+        elements.setupDiscoverHaNodesButton.disabled = Boolean(state.sessionStopped)
+          || currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked;
+      }
+      if (elements.setupBootstrapButton) {
+        elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
+      }
+      const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
+      const selected = state.systems?.some((system) => system.id === selectedId);
+      for (const control of [elements.existingSystemDeleteButton, elements.existingSystemDeleteHistoryToggle]) {
+        if (control) control.disabled = !selected || Boolean(state.sessionStopped);
+      }
+    }
+    if (elements.profileBuilderSaveButton) elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
+    if (elements.profileBuilderDeleteButton) {
+      const loadedProfile = state.loadedBuilderProfileId ? getProfileById(state.loadedBuilderProfileId) : null;
+      elements.profileBuilderDeleteButton.disabled = Boolean(state.sessionStopped)
+        || !loadedProfile?.is_custom || profileReferenceCount(loadedProfile) > 0;
+    }
+  }
+
+  function recordAdminEditorOutcome(operation, target, outcome) {
+    // Keep only target/status, not credentials, raw provisioning output or a
+    // foreign operation's result in the currently visible form.
+    state.adminEditorOutcomes = state.adminEditorOutcomes || {};
+    state.adminEditorOutcomes[operation] = { target, outcome };
+  }
+
   async function discoverQuantastorHaNodes() {
     if (currentSetupPlatform() !== "quantastor" || !elements.setupHaEnabled?.checked) {
       setBanner("Turn on the QuantaStor HA option first.", "error");
@@ -5255,10 +5431,12 @@
     syncHaNodesFromInputs();
     const setupPayload = collectSetupPayload({ preserveRedactedSecrets: true });
     renderQuantastorHaSection();
+    const owner = captureAdminEditorOperation("ha-discovery");
     renderStorageViews();
     try {
       const payload = await fetchJson("/api/admin/system-setup/quantastor-nodes", {
         method: "POST",
+        validateResult: validHaNodesResult,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           system_id: setupPayload.system_id,
@@ -5279,7 +5457,13 @@
           ha_nodes: setupPayload.ha_nodes,
         }),
       });
-      state.haNodes = normalizeHaNodes(payload.nodes || []);
+      requireMutationResult(validHaNodesResult(payload), "QuantaStor node discovery");
+      recordAdminEditorOutcome("ha-discovery", setupPayload.system_id, "success");
+      if (!owner.owns()) return;
+      const draftBefore = setupDraftSnapshot();
+      state.haNodes = normalizeHaNodes(payload.nodes);
+      recordSetupDraftChange(draftBefore);
+      owner.advance();
       renderQuantastorHaSection();
       renderStorageViews();
       const hostDiscovery = payload.host_discovery || {};
@@ -5289,10 +5473,13 @@
         hostDiscovery.attempted && hostDiscovery.ok === false ? "info" : "success"
       );
     } catch (error) {
-      setBanner(`Unable to load nodes from QuantaStor: ${error.message || error}`, "error");
+      recordAdminEditorOutcome("ha-discovery", setupPayload.system_id, error.adminOutcome || "error");
+      if (owner.owns()) setBanner(describeMutationFailure("QuantaStor node discovery", error), "error");
     } finally {
-      state.haNodesLoading = false;
-      renderQuantastorHaSection();
+      if (owner.owns()) {
+        state.haNodesLoading = false;
+        renderQuantastorHaSection();
+      }
     }
   }
 
@@ -5402,17 +5589,20 @@
     };
   }
 
-  async function readJsonResponse(response) {
+  async function readJsonResponse(response, signal) {
     let payload;
     try {
       payload = await response.json();
     } catch (_) {
       payload = null;
     }
+    if (signal?.aborted) {
+      throw signal.reason;
+    }
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Object.keys(payload).length) {
       const rawId = validatedRequestId(response.headers?.get?.("X-Request-ID"));
       const requestId = rawId ? ` (request id ${rawId})` : "";
-      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Retry or check the admin connection.${requestId}`);
+      const error = new Error(`Invalid JSON response (${response.status || "unknown status"}). Check the admin connection.${requestId}`);
       error.requestId = requestId;
       throw error;
     }
@@ -5460,7 +5650,7 @@
     button.addEventListener("click", () => {
       button.disabled = true;
       void runRuntimeAction(containerKey, action).finally(() => {
-        button.disabled = false;
+        button.disabled = Boolean(state.sessionStopped);
       });
     });
     return button;
@@ -5650,23 +5840,18 @@
     return error;
   }
 
-  function classifyTransportFailure(mutating, offlineBeforeDispatch) {
-    // Only the offline state observed *before* fetch was invoked proves the
-    // request never left the browser. Reading navigator.onLine at catch time
-    // cannot: the link may have dropped after the sidecar received the
-    // request, so a mutation that failed after dispatch stays unknown.
-    if (offlineBeforeDispatch) {
-      return "transport";
-    }
-    return mutating ? "unknown" : "transport";
+  function classifyTransportFailure(mutating, requestDispatched) {
+    // Only transport's dispatch marker can prove a request was not sent.
+    // navigator.onLine is advisory, including for reachable LAN services.
+    return mutating && requestDispatched !== false ? "unknown" : "transport";
   }
 
-  function describeTransportFailure(outcome, offlineBeforeDispatch) {
+  function describeTransportFailure(outcome, offlineHint) {
     if (outcome === "unknown") {
       return "Admin could not be reached after the request was sent, so it is unknown whether the change was applied. Refresh to check before retrying.";
     }
-    if (offlineBeforeDispatch) {
-      return "This browser is offline, so the request was not sent. Reconnect, then retry.";
+    if (offlineHint) {
+      return "Admin could not be reached. The browser reports being offline; check the local connection and that Admin is running, then retry.";
     }
     return "Admin could not be reached, so nothing was changed. Check that it is running, then retry.";
   }
@@ -5727,6 +5912,54 @@
       && isNonEmptyString(result.profile.id) && Array.isArray(result.profiles));
   }
 
+  function validSystemDeleteResult(result, systemId, purgeHistory) {
+    const purge = result?.history_purge;
+    return Boolean(result && result.ok === true && result.system_id === systemId
+      && typeof result.deleted_label === "string" && Array.isArray(result.systems)
+      && result.systems.every((system) => system && isNonEmptyString(system.id)
+        && system.id !== systemId && typeof system.label === "string")
+      && (result.default_system_id === null || (isNonEmptyString(result.default_system_id)
+        && result.systems.some((system) => system.id === result.default_system_id)))
+      && purge && purge.requested === purgeHistory && typeof purge.ok === "boolean"
+      && typeof purge.detail === "string"
+      && (purge.summary === null || (purge.summary && Number.isInteger(purge.summary.total_rows)
+        && purge.summary.total_rows >= 0))
+      && (!purge.requested || !purge.ok || purge.summary !== null));
+  }
+
+  function validBootstrapResult(result, submitted) {
+    // account_bootstrap.py can return HTTP 200/ok:false after account setup
+    // when the requested sudo policy is unverified. That is not a refusal.
+    return Boolean(result && typeof result.ok === "boolean" && result.host === submitted.host
+      && result.platform === submitted.platform && result.service_user === submitted.service_user
+      && typeof result.sudo_rules_installed === "boolean" && isNonEmptyString(result.key_source)
+      && isNonEmptyString(result.detail)
+      && (result.authorized_keys_path === null || isNonEmptyString(result.authorized_keys_path))
+      && result.ok === (!submitted.install_sudo_rules || result.sudo_rules_installed)
+      && (!result.sudo_rules_installed || submitted.install_sudo_rules));
+  }
+
+  function validGeneratedKeyResult(result, name) {
+    return Boolean(result && result.ok === true && result.key?.name === name
+      && isNonEmptyString(result.key.runtime_private_path) && Array.isArray(result.keys)
+      && result.keys.every((key) => key && isNonEmptyString(key.name))
+      && result.keys.some((key) => key.name === name));
+  }
+
+  function validHaNodesResult(result) {
+    return Boolean(result && result.ok === true && Array.isArray(result.nodes)
+      && result.nodes.every((node) => node && typeof node.system_id === "string"
+        && typeof node.label === "string" && (node.host === null || typeof node.host === "string"))
+      && result.host_discovery && typeof result.host_discovery.attempted === "boolean"
+      && typeof result.host_discovery.ok === "boolean");
+  }
+
+  function validProfileDeleteResult(result, profileId) {
+    return Boolean(result && result.ok === true && result.profile_id === profileId
+      && typeof result.deleted_label === "string" && Array.isArray(result.profiles)
+      && result.profiles.every((profile) => profile && isNonEmptyString(profile.id) && profile.id !== profileId));
+  }
+
   // Confirmed refusals say "failed"; an unknown outcome says so and keeps the
   // draft so the operator re-checks instead of saving the same change twice.
   function describeMutationFailure(action, error) {
@@ -5738,58 +5971,104 @@
   }
 
   async function fetchJson(url, options = {}) {
+    const { acceptPartialResult = null, validateResult = null, ...requestOptions } = options;
     const mutating = isMutatingRequest(options);
-    // Sampled before dispatch: this is the only offline evidence that can
-    // show the request was never sent.
-    const offlineBeforeDispatch = browserIsOffline();
-    let response;
+    // An offline hint must not veto a request to a reachable local sidecar.
+    const offlineHint = browserIsOffline();
     try {
-      response = await fetchOrReportStopped(url, options);
+      const { body } = await fetchOrReportStopped(url, {
+        ...requestOptions,
+        readBody: async (response, signal) => {
+          let payload;
+          try {
+            payload = await readJsonResponse(response, signal);
+          } catch (protocolError) {
+            if (signal?.aborted || protocolError?.name === "AbortError") {
+              throw protocolError;
+            }
+            // Headers do not decide a mutation whose body is malformed.
+            const outcome = response?.ok
+              ? (mutating ? "unknown" : "error")
+              : classifyResponseFailure(response?.status, mutating);
+            const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
+            error.status = response?.status;
+            error.requestId = protocolError.requestId;
+            error.protocolError = true;
+            throw error;
+          }
+          if (response.ok && validateResult) requireMutationResult(validateResult(payload), "submitted operation");
+          if (!response.ok || (payload.ok === false && !acceptPartialResult?.(payload))) {
+            const outcome = classifyResponseFailure(response?.status, mutating);
+            const error = adminRequestError(
+              describeResponseFailure(describeRequestFailure(payload, response), outcome), outcome
+            );
+            error.status = response.status;
+            throw error;
+          }
+          return payload;
+        },
+      });
+      return body;
     } catch (error) {
-      // An abort is the caller's own cancellation or timeout contract, which
-      // already describes its outcome. Leave it exactly as it was thrown.
-      if (error?.name === "AbortError") {
+      // Keep the caller's cancellation API, distinct from deadline expiry.
+      if (error?.name === "AbortError" || error?.adminOutcome) {
         throw error;
       }
-      // A client timeout on a mutation fires after dispatch, so the sidecar may
-      // still apply the change; a timed-out read changed nothing.
       if (error?.timedOut) {
         if (mutating) {
           const unknown = adminRequestError(`${error.message} The change may or may not have been applied; re-check the current state before retrying.`, "unknown");
           unknown.timedOut = true;
+          unknown.requestDispatched = error.requestDispatched;
           throw unknown;
         }
         error.adminOutcome = "transport";
         throw error;
       }
-      const outcome = classifyTransportFailure(mutating, offlineBeforeDispatch);
-      throw adminRequestError(describeTransportFailure(outcome, offlineBeforeDispatch), outcome);
+      const outcome = classifyTransportFailure(mutating, error.requestDispatched);
+      const failure = adminRequestError(describeTransportFailure(outcome, offlineHint), outcome);
+      failure.requestDispatched = error.requestDispatched;
+      throw failure;
     }
-    let payload;
+  }
+
+
+  // Both restore routes return import_archive's decided result. Maintenance
+  // failures mean the restore succeeded but services need operator attention.
+  function validBackupRestoreResult(result) {
+    const strings = (value) => Array.isArray(value) && value.every(isNonEmptyString);
+    return Boolean(result && result.ok === true
+      && Array.isArray(result.systems)
+      && result.systems.every((system) => system && isNonEmptyString(system.id) && typeof system.label === "string")
+      && (result.default_system_id === null || typeof result.default_system_id === "string")
+      && strings(result.restored_paths)
+      && typeof result.restored_history_database === "boolean"
+      && strings(result.stopped_containers) && strings(result.restarted_containers)
+      && result.restart_failures && typeof result.restart_failures === "object"
+      && !Array.isArray(result.restart_failures)
+      && Object.entries(result.restart_failures).every(([key, value]) => isNonEmptyString(key) && typeof value === "string"));
+  }
+
+  async function fetchBackupRestore(url, options) {
     try {
-      payload = await readJsonResponse(response);
-    } catch (protocolError) {
-      // A malformed or empty body carries no decided result. For a mutation
-      // that reached the sidecar the change may already be applied (#411).
-      const outcome = response?.ok
-        ? (mutating ? "unknown" : "error")
-        : classifyResponseFailure(response?.status, mutating);
-      const error = adminRequestError(describeResponseFailure(protocolError.message, outcome), outcome);
-      error.status = response?.status;
-      error.requestId = protocolError.requestId;
-      error.protocolError = true;
+      const payload = await fetchJson(url, options);
+      requireMutationResult(validBackupRestoreResult(payload), "backup restore");
+      return payload;
+    } catch (error) {
+      // An ok:false 2xx is not the route's documented pre-apply refusal.
+      if ((error.status >= 200 && error.status < 300)
+          || (error.name === "AbortError" && error.requestDispatched)) {
+        error.adminOutcome = "unknown";
+        error.outcomeUnknown = true;
+      }
       throw error;
     }
-    if (!response.ok || (payload && payload.ok === false)) {
-      const outcome = classifyResponseFailure(response?.status, mutating);
-      const error = adminRequestError(
-        describeResponseFailure(describeRequestFailure(payload, response), outcome),
-        outcome
-      );
-      error.status = response.status;
-      throw error;
+  }
+
+  function describeBackupRestoreFailure(error, source = "") {
+    if (error?.outcomeUnknown) {
+      return `It is unknown whether the restore${source ? ` from ${source}` : ""} finished. ${error.message} Refresh the page to check the current settings before restoring again. Check the backup again for a new inspection receipt.`;
     }
-    return payload || {};
+    return `Import failed: ${error.message || error}`;
   }
 
   const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
@@ -5816,24 +6095,39 @@
     // headers arrive), and the call resolves to { response, body }.
     const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, readBody, ...fetchOptions } = options;
     const controller = new AbortController();
-    const cancel = () => controller.abort();
-    let timedOut = false;
-    const timerId = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
-    if (callerSignal?.aborted) {
-      controller.abort();
-    } else {
-      callerSignal?.addEventListener("abort", cancel, { once: true });
-    }
+    let dispatched = false;
+    let rejectStopped;
+    const stopped = new Promise((_resolve, reject) => { rejectStopped = reject; });
+    const stop = (error) => {
+      if (controller.signal.aborted) return;
+      // Reject first: a body reader may translate its abort into a protocol error.
+      rejectStopped(error);
+      controller.abort(error);
+    };
+    const cancel = () => {
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      stop(error);
+    };
+    const timerId = setTimeout(() => stop(requestTimeoutError(timeoutMs)),
+      Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
+    if (callerSignal?.aborted) cancel();
+    else callerSignal?.addEventListener("abort", cancel, { once: true });
     try {
-      const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
-      return readBody ? { response, body: await readBody(response) } : response;
+      // Race the complete reader, not only fetch or the abort signal. Synthetic
+      // readers and broken transports may ignore abort indefinitely.
+      const operation = (async () => {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        dispatched = true;
+        const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+        if (controller.signal.aborted) throw controller.signal.reason;
+        const body = readBody ? await readBody(response, controller.signal) : null;
+        if (controller.signal.aborted) throw controller.signal.reason;
+        return readBody ? { response, body } : response;
+      })();
+      return await Promise.race([stopped, operation]);
     } catch (error) {
-      if (timedOut && !callerSignal?.aborted) {
-        throw requestTimeoutError(timeoutMs);
-      }
+      error.requestDispatched = dispatched;
       throw error;
     } finally {
       clearTimeout(timerId);
@@ -5937,7 +6231,7 @@
       setBanner(`ESXi package upload failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupEsxiHostPrepUploadButton) {
-        elements.setupEsxiHostPrepUploadButton.disabled = false;
+        elements.setupEsxiHostPrepUploadButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6031,7 +6325,7 @@
       setBanner(`TLS inspection failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupInspectTlsButton) {
-        elements.setupInspectTlsButton.disabled = false;
+        elements.setupInspectTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6060,6 +6354,7 @@
           tls_server_name: collectTlsServerName() || null,
         }),
       });
+      const draftBefore = setupDraftSnapshot();
       state.tlsInspection = payload.inspection || state.tlsInspection;
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
@@ -6067,6 +6362,7 @@
       if (elements.setupVerifySsl) {
         elements.setupVerifySsl.checked = true;
       }
+      recordSetupDraftChange(draftBefore);
       renderTlsInspection();
       syncVerifySslHelp();
       syncTlsServerNameHelp();
@@ -6091,7 +6387,7 @@
       setBanner(`Saving the remote certificate material failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupTrustRemoteTlsButton) {
-        elements.setupTrustRemoteTlsButton.disabled = false;
+        elements.setupTrustRemoteTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6121,12 +6417,14 @@
           tls_server_name: collectTlsServerName() || null,
         }),
       });
+      const draftBefore = setupDraftSnapshot();
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
       }
       if (elements.setupVerifySsl) {
         elements.setupVerifySsl.checked = true;
       }
+      recordSetupDraftChange(draftBefore);
       syncVerifySslHelp();
       const trusted = syncTlsTrustStatus(payload.validation || null);
       const validationDetail = buildTlsValidationSuggestion(payload.validation);
@@ -6148,33 +6446,45 @@
       setBanner(`TLS bundle import failed: ${error.message || error}`, "error");
     } finally {
       if (elements.setupTlsImportCaButton) {
-        elements.setupTlsImportCaButton.disabled = false;
+        elements.setupTlsImportCaButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
 
-  function refreshState({ quiet = false } = {}) {
+  function refreshState({ quiet = false, canPublish = null, failureMessage = null, catalogOnly = false, catalogOwner = null } = {}) {
+    // Capture notification ownership now, even if this read must queue. A quiet
+    // post-write refresh still runs after its dialog closes, but cannot borrow
+    // a successor's banner or editor intent when it eventually completes.
+    const admitted = !canPublish || canPublish();
+    if (admitted) state.bannerRevision = (state.bannerRevision || 0) + 1;
+    const options = { quiet, canPublish, failureMessage, catalogOnly, catalogOwner,
+      bannerRevision: state.bannerRevision,
+      editorGeneration: state.setupEditorGeneration,
+      draftRevision: state.setupDraftRevision,
+      storageViewId: state.selectedStorageViewId };
     if (state.refreshPromise) {
       // A refresh is already running. Instead of silently returning (which left callers
       // that awaited refreshState() after a save reading stale lists), queue exactly one
       // follow-up refresh that starts once the in-flight one settles, and hand every
       // caller that promise so their post-refresh lookups observe state at least as new
       // as their own write.
-      state.refreshQueuedQuiet = Boolean(state.refreshQueuedQuiet) && Boolean(quiet);
+      // A closed restore still requires the read, but cannot retire a live
+      // queued caller's notification. All callers await the same fresh read.
+      if (!state.refreshQueued || admitted) state.refreshQueuedOptions = options;
       if (!state.refreshQueued) {
         state.refreshQueued = state.refreshPromise
           .catch(() => {})
-          .then(() => startRefreshState({ quiet: state.refreshQueuedQuiet }));
+          .then(() => startRefreshState(state.refreshQueuedOptions));
       }
       return state.refreshQueued;
     }
-    return startRefreshState({ quiet });
+    return startRefreshState(options);
   }
 
-  function startRefreshState({ quiet = false } = {}) {
+  function startRefreshState(options = {}) {
     state.refreshQueued = null;
-    state.refreshQueuedQuiet = true;
-    const run = runRefreshState({ quiet }).finally(() => {
+    state.refreshQueuedOptions = null;
+    const run = runRefreshState(options).finally(() => {
       if (state.refreshPromise === run) {
         state.refreshPromise = null;
       }
@@ -6183,12 +6493,18 @@
     return run;
   }
 
-  async function runRefreshState({ quiet = false } = {}) {
+  async function runRefreshState({ quiet = false, canPublish = null, failureMessage = null,
+    bannerRevision = state.bannerRevision, editorGeneration = state.setupEditorGeneration,
+    draftRevision = state.setupDraftRevision, storageViewId = state.selectedStorageViewId, catalogOnly = false, catalogOwner = null } = {}) {
+    const ownsBanner = () => (!canPublish || canPublish()) && state.bannerRevision === bannerRevision
+      && state.setupEditorGeneration === editorGeneration && state.setupDraftRevision === draftRevision
+      && state.selectedStorageViewId === storageViewId;
     if (elements.refreshStateButton) {
       elements.refreshStateButton.disabled = true;
     }
-    if (!quiet) {
+    if (!quiet && ownsBanner()) {
       setBanner("Refreshing...");
+      bannerRevision = state.bannerRevision;
     }
     try {
       const payload = await fetchJson("/api/admin/state");
@@ -6222,22 +6538,39 @@
       }
       // Paint the fresh admin state first; the removed-system history scan hits SQLite
       // and must not hold up container status or the saved-system lists.
-      renderAll();
-      if (state.loadedSystemId) {
+      if (catalogOnly) {
+        // Current catalog admission owns pin validity, even if its initiating
+        // mutation retired. Preserve only a still-current mutation across this
+        // synchronous delta; never advance an owner that retired during the GET.
+        const ownsCatalogDraft = catalogOwner?.owns() === true;
+        const draftBefore = setupDraftSnapshot();
+        renderProfileSetupDependencies();
+        recordSetupDraftChange(draftBefore);
+        if (ownsCatalogDraft) catalogOwner.advance();
+        renderExistingSystemCatalog();
+        renderRuntimeCards();
+      } else {
+        renderAll();
+      }
+      if (!catalogOnly && state.loadedSystemId) {
         void fetchLiveEnclosures({ quiet: true });
         void fetchStorageViewCandidates({ quiet: true });
       }
       // The scan can take minutes on large history; the history section shows its
       // own progress, so the refresh reports done without waiting on it.
       void loadOrphanedHistory({ quiet: true });
-      if (!quiet) {
+      if (!quiet && ownsBanner()) {
         setBanner("Refreshed.", "success");
       }
+      return true;
     } catch (error) {
-      setBanner(`Unable to refresh admin state: ${error.message || error}`, "error");
+      if (ownsBanner()) {
+        setBanner(failureMessage || `Unable to refresh admin state: ${error.message || error}`, "error");
+      }
+      return false;
     } finally {
       if (elements.refreshStateButton) {
-        elements.refreshStateButton.disabled = false;
+        elements.refreshStateButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6282,7 +6615,7 @@
     const buttons = elements.runtimeCards?.querySelectorAll("[data-runtime-action][data-container-key]") || [];
     buttons.forEach((button) => {
       if (String(button.dataset.containerKey || "") === String(containerKey || "")) {
-        button.disabled = Boolean(pending);
+        button.disabled = Boolean(pending || state.sessionStopped);
       }
     });
   }
@@ -6676,7 +7009,6 @@
   }
 
   async function runImportBackup() {
-    let importDispatched = false;
     const file = readSelectedImportFile();
     const passphrase = readOptionalSecretValue(elements.backupImportPassphrase);
     if (!file) {
@@ -6725,12 +7057,10 @@
       if (elements.backupImportResult) {
         elements.backupImportResult.textContent = `Importing inspected ${file.name}...`;
       }
-      importDispatched = true;
-      const { response, body: payload } = await fetchWithTimeout(
+      const payload = await fetchBackupRestore(
         `/api/admin/backup/import?stop_services=${String(stopServices)}&restart_services=${String(restartServices)}`,
         {
           timeoutMs: BACKUP_TRANSFER_TIMEOUT_MS,
-          readBody: readJsonResponse,
           method: "POST",
           headers: {
             "Content-Type": "application/octet-stream",
@@ -6741,11 +7071,8 @@
           body: archiveBytes,
         }
       );
-      if (!response.ok || payload?.ok === false) {
-        throw new Error(describeApiError(payload?.detail) || `Request failed with ${response.status}`);
-      }
       state.systems = Array.isArray(payload.systems) ? payload.systems : state.systems;
-      state.defaultSystemId = payload.default_system_id || state.defaultSystemId;
+      state.defaultSystemId = payload.default_system_id;
       const outcome = describeMaintenanceOutcome({
         stopped: payload.stopped_containers,
         restarted: payload.restarted_containers,
@@ -6768,26 +7095,20 @@
       } else {
         setBanner(`Full backup imported from ${file.name}.`, "success");
       }
-      await refreshState({ quiet: true });
+      try {
+        await refreshState({ quiet: true });
+      } catch (_) {
+        setBanner(`Full backup imported from ${file.name}, but the page could not refresh. Refresh to check the current settings and service status.`, "error");
+      }
     } catch (error) {
-      if (importDispatched && error?.timedOut) {
-        // The restore runs on the server after the upload, so a browser timeout
-        // does not stop it. Say the outcome is unknown instead of "failed" so
-        // nobody repeats a restore that may already have been applied.
-        const message = `It is unknown whether the restore from ${file.name} finished. ${error.message} Refresh the page to check the current settings before restoring again.`;
-        if (elements.backupImportResult) {
-          elements.backupImportResult.textContent = message;
-        }
-        setBanner(message, "error");
-        return;
-      }
+      const message = describeBackupRestoreFailure(error, file.name);
       if (elements.backupImportResult) {
-        elements.backupImportResult.textContent = `Import failed: ${error.message || error}`;
+        elements.backupImportResult.textContent = message;
       }
-      setBanner(`Full backup import failed: ${error.message || error}`, "error");
+      setBanner(message, "error");
     } finally {
       if (elements.backupImportButton) {
-        elements.backupImportButton.disabled = false;
+        elements.backupImportButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6836,7 +7157,7 @@
       setBanner(message, "error");
     } finally {
       if (elements.setupCreateDemoButton) {
-        elements.setupCreateDemoButton.disabled = false;
+        elements.setupCreateDemoButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -6887,7 +7208,7 @@
     } finally {
       state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
-        elements.historyPurgeOrphanedButton.disabled = emptyPreview;
+        elements.historyPurgeOrphanedButton.disabled = emptyPreview || Boolean(state.sessionStopped);
       }
     }
   }
@@ -7032,8 +7353,10 @@
     syncKeyHelp();
     try {
       const payload = await fetchJson("/api/admin/ssh-keys");
+      const draftBefore = setupDraftSnapshot();
       state.sshKeys = Array.isArray(payload.keys) ? payload.keys : [];
       syncKeyMode();
+      recordSetupDraftChange(draftBefore);
       if (!quiet) {
         setBanner("SSH key list refreshed.", "success");
       }
@@ -7055,13 +7378,19 @@
       elements.setupGenerateKeyName.value = desiredName;
     }
     setBanner(`Generating SSH key pair ${desiredName}...`);
+    const owner = captureAdminEditorOperation("key-generation");
     try {
       const payload = await fetchJson("/api/admin/ssh-keys/generate", {
         method: "POST",
+        validateResult: (value) => validGeneratedKeyResult(value, desiredName),
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: desiredName }),
       });
-      state.sshKeys = Array.isArray(payload.keys) ? payload.keys : state.sshKeys;
+      requireMutationResult(validGeneratedKeyResult(payload, desiredName), "SSH key generation");
+      recordAdminEditorOutcome("key-generation", desiredName, "success");
+      state.sshKeys = payload.keys;
+      if (!owner.owns()) return;
+      const draftBefore = setupDraftSnapshot();
       renderSshKeyOptions(payload.key?.name || desiredName);
       if (elements.setupSshKeyMode) {
         elements.setupSshKeyMode.value = "reuse";
@@ -7071,10 +7400,24 @@
         elements.setupSshExistingKey.value = payload.key.name;
       }
       applySelectedKey();
+      recordSetupDraftChange(draftBefore);
       setBanner(`SSH key pair ${desiredName} generated.`, "success");
     } catch (error) {
-      setBanner(`SSH key generation failed: ${error.message || error}`, "error");
+      recordAdminEditorOutcome("key-generation", desiredName, error.adminOutcome || "error");
+      if (owner.owns()) setBanner(describeMutationFailure("SSH key generation", error), "error");
     }
+  }
+
+  async function fetchBootstrapResult(payload) {
+    const result = await fetchJson("/api/admin/system-setup/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      acceptPartialResult: (value) => validBootstrapResult(value, payload) && value.ok === false,
+      validateResult: (value) => validBootstrapResult(value, payload),
+    });
+    requireMutationResult(validBootstrapResult(result, payload), "service-account bootstrap");
+    return result;
   }
 
   async function bootstrapServiceAccount() {
@@ -7089,6 +7432,7 @@
       return;
     }
 
+    const owner = captureAdminEditorOperation("bootstrap");
     if (elements.setupBootstrapButton) {
       elements.setupBootstrapButton.disabled = true;
     }
@@ -7097,11 +7441,16 @@
     }
 
     try {
-      const result = await fetchJson("/api/admin/system-setup/bootstrap", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const result = await fetchBootstrapResult(payload);
+      recordAdminEditorOutcome("bootstrap", payload.host, result.ok ? "success" : "partial");
+      if (!owner.owns()) return;
+      if (!result.ok) {
+        if (elements.setupBootstrapResult) elements.setupBootstrapResult.textContent = result.detail;
+        if (elements.setupResult) elements.setupResult.textContent = "Account setup may have completed, but permissions are unverified. Check the host before retrying.";
+        setBanner(`Bootstrap partially completed on ${payload.host}. ${result.detail} Check the host before retrying.`, "error");
+        return;
+      }
+      const draftBefore = setupDraftSnapshot();
       if (elements.setupSshEnabled) {
         elements.setupSshEnabled.checked = true;
       }
@@ -7128,6 +7477,8 @@
       }
       syncSshFields();
       maybeLoadRecommendedCommands();
+      recordSetupDraftChange(draftBefore);
+      owner.advance();
       scheduleSudoersPreviewRefresh(0);
       if (elements.setupBootstrapResult) {
         const sudoState = result.sudo_rules_installed
@@ -7140,13 +7491,15 @@
       }
       setBanner(`Bootstrap complete for ${result.service_user || payload.service_user}.`, "success");
     } catch (error) {
-      if (elements.setupBootstrapResult) {
-        elements.setupBootstrapResult.textContent = `Bootstrap failed: ${error.message || error}`;
+      recordAdminEditorOutcome("bootstrap", payload.host, error.adminOutcome || "error");
+      const message = describeMutationFailure("Bootstrap", error);
+      if (owner.owns() && elements.setupBootstrapResult) {
+        elements.setupBootstrapResult.textContent = message;
       }
-      setBanner(`Bootstrap failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      if (elements.setupBootstrapButton) {
-        elements.setupBootstrapButton.disabled = false;
+      if (owner.owns() && elements.setupBootstrapButton) {
+        elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7165,6 +7518,16 @@
       setBanner("Choose or create an SSH key first.", "error");
       return;
     }
+    // Acknowledgement belongs to this visit and revision, not whichever form is
+    // visible when the request finishes. Keep the saved-list refresh independent.
+    const editorGeneration = state.setupEditorGeneration;
+    const draftRevision = state.setupDraftRevision;
+    const loadedSystemId = state.loadedSystemId;
+    const selectedSystemId = state.selectedExistingSystemId;
+    const ownsEditor = () => state.setupEditorGeneration === editorGeneration
+      && state.loadedSystemId === loadedSystemId;
+    const ownsDraft = () => ownsEditor() && state.setupDraftRevision === draftRevision
+      && (elements.setupSystemId?.value?.trim() || null) === (payload.system_id || null);
     if (elements.setupCreateButton) {
       elements.setupCreateButton.disabled = true;
     }
@@ -7178,15 +7541,21 @@
         body: JSON.stringify(payload),
       });
       requireMutationResult(validSystemSaveResult(result), "system save");
-      state.setupDirty = false;
-      state.loadedSystemId = result.system?.id || state.loadedSystemId;
-      state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
+      if (ownsDraft()) {
+        state.setupDirty = false;
+        state.loadedSystemId = result.system?.id || state.loadedSystemId;
+        if (state.selectedExistingSystemId === selectedSystemId) {
+          state.selectedExistingSystemId = result.system?.id || state.selectedExistingSystemId;
+        }
+      }
       state.defaultSystemId = result.default_system_id || state.defaultSystemId;
-      renderSaveResult(
-        elements.setupResult,
-        result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
-        result
-      );
+      if (state.setupEditorGeneration === editorGeneration) {
+        renderSaveResult(
+          elements.setupResult,
+          result.detail || `${result.updated_existing ? "Updated" : "Created"} ${result.system?.label || payload.label}.`,
+          result
+        );
+      }
       updateCreateButton();
       setBanner(`${result.updated_existing ? "Updated" : "Created"} system ${result.system?.label || payload.label}.`, "success");
       await refreshState({ quiet: true });
@@ -7196,13 +7565,13 @@
       const reason = error?.message || String(error);
       const keptDraftNote = /only accepts changes from/.test(reason) ? " Your entries are still in the form." : "";
       const message = `${describeMutationFailure("System setup", error)}${keptDraftNote}`;
-      if (elements.setupResult) {
+      if (ownsEditor() && elements.setupResult) {
         elements.setupResult.textContent = message;
       }
       setBanner(message, "error");
     } finally {
       if (elements.setupCreateButton) {
-        elements.setupCreateButton.disabled = false;
+        elements.setupCreateButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7217,8 +7586,10 @@
     const deletingLoadedSystem = selectedSystem.id === state.loadedSystemId;
     const deletingDefaultSystem = selectedSystem.id === state.defaultSystemId;
     const purgeHistory = Boolean(elements.existingSystemDeleteHistoryToggle?.checked);
+    const owner = captureAdminEditorOperation("system-delete", { selection: true });
     if (purgeHistory && historyRowCountForSystem(selectedSystem.id) === null) {
       await loadHistoryRowCounts({ quiet: true });
+      if (!owner.owns()) return;
       renderExistingSystems();
     }
     const historyRows = historyRowCountForSystem(selectedSystem.id);
@@ -7260,20 +7631,29 @@
         `/api/admin/system-setup/${encodeURIComponent(selectedSystem.id)}${params.size ? `?${params.toString()}` : ""}`,
         {
           method: "DELETE",
+          validateResult: (value) => validSystemDeleteResult(value, selectedSystem.id, purgeHistory),
         }
       );
-      state.systems = Array.isArray(payload.systems) ? payload.systems : [];
-      state.defaultSystemId = payload.default_system_id || null;
+      requireMutationResult(validSystemDeleteResult(payload, selectedSystem.id, purgeHistory), "system delete");
+      recordAdminEditorOutcome("system-delete", selectedSystem.id, "success");
+      const ownsDraft = owner.owns();
+      state.systems = payload.systems;
+      state.defaultSystemId = payload.default_system_id;
       state.runtime = payload.runtime || state.runtime;
 
-      if (deletingLoadedSystem) {
+      if (deletingLoadedSystem && ownsDraft) {
         resetSetupForm();
+        owner.advance();
       } else {
-        if (state.selectedExistingSystemId === selectedSystem.id) {
+        if (ownsDraft && state.selectedExistingSystemId === selectedSystem.id) {
           state.selectedExistingSystemId = state.defaultSystemId || state.systems[0]?.id || "";
         }
-        renderAll();
+        if (ownsDraft) renderExistingSystems();
+        else renderExistingSystemCatalog();
       }
+
+      if (state.historyRowCounts) delete state.historyRowCounts[selectedSystem.id];
+      if (!ownsDraft) return;
 
       renderSaveResult(
         elements.setupResult,
@@ -7283,9 +7663,7 @@
       if (elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.checked = false;
       }
-      if (state.historyRowCounts) {
-        delete state.historyRowCounts[selectedSystem.id];
-      }
+      owner.advance();
       if (payload.history_purge?.requested && !payload.history_purge.ok) {
         setBanner(
           `Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}, but its history could not be deleted: ${payload.history_purge.detail || "unknown error"}`,
@@ -7301,16 +7679,18 @@
         setBanner(`Deleted ${payload.deleted_label || selectedSystem.label || selectedSystem.id}. Its history is kept.`, "success");
       }
     } catch (error) {
-      if (elements.setupResult) {
-        elements.setupResult.textContent = `System delete failed: ${error.message || error}`;
+      recordAdminEditorOutcome("system-delete", selectedSystem.id, error.adminOutcome || "error");
+      const message = describeMutationFailure("System delete", error);
+      if (owner.owns() && elements.setupResult) {
+        elements.setupResult.textContent = message;
       }
-      setBanner(`System delete failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
       const currentSelectedSystem = getSystemById(elements.existingSystemSelect?.value || state.selectedExistingSystemId);
-      if (elements.existingSystemDeleteButton) {
-        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem;
+      if (owner.owns() && elements.existingSystemDeleteButton) {
+        elements.existingSystemDeleteButton.disabled = !currentSelectedSystem || Boolean(state.sessionStopped);
       }
-      if (elements.existingSystemDeleteHistoryToggle) {
+      if (owner.owns() && elements.existingSystemDeleteHistoryToggle) {
         elements.existingSystemDeleteHistoryToggle.disabled = !currentSelectedSystem;
         if (!currentSelectedSystem) {
           elements.existingSystemDeleteHistoryToggle.checked = false;
@@ -7361,6 +7741,7 @@
       slot_layout: layoutResolution.slotLayoutForSave,
     };
 
+    const owner = captureAdminEditorOperation("profile-save", { builder: true });
     if (elements.profileBuilderSaveButton) {
       elements.profileBuilderSaveButton.disabled = true;
     }
@@ -7375,19 +7756,37 @@
         body: JSON.stringify(payloadBody),
       });
       requireMutationResult(validProfileSaveResult(payload), "custom profile save");
+      recordAdminEditorOutcome("profile-save", draft.id, "success");
       const savedProfileId = payload.profile.id;
-      state.loadedBuilderProfileId = savedProfileId;
-      state.selectedProfileId = savedProfileId;
-      if (elements.setupProfile) {
-        elements.setupProfile.value = savedProfileId;
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true, catalogOwner: owner });
+      if (!owner.owns()) return;
+      if (refreshed === false) {
+        const message = `Saved custom profile ${savedProfileId}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
+        renderSaveResult(elements.profileBuilderResult, message, payload);
+        setBanner(message, "info");
+        return;
       }
-      await refreshState({ quiet: true });
+      {
+        const draftBefore = setupDraftSnapshot();
+        renderProfileOptions();
+        state.loadedBuilderProfileId = savedProfileId;
+        state.selectedProfileId = savedProfileId;
+        if (elements.setupProfile) {
+          elements.setupProfile.value = savedProfileId;
+        }
+        recordSetupDraftChange(draftBefore);
+        owner.advance();
+      }
       const refreshedProfile = getProfileById(savedProfileId);
       if (refreshedProfile) {
         loadProfileIntoBuilder(refreshedProfile);
       } else {
         renderProfileBuilder();
       }
+      owner.advance();
+      renderProfilePreview();
+      renderProfileCatalog();
+      renderStorageViews();
       renderSaveResult(elements.profileBuilderResult, payload.detail || `Saved custom profile ${savedProfileId}.`, payload);
       setBanner(
         payload.updated_existing
@@ -7396,14 +7795,15 @@
         "success"
       );
     } catch (error) {
+      recordAdminEditorOutcome("profile-save", draft.id, error.adminOutcome || "error");
       const message = describeMutationFailure("Custom profile save", error);
-      if (elements.profileBuilderResult) {
+      if (owner.owns() && elements.profileBuilderResult) {
         elements.profileBuilderResult.textContent = message;
       }
-      setBanner(message, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      if (elements.profileBuilderSaveButton) {
-        elements.profileBuilderSaveButton.disabled = false;
+      if (owner.owns() && elements.profileBuilderSaveButton) {
+        elements.profileBuilderSaveButton.disabled = Boolean(state.sessionStopped);
       }
     }
   }
@@ -7432,6 +7832,8 @@
       return;
     }
 
+    const owner = captureAdminEditorOperation("profile-delete", { builder: true });
+    const submittedCatalog = state.profiles;
     if (elements.profileBuilderDeleteButton) {
       elements.profileBuilderDeleteButton.disabled = true;
     }
@@ -7442,23 +7844,76 @@
     try {
       const payload = await fetchJson(`/api/admin/profiles/${encodeURIComponent(profile.id)}`, {
         method: "DELETE",
+        validateResult: (value) => validProfileDeleteResult(value, profile.id),
       });
-      state.loadedBuilderProfileId = "";
-      await refreshState({ quiet: true });
+      requireMutationResult(validProfileDeleteResult(payload, profile.id), "custom profile delete");
+      recordAdminEditorOutcome("profile-delete", profile.id, "success");
+      const refreshed = await refreshState({ quiet: true, canPublish: owner.owns, catalogOnly: true, catalogOwner: owner });
+      if (!owner.owns()) return;
+      if (refreshed === false) {
+        // Reconcile only the catalog captured before DELETE. A successful
+        // state read replaces that object, even for an equal snapshot, and
+        // takes precedence over this fallback, including a recreated same ID.
+        if (state.profiles === submittedCatalog) {
+          state.profiles = payload.profiles;
+        }
+      }
+      // The successful read already reconciled its catalog. A current-owner
+      // fallback must do the same against whichever catalog remains authoritative.
+      // Advance only after our synchronous edit, preserving our own finalizer.
+      const draftBefore = setupDraftSnapshot();
+      renderProfileSetupDependencies();
+      recordSetupDraftChange(draftBefore);
+      owner.advance();
+      if (refreshed === false) {
+        const message = `Deleted custom profile ${profile.label || profile.id}, but catalog refresh is unavailable. Draft retained; refresh state before making further changes.`;
+        renderSaveResult(elements.profileBuilderResult, message, payload);
+        setBanner(message, "info");
+        return;
+      }
       resetProfileBuilder({ keepResult: true });
+      owner.advance();
       renderSaveResult(elements.profileBuilderResult, payload.detail || `Deleted custom profile ${profile.label || profile.id}.`, payload);
       setBanner(`Deleted custom profile ${profile.label || profile.id}.`, "success");
     } catch (error) {
-      if (elements.profileBuilderResult) {
-        elements.profileBuilderResult.textContent = `Custom profile delete failed: ${error.message || error}`;
+      recordAdminEditorOutcome("profile-delete", profile.id, error.adminOutcome || "error");
+      const message = describeMutationFailure("Custom profile delete", error);
+      if (owner.owns() && elements.profileBuilderResult) {
+        elements.profileBuilderResult.textContent = message;
       }
-      setBanner(`Custom profile delete failed: ${error.message || error}`, "error");
+      if (owner.owns()) setBanner(message, "error");
     } finally {
-      renderProfileBuilder();
+      if (owner.owns()) renderProfileBuilder();
     }
   }
 
-  function renderAll() {
+  function reconcileStorageViewProfilePins() {
+    // Every unsaved view is submitted, including views outside the editor.
+    // Reconcile only missing IDs against the admitted catalog; a newer read
+    // may have recreated the deleted ID. Keep all unrelated model/raw fields.
+    state.storageViews.forEach((storageView) => {
+      if (storageView.profile_id && !getProfileById(storageView.profile_id)) {
+        storageView.profile_id = "";
+      }
+    });
+  }
+
+  function renderProfileSetupDependencies() {
+    reconcileStorageViewProfilePins();
+    renderProfileOptions();
+    renderProfilePreview();
+    renderProfileCatalog();
+    // Refresh catalog-derived storage choices/geometry, not the full editor:
+    // syncStorageViewEditorFromState would replace unrelated raw input drafts.
+    renderStorageViewTemplateOptions();
+    renderStorageViewList();
+    renderStorageViewPreview();
+  }
+
+  function renderAll({ trackSetupDraft = true } = {}) {
+    // Refresh can remove a selected profile/key or derive SSH defaults. Loading
+    // a system/resetting uses its own generation and does not call this path.
+    const draftBefore = trackSetupDraft ? setupDraftSnapshot() : null;
     updateAdminMeta();
     renderConfigurationWarnings();
     renderAdminView();
@@ -7467,6 +7922,7 @@
     renderRuntimeCards();
     renderRuntimeBehaviorSettings();
     renderExistingSystems();
+    reconcileStorageViewProfilePins();
     renderProfileOptions();
     renderProfilePreview();
     renderProfileCatalog();
@@ -7484,6 +7940,10 @@
     syncSshFields();
     updateCreateButton();
     scheduleSudoersPreviewRefresh(0);
+    if (trackSetupDraft) {
+      recordSetupDraftChange(draftBefore);
+    }
+    lockActionsIfStopped();
   }
 
   function bindEvents() {
@@ -7630,7 +8090,9 @@
       if (!button || !elements.setupTlsServerName) {
         return;
       }
+      const draftBefore = setupDraftSnapshot();
       elements.setupTlsServerName.value = button.dataset.tlsServerName || "";
+      recordSetupDraftChange(draftBefore);
       syncVerifySslHelp();
       syncTlsServerNameHelp();
       renderTlsServerNameSuggestions();
@@ -7681,8 +8143,10 @@
       if (!card || !elements.setupProfile) {
         return;
       }
+      const draftBefore = setupDraftSnapshot();
       state.selectedProfileId = card.dataset.profileId || "";
       elements.setupProfile.value = state.selectedProfileId;
+      recordSetupDraftChange(draftBefore);
       renderProfilePreview();
       elements.profileCatalog.querySelectorAll("[data-profile-id]").forEach((profileCard) => {
         const selected = profileCard.dataset.profileId === state.selectedProfileId;
@@ -7725,10 +8189,14 @@
       }
       const eventName = field.matches("select") ? "change" : "input";
       field.addEventListener(eventName, () => {
+        state.profileBuilderRevision = (state.profileBuilderRevision || 0) + 1;
+        retireAdminEditorControls({ builderOnly: true });
         renderProfileBuilder();
       });
     });
     elements.profileBuilderOrdering?.addEventListener("change", () => {
+      state.profileBuilderRevision = (state.profileBuilderRevision || 0) + 1;
+      retireAdminEditorControls({ builderOnly: true });
       if (!elements.profileBuilderOrdering || !elements.profileBuilderLayoutText) {
         renderProfileBuilder();
         return;
@@ -7819,12 +8287,16 @@
         resetSetupForm();
       }
     });
-    elements.setupPanel?.addEventListener("input", (event) => {
+    const markSetupDraftChanged = (event) => {
       if (event.target?.closest?.("[data-runtime-behavior-key], .setup-preview-column")) {
         return;
       }
       state.setupDirty = true;
-    });
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      retireAdminEditorControls();
+    };
+    elements.setupPanel?.addEventListener("input", markSetupDraftChanged);
+    elements.setupPanel?.addEventListener("change", markSetupDraftChanged);
     elements.currentSystemsList?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-existing-system-id]");
       if (!button) {
@@ -7949,7 +8421,9 @@
       });
     });
     elements.setupLoadRecommendedButton?.addEventListener("click", () => {
+      const draftBefore = setupDraftSnapshot();
       maybeLoadRecommendedCommands(true);
+      recordSetupDraftChange(draftBefore);
     });
     elements.setupCreateButton?.addEventListener("click", () => {
       void createSystem();
@@ -8057,6 +8531,8 @@
       editButton: document.getElementById("backup-library-edit-button"),
     },
     fetchJson,
+    fetchBackupRestore,
+    describeBackupRestoreFailure,
     formatBytes,
     formatLocalTimestamp,
     setBanner,
@@ -8065,7 +8541,7 @@
     describeBackupRestoreConfirmation,
     describeMaintenanceOutcome,
     renderMaintenanceResult,
-    refreshAdminState: () => refreshState({ quiet: true }),
+    refreshAdminState: (options = {}) => refreshState({ ...options, quiet: true }),
     isStopped: () => state.sessionStopped,
     isVisible: () => state.currentAdminView === "backups" && document.visibilityState !== "hidden",
     setTimeout: (callback, ms) => window.setTimeout(callback, ms),
@@ -8073,7 +8549,7 @@
   backupLibrary?.bind();
 
   bindEvents();
-  renderAll();
+  renderAll({ trackSetupDraft: false });
   void loadOrphanedHistory({ quiet: true });
   maybeLoadRecommendedCommands();
   startCountdownTimer();

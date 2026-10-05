@@ -268,19 +268,57 @@ as SQLite or JSON is not authenticated.
 
 ### Durable phase state machine
 
+These are all persisted rotation phases accepted by `ROTATION_JOURNAL_PHASES`
+in `history_service/segment_rotation.py`. The state column describes the
+checkpoint, not every possible crash state. Publication can change a live file
+before the next journal update. Recovery authenticates the live catalog against
+exactly one of the recorded prior and candidate identities, rather than choosing
+from the phase name alone.
+
 | Phase | Durable state | Recovery outcome |
 |---|---|---|
-| `prepared` | Journal, verified backup evidence, prior catalog identity, source identity, and closed prior-hot rollback copy are durable. No new final segment is visible. | Keep the prior hot and catalog authoritative. Remove only authenticated staging artifacts, then remove the journal last. |
-| `segment-published` | The journal authenticated the final segment name, size, and digest before no-clobber publication; the segment directory was fsynced. Prior hot and catalog remain active. | Remove only the exact journal-authenticated orphan segment and staging artifacts. Keep prior hot and catalog byte-identical. Remove the journal last. |
-| `hot-staged` | New segment is durable. Staged complementary hot and candidate catalog bytes are closed, hashed, and recorded. Prior hot and catalog remain active. | Remove authenticated staged files and the new segment. Keep prior hot and catalog byte-identical. Remove the journal last. |
-| `hot-replaced` | Live hot matches the staged-hot digest; prior-hot rollback and prior catalog remain preserved; active catalog is still the prior generation. Readers remain blocked. | Restore the authenticated prior hot, remove the authenticated new segment and staged candidate catalog, and retain the prior catalog. Remove the journal last. |
-| `catalog-replaced` | Live hot, new segment, and active catalog match the candidate generation; prior hot and catalog are still preserved. Readers remain blocked. | Finalize forward only when every candidate artifact matches the journal and the catalog retains every prior active segment. Any mismatch fails closed without cleanup. |
-| `cleanup` | Candidate generation is authenticated and committed. Prior rollback artifacts may remain. | Remove only authenticated prior-generation rollback artifacts. Fsync each containing directory and remove the journal last. |
+| `prepared` | Initial journal, verified backup evidence, prior catalog and source identities, and both rollback copies are durable. A further journal write in this phase records the new segment's name, size, and digest before publication. | With the prior catalog active, keep the prior hot and catalog, then enter `prior-restored` before authenticated cleanup. A crash during segment publication can leave an authenticated orphan even in this phase. |
+| `segment-published` | The new segment is published without clobbering an existing name and its directory is fsynced. Prior hot and catalog remain active. A further journal write records the staged hot before catalog staging. | With the prior catalog active, keep the prior hot and catalog, then enter `prior-restored` before removing authenticated staging artifacts and the new segment. |
+| `hot-staged` | New segment is durable. Closed, hashed staged hot and candidate catalog bytes are recorded. Prior hot and catalog remain active at this checkpoint. | With the prior catalog active, keep the prior hot or restore it if hot replacement already occurred, then enter `prior-restored` before cleanup. |
+| `hot-replaced` | Live hot matches the staged-hot digest; both rollback copies remain; active catalog is still prior at this checkpoint. | Restore the prior hot if the prior catalog remains active. If candidate catalog publication already occurred, authenticate and finalize the candidate instead. Persist the selected terminal phase before cleanup. |
+| `catalog-replaced` | Live hot, new segment, and active catalog match the candidate generation; both rollback copies remain. | With the candidate catalog active, authenticate the candidate hot, new segment, and every catalog-selected segment, then enter `cleanup`. |
+| `cleanup` | The terminal decision selects the candidate generation. Rollback or staging artifacts may already have been removed. | Revalidate the selected candidate generation, refresh the durable `cleanup` journal, and remove only remaining authenticated rollback and staging artifacts. Remove the journal last. |
+| `prior-restored` | Recovery has verified the retained segments and authenticated the prior hot and catalog. Any needed hot restoration has completed its parent-directory fsync. The terminal journal selects the prior generation before cleanup. | Require the prior hot and catalog and revalidate every retained segment. Refresh the durable `prior-restored` journal, remove only remaining authenticated new-segment, staging, and rollback artifacts, and remove the journal last. |
 
-Before `catalog-replaced`, recovery always returns to the prior generation. At or
-after `catalog-replaced`, recovery only finalizes the candidate generation when
-all recorded bytes match. It never guesses between generations. A mismatch keeps
-the journal and all evidence in place for repair.
+For a nonterminal phase, both rollback copies must still exist and match their
+journal records. If the live catalog matches the prior record, the hot database
+must match either the prior source or the staged hot record. Recovery verifies
+the prior catalog's retained segments and restores the prior hot when needed.
+If the live catalog matches the candidate record, the hot database and new
+segment must match their candidate records and every catalog-selected segment
+must verify. A catalog matching neither record, or both, fails closed.
+
+Only `cleanup` and `prior-restored` permit missing rollback copies as already
+retired evidence. Every remaining rollback copy must still authenticate.
+`cleanup` requires the candidate catalog and hot; `prior-restored` requires the
+prior catalog and hot. Recovery never switches the selected generation on replay,
+even if the other generation's recorded bytes reappear. This allowance does not
+permit missing or divergent files in the selected generation. Recorded staging
+paths already consumed or removed, and an already-removed orphan new segment on
+the prior branch, need not be recreated. Any remaining artifact must pass its
+own authentication before deletion.
+
+On apply, recovery authenticates the current journal and writes the selected
+terminal phase before removing cleanup evidence. It repeats that write on every
+applied replay, including an already terminal phase. The journal file fsync and
+parent-directory fsync must both finish before cleanup proceeds. Either fsync
+failure stops cleanup, even if the journal replacement is already visible. After
+a failure, keep the journal and remaining evidence for recovery. Cleanup fsyncs
+the affected directories and removes the authenticated journal last. Readers
+remain blocked while the activation journal exists.
+
+The public recovery API holds the history write lock. `--recover` without
+`--apply` reports `prior-generation-ready-to-restore` or
+`candidate-ready-to-finalize` after the branch checks, even for a terminal phase;
+these are not proof that cleanup has completed. An applied recovery reports
+`prior-generation-restored` or `candidate-finalized` only after journal removal.
+For these journal-backed receipts, `phase` is the phase read at entry, not the
+terminal phase newly written during that call.
 
 ### Admission and accounting rules
 
@@ -311,26 +349,67 @@ No source, catalog, segment, or rollback cleanup occurs when backup evidence,
 headroom, path identity, timestamp validity, row accounting, fsync, or digest
 verification fails.
 
-The scheduled archive and hot database have different owners. The backup UID
-owns each private `0600` archive, while the app UID owns the hot database and
-must run the publisher. Do not override `enclosure-backup` to run as the app UID.
-It cannot read the private archive. Do not run rotation as the backup UID either;
-it does not own the hot database.
+The publisher's effective UID must be the hot database's stored owner, not
+merely the configured history service UID. Base Compose runs history as `0:0`;
+the prepared non-root overlay defaults to `10001:10001`. Neither tells you who
+owns existing history. In particular, [dropping the non-root overlay](../wiki/Troubleshooting.md)
+leaves app-owned history readable by a root-run service. A root publisher still
+fails the hot-database owner check in that deployment.
 
 After a fresh scheduled FULL backup succeeds, stop the history service cleanly
 and verify that the one-shot backup container has exited. Confirm that
 `backup-status/scheduled-backup.json` reports the successful run and that the
 configured host destination is `backups/scheduled`, corresponding to
-`/app/backups/scheduled`. Then stage only its named archive into the existing
-history bind. Set these four numeric values to the effective Compose identities
-before running the block. The defaults shown match the base Compose file.
+`/app/backups/scheduled`. Keep writers stopped through staging, dry run, apply,
+and any recovery.
+
+From the deployment directory, inspect metadata without following leaf symlinks.
+These GNU `stat` arguments report names, types, numeric owners, modes, and link
+counts, not database or credential contents:
 
 ```bash
-APP_UID=10001
-APP_GID=10001
-BACKUP_UID=1000
-BACKUP_GID=1000
-sudo env APP_UID="$APP_UID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
+stat -c '%n type=%F uid=%u gid=%g mode=%a links=%h' -- \
+  history history/history.db history/segments \
+  backups/scheduled backup-status backup-status/scheduled-backup.json
+```
+
+Use the actual bind source paths if the deployment overrides them. Inspect the
+status-named archive's metadata separately. Do not substitute the service's
+`user` value for these observations. Set the five shell inputs below explicitly:
+
+- `HISTORY_UID` and `HISTORY_GID` are the stored hot-database owner and group.
+  The existing history bind directory must have that same owner/group for this
+  staging recipe. Existing segments must retain their documented ownership and
+  modes. A mismatch is HOLD for owner investigation, not permission to chown.
+- `BACKUP_UID` and `BACKUP_GID` are the observed scheduled-archive owner/group,
+  which must agree with the backup worker identity and its private directory.
+  Base backup defaults to `0:0`; the non-root overlay defaults to `1000:1000`.
+  These are service defaults, not evidence of stored ownership.
+- `APP_GID` is the configured positive shared-status group, default `10001`.
+  Confirm it against the status directory/file group. Do not set `APP_GID=0`
+  or assume it equals `HISTORY_GID`, even for root-owned history.
+
+For example, an observed root-owned bind and hot database use `HISTORY_UID=0`
+and `HISTORY_GID=0`. An observed `10001:10001` bind and database use
+`HISTORY_UID=10001` and `HISTORY_GID=10001`, even after reverting the service to
+root. Custom IDs require the corresponding observed values. Keep existing
+ownership; do not recursively chown history or backups to make examples fit.
+Reject symlinks, unexpected file types, or ambiguous mounts before continuing.
+The staging block retains its descriptor, owner, mode, and link checks.
+
+A separate backup UID owns private `0600` archives that a non-root history owner
+cannot directly read. The staging block uses host permission to copy only the
+verified status-named archive and assigns only that new copy and its staging
+directory to the stored history owner. It does not change existing ownership.
+These required inputs are helper values, not new Compose settings:
+
+```bash
+: "${HISTORY_UID:?Set the observed hot-database owner UID}"
+: "${HISTORY_GID:?Set the observed hot-database group GID}"
+: "${APP_GID:?Set the positive shared-status group GID}"
+: "${BACKUP_UID:?Set the observed scheduled-backup owner UID}"
+: "${BACKUP_GID:?Set the observed scheduled-backup group GID}"
+sudo env HISTORY_UID="$HISTORY_UID" HISTORY_GID="$HISTORY_GID" APP_GID="$APP_GID" BACKUP_UID="$BACKUP_UID" BACKUP_GID="$BACKUP_GID" python3 - <<'PY'
 import hashlib
 import json
 import os
@@ -353,8 +432,8 @@ def numeric_id(name):
     if not raw.isdecimal():
         raise SystemExit(f"{name} must be a numeric ID")
     value = int(raw)
-    if value <= 0:
-        raise SystemExit(f"{name} must be a non-root numeric ID")
+    if name == "APP_GID" and value == 0:
+        raise SystemExit("APP_GID must be a positive shared-status group ID")
     return value
 
 
@@ -393,8 +472,9 @@ def hash_descriptor(descriptor):
     return size, digest.hexdigest()
 
 
-app_uid = numeric_id("APP_UID")
-app_gid = numeric_id("APP_GID")
+history_uid = numeric_id("HISTORY_UID")
+history_gid = numeric_id("HISTORY_GID")
+status_gid = numeric_id("APP_GID")
 backup_uid = numeric_id("BACKUP_UID")
 backup_gid = numeric_id("BACKUP_GID")
 status_directory = os.open("backup-status", DIRECTORY_FLAGS)
@@ -413,7 +493,7 @@ try:
         or (backup_metadata.st_uid, backup_metadata.st_gid) != (backup_uid, backup_gid)
     ):
         raise SystemExit("scheduled backup directory ownership or mode is invalid")
-    if (history_metadata.st_uid, history_metadata.st_gid) != (app_uid, app_gid):
+    if (history_metadata.st_uid, history_metadata.st_gid) != (history_uid, history_gid):
         raise SystemExit("history directory ownership is invalid")
 
     status_bytes, status_metadata = read_regular(
@@ -421,7 +501,7 @@ try:
     )
     if (
         stat.S_IMODE(status_metadata.st_mode) != 0o640
-        or (status_metadata.st_uid, status_metadata.st_gid) != (backup_uid, app_gid)
+        or (status_metadata.st_uid, status_metadata.st_gid) != (backup_uid, status_gid)
     ):
         raise SystemExit("scheduled backup status ownership or mode is invalid")
     try:
@@ -476,7 +556,7 @@ try:
     os.mkdir(STAGE_NAME, 0o700, dir_fd=history_directory)
     stage_created = True
     stage_directory = os.open(STAGE_NAME, DIRECTORY_FLAGS, dir_fd=history_directory)
-    os.fchown(stage_directory, app_uid, app_gid)
+    os.fchown(stage_directory, history_uid, history_gid)
     os.fchmod(stage_directory, 0o700)
     destination = os.open(
         artifact_name,
@@ -498,7 +578,7 @@ try:
             while view:
                 view = view[os.write(destination, view):]
         os.fsync(destination)
-        os.fchown(destination, app_uid, app_gid)
+        os.fchown(destination, history_uid, history_gid)
         os.fchmod(destination, 0o600)
         staged_metadata = os.fstat(destination)
     finally:
@@ -512,7 +592,7 @@ try:
         or copied_digest.hexdigest() != expected_digest
         or staged_metadata.st_size != expected_size
         or stat.S_IMODE(staged_metadata.st_mode) != 0o600
-        or (staged_metadata.st_uid, staged_metadata.st_gid) != (app_uid, app_gid)
+        or (staged_metadata.st_uid, staged_metadata.st_gid) != (history_uid, history_gid)
     ):
         raise SystemExit("scheduled backup archive changed or failed integrity verification")
     current_status, _ = read_regular(status_directory, "scheduled-backup.json", 64 * 1024)
@@ -546,14 +626,41 @@ The staging block refuses an existing staging directory, unsafe names, symlinks,
 hard links, wrong owners or modes, incomplete FULL-backup status, source changes,
 or a size/SHA-256 mismatch. It does not read or copy the passphrase and prints no
 artifact name or digest. The rotation dry run performs the canonical status and
-freshness validation again.
+freshness validation again. Staging alone does not authorize publication:
+stale status must still fail the rotation dry run and apply admission.
 
-Dry-run the next append transaction while the history service remains
-quiesced. `enclosure-history` keeps its normal app identity and uses only its
-existing history and read-only backup-status mounts:
+Dry-run the next append transaction while the history service remains quiesced.
+Each command explicitly selects the stored `HISTORY_UID:HISTORY_GID` for this
+one-shot publisher. `--no-deps` prevents Compose from starting dependencies.
+This does not change the long-running service identity. Keep the same inspected
+values from staging for dry run, apply, and recovery.
+
+Before running, check the complete ordered Compose configuration. The publisher
+must use the same directory bind at `/app/history`, a writable history mount,
+and the existing read-only `/app/backup-status` mount. Its effective UID must
+match the hot owner; its primary GID must be the stored history GID so newly
+published files retain that group. A non-root publisher also needs status read
+and directory-traverse access through `APP_GID`, either as its primary GID or
+an already configured supplementary group. `--user` does not add supplementary
+groups. The base and non-root history services do not declare `group_add`.
+For ordinary app-owned history, `HISTORY_GID=APP_GID` supplies that access.
+Do not assume UID 0 bypasses permissions when the active overlay drops its
+capabilities. If the existing runtime cannot supply the required identity,
+groups, mounts, and access, HOLD for an owner-approved runtime configuration.
+Do not relax archive modes or path/link checks, add privileges, or migrate
+ownership as a workaround.
+
+The commands below show the base chain. For a prepared non-root deployment,
+use `docker compose -f docker-compose.yml -f docker-compose.nonroot.yml` in
+place of `docker compose` in every command below. Retain all other ordered
+files and runtime settings used by that deployment. A reverted root-run service
+with app-owned history still uses that stored owner's `--user` override.
+Actual root/separate-UID staging and container-runtime qualification remain
+open in [#736](https://github.com/gcs8/truenas-jbod-ui/issues/736); source and
+synthetic command checks do not qualify a deployment.
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -568,7 +675,7 @@ transaction artifacts.
 Apply only after the dry run succeeds and the history service remains quiesced:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --cutoff 2026-08-01T00:00:00+00:00 \
@@ -582,7 +689,7 @@ Inspect a pending recovery without changing files, then repeat with `--apply`
 only after reviewing the reported phase:
 
 ```bash
-docker compose run --rm --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
+docker compose run --rm --no-deps --user "${HISTORY_UID:?}:${HISTORY_GID:?}" --entrypoint python enclosure-history scripts/rotate_segmented_history.py \
   --source /app/history/history.db \
   --segments-dir /app/history/segments \
   --recover

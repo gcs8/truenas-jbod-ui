@@ -93,6 +93,21 @@ class _VerifiedSegmentDigest:
     identity: _AuthenticatedFileIdentity
 
 
+class HistoryStorageUnavailableError(ValueError):
+    """Stored history cannot be safely read, independently of request shape."""
+
+
+def metric_sample_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Deduplicate repeated fetches, not equal aggregate measurements."""
+    if item.get("id") is not None:
+        return ("id", item["id"])
+    return (
+        "rollup", item.get("rollup_seconds"), item.get("bucket_start"),
+        item.get("system_id"), item.get("enclosure_key"), item.get("slot"),
+        item.get("metric_name"), item.get("disk_identity_key") or "",
+    )
+
+
 class SegmentedHistoryReader:
     def __init__(
         self,
@@ -133,6 +148,28 @@ class SegmentedHistoryReader:
         allow_pending_recovery: bool = False,
         allow_pending_activation: bool = False,
         quiesced_hot: bool = False,
+    ) -> "SegmentedHistoryReader":
+        try:
+            return cls._from_catalog(
+                hot_path=hot_path, catalog_path=catalog_path,
+                max_segments_per_query=max_segments_per_query,
+                allow_pending_recovery=allow_pending_recovery,
+                allow_pending_activation=allow_pending_activation,
+                quiesced_hot=quiesced_hot,
+            )
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise HistoryStorageUnavailableError(str(exc)) from exc
+
+    @classmethod
+    def _from_catalog(
+        cls,
+        *,
+        hot_path: Path,
+        catalog_path: Path,
+        max_segments_per_query: int,
+        allow_pending_recovery: bool,
+        allow_pending_activation: bool,
+        quiesced_hot: bool,
     ) -> "SegmentedHistoryReader":
         marker_path = activation_pending_path(hot_path)
         if not allow_pending_activation and path_entry_exists(marker_path):
@@ -446,7 +483,7 @@ class SegmentedHistoryReader:
 
     def _require_activation_ready(self) -> None:
         if self.activation_marker_path is not None and path_entry_exists(self.activation_marker_path):
-            raise ValueError("Segmented history activation is pending.")
+            raise HistoryStorageUnavailableError("Segmented history activation is pending.")
 
     def _selected_segment_paths(self, *, since: str | None) -> tuple[Path, ...]:
         self._require_activation_ready()
@@ -461,13 +498,28 @@ class SegmentedHistoryReader:
             or segment.coverage_end >= since_timestamp
         )
         if len(candidates) > self.max_segments_per_query:
-            raise ValueError("Segmented history query exceeds its segment limit.")
+            raise HistoryStorageUnavailableError("Segmented history query exceeds its segment limit.")
         return tuple(segment.path for segment in candidates)
 
     @contextmanager
-    def _query_connection(self, path: Path) -> Iterator[sqlite3.Connection]:
+    def _query_connection(
+        self, path: Path, hot_connection: sqlite3.Connection | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        try:
+            with self._open_query_connection(path, hot_connection) as connection:
+                yield connection
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise HistoryStorageUnavailableError(str(exc)) from exc
+
+    @contextmanager
+    def _open_query_connection(
+        self, path: Path, hot_connection: sqlite3.Connection | None = None,
+    ) -> Iterator[sqlite3.Connection]:
         self._require_activation_ready()
         if path == self.hot_path:
+            if hot_connection is not None:
+                yield hot_connection
+                return
             with self._read_only_connection(path) as connection:
                 yield connection
             return
@@ -683,6 +735,7 @@ class SegmentedHistoryReader:
         *,
         limit: int = 100,
         since: str | None = None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         limit = self._require_limit(limit)
         enclosure_key = enclosure_id or ""
@@ -694,7 +747,7 @@ class SegmentedHistoryReader:
         parameters.append(limit)
         rows: list[dict[str, Any]] = []
         for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-            with self._query_connection(path) as connection:
+            with self._query_connection(path, hot_connection) as connection:
                 rows.extend(
                     dict(row)
                     for row in connection.execute(
@@ -745,6 +798,7 @@ class SegmentedHistoryReader:
         parameters: list[Any],
         limit: int,
         since: str | None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         query_where_clauses = list(where_clauses)
         query_parameters = list(parameters)
@@ -761,7 +815,7 @@ class SegmentedHistoryReader:
         """
         rows: list[dict[str, Any]] = []
         for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-            with self._query_connection(path) as connection:
+            with self._query_connection(path, hot_connection) as connection:
                 rows.extend(dict(row) for row in connection.execute(query, query_parameters).fetchall())
         for row in rows:
             row["value"] = row["value_integer"] if row["value_integer"] is not None else row["value_real"]
@@ -780,6 +834,7 @@ class SegmentedHistoryReader:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         limit = self._require_limit(limit)
         enclosure_key = enclosure_id or ""
@@ -793,6 +848,7 @@ class SegmentedHistoryReader:
             parameters=base_parameters,
             limit=limit,
             since=since,
+            hot_connection=hot_connection,
         )
 
     def list_disk_metric_samples(
@@ -802,6 +858,7 @@ class SegmentedHistoryReader:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         normalized_identity_key = disk_identity_key.strip()
         if not normalized_identity_key:
@@ -817,6 +874,7 @@ class SegmentedHistoryReader:
             parameters=parameters,
             limit=limit,
             since=since,
+            hot_connection=hot_connection,
         )
 
     def list_disk_metric_homes(
@@ -825,6 +883,7 @@ class SegmentedHistoryReader:
         *,
         since: str | None = None,
         limit: int = MAX_HISTORY_QUERY_LIMIT,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         limit = self._require_limit(limit)
         normalized_identity_key = disk_identity_key.strip()
@@ -901,7 +960,7 @@ class SegmentedHistoryReader:
         """
         merged: dict[tuple[str, str, int], dict[str, Any]] = {}
         for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-            with self._query_connection(path) as connection:
+            with self._query_connection(path, hot_connection) as connection:
                 for row in connection.execute(query, [*parameters, limit]).fetchall():
                     item = dict(row)
                     key = (str(item["system_id"]), str(item["enclosure_key"]), int(item["slot"]))
@@ -946,6 +1005,7 @@ class SegmentedHistoryReader:
         metric_name: str | None = None,
         limit: int = 500,
         since: str | None = None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         limit = self._require_limit(limit)
         disk_samples = self.list_disk_metric_samples(
@@ -953,6 +1013,7 @@ class SegmentedHistoryReader:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            hot_connection=hot_connection,
         )
         local_samples = self.list_metric_samples(
             system_id,
@@ -961,22 +1022,11 @@ class SegmentedHistoryReader:
             metric_name=metric_name,
             limit=limit,
             since=since,
+            hot_connection=hot_connection,
         )
         merged_by_key: dict[Any, dict[str, Any]] = {}
         for item in [*disk_samples, *local_samples]:
-            item_id = item.get("id")
-            if item_id is not None:
-                key: Any = ("id", item_id)
-            else:
-                key = (
-                    item.get("observed_at"),
-                    item.get("metric_name"),
-                    item.get("system_id"),
-                    item.get("enclosure_key"),
-                    item.get("slot"),
-                    item.get("value"),
-                )
-            merged_by_key[key] = item
+            merged_by_key[metric_sample_identity(item)] = item
         return sorted(
             merged_by_key.values(),
             key=lambda item: (
@@ -996,22 +1046,41 @@ class SegmentedHistoryReader:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[str, Any]:
-        enclosure_key = enclosure_id or ""
+        # Only the mutable hot source needs a request-owned read snapshot.
         with self._read_only_connection(self.hot_path) as connection:
-            current_row = connection.execute(
-                """
-                SELECT *
-                FROM slot_state_current
-                WHERE system_id = ? AND enclosure_key = ? AND slot = ?
-                """,
-                (system_id, enclosure_key, slot),
-            ).fetchone()
+            connection.execute("BEGIN")
+            return self._build_slot_history_bundle(
+                connection, system_id, enclosure_id, slot,
+                event_limit=event_limit, metric_limits=metric_limits, since=since,
+            )
+
+    def _build_slot_history_bundle(
+        self,
+        hot_connection: sqlite3.Connection,
+        system_id: str,
+        enclosure_id: str | None,
+        slot: int,
+        *,
+        event_limit: int,
+        metric_limits: dict[str, int] | None,
+        since: str | None,
+    ) -> dict[str, Any]:
+        enclosure_key = enclosure_id or ""
+        current_row = hot_connection.execute(
+            """
+            SELECT *
+            FROM slot_state_current
+            WHERE system_id = ? AND enclosure_key = ? AND slot = ?
+            """,
+            (system_id, enclosure_key, slot),
+        ).fetchone()
         current = dict(current_row) if current_row is not None else None
         events = self.list_slot_events(
             system_id,
             enclosure_id,
             slot,
             limit=event_limit,
+            hot_connection=hot_connection,
         )
         metric_limits = metric_limits or {}
         metrics: dict[str, list[dict[str, Any]]] = {}
@@ -1039,6 +1108,7 @@ class SegmentedHistoryReader:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    hot_connection=hot_connection,
                 )
                 if disk_identity_key
                 else self.list_metric_samples(
@@ -1048,13 +1118,16 @@ class SegmentedHistoryReader:
                     metric_name=metric_name,
                     limit=limit,
                     since=since,
+                    hot_connection=hot_connection,
                 )
             )
             metrics[metric_name] = samples
             latest_values[metric_name] = samples[0].get("value") if samples else None
             sample_counts[metric_name] = len(samples)
         if disk_identity_key:
-            homes = self.list_disk_metric_homes(str(disk_identity_key), since=since)
+            homes = self.list_disk_metric_homes(
+                str(disk_identity_key), since=since, hot_connection=hot_connection,
+            )
             current_home_key = (system_id, enclosure_key, slot)
 
             def home_scope_key(home: dict[str, Any]) -> tuple[str, str, int]:
@@ -1485,12 +1558,14 @@ class SegmentedHistoryReader:
         parameters: list[Any],
         limit: int,
         since: str | None,
+        hot_connection: sqlite3.Connection | None = None,
     ) -> list[dict[str, Any]]:
         samples = self._list_raw_metric_samples_by_filter(
             where_clauses=where_clauses,
             parameters=parameters,
             limit=limit,
             since=since,
+            hot_connection=hot_connection,
         )
         if len(samples) >= limit:
             return samples[:limit]
@@ -1514,8 +1589,38 @@ class SegmentedHistoryReader:
                 )
                 rollup_where.append("julianday(bucket_start) < julianday(?)")
                 rollup_parameters.append(boundary)
-            rollup_parameters.append(remaining)
-            query = f"""
+            paths = (self.hot_path, *self._selected_segment_paths(since=since))
+            # Select logical points before hydrating fragments. As in the scope
+            # reader, filling the quota must not stop completion of retained keys.
+            # Each source contributes at most `remaining` keys, and the retained
+            # set is trimmed after each source. Ties retain source precedence.
+            retained_keys: dict[tuple[Any, ...], None] = {}
+            for path in paths:
+                with self._query_connection(path, hot_connection) as connection:
+                    rows = connection.execute(
+                        f"""
+                        SELECT bucket_seconds AS rollup_seconds,
+                               bucket_start AS _bucket_start, system_id,
+                               enclosure_key, slot, metric_name, disk_identity_key
+                        FROM metric_rollups
+                        WHERE {' AND '.join(rollup_where)}
+                        ORDER BY julianday(bucket_start) DESC, bucket_start,
+                                 system_id, enclosure_key, slot, metric_name, disk_identity_key
+                        LIMIT ?
+                        """,
+                        [*rollup_parameters, remaining],
+                    ).fetchall()
+                for row in rows:
+                    retained_keys[self._rollup_key(dict(row))] = None
+                retained_keys = dict.fromkeys(sorted(
+                    retained_keys, key=lambda key: _parse_catalog_timestamp(key[1]), reverse=True
+                )[:remaining])
+            if not retained_keys:
+                continue
+            # Drive hydration from retained keys. Tuple IN can scan the whole
+            # interval on SQLite 3.45; CROSS JOIN keeps full primary-key lookups.
+            query = """
+                WITH retained(k0, k1, k2, k3, k4, k5, k6) AS (VALUES {key_values})
                 SELECT
                     NULL AS id,
                     CASE
@@ -1554,15 +1659,39 @@ class SegmentedHistoryReader:
                     value_sum AS _value_sum,
                     last_value AS _last_value,
                     last_observed_at AS _last_observed_at
-                FROM metric_rollups
-                WHERE {' AND '.join(rollup_where)}
-                ORDER BY julianday(bucket_start) DESC
+                FROM retained
+                CROSS JOIN metric_rollups
+                    ON metric_rollups.bucket_seconds = retained.k0
+                   AND metric_rollups.bucket_start = retained.k1
+                   AND metric_rollups.system_id = retained.k2
+                   AND metric_rollups.enclosure_key = retained.k3
+                   AND metric_rollups.slot = retained.k4
+                   AND metric_rollups.metric_name = retained.k5
+                   AND metric_rollups.disk_identity_key = retained.k6
                 LIMIT ?
             """
             rollups: list[dict[str, Any]] = []
-            for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-                with self._query_connection(path) as connection:
-                    rollups.extend(dict(row) for row in connection.execute(query, rollup_parameters).fetchall())
+            keys = list(retained_keys)
+            for path in paths:
+                with self._query_connection(path, hot_connection) as connection:
+                    # Seven primary-key fields plus the LIMIT bind. Keep each
+                    # statement compatible with SQLite's legacy 999-variable cap
+                    # and with a lower connection-specific limit.
+                    variable_limit = min(999, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+                    chunk_size = (variable_limit - 1) // 7
+                    if chunk_size < 1:
+                        raise ValueError("Segmented history query SQLite variable limit is too small.")
+                    for offset in range(0, len(keys), chunk_size):
+                        chunk = keys[offset:offset + chunk_size]
+                        key_values = ", ".join("(?, ?, ?, ?, ?, ?, ?)" for _ in chunk)
+                        # The primary key guarantees at most one fragment per
+                        # selected key per source. Unselected identities cannot
+                        # consume this quota, even in the same bucket.
+                        rows = connection.execute(
+                            query.format(key_values=key_values),
+                            [*(value for key in chunk for value in key), len(chunk)],
+                        ).fetchall()
+                        rollups.extend(dict(row) for row in rows)
             rollups = self._merge_rollup_rows(rollups)
             rollups.sort(
                 key=lambda row: _parse_catalog_timestamp(row["_bucket_start"]),
@@ -1571,7 +1700,7 @@ class SegmentedHistoryReader:
             rollups = rollups[:remaining]
             for rollup in rollups:
                 rollup["value"] = rollup["value_real"]
-                rollup.pop("_bucket_start", None)
+                rollup["bucket_start"] = rollup.pop("_bucket_start")
             samples.extend(rollups)
             if rollups:
                 if bucket_seconds == 3600:

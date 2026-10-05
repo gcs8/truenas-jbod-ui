@@ -304,6 +304,8 @@ const SMART_PREFETCH_FUNCTIONS = [
   "smartSummaryAgeMs",
   "getSmartSummaryEntry",
   "getSmartCacheKey",
+  "smartDiskIdentity",
+  "smartSnapshotMatchesSelection",
 ];
 
 function flushMicrotasks() {
@@ -314,8 +316,8 @@ function flushMicrotasks() {
 // the queued-batch handover is exercised end to end instead of through stubs.
 function loadSmartPrefetchHarness(options = {}) {
   const slots = options.slots || [
-    { slot: 1, present: true, device_name: "sdb" },
-    { slot: 2, present: true, device_name: "sdc" },
+    { slot: 1, present: true, device_name: "sdb", serial: "SANITIZED-ONE" },
+    { slot: 2, present: true, device_name: "sdc", serial: "SANITIZED-TWO" },
   ];
   const state = {
     snapshotMode: false,

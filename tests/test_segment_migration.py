@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sqlite3
@@ -8,11 +9,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
 from history_service import segment_migration, segment_sealer
-from history_service.store import SCHEMA, HistoryStore
+from history_service.store import CURRENT_SCHEMA_VERSION, MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA, HistoryStore
 
 
 class SimulatedMigrationCrash(BaseException):
@@ -20,6 +23,459 @@ class SimulatedMigrationCrash(BaseException):
 
 
 class SegmentedHistoryMigrationCliTests(unittest.TestCase):
+    def test_schema_contract_closes_owned_memory_connections_on_success_and_error_without_gc(self) -> None:
+        real_connect = sqlite3.connect
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                connections = []
+
+                def connect(*args, **kwargs):
+                    connection = real_connect(*args, **kwargs)
+                    connections.append(connection)
+                    return connection
+
+                was_enabled = gc.isenabled()
+                gc.disable()
+                try:
+                    with patch.object(sqlite3, "connect", side_effect=connect), patch.object(
+                        segment_migration, "SCHEMA", SCHEMA + ("\nINVALID SQL;" if fail else ""),
+                    ):
+                        for _ in range(10):
+                            segment_migration._current_history_schema_contract.cache_clear()
+                            if fail:
+                                with self.assertRaises(sqlite3.OperationalError):
+                                    segment_migration._current_history_schema_contract()
+                            else:
+                                tables, triggers = segment_migration._current_history_schema_contract()
+                                self.assertIn("slot_events", dict(tables))
+                                self.assertIsInstance(triggers, tuple)
+                            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+                                connections[-1].execute("SELECT 1")
+                finally:
+                    for connection in connections:
+                        connection.close()
+                    segment_migration._current_history_schema_contract.cache_clear()
+                    if was_enabled:
+                        gc.enable()
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux descriptor accounting")
+    def test_hot_staging_closes_connections_on_repeated_success_and_faults_without_gc(self) -> None:
+        cutoff = "2025-01-02T00:00:00+00:00"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for fault in (None, "destination-open", "prune"):
+                with self.subTest(fault=fault):
+                    source = root / f"stage-{fault}.sqlite3"
+                    self._create_source_database(source)
+                    if fault == "prune":
+                        with closing(sqlite3.connect(source)) as connection:
+                            connection.executescript("""
+                                CREATE TRIGGER refuse_prune BEFORE DELETE ON metric_samples
+                                BEGIN SELECT RAISE(ABORT, 'synthetic prune fault'); END;
+                            """)
+                    original = source.read_bytes()
+                    real_connect = sqlite3.connect
+
+                    def connect(database, *args, **kwargs):
+                        if fault == "destination-open" and isinstance(database, Path):
+                            raise sqlite3.OperationalError("synthetic destination fault")
+                        return real_connect(database, *args, **kwargs)
+
+                    gc.collect()
+                    was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        before = len(list(Path("/proc/self/fd").iterdir()))
+                        with patch.object(sqlite3, "connect", side_effect=connect):
+                            for _ in range(10):
+                                if fault is not None:
+                                    with self.assertRaisesRegex(sqlite3.Error, "synthetic .* fault"):
+                                        segment_migration._stage_hot_replacement(source, cutoff)
+                                else:
+                                    staged = segment_migration._stage_hot_replacement(source, cutoff)
+                                    with closing(real_connect(staged)) as connection:
+                                        self.assertEqual(connection.execute(
+                                            "SELECT observed_at FROM slot_events",
+                                        ).fetchall(), [(cutoff,)])
+                                        self.assertEqual(connection.execute("PRAGMA quick_check").fetchone(), ("ok",))
+                                    staged.unlink()
+                                self.assertEqual(list(root.glob(f".{source.name}.segmented-*")), [])
+                                self.assertEqual(source.read_bytes(), original)
+                        self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), before)
+                    finally:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always", ResourceWarning)
+                            gc.collect()
+                        if was_enabled:
+                            gc.enable()
+                    self.assertEqual([warning for warning in caught if warning.category is ResourceWarning], [])
+
+    def test_future_schema_refused_before_artifacts_for_api_and_cli(self) -> None:
+        for cli in (False, True):
+            for apply in (False, True):
+                with self.subTest(cli=cli, apply=apply), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    source = root / "history.db"
+                    segments = root / "segments"
+                    self._create_source_database(source)
+                    connection = sqlite3.connect(source)
+                    try:
+                        connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION + 1}")
+                        connection.execute("PRAGMA journal_mode=WAL")
+                    finally:
+                        connection.close()
+                    before = source.read_bytes()
+                    if cli:
+                        result = subprocess.run(
+                            [sys.executable, "scripts/migrate_segmented_history.py",
+                             "--source", str(source), "--segments-dir", str(segments),
+                             "--cutoff", "2025-01-02T00:00:00+00:00", "--key-id", "test-key-1",
+                             *(["--apply"] if apply else [])],
+                            capture_output=True, text=True, timeout=30,
+                            cwd=Path(__file__).resolve().parents[1],
+                        )
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("schema version", result.stderr)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "schema version"):
+                            segment_migration.migrate_segmented_history(
+                                source=source, segments_directory=segments,
+                                cutoff="2025-01-02T00:00:00+00:00", key_id="test-key-1", apply=apply,
+                            )
+                    self.assertEqual(source.read_bytes(), before)
+                    self.assertEqual(sorted(p.name for p in root.iterdir()), ["history.db"])
+
+    def test_supported_schema_versions_keep_dry_run_and_apply_behavior(self) -> None:
+        for version in range(MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION + 1):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "history.db"
+                segments = root / "segments"
+                self._create_source_database(source)
+                connection = sqlite3.connect(source)
+                try:
+                    connection.execute(f"PRAGMA user_version={version}")
+                finally:
+                    connection.close()
+                before = source.read_bytes()
+                self.assertFalse(segment_migration.migrate_segmented_history(
+                    source=source, segments_directory=segments,
+                    cutoff="2025-01-02T00:00:00+00:00", key_id="test-key-1",
+                )["apply"])
+                self.assertEqual(source.read_bytes(), before)
+                self.assertFalse(segments.exists())
+                self.assertTrue(segment_migration.migrate_segmented_history(
+                    source=source, segments_directory=segments,
+                    cutoff="2025-01-02T00:00:00+00:00", key_id="test-key-1", apply=True,
+                )["apply"])
+                segment_migration.rollback_segmented_history(
+                    source=source, segments_directory=segments, apply=True,
+                )
+                self.assertEqual(source.read_bytes(), before)
+
+    def _rollback_fixture(self, root: Path, *, recovery: bool = False) -> tuple[Path, Path, bytes]:
+        source = root / "history.db"
+        segments = root / "segments"
+        self._create_source_database(source)
+        original = source.read_bytes()
+        segment_migration.migrate_segmented_history(
+            source=source, segments_directory=segments,
+            cutoff="2025-01-02T00:00:00+00:00", key_id="test-key-1", apply=True,
+        )
+        if recovery:
+            # An old prepared rollback marker, with its catalog still intact.
+            rollback = segments / ".v1-rollback.sqlite3"
+            digest = segment_migration._sha256_file(rollback)
+            segment_migration._write_pending_marker(
+                segments / ".migration-pending.json", rollback_sha256=digest,
+                operation="rollback", source_sha256=segment_migration._sha256_file(source),
+            )
+            segment_migration._restore_v1_source(source, rollback, 0o600, digest)
+        return source, segments, original
+
+    def _finish_rollback_repeatedly(self, source: Path, segments: Path, original: bytes) -> None:
+        self.assertEqual(source.read_bytes(), original)
+        if (segments / ".migration-pending.json").exists():
+            for _ in range(2):
+                self.assertFalse(segment_migration.recover_pending_migration(
+                    source=source, segments_directory=segments,
+                )["apply"])
+            segment_migration.recover_pending_migration(
+                source=source, segments_directory=segments, apply=True,
+            )
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse((segments / "catalog.json").exists())
+        self.assertFalse((segments / "segment-0001.sqlite3").exists())
+        self.assertFalse((segments / ".migration-pending.json").exists())
+        # Existing API retires the redundant snapshot on the next explicit call.
+        segment_migration.recover_pending_migration(
+            source=source, segments_directory=segments, apply=True,
+        )
+        with self.assertRaisesRegex(ValueError, "not pending"):
+            segment_migration.recover_pending_migration(
+                source=source, segments_directory=segments, apply=True,
+            )
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_rollback_cleanup_recovers_after_actual_unlinks(self) -> None:
+        for recovery in (False, True):
+            for target in ("catalog.json", "segment-0001.sqlite3"):
+                with self.subTest(recovery=recovery, target=target), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, original = self._rollback_fixture(Path(temporary), recovery=recovery)
+                    real_unlink = os.unlink
+
+                    def unlink_then_interrupt(path, *args, **kwargs):
+                        real_unlink(path, *args, **kwargs)
+                        if Path(path).name == target:
+                            raise SimulatedMigrationCrash(target)
+
+                    action = (segment_migration.recover_pending_migration if recovery
+                              else segment_migration.rollback_segmented_history)
+                    with patch.object(os, "unlink", side_effect=unlink_then_interrupt):
+                        with self.assertRaises(SimulatedMigrationCrash):
+                            action(source=source, segments_directory=segments, apply=True)
+                    self.assertFalse((segments / target).exists())
+                    self._finish_rollback_repeatedly(source, segments, original)
+
+    def test_rollback_cleanup_recovers_after_bounded_process_exit(self) -> None:
+        script = '''
+import os, sys
+from pathlib import Path
+from history_service import segment_migration as migration
+source, segments, recovery, target = sys.argv[1:]
+real_unlink = os.unlink
+def unlink(path, *args, **kwargs):
+    real_unlink(path, *args, **kwargs)
+    if Path(path).name == target:
+        os._exit(73)
+os.unlink = unlink
+action = migration.recover_pending_migration if recovery == "1" else migration.rollback_segmented_history
+action(source=Path(source), segments_directory=Path(segments), apply=True)
+'''
+        for recovery in (False, True):
+            for target in ("catalog.json", "segment-0001.sqlite3"):
+                with self.subTest(recovery=recovery, target=target), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, original = self._rollback_fixture(Path(temporary), recovery=recovery)
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, str(source), str(segments), str(int(recovery)), target],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 73, result.stderr)
+                    self.assertFalse((segments / target).exists())
+                    self._finish_rollback_repeatedly(source, segments, original)
+
+    def test_rollback_cleanup_unknown_segment_keeps_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, segments, original = self._rollback_fixture(Path(temporary))
+            real_unlink = os.unlink
+
+            def stop_after_catalog(path, *args, **kwargs):
+                real_unlink(path, *args, **kwargs)
+                if Path(path).name == "catalog.json":
+                    raise SimulatedMigrationCrash()
+
+            with patch.object(os, "unlink", side_effect=stop_after_catalog):
+                with self.assertRaises(SimulatedMigrationCrash):
+                    segment_migration.rollback_segmented_history(
+                        source=source, segments_directory=segments, apply=True,
+                    )
+            unknown = segments / "segment-unknown.sqlite3"
+            unknown.write_bytes(b"unowned")
+            before = {p.name: p.read_bytes() for p in segments.iterdir()}
+            for apply in (False, True, True):
+                with self.assertRaisesRegex(ValueError, "unauthenticated"):
+                    segment_migration.recover_pending_migration(
+                        source=source, segments_directory=segments, apply=apply,
+                    )
+                self.assertEqual({p.name: p.read_bytes() for p in segments.iterdir()}, before)
+                self.assertEqual(source.read_bytes(), original)
+            unknown.unlink()
+            self._finish_rollback_repeatedly(source, segments, original)
+
+    def test_terminal_rollback_refuses_changed_or_unowned_evidence(self) -> None:
+        cases = ("catalog", "segment", "source", "unknown", "symlink", "hardlink",
+                 "path", "duplicate", "size-bool", "digest", "missing-inventory", "source-digest")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, segments, _ = self._rollback_fixture(root)
+                real_unlink = os.unlink
+
+                def stop_before_catalog(path, *args, **kwargs):
+                    if Path(path).name == "catalog.json":
+                        raise SimulatedMigrationCrash()
+                    real_unlink(path, *args, **kwargs)
+
+                with patch.object(os, "unlink", side_effect=stop_before_catalog):
+                    with self.assertRaises(SimulatedMigrationCrash):
+                        segment_migration.rollback_segmented_history(
+                            source=source, segments_directory=segments, apply=True,
+                        )
+                pending = segments / ".migration-pending.json"
+                segment = segments / "segment-0001.sqlite3"
+                if case in {"catalog", "segment", "source"}:
+                    target = {"catalog": segments / "catalog.json", "segment": segment, "source": source}[case]
+                    with target.open("r+b") as stream:
+                        stream.seek(128)
+                        stream.write(b"altered")
+                elif case == "unknown":
+                    (segments / "unowned.txt").write_bytes(b"keep")
+                elif case in {"symlink", "hardlink"}:
+                    other = root / "other.sqlite3"
+                    other.write_bytes(segment.read_bytes())
+                    segment.unlink()
+                    if case == "symlink":
+                        segment.symlink_to(other)
+                    else:
+                        os.link(other, segment)
+                else:
+                    marker = json.loads(pending.read_bytes())
+                    inventory = marker["rollback_cleanup"]
+                    if case == "path":
+                        inventory[1]["file_name"] = "../history.db"
+                    elif case == "duplicate":
+                        inventory.append(dict(inventory[1]))
+                    elif case == "size-bool":
+                        inventory[1]["size_bytes"] = True
+                    elif case == "digest":
+                        inventory[1]["sha256"] = "0" * 64
+                    elif case == "missing-inventory":
+                        del marker["rollback_cleanup"]
+                    elif case == "source-digest":
+                        marker["source_sha256"] = "0" * 64
+                    pending.write_text(json.dumps(marker), encoding="utf-8")
+                before_source = source.read_bytes()
+                before = {p.name: (p.is_symlink(), p.read_bytes()) for p in segments.iterdir()}
+                for apply in (False, True, True):
+                    with self.assertRaises((ValueError, OSError)):
+                        segment_migration.recover_pending_migration(
+                            source=source, segments_directory=segments, apply=apply,
+                        )
+                    self.assertEqual(source.read_bytes(), before_source)
+                    self.assertEqual({p.name: (p.is_symlink(), p.read_bytes()) for p in segments.iterdir()}, before)
+
+    def test_repeated_rollback_recovery_interruptions_preserve_terminal_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, segments, original = self._rollback_fixture(Path(temporary))
+            real_unlink = os.unlink
+            marker_bytes = None
+            for target in ("catalog.json", "segment-0001.sqlite3", ".migration-pending.json"):
+                def stop_after_unlink(path, *args, **kwargs):
+                    real_unlink(path, *args, **kwargs)
+                    if Path(path).name == target:
+                        raise SimulatedMigrationCrash()
+
+                action = (segment_migration.rollback_segmented_history if marker_bytes is None
+                          else segment_migration.recover_pending_migration)
+                with patch.object(os, "unlink", side_effect=stop_after_unlink):
+                    with self.assertRaises(SimulatedMigrationCrash):
+                        action(source=source, segments_directory=segments, apply=True)
+                self.assertEqual(source.read_bytes(), original)
+                pending = segments / ".migration-pending.json"
+                if pending.exists():
+                    if marker_bytes is not None:
+                        self.assertEqual(pending.read_bytes(), marker_bytes)
+                    marker_bytes = pending.read_bytes()
+            self._finish_rollback_repeatedly(source, segments, original)
+
+    def test_rollback_persists_terminal_inventory_before_first_cleanup(self) -> None:
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as temporary:
+                source, segments, original = self._rollback_fixture(Path(temporary), recovery=recovery)
+                pending = segments / ".migration-pending.json"
+                synced: list[tuple[tuple[int, int], bytes | None]] = []
+                real_fsync, real_unlink = os.fsync, os.unlink
+                checked = False
+
+                def fsync(descriptor):
+                    real_fsync(descriptor)
+                    metadata = os.fstat(descriptor)
+                    synced.append(((metadata.st_dev, metadata.st_ino), pending.read_bytes() if pending.exists() else None))
+
+                def unlink(path, *args, **kwargs):
+                    nonlocal checked
+                    if Path(path).name == "catalog.json":
+                        marker = json.loads(pending.read_bytes())
+                        self.assertEqual(marker["phase"], "rollback-cleanup")
+                        self.assertEqual(marker["source_sha256"], segment_migration._sha256_file(source))
+                        self.assertEqual(source.read_bytes(), original)
+                        inventory = marker["rollback_cleanup"]
+                        self.assertEqual({entry["file_name"] for entry in inventory},
+                                         {"catalog.json", "segment-0001.sqlite3"})
+                        for entry in inventory:
+                            artifact = segments / entry["file_name"]
+                            self.assertEqual(entry["size_bytes"], artifact.stat().st_size)
+                            self.assertEqual(entry["sha256"], segment_migration._sha256_file(artifact))
+                        directory_identity = (segments.stat().st_dev, segments.stat().st_ino)
+                        marker_identity = (pending.stat().st_dev, pending.stat().st_ino)
+                        self.assertIn((directory_identity, pending.read_bytes()), synced)
+                        self.assertIn(marker_identity, [identity for identity, _ in synced])
+                        checked = True
+                    real_unlink(path, *args, **kwargs)
+
+                action = (segment_migration.recover_pending_migration if recovery
+                          else segment_migration.rollback_segmented_history)
+                with patch.object(os, "fsync", side_effect=fsync), patch.object(os, "unlink", side_effect=unlink):
+                    action(source=source, segments_directory=segments, apply=True)
+                self.assertTrue(checked)
+                self._finish_rollback_repeatedly(source, segments, original)
+
+    def test_rollback_terminal_fsync_failures_are_recoverable(self) -> None:
+        for recovery in (False, True):
+            action = (segment_migration.recover_pending_migration if recovery
+                      else segment_migration.rollback_segmented_history)
+            # Discover the actual fsync ordinals after source restoration, then fail
+            # each syscall in a fresh fixture. No fabricated high-level checkpoint.
+            total = 0
+            for fail_at in [None]:
+                with tempfile.TemporaryDirectory() as temporary:
+                    source, segments, _ = self._rollback_fixture(Path(temporary), recovery=recovery)
+                    real_fsync = os.fsync
+                    armed = recovery
+                    real_restore = segment_migration._restore_v1_source
+
+                    def restore(*args):
+                        nonlocal armed
+                        real_restore(*args)
+                        armed = True
+
+                    def count_fsync(fd):
+                        nonlocal total
+                        if armed:
+                            total += 1
+                        real_fsync(fd)
+
+                    with (patch.object(os, "fsync", side_effect=count_fsync),
+                          patch.object(segment_migration, "_restore_v1_source", side_effect=restore)):
+                        action(source=source, segments_directory=segments, apply=True)
+            self.assertGreater(total, 0)
+            for fail_at in range(1, total + 1):
+                with self.subTest(recovery=recovery, fsync=fail_at), tempfile.TemporaryDirectory() as temporary:
+                    source, segments, original = self._rollback_fixture(Path(temporary), recovery=recovery)
+                    real_fsync = os.fsync
+                    armed = recovery
+                    calls = 0
+                    real_restore = segment_migration._restore_v1_source
+
+                    def restore(*args):
+                        nonlocal armed
+                        real_restore(*args)
+                        armed = True
+
+                    def fail_fsync(fd):
+                        nonlocal calls
+                        if armed:
+                            calls += 1
+                            if calls == fail_at:
+                                raise OSError("injected terminal fsync")
+                        real_fsync(fd)
+
+                    with (patch.object(os, "fsync", side_effect=fail_fsync),
+                          patch.object(segment_migration, "_restore_v1_source", side_effect=restore)):
+                        with self.assertRaisesRegex(OSError, "injected terminal fsync"):
+                            action(source=source, segments_directory=segments, apply=True)
+                    self._finish_rollback_repeatedly(source, segments, original)
+
     def test_dry_run_refuses_legacy_schema_without_creating_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1214,7 +1670,7 @@ class SegmentedHistoryMigrationCliTests(unittest.TestCase):
 
     @staticmethod
     def _create_source_database(path: Path) -> None:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.executescript(SCHEMA)
             connection.execute(
                 """

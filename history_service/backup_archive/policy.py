@@ -42,7 +42,7 @@ import logging
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -55,6 +55,7 @@ from history_service.backup_archive.settings import (
     ArchiveConfigError,
     ArchiveRootUnavailableError,
     ArchiveTargetSettings,
+    _directory_anchors,
     filesystem_roots_overlap,
 )
 
@@ -99,6 +100,9 @@ class _ClassPolicyBase(BaseModel):
         return value
 
 
+_CRON_PROBE_FROM = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 class ConfigClassPolicy(_ClassPolicyBase):
     local_keep: int = Field(default=30, ge=1, le=10_000)
     debounce_seconds: int = Field(default=30, ge=0, le=86_400)
@@ -128,7 +132,11 @@ class FullClassPolicy(_ClassPolicyBase):
     @classmethod
     def _valid_cron(cls, value: str) -> str:
         try:
-            return CronSchedule.parse(value).expression
+            schedule = CronSchedule.parse(value)
+            # Refuse a schedule with no real date (0 0 30 2 *) here: the
+            # scheduler computes the next run on start and would exit.
+            schedule.next_after(_CRON_PROBE_FROM)
+            return schedule.expression
         except CronError as exc:
             raise ValueError(f"is not a cron schedule ({exc})") from exc
 
@@ -188,7 +196,7 @@ def validate_filesystem_target_roots(
     *,
     allow_unavailable: bool = False,
 ) -> None:
-    """Fail closed when a filesystem target aliases or overlaps local storage.
+    """Refuse local overlap and same-physical-root remote target identities.
 
     With ``allow_unavailable`` (startup and config saves), a root that cannot
     be inspected right now is logged and skipped. A proven overlap is still an
@@ -197,11 +205,23 @@ def validate_filesystem_target_roots(
     """
 
     problems: list[str] = []
+    seen_roots: list[tuple[str, set[tuple[tuple[int, int], tuple[str, ...]]]]] = []
     for target in targets:
         if target.settings.provider != "filesystem":
             continue
         try:
             overlaps = filesystem_roots_overlap(local_archive_root, target.settings.root)
+            # Equal anchor/suffix pairs identify the same directory even through
+            # symlinks, bind-visible aliases, or an as-yet missing suffix. Unlike
+            # local overlap admission, remote ancestors are not treated as equal.
+            anchors = set(_directory_anchors(target.settings.root, label="Filesystem archive target root"))
+            for other_id, other_anchors in seen_roots:
+                if anchors & other_anchors:
+                    problems.append(
+                        f"Filesystem archive targets {other_id!r} and {target.target_id!r} "
+                        "must not use the same physical root."
+                    )
+            seen_roots.append((target.target_id, anchors))
         except ArchiveRootUnavailableError as exc:
             if allow_unavailable:
                 logger.warning(
@@ -318,7 +338,9 @@ def policy_from_section(
     targets = _parse_targets(parsed.targets, targets_source)
     policy = BackupPolicy(config=parsed.config, full=parsed.full, targets=targets)
     validate_filesystem_target_roots(
-        targets, local_archive_root_from_environment(env), allow_unavailable=True
+        policy.enabled_targets(),
+        local_archive_root_from_environment(env),
+        allow_unavailable=True,
     )
     return policy
 

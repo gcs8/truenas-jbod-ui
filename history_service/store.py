@@ -24,7 +24,12 @@ from history_service.segment_catalog import (
     activation_pending_path,
     path_entry_exists,
 )
-from history_service.segment_reader import MAX_HISTORY_QUERY_LIMIT, SegmentedHistoryReader
+from history_service.segment_reader import (
+    MAX_HISTORY_QUERY_LIMIT,
+    HistoryStorageUnavailableError,
+    SegmentedHistoryReader,
+    metric_sample_identity,
+)
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
 logger = logging.getLogger(__name__)
@@ -453,6 +458,18 @@ CREATE INDEX IF NOT EXISTS idx_slot_events_scope
 CREATE INDEX IF NOT EXISTS idx_metric_samples_scope
     ON metric_samples (system_id, enclosure_key, slot, metric_name, observed_at DESC);
 
+-- Absolute-time ordering cannot use the older text-time indexes. These
+-- additive indexes are copied into newly sealed sources by SQLite backup.
+-- Already immutable segments retain their old schema and correct scan path.
+CREATE INDEX IF NOT EXISTS idx_slot_events_scope_chronological
+    ON slot_events (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_metric_samples_slot_chronological
+    ON metric_samples (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_metric_samples_scope_chronological
+    ON metric_samples (system_id, enclosure_key, slot, metric_name, julianday(observed_at) DESC, id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_slot_events_observed_at
     ON slot_events (observed_at, id);
 
@@ -714,6 +731,13 @@ class HistoryStore:
     def _segmented_reader(self) -> SegmentedHistoryReader | None:
         if self.segment_catalog_path is None:
             return None
+        try:
+            return self._load_segmented_reader()
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise HistoryStorageUnavailableError(str(exc)) from exc
+
+    def _load_segmented_reader(self) -> SegmentedHistoryReader:
+        assert self.segment_catalog_path is not None
         if path_entry_exists(activation_pending_path(self.file_path)):
             raise ValueError("Segmented history activation is pending.")
         pending_path = self.segment_catalog_path.parent / MIGRATION_PENDING_MARKER
@@ -1817,6 +1841,15 @@ class HistoryStore:
                 ON metric_samples (disk_identity_key, metric_name, observed_at DESC)
             """
         )
+        # Legacy sources can lack disk_identity_key until column admission.
+        for name, columns in (
+            ("idx_metric_samples_disk_chronological", "disk_identity_key"),
+            ("idx_metric_samples_disk_metric_chronological", "disk_identity_key, metric_name"),
+        ):
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS {name} ON metric_samples "
+                f"({columns}, julianday(observed_at) DESC, id DESC)"
+            )
 
     @staticmethod
     def _ensure_columns(
@@ -1937,6 +1970,105 @@ class HistoryStore:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def prepare_backup_directory(cls, directory: Path) -> None:
+        """Create loader-owned roots without losing their publication obligation.
+
+        Parent barriers stay with the backup operation: an archive barrier must
+        not become a condition of local snapshot success. The prepared marker
+        survives settings-cache eviction, failed loading, and fresh stores.
+        """
+        cls._ensure_directory_entry(
+            directory, prepare_only=True,
+            sync_directory=cls._fsync_directory, rename=cls._rename_at2,
+        )
+
+    def _ensure_backup_directory(self, directory: Path) -> None:
+        self._ensure_directory_entry(
+            directory, prepare_only=False,
+            sync_directory=self._fsync_directory, rename=self._rename_at2,
+        )
+
+    @classmethod
+    def _ensure_directory_entry(
+        cls, directory: Path, *, prepare_only: bool,
+        sync_directory: Callable[[Path], None], rename: Callable[..., None],
+    ) -> None:
+        """Persist only entries we create, including retries after a failed sync.
+
+        Install each new directory with a pending marker already inside it. A
+        failed parent barrier must not turn that directory into an apparently
+        durable pre-existing ancestor on the next call or in a fresh store.
+        Existing unmarked directories are provisioned by the caller, not repaired.
+        """
+        marker_name = ".history-backup-directory-pending"
+        if not directory.is_dir():
+            cls._ensure_directory_entry(
+                directory.parent, prepare_only=prepare_only,
+                sync_directory=sync_directory, rename=rename,
+            )
+            for _ in range(32):
+                staged = directory.parent / f".history-directory-{secrets.token_hex(8)}"
+                try:
+                    staged.mkdir()
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise FileExistsError("Unable to allocate a history backup directory.")
+            installed = False
+            try:
+                # Prepare the marker before the public name can exist. Even a
+                # failure creating/syncing the marker leaves no unmarked target.
+                descriptor = os.open(
+                    staged / marker_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                sync_directory(staged)
+                try:
+                    rename(staged, directory, flags=RENAME_NOREPLACE)
+                    installed = True
+                except FileExistsError:
+                    if not directory.is_dir():
+                        raise
+                    # Another creator won. Its pending marker, if present,
+                    # carries the same parent barrier obligation below.
+            finally:
+                if not installed:
+                    try:
+                        (staged / marker_name).unlink(missing_ok=True)
+                        staged.rmdir()
+                    except OSError:
+                        # Never adopt an abandoned private staging name as a
+                        # backup root, and never recursively remove its contents.
+                        logger.warning("History backup directory staging cleanup failed for %s", staged)
+        marker = directory / marker_name
+        try:
+            metadata = marker.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != 0 or metadata.st_nlink != 1:
+            raise ValueError(f"History backup refuses invalid directory marker {marker}.")
+        if prepare_only:
+            return
+        # Loading can prepare a whole chain before a store exists. Complete
+        # marked ancestors first, stopping at the first unmarked caller-owned
+        # directory; never infer authority to repair arbitrary ancestors.
+        cls._ensure_directory_entry(
+            directory.parent, prepare_only=False,
+            sync_directory=sync_directory, rename=rename,
+        )
+        sync_directory(directory.parent)
+        # Only a successful parent barrier permits retirement. If this unlink
+        # fails, the marker remains for retry; if it reappears after a crash, an
+        # extra parent sync is harmless. No acknowledged data depends on unlink.
+        marker.unlink(missing_ok=True)
+
     def create_backup(
         self,
         backup_dir: str | Path,
@@ -1949,7 +2081,7 @@ class HistoryStore:
     ) -> Path | None:
         self._require_unsegmented_operation("v1 backup")
         backup_root = Path(backup_dir)
-        backup_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(backup_root)
         self._normalize_shared_path_permissions(backup_root, is_dir=True)
         backup_name = f"{self.file_path.stem}-{self._backup_stamp(snapshot_label)}.sqlite3"
         final_path = backup_root / backup_name
@@ -2176,7 +2308,7 @@ class HistoryStore:
 
         observed_at = self._parse_snapshot_label(snapshot_label)
         long_term_root = Path(long_term_backup_dir)
-        long_term_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(long_term_root)
         self._normalize_shared_path_permissions(long_term_root, is_dir=True)
 
         if weekly_retention_count > 0:
@@ -2199,7 +2331,7 @@ class HistoryStore:
             )
 
     def _refresh_backup_copy(self, source_backup_path: Path, target_path: Path) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_backup_directory(target_path.parent)
         self._normalize_shared_path_permissions(target_path.parent, is_dir=True)
         temp_fd, temp_path = self._create_private_replacement_file(
             target_path.parent,
@@ -2963,6 +3095,7 @@ class HistoryStore:
             rows = connection.execute(
                 f"""
                 SELECT
+                    bucket_start,
 {ROLLUP_TO_SAMPLE_PROJECTION}
                 FROM metric_rollups
                 WHERE {' AND '.join(rollup_where)}
@@ -3114,19 +3247,7 @@ class HistoryStore:
         )
         merged_by_key: dict[Any, dict[str, Any]] = {}
         for item in [*disk_samples, *local_samples]:
-            item_id = item.get("id")
-            if item_id is not None:
-                key: Any = ("id", item_id)
-            else:
-                key = (
-                    item.get("observed_at"),
-                    item.get("metric_name"),
-                    item.get("system_id"),
-                    item.get("enclosure_key"),
-                    item.get("slot"),
-                    item.get("value"),
-                )
-            merged_by_key[key] = item
+            merged_by_key[metric_sample_identity(item)] = item
 
         return sorted(
             merged_by_key.values(),
@@ -3156,6 +3277,7 @@ class HistoryStore:
             )
         metric_limits = metric_limits or {}
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             return self._build_slot_history_bundle(
                 connection,
                 system_id,
@@ -3368,7 +3490,7 @@ class HistoryStore:
         metric_limits: dict[str, int] | None = None,
         since: str | None = None,
     ) -> dict[int, dict[str, Any]]:
-        validate_store_scope_request(
+        since = validate_store_scope_request(
             slots=slots,
             event_limit=event_limit,
             metric_limits=metric_limits,
@@ -3388,7 +3510,13 @@ class HistoryStore:
         slot_numbers = sorted({int(slot) for slot in (slots or [])})
         metric_limits = metric_limits or {}
         payload_by_slot: dict[int, dict[str, Any]] = {
-            slot: self._empty_slot_history_payload(metric_limits)
+            slot: {
+                **self._empty_slot_history_payload(metric_limits),
+                "coverage": {
+                    "metrics": {name: "complete" for name in metric_limits},
+                    "events": "complete" if event_limit > 0 else "unknown",
+                },
+            }
             for slot in slot_numbers
         }
 
@@ -3398,25 +3526,37 @@ class HistoryStore:
             placeholders = ", ".join("?" for _ in slot_numbers)
             where_clauses.append(f"slot IN ({placeholders})")
             parameters.extend(slot_numbers)
-        scope_where = " AND ".join(where_clauses)
-
         with closing(self._connect()) as connection:
-            slot_rows = connection.execute(
-                f"""
-                SELECT slot
-                FROM slot_state_current
-                WHERE {scope_where}
-                ORDER BY slot
-                """,
-                parameters,
-            ).fetchall()
-            for row in slot_rows:
-                slot = int(row["slot"])
-                payload_by_slot.setdefault(
-                    slot,
-                    self._empty_slot_history_payload(metric_limits),
-                )
+            # Coverage and samples describe one SQLite read snapshot.
+            connection.execute("BEGIN")
+            # Explicit slots already initialize every target; use the former
+            # slot-discovery query budget for bounded coverage metadata instead.
+            # Retained rollups can overlap raw/hourly/daily representations. Do
+            # not infer complete source coverage from their returned row count.
+            # This metadata query hydrates at most targets * selected metrics
+            # pairs, never extra history rows or an unbounded count result.
+            rollup_where = [*where_clauses]
+            rollup_parameters = [*parameters]
+            if since:
+                rollup_where.append("bucket_start >= ?")
+                rollup_parameters.append(since)
+            if metric_limits:
+                rollup_where.append(f"metric_name IN ({', '.join('?' for _ in metric_limits)})")
+                rollup_parameters.extend(metric_limits)
+                for row in connection.execute(
+                    f"SELECT slot, metric_name FROM metric_rollups WHERE {' AND '.join(rollup_where)} "
+                    "GROUP BY slot, metric_name", rollup_parameters,
+                ).fetchall():
+                    coverage = payload_by_slot[int(row["slot"])]["coverage"]["metrics"]
+                    if coverage[row["metric_name"]] != "truncated":
+                        coverage[row["metric_name"]] = "unknown"
 
+            # Rank with the existing streaming window, then bound its output
+            # BEFORE counting. A full-partition COUNT would retain all omitted
+            # rows in SQLite's MEMORY temp store. Only cap + one sentinel per
+            # partition enters either count window below; the outer filter
+            # keeps the sentinel out of hydration and the response row budget.
+            # bounded_count is overflow evidence, never an exact source total.
             if event_limit > 0:
                 event_where_clauses = [*where_clauses]
                 event_parameters = [*parameters]
@@ -3427,28 +3567,30 @@ class HistoryStore:
                     f"""
                     SELECT *
                     FROM (
-                        SELECT
-                            *,
-                            ROW_NUMBER() OVER (
+                        SELECT *, COUNT(*) OVER (PARTITION BY slot) AS bounded_count
+                        FROM (
+                            SELECT *, ROW_NUMBER() OVER (
                                 PARTITION BY slot
                                 ORDER BY observed_at DESC, id DESC
                             ) AS row_number
-                        FROM slot_events
-                        WHERE {' AND '.join(event_where_clauses)}
+                            FROM slot_events
+                            WHERE {' AND '.join(event_where_clauses)}
+                        )
+                        WHERE row_number <= ?
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*event_parameters, event_limit],
+                    [*event_parameters, event_limit + 1, event_limit],
                 ).fetchall()
                 for row in event_rows:
                     item = dict(row)
                     slot = int(item["slot"])
                     item.pop("row_number", None)
-                    payload_by_slot.setdefault(
-                        slot,
-                        self._empty_slot_history_payload(metric_limits),
-                    )["events"].append(item)
+                    payload_by_slot[slot]["coverage"]["events"] = (
+                        "truncated" if item.pop("bounded_count") > event_limit else "complete"
+                    )
+                    payload_by_slot[slot]["events"].append(item)
 
             for metric_name, limit in metric_limits.items():
                 metric_where_clauses = [*where_clauses, "metric_name = ?"]
@@ -3460,29 +3602,30 @@ class HistoryStore:
                     f"""
                     SELECT *
                     FROM (
-                        SELECT
-                            *,
-                            ROW_NUMBER() OVER (
+                        SELECT *, COUNT(*) OVER (PARTITION BY slot, metric_name) AS bounded_count
+                        FROM (
+                            SELECT *, ROW_NUMBER() OVER (
                                 PARTITION BY slot, metric_name
-                            ORDER BY observed_at DESC, id DESC
-                        ) AS row_number
-                        FROM metric_samples
-                        WHERE {' AND '.join(metric_where_clauses)}
+                                ORDER BY observed_at DESC, id DESC
+                            ) AS row_number
+                            FROM metric_samples
+                            WHERE {' AND '.join(metric_where_clauses)}
+                        )
+                        WHERE row_number <= ?
                     )
                     WHERE row_number <= ?
                     ORDER BY slot, observed_at DESC, id DESC
                     """,
-                    [*metric_parameters, limit],
+                    [*metric_parameters, limit + 1, limit],
                 ).fetchall()
                 for row in metric_rows:
                     item = dict(row)
                     slot = int(item["slot"])
                     item["value"] = item["value_integer"] if item["value_integer"] is not None else item["value_real"]
                     item.pop("row_number", None)
-                    payload_by_slot.setdefault(
-                        slot,
-                        self._empty_slot_history_payload(metric_limits),
-                    )["metrics"].setdefault(metric_name, []).append(item)
+                    if item.pop("bounded_count") > limit:
+                        payload_by_slot[slot]["coverage"]["metrics"][metric_name] = "truncated"
+                    payload_by_slot[slot]["metrics"][metric_name].append(item)
                 self._append_scope_metric_rollups(
                     connection,
                     payload_by_slot,
@@ -3492,7 +3635,6 @@ class HistoryStore:
                     limit=limit,
                     since=since,
                 )
-
         for slot, payload in payload_by_slot.items():
             metrics = payload.setdefault("metrics", {})
             for metric_name in metric_limits:
@@ -3955,6 +4097,9 @@ class HistoryStore:
             if target_mode is not None and stat.S_IMODE(temp_metadata.st_mode) != target_mode:
                 os.fchmod(temp_descriptor, target_mode)
                 temp_metadata = os.fstat(temp_descriptor)
+            # SQLite/copy completion is not a publication barrier. Flush the
+            # final file metadata too, after mode and restore-owner changes.
+            os.fsync(temp_descriptor)
             if not self._path_matches_metadata(temp_path, temp_metadata):
                 raise ValueError(f"History replacement refuses changed temporary path {temp_path}.")
 
@@ -4043,6 +4188,22 @@ class HistoryStore:
         if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
             self._unlink_owned_path(target_path, temp_metadata)
             raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+        try:
+            self._sync_replacement_parents(temp_path, target_path)
+        except Exception:
+            # Do not leave an unacknowledged timestamp discoverable as a recent
+            # backup by the collector. Never overwrite a reappeared temp name.
+            if self._path_matches_metadata(target_path, temp_metadata):
+                self._rename_at2(target_path, temp_path, flags=RENAME_NOREPLACE)
+                self._sync_replacement_parents(temp_path, target_path)
+            raise
+
+    def _sync_replacement_parents(self, temp_path: Path, target_path: Path) -> None:
+        # The private staging directory and public destination are normally
+        # distinct. Both name changes must be durable before evidence retirement.
+        self._fsync_directory(temp_path.parent)
+        if target_path.parent != temp_path.parent:
+            self._fsync_directory(target_path.parent)
 
     def _exchange_existing_target(
         self,
@@ -4062,6 +4223,7 @@ class HistoryStore:
                 raise ValueError(f"History replacement refuses changed target path {target_path}.")
             if target_mode is not None and stat.S_IMODE(published_metadata.st_mode) != target_mode:
                 raise ValueError(f"History replacement refuses changed temporary mode for {temp_path}.")
+            self._sync_replacement_parents(temp_path, target_path)
             self._unlink_owned_path(temp_path, target_metadata)
         except Exception:
             self._rollback_exchange(
@@ -4084,6 +4246,7 @@ class HistoryStore:
         if not target_is_published_temp or not temp_is_displaced_target:
             return
         self._rename_at2(target_path, temp_path, flags=RENAME_EXCHANGE)
+        self._sync_replacement_parents(temp_path, target_path)
         self._discard_owned_path(temp_path, temp_metadata)
 
     @staticmethod

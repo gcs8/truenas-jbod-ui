@@ -13,6 +13,9 @@ from app.services.inventory_registry import InventoryRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 
 
+INVALID_UTF8_CACHE_BYTES = (b"\xff", b'{"slot_details": "\xe2\x82')
+
+
 class SlotDetailStoreBatchConflictTests(unittest.TestCase):
     def test_batch_reloads_under_lock_and_does_not_overwrite_conflicting_entries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,14 +267,16 @@ class SlotDetailStorePruneTests(unittest.TestCase):
 
     def test_prune_unknown_systems_preserves_malformed_cache_bytes(self) -> None:
         malformed_payloads = [
-            [],
-            {"slot_details": []},
-            {"slot_details": {"bad": {"system_id": "new-id", "slot": "not-an-integer"}}},
-        ]
+            json.dumps(payload).encode("utf-8") for payload in (
+                [],
+                {"slot_details": []},
+                {"slot_details": {"bad": {"system_id": "new-id", "slot": "not-an-integer"}}},
+            )
+        ] + list(INVALID_UTF8_CACHE_BYTES)
         for payload in malformed_payloads:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "slot_detail_cache.json"
-                original = json.dumps(payload).encode()
+                original = payload
                 path.write_bytes(original)
                 store = SlotDetailStore(str(path))
 
@@ -279,18 +284,23 @@ class SlotDetailStorePruneTests(unittest.TestCase):
 
                 self.assertEqual(removed, 0)
                 self.assertEqual(path.read_bytes(), original)
+                entry = self._entry("new-id", 3)
+                store.save_entries([entry])
+                self.assertEqual(list(SlotDetailStore(str(path)).load_all().values()), [entry])
 
     def test_load_all_rejects_malformed_container_shapes_without_raising(self) -> None:
         malformed_payloads = [
-            None,
-            [],
-            {"slot_details": []},
-            {"slot_details": "not-a-mapping"},
-        ]
+            json.dumps(payload).encode("utf-8") for payload in (
+                None,
+                [],
+                {"slot_details": []},
+                {"slot_details": "not-a-mapping"},
+            )
+        ] + list(INVALID_UTF8_CACHE_BYTES)
         for payload in malformed_payloads:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "slot_detail_cache.json"
-                path.write_text(json.dumps(payload), encoding="utf-8")
+                path.write_bytes(payload)
 
                 self.assertEqual(SlotDetailStore(str(path)).load_all(), {})
 
@@ -317,14 +327,16 @@ class SlotDetailStorePruneTests(unittest.TestCase):
 
     def test_save_entries_self_heals_malformed_content(self) -> None:
         malformed_payloads = [
-            [],
-            {"slot_details": []},
-            {"slot_details": {"bad": {"system_id": "system-a", "slot": "bad"}}},
-        ]
+            json.dumps(payload).encode("utf-8") for payload in (
+                [],
+                {"slot_details": []},
+                {"slot_details": {"bad": {"system_id": "system-a", "slot": "bad"}}},
+            )
+        ] + list(INVALID_UTF8_CACHE_BYTES)
         for payload in malformed_payloads:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "slot_detail_cache.json"
-                path.write_text(json.dumps(payload), encoding="utf-8")
+                path.write_bytes(payload)
                 store = SlotDetailStore(str(path))
 
                 store.save_entries([self._entry("system-a", 3)])

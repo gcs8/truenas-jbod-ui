@@ -4,11 +4,13 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import tempfile
 from functools import lru_cache
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,13 @@ from history_service.segment_sealer import (
     seal_history_segment,
 )
 from history_service.migration_lock import history_write_lock
-from history_service.store import SCHEMA
+from history_service.store import (
+    CURRENT_SCHEMA_VERSION,
+    MIN_SUPPORTED_SCHEMA_VERSION,
+    SCHEMA,
+    HistoryStore,
+    describe_unsupported_schema_version,
+)
 
 
 class SegmentedHistoryMigrationError(RuntimeError):
@@ -41,7 +49,7 @@ def _current_history_schema_contract() -> tuple[
     tuple[tuple[str, tuple[str, ...]], ...],
     tuple[str, ...],
 ]:
-    with sqlite3.connect(":memory:") as connection:
+    with closing(sqlite3.connect(":memory:")) as connection:
         connection.executescript(SCHEMA)
         table_names = tuple(
             str(row[0])
@@ -79,9 +87,16 @@ def _require_current_history_schema(
     source: Path,
     source_metadata: os.stat_result,
 ) -> None:
+    # _require_regular_source has already refused all SQLite sidecars. Reuse
+    # startup's side-effect-free header reader, never its schema initializer.
+    found = HistoryStore._read_schema_version_from_header(source)
+    if found is None:
+        raise ValueError("History database schema version could not be preflighted for segmented migration.")
+    if not MIN_SUPPORTED_SCHEMA_VERSION <= found <= CURRENT_SCHEMA_VERSION:
+        raise ValueError(describe_unsupported_schema_version(source, found))
     source_uri = f"{source.resolve().as_uri()}?mode=ro&immutable=1"
     try:
-        with sqlite3.connect(source_uri, uri=True) as connection:
+        with closing(sqlite3.connect(source_uri, uri=True)) as connection:
             connection.execute("PRAGMA query_only = ON")
             if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise ValueError("History database integrity check failed before segmented migration.")
@@ -336,9 +351,11 @@ def _stage_hot_replacement(source: Path, cutoff: str) -> Path:
         descriptor = -1
         # The source is quiesced and sidecar-free by contract. immutable=1 keeps a
         # WAL-header hot from growing -wal/-shm that the next preflight would refuse.
-        with sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro&immutable=1", uri=True) as source_connection:
+        with closing(sqlite3.connect(
+            f"{source.resolve().as_uri()}?mode=ro&immutable=1", uri=True,
+        )) as source_connection:
             source_connection.execute("PRAGMA query_only = ON")
-            with sqlite3.connect(temporary_path) as replacement_connection:
+            with closing(sqlite3.connect(temporary_path)) as replacement_connection:
                 source_connection.backup(replacement_connection)
                 replacement_connection.execute("PRAGMA journal_mode = DELETE")
                 with replacement_connection:
@@ -832,6 +849,133 @@ def migrate_segmented_history(
         )
 
 
+def _rollback_cleanup_inventory(value: Any) -> list[dict[str, Any]]:
+    """Only a terminal marker can authorize missing catalog/segment files."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("Segmented history rollback cleanup inventory is invalid.")
+    names: set[str] = set()
+    for index, record in enumerate(value):
+        if not isinstance(record, dict) or set(record) != {"file_name", "size_bytes", "sha256"}:
+            raise ValueError("Segmented history rollback cleanup inventory is invalid.")
+        name, size, digest = record["file_name"], record["size_bytes"], record["sha256"]
+        if (
+            not isinstance(name, str)
+            or (index == 0 and name != "catalog.json")
+            or (index > 0 and (
+                not name.endswith(".sqlite3")
+                or not SEGMENT_ID_PATTERN.fullmatch(name.removesuffix(".sqlite3"))
+            ))
+            or name in names
+            or type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValueError("Segmented history rollback cleanup inventory is invalid.")
+        names.add(name)
+    return value
+
+
+def _retire_rollback_artifact(directory: Path, record: dict[str, Any], *, remove: bool) -> None:
+    """Verify surviving bytes through one descriptor, then optionally unlink."""
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                record["file_name"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size != record["size_bytes"]:
+            raise ValueError("Segmented history rollback cleanup integrity check failed.")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        current = os.stat(record["file_name"], dir_fd=directory_fd, follow_symlinks=False)
+        if digest.hexdigest() != record["sha256"] or current != os.fstat(descriptor) or (
+            current.st_dev, current.st_ino, current.st_mode, current.st_size, current.st_mtime_ns
+        ) != (
+            metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size, metadata.st_mtime_ns
+        ):
+            raise ValueError("Segmented history rollback cleanup integrity check failed.")
+        if remove:
+            os.unlink(record["file_name"], dir_fd=directory_fd)
+            os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _require_rollback_cleanup_files(directory: Path, inventory: list[dict[str, Any]]) -> None:
+    expected = {record["file_name"] for record in inventory}
+    expected.update({MIGRATION_PENDING_MARKER, ".v1-rollback.sqlite3"})
+    if any(path.name not in expected for path in directory.iterdir()):
+        raise ValueError("Segmented history rollback cleanup found an unauthenticated file.")
+    # Validate the whole surviving set before deleting any member.
+    for record in inventory:
+        _retire_rollback_artifact(directory, record, remove=False)
+
+
+def _prepare_rollback_cleanup(source: Path, directory: Path, catalog: dict[str, Any]) -> dict[str, Any]:
+    catalog_path = directory / "catalog.json"
+    catalog_path = SegmentedHistoryReader._require_regular_file(catalog_path, label="catalog")
+    content = catalog_path.read_bytes()
+    if json.loads(content) != catalog:
+        raise ValueError("Segmented history rollback catalog changed before cleanup.")
+    inventory = _rollback_cleanup_inventory([
+        {"file_name": "catalog.json", "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()},
+        *({key: entry[key] for key in ("file_name", "size_bytes", "sha256")} for entry in catalog["segments"]),
+    ])
+    _require_rollback_cleanup_files(directory, inventory)
+    rollback_sha256 = catalog["rollback_sha256"]
+    if _sha256_file(source) != rollback_sha256:
+        raise ValueError("Segmented history recovery refuses a divergent live source.")
+    # A previous restore may have replaced the source but failed its directory
+    # fsync. Re-establish durability before publishing terminal deletion authority.
+    with source.open("rb", buffering=0) as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(source.parent)
+    pending = {
+        "marker_version": 1,
+        "operation": "rollback",
+        "phase": "rollback-cleanup",
+        "status": "migration-pending",
+        "rollback_sha256": rollback_sha256,
+        "source_sha256": rollback_sha256,
+        "rollback_cleanup": inventory,
+    }
+    _write_private_json_replace(directory / MIGRATION_PENDING_MARKER, pending, temporary_prefix=".migration-pending-")
+    return pending
+
+
+def _finish_rollback_cleanup(source: Path, directory: Path, pending: dict[str, Any], *, apply: bool) -> None:
+    inventory = _rollback_cleanup_inventory(pending.get("rollback_cleanup"))
+    if pending["source_sha256"] != pending["rollback_sha256"] or _sha256_file(source) != pending["source_sha256"]:
+        raise ValueError("Segmented history recovery refuses a divergent live source.")
+    _require_rollback_cleanup_files(directory, inventory)
+    if not apply:
+        return
+    pending_path = directory / MIGRATION_PENDING_MARKER
+    # A previous marker replace may have failed its fsync. Do not rely on mere
+    # visibility of terminal authority when resuming destructive cleanup.
+    with pending_path.open("rb", buffering=0) as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(directory)
+    for record in inventory:
+        _retire_rollback_artifact(directory, record, remove=True)
+    _require_rollback_cleanup_files(directory, inventory)
+    if _sha256_file(source) != pending["source_sha256"]:
+        raise ValueError("Segmented history recovery refuses a divergent live source.")
+    # Also sync on a replay where all files are already absent.
+    _fsync_directory(directory)
+    _clear_pending_marker(pending_path)
+
+
 def _rollback_segmented_history_locked(
     *,
     source: Path,
@@ -867,11 +1011,8 @@ def _rollback_segmented_history_locked(
         source_sha256=_sha256_file(source),
     )
     _restore_v1_source(source, rollback_path, source_mode, rollback_sha256)
-    catalog_path.unlink()
-    for segment_path in segment_paths:
-        segment_path.unlink()
-    _fsync_directory(segments_directory)
-    _clear_pending_marker(pending_path)
+    terminal = _prepare_rollback_cleanup(source, segments_directory, catalog)
+    _finish_rollback_cleanup(source, segments_directory, terminal, apply=True)
     return {
         "apply": True,
         "catalog_path": str(catalog_path),
@@ -952,14 +1093,23 @@ def _recover_pending_migration_locked(
         pending.get("marker_version") != 1
         or pending.get("status") != "migration-pending"
         or operation not in {"forward", "rollback"}
-        or phase not in {"prepared", "segment-ready", "hot-ready"}
+        or phase not in {"prepared", "segment-ready", "hot-ready", "rollback-cleanup"}
         or not isinstance(rollback_sha256, str)
         or not isinstance(source_sha256, str)
-        or (operation == "rollback" and phase != "prepared")
+        or (operation == "rollback" and phase not in {"prepared", "rollback-cleanup"})
+        or (operation == "forward" and phase == "rollback-cleanup")
         or (phase == "hot-ready" and not isinstance(replacement_sha256, str))
         or _sha256_file(rollback_path) != rollback_sha256
     ):
         raise ValueError("Segmented history migration recovery integrity check failed.")
+    if phase == "rollback-cleanup":
+        _finish_rollback_cleanup(source, segments_directory, pending, apply=apply)
+        return {
+            "apply": apply,
+            "recovery_state": "rollback-finalized" if apply else "rollback-ready-to-finalize",
+            "rollback_path": str(rollback_path),
+            "orphaned_segment_paths": [],
+        }
     publication = pending.get("segment_publication")
     referenced_segment_path: Path | None = None
     if isinstance(publication, dict):
@@ -1005,11 +1155,8 @@ def _recover_pending_migration_locked(
                     "catalog_path": str(catalog_path),
                     "detail": "Dry run only. Pass --apply to finalize the restored v1 source.",
                 }
-            catalog_path.unlink()
-            for segment_path in segment_paths:
-                segment_path.unlink()
-            _fsync_directory(segments_directory)
-            _clear_pending_marker(pending_path)
+            terminal = _prepare_rollback_cleanup(source, segments_directory, catalog)
+            _finish_rollback_cleanup(source, segments_directory, terminal, apply=True)
             return {
                 "apply": True,
                 "recovery_state": "rollback-finalized",

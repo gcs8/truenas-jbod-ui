@@ -68,9 +68,6 @@ CHUNK_SIZE = 1024 * 1024
 PARTIAL_SUFFIX = ".partial"
 MAX_NAME_LENGTH = 1024
 MAX_NAME_DEPTH = 8
-# S3: re-download objects up to this size to hash them; larger objects rely on
-# the stored SHA-256 metadata plus the ETag computed for our fixed part size.
-S3_REGET_LIMIT = 16 * 1024 * 1024
 S3_MULTIPART_THRESHOLD = 64 * 1024 * 1024
 S3_MULTIPART_CHUNKSIZE = 64 * 1024 * 1024
 SFTP_PREFETCH_MAX_REQUESTS = 64
@@ -88,6 +85,10 @@ class ArchiveTransportError(RuntimeError):
 
 class ArchiveVerificationError(ArchiveTransportError):
     """The readback check did not match what was sent."""
+
+
+class ArchiveDownloadTooLargeError(ArchiveVerificationError):
+    """A download grew past the catalogued size, so it cannot match the catalogue."""
 
 
 class NfsUnmountError(ArchiveTransportError):
@@ -113,6 +114,14 @@ class StoredObject:
     verified: bool
 
 
+class ArchivePublicationUncertainError(ArchiveTransportError):
+    """The object is visible, but its directory entry may not be durable."""
+
+    def __init__(self, stored: StoredObject) -> None:
+        super().__init__("Archive object was published, but directory durability could not be confirmed.")
+        self.stored = stored
+
+
 @runtime_checkable
 class ArchiveTarget(Protocol):
     provider: str
@@ -126,7 +135,7 @@ class ArchiveTarget(Protocol):
 
     def delete(self, name: str) -> None: ...
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]: ...
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]: ...
 
     def test(self) -> dict[str, Any]: ...
 
@@ -221,21 +230,37 @@ class _HashingReader(io.RawIOBase):
         return len(chunk)
 
 
-def _copy_stream(source: Any, write: Callable[[bytes], Any]) -> tuple[int, str]:
+def _copy_stream(source: Any, write: Callable[[bytes], Any], limit: int | None = None) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
     while True:
         chunk = source.read(CHUNK_SIZE)
         if not chunk:
             break
+        size += len(chunk)
+        _check_download_limit(size, limit)
         write(chunk)
         digest.update(chunk)
-        size += len(chunk)
     return size, digest.hexdigest()
 
 
-def _hash_stream(source: Any) -> tuple[int, str]:
-    return _copy_stream(source, lambda _chunk: None)
+def _check_download_limit(size: int, limit: int | None) -> None:
+    if limit is not None and size > limit:
+        raise ArchiveDownloadTooLargeError("Archive download is larger than expected; stopped before the catalogue check.")
+
+
+def _hash_stream(source: Any, expected_size: int | None = None) -> tuple[int, str]:
+    size = 0
+
+    def check_size(chunk: bytes) -> None:
+        nonlocal size
+        size += len(chunk)
+        if expected_size is not None and size > expected_size:
+            # _copy_stream reads fixed-size chunks: at most one excess chunk
+            # is consumed, never the remainder of an oversized response.
+            raise ArchiveVerificationError("Archive readback is larger than the bytes sent.")
+
+    return _copy_stream(source, check_size)
 
 
 def _check_readback(label: str, expected_size: int, expected_sha: str, size: int, sha: str | None) -> None:
@@ -283,8 +308,11 @@ class _TargetBase:
     def delete(self, name: str) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:  # pragma: no cover - abstract
-        """Stream object ``name`` into a new private file; return (size, sha256)."""
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:  # pragma: no cover - abstract
+        """Stream object ``name`` into a new private file; return (size, sha256).
+
+        With ``limit``, fail once more than ``limit`` bytes arrive.
+        """
         raise NotImplementedError
 
     def test(self) -> dict[str, Any]:
@@ -339,6 +367,9 @@ class LocalDirectoryTarget(_TargetBase):
         self._confine_to = Path(confine_to) if confine_to is not None else None
         self._local_archive_root = Path(local_archive_root) if local_archive_root is not None else None
         self._root_real: Path | None = None
+        # The scheduler supplies policy-wide identity admission. It must run at
+        # each mutation, including when lifecycle reuses an already-open target.
+        self.before_mutation: Callable[[], None] = lambda: None
 
     @property
     def transport_encrypted(self) -> bool:
@@ -348,7 +379,18 @@ class LocalDirectoryTarget(_TargetBase):
     def _ensure_root(self) -> Path:
         if self._root_real is not None:
             return self._root_real
-        self._root.mkdir(parents=True, exist_ok=True)
+        missing = []
+        current = self._root.absolute()
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory)
+            except FileExistsError:
+                if not directory.is_dir():
+                    raise
+
         if not self._root.is_dir():
             raise ArchiveTransportError("Archive root is not a directory.")
         real = Path(os.path.realpath(self._root))
@@ -390,6 +432,7 @@ class LocalDirectoryTarget(_TargetBase):
         return root.joinpath(*parts)
 
     def put(self, local_path: Path, name: str) -> StoredObject:
+        self.before_mutation()
         final = self._object_path(name, create_parents=True)
         partial = final.with_name(final.name + PARTIAL_SUFFIX)
         flags = (
@@ -407,8 +450,9 @@ class LocalDirectoryTarget(_TargetBase):
                     target.flush()
                     os.fsync(target.fileno())
                 with open(partial, "rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback(self.provider, size, sha, back_size, back_sha)
+                self.before_mutation()
                 os.replace(partial, final)
             except BaseException:
                 try:
@@ -416,19 +460,28 @@ class LocalDirectoryTarget(_TargetBase):
                 except FileNotFoundError:
                     pass
                 raise
-        self._fsync_dir(final.parent)
+        stored = StoredObject(name=name, size=size, sha256=sha, verified=False)
+        try:
+            # Existence is not durability evidence: a previous job/target may
+            # have left this hierarchy after a rejected or uncertain upload.
+            # Re-establish every containing-directory barrier for each put,
+            # from the filesystem root (or confined mount) through the leaf.
+            boundary = Path(os.path.realpath(self._confine_to)) if self._confine_to is not None else Path(final.anchor)
+            for directory in (*reversed(final.parent.parents), final.parent):
+                if directory == boundary or boundary in directory.parents:
+                    self._fsync_dir(directory)
+        except OSError as exc:
+            raise ArchivePublicationUncertainError(stored) from exc
         return StoredObject(name=name, size=size, sha256=sha, verified=True)
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:
-        try:
-            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        except OSError:
-            return
+        # Content verification does not establish directory-entry durability.
+        # There is no weaker-barrier mode: unsupported barriers also refuse
+        # success, leaving the published bytes in place for operator inspection.
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(descriptor)
-        except OSError:
-            pass
         finally:
             os.close(descriptor)
 
@@ -455,12 +508,13 @@ class LocalDirectoryTarget(_TargetBase):
                 )
         return results
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._object_path(name, create_parents=False)
         with _open_local_source(path) as (source, _size), _download_destination(Path(local_path)) as target:
-            return _copy_stream(source, target.write)
+            return _copy_stream(source, target.write, limit)
 
     def delete(self, name: str) -> None:
+        self.before_mutation()
         path = self._object_path(name, create_parents=False)
         try:
             metadata = os.lstat(path)
@@ -468,6 +522,7 @@ class LocalDirectoryTarget(_TargetBase):
             return
         if stat.S_ISDIR(metadata.st_mode):
             raise ArchiveTransportError("Archive delete refuses to remove a directory.")
+        self.before_mutation()
         os.unlink(path)
 
 
@@ -582,15 +637,16 @@ class FtpTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         digest = hashlib.sha256()
         size = 0
         with _download_destination(Path(local_path)) as target:
             def write(chunk: bytes) -> None:
                 nonlocal size
-                digest.update(chunk)
                 size += len(chunk)
+                _check_download_limit(size, limit)
+                digest.update(chunk)
                 target.write(chunk)
 
             self._ftp.retrbinary(f"RETR {path}", write, blocksize=CHUNK_SIZE)
@@ -740,7 +796,7 @@ class SftpTarget(_TargetBase):
                     size, sha = _copy_stream(source, remote.write)
                 with self._sftp.open(partial, "rb") as readback:
                     readback.prefetch(size, max_concurrent_requests=SFTP_PREFETCH_MAX_REQUESTS)
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SFTP", size, sha, back_size, back_sha)
                 try:
                     self._sftp.posix_rename(partial, final)
@@ -782,10 +838,10 @@ class SftpTarget(_TargetBase):
                 )
                 results.append(RemoteObject(name=child, size=int(entry.st_size or 0), modified=modified))
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         with self._sftp.open(path, "rb") as remote, _download_destination(Path(local_path)) as target:
-            return _copy_stream(remote, target.write)
+            return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -874,7 +930,7 @@ class SmbTarget(_TargetBase):
                 with self._client.open_file(partial, mode="wb") as remote:
                     size, sha = _copy_stream(source, remote.write)
                 with self._client.open_file(partial, mode="rb") as readback:
-                    back_size, back_sha = _hash_stream(readback)
+                    back_size, back_sha = _hash_stream(readback, expected_size=size)
                 _check_readback("SMB", size, sha, back_size, back_sha)
                 self._client.replace(partial, final)
             except BaseException:
@@ -913,10 +969,10 @@ class SmbTarget(_TargetBase):
                     )
                 )
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         path = self._path(*validate_object_name(name))
         with self._client.open_file(path, mode="rb") as remote, _download_destination(Path(local_path)) as target:
-            return _copy_stream(remote, target.write)
+            return _copy_stream(remote, target.write, limit)
 
     def delete(self, name: str) -> None:
         parts = validate_object_name(name)
@@ -1090,16 +1146,26 @@ def _nfs_encrypted(settings: ArchiveTargetSettings) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _import_boto3() -> tuple[Any, Any, Any]:
+def _import_boto3() -> tuple[Any, Any, Any, tuple[type[BaseException], ...]]:
     try:
         import boto3
+        import botocore.exceptions as botocore_exceptions
         from boto3.s3.transfer import TransferConfig
         from botocore.config import Config
     except ImportError as exc:
         raise DependencyMissingError(
             "S3 archive support requires the boto3 package; install boto3 to use this target."
         ) from exc
-    return boto3, TransferConfig, Config
+    connection_errors = (
+        botocore_exceptions.EndpointConnectionError,
+        botocore_exceptions.ConnectTimeoutError,
+        botocore_exceptions.ReadTimeoutError,
+        botocore_exceptions.ConnectionClosedError,
+        botocore_exceptions.HTTPClientError,
+        botocore_exceptions.ProxyConnectionError,
+        botocore_exceptions.SSLError,
+    )
+    return boto3, TransferConfig, Config, connection_errors
 
 
 def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str, *, multipart: bool) -> str:
@@ -1114,12 +1180,22 @@ def _s3_expected_etag(md5_parts: list[bytes], whole_md5: str, *, multipart: bool
 class S3Target(_TargetBase):
     provider = "s3"
 
-    def __init__(self, client: Any, bucket: str, prefix: str, *, transfer_config: Any, encrypted: bool) -> None:
+    def __init__(
+        self,
+        client: Any,
+        bucket: str,
+        prefix: str,
+        *,
+        transfer_config: Any,
+        encrypted: bool,
+        connection_errors: tuple[type[BaseException], ...],
+    ) -> None:
         self._client = client
         self._bucket = bucket
         self._prefix = prefix
         self._transfer_config = transfer_config
         self._encrypted = encrypted
+        self._connection_errors = connection_errors
 
     @property
     def transport_encrypted(self) -> bool:
@@ -1174,7 +1250,9 @@ class S3Target(_TargetBase):
             )
         try:
             verified = self._verify(key, size, sha_hex, _s3_expected_etag(part_md5s, whole_md5.hexdigest(), multipart=multipart))
-        except ArchiveVerificationError:
+        except Exception:
+            # Any readback failure (mismatch, timeout, reset) leaves an
+            # uncatalogued object that grooming never sees, so remove it.
             self._delete_quietly(key)
             raise
         return StoredObject(name=name, size=size, sha256=sha_hex, verified=verified)
@@ -1189,19 +1267,17 @@ class S3Target(_TargetBase):
         etag = str(head.get("ETag") or "").strip('"')
         if etag and etag == expected_etag:
             return True
-        if size <= S3_REGET_LIMIT:
-            body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
-            try:
-                back_size, back_sha = _hash_stream(body)
-            finally:
-                close = getattr(body, "close", None)
-                if callable(close):
-                    close()
-            _check_readback("S3", size, sha_hex, back_size, back_sha)
-            return True
-        # Large object whose ETag is not a plain MD5 (for example SSE-KMS):
-        # size matched, content not independently confirmed.
-        return False
+        # ETag is not the MD5 we computed (for example SSE-KMS): stream the
+        # object back and hash it; this never buffers the whole object.
+        body = self._client.get_object(Bucket=self._bucket, Key=key)["Body"]
+        try:
+            back_size, back_sha = _hash_stream(body, expected_size=size)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        _check_readback("S3", size, sha_hex, back_size, back_sha)
+        return True
 
     def _delete_quietly(self, key: str) -> None:
         try:
@@ -1234,12 +1310,12 @@ class S3Target(_TargetBase):
                 )
         return sorted(results, key=lambda item: item.name)
 
-    def get(self, name: str, local_path: Path) -> tuple[int, str]:
+    def get(self, name: str, local_path: Path, *, limit: int | None = None) -> tuple[int, str]:
         validate_object_name(name)
         body = self._client.get_object(Bucket=self._bucket, Key=self._key(name))["Body"]
         try:
             with _download_destination(Path(local_path)) as target:
-                return _copy_stream(body, target.write)
+                return _copy_stream(body, target.write, limit)
         finally:
             close = getattr(body, "close", None)
             if callable(close):
@@ -1247,12 +1323,15 @@ class S3Target(_TargetBase):
 
     def delete(self, name: str) -> None:
         validate_object_name(name)
-        self._client.delete_object(Bucket=self._bucket, Key=self._key(name))
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=self._key(name))
+        except self._connection_errors as exc:
+            raise ConnectionError("S3 archive location is unavailable.") from exc
 
 
 @contextmanager
 def _open_s3(settings: ArchiveTargetSettings) -> Iterator[S3Target]:
-    boto3, transfer_config_class, botocore_config_class = _import_boto3()
+    boto3, transfer_config_class, botocore_config_class, connection_errors = _import_boto3()
     client_kwargs: dict[str, Any] = {
         "aws_access_key_id": read_secret_file(settings.access_key_id_file, "S3 access key id"),
         "aws_secret_access_key": read_secret_file(settings.secret_access_key_file, "S3 secret access key"),
@@ -1279,6 +1358,7 @@ def _open_s3(settings: ArchiveTargetSettings) -> Iterator[S3Target]:
             "/".join(normalized_root_parts(settings.root)),
             transfer_config=transfer_config,
             encrypted=not settings.endpoint_url.startswith("http://"),
+            connection_errors=connection_errors,
         )
     finally:
         close = getattr(client, "close", None)

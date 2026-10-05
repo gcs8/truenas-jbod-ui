@@ -3748,5 +3748,184 @@ class MappingRevisionBatchTests(unittest.TestCase):
             self.assertEqual(reads.call_count, 0)
 
 
+class MappingLookupSnapshotTests(unittest.TestCase):
+    def make_store(self, root):
+        return MappingStore(Path(root) / "mapping.json")
+
+    def test_snapshot_matches_preloaded_v1_v2_drawer_and_fallback_reads(self):
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as root:
+                store = self.make_store(root)
+                write_batch_document(store, version, batch_parity_rows(store, version))
+                before = store.file_path.read_bytes()
+                loaded = store.load_all()
+                snapshot = store.load_lookup_snapshot()
+                self.assertEqual(dict(snapshot), dict(loaded))
+                for system in (BATCH_SYSTEM, None, "synthetic-other"):
+                    for enclosure in (BATCH_SHELF, BATCH_DRAWER, None, "synthetic-other"):
+                        for slot in range(6):
+                            for fallback in (False, True):
+                                self.assertEqual(
+                                    store.get_mapping(system, enclosure, slot, allow_legacy_fallback=fallback,
+                                                      loaded_entries=snapshot),
+                                    store.get_mapping(system, enclosure, slot, allow_legacy_fallback=fallback,
+                                                      loaded_entries=loaded),
+                                )
+                            self.assertEqual(
+                                store.has_legacy_only_mapping(system, enclosure, slot, loaded_entries=snapshot),
+                                store.has_legacy_only_mapping(system, enclosure, slot, loaded_entries=loaded),
+                            )
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_keeps_v1_document_version_for_v2_prefixed_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = ManualMapping(system_id="v2", enclosure_id="enc:a", slot=1, serial="SYNTHETIC")
+            write_v1_mappings(store, {"v2:enc:a:1": mapping})
+            snapshot = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping("v2", "enc:a", 1, loaded_entries=snapshot), mapping)
+
+    def test_snapshot_is_immutable_and_returned_models_cannot_poison_lookup(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = batch_mapping(slot=1)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: mapping})
+            snapshot = store.load_lookup_snapshot()
+            expected = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            snapshot[key].serial = "POISONED"
+            for value in snapshot.values():
+                value.enclosure_id = "POISONED"
+            returned = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            returned.serial = "POISONED"
+            with self.assertRaises(TypeError):
+                snapshot[key] = returned
+            with self.assertRaises(TypeError):
+                del snapshot[key]
+            with self.assertRaises(AttributeError):
+                snapshot._entries = {}
+            with self.assertRaises(TypeError):
+                snapshot._entries[key] = "POISONED"
+            with self.assertRaises(TypeError):
+                snapshot._mappings[(BATCH_SYSTEM, BATCH_SHELF, 1)] = "POISONED"
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot), expected)
+            self.assertEqual(snapshot[key], mapping)
+
+    def test_read_snapshot_keeps_revision_state_without_exposing_mutable_lookup_models(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            mapping = batch_mapping(slot=1)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: mapping})
+
+            snapshot = store.load_read_snapshot()
+            expected = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            snapshot[key].serial = "POISONED"
+
+            self.assertEqual(
+                store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot),
+                expected,
+            )
+            self.assertEqual(store.count_for_system(BATCH_SYSTEM, loaded_entries=snapshot), 1)
+            self.assertIn(
+                (BATCH_SHELF, 1),
+                store.save_revisions(
+                    BATCH_SYSTEM,
+                    [(BATCH_SHELF, 1)],
+                    loaded_entries=snapshot,
+                ),
+            )
+
+    def test_mutable_preloads_are_never_cached(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            key = store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1)
+            write_v1_mappings(store, {key: batch_mapping(slot=1)})
+            snapshot = store.load_lookup_snapshot()
+            for loaded in (store.load_all(), dict(store.load_all())):
+                original = store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1, loaded_entries=loaded)
+                loaded[key].serial = "CHANGED"
+                self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1,
+                                                   loaded_entries=loaded).serial, "CHANGED")
+                self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1,
+                                                   loaded_entries=snapshot), original)
+                loaded[key].enclosure_id = "synthetic-wrong-shelf"
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 1, loaded_entries=loaded)
+
+    def test_new_snapshot_refreshes_after_write_without_changing_retained_pass_or_cas(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            write_v1_mappings(store, {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 1): batch_mapping(slot=1)})
+            snapshot = store.load_lookup_snapshot()
+            original = store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot)
+            revision = store.save_revision(BATCH_SYSTEM, BATCH_DRAWER, 1)
+            clear = store.clear_revision(BATCH_SYSTEM, BATCH_DRAWER, 1)
+            store.save_mapping(batch_mapping(slot=1, serial="NEW"), expected_revision=revision)
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=snapshot), original)
+            fresh = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, loaded_entries=fresh).serial, "NEW")
+            before = store.file_path.read_bytes()
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(batch_mapping(slot=1), expected_revision=revision)
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(BATCH_SYSTEM, BATCH_DRAWER, 1, expected_revision=clear)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_preserves_preload_conflicts_without_broadening_direct_target_refusal(self):
+        for kind in ("invalid-v1", "invalid-v2", "duplicate"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                store = self.make_store(root)
+                version = 2 if kind == "invalid-v2" else 1
+                key = (store._encode_v2_key(BATCH_SYSTEM, BATCH_SHELF, 7) if version == 2
+                       else store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7))
+                if kind.startswith("invalid"):
+                    rows = {key: batch_mapping(enclosure="synthetic-wrong", slot=7)}
+                else:
+                    rows = {key: batch_mapping(slot=7),
+                            f"{BATCH_SYSTEM}:{BATCH_DRAWER}:7":
+                            batch_mapping(enclosure=BATCH_DRAWER, slot=7, serial="DIVERGENT")}
+                write_batch_document(store, version, rows)
+                before = store.file_path.read_bytes()
+                self.assertIsNone(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0))
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7)
+                with self.assertRaises(MappingScopeConflict):
+                    store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0, loaded_entries=store.load_all())
+                with self.assertRaises(MappingScopeConflict):
+                    store.load_lookup_snapshot()
+                self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_keeps_legacy_drawer_preload_and_direct_conflict_policies_distinct(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            rows = {store._slot_key(BATCH_SYSTEM, BATCH_SHELF, 7): batch_mapping(slot=7),
+                    f"{BATCH_DRAWER}:7": batch_mapping(system=None, enclosure=BATCH_DRAWER,
+                                                      slot=7, serial="DIVERGENT")}
+            write_batch_document(store, 1, rows)
+            before = store.file_path.read_bytes()
+            snapshot = store.load_lookup_snapshot()
+            self.assertEqual(store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7, loaded_entries=snapshot),
+                             store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7, loaded_entries=store.load_all()))
+            self.assertIsNone(store.get_mapping(BATCH_SYSTEM, BATCH_SHELF, 0))
+            with self.assertRaises(MappingScopeConflict):
+                store.get_mapping(BATCH_SYSTEM, BATCH_DRAWER, 7)
+            with self.assertRaises(MappingScopeConflict):
+                store.save_revision(BATCH_SYSTEM, BATCH_DRAWER, 7)
+            self.assertEqual(store.file_path.read_bytes(), before)
+
+    def test_snapshot_retains_tolerant_v1_and_strict_v2_loading(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(root)
+            for raw in ('not-json', '{"version":1,"slot_mappings":{"bad":false}}'):
+                store.file_path.write_text(raw)
+                self.assertEqual(dict(store.load_lookup_snapshot()), {})
+            for raw in ('{"version":2,"slot_mappings":{"bad":false}}',
+                        '{"version":3,"slot_mappings":{}}'):
+                store.file_path.write_text(raw)
+                with self.assertRaises(MappingScopeConflict):
+                    store.load_lookup_snapshot()
+
+
 if __name__ == "__main__":
     unittest.main()

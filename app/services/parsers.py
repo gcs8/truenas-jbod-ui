@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -188,6 +189,7 @@ class SESMapEnclosure:
     # Kernel enclosure-driver bindings that found no bay keyed by a device slot
     # number, counted by contributing SES path.
     unplaced_sysfs_bindings_by_ses_device: dict[str, int] = field(default_factory=dict)
+    ssh_host: str | None = None
 
 
 @dataclass(slots=True)
@@ -549,7 +551,7 @@ def parse_glabel_status(output: str) -> GlabelInfo:
 def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
     info = CamcontrolInfo()
     current_controller: str | None = None
-    grouped_devices: dict[tuple[str, str | None, str | None], list[str]] = {}
+    device_rows: list[list[str]] = []
 
     for line in output.splitlines():
         bus_match = re.match(r"^(?:scbus|umass-sim)\d+\s+on\s+(?P<controller>\S+)\s+bus\s+\d+:", line.strip(), re.IGNORECASE)
@@ -565,11 +567,6 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
             continue
 
         model = match.group("model").strip()
-        group_key = (
-            model,
-            normalize_text(match.group("target")),
-            normalize_text(match.group("lun")),
-        )
         parsed_devices: list[str] = []
         for device in match.group("devices").split(","):
             if not DEVICE_REGEX.search(device.strip()):
@@ -581,9 +578,11 @@ def parse_camcontrol_devlist(output: str) -> CamcontrolInfo:
                 if current_controller:
                     info.controllers[normalized.lower()] = current_controller
         if parsed_devices:
-            grouped_devices.setdefault(group_key, []).extend(parsed_devices)
+            device_rows.append(parsed_devices)
 
-    for devices in grouped_devices.values():
+    # Only aliases explicitly listed on one CAM row describe the same device.
+    # Model/target/LUN repeats across HBAs do not establish disk identity.
+    for devices in device_rows:
         deduped = list(dict.fromkeys(devices))
         if len(deduped) < 2:
             continue
@@ -857,7 +856,7 @@ def _merge_ses_slot_evidence(existing: SESMapSlot, slot: SESMapSlot) -> None:
         "ses_element_id_fallback": 1,
         "ses_element_index_invalid_descriptor": 1,
         "ses_description": 2,
-        "ses_device_slot_number": 2,
+        "ses_device_slot_number": 3,
     }
     existing_strength = source_strength.get(existing.slot_number_source, 0)
     incoming_strength = source_strength.get(slot.slot_number_source, 0)
@@ -1136,6 +1135,25 @@ def _finalize_ses_invalid_descriptor_evidence(
         )
 
 
+def _ses_control_slot_number(slot: SESMapSlot, ses_device: str | None) -> int | None:
+    # Display ordinals, SG descriptor labels and inferred invalid-AES bays
+    # are not --dev-slot-num coordinates. CORE retains typed element control.
+    if slot.slot_number_source == "ses_element_id_fallback" or (
+        ses_device and ses_device.startswith("/dev/sg")
+        and slot.slot_number_source in {"ses_description", "ses_element_index_invalid_descriptor"}
+    ):
+        return None
+    return slot.slot_number
+
+
+def _ses_control_host(slot: SESMapSlot, enclosure: SESMapEnclosure) -> str | None:
+    device = slot.ses_device or enclosure.ses_device
+    for target in slot.control_targets:
+        if target.get("ses_device") == device and target.get("ssh_host"):
+            return normalize_text(target.get("ssh_host"))
+    return enclosure.ssh_host
+
+
 def _record_ses_slot(
     enclosure: SESMapEnclosure,
     slot: SESMapSlot,
@@ -1180,7 +1198,7 @@ def _record_ses_slot(
             {
                 "ses_device": slot.ses_device or enclosure.ses_device,
                 "ses_element_id": slot.element_id,
-                "ses_slot_number": reported_slot_number,
+                "ses_slot_number": _ses_control_slot_number(slot, slot.ses_device or enclosure.ses_device),
             }
         ],
     )
@@ -1669,11 +1687,16 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
                 element_id=slot_number,
                 ses_device=ses_device,
                 description=f"Slot {slot_number:02d}",
+                slot_number_source="ses_element_id_fallback",
+                slot_number_warning=(
+                    f"SES EC element {slot_number} has no verified device slot number; "
+                    "using element order for status geometry only, not LED control."
+                ),
                 control_targets=[
                     {
                         "ses_device": ses_device,
                         "ses_element_id": slot_number,
-                        "ses_slot_number": slot_number,
+                        "ses_slot_number": None,
                     }
                 ],
             )
@@ -1783,6 +1806,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
                 slot_number=-1,
                 element_id=element_id,
                 ses_device=ses_device,
+                description=descriptor,
             )
             continue
 
@@ -2017,26 +2041,57 @@ def _infer_scale_enclosure_profile(
     return None, f"{slot_count} Bay SES", rows, columns, None
 
 
+def _ses_enclosures_share_identity(first: SESMapEnclosure, second: SESMapEnclosure) -> bool:
+    if first.enclosure_id and second.enclosure_id:
+        return first.enclosure_id == second.enclosure_id
+    if first.ssh_host == second.ssh_host:
+        return bool(first.ses_device and first.ses_device == second.ses_device)
+    # Unkeyed redundant paths need disk and attached-enclosure evidence.
+    # Host-local names and sg basenames are never cross-host identity proof.
+    def bay_identities(enclosure):
+        addresses = Counter(slot.sas_address for slot in enclosure.slots.values() if slot.sas_address)
+        return {(slot.slot_number, slot.sas_address, slot.attached_sas_address)
+                for slot in enclosure.slots.values()
+                if slot.sas_address not in {None, "0x0"} and addresses[slot.sas_address] == 1
+                and slot.attached_sas_address not in {None, "0x0"}
+                and not slot.sas_address_conflict and not slot.sas_address_degraded}
+    return bool(bay_identities(first) & bay_identities(second))
+
+
 def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclosure]:
     merged: dict[str, SESMapEnclosure] = {}
-    slot_evidence: dict[str, list[SESMapSlot]] = {}
+    identity_enclosures: dict[str, SESMapEnclosure] = {}
+    slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
     enclosure_ids: dict[str, str] = {}
-    ses_device_keys: dict[str, str] = {}
-    unkeyed_names: dict[str, str] = {}
+    ses_device_keys: dict[tuple[str | None, str], str] = {}
+    unkeyed_names: dict[tuple[str | None, str], str] = {}
 
     for enclosure in enclosures:
         key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
         if key is None and enclosure.ses_device:
-            key = ses_device_keys.get(enclosure.ses_device)
+            key = ses_device_keys.get((enclosure.ssh_host, enclosure.ses_device))
+            if key is not None and (
+                enclosure.enclosure_id and merged[key].enclosure_id
+                and enclosure.enclosure_id != merged[key].enclosure_id
+            ):
+                key = None
         if key is None and enclosure.enclosure_name and not enclosure.enclosure_id:
-            key = unkeyed_names.get(enclosure.enclosure_name)
+            key = unkeyed_names.get((enclosure.ssh_host, enclosure.enclosure_name))
+        if key is None and enclosure.ssh_host:
+            key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
+                        if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
+                                and enclosure.enclosure_id != merged[candidate_key].enclosure_id)
+                        if _ses_enclosures_share_identity(candidate, enclosure)), None)
         if key is None:
             key = enclosure.enclosure_id or enclosure.ses_device or enclosure.enclosure_name or f"unknown-{len(merged)}"
+            if key in merged:
+                key = f"{key}@{enclosure.ssh_host or 'local'}:{len(merged)}"
             ses_devices = list(enclosure.ses_devices)
             if enclosure.ses_device and enclosure.ses_device not in ses_devices:
                 ses_devices.append(enclosure.ses_device)
             merged[key] = SESMapEnclosure(
                 ses_device=enclosure.ses_device,
+                ssh_host=enclosure.ssh_host,
                 ses_devices=ses_devices,
                 enclosure_id=enclosure.enclosure_id,
                 enclosure_name=enclosure.enclosure_name,
@@ -2048,6 +2103,7 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 slots={},
             )
             slot_evidence[key] = []
+            identity_enclosures[key] = enclosure
         target = merged[key]
         target.enclosure_id = target.enclosure_id or enclosure.enclosure_id
         target.enclosure_name = target.enclosure_name or enclosure.enclosure_name
@@ -2066,22 +2122,22 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
         target.slot_layout = target.slot_layout or enclosure.slot_layout
         if target.enclosure_id:
             enclosure_ids.setdefault(target.enclosure_id, key)
-        if target.ses_device:
-            ses_device_keys.setdefault(target.ses_device, key)
-        if target.enclosure_name and not target.enclosure_id:
-            unkeyed_names.setdefault(target.enclosure_name, key)
-        slot_evidence[key].extend(enclosure.slots.values())
+        if enclosure.ses_device:
+            ses_device_keys.setdefault((enclosure.ssh_host, enclosure.ses_device), key)
+        if enclosure.enclosure_name and not target.enclosure_id:
+            unkeyed_names.setdefault((enclosure.ssh_host, enclosure.enclosure_name), key)
+        slot_evidence[key].extend((slot, enclosure.ssh_host) for slot in enclosure.slots.values())
 
         for slot in enclosure.unmapped_slots:
             _record_unmapped_ses_slot(target, slot)
 
     for key, target in merged.items():
         slots_by_element: list[SESMapSlot] = []
-        element_positions: dict[tuple[str, int], int] = {}
-        for slot in slot_evidence[key]:
+        element_positions: dict[tuple[str | None, str, int], int] = {}
+        for slot, ssh_host in slot_evidence[key]:
             ses_device = slot.ses_device or target.ses_device or ""
             identity = (
-                (ses_device, slot.element_id)
+                (ssh_host, ses_device, slot.element_id)
                 if slot.element_id is not None
                 else None
             )
@@ -2574,6 +2630,11 @@ def build_slot_candidates_from_ses_enclosures(
                 if combined_slot < 0 or combined_slot >= slot_count:
                     continue
 
+                # Keep display labels separate from control coordinates in
+                # both the target list and the inventory metadata fallback.
+                control_slot_number = _ses_control_slot_number(
+                    slot, slot.ses_device or enclosure.ses_device,
+                )
                 candidates[combined_slot] = {
                     "status": slot.status,
                     "descriptor": slot.description,
@@ -2595,9 +2656,9 @@ def build_slot_candidates_from_ses_enclosures(
                     "enclosure_id": enclosure.enclosure_id,
                     "enclosure_label": enclosure.enclosure_label,
                     "enclosure_name": enclosure.enclosure_name,
-                    "ses_device": enclosure.ses_device,
+                    "ses_device": slot.ses_device or enclosure.ses_device,
                     "ses_element_id": slot.element_id,
-                    "ses_slot_number": slot.slot_number,
+                    "ses_slot_number": control_slot_number,
                     "sas_address_hint": None if slot.sas_address_degraded else slot.sas_address,
                     "sas_address_source": slot.sas_address_source,
                     "sas_address_conflict": slot.sas_address_conflict,
@@ -2620,7 +2681,8 @@ def build_slot_candidates_from_ses_enclosures(
                             {
                                 "ses_device": slot.ses_device or enclosure.ses_device,
                                 "ses_element_id": slot.element_id,
-                                "ses_slot_number": slot.slot_number,
+                                "ses_slot_number": control_slot_number,
+                                "ssh_host": _ses_control_host(slot, enclosure),
                             }
                         ],
                     ),
@@ -2657,6 +2719,7 @@ def build_slot_candidates_from_ses_enclosures(
                             "ses_device": slot.ses_device or enclosure.ses_device,
                             "ses_element_id": slot.element_id,
                             "ses_slot_number": None,
+                            "ssh_host": _ses_control_host(slot, enclosure),
                         }
                     ],
                 ),
