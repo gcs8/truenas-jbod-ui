@@ -1185,6 +1185,37 @@ def build_health_payload(
     }
 
 
+def build_system_health_entry(
+    system_id: str,
+    label: str | None,
+    snapshot: InventorySnapshot | None,
+    *,
+    default: bool,
+) -> dict[str, object]:
+    """One informational per-system row for ``/healthz`` (#783).
+
+    Only the default system decides the top-level status and HTTP code. These
+    rows let operators see every other configured system from cached inventory
+    alone; they never trigger collection and carry no per-source dumps.
+    """
+
+    if snapshot is None:
+        status_text, summary, last_updated = "unknown", HEALTH_SUMMARY_WAITING, None
+    else:
+        inventory = build_health_payload(snapshot)
+        status_text = str(inventory["status"])
+        summary = inventory["summary"]
+        last_updated = inventory["last_updated"]
+    return {
+        "id": system_id,
+        "label": label or system_id,
+        "default": default,
+        "status": status_text,
+        "summary": summary,
+        "last_updated": last_updated,
+    }
+
+
 def health_status_code(payload: dict[str, object]) -> int:
     """HTTP status for a health payload: 503 only when the container itself is down."""
 

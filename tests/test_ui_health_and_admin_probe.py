@@ -98,9 +98,15 @@ def _service(**overrides: object) -> Mock:
     return service
 
 
-def _registry(service: Mock) -> Mock:
+def _registry(service: Mock, *, others: dict[str, Mock | None] | None = None) -> Mock:
     registry = Mock()
     registry.get_service.return_value = service
+    default = SimpleNamespace(id="system-a", label="System A")
+    extra = {system_id: SimpleNamespace(id=system_id, label=system_id.title()) for system_id in (others or {})}
+    registry.settings = SimpleNamespace(systems=[default, *extra.values()])
+    registry.get_system.return_value = default
+    services = {"system-a": service, **(others or {})}
+    registry.peek_service.side_effect = lambda system_id: services.get(system_id)
     return registry
 
 
@@ -284,9 +290,18 @@ class HealthzTests(unittest.TestCase):
         snapshot: InventorySnapshot | None,
         problems: tuple[str, ...] = (),
         known_hosts_warnings: tuple[str, ...] = (),
+        others: dict[str, InventorySnapshot | None | str] | None = None,
     ) -> tuple[int, dict]:
         service = Mock()
         service.peek_cached_snapshot.return_value = snapshot
+        other_services: dict[str, Mock | None] = {}
+        for system_id, other_snapshot in (others or {}).items():
+            if other_snapshot == "no-service":
+                other_services[system_id] = None
+                continue
+            other_service = Mock()
+            other_service.peek_cached_snapshot.return_value = other_snapshot
+            other_services[system_id] = other_service
         request = SimpleNamespace(
             app=SimpleNamespace(
                 state=SimpleNamespace(
@@ -296,8 +311,10 @@ class HealthzTests(unittest.TestCase):
             )
         )
         route = _route("/healthz")
-        with patch.object(app_routes, "get_inventory_registry", return_value=_registry(service)):
+        registry = _registry(service, others=other_services)
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
             response = asyncio.run(route.endpoint(request))
+        registry.get_service.assert_called_once_with(None)
         return response.status_code, json.loads(response.body)
 
     def test_empty_cache_is_waiting_not_a_problem(self) -> None:
@@ -314,8 +331,55 @@ class HealthzTests(unittest.TestCase):
                 "sources": {},
                 "warnings": [],
                 "cache_state": "empty",
+                "scope": "default_system",
+                "systems": [
+                    {
+                        "id": "system-a",
+                        "label": "System A",
+                        "default": True,
+                        "status": "unknown",
+                        "summary": "Waiting for the first inventory",
+                        "last_updated": None,
+                    }
+                ],
             },
         )
+
+    def test_other_system_failure_is_listed_without_changing_status_or_code(self) -> None:
+        failing = _snapshot(api_ok=False, api_message="connection refused")
+        status, body = self.call_healthz(
+            _snapshot(), others={"system-b": failing, "system-c": None, "system-d": "no-service"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["summary"], "All sources OK")
+        self.assertEqual(body["problems"], [])
+        self.assertEqual(body["scope"], "default_system")
+        by_id = {entry["id"]: entry for entry in body["systems"]}
+        self.assertEqual([entry["id"] for entry in body["systems"]], ["system-a", "system-b", "system-c", "system-d"])
+        self.assertEqual(by_id["system-a"]["status"], "ok")
+        self.assertTrue(by_id["system-a"]["default"])
+        self.assertEqual(by_id["system-b"]["status"], "degraded")
+        self.assertEqual(by_id["system-b"]["summary"], "TrueNAS API degraded: connection refused")
+        self.assertFalse(by_id["system-b"]["default"])
+        self.assertIsNotNone(by_id["system-b"]["last_updated"])
+        for idle in ("system-c", "system-d"):
+            self.assertEqual(by_id[idle]["status"], "unknown")
+            self.assertEqual(by_id[idle]["summary"], "Waiting for the first inventory")
+            self.assertIsNone(by_id[idle]["last_updated"])
+
+    def test_local_down_still_wins_with_other_systems_listed(self) -> None:
+        status, body = self.call_healthz(
+            _snapshot(), problems=(CHOWN_SENTENCE,), others={"system-b": _snapshot()}
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(body["status"], "down")
+        self.assertEqual([entry["status"] for entry in body["systems"]], ["ok", "ok"])
+
+    def test_per_system_entries_omit_source_dumps(self) -> None:
+        _status, body = self.call_healthz(_snapshot(), others={"system-b": _snapshot()})
+        for entry in body["systems"]:
+            self.assertEqual(set(entry), {"id", "label", "default", "status", "summary", "last_updated"})
 
     def test_healthy_snapshot_says_all_sources_ok_with_per_source_dump(self) -> None:
         status, body = self.call_healthz(_snapshot())

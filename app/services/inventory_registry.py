@@ -77,6 +77,11 @@ class InventoryRegistry:
     def has_system(self, system_id: str) -> bool:
         return any(system.id == system_id for system in self.settings.systems)
 
+    def peek_service(self, system_id: str) -> InventoryService | None:
+        """Return the already-built service for ``system_id`` without creating one."""
+
+        return self._services.get(system_id)
+
     def get_service(self, system_id: str | None) -> InventoryService:
         system = self.get_system(system_id)
         service = self._services.get(system.id)
