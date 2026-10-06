@@ -65,6 +65,11 @@
     return unit === "B" ? `${Math.trunc(size)} B` : `${size.toFixed(1)} ${unit}`;
   }
 
+  // #833: a size the service could not read is unknown, never an empty database.
+  function databaseSizeLabel(value) {
+    return typeof value === "number" && Number.isFinite(value) ? formatBytes(value) : "unknown";
+  }
+
   function setText(id, value) {
     const element = document.getElementById(id);
     if (element) {
@@ -220,7 +225,7 @@
     setCount("metric-samples-value", counts.metric_sample_count);
     setCount("metric-rollups-value", counts.metric_rollup_count);
     updateFullRefreshCooldown(refresh.full_refresh_cooldown_seconds_remaining);
-    setText("db-size-value", formatBytes(payload.database?.size_bytes ?? payload.database_size_bytes));
+    setText("db-size-value", databaseSizeLabel(payload.database?.size_bytes ?? payload.database_size_bytes));
     // #597: the server formats these so the page and polling share one rule.
     if (typeof payload.database?.reclaimable_label === "string") {
       setText("db-reclaimable", `Free inside the file: ${payload.database.reclaimable_label}`);
@@ -228,17 +233,42 @@
     if (typeof payload.database?.backup_footprint_label === "string") {
       setText("status-backup-footprint", payload.database.backup_footprint_label);
     }
-    renderScopes(payload.scopes || []);
+    const storageDegraded = renderStorageDegraded(payload.degraded_reason);
+    renderScopes(payload.scopes || [], storageDegraded);
   }
 
-  function renderScopes(scopes) {
+  // #833: the overview names why stored history shows nothing. A reason shows
+  // the notice, null clears it, and missing or malformed evidence keeps the
+  // last known notice. Returns whether the notice is showing.
+  function renderStorageDegraded(reason) {
+    const notice = document.getElementById("history-storage-degraded");
+    if (!notice) return typeof reason === "string" && reason !== "";
+    if (typeof reason === "string" && reason !== "") {
+      notice.textContent = reason;
+      notice.hidden = false;
+    } else if (reason === null) {
+      notice.textContent = "";
+      notice.hidden = true;
+    }
+    return !notice.hidden && notice.textContent !== "";
+  }
+
+  function renderScopes(scopes, storageDegraded = false) {
     const body = document.getElementById("tracked-scopes-body");
     if (!body) {
       return;
     }
     const rows = Array.isArray(scopes) ? scopes : [];
     if (!rows.length) {
-      body.innerHTML = "<tr><td colspan='6'>No slot history has been collected yet.</td></tr>";
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.setAttribute("colspan", "6");
+      // Nothing was read while storage is degraded; do not claim nothing was collected.
+      cell.textContent = storageDegraded
+        ? "Systems and enclosures are unavailable until stored history can be read."
+        : "No slot history has been collected yet.";
+      row.appendChild(cell);
+      body.replaceChildren(row);
       return;
     }
     body.replaceChildren(...rows.map((scope) => {

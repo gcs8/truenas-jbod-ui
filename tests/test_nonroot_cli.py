@@ -51,6 +51,21 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                 self.assertIn("preflight", result.stdout)
                 self.assertEqual(result.stderr, "")
 
+    def test_help_and_docs_state_the_stopped_writer_precondition(self) -> None:
+        # The link checks are point-in-time; they hold only while nothing else
+        # can create, rename or unlink files under the deployment root (#731).
+        result = self._run(["--help"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = " ".join(result.stdout.split())
+        self.assertIn("Stop every writer", help_text)
+        self.assertIn("hard links", help_text)
+        repo = SCRIPT_PATH.parents[1]
+        for relative in ("scripts/README.md", "wiki/Troubleshooting.md"):
+            with self.subTest(document=relative):
+                text = " ".join((repo / relative).read_text(encoding="utf-8").split())
+                self.assertIn("Stop every writer", text)
+                self.assertIn("hard link", text)
+
     def test_unsupported_execution_fails_before_inspecting_root(self) -> None:
         for mode in ("resource", "identity", "descriptors"):
             for apply in ([], ["--apply"]):
