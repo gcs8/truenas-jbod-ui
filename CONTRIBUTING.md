@@ -600,14 +600,17 @@ Rules:
 4. The builder and checker share one centrally declared semantic input graph.
    The checked-in artifact must always be an exact build of the reachable
    commit it records.
-5. The public demo is rebuilt when a release is cut, not in ordinary pull
-   requests. A pull request that changes a declared input leaves
+5. The public demo is rebuilt when a stable release is cut, not in ordinary
+   pull requests or prereleases such as `v0.24.0-beta.1`. A pull request that
+   changes a declared input leaves
    `public-demo/**`, the screenshots, and the review record alone. Release
    preparation rebuilds the demo from the release source, recaptures the
    screenshots on Linux, and records the pixel review. The release checks
    (`check_public_demo_artifact.py --require-current`,
    `validate_release_wrap.py --public-demo-only`, and the same check in
-   `.github/workflows/publish-ghcr.yml`) fail until that is done.
+   `.github/workflows/publish-ghcr.yml`) fail until that is done; for a
+   prerelease they skip the demo (see "Prereleases" in
+   `docs/RELEASE_CHECKLIST.md`).
 6. Any future local-history conversion must be an explicit maintainer-only tool
    that writes the bounded public fixture. Fixture review, artifact regeneration,
    and publication remain separate later steps.

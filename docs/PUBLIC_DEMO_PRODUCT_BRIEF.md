@@ -48,7 +48,7 @@ The banner shows two different identities:
 
 The leading source-parity manifest also records the artifact hash and the combined source/output hash. `scripts/check_public_demo_artifact.py` checks every field and requires the recorded source revision to be an ancestor of the current checkout. By default it reads the declared inputs at that recorded revision, so a pull request that changes a demo input still passes as long as the artifact is an exact build of the commit it records. With `--require-current`, used when a release is cut, it also rejects any declared input changed after that revision.
 
-The demo is rebuilt when a release is cut, not in every pull request, so between releases it trails `main`. The release uses two commits: the first freezes the source graph, and the next adds the artifact generated with `--source-revision` set to that first commit. This avoids claiming that a file contains the Git commit that already contains the same file. `docs/RELEASE_CHECKLIST.md` ("Public demo rebuild") has the steps, and `scripts/validate_release_wrap.py <version> --public-demo-only` refuses a release until they are done.
+The demo is rebuilt when a stable release is cut, not in every pull request or prerelease, so between stable releases it trails `main`. The release uses two commits: the first freezes the source graph, and the next adds the artifact generated with `--source-revision` set to that first commit. This avoids claiming that a file contains the Git commit that already contains the same file. `docs/RELEASE_CHECKLIST.md` ("Public demo rebuild") has the steps, and `scripts/validate_release_wrap.py <version> --public-demo-only` refuses a release until they are done.
 
 ## Screenshot provenance
 

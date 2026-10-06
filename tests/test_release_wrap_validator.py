@@ -466,6 +466,7 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
     def test_a_prerelease_leaves_the_public_demo_for_the_stable_release(self) -> None:
         self.assertFalse(public_demo_freshness_required("v0.24.0-beta.1"))
         self.assertFalse(public_demo_freshness_required("0.24.0-rc.2"))
+        self.assertFalse(public_demo_freshness_required("v0.24.0-rc.1+build.5"))
         # Build metadata alone is not a prerelease, even with a hyphen in it.
         self.assertTrue(public_demo_freshness_required("v0.24.0+build-1"))
         with self.assertRaises(ValueError):

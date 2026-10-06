@@ -30,8 +30,8 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   release that documents the gap, remediation, and full gate evidence.
 - If this checklist changes during release prep, rerun or re-evaluate the
   affected gates and update the release wrap before cutting the tag.
-- Every release rebuilds the public demo from the release source. Pull requests
-  do not, so the checked-in demo is normally older than `main`. Follow
+- Every stable release rebuilds the public demo from the release source. Pull
+  requests do not, so the checked-in demo is normally older than `main`. Follow
   "Public demo rebuild" below before tagging. The pre-tag and final validators
   and the GHCR release workflow run
   `python scripts/validate_release_wrap.py <version> --public-demo-only` and
@@ -110,9 +110,10 @@ python scripts/validate_release_wrap.py "$version" \
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
 3. Draft or update the release notes and release wrap before tagging. Bump
-   `app/__init__.py` to the release version, then do the "Public demo rebuild"
-   below from that commit. `validate_release_wrap.py <version>
-   --public-demo-only` must pass before the next step.
+   `app/__init__.py` to the release version. For a stable release, do the
+   "Public demo rebuild" below from that commit; a prerelease skips it (see
+   "Prereleases"). `validate_release_wrap.py <version> --public-demo-only`
+   must pass before the next step.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
@@ -407,8 +408,9 @@ python scripts/validate_release_wrap.py "$version" \
 
 ## Public demo rebuild
 
-Required for every release. Ordinary pull requests leave the demo alone, so
-this is the only place it catches up with the source.
+Required for every stable release; a prerelease skips it. Ordinary pull
+requests leave the demo alone, so this is the only place it catches up with
+the source.
 
 1. On the release branch, after the version bump and the last source change,
    commit, then build from that exact commit:

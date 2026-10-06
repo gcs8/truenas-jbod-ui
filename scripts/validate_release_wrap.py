@@ -52,7 +52,7 @@ OWNER_PUBLICATION_TARGETS = {"external wiki", "public demo"}
 VALID_RESULTS = {"pass", "blocked", "n/a"}
 WIKI_DRIFT_REQUIRED_FROM = (0, 22, 3)
 CHANGELOG_COVERAGE_REQUIRED_FROM = (0, 22, 3)
-VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?")
+VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
 # Releases from this version on must ship a public demo rebuilt from the
 # release source. Earlier releases predate the release-time rebuild rule.
 PUBLIC_DEMO_FRESHNESS_REQUIRED_FROM = (0, 23, 1)
