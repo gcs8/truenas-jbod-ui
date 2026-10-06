@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Kept storage-view history on a candidate's own enclosure, so a disk recorded
+  in another enclosure no longer shows the history of a same-numbered local
+  bay, in the live view, the history route and offline exports. (#888)
 - Bounded the SFTP subsystem request and every later SFTP request by the
   target's timeout, so a server that stalls after login no longer holds the
   backup job or delays the next target. (#889)
