@@ -2304,8 +2304,11 @@ class SnapshotExportService:
 
     @staticmethod
     def _storage_view_history_target(runtime_view: Any, runtime_slot: Any, *, fallback_enclosure_id: str | None) -> tuple[int, str | None]:
-        if runtime_slot.snapshot_slot is not None:
-            return int(runtime_slot.snapshot_slot), runtime_view.backing_enclosure_id or fallback_enclosure_id
+        enclosure_id = runtime_view.backing_enclosure_id or fallback_enclosure_id
+        # A bay number only names a disk inside its own enclosure; a candidate
+        # from another enclosure keys the view's own history scope instead.
+        if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, enclosure_id}:
+            return int(runtime_slot.snapshot_slot), enclosure_id
         return int(runtime_slot.slot_index), f"storage-view:{runtime_view.id}"
 
     @staticmethod

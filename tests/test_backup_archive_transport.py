@@ -15,6 +15,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import contextmanager
@@ -43,6 +44,7 @@ from history_service.backup_archive.transport import (
     transport_encrypted,
     validate_object_name,
 )
+from tests import sftp_stall_server
 
 
 def _sha(data: bytes) -> str:
@@ -476,6 +478,7 @@ class FilesystemTargetTests(_TempCase):
             result = target.test()
         self.assertTrue(result["ok"], result)
         self.assertIn("readback matched", result["detail"])
+        self.assertEqual(result["upload_check"], "readback")
         self.assertIsInstance(result["duration_ms"], int)
         self.assertEqual(list((self.tmp / "archive").iterdir()), [])
 
@@ -523,6 +526,7 @@ class FakeFTP:
         self.cwd_path = "/"
         self.log: list[str] = []
         self.corrupt_size = False
+        self.alter_same_length = False
         self.deny_mkd: set[str] = set()
         FakeFTP.instances.append(self)
 
@@ -568,7 +572,19 @@ class FakeFTP:
                 break
             self.log.append(f"chunk {len(chunk)}")
             chunks.append(chunk)
-        self.files[path] = b"".join(chunks)
+        data = b"".join(chunks)
+        if self.alter_same_length and data:
+            data = bytes([data[0] ^ 0xFF]) + data[1:]  # same size, different content
+        self.files[path] = data
+
+    def retrbinary(self, cmd, callback, blocksize=8192):
+        verb, path = cmd.split(" ", 1)
+        assert verb == "RETR"
+        if path not in self.files:
+            raise ftplib.error_perm("550 not found")
+        data = self.files[path]
+        for offset in range(0, len(data), blocksize):
+            callback(data[offset : offset + blocksize])
 
     def voidcmd(self, cmd):
         return "200"
@@ -636,7 +652,7 @@ class FtpTargetTests(_TempCase):
             target.delete("full/b1.tar.zst")
             target.delete("full/b1.tar.zst")
         ftp = FakeFTP.instances[0]
-        self.assertEqual(stored, StoredObject("full/b1.tar.zst", len(data), _sha(data), True))
+        self.assertEqual(stored, StoredObject("full/b1.tar.zst", len(data), _sha(data), True, "size"))
         self.assertIn("rename /pub/jbod-ui/full/b1.tar.zst.partial -> /pub/jbod-ui/full/b1.tar.zst", ftp.log)
         self.assertGreaterEqual(sum(1 for line in ftp.log if line.startswith("chunk")), 3)
         self.assertEqual(
@@ -697,6 +713,27 @@ class FtpTargetTests(_TempCase):
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["transport_encrypted"])
         self.assertEqual(FakeFTP.instances[0].files, {})
+        # #722: FTP never reads the content back, so the probe must not say so.
+        self.assertEqual(result["upload_check"], "size")
+        self.assertNotIn("readback matched", result["detail"])
+        self.assertIn("remote size matched", result["detail"])
+        self.assertIn("SHA-256 was computed on the bytes sent", result["detail"])
+
+    def test_size_only_upload_accepts_same_length_altered_data_and_says_so(self) -> None:
+        # #722: FTP's agreed guarantee is size only. A same-length change is
+        # not caught at upload, and the result says the check was size only.
+        data = b"synthetic archive bytes"
+        with open_target(self.settings()) as target:
+            FakeFTP.instances[0].alter_same_length = True
+            stored = target.put(self.source(data), "full/b1.tar.zst")
+            self.assertTrue(stored.verified)
+            self.assertEqual(stored.upload_check, "size")
+            self.assertEqual(stored.sha256, _sha(data))  # the bytes sent
+            back = self.tmp / "back"
+            size, digest = target.get("full/b1.tar.zst", back)
+        # An explicit download check sees the difference.
+        self.assertEqual(size, len(data))
+        self.assertNotEqual(digest, _sha(data))
 
 
 # --------------------------------------------------------------------------
@@ -810,14 +847,19 @@ class FakeSSHClient:
 
     def __init__(self):
         self.host_keys = paramiko.HostKeys()
+        self.system_host_keys = paramiko.HostKeys()
         self.policy = None
         self.sftp = FakeSFTP()
         self.connect_kwargs = None
         self.closed = False
+        self.sftp_session_timeout = None
         FakeSSHClient.instances.append(self)
 
     def load_host_keys(self, path):
         self.host_keys.load(path)
+
+    def load_system_host_keys(self, path):
+        self.system_host_keys.load(path)
 
     def get_host_keys(self):
         return self.host_keys
@@ -831,13 +873,19 @@ class FakeSSHClient:
     def connect(self, **kwargs):
         self.connect_kwargs = kwargs
         hostname = kwargs["hostname"] if kwargs.get("port", 22) == 22 else f"[{kwargs['hostname']}]:{kwargs['port']}"
-        known = self.host_keys.lookup(hostname)
+        # Like paramiko: system host keys first, then the client's own.
+        known = self.system_host_keys.lookup(hostname) or self.host_keys.lookup(hostname)
         if known is None or SERVER_KEY.get_name() not in known:
             self.policy.missing_host_key(self, hostname, SERVER_KEY)
         elif known[SERVER_KEY.get_name()] != SERVER_KEY:
             raise paramiko.BadHostKeyException(hostname, SERVER_KEY, known[SERVER_KEY.get_name()])
 
     def open_sftp(self):
+        return self.sftp
+
+    def open_sftp_session(self, timeout):
+        # Stands in for transport._open_sftp_session on this fake client.
+        self.sftp_session_timeout = timeout
         return self.sftp
 
     def _log(self, level, message):
@@ -885,7 +933,13 @@ class SftpTargetTests(_TempCase):
         patcher = mock.patch.object(transport.paramiko, "SSHClient", FakeSSHClient)
         patcher.start()
         self.addCleanup(patcher.stop)
+        session = mock.patch.object(
+            transport, "_open_sftp_session", lambda client, timeout: client.open_sftp_session(timeout)
+        )
+        session.start()
+        self.addCleanup(session.stop)
         self.known_hosts = self.tmp / "known_hosts"
+        self.pin_file = self.tmp / "state" / "sftp_known_hosts"
 
     def settings(self, **kw) -> ArchiveTargetSettings:
         values = {
@@ -924,14 +978,63 @@ class SftpTargetTests(_TempCase):
     def test_changed_host_key_is_rejected_even_with_tofu(self) -> None:
         self.pin_key(OTHER_KEY)
         with self.assertRaises(paramiko.BadHostKeyException):
-            with open_target(self.settings(trust_on_first_use=True)):
+            with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
                 pass
 
-    def test_tofu_pins_the_first_key(self) -> None:
-        with open_target(self.settings(trust_on_first_use=True)):
+    def test_every_post_connect_wait_uses_the_target_timeout(self) -> None:
+        # #723: connect/banner/auth were bounded, but not the channel or the
+        # SFTP session opened after them.
+        self.pin_key()
+        with open_target(self.settings(timeout_seconds=7.5)):
             pass
-        pinned = paramiko.HostKeys(str(self.known_hosts))
+        client = FakeSSHClient.instances[0]
+        self.assertEqual(client.connect_kwargs["channel_timeout"], 7.5)
+        self.assertEqual(client.sftp_session_timeout, 7.5)
+
+    def test_tofu_pins_the_first_key(self) -> None:
+        with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
+            pass
+        pinned = paramiko.HostKeys(str(self.pin_file))
         self.assertEqual(pinned.lookup("sftp.example.test")[SERVER_KEY.get_name()], SERVER_KEY)
+
+    def test_tofu_never_writes_the_file_a_target_names(self) -> None:
+        # #816: known_hosts_path is target configuration. With trust on first
+        # use the scheduler only reads it; a new key goes to its own pin file.
+        for existing in (None, b"", b"# operator notes\n"):
+            with self.subTest(existing=existing):
+                victim = self.tmp / "journal" / "config-changes.jsonl"
+                if victim.exists():
+                    victim.unlink()
+                if self.pin_file.exists():
+                    self.pin_file.unlink()
+                if existing is not None:
+                    victim.parent.mkdir(exist_ok=True)
+                    victim.write_bytes(existing)
+                with open_target(
+                    self.settings(trust_on_first_use=True, known_hosts_path=str(victim)),
+                    sftp_pin_file=self.pin_file,
+                ):
+                    pass
+                self.assertEqual(victim.read_bytes() if victim.exists() else None, existing)
+                self.assertFalse(victim.parent.exists() and existing is None)
+                pinned = paramiko.HostKeys(str(self.pin_file))
+                self.assertEqual(pinned.lookup("sftp.example.test")[SERVER_KEY.get_name()], SERVER_KEY)
+
+    def test_tofu_still_honours_keys_already_in_the_target_file(self) -> None:
+        self.pin_key()
+        with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
+            pass
+        self.assertEqual(self.pin_file.read_text(), "")
+        self.pin_key(OTHER_KEY)
+        with self.assertRaises(paramiko.BadHostKeyException):
+            with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
+                pass
+
+    def test_tofu_without_a_scheduler_pin_file_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ArchiveConfigError, "pin file"):
+            with open_target(self.settings(trust_on_first_use=True)):
+                pass
+        self.assertFalse(self.known_hosts.exists())
 
     def test_put_verifies_by_readback_and_renames(self) -> None:
         self.pin_key()
@@ -977,6 +1080,50 @@ class SftpTargetTests(_TempCase):
             with mock.patch.object(FakeSFTP, "mkdir", side_effect=PermissionError(13, "Permission denied")):
                 with open_target(self.settings()):
                     pass
+
+
+class SftpStallTests(_TempCase):
+    """#723: a real loopback SFTP server that stalls after authentication."""
+
+    TIMEOUT = 0.5
+    BOUND = 4.0  # well under the stall server's own MAX_HOLD_SECONDS
+
+    def settings(self, server: sftp_stall_server.StallingSftpServer) -> ArchiveTargetSettings:
+        known_hosts = self.tmp / "known_hosts"
+        server.write_known_hosts(known_hosts)
+        return ArchiveTargetSettings(
+            target_id="stalled",
+            provider="sftp",
+            root="/srv/backups/jbod-ui",
+            hostname="127.0.0.1",
+            port=server.port,
+            username=sftp_stall_server.USERNAME,
+            password_file=self.secret("sftp-pass", sftp_stall_server.PASSWORD),
+            known_hosts_path=str(known_hosts),
+            timeout_seconds=self.TIMEOUT,
+        )
+
+    def assert_times_out_and_closes(self, stall: str) -> None:
+        before = sftp_stall_server.live_client_transports()
+        with sftp_stall_server.StallingSftpServer(stall=stall) as server:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                with open_target(self.settings(server)):
+                    self.fail("a stalled SFTP target must not open")
+            elapsed = time.monotonic() - started
+            self.assertTrue(server.reached.is_set(), "the client never reached the stall")
+            self.assertEqual(server.connections, 1)
+        self.assertLess(elapsed, self.BOUND)
+        deadline = time.monotonic() + 5
+        while sftp_stall_server.live_client_transports() - before and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(sftp_stall_server.live_client_transports() - before, set())
+
+    def test_stalled_subsystem_request_times_out_and_closes_the_connection(self) -> None:
+        self.assert_times_out_and_closes("subsystem")
+
+    def test_stalled_first_sftp_request_times_out_and_closes_the_connection(self) -> None:
+        self.assert_times_out_and_closes("request")
 
 
 # --------------------------------------------------------------------------

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, cast
+from typing import Callable, NamedTuple, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -62,7 +62,7 @@ from history_service.startup import (
     open_history_store_with_retries,
 )
 from history_service.startup_migration import open_history_store_after_recovery
-from history_service.segment_reader import HistoryStorageUnavailableError
+from history_service.segment_reader import HistoryStorageUnavailableError, SegmentCatalogMissingError
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -483,31 +483,59 @@ async def _refuse_while_storage_is_unavailable(request: Request, call_next):
     return await call_next(request)
 
 
+class HistorySummary(NamedTuple):
+    counts: dict[str, object]
+    counts_exact: bool
+    scopes: list[dict[str, object]]
+    size_bytes: int | None
+    degraded_reason: str | None
+
+
+async def read_history_summary(exact_counts: bool, *, degrade_missing_catalog: bool) -> HistorySummary:
+    """Counts, scopes and size for the page, its overview poll and refresh replies.
+
+    With ``degrade_missing_catalog`` (the page and GET /api/history/overview
+    only), a segmented deployment whose catalog does not exist yet answers
+    degraded content (#833): no counts, no scopes, an unknown size, and the
+    reason /healthz gives for it (#663). Otherwise, and for every other
+    storage failure, the error still reaches the storage-unavailable handler.
+    """
+    try:
+        counts = cast(
+            dict[str, object],
+            await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
+        )
+        scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
+        size_bytes = await asyncio.to_thread(store.database_size_bytes)
+    except SegmentCatalogMissingError:
+        if not degrade_missing_catalog:
+            raise
+        return HistorySummary({}, False, [], None, SEGMENT_CATALOG_MISSING_REASON)
+    counts_exact = exact_counts or counts.get("estimated") is False
+    return HistorySummary(counts, counts_exact, scopes, size_bytes, None)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, exact_counts: bool = Query(default=False)) -> HTMLResponse:
     status = public_collector_status(await asyncio.to_thread(collector.status))
-    counts = cast(
-        dict[str, object],
-        await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
-    )
-    scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
-    database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
-    disk = await asyncio.to_thread(database_disk_metrics)
+    summary = await read_history_summary(exact_counts, degrade_missing_catalog=True)
+    disk = await asyncio.to_thread(database_disk_metrics, degrade_missing_catalog=True)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
         build_dashboard_context(
             request=request,
             status=status,
-            counts=counts,
-            scopes=scopes,
+            counts=summary.counts,
+            scopes=summary.scopes,
             app_version=__version__,
             release_status=get_release_status_service().snapshot(),
-            database_size_bytes=database_size_bytes,
+            database_size_bytes=summary.size_bytes,
             reclaimable_bytes=disk["reclaimable_bytes"],
             main_file_size_bytes=disk["main_file_size_bytes"],
             backup_footprint=disk["backup_footprint"],
             refresh=refresh_cooldown_status(),
+            degraded_reason=summary.degraded_reason,
         ),
     )
 
@@ -555,6 +583,10 @@ async def healthz() -> JSONResponse:
     database_size_bytes: int | None
     try:
         database_size_bytes = await asyncio.to_thread(store.database_size_bytes)
+    except SegmentCatalogMissingError:
+        # The store wraps read failures (#860); name this one as the dashboard does (#833).
+        database_size_bytes = None
+        degraded_reason = degraded_reason or SEGMENT_CATALOG_MISSING_REASON
     except FileNotFoundError as exc:
         database_size_bytes = None
         catalog_path = store.segment_catalog_path
@@ -588,20 +620,31 @@ async def livez() -> JSONResponse:
     )
 
 
-@app.get("/api/history/overview")
-async def overview(exact_counts: bool = Query(default=False)) -> dict[str, object]:
-    counts = await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts)
-    return {
+async def overview(exact_counts: bool = False, *, degrade_missing_catalog: bool = False) -> dict[str, object]:
+    """The overview payload. Refresh replies reuse it with their shape unchanged."""
+    summary = await read_history_summary(exact_counts, degrade_missing_catalog=degrade_missing_catalog)
+    payload: dict[str, object] = {
         "collector": public_collector_status(await asyncio.to_thread(collector.status)),
         "refresh": refresh_cooldown_status(),
-        "counts": counts,
-        "counts_exact": exact_counts or counts.get("estimated") is False,
+        "counts": summary.counts,
+        "counts_exact": summary.counts_exact,
         "database": {
-            "size_bytes": await asyncio.to_thread(store.database_size_bytes),
-            **public_disk_metrics(await asyncio.to_thread(database_disk_metrics)),
+            "size_bytes": summary.size_bytes,
+            **public_disk_metrics(
+                await asyncio.to_thread(database_disk_metrics, degrade_missing_catalog=degrade_missing_catalog)
+            ),
         },
-        "scopes": await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts),
+        "scopes": summary.scopes,
     }
+    if degrade_missing_catalog:
+        # Null when stored history was read; otherwise why it shows nothing (#833).
+        payload["degraded_reason"] = summary.degraded_reason
+    return payload
+
+
+@app.get("/api/history/overview")
+async def overview_route(exact_counts: bool = Query(default=False)) -> dict[str, object]:
+    return await overview(exact_counts, degrade_missing_catalog=True)
 
 
 @app.post("/api/history/refresh", response_model=None)
@@ -873,15 +916,22 @@ def format_count(value: object) -> str:
     return f"{value}"
 
 
-def database_disk_metrics() -> dict[str, object]:
+def database_disk_metrics(*, degrade_missing_catalog: bool = False) -> dict[str, object]:
     """Free pages, main-file size and backup footprint, read-only (#455).
 
     Shared by the page render and /api/history/overview so the dashboard's
     polling keeps these labels current (#597).
     """
 
+    try:
+        reclaimable_bytes = store.reclaimable_bytes()
+    except SegmentCatalogMissingError:
+        if not degrade_missing_catalog:
+            raise
+        # Degraded content (#833): free space is unknown, not a page failure.
+        reclaimable_bytes = None
     return {
-        "reclaimable_bytes": store.reclaimable_bytes(),
+        "reclaimable_bytes": reclaimable_bytes,
         "main_file_size_bytes": store.main_file_size_bytes(),
         "backup_footprint": store.backup_footprint(
             settings.backup_dir,
@@ -1007,11 +1057,12 @@ def build_dashboard_context(
     scopes: list[dict[str, object]],
     app_version: str,
     release_status: dict[str, object] | None = None,
-    database_size_bytes: int = 0,
+    database_size_bytes: int | None = 0,
     reclaimable_bytes: int | None = None,
     main_file_size_bytes: int | None = None,
     backup_footprint: dict[str, int] | None = None,
     refresh: dict[str, object] | None = None,
+    degraded_reason: str | None = None,
 ) -> dict[str, object]:
     release_payload = release_status or {}
     backoff_seconds = int(status.get("background_backoff_seconds_remaining") or 0)
@@ -1023,11 +1074,13 @@ def build_dashboard_context(
         "status": status,
         "counts": counts,
         "scopes": scopes,
-        "database_size_label": format_bytes(database_size_bytes),
+        # None means the size could not be read (#833), never an empty database.
+        "database_size_label": "unknown" if database_size_bytes is None else format_bytes(database_size_bytes),
         "reclaimable_label": reclaimable_label(
             reclaimable_bytes,
-            database_size_bytes if main_file_size_bytes is None else main_file_size_bytes,
+            (database_size_bytes or 0) if main_file_size_bytes is None else main_file_size_bytes,
         ),
+        "degraded_reason": degraded_reason,
         "backup_footprint_label": backup_footprint_label(backup_footprint),
         "release_summary": str(release_payload.get("summary") or "Checking for updates..."),
         "latest_url": safe_http_url(release_payload.get("latest_url")),

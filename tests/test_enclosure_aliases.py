@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from starlette.requests import Request
 
@@ -52,11 +52,11 @@ class EnclosureAliasRouteTests(unittest.TestCase):
         service = Mock()
         service.system.id = "system-a"
         service.system.truenas.platform = "scale"
-        service.save_sas_fabric_alias.return_value = {
+        service.save_sas_fabric_alias_async = AsyncMock(return_value={
             "ok": True,
             "cleared": False,
             "alias": {"object_id": "enc-a", "label": "Archive East"},
-        }
+        })
         registry = Mock()
         registry.get_service.return_value = service
         payload = SasFabricAliasRequest(
@@ -80,7 +80,7 @@ class EnclosureAliasRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(json.loads(response.body)["ok"])
-        service.save_sas_fabric_alias.assert_called_once_with(
+        service.save_sas_fabric_alias_async.assert_awaited_once_with(
             object_id="enc-a::drawer-top",
             object_kind="enclosure",
             label="Archive East",

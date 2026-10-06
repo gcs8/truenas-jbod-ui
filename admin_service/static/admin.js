@@ -6075,6 +6075,9 @@
   // Backup and debug downloads and restore uploads move whole archives and may
   // stop and restart containers, so they get a long limit instead of 60 s.
   const BACKUP_TRANSFER_TIMEOUT_MS = 30 * 60 * 1000;
+  // Orphaned-history scans and purges walk every history row and segment and
+  // can take minutes on large history, so they get the same long limit.
+  const HISTORY_MAINTENANCE_TIMEOUT_MS = 30 * 60 * 1000;
 
   function requestTimeoutError(timeoutMs) {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
@@ -7173,7 +7176,7 @@
       elements.historyPurgeOrphanedResult.textContent = "Scanning for orphaned history rows...";
     }
     try {
-      const preview = await fetchJson("/api/admin/history/orphaned");
+      const preview = await fetchJson("/api/admin/history/orphaned", { timeoutMs: HISTORY_MAINTENANCE_TIMEOUT_MS });
       if (!Array.isArray(preview.orphaned_systems) || !preview.purge_preview_token) {
         throw new Error("History preview is unavailable. Retry before purging.");
       }
@@ -7190,8 +7193,13 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ preview_token: preview.purge_preview_token, confirm_irreversible: true }),
+        timeoutMs: HISTORY_MAINTENANCE_TIMEOUT_MS,
       });
       await loadOrphanedHistory({ quiet: true, fresh: true });
+      // Nothing left to purge after a confirmed rescan: keep Purge disabled.
+      if (!state.orphanedHistoryError && Array.isArray(state.orphanedHistory) && !state.orphanedHistory.length) {
+        emptyPreview = true;
+      }
       if (elements.historyPurgeOrphanedResult) {
         elements.historyPurgeOrphanedResult.textContent = payload.detail || "Orphaned history scan finished.";
       }
@@ -7201,10 +7209,15 @@
         setBanner("No orphaned history rows matched the current config.", "info");
       }
     } catch (error) {
+      // A timed-out or interrupted purge may still be running or have committed
+      // on the server, so say the outcome is unknown rather than failed.
+      const detail = error?.adminOutcome === "unknown" || error?.outcomeUnknown
+        ? `Orphaned history purge outcome is unknown. ${error.message || error} Preview again to see what remains.`
+        : `Orphaned history purge failed: ${error.message || error}`;
       if (elements.historyPurgeOrphanedResult) {
-        elements.historyPurgeOrphanedResult.textContent = `Orphaned history purge failed: ${error.message || error}`;
+        elements.historyPurgeOrphanedResult.textContent = detail;
       }
-      setBanner(`Orphaned history purge failed: ${error.message || error}`, "error");
+      setBanner(detail, error?.adminOutcome === "unknown" || error?.outcomeUnknown ? "info" : "error");
     } finally {
       state.historyPurgePending = false;
       if (elements.historyPurgeOrphanedButton) {
@@ -7251,7 +7264,7 @@
       elements.historyAdoptResult.textContent = "Scanning for removed-system history that can be adopted...";
     }
     try {
-      const payload = await fetchJson("/api/admin/history/orphaned");
+      const payload = await fetchJson("/api/admin/history/orphaned", { timeoutMs: HISTORY_MAINTENANCE_TIMEOUT_MS });
       if (!Array.isArray(payload.orphaned_systems)) throw new Error("Invalid history source response. Retry the scan.");
       state.orphanedHistory = payload.orphaned_systems;
       state.orphanedHistoryError = false;

@@ -5,18 +5,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from history_service import main as history_main
 from history_service.collector import HistoryCollector
 from history_service.config import HistorySettings
 from history_service.diagnostics import RETENTION_FAILURE_SENTENCES
+from history_service.segment_catalog import MIGRATION_PENDING_MARKER
+from history_service.store import HistoryStore
 
 
 def _collector(**settings: Any) -> HistoryCollector:
@@ -150,6 +153,167 @@ class HealthzShapeTests(unittest.TestCase):
         )
 
         self.assertEqual(payload["status"], "ok")
+
+
+def _asgi_get(path: str, query: bytes = b"", *, method: str = "GET", body: bytes = b"") -> tuple[int, bytes]:
+    """Drive the real app, its exception handlers and middleware, without lifespan."""
+
+    async def invoke() -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+
+        async def receive() -> Any:
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message: Any) -> None:
+            messages.append(message)
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
+            "root_path": "", "query_string": query,
+            "headers": [(b"host", b"testserver"), (b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 12345), "server": ("testserver", 80),
+        }
+        try:
+            await history_main.app(scope, receive, send)
+        except Exception:
+            # An unhandled error still sends its 500 first; report that status.
+            if not any(message["type"] == "http.response.start" for message in messages):
+                raise
+        return messages
+
+    messages = asyncio.run(invoke())
+    status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+    body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    return status, body
+
+
+class MissingSegmentCatalogDashboardTests(unittest.TestCase):
+    """#833: the page and its overview poll degrade like /healthz (#663) does.
+
+    A real store is configured for segmented history with a catalog path that
+    does not exist, the way a fresh segmented deployment starts.
+    """
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.root = Path(temp_dir.name)
+        self.catalog = self.root / "segments" / "catalog.json"
+        self.store = HistoryStore(str(self.root / "history.db"), segment_catalog_path=str(self.catalog))
+        for patcher in (
+            patch.object(history_main, "store", self.store),
+            patch.object(history_main, "startup_failure_reason", None),
+            patch.object(history_main.collector, "status", return_value={"collector_running": True}),
+            patch.object(history_main.collector, "degraded_reason", return_value=None),
+            patch.object(history_main.get_release_status_service(), "snapshot", return_value={}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _storage_banner(markup: str) -> re.Match[str]:
+        banner = re.search(r'<div id="history-storage-degraded"([^>]*)>(.*?)</div>', markup, flags=re.DOTALL)
+        assert banner is not None, "the dashboard must carry the storage notice hook"
+        return banner
+
+    def test_overview_answers_degraded_content_with_the_missing_catalog_reason(self) -> None:
+        for query in (b"", b"exact_counts=true"):
+            with self.subTest(query=query):
+                status, body = _asgi_get("/api/history/overview", query)
+                self.assertEqual(status, 200, body)
+                payload = json.loads(body)
+                self.assertEqual(payload["degraded_reason"], history_main.SEGMENT_CATALOG_MISSING_REASON)
+                self.assertEqual(payload["counts"], {})
+                self.assertIs(payload["counts_exact"], False)
+                self.assertEqual(payload["scopes"], [])
+                self.assertIsNone(payload["database"]["size_bytes"])
+                self.assertIsNone(payload["database"]["reclaimable_bytes"])
+                self.assertEqual(payload["database"]["reclaimable_label"], "unknown")
+                self.assertIs(payload["collector"]["collector_running"], True)
+        self.assertFalse(os.path.lexists(self.catalog), "a read must not create the catalog")
+
+    def test_dashboard_page_shows_the_missing_catalog_reason_and_an_unknown_size(self) -> None:
+        status, body = _asgi_get("/")
+
+        self.assertEqual(status, 200, body)
+        markup = body.decode("utf-8")
+        banner = self._storage_banner(markup)
+        self.assertNotIn("hidden", banner.group(1))
+        self.assertEqual(banner.group(2).strip(), history_main.SEGMENT_CATALOG_MISSING_REASON)
+        self.assertRegex(markup, r'id="db-size-value" class="value">\s*unknown\s*<')
+        self.assertIn("Free inside the file: unknown", markup)
+        # Nothing was read, so the page must not claim nothing was collected.
+        self.assertNotIn("No slot history has been collected yet.", markup)
+        self.assertFalse(os.path.lexists(self.catalog), "a read must not create the catalog")
+
+    def test_healthz_names_the_same_missing_catalog_reason_as_the_dashboard(self) -> None:
+        status, body = _asgi_get("/healthz")
+
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["detail"], history_main.SEGMENT_CATALOG_MISSING_REASON)
+        self.assertIsNone(payload["database_size_bytes"])
+
+    def test_a_catalog_naming_a_missing_segment_still_fails_closed(self) -> None:
+        self.catalog.parent.mkdir(parents=True)
+        self.catalog.write_text(
+            json.dumps({
+                "catalog_version": 1, "generation_id": "generation-0001", "complete": True,
+                "segments": [{
+                    "segment_id": "segment-0001", "file_name": "segment-0001.sqlite3",
+                    "size_bytes": 4096, "sha256": "0" * 64,
+                    "coverage_start": "2026-09-01T00:00:00+00:00",
+                    "coverage_end": "2026-09-02T00:00:00+00:00",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self._assert_storage_unavailable()
+
+    def test_a_pending_migration_marker_still_fails_closed(self) -> None:
+        self.catalog.parent.mkdir(parents=True)
+        (self.catalog.parent / MIGRATION_PENDING_MARKER).write_text("synthetic", encoding="utf-8")
+        self._assert_storage_unavailable()
+
+    def _assert_storage_unavailable(self) -> None:
+        for path in ("/", "/api/history/overview"):
+            with self.subTest(path=path):
+                status, body = _asgi_get(path)
+                self.assertEqual(status, 503, body)
+                self.assertEqual(json.loads(body), {"detail": history_main.HISTORY_UNAVAILABLE_DETAIL})
+
+    def test_a_refresh_reply_keeps_its_storage_unavailable_answer(self) -> None:
+        # Only the page and GET /api/history/overview degrade (#833); the
+        # refresh reply reuses the overview payload but keeps its own contract.
+        admission = history_main.ManualRefreshAdmission(cooldown_seconds=900)
+        with (
+            patch.object(history_main, "refresh_admission", admission),
+            patch.object(history_main.settings, "refresh_auth_mode", "network"),
+            patch.object(history_main.collector, "collection_pause", return_value=(False, None)),
+            patch.object(type(history_main.collector), "collection_running", new_callable=PropertyMock, return_value=False),
+            patch.object(history_main.collector, "run_once", new_callable=AsyncMock) as run_once,
+        ):
+            status, body = _asgi_get("/api/history/refresh", method="POST", body=b'{"mode":"fast"}')
+
+        run_once.assert_awaited_once()
+        self.assertEqual(status, 503, body)
+        self.assertEqual(json.loads(body), {"detail": history_main.HISTORY_UNAVAILABLE_DETAIL})
+
+    def test_a_readable_store_reports_no_degraded_reason(self) -> None:
+        with patch.object(history_main, "store", HistoryStore(str(self.root / "plain.db"))):
+            overview_status, overview_body = _asgi_get("/api/history/overview")
+            page_status, page_body = _asgi_get("/")
+
+        self.assertEqual((overview_status, page_status), (200, 200))
+        payload = json.loads(overview_body)
+        self.assertIsNone(payload["degraded_reason"])
+        self.assertIsInstance(payload["database"]["size_bytes"], int)
+        banner = self._storage_banner(page_body.decode("utf-8"))
+        self.assertIn("hidden", banner.group(1))
+        self.assertEqual(banner.group(2).strip(), "")
+        self.assertIn("No slot history has been collected yet.", page_body.decode("utf-8"))
 
 
 class StartingStateTests(unittest.TestCase):

@@ -66,8 +66,9 @@ class ArchiveTargetSettings:
     timeout_seconds: float = 30.0
     # ftp: explicit FTPS (AUTH TLS, then PROT P). Plain FTP is allowed.
     use_tls: bool = False
-    # sftp: host-key verification. known_hosts_path is required; an unknown
-    # key fails unless trust_on_first_use is set for this target.
+    # sftp: host-key verification. known_hosts_path is required and only
+    # read; an unknown key fails unless trust_on_first_use is set, which pins
+    # it in the scheduler's own state folder instead (#816).
     known_hosts_path: str = ""
     trust_on_first_use: bool = False
     private_key_file: str = ""

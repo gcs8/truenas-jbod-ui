@@ -15,7 +15,7 @@ const FETCH_JSON_HELPERS = ["fetchJson", "fetchOrReportStopped", "sessionRemaini
 const MUTATION_RESULT_HELPERS = ["requireMutationResult", "isNonEmptyString", "validSystemSaveResult", "validDemoSystemResult", "validProfileSaveResult", "describeMutationFailure", "adminRequestError", "captureAdminEditorOperation", "retireAdminEditorControls", "recordAdminEditorOutcome"];
 const SYNTHETIC_REQUEST_ID = "0123456789abcdef0123456789abcdef";
 function load(names, bindings = {}) {
-  const context = vm.createContext({console, URLSearchParams, setTimeout, clearTimeout, state: {admin: {}}, renderSaveResult(target, detail) {if (target) target.textContent = detail;}, AbortController, DEFAULT_REQUEST_TIMEOUT_MS: 60000, ...bindings});
+  const context = vm.createContext({console, URLSearchParams, setTimeout, clearTimeout, state: {admin: {}}, renderSaveResult(target, detail) {if (target) target.textContent = detail;}, AbortController, DEFAULT_REQUEST_TIMEOUT_MS: 60000, HISTORY_MAINTENANCE_TIMEOUT_MS: 1800000, ...bindings});
   vm.runInContext(names.map(extract).join("\n") + `\nglobalThis.tested = {${names.join(",")}}`, context);
   return context.tested;
 }
@@ -30,6 +30,64 @@ test("empty purge preview disables deletion without asking for confirmation", as
   let confirms = 0;
   await load(["purgeOrphanedHistory"], {state: {}, elements, fetchJson: async () => ({orphaned_systems: [], purge_preview_token: "proof"}), window: {confirm() {confirms++;}}, setBanner() {}}).purgeOrphanedHistory();
   assert.equal(confirms, 0); assert.equal(elements.historyPurgeOrphanedButton.disabled, true);
+});
+test("orphaned-history preview, purge and adopt scans use the long history maintenance timeout", async () => {
+  const constant = source.match(/^  const HISTORY_MAINTENANCE_TIMEOUT_MS = (.+);$/m);
+  assert.ok(constant, "HISTORY_MAINTENANCE_TIMEOUT_MS must exist");
+  const timeoutMs = vm.runInNewContext(constant[1]);
+  assert.ok(timeoutMs >= 10 * 60 * 1000, "a history scan can take minutes");
+  const calls = [];
+  const fetchJson = async (url, options = {}) => {
+    calls.push({url, method: options.method || "GET", timeoutMs: options.timeoutMs});
+    return url.endsWith("/purge-orphaned")
+      ? {ok: true, detail: "done", summary: {total_rows: 4}}
+      : {orphaned_systems: [{system_id: "removed-one", total_rows: 4}], purge_preview_token: "proof"};
+  };
+  const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};
+  await load(["purgeOrphanedHistory"], {state: {}, elements, fetchJson, window: {confirm: () => true}, loadOrphanedHistory: async () => {}, setBanner() {}, HISTORY_MAINTENANCE_TIMEOUT_MS: timeoutMs}).purgeOrphanedHistory();
+  await load(["loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"], {state: {}, elements: {}, fetchJson, renderHistoryMaintenance() {}, setBanner() {}, HISTORY_MAINTENANCE_TIMEOUT_MS: timeoutMs}).loadOrphanedHistory();
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.url}`), [
+    "GET /api/admin/history/orphaned", "POST /api/admin/history/purge-orphaned", "GET /api/admin/history/orphaned",
+  ]);
+  for (const call of calls) assert.equal(call.timeoutMs, timeoutMs, `${call.method} ${call.url}`);
+});
+test("purge leaves the button disabled when the fresh rescan finds nothing left", async () => {
+  const state = {orphanedHistory: [{system_id: "removed-one", total_rows: 4}]};
+  const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};
+  const fetchJson = async (url) => url.endsWith("/purge-orphaned")
+    ? {ok: true, detail: "Purged.", summary: {total_rows: 4}}
+    : {orphaned_systems: [{system_id: "removed-one", total_rows: 4}], purge_preview_token: "proof"};
+  const loadOrphanedHistory = async () => { state.orphanedHistory = []; state.orphanedHistoryError = false; };
+  await load(["purgeOrphanedHistory"], {state, elements, fetchJson, window: {confirm: () => true}, loadOrphanedHistory, setBanner() {}, HISTORY_MAINTENANCE_TIMEOUT_MS: 1}).purgeOrphanedHistory();
+  assert.equal(elements.historyPurgeOrphanedButton.disabled, true);
+  assert.equal(elements.historyPurgeOrphanedResult.textContent, "Purged.");
+});
+test("purge re-enables the button when rows remain or the rescan failed", async () => {
+  for (const [remaining, rescanError] of [[[{system_id: "other", total_rows: 2}], false], [[], true]]) {
+    const state = {};
+    const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};
+    const fetchJson = async (url) => url.endsWith("/purge-orphaned")
+      ? {ok: true, detail: "Purged.", summary: {total_rows: 4}}
+      : {orphaned_systems: [{system_id: "removed-one", total_rows: 4}], purge_preview_token: "proof"};
+    const loadOrphanedHistory = async () => { state.orphanedHistory = remaining; state.orphanedHistoryError = rescanError; };
+    await load(["purgeOrphanedHistory"], {state, elements, fetchJson, window: {confirm: () => true}, loadOrphanedHistory, setBanner() {}, HISTORY_MAINTENANCE_TIMEOUT_MS: 1}).purgeOrphanedHistory();
+    assert.equal(elements.historyPurgeOrphanedButton.disabled, false, JSON.stringify({remaining, rescanError}));
+  }
+});
+test("a purge whose outcome is unknown is not reported as failed", async () => {
+  const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};
+  let banner = "";
+  const fetchJson = async (url) => {
+    if (!url.endsWith("/purge-orphaned")) return {orphaned_systems: [{system_id: "removed-one", total_rows: 4}], purge_preview_token: "proof"};
+    const error = new Error("Timed out after 30 minutes. The change may or may not have been applied; re-check the current state before retrying.");
+    error.adminOutcome = "unknown";
+    throw error;
+  };
+  await load(["purgeOrphanedHistory"], {state: {}, elements, fetchJson, window: {confirm: () => true}, loadOrphanedHistory: async () => {}, setBanner(text) { banner = text; }, HISTORY_MAINTENANCE_TIMEOUT_MS: 1}).purgeOrphanedHistory();
+  assert.doesNotMatch(elements.historyPurgeOrphanedResult.textContent, /failed/i);
+  assert.match(elements.historyPurgeOrphanedResult.textContent, /outcome is unknown/i);
+  assert.match(elements.historyPurgeOrphanedResult.textContent, /may or may not have been applied/);
+  assert.doesNotMatch(banner, /failed/i);
 });
 test("incomplete state object cannot clear saved lists", async () => {
   const state = {systems: [{id: "keep"}], profiles: [{id: "keep-profile"}]};

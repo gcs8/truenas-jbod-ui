@@ -87,6 +87,9 @@ HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
+# Trust-on-first-use SFTP targets pin new host keys here, in the scheduler's
+# private state, never in a file a target names (#816).
+SFTP_PIN_FILE_NAME = "sftp_known_hosts"
 
 
 class SchedulerBusyError(RuntimeError):
@@ -1062,7 +1065,11 @@ class BackupScheduler:
             )
             validate_filesystem_target_roots(peers, self.paths.local_dir, allow_unavailable=True)
         opened = (
-            self._open_target(target.settings, local_archive_root=self.paths.local_dir)
+            self._open_target(
+                target.settings,
+                local_archive_root=self.paths.local_dir,
+                sftp_pin_file=self.paths.state_dir / SFTP_PIN_FILE_NAME,
+            )
             if self._open_target_is_default
             else self._open_target(target.settings)
         )
@@ -1102,10 +1109,20 @@ class BackupScheduler:
             preserved_by="scheduler-recovery" if preserved else "",
         )
 
-    def _catalog_remote(self, source: ArtifactRecord, remote_record: ArtifactRecord) -> None:
+    def _catalog_remote(
+        self,
+        source: ArtifactRecord,
+        remote_record: ArtifactRecord,
+        *,
+        upload_check: str = "readback",
+    ) -> None:
         self.catalog.add(remote_record)
         with self._state_lock:
-            self._meta[remote_record.artifact_id] = self._metadata_snapshot(source.artifact_id)
+            meta = self._metadata_snapshot(source.artifact_id)
+            # #722: remember how the upload was checked, so the detail view can
+            # say "size only" until an explicit verify re-reads and hashes it.
+            meta["upload_check"] = upload_check
+            self._meta[remote_record.artifact_id] = meta
             self._save_meta()
 
     def _ship(self, record: ArtifactRecord) -> list[str]:
@@ -1125,14 +1142,14 @@ class BackupScheduler:
                 if stored.size != record.size or stored.sha256 != record.sha256:
                     raise RuntimeError("remote copy does not match the local archive")
                 remote_record = self._remote_record(record, target, stored)
-                self._catalog_remote(record, remote_record)
+                self._catalog_remote(record, remote_record, upload_check=stored.upload_check)
                 self._record_target(target.target_id, RunRecord(at=at, ok=True, artifact_id=remote_record.artifact_id))
             except ArchivePublicationUncertainError as exc:
                 remote_record = self._remote_record(record, target, exc.stored, preserved=True)
                 try:
                     if remote_record.size != record.size or remote_record.sha256 != record.sha256:
                         raise RuntimeError("uncertain remote copy does not match the local archive")
-                    self._catalog_remote(record, remote_record)
+                    self._catalog_remote(record, remote_record, upload_check=exc.stored.upload_check)
                 except Exception as catalog_exc:  # noqa: BLE001 - keep target failure isolated
                     logger.warning(
                         "Uncertain remote backup copy to %s could not be catalogued (%s).",
@@ -1350,6 +1367,8 @@ class BackupScheduler:
             else None
         )
         payload["last_verify"] = meta.get("last_verify")
+        # None for local copies and copies catalogued before #722.
+        payload["upload_check"] = meta.get("upload_check") if meta.get("upload_check") in {"readback", "size"} else None
         return payload
 
     def library(self) -> dict[str, Any]:

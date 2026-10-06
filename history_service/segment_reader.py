@@ -97,6 +97,16 @@ class HistoryStorageUnavailableError(ValueError):
     """Stored history cannot be safely read, independently of request shape."""
 
 
+class SegmentCatalogMissingError(HistoryStorageUnavailableError):
+    """Segmented history is configured but its catalog file does not exist.
+
+    A fresh segmented deployment is in this state until a migration or
+    restore publishes the catalog. It stays a storage-unavailable error for
+    every caller; only the dashboard and its overview present it as degraded
+    content (#833) and /healthz as degraded (#663).
+    """
+
+
 def metric_sample_identity(item: dict[str, Any]) -> tuple[Any, ...]:
     """Deduplicate repeated fetches, not equal aggregate measurements."""
     if item.get("id") is not None:
