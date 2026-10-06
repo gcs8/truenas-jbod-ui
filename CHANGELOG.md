@@ -268,6 +268,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Bounded the SFTP subsystem request and every later SFTP request by the
   target's timeout, so a server that stalls after login no longer holds the
   backup job or delays the next target. (#889)
+- Showed a degraded history dashboard, with the reason `/healthz` gives,
+  when a segmented deployment has no catalog yet, instead of failing the page
+  and its overview. Refresh requests still report the storage error. (#891)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
