@@ -302,6 +302,10 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 
 ### Fixed
 
+- Gave a TrueNAS inventory read four times `TRUENAS_TIMEOUT`, 60 seconds by
+  default, so a large CORE shelf whose SMART test history takes longer than
+  one call's timeout no longer fails every refresh. LED and single-disk SMART
+  calls keep one timeout. (#899)
 - Stopped a QuantaStor system's inventory and storage views from failing with
   HTTP 500 when the appliance reports a pool member's status as a numeric
   code. Member health now falls back to the pool's status text. (#898)

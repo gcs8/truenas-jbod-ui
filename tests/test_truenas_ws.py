@@ -7,7 +7,12 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import TrueNASConfig
-from app.services.truenas_ws import _MiddlewareCallDispatcher, TrueNASAPIError, TrueNASWebsocketClient
+from app.services.truenas_ws import (
+    INVENTORY_DEADLINE_MULTIPLIER,
+    TrueNASAPIError,
+    TrueNASWebsocketClient,
+    _MiddlewareCallDispatcher,
+)
 
 
 class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
@@ -906,9 +911,9 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
 class NormalOperationPeer:
     """Synthetic normal-operation wire peer, shared by the two dialect suites."""
 
-    def __init__(self, dialect="ddp", *, phase="method", mode="silence", close_error=False):
+    def __init__(self, dialect="ddp", *, phase="method", mode="silence", close_error=False, delay=0.0):
         self.dialect, self.phase, self.mode = dialect, phase, mode
-        self.close_error = close_error
+        self.close_error, self.delay = close_error, delay
         self.queue = asyncio.Queue()
         self.sent, self.pongs, self.waiting = [], [], []
         self.connections = self.closes = self.receivers = self.peak_receivers = 0
@@ -1007,6 +1012,9 @@ class NormalOperationPeer:
         if self.mode in ("normal", "shared_budget"):
             if self.mode == "shared_budget":
                 await asyncio.sleep(0.04)
+            elif self.delay and message["method"] in ("smart.test.results", "enclosure.set_slot_status", "disk.smartctl"):
+                # One slow call per operation, like CORE's smart.test.results.
+                await asyncio.sleep(self.delay)
             self.reply(message)
         elif self.mode in ("ping", "ping_success", "blocked_pong"):
             self.waiting.append(message)
@@ -1056,6 +1064,11 @@ class NormalOperationDeadlineChecks:
             platform="core" if self.dialect == "ddp" else "scale", api_dialect=self.dialect,
         ))
         self.client.config.timeout_seconds = 0.06
+        # These lifecycle checks time every operation against one budget. The
+        # longer inventory deadline has its own test below.
+        multiplier = patch("app.services.truenas_ws.INVENTORY_DEADLINE_MULTIPLIER", 1)
+        multiplier.start()
+        self.addCleanup(multiplier.stop)
         self.loop_errors = []
         loop = asyncio.get_running_loop()
         old_handler = loop.get_exception_handler()
@@ -1137,6 +1150,28 @@ class NormalOperationDeadlineChecks:
                     with self.assertRaises(TimeoutError):
                         task.result()
                 self.assertTrue(peer.started.is_set(), "must reach method after delayed authentication")
+
+    async def test_inventory_read_gets_a_longer_deadline_than_one_call(self):
+        # CORE's smart.test.results can take several times one call's timeout
+        # on a large shelf. Only fetch_all gets the longer budget, and it stays
+        # bounded when the appliance never answers.
+        self.client.config.timeout_seconds = 0.05
+        with patch("app.services.truenas_ws.INVENTORY_DEADLINE_MULTIPLIER", INVENTORY_DEADLINE_MULTIPLIER):
+            for name in self.operations:
+                with self.subTest(operation=name):
+                    peer = NormalOperationPeer(self.dialect, mode="normal", delay=0.1)
+                    async with self.running(name, peer) as task:
+                        await self.finished(task)
+                        if name == "fetch_all":
+                            self.assertEqual(task.result().disks, [{"name": "da0"}])
+                        else:
+                            with self.assertRaises(TimeoutError):
+                                task.result()
+            peer = NormalOperationPeer(self.dialect)
+            async with self.running("fetch_all", peer) as task:
+                await self.finished(task)
+                with self.assertRaisesRegex(TimeoutError, r"within 0\.2s"):
+                    task.result()
 
     async def test_completed_normal_operations_preserve_payloads(self):
         for name in self.operations:
