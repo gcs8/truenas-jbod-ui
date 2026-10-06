@@ -302,6 +302,9 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 
 ### Fixed
 
+- Stopped a QuantaStor system's inventory and storage views from failing with
+  HTTP 500 when the appliance reports a pool member's status as a numeric
+  code. Member health now falls back to the pool's status text. (#898)
 - Listed every saved system in `/healthz` with its cached status while keeping
   the overall status and HTTP code scoped to the default system. (#885)
 - Rebuilt cached Storage Fabric topology for an alias save in a worker thread,
