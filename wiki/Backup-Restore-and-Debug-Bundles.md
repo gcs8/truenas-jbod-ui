@@ -428,7 +428,7 @@ journal. Restart the scheduler to apply a save:
 
 | `provider` | Encrypted in transit | Notes |
 | --- | --- | --- |
-| `sftp` | Yes | Needs `known_hosts_path` and a key or password file. Use SFTP for "SCP" |
+| `sftp` | Yes | Needs `known_hosts_path` and a key or password file. With `trust_on_first_use`, a new host key is saved in the scheduler's own state folder and `known_hosts_path` is only read. Use SFTP for "SCP" |
 | `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
 | `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |

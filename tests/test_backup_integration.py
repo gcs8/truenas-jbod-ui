@@ -477,6 +477,28 @@ class SchedulerPreservationTests(SchedulerTestBase):
                    {**TARGET, "target_id": "second", "root": str(alias)}]
         return first, second, alias, targets
 
+    def test_sftp_targets_pin_new_host_keys_in_the_scheduler_state_folder(self):
+        # #816: the pin file comes from the scheduler, not the target settings.
+        from unittest.mock import Mock
+
+        from history_service.backup_archive import transport
+
+        opened = []
+
+        @contextlib.contextmanager
+        def fake_open_sftp(settings, pin_file=None):
+            opened.append((settings.known_hosts_path, pin_file))
+            yield Mock(test=Mock(return_value={"ok": True}))
+
+        target = {"target_id": "tofu", "provider": "sftp", "root": "/srv/backups/jbod",
+                  "hostname": "nas.example.test", "username": "backup", "trust_on_first_use": True,
+                  "known_hosts_path": "/run/backup-secrets/archive_known_hosts",
+                  "password_file": "/run/backup-secrets/archive_sftp_password"}
+        scheduler = self.real_scheduler([target]).service
+        with patch.object(transport, "_open_sftp", fake_open_sftp):
+            self.assertTrue(scheduler.test_target("tofu")["ok"])
+        self.assertEqual(opened, [(target["known_hosts_path"], self._paths.state_dir / "sftp_known_hosts")])
+
     def test_remote_same_root_policy_refuses_enabled_plain_and_symlink_aliases(self):
         from history_service.backup_archive.policy import policy_from_section
 

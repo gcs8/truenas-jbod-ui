@@ -717,16 +717,25 @@ def _load_private_key(settings: ArchiveTargetSettings) -> paramiko.PKey | None:
     raise ArchiveConfigError("SFTP private key file is not a supported unencrypted or passphrase-protected key.")
 
 
-def _sftp_host_key_policy(client: paramiko.SSHClient, settings: ArchiveTargetSettings) -> None:
+def _sftp_host_key_policy(
+    client: paramiko.SSHClient, settings: ArchiveTargetSettings, pin_file: Path | None,
+) -> None:
     known_hosts = Path(settings.known_hosts_path)
     if settings.trust_on_first_use:
         from app.services.ssh_probe import AutoPinHostKeyPolicy
 
-        known_hosts.parent.mkdir(parents=True, exist_ok=True)
-        if not known_hosts.exists():
-            known_hosts.touch(mode=0o600)
-        client.load_host_keys(str(known_hosts))
-        client.set_missing_host_key_policy(AutoPinHostKeyPolicy(str(known_hosts)))
+        # #816: the target's known_hosts_path is only read, and its keys win.
+        # A first-seen key goes to the scheduler's own pin file, so a target
+        # can never make the scheduler write to a file it names.
+        if pin_file is None:
+            raise ArchiveConfigError("SFTP trust-on-first-use needs the backup scheduler's own pin file.")
+        if known_hosts.exists():
+            client.load_system_host_keys(str(known_hosts))
+        pin_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not pin_file.exists():
+            pin_file.touch(mode=0o600)
+        client.load_host_keys(str(pin_file))
+        client.set_missing_host_key_policy(AutoPinHostKeyPolicy(str(pin_file)))
         return
     if not known_hosts.is_file():
         raise ArchiveConfigError(
@@ -897,12 +906,12 @@ def _open_sftp_session(client: paramiko.SSHClient, timeout: float) -> paramiko.S
 
 
 @contextmanager
-def _open_sftp(settings: ArchiveTargetSettings) -> Iterator[SftpTarget]:
+def _open_sftp(settings: ArchiveTargetSettings, pin_file: Path | None = None) -> Iterator[SftpTarget]:
     password = read_secret_file(settings.password_file, "SFTP password") if settings.password_file else None
     pkey = _load_private_key(settings)
     client = paramiko.SSHClient()
     try:
-        _sftp_host_key_policy(client, settings)
+        _sftp_host_key_policy(client, settings, pin_file)
         client.connect(
             hostname=settings.hostname,
             port=settings.effective_port or 22,
@@ -1421,8 +1430,13 @@ def open_target(
     settings: ArchiveTargetSettings,
     *,
     local_archive_root: str | os.PathLike[str] | None = None,
+    sftp_pin_file: str | os.PathLike[str] | None = None,
 ) -> Iterator[ArchiveTarget]:
-    """Open one connection (or NFS mount) for the whole block and close it on exit."""
+    """Open one connection (or NFS mount) for the whole block and close it on exit.
+
+    ``sftp_pin_file`` is where trust-on-first-use SFTP targets pin a new host
+    key; it belongs to the scheduler, never to the target's settings.
+    """
 
     provider = settings.provider
     if provider == "filesystem":
@@ -1434,7 +1448,7 @@ def open_target(
         with _open_ftp(settings) as target:
             yield target
     elif provider == "sftp":
-        with _open_sftp(settings) as target:
+        with _open_sftp(settings, Path(sftp_pin_file) if sftp_pin_file is not None else None) as target:
             yield target
     elif provider == "smb":
         with _open_smb(settings) as target:

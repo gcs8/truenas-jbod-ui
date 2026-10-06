@@ -812,6 +812,7 @@ class FakeSSHClient:
 
     def __init__(self):
         self.host_keys = paramiko.HostKeys()
+        self.system_host_keys = paramiko.HostKeys()
         self.policy = None
         self.sftp = FakeSFTP()
         self.connect_kwargs = None
@@ -821,6 +822,9 @@ class FakeSSHClient:
 
     def load_host_keys(self, path):
         self.host_keys.load(path)
+
+    def load_system_host_keys(self, path):
+        self.system_host_keys.load(path)
 
     def get_host_keys(self):
         return self.host_keys
@@ -834,7 +838,8 @@ class FakeSSHClient:
     def connect(self, **kwargs):
         self.connect_kwargs = kwargs
         hostname = kwargs["hostname"] if kwargs.get("port", 22) == 22 else f"[{kwargs['hostname']}]:{kwargs['port']}"
-        known = self.host_keys.lookup(hostname)
+        # Like paramiko: system host keys first, then the client's own.
+        known = self.system_host_keys.lookup(hostname) or self.host_keys.lookup(hostname)
         if known is None or SERVER_KEY.get_name() not in known:
             self.policy.missing_host_key(self, hostname, SERVER_KEY)
         elif known[SERVER_KEY.get_name()] != SERVER_KEY:
@@ -899,6 +904,7 @@ class SftpTargetTests(_TempCase):
         session.start()
         self.addCleanup(session.stop)
         self.known_hosts = self.tmp / "known_hosts"
+        self.pin_file = self.tmp / "state" / "sftp_known_hosts"
 
     def settings(self, **kw) -> ArchiveTargetSettings:
         values = {
@@ -937,7 +943,7 @@ class SftpTargetTests(_TempCase):
     def test_changed_host_key_is_rejected_even_with_tofu(self) -> None:
         self.pin_key(OTHER_KEY)
         with self.assertRaises(paramiko.BadHostKeyException):
-            with open_target(self.settings(trust_on_first_use=True)):
+            with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
                 pass
 
     def test_every_post_connect_wait_uses_the_target_timeout(self) -> None:
@@ -951,10 +957,49 @@ class SftpTargetTests(_TempCase):
         self.assertEqual(client.sftp_session_timeout, 7.5)
 
     def test_tofu_pins_the_first_key(self) -> None:
-        with open_target(self.settings(trust_on_first_use=True)):
+        with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
             pass
-        pinned = paramiko.HostKeys(str(self.known_hosts))
+        pinned = paramiko.HostKeys(str(self.pin_file))
         self.assertEqual(pinned.lookup("sftp.example.test")[SERVER_KEY.get_name()], SERVER_KEY)
+
+    def test_tofu_never_writes_the_file_a_target_names(self) -> None:
+        # #816: known_hosts_path is target configuration. With trust on first
+        # use the scheduler only reads it; a new key goes to its own pin file.
+        for existing in (None, b"", b"# operator notes\n"):
+            with self.subTest(existing=existing):
+                victim = self.tmp / "journal" / "config-changes.jsonl"
+                if victim.exists():
+                    victim.unlink()
+                if self.pin_file.exists():
+                    self.pin_file.unlink()
+                if existing is not None:
+                    victim.parent.mkdir(exist_ok=True)
+                    victim.write_bytes(existing)
+                with open_target(
+                    self.settings(trust_on_first_use=True, known_hosts_path=str(victim)),
+                    sftp_pin_file=self.pin_file,
+                ):
+                    pass
+                self.assertEqual(victim.read_bytes() if victim.exists() else None, existing)
+                self.assertFalse(victim.parent.exists() and existing is None)
+                pinned = paramiko.HostKeys(str(self.pin_file))
+                self.assertEqual(pinned.lookup("sftp.example.test")[SERVER_KEY.get_name()], SERVER_KEY)
+
+    def test_tofu_still_honours_keys_already_in_the_target_file(self) -> None:
+        self.pin_key()
+        with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
+            pass
+        self.assertEqual(self.pin_file.read_text(), "")
+        self.pin_key(OTHER_KEY)
+        with self.assertRaises(paramiko.BadHostKeyException):
+            with open_target(self.settings(trust_on_first_use=True), sftp_pin_file=self.pin_file):
+                pass
+
+    def test_tofu_without_a_scheduler_pin_file_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ArchiveConfigError, "pin file"):
+            with open_target(self.settings(trust_on_first_use=True)):
+                pass
+        self.assertFalse(self.known_hosts.exists())
 
     def test_put_verifies_by_readback_and_renames(self) -> None:
         self.pin_key()
