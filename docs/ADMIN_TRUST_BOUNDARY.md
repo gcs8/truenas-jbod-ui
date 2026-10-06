@@ -42,6 +42,15 @@ start in Basic mode until the configured value is valid. A mismatch returns
 `403 Cross-origin admin mutation rejected.` Headerless CLI and automation
 requests remain available.
 
+Without `ADMIN_PUBLIC_ORIGIN` or `APP_PUBLIC_ORIGIN`, the request's own address
+is trusted only when its host is an IP address, `localhost`, or a name listed in
+`ADMIN_ALLOWED_HOSTS`. This blocks DNS rebinding, where an attacker's name
+resolves to this server and the browser sends a matching `Host` and `Origin`.
+Rebinding needs a host name, so pages opened by IP address keep working without
+a setting. If you open the admin or main UI by a DNS name, list that name, for
+example `ADMIN_ALLOWED_HOSTS=jbod.example.test`, without a scheme or port.
+Changes from any other name return 403. Reads are not affected.
+
 For the main UI on port `8080`, network mode allows reads and writes without a
 login. Persistent mapping and alias changes, mapping imports, enclosure or drive
 LED actions, and system locator changes are available to anyone who can reach

@@ -13,6 +13,18 @@ mode derives that origin from the requested address, so it needs no extra
 setting. Use the explicit public-origin settings when a reverse proxy changes
 the address seen by the services.
 
+When no public origin is set, that derived address is trusted for changes only
+when it is an IP address, `localhost`, or a name in `ADMIN_ALLOWED_HOSTS`.
+Opening the pages by IP needs nothing. If you open them by a DNS name, list it:
+
+```dotenv
+ADMIN_ALLOWED_HOSTS=jbod.example.test,nas.example.test
+```
+
+Names only, separated by commas, with no scheme or port. One list covers the
+main UI and the admin service. It blocks DNS-rebinding pages from making
+changes; reads are not affected.
+
 Enable built-in Basic authentication when reachability is broader than the
 people who should control the app:
 
