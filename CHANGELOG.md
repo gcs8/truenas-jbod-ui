@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Gave the admin orphaned-history preview, adopt scan and purge the long
+  30-minute request limit, reported a timed-out purge as an unknown outcome,
+  and kept Purge disabled when nothing is left to purge. (#883)
 - Kept storage-view history on a candidate's own enclosure, so a disk recorded
   in another enclosure no longer shows the history of a same-numbered local
   bay, in the live view, the history route and offline exports. (#888)
