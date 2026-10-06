@@ -15,6 +15,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import contextmanager
@@ -43,6 +44,7 @@ from history_service.backup_archive.transport import (
     transport_encrypted,
     validate_object_name,
 )
+from tests import sftp_stall_server
 
 
 def _sha(data: bytes) -> str:
@@ -814,6 +816,7 @@ class FakeSSHClient:
         self.sftp = FakeSFTP()
         self.connect_kwargs = None
         self.closed = False
+        self.sftp_session_timeout = None
         FakeSSHClient.instances.append(self)
 
     def load_host_keys(self, path):
@@ -838,6 +841,11 @@ class FakeSSHClient:
             raise paramiko.BadHostKeyException(hostname, SERVER_KEY, known[SERVER_KEY.get_name()])
 
     def open_sftp(self):
+        return self.sftp
+
+    def open_sftp_session(self, timeout):
+        # Stands in for transport._open_sftp_session on this fake client.
+        self.sftp_session_timeout = timeout
         return self.sftp
 
     def _log(self, level, message):
@@ -885,6 +893,11 @@ class SftpTargetTests(_TempCase):
         patcher = mock.patch.object(transport.paramiko, "SSHClient", FakeSSHClient)
         patcher.start()
         self.addCleanup(patcher.stop)
+        session = mock.patch.object(
+            transport, "_open_sftp_session", lambda client, timeout: client.open_sftp_session(timeout)
+        )
+        session.start()
+        self.addCleanup(session.stop)
         self.known_hosts = self.tmp / "known_hosts"
 
     def settings(self, **kw) -> ArchiveTargetSettings:
@@ -926,6 +939,16 @@ class SftpTargetTests(_TempCase):
         with self.assertRaises(paramiko.BadHostKeyException):
             with open_target(self.settings(trust_on_first_use=True)):
                 pass
+
+    def test_every_post_connect_wait_uses_the_target_timeout(self) -> None:
+        # #723: connect/banner/auth were bounded, but not the channel or the
+        # SFTP session opened after them.
+        self.pin_key()
+        with open_target(self.settings(timeout_seconds=7.5)):
+            pass
+        client = FakeSSHClient.instances[0]
+        self.assertEqual(client.connect_kwargs["channel_timeout"], 7.5)
+        self.assertEqual(client.sftp_session_timeout, 7.5)
 
     def test_tofu_pins_the_first_key(self) -> None:
         with open_target(self.settings(trust_on_first_use=True)):
@@ -977,6 +1000,50 @@ class SftpTargetTests(_TempCase):
             with mock.patch.object(FakeSFTP, "mkdir", side_effect=PermissionError(13, "Permission denied")):
                 with open_target(self.settings()):
                     pass
+
+
+class SftpStallTests(_TempCase):
+    """#723: a real loopback SFTP server that stalls after authentication."""
+
+    TIMEOUT = 0.5
+    BOUND = 4.0  # well under the stall server's own MAX_HOLD_SECONDS
+
+    def settings(self, server: sftp_stall_server.StallingSftpServer) -> ArchiveTargetSettings:
+        known_hosts = self.tmp / "known_hosts"
+        server.write_known_hosts(known_hosts)
+        return ArchiveTargetSettings(
+            target_id="stalled",
+            provider="sftp",
+            root="/srv/backups/jbod-ui",
+            hostname="127.0.0.1",
+            port=server.port,
+            username=sftp_stall_server.USERNAME,
+            password_file=self.secret("sftp-pass", sftp_stall_server.PASSWORD),
+            known_hosts_path=str(known_hosts),
+            timeout_seconds=self.TIMEOUT,
+        )
+
+    def assert_times_out_and_closes(self, stall: str) -> None:
+        before = sftp_stall_server.live_client_transports()
+        with sftp_stall_server.StallingSftpServer(stall=stall) as server:
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                with open_target(self.settings(server)):
+                    self.fail("a stalled SFTP target must not open")
+            elapsed = time.monotonic() - started
+            self.assertTrue(server.reached.is_set(), "the client never reached the stall")
+            self.assertEqual(server.connections, 1)
+        self.assertLess(elapsed, self.BOUND)
+        deadline = time.monotonic() + 5
+        while sftp_stall_server.live_client_transports() - before and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(sftp_stall_server.live_client_transports() - before, set())
+
+    def test_stalled_subsystem_request_times_out_and_closes_the_connection(self) -> None:
+        self.assert_times_out_and_closes("subsystem")
+
+    def test_stalled_first_sftp_request_times_out_and_closes_the_connection(self) -> None:
+        self.assert_times_out_and_closes("request")
 
 
 # --------------------------------------------------------------------------
