@@ -478,6 +478,7 @@ class FilesystemTargetTests(_TempCase):
             result = target.test()
         self.assertTrue(result["ok"], result)
         self.assertIn("readback matched", result["detail"])
+        self.assertEqual(result["upload_check"], "readback")
         self.assertIsInstance(result["duration_ms"], int)
         self.assertEqual(list((self.tmp / "archive").iterdir()), [])
 
@@ -525,6 +526,7 @@ class FakeFTP:
         self.cwd_path = "/"
         self.log: list[str] = []
         self.corrupt_size = False
+        self.alter_same_length = False
         self.deny_mkd: set[str] = set()
         FakeFTP.instances.append(self)
 
@@ -570,7 +572,19 @@ class FakeFTP:
                 break
             self.log.append(f"chunk {len(chunk)}")
             chunks.append(chunk)
-        self.files[path] = b"".join(chunks)
+        data = b"".join(chunks)
+        if self.alter_same_length and data:
+            data = bytes([data[0] ^ 0xFF]) + data[1:]  # same size, different content
+        self.files[path] = data
+
+    def retrbinary(self, cmd, callback, blocksize=8192):
+        verb, path = cmd.split(" ", 1)
+        assert verb == "RETR"
+        if path not in self.files:
+            raise ftplib.error_perm("550 not found")
+        data = self.files[path]
+        for offset in range(0, len(data), blocksize):
+            callback(data[offset : offset + blocksize])
 
     def voidcmd(self, cmd):
         return "200"
@@ -638,7 +652,7 @@ class FtpTargetTests(_TempCase):
             target.delete("full/b1.tar.zst")
             target.delete("full/b1.tar.zst")
         ftp = FakeFTP.instances[0]
-        self.assertEqual(stored, StoredObject("full/b1.tar.zst", len(data), _sha(data), True))
+        self.assertEqual(stored, StoredObject("full/b1.tar.zst", len(data), _sha(data), True, "size"))
         self.assertIn("rename /pub/jbod-ui/full/b1.tar.zst.partial -> /pub/jbod-ui/full/b1.tar.zst", ftp.log)
         self.assertGreaterEqual(sum(1 for line in ftp.log if line.startswith("chunk")), 3)
         self.assertEqual(
@@ -699,6 +713,27 @@ class FtpTargetTests(_TempCase):
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["transport_encrypted"])
         self.assertEqual(FakeFTP.instances[0].files, {})
+        # #722: FTP never reads the content back, so the probe must not say so.
+        self.assertEqual(result["upload_check"], "size")
+        self.assertNotIn("readback matched", result["detail"])
+        self.assertIn("remote size matched", result["detail"])
+        self.assertIn("SHA-256 was computed on the bytes sent", result["detail"])
+
+    def test_size_only_upload_accepts_same_length_altered_data_and_says_so(self) -> None:
+        # #722: FTP's agreed guarantee is size only. A same-length change is
+        # not caught at upload, and the result says the check was size only.
+        data = b"synthetic archive bytes"
+        with open_target(self.settings()) as target:
+            FakeFTP.instances[0].alter_same_length = True
+            stored = target.put(self.source(data), "full/b1.tar.zst")
+            self.assertTrue(stored.verified)
+            self.assertEqual(stored.upload_check, "size")
+            self.assertEqual(stored.sha256, _sha(data))  # the bytes sent
+            back = self.tmp / "back"
+            size, digest = target.get("full/b1.tar.zst", back)
+        # An explicit download check sees the difference.
+        self.assertEqual(size, len(data))
+        self.assertNotEqual(digest, _sha(data))
 
 
 # --------------------------------------------------------------------------

@@ -851,7 +851,7 @@ class UnwritableDataDirectoryRouteTests(unittest.TestCase):
         service = Mock()
         service.system.id = "system-a"
         service.system.truenas.platform = "core"
-        service.save_sas_fabric_alias = Mock(
+        service.save_sas_fabric_alias_async = AsyncMock(
             side_effect=SasFabricAliasStorageUnwritable(Path("/app/data"))
         )
         registry = Mock()

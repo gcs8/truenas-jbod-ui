@@ -60,12 +60,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the target at a separate directory or disk before upgrading. With a
   filesystem target, `BACKUP_ARCHIVE_DIR` must also be an absolute path.
   (#633, #651)
+- `ADMIN_ALLOWED_HOSTS`: if you open the main UI or admin by a DNS name and
+  set no `APP_PUBLIC_ORIGIN` or `ADMIN_PUBLIC_ORIGIN`, add that name to
+  `ADMIN_ALLOWED_HOSTS` in `.env` (names only, comma-separated) and recreate
+  the containers, or changes return 403. Pages opened by IP address or
+  `localhost` need nothing. (#892)
 
 ### Security
 
 - An SFTP backup target with `trust_on_first_use` now pins a new host key in
   the scheduler's own state folder and only reads its `known_hosts_path`, so a
   target can no longer make the scheduler write to a file it names. (#895)
+- Without a public origin, the main UI and admin now accept changes only when
+  the browser address is an IP address, `localhost` or a name in the new
+  `ADMIN_ALLOWED_HOSTS`, so a DNS-rebinding page can no longer make changes.
+  (#892)
 - Completed credential scrubbing in shared debug exports, bounded archive
   upload verification reads and persisted newly created archive directories before
   granting verified publication credit. (#878)
@@ -268,6 +277,26 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Rebuilt cached Storage Fabric topology for an alias save in a worker thread,
+  so renaming a fabric object no longer stalls every other UI request. (#894)
+- Described FTP upload checks as size only: the target test and a copy's
+  details no longer claim the content was read back, until an explicit Verify
+  downloads the copy and matches its size and SHA-256. (#890)
+- Refused a backup target secret file that another target or field already
+  uses, and required a new secret file once a target points somewhere else, so
+  one target cannot send another's credential to its server. (#887)
+- Rejected multiply-linked regular files before non-root ownership migration,
+  preserving excluded files' ownership and modes, and documented that every
+  writer must stay stopped while `--apply` runs. (#742)
+- Checked the checked-in public demo against the parity rules of the revision
+  it was built from, so a later schema or offline-image change no longer fails
+  it between releases. (#886)
+- Gave the admin orphaned-history preview, adopt scan and purge the long
+  30-minute request limit, reported a timed-out purge as an unknown outcome,
+  and kept Purge disabled when nothing is left to purge. (#883)
+- Kept storage-view history on a candidate's own enclosure, so a disk recorded
+  in another enclosure no longer shows the history of a same-numbered local
+  bay, in the live view, the history route and offline exports. (#888)
 - Bounded the SFTP subsystem request and every later SFTP request by the
   target's timeout, so a server that stalls after login no longer holds the
   backup job or delays the next target. (#889)

@@ -40,7 +40,7 @@ class ReadUiAuthIsolationTests(unittest.TestCase):
         from admin_service.config import get_admin_settings
 
         self.assertEqual(set(ReadUiAuthSettings.model_fields), {
-            "auth_mode", "auth_username", "auth_password", "public_origin",
+            "auth_mode", "auth_username", "auth_password", "public_origin", "allowed_hosts",
         })
         with tempfile.TemporaryDirectory() as temporary:
             password_file = Path(temporary) / "password"
@@ -172,6 +172,7 @@ async def invoke_asgi(
     additional_origins: tuple[str, ...] = (),
     referer: str | None = None,
     body: bytes = b"{}",
+    host_header: str = "ui.example.test",
 ) -> tuple[int, dict[str, str], bytes]:
     messages: list[dict[str, Any]] = []
     request_sent = False
@@ -188,7 +189,7 @@ async def invoke_asgi(
         messages.append(message)
 
     headers = [
-        (b"host", b"ui.example.test"),
+        (b"host", host_header.encode("latin-1")),
         (b"content-type", b"application/json"),
         (b"content-length", str(len(body)).encode("ascii")),
     ]
@@ -231,12 +232,15 @@ def build_app(
     *,
     auth_mode: Literal["network", "basic"],
     public_origin: str | None = None,
+    # invoke_asgi's Host is a name, which writes must list without a public origin (#779).
+    allowed_hosts: str = "ui.example.test",
 ):
     settings = Settings(app=AppConfig(public_origin=public_origin))
     auth_settings = ReadUiAuthSettings(
         auth_mode=auth_mode,
         auth_username="operator" if auth_mode == "basic" else None,
         auth_password=SecretStr("synthetic-passphrase") if auth_mode == "basic" else None,
+        allowed_hosts=allowed_hosts,
     )
     with patch.object(app_main, "get_settings", return_value=settings):
         with patch.object(
@@ -281,11 +285,17 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         *,
         auth_mode: Literal["network", "basic"],
         public_origin: str | None = None,
+        allowed_hosts: str = "ui.example.test",
     ):
-        return build_app(auth_mode=auth_mode, public_origin=public_origin)
+        return build_app(auth_mode=auth_mode, public_origin=public_origin, allowed_hosts=allowed_hosts)
 
     def test_network_mode_keeps_reads_and_mutations_available_without_auth(self) -> None:
         app = self.make_app(auth_mode="network")
+        unlisted = self.make_app(auth_mode="network", allowed_hosts="")
+        self.assertEqual(
+            asyncio.run(invoke_asgi(unlisted, "/api/system-locator", method="POST"))[0],
+            403,
+        )
 
         read_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
         read_only_post, _headers, _body = asyncio.run(
@@ -320,6 +330,48 @@ class ReadUIAuthorizationTests(unittest.TestCase):
         )
         self.assertNotIn(same_origin_mutation, {401, 403})
         self.assertEqual(cross_site_mutation, 403)
+
+    def test_network_mode_without_public_origin_refuses_writes_to_unlisted_host_names(self) -> None:
+        # #779: a DNS-rebinding name presents a matching Host and Origin.
+        app = self.make_app(auth_mode="network", allowed_hosts="bays.example.test")
+
+        def write(host: str, *, origin: str | None = None) -> tuple[int, bytes]:
+            status, _headers, body = asyncio.run(
+                invoke_asgi(app, "/api/system-locator", method="POST", host_header=host, origin=origin)
+            )
+            return status, body
+
+        status, body = write("rebind.example.test:8080", origin="http://rebind.example.test:8080")
+        self.assertEqual(status, 403)
+        detail = json.loads(body)["detail"]
+        self.assertIn("rebind.example.test", detail)
+        self.assertIn("ADMIN_ALLOWED_HOSTS", detail)
+        self.assertIn("APP_PUBLIC_ORIGIN", detail)
+        self.assertEqual(write("rebind.example.test:8080")[0], 403)
+        self.assertEqual(write("[::1")[0], 403)
+        for host in ("192.0.2.10:8080", "localhost:8080", "[::1]:8080", "[2001:db8::10]", "Bays.Example.Test.:8080"):
+            with self.subTest(accepted=host):
+                self.assertNotIn(write(host, origin=f"http://{host}")[0], {401, 403})
+        self.assertEqual(write("192.0.2.10:8080", origin="https://attacker.example")[0], 403)
+
+        reads = asyncio.run(invoke_asgi(app, "/missing", host_header="rebind.example.test:8080"))[0]
+        read_only_post = asyncio.run(
+            invoke_asgi(app, "/api/mappings/import/preview", method="POST", host_header="rebind.example.test:8080")
+        )[0]
+        self.assertEqual(reads, 404)
+        self.assertEqual(read_only_post, 200)
+
+        proxied = self.make_app(auth_mode="network", public_origin="https://bays.example.test")
+        status = asyncio.run(
+            invoke_asgi(
+                proxied,
+                "/api/system-locator",
+                method="POST",
+                host_header="enclosure-ui:8000",
+                origin="https://bays.example.test",
+            )
+        )[0]
+        self.assertNotIn(status, {401, 403})
 
     def test_basic_mode_keeps_reads_anonymous_and_requires_same_origin_for_mutations(self) -> None:
         app = self.make_app(

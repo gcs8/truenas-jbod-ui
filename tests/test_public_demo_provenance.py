@@ -12,10 +12,19 @@ from app.services.public_demo_fixture import build_public_demo_html
 from scripts.build_public_demo import normalize_artifact_html
 from scripts.public_demo_inputs import PUBLIC_DEMO_INPUT_PATHS
 from scripts.public_demo_source_parity import (
+    INLINE_SOURCE_WRAPPERS,
+    OFFLINE_IMAGE_INPUTS,
+    SOURCE_PARITY_SCHEMA,
     add_source_parity_manifest,
     parse_manifest,
     recorded_source_revision_errors,
 )
+
+try:
+    from scripts.public_demo_source_parity import recorded_parity_rules
+except ImportError:  # pragma: no cover - RED before #791
+    def recorded_parity_rules(_text: str):  # type: ignore[no-redef]
+        raise AssertionError("recorded_parity_rules is not implemented")
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,6 +209,34 @@ class ReleaseOnlyRebuildTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("public demo embedded output fingerprint mismatch", result.stderr)
 
+    def test_pull_request_check_uses_the_recorded_revisions_parity_rules(self) -> None:
+        # A later pull request that bumps the parity schema or adds an offline
+        # image must not fail the older checked-in demo; a release still must
+        # rebuild it under the current rules (#791).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = self.clone_with_later_input_change(temp_dir)
+            parity = repository / "scripts/public_demo_source_parity.py"
+            text = parity.read_text(encoding="utf-8")
+            schema_line = f"SOURCE_PARITY_SCHEMA = {SOURCE_PARITY_SCHEMA}\n"
+            images_line = "OFFLINE_IMAGE_INPUTS: dict[Path, str] = {\n"
+            self.assertEqual(text.count(schema_line), 1)
+            self.assertEqual(text.count(images_line), 1)
+            text = text.replace(schema_line, f"SOURCE_PARITY_SCHEMA = {SOURCE_PARITY_SCHEMA + 1}\n")
+            text = text.replace(
+                images_line, images_line + '    Path("app/static/images/later-card.png"): "image/png",\n'
+            )
+            parity.write_text(text, encoding="utf-8")
+            (repository / "app/static/images/later-card.png").write_bytes(b"\x89PNG later fixture")
+            subprocess.run(["git", "add", "--all"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "later parity rule change"], cwd=repository, check=True)
+            pull_request = run_artifact_checker(repository)
+            release = run_artifact_checker(repository, "--require-current")
+
+        self.assertEqual(pull_request.returncode, 0, pull_request.stderr)
+        self.assertIn("Public demo artifact is publishable", pull_request.stdout)
+        self.assertNotEqual(release.returncode, 0)
+        self.assertIn("unsupported public demo source parity schema", release.stderr)
+
     def test_pull_request_check_rejects_an_unreachable_source_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = self.clone_with_later_input_change(temp_dir)
@@ -213,6 +250,64 @@ class ReleaseOnlyRebuildTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("recorded public demo source revision is not a local commit", result.stderr)
+
+
+class RecordedParityRulesTests(unittest.TestCase):
+    """Recorded parity constants are read as literals, never executed (#791)."""
+
+    def test_current_module_text_yields_the_current_rules(self) -> None:
+        text = (ROOT / "scripts/public_demo_source_parity.py").read_text(encoding="utf-8")
+        rules = recorded_parity_rules(text)
+        self.assertIsNotNone(rules)
+        assert rules is not None
+        self.assertEqual(rules.schema, SOURCE_PARITY_SCHEMA)
+        self.assertEqual(rules.offline_images, OFFLINE_IMAGE_INPUTS)
+        self.assertEqual(rules.inline_wrappers, INLINE_SOURCE_WRAPPERS)
+
+    def test_recorded_demo_revision_rules_parse(self) -> None:
+        checked = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
+        manifest, _html, errors = parse_manifest(checked)
+        self.assertEqual(errors, [])
+        recorded = subprocess.run(
+            ["git", "show", f"{manifest['source_revision']}:scripts/public_demo_source_parity.py"],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        if recorded.returncode != 0:
+            self.skipTest("recorded demo revision is not available in this clone")
+        self.assertIsNotNone(recorded_parity_rules(recorded.stdout))
+
+    def test_module_text_is_parsed_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / "executed"
+            text = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('ran')\n"
+                "SOURCE_PARITY_SCHEMA = 3\n"
+                "OFFLINE_IMAGE_INPUTS = {Path('app/static/images/a.png'): 'image/png'}\n"
+                "INLINE_SOURCE_WRAPPERS = {Path('app/static/app.js'): ('<script>\\n', '\\n</script>')}\n"
+            )
+            rules = recorded_parity_rules(text)
+            self.assertFalse(marker.exists())
+        self.assertIsNotNone(rules)
+
+    def test_non_literal_missing_or_unsafe_rules_fail_closed(self) -> None:
+        images = "OFFLINE_IMAGE_INPUTS = {Path('app/static/images/a.png'): 'image/png'}\n"
+        wrappers = "INLINE_SOURCE_WRAPPERS = {Path('app/static/app.js'): ('<script>\\n', '\\n</script>')}\n"
+        cases = {
+            "computed schema": "SOURCE_PARITY_SCHEMA = compute()\n" + images + wrappers,
+            "boolean schema": "SOURCE_PARITY_SCHEMA = True\n" + images + wrappers,
+            "missing wrappers": "SOURCE_PARITY_SCHEMA = 3\n" + images,
+            "parent path": "SOURCE_PARITY_SCHEMA = 3\n"
+            "OFFLINE_IMAGE_INPUTS = {Path('../outside.png'): 'image/png'}\n" + wrappers,
+            "absolute path": "SOURCE_PARITY_SCHEMA = 3\n"
+            "OFFLINE_IMAGE_INPUTS = {Path('/etc/outside.png'): 'image/png'}\n" + wrappers,
+            "short wrapper": "SOURCE_PARITY_SCHEMA = 3\n" + images
+            + "INLINE_SOURCE_WRAPPERS = {Path('app/static/app.js'): ('<script>',)}\n",
+            "syntax error": "SOURCE_PARITY_SCHEMA = (\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertIsNone(recorded_parity_rules(text))
 
 
 if __name__ == "__main__":
