@@ -419,17 +419,22 @@ journal. Restart the scheduler to apply a save:
   for example `/run/backup-secrets/archive_sftp_key`. The path must be inside
   `/run/backup-secrets` and cannot be the archive passphrase file. Leaving the
   field empty keeps the current file.
+- Each secret file belongs to one target credential. The editor refuses a path
+  that another target or another field already uses, including the S3 keys, so
+  one target cannot send another target's secret to its own server. Targets
+  that already share a file in `config.yaml` keep working until you name a
+  secret path again.
 - Renaming a target keeps its secret files. Changing where it points (provider,
   host, port, user name, share, bucket, endpoint and similar settings) means you
-  must choose its secret files again or clear them, so a saved credential is
-  never sent to a new server by accident.
+  must name new secret files or clear them; entering the old path again is
+  refused, so a saved credential is never sent to a new server by accident.
 
 ### Targets
 
 | `provider` | Encrypted in transit | Notes |
 | --- | --- | --- |
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. Use SFTP for "SCP" |
-| `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted |
+| `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted. Uploads check the remote size only; the target test and the backup's details say so until **Verify** downloads it and matches size and SHA-256 |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
 | `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
 | `nfs` | No | Needs the NFS overlay below |

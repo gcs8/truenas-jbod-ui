@@ -1257,10 +1257,13 @@ def build_router() -> APIRouter:
 
         display_slot_by_target: dict[tuple[str | None, int], list[int]] = {}
         slots_by_enclosure: dict[str | None, set[int]] = {}
+        bay_enclosure_id = enclosure_id or runtime_view.backing_enclosure_id
         for runtime_slot in runtime_view.slots:
-            if runtime_slot.snapshot_slot is not None:
+            # A bay number only names a disk inside its own enclosure; a candidate
+            # from another enclosure reads the view's own history scope instead.
+            if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, bay_enclosure_id}:
                 history_slot = int(runtime_slot.snapshot_slot)
-                history_enclosure_id = enclosure_id or runtime_view.backing_enclosure_id
+                history_enclosure_id = bay_enclosure_id
             else:
                 history_slot = int(runtime_slot.slot_index)
                 history_enclosure_id = f"storage-view:{runtime_view.id}"

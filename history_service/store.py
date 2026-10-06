@@ -27,6 +27,7 @@ from history_service.segment_catalog import (
 from history_service.segment_reader import (
     MAX_HISTORY_QUERY_LIMIT,
     HistoryStorageUnavailableError,
+    SegmentCatalogMissingError,
     SegmentedHistoryReader,
     metric_sample_identity,
 )
@@ -733,6 +734,8 @@ class HistoryStore:
             return None
         try:
             return self._load_segmented_reader()
+        except SegmentCatalogMissingError:
+            raise
         except (ValueError, OSError, sqlite3.Error) as exc:
             raise HistoryStorageUnavailableError(str(exc)) from exc
 
@@ -746,7 +749,12 @@ class HistoryStore:
         with self._segment_reader_lock:
             if path_entry_exists(pending_path):
                 raise ValueError("Segmented history migration recovery is pending.")
-            metadata = os.stat(self.segment_catalog_path, follow_symlinks=False)
+            try:
+                metadata = os.stat(self.segment_catalog_path, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                # Only the catalog entry itself being absent; a catalog that
+                # names a missing segment fails later as unreadable history.
+                raise SegmentCatalogMissingError(str(exc)) from exc
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                 raise ValueError("Segmented history catalog must be a regular file.")
             identity = (

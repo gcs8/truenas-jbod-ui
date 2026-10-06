@@ -2186,6 +2186,90 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(len(problems), 1)
         self.assertTrue(problems[0].startswith("Backup target Office NAS degraded:"))
 
+    def test_size_only_remote_copy_says_so_and_explicit_verify_fails_closed(self) -> None:
+        # #722: an FTP-style target checks size only at upload. The artifact
+        # detail must say so, and an explicit Verify (download, size and
+        # SHA-256) must catch a same-length change and stop counting the copy.
+        import dataclasses
+
+        class SizeOnlyTarget(LocalDirectoryTarget):
+            def put(self, local_path, name):
+                return dataclasses.replace(super().put(local_path, name), upload_check="size")
+
+        def open_target(settings):
+            @contextlib.contextmanager
+            def opened():
+                yield SizeOnlyTarget(self.remote_root / settings.target_id)
+
+            return opened()
+
+        self.open_target = open_target  # type: ignore[method-assign]
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET]})
+        local = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        self.assertTrue(remote.verified)
+        self.assertEqual(scheduler.detail(remote.artifact_id)["upload_check"], "size")
+        self.assertIsNone(scheduler.detail(local.artifact_id)["upload_check"])
+
+        stored = self.remote_root / "nas" / remote.name
+        data = stored.read_bytes()
+        stored.write_bytes(bytes([data[0] ^ 0xFF]) + data[1:])
+        result = scheduler.verify(remote.artifact_id)
+        self.assertFalse(result["ok"])
+        self.assertIn("SHA-256", result["detail"])
+        self.assertFalse(scheduler.catalog.get(remote.artifact_id).verified)
+        self.assertFalse(scheduler.serialize(scheduler.get(remote.artifact_id))["restorable"])
+
+    def test_stalled_sftp_target_times_out_and_later_targets_still_ship(self) -> None:
+        # #723: a real loopback SFTP server stalls after authentication. The
+        # shipping job must give up within the target timeout, release its job
+        # reservation, leave no client connection running, and still ship to
+        # the next target.
+        import time as time_module
+
+        from history_service.backup_archive import transport
+        from history_service.backup_archive.settings import ArchiveTargetSettings
+        from tests import sftp_stall_server
+
+        stalled = {**TARGET, "target_id": "stalled", "label": "Stalled SFTP", "root": "/unused-stalled"}
+        second = {**TARGET, "target_id": "cloud", "label": "Cloud", "root": "/unused-cloud"}
+        secret = self.root / "sftp-password"
+        secret.write_text(sftp_stall_server.PASSWORD + "\n", encoding="utf-8")
+        secret.chmod(0o600)
+        known_hosts = self.root / "known_hosts"
+        before = sftp_stall_server.live_client_transports()
+        default_open = self.open_target
+        with sftp_stall_server.StallingSftpServer(stall="request") as server:
+            server.write_known_hosts(known_hosts)
+
+            def open_target(settings):
+                if settings.target_id != "stalled":
+                    return default_open(settings)
+                return transport.open_target(ArchiveTargetSettings(
+                    target_id="stalled", provider="sftp", root="/srv/backups/jbod-ui",
+                    hostname="127.0.0.1", port=server.port, username=sftp_stall_server.USERNAME,
+                    password_file=str(secret), known_hosts_path=str(known_hosts), timeout_seconds=0.5,
+                ))
+
+            self.open_target = open_target  # type: ignore[method-assign]
+            scheduler = self.make({"full": {"enabled": True}, "targets": [stalled, second]})
+            started = time_module.monotonic()
+            scheduler.run_now("full")
+            elapsed = time_module.monotonic() - started
+            self.assertTrue(server.reached.is_set())
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(sorted(r.location for r in scheduler.catalog.list()), ["cloud", "local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["stalled"]["ok"])
+        self.assertIn("TimeoutError", status["targets"]["stalled"]["detail"])
+        self.assertTrue(status["targets"]["cloud"]["ok"])
+        self.assertIsNone(scheduler.running)
+        scheduler.run_now("config")  # the job reservation was released
+        deadline = time_module.monotonic() + 5
+        while sftp_stall_server.live_client_transports() - before and time_module.monotonic() < deadline:
+            time_module.sleep(0.05)
+        self.assertEqual(sftp_stall_server.live_client_transports() - before, set())
+
     def test_disabled_target_gets_no_retention_rule(self) -> None:
         disabled = {**TARGET, "target_id": "cloud", "label": "Cloud", "enabled": False}
         scheduler = self.make({"full": {"enabled": True, "remote_keep": 3}, "targets": [TARGET, disabled]})
@@ -2961,11 +3045,138 @@ class PolicyEditorTests(unittest.TestCase):
         view = self.view()
         values = dict(view["targets"][0]["values"], hostname="nas2.example.test")
         self.save(self._target_payload(view, values, {
-            "private_key_file": "/run/backup-secrets/archive_sftp_key", "password_file": None,
+            "private_key_file": "/run/backup-secrets/nas2_sftp_key", "password_file": None,
         }))
         stored = yaml.safe_load(self.config.read_text())["backups"]["targets"][0]
         self.assertEqual(stored["hostname"], "nas2.example.test")
+        self.assertEqual(stored["private_key_file"], "/run/backup-secrets/nas2_sftp_key")
         self.assertNotIn("password_file", stored)
+
+    def test_changed_endpoint_refuses_repeating_the_same_secret_path(self) -> None:
+        # #777: naming the old file again is not a new choice; the credential
+        # would follow the target to wherever it now points.
+        for path in ("/run/backup-secrets/archive_sftp_key", "/run/backup-secrets//archive_sftp_key"):
+            with self.subTest(path=path):
+                view = self.view()
+                before = self.config.read_bytes()
+                values = dict(view["targets"][0]["values"], hostname="attacker.example.test")
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "new secret file"):
+                    self.save(self._target_payload(view, values, {
+                        "private_key_file": path, "password_file": None,
+                    }))
+                self.assertEqual(self.config.read_bytes(), before)
+        # The same endpoint may still name its own file again.
+        view = self.view()
+        self.save(self._target_payload(view, dict(view["targets"][0]["values"]), {
+            "private_key_file": "/run/backup-secrets/archive_sftp_key",
+        }))
+
+    def _add_s3_target(self) -> None:
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"].append({
+            "target_id": "offsite-s3", "provider": "s3", "root": "jbod", "bucket": "jbod-backups",
+            "region": "us-east-1",
+            "access_key_id_file": "/run/backup-secrets/archive_s3_key_id",
+            "secret_access_key_file": "/run/backup-secrets/archive_s3_secret",
+        })
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+
+    def _entries(self, view: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {"values": dict(target["values"]), "original_target_id": target["original_target_id"], "secrets": {}}
+            for target in view["targets"]
+        ]
+
+    def test_secret_file_of_another_target_is_refused(self) -> None:
+        # #777: a new FTP target must not be able to send the S3 secret to its host.
+        self._add_s3_target()
+        attacker = {
+            "values": {"target_id": "drop", "provider": "ftp", "hostname": "attacker.example.test",
+                       "username": "x", "root": "/drop", "enabled": True},
+            "secrets": {"password_file": "/run/backup-secrets/archive_s3_secret"},
+        }
+        view = self.view()
+        before = self.config.read_bytes()
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+            self.save({"revision": view["revision"], "targets": [*self._entries(view), attacker]})
+        self.assertEqual(self.config.read_bytes(), before)
+        # Nor may an existing target take it over.
+        view = self.view()
+        entries = self._entries(view)
+        entries[0]["secrets"] = {"password_file": "/run/backup-secrets/archive_s3_secret"}
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+            self.save({"revision": view["revision"], "targets": entries})
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_secret_file_ownership_compares_double_leading_slash_spellings(self) -> None:
+        # POSIX keeps exactly two leading slashes distinct, but Linux opens the
+        # same file, so a hand-written //run/... must still own its secret.
+        self._add_s3_target()
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"][1]["secret_access_key_file"] = "//run/backup-secrets/archive_s3_secret"
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+        for spelling in ("/run/backup-secrets/archive_s3_secret", "//run/backup-secrets/archive_s3_secret"):
+            with self.subTest(spelling=spelling):
+                view = self.view()
+                before = self.config.read_bytes()
+                attacker = {
+                    "values": {"target_id": "drop", "provider": "ftp", "hostname": "attacker.example.test",
+                               "username": "x", "root": "/drop", "enabled": True},
+                    "secrets": {"password_file": spelling},
+                }
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+                    self.save({"revision": view["revision"], "targets": [*self._entries(view), attacker]})
+                self.assertEqual(self.config.read_bytes(), before)
+
+    def test_moving_a_secret_file_to_another_target_in_one_save_is_refused(self) -> None:
+        # Deleting the S3 target and handing its secret to a new row in the
+        # same save is still naming another target's saved secret.
+        self._add_s3_target()
+        view = self.view()
+        before = self.config.read_bytes()
+        entries = self._entries(view)[:1]
+        entries.append({
+            "values": {"target_id": "drop", "provider": "ftp", "hostname": "attacker.example.test",
+                       "username": "x", "root": "/drop", "enabled": True},
+            "secrets": {"password_file": "/run/backup-secrets/archive_s3_secret"},
+        })
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+            self.save({"revision": view["revision"], "targets": entries})
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_one_secret_file_cannot_fill_two_fields_or_two_new_targets(self) -> None:
+        view = self.view()
+        before = self.config.read_bytes()
+        entries = self._entries(view)
+        entries[0]["secrets"] = {"password_file": "/run/backup-secrets/archive_sftp_key"}
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+            self.save({"revision": view["revision"], "targets": entries})
+        new_rows = [
+            {"values": {"target_id": f"ftp-{n}", "provider": "ftp", "hostname": f"ftp{n}.example.test",
+                        "username": "x", "root": "/drop", "enabled": True},
+             "secrets": {"password_file": "/run/backup-secrets/shared_ftp_password"}}
+            for n in (1, 2)
+        ]
+        with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+            self.save({"revision": view["revision"], "targets": [*self._entries(view), *new_rows]})
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_untouched_shared_secret_files_from_before_still_save(self) -> None:
+        # Non-breaking: files already shared in config.yaml are left alone
+        # until someone names a secret path again.
+        document = yaml.safe_load(self.config.read_text())
+        second = dict(document["backups"]["targets"][0], target_id="second-nas", hostname="nas2.example.test")
+        document["backups"]["targets"].append(second)
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+        view = self.view()
+        self.save({"revision": view["revision"], "classes": {"config": {"local_keep": 31}},
+                   "targets": self._entries(view)})
+        stored = yaml.safe_load(self.config.read_text())["backups"]
+        self.assertEqual(stored["config"]["local_keep"], 31)
+        self.assertEqual(
+            [target["private_key_file"] for target in stored["targets"]],
+            ["/run/backup-secrets/archive_sftp_key"] * 2,
+        )
 
     def _rewrite_target(self, **changes: Any) -> None:
         document = yaml.safe_load(self.config.read_text())
