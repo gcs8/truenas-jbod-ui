@@ -192,6 +192,16 @@ check must reach at least the archive count and the previous check's count, so
 a restart that loses history fails even while the count stays above the
 archive's. Every other count stays exact, and egress-blocked runs stay exact
 for every count.
+
+Counts alone cannot prove the restart kept the old rows, because new rows can
+hide lost ones. Before the restart the controller fingerprints the restored
+history read-only: for each history table it records the highest row ID and a
+hash of every row's ID and primary key up to it, plus a hash of each sealed
+segment file. After the restart it rehashes exactly those rows and files, and
+any difference fails the drill. Upserts that keep a row's key, such as current
+slot state, still pass. The QA stack sets every `HISTORY_*_RETENTION_DAYS` to
+`0` so retention cannot prune restored rows during the drill.
+
 After the restart check the controller writes `raw-private/history-growth.json`.
 It holds the growth per history count and the newest events grouped by system,
 event type and changed fields. Status fields such as health show their

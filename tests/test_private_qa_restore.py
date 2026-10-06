@@ -302,6 +302,59 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.QaRestoreError, "history.event_count: expected 100, observed 119"):
             self.module.reconcile_checkpoint(archive, startup, archive, growable=frozenset())
 
+    def test_restart_fingerprint_catches_lost_rows_that_new_rows_hide(self) -> None:
+        import sqlite3
+        import subprocess
+
+        def unprivileged(command, **kwargs):
+            self.assertEqual(list(command[:4]), ["sudo", "-n", "--", "python3"])
+            return subprocess.run([sys.executable, *command[4:]], capture_output=True, text=True, check=True).stdout
+
+        with tempfile.TemporaryDirectory() as raw_root, \
+                patch.object(self.module, "_app_owned_reader", side_effect=unprivileged):
+            runtime = Path(raw_root)
+            (runtime / "history" / "segments").mkdir(parents=True)
+            segment = runtime / "history" / "segments" / "segment-0001.sqlite3"
+            segment.write_bytes(b"sealed")
+            database = sqlite3.connect(runtime / "history" / "history.db", isolation_level=None)
+            database.executescript("""
+                CREATE TABLE slot_state_current (system_id TEXT, enclosure_key TEXT, slot INTEGER, health TEXT,
+                    PRIMARY KEY (system_id, enclosure_key, slot));
+                CREATE TABLE slot_events (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT);
+                CREATE TABLE metric_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at TEXT);
+                CREATE TABLE metric_rollups (bucket_seconds INTEGER, bucket_start TEXT, metric_name TEXT,
+                    PRIMARY KEY (bucket_seconds, bucket_start, metric_name));
+                INSERT INTO slot_state_current VALUES ('alpha', 'e', 1, 'OK'), ('alpha', 'e', 2, 'OK');
+                INSERT INTO slot_events (observed_at) VALUES ('t1'), ('t2');
+                INSERT INTO metric_samples (observed_at) VALUES ('t1'), ('t2'), ('t3');
+            """)
+            before = self.module._history_fingerprint(runtime)
+            self.assertEqual({table: value["rows"] for table, value in before["tables"].items()}, {
+                "slot_state_current": 2, "slot_events": 2, "metric_samples": 3, "metric_rollups": 0})
+            self.assertEqual(set(before["segments"]), {"segment-0001.sqlite3"})
+
+            # Live growth and in-place upserts keep every earlier row.
+            database.executescript("""
+                INSERT INTO slot_events (observed_at) VALUES ('t3');
+                INSERT INTO metric_samples (observed_at) VALUES ('t4'), ('t5');
+                INSERT INTO slot_state_current VALUES ('alpha', 'e', 1, 'FAULT')
+                    ON CONFLICT (system_id, enclosure_key, slot) DO UPDATE SET health = excluded.health;
+                INSERT INTO slot_state_current VALUES ('alpha', 'e', 3, 'OK');
+            """)
+            self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+
+            # The counts still grow, but an earlier sample is gone.
+            database.executescript("""
+                DELETE FROM metric_samples WHERE observed_at = 't2';
+                INSERT INTO metric_samples (observed_at) VALUES ('t6'), ('t7');
+            """)
+            with self.assertRaisesRegex(self.module.QaRestoreError, "before the restart changed: metric_samples$"):
+                self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+            segment.write_bytes(b"rewritten")
+            with self.assertRaisesRegex(self.module.QaRestoreError, "metric_samples, segment-0001.sqlite3$"):
+                self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+            database.close()
+
     def test_history_growth_breakdown_shows_status_transitions_and_names_identity_fields(self) -> None:
         import sqlite3
         import subprocess
@@ -569,6 +622,10 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             self.assertIn("APP_PUBLIC_ORIGIN=http://127.0.0.1:28080", environment)
             self.assertIn("ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:28082", environment)
             self.assertNotIn("ADMIN_ALLOWED_ORIGINS", environment)
+            # Retention must not prune restored history between count checks.
+            for kind in ("RAW_METRIC", "EVENT", "HOURLY_ROLLUP", "DAILY_ROLLUP"):
+                self.assertIn(f"HISTORY_{kind}_RETENTION_DAYS=0\n", environment)
+                self.assertIn(f"${{HISTORY_{kind}_RETENTION_DAYS:-", (ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
             self.assertEqual(stat.S_IMODE((runtime / ".env").stat().st_mode), 0o600)
             self.assertEqual(
                 stat.S_IMODE(override.stat().st_mode),
@@ -1487,10 +1544,17 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 breakdown = [{"system_id": "alpha", "event_type": "slot_state_changed", "changes": ["health"], "count": 2}]
                 events = []
                 def run(command, **kwargs):
+                    if "restart" in command:
+                        events.append("restart")
                     if "down" in command:
                         events.append("down")
                         if mode == "down-failed":
                             raise RuntimeError("synthetic down failed")
+                fingerprints = [{"tables": {"slot_events": {"mark": 3}}, "segments": {}}, {"rehashed": True}]
+                def fingerprint(runtime_root, before=None):
+                    events.append("fingerprint-after" if before else "fingerprint-before")
+                    self.assertIs(before, fingerprints[0] if before else None)
+                    return fingerprints[bool(before)]
                 def transport(command, **kwargs):
                     events.append("readback")
                     return Mock(returncode=1 if mode == "readback-unknown" else 0,
@@ -1506,6 +1570,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                         stack.enter_context(patch.object(self.module, name))
                     reconcile = stack.enter_context(patch.object(self.module, "reconcile_checkpoint"))
                     stack.enter_context(patch.object(self.module, "_history_growth_breakdown", return_value=breakdown))
+                    stack.enter_context(patch.object(self.module, "_history_fingerprint", side_effect=fingerprint))
+                    survived = stack.enter_context(patch.object(self.module, "verify_history_survived"))
                     stack.enter_context(patch.object(self.module, "parse_args", return_value=args))
                     stack.enter_context(patch.object(self.module, "_run", side_effect=run))
                     stack.enter_context(patch.object(self.module.subprocess, "run", side_effect=transport))
@@ -1543,6 +1609,10 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 self.assertEqual([args[2] is None for args in checkpoints], [True, False, False])
                 self.assertIs(checkpoints[1][2], checkpoints[0][1])
                 self.assertIs(checkpoints[2][2], checkpoints[1][1])
+                # The pre-restart rows are fingerprinted, then rechecked after it.
+                self.assertLess(events.index("fingerprint-before"), events.index("restart"))
+                self.assertLess(events.index("restart"), events.index("fingerprint-after"))
+                survived.assert_called_once_with(*fingerprints)
                 self.assertLess(events.index("history-growth.json"), events.index("receipt"))
                 self.assertEqual(
                     json.loads((args.evidence_dir / "raw-private" / "history-growth.json").read_text()),

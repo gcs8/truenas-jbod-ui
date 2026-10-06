@@ -94,6 +94,36 @@ HISTORY_GROWTH_STATUS_FIELDS = (
     "multipath_mode",
 )
 HISTORY_DB_PATH = "/app/history/history.db"
+HISTORY_SEGMENTS_PATH = "/app/history/segments"
+# Runs as root on the QA host against the restored history. In one read
+# transaction it takes each table's highest rowid as a mark and hashes the
+# rowid and primary key of every row at or below it; given marks, it rehashes
+# exactly those rows. Sealed segment files are hashed whole. Upserts that keep
+# a row's key pass; a lost, replaced or rewritten row fails.
+HISTORY_FINGERPRINT_SCRIPT = r"""
+import glob, hashlib, json, os, sqlite3, sys, urllib.parse
+path, segments, marks = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+db = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True, isolation_level=None)
+db.execute("BEGIN")
+tables = {}
+for table in ("slot_state_current", "slot_events", "metric_samples", "metric_rollups"):
+    keys = [row[1] for row in sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: row[5]) if row[5]]
+    mark = marks[table] if marks else db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+    digest, rows = hashlib.sha256(), 0
+    for row in db.execute(f"SELECT rowid, {', '.join(keys)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):
+        digest.update(repr(row).encode())
+        rows += 1
+    tables[table] = {"mark": mark, "rows": rows, "sha256": digest.hexdigest()}
+db.execute("COMMIT")
+files = {}
+for name in sorted(glob.glob(os.path.join(segments, "segment-*.sqlite3"))):
+    digest = hashlib.sha256()
+    with open(name, "rb") as source:
+        while chunk := source.read(1 << 20):
+            digest.update(chunk)
+    files[os.path.basename(name)] = digest.hexdigest()
+print(json.dumps({"tables": tables, "segments": files}))
+"""
 REQUIRED_FULL_GROUPS = {
     "config_file",
     "runtime_overrides_file",
@@ -802,13 +832,13 @@ def _run(
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
 
 
-def _app_owned_reader(command: Sequence[str]) -> str:
+def _app_owned_reader(command: Sequence[str], *, timeout: int = 30) -> str:
     result = subprocess.run(
         list(command),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
-        timeout=30,
+        timeout=timeout,
         check=False,
     )
     if result.returncode != 0:
@@ -1016,6 +1046,9 @@ def _write_runtime_files(
             "METRICS_ENABLED=true",
             "HISTORY_STARTUP_GRACE_SECONDS=0",
             "HISTORY_POLL_INTERVAL_SECONDS=3600",
+            # The drill proves restored history survives; retention must not
+            # prune it between checks once a live collector pass succeeds.
+            *(f"HISTORY_{kind}_RETENTION_DAYS=0" for kind in ("RAW_METRIC", "EVENT", "HOURLY_ROLLUP", "DAILY_ROLLUP")),
             "ADMIN_AUTO_STOP_SECONDS=0",
             *((f"HISTORY_SEGMENT_CATALOG_PATH={SEGMENT_CATALOG_PATH}",) if segmented_history else ()),
             "",
@@ -1123,6 +1156,55 @@ def reconcile_checkpoint(
     reconcile_counts(baseline, observed, growable=growable)
     if previous is not None and growable:
         reconcile_counts({"history": previous.get("history")}, observed, growable=growable)
+
+
+def _history_fingerprint(
+    runtime_root: Path,
+    before: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint restored history rows, or rehash the rows `before` covered."""
+    marks = {table: value["mark"] for table, value in before["tables"].items()} if before else {}
+    output = _app_owned_reader(
+        [
+            "sudo",
+            "-n",
+            "--",
+            "python3",
+            "-c",
+            HISTORY_FINGERPRINT_SCRIPT,
+            str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
+            str(_qa_host_path(runtime_root, HISTORY_SEGMENTS_PATH)),
+            json.dumps(marks),
+        ],
+        timeout=600,
+    )
+    try:
+        fingerprint = json.loads(output)
+    except ValueError as exc:
+        raise QaRestoreError("history fingerprint was invalid") from exc
+    if not (
+        isinstance(fingerprint, dict)
+        and isinstance(fingerprint.get("tables"), dict)
+        and isinstance(fingerprint.get("segments"), dict)
+    ):
+        raise QaRestoreError("history fingerprint was invalid")
+    return fingerprint
+
+
+def verify_history_survived(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Every row and sealed segment seen before the restart must still be there.
+
+    Counts alone cannot show this in live mode: new rows can hide lost ones.
+    """
+    changed = [
+        table for table, value in before["tables"].items() if after["tables"].get(table) != value
+    ] + [
+        name for name, digest in before["segments"].items() if after["segments"].get(name) != digest
+    ]
+    if changed:
+        raise QaRestoreError(
+            "history recorded before the restart changed: " + ", ".join(sorted(changed))
+        )
 
 
 def history_growth(expected: dict[str, Any], observed: dict[str, Any]) -> dict[str, int]:
@@ -1875,6 +1957,7 @@ def main() -> int:
         phase = "restart-survival"
         if RESTART_COMMAND_LABEL != "docker compose restart":
             raise QaRestoreError("compose restart command label drifted")
+        before_restart = _history_fingerprint(args.runtime_root)
         if service_access is None:
             raise QaRestoreError("loopback service access was not initialized")
         service_access.close()
@@ -1913,6 +1996,9 @@ def main() -> int:
             args.runtime_root, ports, username, password
         )
         reconcile_checkpoint(baseline, observed_after_restart, observed_after_writes, growable=growable)
+        verify_history_survived(
+            before_restart, _history_fingerprint(args.runtime_root, before_restart)
+        )
         # Written before the browser phase so a later failure still keeps it.
         growth = history_growth(baseline, observed_after_restart)
         write_private_json(
