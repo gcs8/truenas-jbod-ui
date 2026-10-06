@@ -8,6 +8,7 @@ work on a host out while a planned session runs.
 from __future__ import annotations
 
 import asyncio
+import gc
 import tempfile
 import threading
 import time
@@ -39,7 +40,9 @@ OTHER_HOST = "192.0.2.45"
 
 
 def _exec_ok(delay: float = 0.0, counters: dict | None = None):
-    lock = threading.Lock()
+    # Re-entrant: a channel freed by the cycle collector runs this close from
+    # inside another channel's close on the same thread.
+    lock = threading.RLock()
 
     def exec_command(command: str, timeout=None):
         if counters is not None:
@@ -81,6 +84,35 @@ def _tofu_config(known_hosts: str) -> SSHConfig:
         strict_host_key_checking=False,
         known_hosts_path=known_hosts,
     )
+
+
+class FakeChannelCloseTests(unittest.TestCase):
+    def test_counted_close_survives_a_collection_that_finalizes_another_channel(self) -> None:
+        # Replacing channel.close makes a cycle, so a dead channel is freed by
+        # the cycle collector and its __del__ calls the counted close. A
+        # collection that lands inside another channel's counted close (with
+        # the fixture lock held) re-enters it on the same thread; a plain Lock
+        # deadlocked CI shard (3.14, 1) there.
+        gc.disable()
+        self.addCleanup(gc.enable)
+        counters = {"open": 0, "peak": 0}
+        exec_command = _exec_ok(counters=counters)
+        stale = exec_command("stale")[1].channel
+        stale.close()
+        del stale
+        real_close = paramiko.Channel.close
+
+        def close_with_collection(channel) -> None:
+            gc.collect()
+            real_close(channel)
+
+        with patch.object(paramiko.Channel, "close", close_with_collection):
+            live = exec_command("live")[1].channel
+        closer = threading.Thread(target=live.close, daemon=True)
+        closer.start()
+        closer.join(5)
+        self.assertFalse(closer.is_alive(), "counted close deadlocked")
+        self.assertEqual(counters["open"], 0)
 
 
 class HostKeyPolicyIsUnchangedTests(unittest.TestCase):
@@ -188,7 +220,7 @@ class HostKeyPolicyIsUnchangedTests(unittest.TestCase):
     def test_planned_groups_settle_on_a_lower_server_session_limit(self, ssh_client_cls: MagicMock) -> None:
         """A server with MaxSessions below 8 refuses extra channels; those commands wait and retry."""
         server_limit = 3
-        lock = threading.Lock()
+        lock = threading.RLock()  # see _exec_ok
         state = {"open": 0, "peak": 0, "refused": 0}
         ok_exec = _exec_ok(delay=0.01)
 
