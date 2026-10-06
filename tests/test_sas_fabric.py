@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1653,6 +1654,35 @@ class FabricAliasMutationRegressionTests(unittest.TestCase):
         self.assertTrue(result["cleared"])
         self.assertIsNone(self.fabric().paths[0].get("alias"))
         self.assertEqual(self.store.load_all(), {})
+
+    def test_route_save_rebuilds_cached_fabrics_off_the_event_loop(self):
+        # #813: the async alias route must not rebuild every cached fabric on
+        # the event loop, and must reach the same legacy-ownership decision.
+        self.seed("path:linux-block:pool-mirror")
+        object_id = self.fabric().paths[0]["id"]
+        build_threads = []
+
+        def recording_build(**kwargs):
+            build_threads.append(threading.get_ident())
+            return build_sas_fabric_snapshot(**kwargs)
+
+        async def save(label):
+            loop_thread = threading.get_ident()
+            result = await self.service.save_sas_fabric_alias_async(
+                object_id=object_id, object_kind="path", label=label)
+            return loop_thread, result
+
+        with patch("app.services.inventory.build_sas_fabric_snapshot", side_effect=recording_build):
+            loop_thread, saved = asyncio.run(save("New name"))
+            self.assertTrue(build_threads)
+            self.assertNotIn(loop_thread, build_threads)
+            self.assertEqual(saved["alias"]["label"], "New name")
+            self.assertEqual([a.object_id for a in self.store.list_aliases("synthetic")], [object_id])
+            build_threads.clear()
+            loop_thread, cleared = asyncio.run(save(None))
+            self.assertNotIn(loop_thread, build_threads)
+        self.assertTrue(cleared["cleared"])
+        self.assertIsNone(self.fabric().paths[0].get("alias"))
 
     def test_public_save_then_clear_never_resurrects_legacy_name(self):
         self.seed("path:linux-block:pool-mirror")

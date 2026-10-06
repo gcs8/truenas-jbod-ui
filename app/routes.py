@@ -503,7 +503,7 @@ def build_router() -> APIRouter:
             sas_fabric_alias=payload.object_id,
         )
         try:
-            result = service.save_sas_fabric_alias(
+            result = await service.save_sas_fabric_alias_async(
                 object_id=payload.object_id,
                 object_kind=payload.object_kind,
                 label=payload.label,
