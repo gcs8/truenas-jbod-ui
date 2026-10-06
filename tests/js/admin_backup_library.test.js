@@ -693,6 +693,33 @@ test("target test shows the result next to the target, scrubbed", async () => {
   assert.doesNotMatch(failed, /svc:pw|\/srv\//);
 });
 
+test("a size-only target test and an FTP copy say the upload check was size only (#722)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "ftp archive destination is writable; the remote size matched", duration_ms: 42, provider: "ftp", transport_encrypted: false, upload_check: "size" }),
+    "GET /api/admin/backups/full-odd": () => ({ ...syntheticLibrary().artifacts[4], upload_check: "size", last_verify: null }),
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.testTarget("legacy-ftp");
+  const row = elements.targets.querySelector('tr[data-target-id="legacy-ftp"]').textContent;
+  assert.match(row, /Works \(42 ms\)\. Size checked only; Verify re-reads a backup\./);
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.match(elements.dialog.textContent, /VerifiedSize only at upload; Verify re-reads and hashes it/);
+});
+
+test("a size-only copy that passed an explicit Verify shows Yes", async () => {
+  const api = fakeApi({
+    "GET /api/admin/backups/full-odd": () => ({ ...syntheticLibrary().artifacts[4], upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: true, detail: "" } }),
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.match(elements.dialog.textContent, /VerifiedYes/);
+  assert.doesNotMatch(elements.dialog.textContent, /Size only at upload/);
+});
+
 test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
   const { elements, library, api, banners, refreshes } = mount();
   await library.load();

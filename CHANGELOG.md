@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Described FTP upload checks as size only: the target test and a copy's
+  details no longer claim the content was read back, until an explicit Verify
+  downloads the copy and matches its size and SHA-256. (#890)
 - Refused a backup target secret file that another target or field already
   uses, and required a new secret file once a target points somewhere else, so
   one target cannot send another's credential to its server. (#887)

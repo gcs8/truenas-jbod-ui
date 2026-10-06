@@ -434,7 +434,7 @@ journal. Restart the scheduler to apply a save:
 | `provider` | Encrypted in transit | Notes |
 | --- | --- | --- |
 | `sftp` | Yes | Needs `known_hosts_path` and a key or password file. Use SFTP for "SCP" |
-| `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted |
+| `ftp` | Only with `use_tls: true` | Plain FTP is allowed and labelled unencrypted. The archive itself is always encrypted. Uploads check the remote size only; the target test and the backup's details say so until **Verify** downloads it and matches size and SHA-256 |
 | `smb` | With `smb_encrypt: true` | Needs `share` |
 | `s3` | By default (HTTPS); no with an `http://` custom endpoint | S3 and compatible stores: `bucket`, `region`, optional `endpoint_url` |
 | `nfs` | No | Needs the NFS overlay below |
