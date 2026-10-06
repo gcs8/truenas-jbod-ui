@@ -654,7 +654,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("chronological indexes", matrix)
         self.assertIn("chronological indexes", scripts_guide)
         self.assertRegex(
-            changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
+            # The newest section: Unreleased, or the release cut from it.
+            changelog.split("\n## ", 2)[1],
             r"\(#637(?:, #\d+)*\)",
         )
 

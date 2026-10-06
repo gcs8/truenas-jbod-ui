@@ -26,9 +26,21 @@ from app.services.public_demo_fixture import (
     load_public_demo_fixture,
 )
 from app.services.snapshot_export import EXPORT_HISTORY_CACHE, EXPORT_RENDER_CACHE, EXPORT_ZIP_CACHE
+from scripts.public_demo_source_parity import recorded_source_integrity
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def demo_app_version() -> str:
+    """The app version the checked-in demo was built from.
+
+    A prerelease bumps ``__version__`` but leaves the demo for the next stable
+    release, so the demo may trail the source. Mirrors the checker's PR mode.
+    """
+    html = (ROOT / "public-demo/index.html").read_text(encoding="utf-8")
+    recorded = recorded_source_integrity(html, source_root=ROOT)
+    return recorded[1] if recorded and recorded[1] else __version__
 
 
 def clear_export_caches() -> None:
@@ -67,7 +79,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
 
         for marker in (
             "Demo data",
-            f'id="snapshot-app-version">v{__version__}<',
+            f'id="snapshot-app-version">v{demo_app_version()}<',
             PUBLIC_DEMO_GENERATED_AT.isoformat(),
             "A 60-bay JBOD with made-up disks.",
             "About this demo",
@@ -86,12 +98,13 @@ class PublicDemoArtifactTests(unittest.TestCase):
         self.assertNotIn('id="sas-fabric-view-link"', html)
 
     def test_artifact_version_mismatch_is_rejected(self) -> None:
+        version = demo_app_version()
         with tempfile.TemporaryDirectory() as temp_dir:
             demo_dir = Path(temp_dir) / "public-demo"
             artifact = self.copy_artifact(demo_dir)
             artifact.write_text(
                 artifact.read_text(encoding="utf-8").replace(
-                    f'id="snapshot-app-version">v{__version__}<',
+                    f'id="snapshot-app-version">v{version}<',
                     'id="snapshot-app-version">v0.0.0-stale<',
                 ),
                 encoding="utf-8",
@@ -99,7 +112,7 @@ class PublicDemoArtifactTests(unittest.TestCase):
             result = run_checker(demo_dir)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"does not match source {__version__}", result.stderr)
+        self.assertIn(f"does not match source {version}", result.stderr)
 
     def test_missing_source_manifest_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
