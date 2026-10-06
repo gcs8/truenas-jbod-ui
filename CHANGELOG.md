@@ -277,6 +277,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Listed every saved system in `/healthz` with its cached status while keeping
+  the overall status and HTTP code scoped to the default system. (#885)
 - Rebuilt cached Storage Fabric topology for an alias save in a worker thread,
   so renaming a fabric object no longer stalls every other UI request. (#894)
 - Described FTP upload checks as size only: the target test and a copy's

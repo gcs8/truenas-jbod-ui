@@ -2182,12 +2182,15 @@ class MainAppBoundaryTests(unittest.TestCase):
                     "sources": snapshot.model_dump(mode="json")["sources"],
                     "warnings": ["cached warning", "synthetic warning: café"],
                     "cache_state": "cached",
+                    "scope": "default_system",
+                    "systems": [],
                 }
                 self.assertEqual(expected["sources"], sources)
                 fake_service = MagicMock()
                 fake_service.peek_cached_snapshot.return_value = snapshot
                 fake_registry = MagicMock()
                 fake_registry.get_service.return_value = fake_service
+                fake_registry.settings.systems = []
 
                 with (
                     patch("app.routes.get_inventory_registry", return_value=fake_registry),
@@ -2210,6 +2213,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_service.peek_cached_snapshot.return_value = None
         fake_registry = MagicMock()
         fake_registry.get_service.return_value = fake_service
+        fake_registry.settings.systems = []
 
         with patch("app.routes.get_inventory_registry", return_value=fake_registry):
             response = self._call_main_route("/healthz")
@@ -2226,6 +2230,8 @@ class MainAppBoundaryTests(unittest.TestCase):
                 "sources": {},
                 "warnings": [],
                 "cache_state": "empty",
+                "scope": "default_system",
+                "systems": [],
             }).body,
         )
         fake_registry.get_service.assert_called_once_with(None)

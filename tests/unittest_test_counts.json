@@ -94,7 +94,7 @@
     "test_segmented_history": 13,
     "test_segmented_history_reader": 56,
     "test_segmented_restore_recovery": 18,
-    "test_settings_reload": 53,
+    "test_settings_reload": 54,
     "test_slot_bounds_routes": 35,
     "test_slot_detail_store": 17,
     "test_smart_grid_io": 47,
@@ -111,7 +111,7 @@
     "test_tls_trust": 12,
     "test_truenas_ws": 65,
     "test_truenas_ws_jsonrpc": 51,
-    "test_ui_health_and_admin_probe": 69,
+    "test_ui_health_and_admin_probe": 72,
     "test_unittest_shards": 15,
     "test_upgrade_notice": 23,
     "test_wiki_drift_verifier": 21

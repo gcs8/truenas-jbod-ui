@@ -64,6 +64,7 @@ from app.route_support import (
     _load_storage_view_export_source,
     build_health_payload,
     build_index_context,
+    build_system_health_entry,
     check_slot_bounds,
     ensure_read_slot_bounds,
     ensure_slot_bounds,
@@ -1441,15 +1442,20 @@ def build_router() -> APIRouter:
 
     @router.get("/healthz")
     async def healthz(request: Request) -> JSONResponse:
+        # Status and HTTP code describe the default system only (#783); the
+        # immutable update gate depends on that. ``systems`` adds one
+        # informational row per configured system from cached inventory.
         registry = get_inventory_registry()
         service = registry.get_service(None)
+        default_system = registry.get_system(None)
         storage_problems, history_problem, backup_problems = await asyncio.gather(
             asyncio.to_thread(refresh_storage_problems, request),
             asyncio.to_thread(history_service_problem, get_settings()),
             asyncio.to_thread(backup_archive_problems),
         )
+        default_snapshot = service.peek_cached_snapshot()
         payload = build_health_payload(
-            service.peek_cached_snapshot(),
+            default_snapshot,
             startup_problems=storage_problems,
             remote_problems=[
                 *known_hosts_warnings_for(request),
@@ -1458,6 +1464,17 @@ def build_router() -> APIRouter:
                 *backup_problems,
             ],
         )
+        systems = []
+        for system in registry.settings.systems:
+            is_default = system.id == default_system.id
+            if is_default:
+                snapshot = default_snapshot
+            else:
+                other = registry.peek_service(system.id)
+                snapshot = other.peek_cached_snapshot() if other is not None else None
+            systems.append(build_system_health_entry(system.id, system.label, snapshot, default=is_default))
+        payload["scope"] = "default_system"
+        payload["systems"] = systems
         return JSONResponse(payload, status_code=health_status_code(payload))
 
     return router

@@ -332,6 +332,14 @@ history service is unhealthy), and HTTP 503 with `status: down` only for a local
 fault such as an unwritable data, logs or known-hosts folder. See
 [[Troubleshooting]] for the full table.
 
+With several saved systems, `status` and the HTTP code cover only the default
+system (`scope: default_system`). The `systems` list adds one row per saved
+system (`id`, `label`, `default`, `status`, `summary`, `last_updated`) from its
+cached inventory, so a failing non-default appliance shows up there without
+turning `/healthz` degraded or failing an update health gate. A system that has
+not been opened since startup, or since a config change to that system, reads
+`unknown`.
+
 ## Optional history sidecar
 
 Turn on history when you want slot-history charts, timeline heat maps, and
