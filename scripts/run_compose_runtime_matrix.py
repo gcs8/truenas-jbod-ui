@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
+import functools
 import json
 import os
 import re
@@ -10,6 +12,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -231,10 +234,20 @@ def _read_available_memory_kib() -> int:
     raise RuntimeError("MemAvailable is missing from /proc/meminfo.")
 
 
+@functools.cache
+def _empty_docker_config() -> str:
+    # An empty private directory is an empty Docker config. A file such as
+    # /dev/null, or a path under an unreadable directory, makes some Docker CLI
+    # builds drop the system compose plugin.
+    path = tempfile.mkdtemp(prefix="tjui-matrix-docker-config-")
+    atexit.register(shutil.rmtree, path, True)
+    return path
+
+
 def _child_environment() -> dict[str, str]:
     # Never inherit Compose interpolation, remote Docker contexts, credentials,
     # or user config. The owned --env-file is the sole interpolation input.
-    return {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/dev/null",
+    return {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": _empty_docker_config(),
             "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
 

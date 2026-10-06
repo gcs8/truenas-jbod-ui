@@ -6,6 +6,7 @@ import io
 import json
 import os
 import socket
+import stat
 import tempfile
 import unittest
 import urllib.parse
@@ -143,6 +144,22 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "source revision"),
         ):
             module.validate_exact_image(image_id, source_commit)
+
+    def test_child_environment_isolates_docker_config_without_hiding_cli_plugins(self) -> None:
+        module = self.load_matrix_module()
+        environment = module._child_environment()
+
+        self.assertEqual(set(environment), {"PATH", "HOME", "DOCKER_CONFIG", "DOCKER_HOST"})
+        self.assertEqual(environment["DOCKER_HOST"], "unix:///var/run/docker.sock")
+        # /dev/null or a path under an unreadable directory makes Ubuntu's
+        # docker.io CLI drop the system compose plugin; an empty private
+        # directory is an empty config that still finds it.
+        config = Path(environment["DOCKER_CONFIG"])
+        metadata = config.stat(follow_symlinks=False)
+        self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o700)
+        self.assertEqual(list(config.iterdir()), [])
+        self.assertEqual(module._child_environment(), environment)
 
     def test_matrix_runtime_root_must_be_an_empty_child_of_scratch_root(self) -> None:
         module = self.load_matrix_module()
