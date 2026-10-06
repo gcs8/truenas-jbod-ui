@@ -145,6 +145,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Changed
 
+- A GitHub prerelease such as `v0.24.0-beta.1` now publishes the `dev` image
+  tag, not `latest`, and waits for the next stable release to rebuild the
+  public demo. Only a full release moves `latest`. (#896)
 - The required production-derived release restore gate now exercises the default
   encrypted `tar.zst` FULL export through inspection, import, restart and
   readback, while a separate explicit `7z` round trip preserves backward-format
