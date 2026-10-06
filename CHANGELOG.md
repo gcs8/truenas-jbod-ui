@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Checked the checked-in public demo against the parity rules of the revision
+  it was built from, so a later schema or offline-image change no longer fails
+  it between releases. (#886)
 - Gave the admin orphaned-history preview, adopt scan and purge the long
   30-minute request limit, reported a timed-out purge as an unknown outcome,
   and kept Purge disabled when nothing is left to purge. (#883)
