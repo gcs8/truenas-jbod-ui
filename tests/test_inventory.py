@@ -12360,6 +12360,51 @@ Enclosure Status diagnostic page:
 
         self.assertEqual(members, {})
 
+    def test_build_quantastor_topology_members_skips_numeric_status_codes(self) -> None:
+        # QuantaStor reports storagePoolDeviceEnum `status` as an integer code
+        # (1 for members, 7 for the hot spare). It used to reach str.strip()
+        # and fail every /api/inventory request for the system with a 500.
+        settings = Settings()
+        system = SystemConfig(
+            id="quantastor-lab",
+            label="Quantastor Lab",
+            default_profile_id="supermicro-ssg-2028r-shared-front-24",
+            truenas=TrueNASConfig(platform="quantastor", api_user="jbodmap", api_password="secret"),
+            ssh=SSHConfig(enabled=False),
+        )
+        service = InventoryService(
+            settings=settings,
+            system=system,
+            truenas_client=AsyncMock(),
+            ssh_probe=AsyncMock(),
+            bmc_service=None,
+            mapping_store=MappingStore(Path(tempfile.mkdtemp()) / "mappings.json"),
+            profile_registry=ProfileRegistry(settings),
+        )
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            disks=[],
+            pools=[{"id": "pool-1", "name": "HA-Pool-R10", "status": "ONLINE", "state": 0}],
+            disk_temperatures={},
+            smart_test_results=[],
+            systems=[{"id": "node-a", "name": "ExampleQS-Right"}],
+            pool_devices=[
+                {"storagePoolId": "pool-1", "physicalDiskId": "pdisk-1", "devicePath": "/dev/sdb",
+                 "raidGroupId": "mirror-0", "number": 0, "status": 1, "state": 0, "isSpare": False},
+                {"storagePoolId": "pool-1", "physicalDiskId": 42, "devicePath": "/dev/sdc",
+                 "raidGroupId": "spares", "number": 1, "status": 7, "state": 0, "isSpare": True},
+            ],
+        )
+
+        members = service._build_quantastor_topology_members(raw_data)
+
+        data, spare = members["pdisk-1"], members["42"]
+        self.assertIs(members["sdc"], spare)
+        self.assertEqual((data.health, data.vdev_name, data.vdev_class), ("ONLINE", "mirror-0", "data"))
+        self.assertEqual((spare.health, spare.vdev_name, spare.vdev_class), ("ONLINE", "spares", "spare"))
+        self.assertIsNone(service._quantastor_text(7, None, " ", True))
+        self.assertEqual(service._quantastor_text(1, " DEGRADED "), "DEGRADED")
+
     async def test_quantastor_smart_summary_handles_spare_using_by_path_primary_alias(self) -> None:
         class DummyQuantastorClient:
             async def fetch_all(self) -> TrueNASRawData:

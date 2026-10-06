@@ -7837,7 +7837,7 @@ class InventoryService:
                 normalize_text(disk.get("devicePath")),
                 disk_id,
             )
-            health = normalize_text(disk.get("healthStatus") or disk.get("status"))
+            health = self._quantastor_text(disk.get("healthStatus"), disk.get("status"))
             pool_id = normalize_text(
                 str(disk.get("storagePoolId") or disk.get("poolId"))
                 if (disk.get("storagePoolId") or disk.get("poolId")) is not None
@@ -8466,14 +8466,14 @@ class InventoryService:
                 else None
             ) or "Pool"
             member_number = device.get("number")
-            vdev_name = normalize_text(device.get("raidGroupId") or device.get("name") or device.get("deviceName")) or (
+            vdev_name = normalize_value_text(device.get("raidGroupId") or device.get("name") or device.get("deviceName")) or (
                 f"member-{member_number}" if isinstance(member_number, int) else "member"
             )
-            vdev_class = normalize_text(
-                device.get("class")
-                or device.get("usageType")
-                or device.get("role")
-                or ("spare" if device.get("isSpare") or normalize_text(device.get("raidGroupId")) == "spares" else None)
+            vdev_class = self._quantastor_text(
+                device.get("class"),
+                device.get("usageType"),
+                device.get("role"),
+                "spare" if device.get("isSpare") or normalize_value_text(device.get("raidGroupId")) == "spares" else None,
             ) or "data"
             owner_label = self._quantastor_pool_owner_label(pool, system_index)
             topology_label = f"{pool_name} > {vdev_name} > {vdev_class}"
@@ -8485,18 +8485,13 @@ class InventoryService:
                 vdev_class=vdev_class,
                 vdev_name=vdev_name,
                 topology_label=topology_label,
-                health=normalize_text(device.get("status") or pool.get("status") or pool.get("health")),
-                raw_name=normalize_text(device.get("name") or device.get("devicePath")),
-                raw_path=normalize_text(device.get("devicePath")),
+                health=self._quantastor_text(device.get("status"), pool.get("status"), pool.get("health")),
+                raw_name=normalize_value_text(device.get("name") or device.get("devicePath")),
+                raw_path=normalize_value_text(device.get("devicePath")),
             )
-            for key in normalize_lookup_keys(device.get("physicalDiskId")):
-                members[key] = member
-            for key in normalize_lookup_keys(device.get("devicePath")):
-                members[key] = member
-            for key in normalize_lookup_keys(device.get("physicalDiskSerialNumber")):
-                members[key] = member
-            for key in normalize_lookup_keys(device.get("physicalDiskScsiId")):
-                members[key] = member
+            for field_name in ("physicalDiskId", "devicePath", "physicalDiskSerialNumber", "physicalDiskScsiId"):
+                for key in normalize_lookup_keys(normalize_value_text(device.get(field_name))):
+                    members[key] = member
             physical_disk_obj = device.get("physicalDiskObj")
             if isinstance(physical_disk_obj, dict):
                 for value in (
@@ -8899,6 +8894,16 @@ class InventoryService:
                     "quantastor_ssh_hosts_by_system_id": hosts_by_system,
                 }
             )
+
+    @staticmethod
+    def _quantastor_text(*values: Any) -> str | None:
+        # QuantaStor sends enum codes as numbers in fields that can also carry
+        # text (pool-device `status` is 1 or 7). A code is not display text, so
+        # skip it and fall back to the next value instead of crashing on it.
+        for value in values:
+            if isinstance(value, str) and (text := value.strip()):
+                return text
+        return None
 
     @staticmethod
     def _quantastor_bool(value: Any) -> bool:
