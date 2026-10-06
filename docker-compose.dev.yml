@@ -25,6 +25,7 @@ services:
       ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
       ADMIN_TIMEOUT_SECONDS: ${ADMIN_TIMEOUT_SECONDS:-0.75}
       APP_PUBLIC_ORIGIN: ${APP_PUBLIC_ORIGIN:-}
+      ADMIN_ALLOWED_HOSTS: ${ADMIN_ALLOWED_HOSTS:-}
       ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE:-network}
       # Same interpolation source as enclosure-history, so all three services share
       # one release-check policy. Blank means unset: config.yaml app.release_check_*
@@ -171,6 +172,7 @@ services:
       ADMIN_PORT: 8002
       ADMIN_BIND_ADDRESS: ${ADMIN_BIND_ADDRESS:-0.0.0.0}
       ADMIN_PUBLIC_ORIGIN: ${ADMIN_PUBLIC_ORIGIN:-}
+      ADMIN_ALLOWED_HOSTS: ${ADMIN_ALLOWED_HOSTS:-}
       ADMIN_AUTO_STOP_SECONDS: ${ADMIN_AUTO_STOP_SECONDS:-3600}
       ADMIN_CONTAINER_UI_NAME: truenas-jbod-ui
       ADMIN_CONTAINER_HISTORY_NAME: truenas-jbod-history
