@@ -94,6 +94,44 @@ HISTORY_GROWTH_STATUS_FIELDS = (
     "multipath_mode",
 )
 HISTORY_DB_PATH = "/app/history/history.db"
+HISTORY_SEGMENTS_PATH = "/app/history/segments"
+# Runs as root on the QA host against the restored history. In one read
+# transaction it takes each table's highest rowid as a mark and hashes every
+# row at or below it; given the earlier marks and columns, it rehashes exactly
+# those rows. Events and samples are append-only, and rollups change only
+# through retention, which the drill disables, so those tables hash every
+# column: a rollback cannot hide behind replacement rows or older aggregates.
+# Current slot state, which the collector upserts in place, hashes only rowid
+# and primary key. The segment catalog and sealed segment files are hashed
+# whole.
+HISTORY_FINGERPRINT_SCRIPT = r"""
+import glob, hashlib, json, os, sqlite3, sys, urllib.parse
+path, segments, before = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+db = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True, isolation_level=None)
+db.execute("BEGIN")
+tables = {}
+for table, whole_rows in (("slot_state_current", False), ("slot_events", True), ("metric_samples", True), ("metric_rollups", True)):
+    if table in before:
+        mark, columns = before[table]["mark"], before[table]["columns"]
+    else:
+        info = sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: (row[5] == 0, row[5], row[0]))
+        columns = [row[1] for row in info if whole_rows or row[5]]
+        mark = db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+    digest, rows = hashlib.sha256(), 0
+    for row in db.execute(f"SELECT rowid, {', '.join(columns)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):
+        digest.update(repr(row).encode())
+        rows += 1
+    tables[table] = {"mark": mark, "columns": columns, "rows": rows, "sha256": digest.hexdigest()}
+db.execute("COMMIT")
+files = {}
+for name in sorted(glob.glob(os.path.join(segments, "catalog.json")) + glob.glob(os.path.join(segments, "segment-*.sqlite3"))):
+    digest = hashlib.sha256()
+    with open(name, "rb") as source:
+        while chunk := source.read(1 << 20):
+            digest.update(chunk)
+    files[os.path.basename(name)] = digest.hexdigest()
+print(json.dumps({"tables": tables, "segments": files}))
+"""
 REQUIRED_FULL_GROUPS = {
     "config_file",
     "runtime_overrides_file",
@@ -802,13 +840,13 @@ def _run(
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
 
 
-def _app_owned_reader(command: Sequence[str]) -> str:
+def _app_owned_reader(command: Sequence[str], *, timeout: int = 30) -> str:
     result = subprocess.run(
         list(command),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
-        timeout=30,
+        timeout=timeout,
         check=False,
     )
     if result.returncode != 0:
@@ -1016,6 +1054,9 @@ def _write_runtime_files(
             "METRICS_ENABLED=true",
             "HISTORY_STARTUP_GRACE_SECONDS=0",
             "HISTORY_POLL_INTERVAL_SECONDS=3600",
+            # The drill proves restored history survives; retention must not
+            # prune it between checks once a live collector pass succeeds.
+            *(f"HISTORY_{kind}_RETENTION_DAYS=0" for kind in ("RAW_METRIC", "EVENT", "HOURLY_ROLLUP", "DAILY_ROLLUP")),
             "ADMIN_AUTO_STOP_SECONDS=0",
             *((f"HISTORY_SEGMENT_CATALOG_PATH={SEGMENT_CATALOG_PATH}",) if segmented_history else ()),
             "",
@@ -1105,6 +1146,73 @@ def _validated_history_counts(payload: dict[str, Any]) -> dict[str, int]:
             raise QaRestoreError(f"history count {key} is missing or invalid")
         counts[key] = value
     return counts
+
+
+def reconcile_checkpoint(
+    baseline: dict[str, Any],
+    observed: dict[str, Any],
+    previous: dict[str, Any] | None,
+    *,
+    growable: frozenset[str],
+) -> None:
+    """Compare a checkpoint with the archive and its history with the last checkpoint.
+
+    Growth may continue between checks, but no check may lose history that an
+    earlier check saw, even while it stays above the archive count. Exact
+    (offline) checks already pin every checkpoint to the archive.
+    """
+    reconcile_counts(baseline, observed, growable=growable)
+    if previous is not None and growable:
+        reconcile_counts({"history": previous.get("history")}, observed, growable=growable)
+
+
+def _history_fingerprint(
+    runtime_root: Path,
+    before: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint restored history rows, or rehash the rows `before` covered."""
+    earlier = before["tables"] if before else {}
+    output = _app_owned_reader(
+        [
+            "sudo",
+            "-n",
+            "--",
+            "python3",
+            "-c",
+            HISTORY_FINGERPRINT_SCRIPT,
+            str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
+            str(_qa_host_path(runtime_root, HISTORY_SEGMENTS_PATH)),
+            json.dumps(earlier),
+        ],
+        timeout=600,
+    )
+    try:
+        fingerprint = json.loads(output)
+    except ValueError as exc:
+        raise QaRestoreError("history fingerprint was invalid") from exc
+    if not (
+        isinstance(fingerprint, dict)
+        and isinstance(fingerprint.get("tables"), dict)
+        and isinstance(fingerprint.get("segments"), dict)
+    ):
+        raise QaRestoreError("history fingerprint was invalid")
+    return fingerprint
+
+
+def verify_history_survived(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Every row and sealed segment seen before the restart must still be there.
+
+    Counts alone cannot show this in live mode: new rows can hide lost ones.
+    """
+    changed = [
+        table for table, value in before["tables"].items() if after["tables"].get(table) != value
+    ] + [
+        name for name, digest in before["segments"].items() if after["segments"].get(name) != digest
+    ]
+    if changed:
+        raise QaRestoreError(
+            "history recorded before the restart changed: " + ", ".join(sorted(changed))
+        )
 
 
 def history_growth(expected: dict[str, Any], observed: dict[str, Any]) -> dict[str, int]:
@@ -1834,10 +1942,11 @@ def main() -> int:
 
         phase = "aggregate-reconcile"
         growable = LIVE_GROWABLE_COUNTS if args.live_read_only else frozenset()
+        baseline = inspection["aggregate_counts"]
         observed, system_id = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed, growable=growable)
+        reconcile_checkpoint(baseline, observed, None, growable=growable)
 
         phase = "pencil-writes"
         pencil_results = _exercise_pencil_writes(
@@ -1851,11 +1960,12 @@ def main() -> int:
         observed_after_writes, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_writes, growable=growable)
+        reconcile_checkpoint(baseline, observed_after_writes, observed, growable=growable)
 
         phase = "restart-survival"
         if RESTART_COMMAND_LABEL != "docker compose restart":
             raise QaRestoreError("compose restart command label drifted")
+        before_restart = _history_fingerprint(args.runtime_root)
         if service_access is None:
             raise QaRestoreError("loopback service access was not initialized")
         service_access.close()
@@ -1893,9 +2003,12 @@ def main() -> int:
         observed_after_restart, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_restart, growable=growable)
+        reconcile_checkpoint(baseline, observed_after_restart, observed_after_writes, growable=growable)
+        verify_history_survived(
+            before_restart, _history_fingerprint(args.runtime_root, before_restart)
+        )
         # Written before the browser phase so a later failure still keeps it.
-        growth = history_growth(inspection["aggregate_counts"], observed_after_restart)
+        growth = history_growth(baseline, observed_after_restart)
         write_private_json(
             raw_dir / "history-growth.json",
             {

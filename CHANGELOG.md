@@ -922,9 +922,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - A live read-only restore drill lets the restored history counts grow, since
   its collector polls the real appliances, but never shrink. Every other count
-  stays exact, and egress-blocked drills stay exact for all counts. The drill
-  writes a private breakdown of the new events and records the growth in its
-  receipt. (#900)
+  stays exact, and egress-blocked drills stay exact for all counts. Each check
+  must also reach the previous check's history counts. The drill fingerprints
+  the restored history rows and sealed segments before its restart and
+  rechecks them after, so lost rows fail even when new rows hide them in the
+  counts, and it turns retention off for the drill. It writes a private
+  breakdown of the new events and records the growth in its receipt.
+  (#900, #901)
 - Closed owned SQLite connections explicitly during history rotation, migration
   and sealing, including fault paths. (#877)
 - The release QA scripts run end to end again. The Compose runtime matrix

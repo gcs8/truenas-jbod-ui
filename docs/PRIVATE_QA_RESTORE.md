@@ -187,8 +187,25 @@ appliance.
 
 In live read-only mode the restored history collector polls the real
 appliances, so it can record new events, samples and slots before or between
-the three count checks. Those `history` counts may grow but never shrink. Every
-other count stays exact, and egress-blocked runs stay exact for every count.
+the three count checks. Those `history` counts may grow but never shrink: each
+check must reach at least the archive count and the previous check's count, so
+a restart that loses history fails even while the count stays above the
+archive's. Every other count stays exact, and egress-blocked runs stay exact
+for every count.
+
+Counts alone cannot prove the restart kept the old rows, because new rows can
+hide lost ones. Before the restart the controller fingerprints the restored
+history read-only. For each history table it records the highest row ID and a
+hash of every row up to it. Events and samples are append-only, and rollups
+change only through retention, which the drill turns off, so their whole rows
+are hashed: replacement rows that reuse a lost ID or older aggregates still
+fail. Current slot state is updated in place, so only its row ID and primary
+key are hashed. The segment catalog and each sealed segment file are
+hashed whole. After the restart the controller rehashes exactly those rows,
+columns and files, and any difference fails the drill. The QA stack sets every
+`HISTORY_*_RETENTION_DAYS` to `0` so retention cannot prune restored rows
+during the drill.
+
 After the restart check the controller writes `raw-private/history-growth.json`.
 It holds the growth per history count and the newest events grouped by system,
 event type and changed fields. Status fields such as health show their
