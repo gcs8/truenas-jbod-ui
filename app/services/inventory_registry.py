@@ -78,9 +78,19 @@ class InventoryRegistry:
         return any(system.id == system_id for system in self.settings.systems)
 
     def peek_service(self, system_id: str) -> InventoryService | None:
-        """Return the already-built service for ``system_id`` without creating one."""
+        """Return the service whose cache answers for ``system_id``, building none.
 
-        return self._services.get(system_id)
+        After a reload that is the replaced settings' service until the system
+        is opened again, but only while its snapshots would carry over.
+        """
+
+        service = self._services.get(system_id)
+        if service is not None:
+            return service
+        predecessor = self._predecessors.get(system_id)
+        if predecessor is None or not self.has_system(system_id):
+            return None
+        return predecessor if self._snapshots_still_valid(predecessor, self.get_system(system_id)) else None
 
     def get_service(self, system_id: str | None) -> InventoryService:
         system = self.get_system(system_id)

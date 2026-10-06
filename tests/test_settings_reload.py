@@ -614,6 +614,32 @@ class RegistryCarryOverTests(ConfigReloadTestCase):
         new_service = InventoryRegistry(self.runtime.current().settings, previous=old_registry).get_service("beta")
         self.assertIsNone(new_service._source_bundle)
 
+    def test_peek_service_keeps_an_unreopened_system_cache_across_a_reload(self) -> None:
+        # /healthz peeks every system (#783). A system nobody reopened since a
+        # reload must still show its cached inventory while nothing it was
+        # built from changed, and peeking must never build a service.
+        from app.services.inventory import SNAPSHOT_NO_ENCLOSURE_KEY
+
+        old_registry = InventoryRegistry(self.runtime.current().settings)
+        cached = object()
+        old_registry.get_service("beta")._cache = {SNAPSHOT_NO_ENCLOSURE_KEY: cached}  # type: ignore[dict-item]
+
+        self.config["systems"][0]["label"] = "Alpha Renamed"
+        self._write_config()
+        self.assertTrue(self._check())
+        registry = InventoryRegistry(self.runtime.current().settings, previous=old_registry)
+        peeked = registry.peek_service("beta")
+        assert peeked is not None
+        self.assertIs(peeked.peek_cached_snapshot(), cached)
+        self.assertNotIn("beta", registry._services)
+        self.assertIsNone(registry.peek_service("alpha"))
+
+        self.config["systems"][1]["truenas"]["host"] = "https://198.51.100.99"
+        self._write_config()
+        self.assertTrue(self._check())
+        moved = InventoryRegistry(self.runtime.current().settings, previous=registry)
+        self.assertIsNone(moved.peek_service("beta"))
+
     def test_removed_system_is_not_configured_after_reload(self) -> None:
         from app.services.inventory_registry import SystemNotConfiguredError
 
@@ -699,6 +725,12 @@ class MainAppWiringTests(ConfigReloadTestCase):
 
             def get_service(self, _system_id: Any) -> Any:
                 return self
+
+            def get_system(self, _system_id: Any) -> Any:
+                return self.system
+
+            def peek_service(self, system_id: str) -> Any:
+                return self if system_id == self.system.id else None
 
             async def get_snapshot(self, **_: Any) -> InventorySnapshot:
                 return InventorySnapshot(slots=[], refresh_interval_seconds=self.settings.app.refresh_interval_seconds)
