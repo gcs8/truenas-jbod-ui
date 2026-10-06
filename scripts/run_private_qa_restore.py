@@ -78,6 +78,60 @@ HISTORY_COUNT_FIELDS = {
     "metric_sample_count",
     "metric_rollup_count",
 }
+# Live read-only QA restores a collector that polls the real appliances, so it
+# may record new history before or between the count checks. History may grow
+# there and never shrink; everything else stays exact, and offline runs stay
+# exact throughout.
+LIVE_GROWABLE_COUNTS = frozenset(f"history.{key}" for key in HISTORY_COUNT_FIELDS)
+# Event fields whose values are status words, never identities, so the growth
+# breakdown may show them. Every other changed field is named, not shown.
+HISTORY_GROWTH_STATUS_FIELDS = (
+    "present",
+    "state",
+    "identify_active",
+    "health",
+    "multipath_state",
+    "multipath_mode",
+)
+HISTORY_DB_PATH = "/app/history/history.db"
+HISTORY_SEGMENTS_PATH = "/app/history/segments"
+# Runs as root on the QA host against the restored history. In one read
+# transaction it takes each table's highest rowid as a mark and hashes every
+# row at or below it; given the earlier marks and columns, it rehashes exactly
+# those rows. Events and samples are append-only, and rollups change only
+# through retention, which the drill disables, so those tables hash every
+# column: a rollback cannot hide behind replacement rows or older aggregates.
+# Current slot state, which the collector upserts in place, hashes only rowid
+# and primary key. The segment catalog and sealed segment files are hashed
+# whole.
+HISTORY_FINGERPRINT_SCRIPT = r"""
+import glob, hashlib, json, os, sqlite3, sys, urllib.parse
+path, segments, before = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+db = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True, isolation_level=None)
+db.execute("BEGIN")
+tables = {}
+for table, whole_rows in (("slot_state_current", False), ("slot_events", True), ("metric_samples", True), ("metric_rollups", True)):
+    if table in before:
+        mark, columns = before[table]["mark"], before[table]["columns"]
+    else:
+        info = sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: (row[5] == 0, row[5], row[0]))
+        columns = [row[1] for row in info if whole_rows or row[5]]
+        mark = db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+    digest, rows = hashlib.sha256(), 0
+    for row in db.execute(f"SELECT rowid, {', '.join(columns)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):
+        digest.update(repr(row).encode())
+        rows += 1
+    tables[table] = {"mark": mark, "columns": columns, "rows": rows, "sha256": digest.hexdigest()}
+db.execute("COMMIT")
+files = {}
+for name in sorted(glob.glob(os.path.join(segments, "catalog.json")) + glob.glob(os.path.join(segments, "segment-*.sqlite3"))):
+    digest = hashlib.sha256()
+    with open(name, "rb") as source:
+        while chunk := source.read(1 << 20):
+            digest.update(chunk)
+    files[os.path.basename(name)] = digest.hexdigest()
+print(json.dumps({"tables": tables, "segments": files}))
+"""
 REQUIRED_FULL_GROUPS = {
     "config_file",
     "runtime_overrides_file",
@@ -245,6 +299,7 @@ def reconcile_counts(
     observed: dict[str, Any],
     *,
     prefix: str = "",
+    growable: frozenset[str] = frozenset(),
 ) -> None:
     mismatches: list[str] = []
     for key, expected_value in expected.items():
@@ -262,12 +317,15 @@ def reconcile_counts(
                 )
                 continue
             try:
-                reconcile_counts(expected_value, observed_value, prefix=field)
+                reconcile_counts(expected_value, observed_value, prefix=field, growable=growable)
             except QaRestoreError as exc:
                 mismatches.append(str(exc))
+        elif field in growable and type(observed_value) is int and observed_value >= expected_value:
+            continue
         elif observed_value != expected_value:
+            bound = "at least " if field in growable else ""
             mismatches.append(
-                f"{field}: expected {expected_value}, observed {observed_value}"
+                f"{field}: expected {bound}{expected_value}, observed {observed_value}"
             )
     if mismatches:
         raise QaRestoreError("; ".join(mismatches))
@@ -782,13 +840,13 @@ def _run(
         raise QaRestoreError(f"command failed with exit code {result.returncode}")
 
 
-def _app_owned_reader(command: Sequence[str]) -> str:
+def _app_owned_reader(command: Sequence[str], *, timeout: int = 30) -> str:
     result = subprocess.run(
         list(command),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
-        timeout=30,
+        timeout=timeout,
         check=False,
     )
     if result.returncode != 0:
@@ -996,6 +1054,9 @@ def _write_runtime_files(
             "METRICS_ENABLED=true",
             "HISTORY_STARTUP_GRACE_SECONDS=0",
             "HISTORY_POLL_INTERVAL_SECONDS=3600",
+            # The drill proves restored history survives; retention must not
+            # prune it between checks once a live collector pass succeeds.
+            *(f"HISTORY_{kind}_RETENTION_DAYS=0" for kind in ("RAW_METRIC", "EVENT", "HOURLY_ROLLUP", "DAILY_ROLLUP")),
             "ADMIN_AUTO_STOP_SECONDS=0",
             *((f"HISTORY_SEGMENT_CATALOG_PATH={SEGMENT_CATALOG_PATH}",) if segmented_history else ()),
             "",
@@ -1085,6 +1146,128 @@ def _validated_history_counts(payload: dict[str, Any]) -> dict[str, int]:
             raise QaRestoreError(f"history count {key} is missing or invalid")
         counts[key] = value
     return counts
+
+
+def reconcile_checkpoint(
+    baseline: dict[str, Any],
+    observed: dict[str, Any],
+    previous: dict[str, Any] | None,
+    *,
+    growable: frozenset[str],
+) -> None:
+    """Compare a checkpoint with the archive and its history with the last checkpoint.
+
+    Growth may continue between checks, but no check may lose history that an
+    earlier check saw, even while it stays above the archive count. Exact
+    (offline) checks already pin every checkpoint to the archive.
+    """
+    reconcile_counts(baseline, observed, growable=growable)
+    if previous is not None and growable:
+        reconcile_counts({"history": previous.get("history")}, observed, growable=growable)
+
+
+def _history_fingerprint(
+    runtime_root: Path,
+    before: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint restored history rows, or rehash the rows `before` covered."""
+    earlier = before["tables"] if before else {}
+    output = _app_owned_reader(
+        [
+            "sudo",
+            "-n",
+            "--",
+            "python3",
+            "-c",
+            HISTORY_FINGERPRINT_SCRIPT,
+            str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
+            str(_qa_host_path(runtime_root, HISTORY_SEGMENTS_PATH)),
+            json.dumps(earlier),
+        ],
+        timeout=600,
+    )
+    try:
+        fingerprint = json.loads(output)
+    except ValueError as exc:
+        raise QaRestoreError("history fingerprint was invalid") from exc
+    if not (
+        isinstance(fingerprint, dict)
+        and isinstance(fingerprint.get("tables"), dict)
+        and isinstance(fingerprint.get("segments"), dict)
+    ):
+        raise QaRestoreError("history fingerprint was invalid")
+    return fingerprint
+
+
+def verify_history_survived(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Every row and sealed segment seen before the restart must still be there.
+
+    Counts alone cannot show this in live mode: new rows can hide lost ones.
+    """
+    changed = [
+        table for table, value in before["tables"].items() if after["tables"].get(table) != value
+    ] + [
+        name for name, digest in before["segments"].items() if after["segments"].get(name) != digest
+    ]
+    if changed:
+        raise QaRestoreError(
+            "history recorded before the restart changed: " + ", ".join(sorted(changed))
+        )
+
+
+def history_growth(expected: dict[str, Any], observed: dict[str, Any]) -> dict[str, int]:
+    before, after = expected.get("history") or {}, observed.get("history") or {}
+    return {
+        key: after[key] - before[key]
+        for key in sorted(HISTORY_COUNT_FIELDS)
+        if type(before.get(key)) is int and type(after.get(key)) is int
+    }
+
+
+def _history_growth_breakdown(runtime_root: Path, new_events: int) -> list[dict[str, Any]]:
+    """Group the newest restored events by system, type and changed fields.
+
+    Status fields show their transition; identity fields are only named, so the
+    private breakdown can tell real changes from upgrade churn without serials.
+    """
+    if new_events <= 0:
+        return []
+    code = (
+        "import collections,json,sqlite3,sys,urllib.parse;"
+        "path,limit,status=sys.argv[1],int(sys.argv[2]),set(json.loads(sys.argv[3]));"
+        "db=sqlite3.connect('file:'+urllib.parse.quote(path)+'?mode=ro',uri=True);"
+        "groups=collections.Counter()"
+        "\nfor system_id,event_type,details in db.execute("
+        "'SELECT system_id,event_type,details_json FROM slot_events ORDER BY id DESC LIMIT ?',(limit,)):"
+        "\n try: changes=json.loads(details)"
+        "\n except ValueError: changes={}"
+        "\n changes=changes if isinstance(changes,dict) else {}"
+        "\n groups[(system_id,event_type,tuple(sorted("
+        "f\"{name}: {str(change.get('previous'))[:40]} -> {str(change.get('current'))[:40]}\""
+        " if name in status and isinstance(change,dict) else name for name,change in changes.items())))]+=1"
+        "\nprint(json.dumps([{'system_id':s,'event_type':t,'changes':list(c),'count':n}"
+        " for (s,t,c),n in groups.most_common()]))"
+    )
+    output = _app_owned_reader(
+        [
+            "sudo",
+            "-n",
+            "--",
+            "python3",
+            "-c",
+            code,
+            str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
+            str(new_events),
+            json.dumps(HISTORY_GROWTH_STATUS_FIELDS),
+        ]
+    )
+    try:
+        breakdown = json.loads(output)
+    except ValueError as exc:
+        raise QaRestoreError("history growth breakdown was invalid") from exc
+    if not isinstance(breakdown, list):
+        raise QaRestoreError("history growth breakdown was invalid")
+    return breakdown
 
 
 def _qa_host_path(runtime_root: Path, configured_path: object) -> Path:
@@ -1758,10 +1941,12 @@ def main() -> int:
         _wait_history_idle(ports[1], username, password)
 
         phase = "aggregate-reconcile"
+        growable = LIVE_GROWABLE_COUNTS if args.live_read_only else frozenset()
+        baseline = inspection["aggregate_counts"]
         observed, system_id = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed)
+        reconcile_checkpoint(baseline, observed, None, growable=growable)
 
         phase = "pencil-writes"
         pencil_results = _exercise_pencil_writes(
@@ -1775,11 +1960,12 @@ def main() -> int:
         observed_after_writes, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_writes)
+        reconcile_checkpoint(baseline, observed_after_writes, observed, growable=growable)
 
         phase = "restart-survival"
         if RESTART_COMMAND_LABEL != "docker compose restart":
             raise QaRestoreError("compose restart command label drifted")
+        before_restart = _history_fingerprint(args.runtime_root)
         if service_access is None:
             raise QaRestoreError("loopback service access was not initialized")
         service_access.close()
@@ -1817,7 +2003,21 @@ def main() -> int:
         observed_after_restart, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_restart)
+        reconcile_checkpoint(baseline, observed_after_restart, observed_after_writes, growable=growable)
+        verify_history_survived(
+            before_restart, _history_fingerprint(args.runtime_root, before_restart)
+        )
+        # Written before the browser phase so a later failure still keeps it.
+        growth = history_growth(baseline, observed_after_restart)
+        write_private_json(
+            raw_dir / "history-growth.json",
+            {
+                "growth": growth,
+                "newest_events": _history_growth_breakdown(
+                    args.runtime_root, growth.get("event_count", 0)
+                ),
+            },
+        )
 
         qa_results: dict[str, bool] = {}
         if not args.skip_browser_and_performance:
@@ -1861,6 +2061,7 @@ def main() -> int:
             },
             "import_summary": import_summary,
             "aggregate_counts_match": True,
+            "history_growth": growth,
             "pencil_cycles": {
                 **pencil_results,
                 "cleanup_verified": True,
