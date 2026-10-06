@@ -60,6 +60,15 @@ CLASS_FIELDS = {
 # The scheduler container mounts ./config/backup-secrets at this path; the admin
 # container sees the same folder under its config directory.
 SCHEDULER_SECRET_ROOT = PurePosixPath("/run/backup-secrets")
+
+
+def _secret_path(text: str) -> PurePosixPath:
+    # POSIX lets exactly two leading slashes mean something else, so
+    # PurePosixPath keeps "//run/x" apart from "/run/x". Linux opens the same
+    # file for both, so ownership and folder checks compare the Linux form.
+    return PurePosixPath("/" + text.lstrip("/") if text.startswith("/") else text)
+
+
 # The archive passphrase lives in the same folder. A target must never be able
 # to name it, or the scheduler would send it to that target as a credential.
 PASSPHRASE_ENV_NAMES = ("BACKUP_ARCHIVE_PASSPHRASE_FILE", "SCHEDULED_BACKUP_PASSPHRASE_FILE")
@@ -109,7 +118,7 @@ def _secret_file_state(value: Any, config_dir: Path) -> dict[str, Any]:
     text = str(value or "").strip()
     if not text:
         return {"configured": False, "present": None}
-    candidate = PurePosixPath(text)
+    candidate = _secret_path(text)
     try:
         relative = candidate.relative_to(SCHEDULER_SECRET_ROOT)
     except ValueError:
@@ -231,7 +240,7 @@ def _forbidden_secret_paths(environ: Mapping[str, str]) -> set[str]:
     for name in PASSPHRASE_ENV_NAMES:
         value = str(environ.get(name) or "").strip()
         if value:
-            paths.add(str(PurePosixPath(value)))
+            paths.add(str(_secret_path(value)))
     return paths
 
 
@@ -254,7 +263,7 @@ def _endpoint(values: Mapping[str, Any]) -> tuple[Any, ...]:
 def _secret_path_key(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
-    return str(PurePosixPath(value.strip()))
+    return str(_secret_path(value.strip()))
 
 
 def _stored_secret_owners(targets: Any) -> dict[str, set[tuple[str, str]]]:
@@ -318,7 +327,7 @@ def _merge_target(
             problems.append(f"{where}.{name} must be an absolute path to a secret file, or null to clear it.")
             continue
         text = change.strip()
-        candidate = PurePosixPath(text)
+        candidate = _secret_path(text)
         if not text.startswith("/") or ".." in candidate.parts or "\x00" in text:
             problems.append(f"{where}.{name} must be an absolute path to a secret file.")
             continue

@@ -3024,6 +3024,26 @@ class PolicyEditorTests(unittest.TestCase):
             self.save({"revision": view["revision"], "targets": entries})
         self.assertEqual(self.config.read_bytes(), before)
 
+    def test_secret_file_ownership_compares_double_leading_slash_spellings(self) -> None:
+        # POSIX keeps exactly two leading slashes distinct, but Linux opens the
+        # same file, so a hand-written //run/... must still own its secret.
+        self._add_s3_target()
+        document = yaml.safe_load(self.config.read_text())
+        document["backups"]["targets"][1]["secret_access_key_file"] = "//run/backup-secrets/archive_s3_secret"
+        self.config.write_text(yaml.safe_dump(document, sort_keys=False))
+        for spelling in ("/run/backup-secrets/archive_s3_secret", "//run/backup-secrets/archive_s3_secret"):
+            with self.subTest(spelling=spelling):
+                view = self.view()
+                before = self.config.read_bytes()
+                attacker = {
+                    "values": {"target_id": "drop", "provider": "ftp", "hostname": "attacker.example.test",
+                               "username": "x", "root": "/drop", "enabled": True},
+                    "secrets": {"password_file": spelling},
+                }
+                with self.assertRaisesRegex(self.editor.PolicyEditError, "already used by another backup secret"):
+                    self.save({"revision": view["revision"], "targets": [*self._entries(view), attacker]})
+                self.assertEqual(self.config.read_bytes(), before)
+
     def test_moving_a_secret_file_to_another_target_in_one_save_is_refused(self) -> None:
         # Deleting the S3 target and handing its secret to a new row in the
         # same save is still naming another target's saved secret.
