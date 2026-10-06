@@ -195,12 +195,15 @@ for every count.
 
 Counts alone cannot prove the restart kept the old rows, because new rows can
 hide lost ones. Before the restart the controller fingerprints the restored
-history read-only: for each history table it records the highest row ID and a
-hash of every row's ID and primary key up to it, plus a hash of each sealed
-segment file. After the restart it rehashes exactly those rows and files, and
-any difference fails the drill. Upserts that keep a row's key, such as current
-slot state, still pass. The QA stack sets every `HISTORY_*_RETENTION_DAYS` to
-`0` so retention cannot prune restored rows during the drill.
+history read-only. For each history table it records the highest row ID and a
+hash of every row up to it. Events and samples are append-only, so their
+whole rows are hashed: replacement rows that reuse a lost ID still fail.
+Current slot state and rollups are updated in place, so only their row ID and
+primary key are hashed. The segment catalog and each sealed segment file are
+hashed whole. After the restart the controller rehashes exactly those rows,
+columns and files, and any difference fails the drill. The QA stack sets every
+`HISTORY_*_RETENTION_DAYS` to `0` so retention cannot prune restored rows
+during the drill.
 
 After the restart check the controller writes `raw-private/history-growth.json`.
 It holds the growth per history count and the newest events grouped by system,

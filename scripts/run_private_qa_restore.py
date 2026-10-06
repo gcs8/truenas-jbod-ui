@@ -96,27 +96,33 @@ HISTORY_GROWTH_STATUS_FIELDS = (
 HISTORY_DB_PATH = "/app/history/history.db"
 HISTORY_SEGMENTS_PATH = "/app/history/segments"
 # Runs as root on the QA host against the restored history. In one read
-# transaction it takes each table's highest rowid as a mark and hashes the
-# rowid and primary key of every row at or below it; given marks, it rehashes
-# exactly those rows. Sealed segment files are hashed whole. Upserts that keep
-# a row's key pass; a lost, replaced or rewritten row fails.
+# transaction it takes each table's highest rowid as a mark and hashes every
+# row at or below it; given the earlier marks and columns, it rehashes exactly
+# those rows. Append-only tables hash every column, so a restart that rolls the
+# database back cannot hide behind replacement rows that reuse lost IDs. Tables
+# the collector upserts in place hash only rowid and primary key. The segment
+# catalog and sealed segment files are hashed whole.
 HISTORY_FINGERPRINT_SCRIPT = r"""
 import glob, hashlib, json, os, sqlite3, sys, urllib.parse
-path, segments, marks = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+path, segments, before = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 db = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True, isolation_level=None)
 db.execute("BEGIN")
 tables = {}
-for table in ("slot_state_current", "slot_events", "metric_samples", "metric_rollups"):
-    keys = [row[1] for row in sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: row[5]) if row[5]]
-    mark = marks[table] if marks else db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+for table, append_only in (("slot_state_current", False), ("slot_events", True), ("metric_samples", True), ("metric_rollups", False)):
+    if table in before:
+        mark, columns = before[table]["mark"], before[table]["columns"]
+    else:
+        info = sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: (row[5] == 0, row[5], row[0]))
+        columns = [row[1] for row in info if append_only or row[5]]
+        mark = db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
     digest, rows = hashlib.sha256(), 0
-    for row in db.execute(f"SELECT rowid, {', '.join(keys)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):
+    for row in db.execute(f"SELECT rowid, {', '.join(columns)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):
         digest.update(repr(row).encode())
         rows += 1
-    tables[table] = {"mark": mark, "rows": rows, "sha256": digest.hexdigest()}
+    tables[table] = {"mark": mark, "columns": columns, "rows": rows, "sha256": digest.hexdigest()}
 db.execute("COMMIT")
 files = {}
-for name in sorted(glob.glob(os.path.join(segments, "segment-*.sqlite3"))):
+for name in sorted(glob.glob(os.path.join(segments, "catalog.json")) + glob.glob(os.path.join(segments, "segment-*.sqlite3"))):
     digest = hashlib.sha256()
     with open(name, "rb") as source:
         while chunk := source.read(1 << 20):
@@ -1163,7 +1169,7 @@ def _history_fingerprint(
     before: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fingerprint restored history rows, or rehash the rows `before` covered."""
-    marks = {table: value["mark"] for table, value in before["tables"].items()} if before else {}
+    earlier = before["tables"] if before else {}
     output = _app_owned_reader(
         [
             "sudo",
@@ -1174,7 +1180,7 @@ def _history_fingerprint(
             HISTORY_FINGERPRINT_SCRIPT,
             str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
             str(_qa_host_path(runtime_root, HISTORY_SEGMENTS_PATH)),
-            json.dumps(marks),
+            json.dumps(earlier),
         ],
         timeout=600,
     )

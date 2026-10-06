@@ -316,6 +316,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             (runtime / "history" / "segments").mkdir(parents=True)
             segment = runtime / "history" / "segments" / "segment-0001.sqlite3"
             segment.write_bytes(b"sealed")
+            catalog = runtime / "history" / "segments" / "catalog.json"
+            catalog.write_text('{"segments": ["segment-0001"]}')
             database = sqlite3.connect(runtime / "history" / "history.db", isolation_level=None)
             database.executescript("""
                 CREATE TABLE slot_state_current (system_id TEXT, enclosure_key TEXT, slot INTEGER, health TEXT,
@@ -331,28 +333,45 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             before = self.module._history_fingerprint(runtime)
             self.assertEqual({table: value["rows"] for table, value in before["tables"].items()}, {
                 "slot_state_current": 2, "slot_events": 2, "metric_samples": 3, "metric_rollups": 0})
-            self.assertEqual(set(before["segments"]), {"segment-0001.sqlite3"})
+            self.assertEqual(set(before["segments"]), {"catalog.json", "segment-0001.sqlite3"})
+            # Append-only tables hash whole rows; upserted tables hash only their keys.
+            self.assertEqual(before["tables"]["slot_events"]["columns"], ["id", "observed_at"])
+            self.assertEqual(before["tables"]["slot_state_current"]["columns"], ["system_id", "enclosure_key", "slot"])
 
-            # Live growth and in-place upserts keep every earlier row.
+            def survived():
+                self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+
+            # Live growth, in-place upserts and a column added on restart keep every earlier row.
             database.executescript("""
                 INSERT INTO slot_events (observed_at) VALUES ('t3');
                 INSERT INTO metric_samples (observed_at) VALUES ('t4'), ('t5');
                 INSERT INTO slot_state_current VALUES ('alpha', 'e', 1, 'FAULT')
                     ON CONFLICT (system_id, enclosure_key, slot) DO UPDATE SET health = excluded.health;
                 INSERT INTO slot_state_current VALUES ('alpha', 'e', 3, 'OK');
+                ALTER TABLE metric_samples ADD COLUMN added_on_restart TEXT DEFAULT 'x';
             """)
-            self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+            survived()
 
-            # The counts still grow, but an earlier sample is gone.
-            database.executescript("""
-                DELETE FROM metric_samples WHERE observed_at = 't2';
-                INSERT INTO metric_samples (observed_at) VALUES ('t6'), ('t7');
-            """)
-            with self.assertRaisesRegex(self.module.QaRestoreError, "before the restart changed: metric_samples$"):
-                self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
-            segment.write_bytes(b"rewritten")
-            with self.assertRaisesRegex(self.module.QaRestoreError, "metric_samples, segment-0001.sqlite3$"):
-                self.module.verify_history_survived(before, self.module._history_fingerprint(runtime, before))
+            for mutate, changed in (
+                # A rollback lets a later pass reuse a lost event's ID with new contents.
+                (lambda: database.executescript("""
+                    DELETE FROM slot_events WHERE id = 2;
+                    INSERT INTO slot_events (id, observed_at) VALUES (2, 't2-replayed');
+                """), "slot_events"),
+                # The counts still grow, but an earlier sample is gone.
+                (lambda: database.executescript("""
+                    DELETE FROM metric_samples WHERE observed_at = 't2';
+                    INSERT INTO metric_samples (observed_at) VALUES ('t6'), ('t7');
+                """), "metric_samples, slot_events"),
+                (lambda: catalog.write_text('{"segments": []}'), "catalog.json, metric_samples, slot_events"),
+                (lambda: segment.write_bytes(b"rewritten"),
+                 "catalog.json, metric_samples, segment-0001.sqlite3, slot_events"),
+            ):
+                mutate()
+                with self.subTest(changed=changed), self.assertRaisesRegex(
+                    self.module.QaRestoreError, f"before the restart changed: {changed}$"
+                ):
+                    survived()
             database.close()
 
     def test_history_growth_breakdown_shows_status_transitions_and_names_identity_fields(self) -> None:
