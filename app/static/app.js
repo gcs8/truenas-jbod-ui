@@ -3542,8 +3542,19 @@
     return Boolean(view && view.kind === "ses_enclosure");
   }
 
+  // A bay number only names a disk inside its own enclosure. A view slot whose
+  // candidate was recorded in another enclosure must not borrow this bay.
+  function storageViewSlotBayInEnclosure(slot, enclosureId) {
+    const slotEnclosureId = slot?.snapshot_enclosure_id ?? null;
+    return slotEnclosureId === null || (Boolean(enclosureId) && slotEnclosureId === enclosureId);
+  }
+
   function getLiveBackedStorageViewSlot(view, slot) {
     if (!isLiveStyledStorageView(view) || !slot || !Number.isInteger(slot.snapshot_slot)) {
+      return null;
+    }
+    // getSlotById reads the rendered snapshot, so the bay must belong to it.
+    if (!storageViewSlotBayInEnclosure(slot, state.snapshot?.selected_enclosure_id)) {
       return null;
     }
     return getSlotById(slot.snapshot_slot);
@@ -3808,14 +3819,16 @@
     if (!view || !slot) {
       return null;
     }
-    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot);
+    const liveEnclosureId = view.backing_enclosure_id || currentLiveEnclosureId();
+    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot)
+      && storageViewSlotBayInEnclosure(slot, liveEnclosureId);
     return {
       slot: usesLiveSlotHistory ? slot.snapshot_slot : slot.slot_index,
       slot_label: slot.slot_label,
       device_name: slot.device_name || null,
       serial: slot.serial || null,
       enclosure_id: usesLiveSlotHistory
-        ? (view.backing_enclosure_id || currentLiveEnclosureId() || `${view.id}`)
+        ? (liveEnclosureId || `${view.id}`)
         : `storage-view:${view.id}`,
       enclosure_label: usesLiveSlotHistory
         ? (view.backing_enclosure_label || view.label || null)
