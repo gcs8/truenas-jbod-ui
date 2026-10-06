@@ -463,6 +463,30 @@ class ReleaseWrapValidatorTests(unittest.TestCase):
         self.assertTrue(public_demo_freshness_required("v0.24.0"))
         self.assertTrue(public_demo_freshness_required("1.0.0"))
 
+    def test_a_prerelease_leaves_the_public_demo_for_the_stable_release(self) -> None:
+        self.assertFalse(public_demo_freshness_required("v0.24.0-beta.1"))
+        self.assertFalse(public_demo_freshness_required("0.24.0-rc.2"))
+        self.assertFalse(public_demo_freshness_required("v0.24.0-rc.1+build.5"))
+        # Build metadata alone is not a prerelease, even with a hyphen in it.
+        self.assertTrue(public_demo_freshness_required("v0.24.0+build-1"))
+        with self.assertRaises(ValueError):
+            public_demo_freshness_required("v0.24-beta")
+
+    def test_public_demo_only_passes_a_prerelease_and_still_rejects_a_bad_version(self) -> None:
+        def run(version: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, "scripts/validate_release_wrap.py", version, "--public-demo-only"],
+                cwd=REPOSITORY_ROOT, text=True, capture_output=True, check=False,
+            )
+
+        beta = run("v99.0.0-beta.1")
+        self.assertEqual(beta.returncode, 0, beta.stdout)
+        self.assertIn("waits for the next stable release", beta.stdout)
+
+        malformed = run("v99.0-beta.1")
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertIn("semantic version form", malformed.stdout)
+
     def test_release_refuses_a_public_demo_that_was_not_rebuilt_for_it(self) -> None:
         # The checked-in demo carries its own app version. Asking for any other
         # version must fail before any tag, image, or Pages publication.

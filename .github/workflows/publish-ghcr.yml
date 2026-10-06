@@ -55,8 +55,23 @@ jobs:
         if: github.event_name == 'release'
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
+          # A SemVer suffix (v0.24.0-beta.1) and GitHub's prerelease flag must
+          # agree, so a beta never moves `latest` and a stable release never
+          # skips the demo gate below.
+          core="${RELEASE_TAG%%+*}"
+          tagged=false
+          if [[ "$core" == *-* ]]; then tagged=true; fi
+          if [ "$tagged" != "$PRERELEASE" ]; then
+            echo "Release $RELEASE_TAG is marked prerelease=$PRERELEASE but its tag says $tagged."
+            exit 1
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "Prerelease $RELEASE_TAG publishes to dev; the public demo waits for the next stable release."
+            exit 0
+          fi
           # Pull requests do not rebuild the public demo; cutting a release
           # does. Refuse to publish the image until the checked-in demo and
           # screenshots were rebuilt and reviewed from this release source.
@@ -77,6 +92,7 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
 
@@ -90,7 +106,12 @@ jobs:
             version="${release_tag#v}"
             tags+=("$image:$release_tag")
             tags+=("$image:$version")
-            tags+=("$image:latest")
+            # `latest` is the newest stable release; anything else goes to `dev`.
+            if [ "$PRERELEASE" = "true" ]; then
+              tags+=("$image:dev")
+            else
+              tags+=("$image:latest")
+            fi
           else
             if [ -n "$INPUT_TAGS" ]; then
               normalized="${INPUT_TAGS//,/ }"

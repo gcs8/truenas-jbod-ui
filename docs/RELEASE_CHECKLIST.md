@@ -30,13 +30,16 @@ The goal is to make releases boring, repeatable, and easy to audit later.
   release that documents the gap, remediation, and full gate evidence.
 - If this checklist changes during release prep, rerun or re-evaluate the
   affected gates and update the release wrap before cutting the tag.
-- Every release rebuilds the public demo from the release source. Pull requests
-  do not, so the checked-in demo is normally older than `main`. Follow
+- Every stable release rebuilds the public demo from the release source. Pull
+  requests do not, so the checked-in demo is normally older than `main`. Follow
   "Public demo rebuild" below before tagging. The pre-tag and final validators
   and the GHCR release workflow run
   `python scripts/validate_release_wrap.py <version> --public-demo-only` and
   refuse the release until the demo, screenshots, and pixel review match the
   release source and version.
+- A prerelease (`vX.Y.Z-beta.N`, `-rc.N`) follows this whole checklist except
+  the public demo rebuild and its screenshots, which wait for the next stable
+  release. See "Prereleases" below.
 
 ## Required Release Wrap Evidence
 
@@ -107,9 +110,10 @@ python scripts/validate_release_wrap.py "$version" \
 2. Confirm scope, release branch, version, and whether the release is a normal
    feature release, patch, hotfix, docs-only correction, or process correction.
 3. Draft or update the release notes and release wrap before tagging. Bump
-   `app/__init__.py` to the release version, then do the "Public demo rebuild"
-   below from that commit. `validate_release_wrap.py <version>
-   --public-demo-only` must pass before the next step.
+   `app/__init__.py` to the release version. For a stable release, do the
+   "Public demo rebuild" below from that commit; a prerelease skips it (see
+   "Prereleases"). `validate_release_wrap.py <version> --public-demo-only`
+   must pass before the next step.
 4. Run local unit, syntax, hygiene, Docker health, optional-sidecar, browser,
    feature-specific, public-demo, perf, docs/wiki source-diff, and privacy gates.
 5. Run the Linux QA Docker restore gate and restored-stack perf/browser gates.
@@ -404,8 +408,9 @@ python scripts/validate_release_wrap.py "$version" \
 
 ## Public demo rebuild
 
-Required for every release. Ordinary pull requests leave the demo alone, so
-this is the only place it catches up with the source.
+Required for every stable release; a prerelease skips it. Ordinary pull
+requests leave the demo alone, so this is the only place it catches up with
+the source.
 
 1. On the release branch, after the version bump and the last source change,
    commit, then build from that exact commit:
@@ -660,7 +665,8 @@ owner-approved `workflow_dispatch`.
 - confirm GHCR has the expected release tags:
   - `ghcr.io/gcs8/truenas-jbod-ui:vX.Y.Z`
   - `ghcr.io/gcs8/truenas-jbod-ui:X.Y.Z`
-  - `ghcr.io/gcs8/truenas-jbod-ui:latest`
+  - `ghcr.io/gcs8/truenas-jbod-ui:latest` for a stable release, or `:dev` for a
+    prerelease
 - after the new image is available, update the real long-running deployments
   cleanly and record a final sniff test for each one:
   - local Windows Docker stack
@@ -670,6 +676,24 @@ owner-approved `workflow_dispatch`.
     smoke path on each instance
 - use `gh` or the GitHub UI for GitHub-side actions such as PRs, issues, and
   release-page preparation
+
+## Prereleases
+
+A version with a SemVer prerelease suffix, such as `v0.24.0-beta.1`, is a
+prerelease. Anything that is not a full release ships this way.
+
+- Publish the GitHub release with **Set as a pre-release** checked. The
+  `Publish GHCR Image` workflow refuses a release whose tag suffix and
+  prerelease flag disagree.
+- GHCR receives `vX.Y.Z-beta.N`, `X.Y.Z-beta.N` and `dev`. It never moves
+  `latest`, which stays on the newest stable release.
+- Skip "Public demo rebuild" and "Screenshots". The docs, wiki and privacy
+  checks in the `Docs/wiki/public-demo gate` row still need `Pass`; its
+  evidence says `public demo deferred: prerelease`.
+  `validate_release_wrap.py` does not require a current demo for a prerelease.
+- Every other gate in this checklist still applies.
+- The in-app update check reads GitHub's latest stable release, so a beta
+  never prompts a stable install to upgrade.
 
 ## After Release
 
