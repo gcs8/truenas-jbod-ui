@@ -513,7 +513,7 @@ test("a purge that finds admin stopped leaves Purge disabled", async () => {
         throw new TypeError("Failed to fetch");
       },
     },
-    SESSION_CONSTANTS
+    [...SESSION_CONSTANTS, "HISTORY_MAINTENANCE_TIMEOUT_MS"]
   );
 
   await functions.purgeOrphanedHistory();

@@ -124,6 +124,12 @@ or the credentials are wrong. Sign in again on that page. A cross-origin error
 means `APP_PUBLIC_ORIGIN` does not exactly match the scheme, host, and port in
 the browser address bar.
 
+`... only accepts changes from an IP address, localhost or a name listed in
+ADMIN_ALLOWED_HOSTS` means the page was opened by a DNS name that is not
+listed and no public origin is set. Add the name to `ADMIN_ALLOWED_HOSTS` in
+`.env` (names only, comma-separated), or open the page by IP, then recreate the
+containers. The same message and fix apply to the admin service.
+
 ## Admin mutations return 403
 
 `This page was opened at ..., but the admin service only accepts changes from
