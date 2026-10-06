@@ -260,6 +260,64 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         ):
             self.module.reconcile_counts(expected, observed)
 
+    def test_live_reconciliation_lets_history_grow_but_never_shrink(self) -> None:
+        live = self.module.LIVE_GROWABLE_COUNTS
+        expected = {"systems": 2, "history": {"tracked_slots": 7, "event_count": 8, "metric_sample_count": 9}}
+        grown = {"systems": 2, "history": {"tracked_slots": 8, "event_count": 27, "metric_sample_count": 9}}
+        self.module.reconcile_counts(expected, grown, growable=live)
+        self.assertEqual(
+            self.module.history_growth(expected, grown),
+            {"event_count": 19, "metric_sample_count": 0, "tracked_slots": 1},
+        )
+        # Offline runs stay exact.
+        with self.assertRaisesRegex(self.module.QaRestoreError, "history.event_count: expected 8, observed 27"):
+            self.module.reconcile_counts(expected, grown)
+        for observed, message in (
+            ({**grown, "history": {**grown["history"], "event_count": 7}},
+             "history.event_count: expected at least 8, observed 7"),
+            ({**grown, "history": {**grown["history"], "event_count": True}},
+             "history.event_count: expected at least 8, observed True"),
+            ({**grown, "systems": 3}, "systems: expected 2, observed 3"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(self.module.QaRestoreError, message):
+                self.module.reconcile_counts(expected, observed, growable=live)
+
+    def test_history_growth_breakdown_shows_status_transitions_and_names_identity_fields(self) -> None:
+        import sqlite3
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime = Path(raw_root)
+            (runtime / "history").mkdir()
+            database = sqlite3.connect(runtime / "history" / "history.db")
+            database.execute("CREATE TABLE slot_events (id INTEGER PRIMARY KEY, system_id TEXT, event_type TEXT, details_json TEXT)")
+            rows = [
+                ("restored", "slot_state_changed", {"health": {"previous": "OK", "current": "FAULT"}}),
+                ("alpha", "slot_identity_changed", {"serial": {"previous": "SER-OLD-1", "current": "SER-NEW-1"}}),
+                ("alpha", "slot_state_changed", {"health": {"previous": None, "current": "ONLINE"}}),
+                ("alpha", "slot_state_changed", {"health": {"previous": None, "current": "ONLINE"}}),
+            ]
+            database.executemany(
+                "INSERT INTO slot_events (system_id, event_type, details_json) VALUES (?, ?, ?)",
+                [(system, kind, json.dumps(details)) for system, kind, details in rows],
+            )
+            database.commit()
+            database.close()
+
+            def unprivileged(command):
+                self.assertEqual(list(command[:4]), ["sudo", "-n", "--", "python3"])
+                return subprocess.run([sys.executable, *command[4:]], capture_output=True, text=True, check=True).stdout
+
+            with patch.object(self.module, "_app_owned_reader", side_effect=unprivileged):
+                self.assertEqual(self.module._history_growth_breakdown(runtime, 0), [])
+                breakdown = self.module._history_growth_breakdown(runtime, 3)
+
+        self.assertEqual(breakdown, [
+            {"system_id": "alpha", "event_type": "slot_state_changed", "changes": ["health: None -> ONLINE"], "count": 2},
+            {"system_id": "alpha", "event_type": "slot_identity_changed", "changes": ["serial"], "count": 1},
+        ])
+        self.assertNotIn("SER-", json.dumps(breakdown))
+
     def test_import_summary_requires_exact_groups_and_history_activation(self) -> None:
         expected_groups = sorted(self.module.REQUIRED_FULL_GROUPS)
         payload = {
@@ -1385,7 +1443,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         import shutil
         from types import SimpleNamespace
 
-        for mode in ("stopped", "keep-running", "down-failed", "readback-unknown"):
+        for mode in ("stopped", "live", "keep-running", "down-failed", "readback-unknown"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 backup, key = root / "backup", root / "key"
@@ -1393,7 +1451,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     path.write_text("synthetic")
                     path.chmod(0o600)
                 args = SimpleNamespace(
-                    approval=self.module.APPROVAL, live_read_only=False, skip_browser_and_performance=False,
+                    approval=self.module.APPROVAL, live_read_only=mode == "live",
+                    live_approval=self.module.LIVE_APPROVAL, skip_browser_and_performance=False,
                     target_handle="run-" + "a" * 32, source_commit="b" * 40, image="sha256:" + "c" * 64,
                     backup=backup, passphrase_file=key, app_port=28080, history_port=28081, admin_port=28082,
                     scratch_root=root, runtime_root=root / "runtime", evidence_dir=root / "evidence",
@@ -1403,7 +1462,9 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 inspection = {"schema_version": 1, "app_version": "synthetic", "encrypted": True,
                               "encryption_mode": "encrypted", "inspection_receipt": "synthetic-receipt",
                               "packaging": "7z", "selected_groups": [], "present_groups": [], "absent_groups": [],
-                              "member_count": 0, "total_uncompressed_bytes": 0, "aggregate_counts": {}}
+                              "member_count": 0, "total_uncompressed_bytes": 0,
+                              "aggregate_counts": {"history": {"event_count": 3}}}
+                breakdown = [{"system_id": "alpha", "event_type": "slot_state_changed", "changes": ["health"], "count": 2}]
                 events = []
                 def run(command, **kwargs):
                     if "down" in command:
@@ -1416,13 +1477,15 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                                 stdout="truenas-jbod-ui running" if "container" in command and mode in {"keep-running", "down-failed"} else "")
                 write = self.module.write_private_json
                 def receipt_writer(path, receipt):
-                    events.append("receipt")
+                    events.append("receipt" if path.name == "sanitized-receipt.json" else path.name)
                     write(path, receipt)
                 with contextlib.ExitStack() as stack:
                     for name in ("_validate_exact_source", "_validate_exact_image", "_validate_runtime_preflight",
                                  "_validate_container_names_available", "_capture_compose_logs", "_wait_json",
-                                 "_wait_history_idle", "reconcile_counts", "post_archive"):
+                                 "_wait_history_idle", "post_archive"):
                         stack.enter_context(patch.object(self.module, name))
+                    reconcile = stack.enter_context(patch.object(self.module, "reconcile_counts"))
+                    stack.enter_context(patch.object(self.module, "_history_growth_breakdown", return_value=breakdown))
                     stack.enter_context(patch.object(self.module, "parse_args", return_value=args))
                     stack.enter_context(patch.object(self.module, "_run", side_effect=run))
                     stack.enter_context(patch.object(self.module.subprocess, "run", side_effect=transport))
@@ -1430,7 +1493,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     stack.enter_context(patch.object(self.module, "_LoopbackProxySet", return_value=Mock()))
                     stack.enter_context(patch.object(self.module, "validate_inspection_payload", return_value=inspection))
                     stack.enter_context(patch.object(self.module, "_safe_import_summary", return_value={}))
-                    stack.enter_context(patch.object(self.module, "_observed_counts", return_value=({}, "synthetic-system")))
+                    stack.enter_context(patch.object(self.module, "_observed_counts", return_value=(
+                        {"history": {"event_count": 5}}, "synthetic-system")))
                     stack.enter_context(patch.object(self.module, "_exercise_pencil_writes", return_value={"sas_fabric_label": True}))
                     stack.enter_context(patch.object(self.module, "_run_browser_and_perf", return_value={"offline_browser": True}))
                     stack.enter_context(patch.object(self.module, "_remove_runtime_root", side_effect=shutil.rmtree))
@@ -1444,12 +1508,23 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     else:
                         self.assertEqual(self.module.main(), 0)
                 receipt = json.loads((args.evidence_dir / "sanitized-receipt.json").read_text())
-                self.assertEqual(receipt["status"], "PASS" if mode in {"stopped", "keep-running"} else "FAIL")
-                self.assertEqual(receipt["stack_state"], "verified-stopped" if mode == "stopped" else "unknown" if mode == "readback-unknown" else "running")
+                stopped = mode in {"stopped", "live"}
+                self.assertEqual(receipt["status"], "PASS" if stopped or mode == "keep-running" else "FAIL")
+                self.assertEqual(receipt["stack_state"], "verified-stopped" if stopped else "unknown" if mode == "readback-unknown" else "running")
                 self.assertEqual(events[-1], "receipt")
                 self.assertLess(events.index("readback"), events.index("receipt"))
                 self.assertEqual("down" in events, mode != "keep-running")
-                self.assertEqual(args.runtime_root.exists(), mode != "stopped")
+                self.assertEqual(args.runtime_root.exists(), not stopped)
+                # Live runs let history grow; the growth is recorded either way.
+                growable = self.module.LIVE_GROWABLE_COUNTS if mode == "live" else frozenset()
+                self.assertEqual([call.kwargs["growable"] for call in reconcile.call_args_list], [growable] * 3)
+                self.assertLess(events.index("history-growth.json"), events.index("receipt"))
+                self.assertEqual(
+                    json.loads((args.evidence_dir / "raw-private" / "history-growth.json").read_text()),
+                    {"growth": {"event_count": 2}, "newest_events": breakdown},
+                )
+                if receipt["status"] == "PASS":
+                    self.assertEqual(receipt["history_growth"], {"event_count": 2})
 
     def test_mandatory_gates_and_opaque_target_handle_fail_closed(self) -> None:
         self.assertEqual(

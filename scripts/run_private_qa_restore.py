@@ -78,6 +78,22 @@ HISTORY_COUNT_FIELDS = {
     "metric_sample_count",
     "metric_rollup_count",
 }
+# Live read-only QA restores a collector that polls the real appliances, so it
+# may record new history before or between the count checks. History may grow
+# there and never shrink; everything else stays exact, and offline runs stay
+# exact throughout.
+LIVE_GROWABLE_COUNTS = frozenset(f"history.{key}" for key in HISTORY_COUNT_FIELDS)
+# Event fields whose values are status words, never identities, so the growth
+# breakdown may show them. Every other changed field is named, not shown.
+HISTORY_GROWTH_STATUS_FIELDS = (
+    "present",
+    "state",
+    "identify_active",
+    "health",
+    "multipath_state",
+    "multipath_mode",
+)
+HISTORY_DB_PATH = "/app/history/history.db"
 REQUIRED_FULL_GROUPS = {
     "config_file",
     "runtime_overrides_file",
@@ -245,6 +261,7 @@ def reconcile_counts(
     observed: dict[str, Any],
     *,
     prefix: str = "",
+    growable: frozenset[str] = frozenset(),
 ) -> None:
     mismatches: list[str] = []
     for key, expected_value in expected.items():
@@ -262,12 +279,15 @@ def reconcile_counts(
                 )
                 continue
             try:
-                reconcile_counts(expected_value, observed_value, prefix=field)
+                reconcile_counts(expected_value, observed_value, prefix=field, growable=growable)
             except QaRestoreError as exc:
                 mismatches.append(str(exc))
+        elif field in growable and type(observed_value) is int and observed_value >= expected_value:
+            continue
         elif observed_value != expected_value:
+            bound = "at least " if field in growable else ""
             mismatches.append(
-                f"{field}: expected {expected_value}, observed {observed_value}"
+                f"{field}: expected {bound}{expected_value}, observed {observed_value}"
             )
     if mismatches:
         raise QaRestoreError("; ".join(mismatches))
@@ -1087,6 +1107,61 @@ def _validated_history_counts(payload: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def history_growth(expected: dict[str, Any], observed: dict[str, Any]) -> dict[str, int]:
+    before, after = expected.get("history") or {}, observed.get("history") or {}
+    return {
+        key: after[key] - before[key]
+        for key in sorted(HISTORY_COUNT_FIELDS)
+        if type(before.get(key)) is int and type(after.get(key)) is int
+    }
+
+
+def _history_growth_breakdown(runtime_root: Path, new_events: int) -> list[dict[str, Any]]:
+    """Group the newest restored events by system, type and changed fields.
+
+    Status fields show their transition; identity fields are only named, so the
+    private breakdown can tell real changes from upgrade churn without serials.
+    """
+    if new_events <= 0:
+        return []
+    code = (
+        "import collections,json,sqlite3,sys,urllib.parse;"
+        "path,limit,status=sys.argv[1],int(sys.argv[2]),set(json.loads(sys.argv[3]));"
+        "db=sqlite3.connect('file:'+urllib.parse.quote(path)+'?mode=ro',uri=True);"
+        "groups=collections.Counter()"
+        "\nfor system_id,event_type,details in db.execute("
+        "'SELECT system_id,event_type,details_json FROM slot_events ORDER BY id DESC LIMIT ?',(limit,)):"
+        "\n try: changes=json.loads(details)"
+        "\n except ValueError: changes={}"
+        "\n changes=changes if isinstance(changes,dict) else {}"
+        "\n groups[(system_id,event_type,tuple(sorted("
+        "f\"{name}: {str(change.get('previous'))[:40]} -> {str(change.get('current'))[:40]}\""
+        " if name in status and isinstance(change,dict) else name for name,change in changes.items())))]+=1"
+        "\nprint(json.dumps([{'system_id':s,'event_type':t,'changes':list(c),'count':n}"
+        " for (s,t,c),n in groups.most_common()]))"
+    )
+    output = _app_owned_reader(
+        [
+            "sudo",
+            "-n",
+            "--",
+            "python3",
+            "-c",
+            code,
+            str(_qa_host_path(runtime_root, HISTORY_DB_PATH)),
+            str(new_events),
+            json.dumps(HISTORY_GROWTH_STATUS_FIELDS),
+        ]
+    )
+    try:
+        breakdown = json.loads(output)
+    except ValueError as exc:
+        raise QaRestoreError("history growth breakdown was invalid") from exc
+    if not isinstance(breakdown, list):
+        raise QaRestoreError("history growth breakdown was invalid")
+    return breakdown
+
+
 def _qa_host_path(runtime_root: Path, configured_path: object) -> Path:
     if not isinstance(configured_path, str):
         raise QaRestoreError("restored state path must be a string")
@@ -1758,10 +1833,11 @@ def main() -> int:
         _wait_history_idle(ports[1], username, password)
 
         phase = "aggregate-reconcile"
+        growable = LIVE_GROWABLE_COUNTS if args.live_read_only else frozenset()
         observed, system_id = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed)
+        reconcile_counts(inspection["aggregate_counts"], observed, growable=growable)
 
         phase = "pencil-writes"
         pencil_results = _exercise_pencil_writes(
@@ -1775,7 +1851,7 @@ def main() -> int:
         observed_after_writes, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_writes)
+        reconcile_counts(inspection["aggregate_counts"], observed_after_writes, growable=growable)
 
         phase = "restart-survival"
         if RESTART_COMMAND_LABEL != "docker compose restart":
@@ -1817,7 +1893,18 @@ def main() -> int:
         observed_after_restart, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_restart)
+        reconcile_counts(inspection["aggregate_counts"], observed_after_restart, growable=growable)
+        # Written before the browser phase so a later failure still keeps it.
+        growth = history_growth(inspection["aggregate_counts"], observed_after_restart)
+        write_private_json(
+            raw_dir / "history-growth.json",
+            {
+                "growth": growth,
+                "newest_events": _history_growth_breakdown(
+                    args.runtime_root, growth.get("event_count", 0)
+                ),
+            },
+        )
 
         qa_results: dict[str, bool] = {}
         if not args.skip_browser_and_performance:
@@ -1861,6 +1948,7 @@ def main() -> int:
             },
             "import_summary": import_summary,
             "aggregate_counts_match": True,
+            "history_growth": growth,
             "pencil_cycles": {
                 **pencil_results,
                 "cleanup_verified": True,
