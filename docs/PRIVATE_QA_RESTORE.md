@@ -187,8 +187,11 @@ appliance.
 
 In live read-only mode the restored history collector polls the real
 appliances, so it can record new events, samples and slots before or between
-the three count checks. Those `history` counts may grow but never shrink. Every
-other count stays exact, and egress-blocked runs stay exact for every count.
+the three count checks. Those `history` counts may grow but never shrink: each
+check must reach at least the archive count and the previous check's count, so
+a restart that loses history fails even while the count stays above the
+archive's. Every other count stays exact, and egress-blocked runs stay exact
+for every count.
 After the restart check the controller writes `raw-private/history-growth.json`.
 It holds the growth per history count and the newest events grouped by system,
 event type and changed fields. Status fields such as health show their

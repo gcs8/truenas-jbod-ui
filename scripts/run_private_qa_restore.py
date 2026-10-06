@@ -1107,6 +1107,24 @@ def _validated_history_counts(payload: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def reconcile_checkpoint(
+    baseline: dict[str, Any],
+    observed: dict[str, Any],
+    previous: dict[str, Any] | None,
+    *,
+    growable: frozenset[str],
+) -> None:
+    """Compare a checkpoint with the archive and its history with the last checkpoint.
+
+    Growth may continue between checks, but no check may lose history that an
+    earlier check saw, even while it stays above the archive count. Exact
+    (offline) checks already pin every checkpoint to the archive.
+    """
+    reconcile_counts(baseline, observed, growable=growable)
+    if previous is not None and growable:
+        reconcile_counts({"history": previous.get("history")}, observed, growable=growable)
+
+
 def history_growth(expected: dict[str, Any], observed: dict[str, Any]) -> dict[str, int]:
     before, after = expected.get("history") or {}, observed.get("history") or {}
     return {
@@ -1834,10 +1852,11 @@ def main() -> int:
 
         phase = "aggregate-reconcile"
         growable = LIVE_GROWABLE_COUNTS if args.live_read_only else frozenset()
+        baseline = inspection["aggregate_counts"]
         observed, system_id = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed, growable=growable)
+        reconcile_checkpoint(baseline, observed, None, growable=growable)
 
         phase = "pencil-writes"
         pencil_results = _exercise_pencil_writes(
@@ -1851,7 +1870,7 @@ def main() -> int:
         observed_after_writes, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_writes, growable=growable)
+        reconcile_checkpoint(baseline, observed_after_writes, observed, growable=growable)
 
         phase = "restart-survival"
         if RESTART_COMMAND_LABEL != "docker compose restart":
@@ -1893,9 +1912,9 @@ def main() -> int:
         observed_after_restart, _ = _observed_counts(
             args.runtime_root, ports, username, password
         )
-        reconcile_counts(inspection["aggregate_counts"], observed_after_restart, growable=growable)
+        reconcile_checkpoint(baseline, observed_after_restart, observed_after_writes, growable=growable)
         # Written before the browser phase so a later failure still keeps it.
-        growth = history_growth(inspection["aggregate_counts"], observed_after_restart)
+        growth = history_growth(baseline, observed_after_restart)
         write_private_json(
             raw_dir / "history-growth.json",
             {

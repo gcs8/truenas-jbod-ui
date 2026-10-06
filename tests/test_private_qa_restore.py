@@ -282,6 +282,26 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(self.module.QaRestoreError, message):
                 self.module.reconcile_counts(expected, observed, growable=live)
 
+    def test_live_checkpoints_fail_when_history_shrinks_between_checks(self) -> None:
+        live = self.module.LIVE_GROWABLE_COUNTS
+        archive = {"systems": 2, "history": {"event_count": 100, "tracked_slots": 7}}
+        startup = {"systems": 2, "history": {"event_count": 119, "tracked_slots": 7}}
+        grown = {"systems": 2, "history": {"event_count": 125, "tracked_slots": 8}}
+        lost = {"systems": 2, "history": {"event_count": 109, "tracked_slots": 7}}
+        self.module.reconcile_checkpoint(archive, startup, None, growable=live)
+        self.module.reconcile_checkpoint(archive, grown, startup, growable=live)
+        # 109 is still above the archive's 100, but restart lost 10 events.
+        self.module.reconcile_counts(archive, lost, growable=live)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "history.event_count: expected at least 119, observed 109"):
+            self.module.reconcile_checkpoint(archive, lost, startup, growable=live)
+        with self.assertRaisesRegex(self.module.QaRestoreError, "history.tracked_slots: expected at least 8, observed 7"):
+            self.module.reconcile_checkpoint(archive, {**grown, "history": {**grown["history"], "tracked_slots": 7}},
+                                             grown, growable=live)
+        # Offline checkpoints stay exact against the archive and each other.
+        self.module.reconcile_checkpoint(archive, archive, archive, growable=frozenset())
+        with self.assertRaisesRegex(self.module.QaRestoreError, "history.event_count: expected 100, observed 119"):
+            self.module.reconcile_checkpoint(archive, startup, archive, growable=frozenset())
+
     def test_history_growth_breakdown_shows_status_transitions_and_names_identity_fields(self) -> None:
         import sqlite3
         import subprocess
@@ -1484,7 +1504,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                                  "_validate_container_names_available", "_capture_compose_logs", "_wait_json",
                                  "_wait_history_idle", "post_archive"):
                         stack.enter_context(patch.object(self.module, name))
-                    reconcile = stack.enter_context(patch.object(self.module, "reconcile_counts"))
+                    reconcile = stack.enter_context(patch.object(self.module, "reconcile_checkpoint"))
                     stack.enter_context(patch.object(self.module, "_history_growth_breakdown", return_value=breakdown))
                     stack.enter_context(patch.object(self.module, "parse_args", return_value=args))
                     stack.enter_context(patch.object(self.module, "_run", side_effect=run))
@@ -1518,6 +1538,11 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 # Live runs let history grow; the growth is recorded either way.
                 growable = self.module.LIVE_GROWABLE_COUNTS if mode == "live" else frozenset()
                 self.assertEqual([call.kwargs["growable"] for call in reconcile.call_args_list], [growable] * 3)
+                # Each check after the first is chained to the one before it.
+                checkpoints = [call.args for call in reconcile.call_args_list]
+                self.assertEqual([args[2] is None for args in checkpoints], [True, False, False])
+                self.assertIs(checkpoints[1][2], checkpoints[0][1])
+                self.assertIs(checkpoints[2][2], checkpoints[1][1])
                 self.assertLess(events.index("history-growth.json"), events.index("receipt"))
                 self.assertEqual(
                     json.loads((args.evidence_dir / "raw-private" / "history-growth.json").read_text()),
