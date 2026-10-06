@@ -37,6 +37,8 @@ from app.http_auth import (
     configured_origin_identity,
     origin_identity,
     request_origin_allowed,
+    request_host_allows_writes,
+    unlisted_host_rejection_detail,
 )
 from app.metrics import observe_backup_operation
 from app.request_context import REQUEST_ID_HEADER, current_request_id, generate_request_id
@@ -238,8 +240,15 @@ def _accepted_origin(request: Request, settings: AdminSettings) -> str:
     return (settings.public_origin or f"{request.url.scheme}://{request.url.netloc}").rstrip("/")
 
 
+def _unlisted_host(request: Request, settings: AdminSettings) -> bool:
+    # #779: the Host-derived origin is only trusted for IPs, localhost and listed names.
+    return not settings.public_origin and not request_host_allows_writes(request, settings.allowed_host_names)
+
+
 def _request_origin_allowed(request: Request, settings: AdminSettings) -> bool:
-    return request_origin_allowed(request, _accepted_origin(request, settings))
+    return not _unlisted_host(request, settings) and request_origin_allowed(
+        request, _accepted_origin(request, settings)
+    )
 
 
 def _describe_request_origin(request: Request) -> str:
@@ -252,6 +261,13 @@ def _describe_request_origin(request: Request) -> str:
 
 
 def cross_origin_rejection_detail(request: Request, settings: AdminSettings) -> str:
+    if _unlisted_host(request, settings):
+        return unlisted_host_rejection_detail(
+            request,
+            service="The admin service",
+            origin_setting="ADMIN_PUBLIC_ORIGIN",
+            container="admin",
+        )
     opened_at = _describe_request_origin(request)
     accepted = _accepted_origin(request, settings)
     return (

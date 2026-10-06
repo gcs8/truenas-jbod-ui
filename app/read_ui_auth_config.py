@@ -4,10 +4,10 @@ import json
 import os
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator, model_validator
 
 from app.config_errors import ConfigurationError, describe_validation_error
-
+from app.http_auth import parse_allowed_hosts
 from app.secret_files import load_secret_environment_value
 
 
@@ -20,6 +20,17 @@ class ReadUiAuthSettings(BaseModel):
     auth_mode: Literal["network", "basic"] = "network"
     auth_username: str | None = None
     auth_password: SecretStr | None = None
+    # Host names that may make changes when no public origin is set (#779).
+    allowed_hosts: str = ""
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _normalize_allowed_hosts(cls, value: str) -> str:
+        return ",".join(sorted(parse_allowed_hosts(value)))
+
+    @property
+    def allowed_host_names(self) -> frozenset[str]:
+        return frozenset(name for name in self.allowed_hosts.split(",") if name)
 
     @model_validator(mode="after")
     def validate_authentication(self) -> "ReadUiAuthSettings":
@@ -40,7 +51,9 @@ AUTH_ENV_OVERRIDES = {
     "ADMIN_AUTH_MODE": "auth_mode",
     "ADMIN_AUTH_USERNAME": "auth_username",
     "ADMIN_AUTH_PASSWORD": "auth_password",
+    "ADMIN_ALLOWED_HOSTS": "allowed_hosts",
 }
+TEXT_AUTH_FIELDS = frozenset({"auth_username", "auth_password", "allowed_hosts"})
 
 
 def _parse_scalar(value: str):
@@ -71,7 +84,7 @@ def load_read_ui_auth_settings() -> ReadUiAuthSettings:
         if raw_value is not None:
             payload[field_name] = (
                 raw_value
-                if field_name in {"auth_username", "auth_password"}
+                if field_name in TEXT_AUTH_FIELDS
                 else _parse_scalar(raw_value)
             )
     field_to_env = {field_name: env_name for env_name, field_name in AUTH_ENV_OVERRIDES.items()}

@@ -2,7 +2,7 @@
   "schema": 1,
   "modules": {
     "test_account_bootstrap": 28,
-    "test_admin_auth": 24,
+    "test_admin_auth": 28,
     "test_admin_command_state": 5,
     "test_admin_config": 6,
     "test_admin_error_correlation": 10,
@@ -78,7 +78,7 @@
     "test_public_docs_contract": 32,
     "test_public_screenshots": 10,
     "test_quantastor_api": 22,
-    "test_read_ui_auth": 15,
+    "test_read_ui_auth": 16,
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
     "test_release_wrap_validator": 27,
