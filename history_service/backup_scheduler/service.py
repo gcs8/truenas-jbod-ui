@@ -87,6 +87,9 @@ HISTORY_REPLACEMENT_COPIES = 14
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
+# Trust-on-first-use SFTP targets pin new host keys here, in the scheduler's
+# private state, never in a file a target names (#816).
+SFTP_PIN_FILE_NAME = "sftp_known_hosts"
 
 
 class SchedulerBusyError(RuntimeError):
@@ -1062,7 +1065,11 @@ class BackupScheduler:
             )
             validate_filesystem_target_roots(peers, self.paths.local_dir, allow_unavailable=True)
         opened = (
-            self._open_target(target.settings, local_archive_root=self.paths.local_dir)
+            self._open_target(
+                target.settings,
+                local_archive_root=self.paths.local_dir,
+                sftp_pin_file=self.paths.state_dir / SFTP_PIN_FILE_NAME,
+            )
             if self._open_target_is_default
             else self._open_target(target.settings)
         )

@@ -68,6 +68,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- An SFTP backup target with `trust_on_first_use` now pins a new host key in
+  the scheduler's own state folder and only reads its `known_hosts_path`, so a
+  target can no longer make the scheduler write to a file it names. (#895)
 - Without a public origin, the main UI and admin now accept changes only when
   the browser address is an IP address, `localhost` or a name in the new
   `ADMIN_ALLOWED_HOSTS`, so a DNS-rebinding page can no longer make changes.
