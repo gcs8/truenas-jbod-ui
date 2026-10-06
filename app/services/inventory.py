@@ -1770,42 +1770,78 @@ class InventoryService:
             }
         )
 
-    def _sas_fabric_alias_mutation_context(
-        self, object_id: str, object_kind: str | None,
-    ) -> tuple[list[str], dict[str, set[str]]]:
-        # This synchronous mutation must not fetch live topology or guess the
-        # components of a digest. Rebuild from the already observed snapshots
-        # and source bundle, including other cached views to detect collisions.
-        from app.services.sas_fabric import sas_fabric_legacy_alias_targets
-
-        compatible = set(storage_node_legacy_alias_ids(object_id, object_kind))
+    def _sas_fabric_alias_observation(self) -> tuple[Any, list[InventorySnapshot], set[str]]:
+        # An alias mutation must not fetch live topology or guess the components
+        # of a digest. It checks against the already observed snapshots and
+        # source bundle, including other cached views to detect collisions.
         bundle = getattr(self, "_source_bundle", None)
         snapshots = [
             snapshot for key, snapshot in getattr(self, "_cache", {}).items()
             if key not in getattr(self, "_snapshot_invalidated", set())
             and self._snapshot_has_trusted_topology(snapshot)
         ]
-        nodes = []
-        if bundle is not None:
-            for snapshot in snapshots:
-                fabric = build_sas_fabric_snapshot(
-                    system=self.system, snapshot=snapshot, ssh_outputs=bundle.ssh_outputs,
-                    sources=bundle.sources, warnings=bundle.warnings,
-                    command_failures=bundle.ssh_failure_details,
-                )
-                nodes.extend(fabric.nodes)
+        known_enclosures = {option.id for snapshot in snapshots for option in snapshot.enclosures}
+        known_enclosures.update(getattr(self, "_canonical_enclosure_options", None) or {})
+        return bundle, snapshots, known_enclosures
+
+    def _observed_sas_fabric_nodes(self, bundle: Any, snapshots: list[InventorySnapshot]) -> list[Any]:
+        # Reads only its arguments, so the alias route runs it off the event loop (#813).
+        if bundle is None:
+            return []
+        return [
+            node
+            for snapshot in snapshots
+            for node in build_sas_fabric_snapshot(
+                system=self.system, snapshot=snapshot, ssh_outputs=bundle.ssh_outputs,
+                sources=bundle.sources, warnings=bundle.warnings,
+                command_failures=bundle.ssh_failure_details,
+            ).nodes
+        ]
+
+    def _sas_fabric_alias_mutation_context(
+        self, object_id: str, object_kind: str | None, observed: tuple[Any, ...] | None = None,
+    ) -> tuple[list[str], dict[str, set[str]]]:
+        from app.services.sas_fabric import sas_fabric_legacy_alias_targets
+
+        if observed is None:
+            bundle, snapshots, known_enclosures = self._sas_fabric_alias_observation()
+            nodes = self._observed_sas_fabric_nodes(bundle, snapshots)
+        else:
+            snapshots, known_enclosures, nodes = observed
+        compatible = set(storage_node_legacy_alias_ids(object_id, object_kind))
         targets = sas_fabric_legacy_alias_targets(nodes)
         compatible.update(key for key, owners in targets.items() if object_id in owners)
         if ":storage-v2:" in object_id and not any(node.id == object_id for node in nodes):
             raise ValueError("Storage Fabric alias topology is unavailable; refresh the view before renaming.")
         # A partial set of known enclosures cannot establish system-wide unique
         # legacy ownership. Preserve the compatibility IDs but withhold proof.
-        known_enclosures = {option.id for snapshot in snapshots for option in snapshot.enclosures}
-        known_enclosures.update(getattr(self, "_canonical_enclosure_options", None) or {})
         observed_enclosures = {snapshot.selected_enclosure_id for snapshot in snapshots}
         if not known_enclosures.issubset(observed_enclosures):
             targets = {}
         return sorted(compatible), targets
+
+    async def save_sas_fabric_alias_async(self, **request: Any) -> dict[str, Any]:
+        """``save_sas_fabric_alias`` with its topology rebuild in a worker thread (#813).
+
+        A refresh can replace the cache while the worker runs, so the save uses
+        a rebuild only when its observation is still current, with no await
+        between that check and the store write.
+        """
+
+        if self.sas_fabric_alias_store is None:
+            return self.save_sas_fabric_alias(**request)
+        for _attempt in range(3):
+            bundle, snapshots, known_enclosures = self._sas_fabric_alias_observation()
+            nodes = await asyncio.to_thread(self._observed_sas_fabric_nodes, bundle, snapshots)
+            now_bundle, now_snapshots, now_known = self._sas_fabric_alias_observation()
+            if (
+                now_bundle is bundle
+                and now_known == known_enclosures
+                and len(now_snapshots) == len(snapshots)
+                and all(now is then for now, then in zip(now_snapshots, snapshots))
+            ):
+                return self.save_sas_fabric_alias(**request, _observed=(snapshots, known_enclosures, nodes))
+        raise ValueError("Storage Fabric topology kept changing during the rename; try again.")
 
     def save_sas_fabric_alias(
         self,
@@ -1815,6 +1851,7 @@ class InventoryService:
         object_kind: str | None = None,
         selected_enclosure_id: str | None = None,
         scope: str = "auto",
+        _observed: tuple[Any, ...] | None = None,
     ) -> dict[str, Any]:
         if self.sas_fabric_alias_store is None:
             return {"ok": False, "cleared": False, "alias": None}
@@ -1839,7 +1876,9 @@ class InventoryService:
                 else None
             )
 
-        compatible_object_ids, legacy_owners = self._sas_fabric_alias_mutation_context(object_text, kind_name)
+        compatible_object_ids, legacy_owners = self._sas_fabric_alias_mutation_context(
+            object_text, kind_name, _observed,
+        )
         if not label_text:
             cleared = self.sas_fabric_alias_store.clear_alias(
                 self.system.id,

@@ -274,6 +274,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Rebuilt cached Storage Fabric topology for an alias save in a worker thread,
+  so renaming a fabric object no longer stalls every other UI request. (#894)
 - Described FTP upload checks as size only: the target test and a copy's
   details no longer claim the content was read back, until an explicit Verify
   downloads the copy and matches its size and SHA-256. (#890)
