@@ -277,11 +277,22 @@ def changelog_coverage_required(version: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= CHANGELOG_COVERAGE_REQUIRED_FROM
 
 
+def is_prerelease(version: str) -> bool:
+    """``X.Y.Z-beta.1`` is a prerelease; ``+build`` metadata alone is not."""
+
+    version = version.removeprefix("v")
+    if VERSION_RE.fullmatch(version) is None:
+        raise ValueError("version must use semantic version form X.Y.Z")
+    return "-" in version.split("+", 1)[0]
+
+
 def public_demo_freshness_required(version: str) -> bool:
+    """Stable releases rebuild the demo; a prerelease waits for the next stable one."""
+
     match = VERSION_RE.fullmatch(version.removeprefix("v"))
     if match is None:
         raise ValueError("version must use semantic version form X.Y.Z")
-    return tuple(int(part) for part in match.groups()) >= PUBLIC_DEMO_FRESHNESS_REQUIRED_FROM
+    return not is_prerelease(version) and tuple(map(int, match.groups())) >= PUBLIC_DEMO_FRESHNESS_REQUIRED_FROM
 
 
 def public_demo_release_issues(repository: Path, version: str) -> list[ValidationIssue]:
@@ -369,6 +380,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     version = args.version.removeprefix("v")
     if args.public_demo_only:
         try:
+            if is_prerelease(version):
+                print(f"Prerelease {version}: the public demo waits for the next stable release.")
+                return 0
             demo_issues = public_demo_release_issues(args.repository, version)
         except ValueError as exc:
             print(f"- {exc}")

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +19,88 @@ RELEASE_CHECKLIST_PATH = REPO_ROOT / "docs/RELEASE_CHECKLIST.md"
 DEPLOY_HELPER_PATH = REPO_ROOT / "scripts/update_immutable_deployment.py"
 
 
+def _run_release_step(name: str, tag: str, prerelease: bool) -> tuple[int, str, list[str], bool]:
+    """Run one publish-workflow step's own bash for a ``release`` event.
+
+    Returns the exit code, output, resolved image tags and whether the step
+    called the public-demo validator (a stub ``python`` records the call).
+    """
+
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    step = next(s for s in workflow["jobs"]["publish"]["steps"] if s.get("name") == name)
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        stub = root / "bin" / "python"
+        stub.parent.mkdir()
+        stub.write_text(f'#!/bin/sh\necho "$@" > "{root}/validator-called"\n', encoding="utf-8")
+        stub.chmod(0o755)
+        output = root / "github-output"
+        env = {
+            "PATH": f"{stub.parent}:{os.environ['PATH']}",
+            "GITHUB_EVENT_NAME": "release",
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_REPOSITORY": "gcs8/truenas-jbod-ui",
+            "GITHUB_SHA": "0123456789abcdef0123456789abcdef01234567",
+            "IMAGE_NAME": "ghcr.io/gcs8/truenas-jbod-ui",
+            "INPUT_TAGS": "",
+            "INPUT_LATEST": "false",
+            "RELEASE_TAG": tag,
+            "PRERELEASE": "true" if prerelease else "false",
+        }
+        result = subprocess.run(
+            [shutil.which("bash") or "/bin/bash", "-c", step["run"]],
+            cwd=root, env=env, capture_output=True, text=True, check=False,
+        )
+        text = output.read_text(encoding="utf-8") if output.exists() else ""
+        tags = re.search(r"tags<<EOF\n(.*?)EOF\n", text, re.S)
+        return (
+            result.returncode,
+            result.stdout + result.stderr,
+            tags.group(1).split() if tags else [],
+            (root / "validator-called").exists(),
+        )
+
+
 class GHCRReleaseContractTests(unittest.TestCase):
+    def test_stable_release_moves_latest_and_never_dev(self) -> None:
+        code, _out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0", prerelease=False)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            tags,
+            [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0", "0.24.0", "latest")],
+        )
+
+    def test_prerelease_moves_dev_and_never_latest(self) -> None:
+        code, _out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0-beta.1", prerelease=True)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            tags,
+            [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-beta.1", "0.24.0-beta.1", "dev")],
+        )
+
+    def test_demo_gate_runs_for_stable_and_waits_for_a_prerelease(self) -> None:
+        gate = "Require a public demo rebuilt for this release"
+
+        code, _out, _tags, called = _run_release_step(gate, "v0.24.0", prerelease=False)
+        self.assertEqual((code, called), (0, True))
+
+        code, out, _tags, called = _run_release_step(gate, "v0.24.0-beta.1", prerelease=True)
+        self.assertEqual((code, called), (0, False))
+        self.assertIn("publishes to dev", out)
+
+    def test_demo_gate_refuses_a_tag_that_disagrees_with_the_prerelease_flag(self) -> None:
+        gate = "Require a public demo rebuilt for this release"
+
+        for tag, prerelease in (("v0.24.0-beta.1", False), ("v0.24.0", True), ("v0.24.0+build-1", True)):
+            with self.subTest(tag=tag, prerelease=prerelease):
+                code, out, _tags, called = _run_release_step(gate, tag, prerelease)
+                self.assertNotEqual(code, 0)
+                self.assertFalse(called)
+                self.assertIn("is marked prerelease=", out)
+
     def test_publish_workflow_records_the_pushed_manifest_digest(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 

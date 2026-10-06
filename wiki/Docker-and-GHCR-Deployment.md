@@ -290,7 +290,7 @@ Useful tag shapes:
 | `latest` | you want the newest stable published image |
 | `v0.22.2` | you want the image currently labeled with that GitHub release |
 | `0.22.2` | you want the same stable release without the `v` prefix |
-| `dev` | you are testing the current development image and accept churn |
+| `dev` | you want the newest prerelease, such as `v0.24.0-beta.1`, and accept churn |
 
 Every registry tag is a mutable pointer, including `latest`, version tags, and
 `sha-...` tags. Only a digest reference is immutable:
