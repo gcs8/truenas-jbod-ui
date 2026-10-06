@@ -45,6 +45,7 @@ import ssl
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -872,6 +873,49 @@ class SftpTarget(_TargetBase):
                 raise
 
 
+def _open_sftp_session(client: paramiko.SSHClient, timeout: float) -> paramiko.SFTPClient:
+    """Open the SFTP subsystem with every wait bounded by ``timeout`` (#723).
+
+    ``SSHClient.connect`` only bounds connect, banner and authentication.
+    Paramiko waits for the subsystem reply without any limit, and an SFTP
+    channel has no read timeout by default. A stalled server could then hold
+    the shipping job forever. The channel timeout is set before the SFTP
+    version handshake and stays set for every later request.
+    """
+
+    transport = client.get_transport()
+    if transport is None or not transport.is_active():
+        raise ArchiveTransportError("SFTP archive connection closed before the SFTP session opened.")
+    channel = transport.open_session(timeout=timeout)
+    channel.settimeout(timeout)
+    timed_out = threading.Event()
+
+    def give_up() -> None:
+        timed_out.set()
+        channel.close()  # wakes invoke_subsystem, which has no timeout of its own
+
+    watchdog = threading.Timer(timeout, give_up)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        channel.invoke_subsystem("sftp")
+    except paramiko.SSHException:
+        channel.close()
+        if timed_out.is_set():
+            raise TimeoutError(f"SFTP subsystem did not start within {timeout:g} s.") from None
+        raise
+    finally:
+        watchdog.cancel()
+    if timed_out.is_set():
+        channel.close()
+        raise TimeoutError(f"SFTP subsystem did not start within {timeout:g} s.")
+    try:
+        return paramiko.SFTPClient(channel)
+    except BaseException:
+        channel.close()
+        raise
+
+
 @contextmanager
 def _open_sftp(settings: ArchiveTargetSettings) -> Iterator[SftpTarget]:
     password = read_secret_file(settings.password_file, "SFTP password") if settings.password_file else None
@@ -890,8 +934,9 @@ def _open_sftp(settings: ArchiveTargetSettings) -> Iterator[SftpTarget]:
             timeout=settings.timeout_seconds,
             banner_timeout=settings.timeout_seconds,
             auth_timeout=settings.timeout_seconds,
+            channel_timeout=settings.timeout_seconds,
         )
-        sftp = client.open_sftp()
+        sftp = _open_sftp_session(client, settings.timeout_seconds)
         try:
             root = "/".join(normalized_root_parts(settings.root))
             if settings.root.startswith("/"):

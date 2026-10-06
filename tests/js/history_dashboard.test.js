@@ -106,6 +106,17 @@ test("dashboard formatters preserve count, byte, duration, and status labels", (
   assert.equal(functions.backoffLabel(1.2), "2s remaining");
 });
 
+test("an unread database size is unknown, never 0 B (#833)", () => {
+  const { databaseSizeLabel } = loadFunctions(["formatBytes", "databaseSizeLabel"]);
+
+  for (const unread of [null, undefined, "", "bad", Number.NaN, {}]) {
+    assert.equal(databaseSizeLabel(unread), "unknown");
+  }
+  assert.equal(databaseSizeLabel(0), "0 B");
+  assert.equal(databaseSizeLabel(1536), "1.5 KiB");
+  assert.match(TEMPLATE_SOURCE, /id="history-storage-degraded"/);
+});
+
 test("collector state says Starting during the grace period (#441)", () => {
   const { collectorStateLabel } = loadFunctions(["collectorStateLabel"]);
 

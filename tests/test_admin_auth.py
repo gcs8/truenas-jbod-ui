@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import yaml
 from pydantic import SecretStr, ValidationError
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
@@ -39,6 +40,7 @@ async def invoke_asgi(
     method: str = "GET",
     origin: str | None = None,
     referer: str | None = None,
+    host_header: str = "admin.example.test",
 ) -> tuple[int, dict[str, str], bytes]:
     messages: list[dict[str, Any]] = []
     request_sent = False
@@ -53,7 +55,7 @@ async def invoke_asgi(
     async def send(message: dict[str, Any]) -> None:
         messages.append(message)
 
-    headers = [(b"host", b"admin.example.test")]
+    headers = [(b"host", host_header.encode("latin-1"))]
     if authorization is not None:
         headers.append((b"authorization", authorization.encode("ascii")))
     if origin is not None:
@@ -122,16 +124,19 @@ class AdminAuthenticationTests(unittest.TestCase):
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
-        get_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
+        # Reached by IP, which needs no setting (#779).
+        host = "192.0.2.10:8082"
+        get_status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing", host_header=host))
         headerless_post_status, _headers, _body = asyncio.run(
-            invoke_asgi(app, "/missing", method="POST")
+            invoke_asgi(app, "/missing", method="POST", host_header=host)
         )
         same_origin_post_status, _headers, _body = asyncio.run(
             invoke_asgi(
                 app,
                 "/missing",
                 method="POST",
-                origin="http://admin.example.test",
+                origin=f"http://{host}",
+                host_header=host,
             )
         )
         cross_site_post_status, _headers, _body = asyncio.run(
@@ -140,6 +145,7 @@ class AdminAuthenticationTests(unittest.TestCase):
                 "/missing",
                 method="POST",
                 origin="https://unrelated.example",
+                host_header=host,
             )
         )
         self.assertEqual(get_status, 404)
@@ -353,9 +359,10 @@ class AdminAuthenticationTests(unittest.TestCase):
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
-        status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing"))
+        host = "192.0.2.10:8082"
+        status, _headers, _body = asyncio.run(invoke_asgi(app, "/missing", host_header=host))
         write_status, _headers, _body = asyncio.run(
-            invoke_asgi(app, "/missing", method="POST")
+            invoke_asgi(app, "/missing", method="POST", host_header=host)
         )
         cross_site_write_status, _headers, cross_site_body = asyncio.run(
             invoke_asgi(
@@ -363,12 +370,13 @@ class AdminAuthenticationTests(unittest.TestCase):
                 "/missing",
                 method="POST",
                 origin="https://unrelated.example",
+                host_header=host,
             )
         )
         self.assertEqual(status, 404)
         self.assertEqual(write_status, 404)
         self.assertEqual(cross_site_write_status, 403)
-        assert_cross_origin_rejection_body(self, cross_site_body, "https://unrelated.example", "http://admin.example.test")
+        assert_cross_origin_rejection_body(self, cross_site_body, "https://unrelated.example", f"http://{host}")
 
     def test_default_admin_app_starts_without_an_origin_or_authentication(self) -> None:
         inherited = dict(os.environ)
@@ -446,7 +454,7 @@ class AdminAuthenticationTests(unittest.TestCase):
         assert_cross_origin_rejection_body(self, foreign_body, "http://admin.example.test:8082", ADMIN_TEST_PUBLIC_ORIGIN)
 
     def test_cross_origin_rejection_names_both_addresses_without_leaking_the_referer_path(self) -> None:
-        settings = AdminSettings(auth_mode="network", auto_stop_seconds=0)
+        settings = AdminSettings(auth_mode="network", allowed_hosts="admin.example.test", auto_stop_seconds=0)
         with patch("admin_service.main.get_admin_settings", return_value=settings):
             app = create_app()
 
@@ -471,6 +479,137 @@ class AdminAuthenticationTests(unittest.TestCase):
         assert_cross_origin_rejection_body(self, body, "http://192.0.2.10:8082", "http://admin.example.test")
         self.assertNotIn(b"view=builder", body)
         self.assertEqual(same_origin_status, 404)
+
+    def test_network_mode_without_public_origin_accepts_writes_only_for_known_hosts(self) -> None:
+        # #779: with no ADMIN_PUBLIC_ORIGIN, a DNS-rebinding name can present a
+        # matching Host and Origin. Writes need an IP address, localhost or a
+        # name listed in ADMIN_ALLOWED_HOSTS.
+        settings = AdminSettings(
+            auth_mode="network",
+            allowed_hosts=" NAS.Example.Test. ,jbod-admin.example.test",
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        def write(host: str, *, origin: str | None = None) -> tuple[int, bytes]:
+            status, _headers, body = asyncio.run(
+                invoke_asgi(app, "/missing", method="POST", host_header=host, origin=origin)
+            )
+            return status, body
+
+        status, body = write("rebind.example.test:8082", origin="http://rebind.example.test:8082")
+        self.assertEqual(status, 403)
+        detail = json.loads(body)["detail"]
+        self.assertIn("rebind.example.test", detail)
+        self.assertIn("ADMIN_ALLOWED_HOSTS", detail)
+        self.assertIn("ADMIN_PUBLIC_ORIGIN", detail)
+        self.assertIn("only accepts changes from", detail)  # admin.js keeps the draft on this text
+        self.assertEqual(write("rebind.example.test:8082")[0], 403)  # headerless too
+
+        for host in (
+            "192.0.2.10:8082",
+            "192.0.2.10",
+            "localhost:8082",
+            "LOCALHOST.",
+            "127.0.0.1:8082",
+            "[::1]:8082",
+            "[2001:db8::10]:8082",
+            "nas.example.test:8082",
+            "NAS.EXAMPLE.TEST.:8082",
+            "jbod-admin.example.test",
+        ):
+            with self.subTest(accepted=host):
+                self.assertEqual(write(host, origin=f"http://{host}")[0], 404)
+                self.assertEqual(write(host)[0], 404)
+
+        for host in (
+            "",
+            "[::1",
+            "[v1.x]",
+            "[192.0.2.10]",
+            "nas.example.test:abc",
+            "nas.example.test:99999",
+            "bad host",
+            "user@nas.example.test",
+            "nas.example.test/x",
+            "2001:db8::10",
+            "nas.example.test.evil.example",
+        ):
+            with self.subTest(rejected=host):
+                self.assertEqual(write(host)[0], 403)
+
+        # Reads are unchanged, and a mismatched Origin is still refused on a known host.
+        read_status, _headers, _body = asyncio.run(
+            invoke_asgi(app, "/missing", host_header="rebind.example.test:8082")
+        )
+        self.assertEqual(read_status, 404)
+        self.assertEqual(write("192.0.2.10:8082", origin="https://unrelated.example")[0], 403)
+
+    def test_configured_public_origin_keeps_its_meaning_for_any_host(self) -> None:
+        settings = AdminSettings(
+            auth_mode="network",
+            public_origin="https://jbod-admin.example.test",
+            auto_stop_seconds=0,
+        )
+        with patch("admin_service.main.get_admin_settings", return_value=settings):
+            app = create_app()
+
+        proxied, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                host_header="enclosure-admin:8002",
+                origin="https://jbod-admin.example.test",
+            )
+        )
+        rebound, _headers, _body = asyncio.run(
+            invoke_asgi(
+                app,
+                "/missing",
+                method="POST",
+                host_header="rebind.example.test:8082",
+                origin="http://rebind.example.test:8082",
+            )
+        )
+        self.assertEqual(proxied, 404)
+        self.assertEqual(rebound, 403)
+
+    def test_allowed_hosts_setting_is_normalized_and_rejects_non_host_entries(self) -> None:
+        settings = AdminSettings(allowed_hosts=" NAS.Example.Test. , 192.0.2.10,[2001:DB8::1],,nas.example.test ")
+        self.assertEqual(
+            settings.allowed_host_names,
+            frozenset({"nas.example.test", "192.0.2.10", "2001:db8::1"}),
+        )
+        self.assertEqual(AdminSettings().allowed_host_names, frozenset())
+        for entry in ("http://nas.example.test", "nas.example.test:8082", "nas.example.test/ui", "bad host", "*.example.test"):
+            with self.subTest(entry=entry):
+                with self.assertRaisesRegex(ValidationError, "host name or IP address"):
+                    AdminSettings(allowed_hosts=entry)
+
+    def test_allowed_hosts_environment_value_reaches_admin_and_main_ui_settings(self) -> None:
+        from app.read_ui_auth_config import load_read_ui_auth_settings
+
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = {
+                "ADMIN_ALLOWED_HOSTS": "Nas.Example.Test.,123",
+                "ADMIN_HOST_PREP_TEMP_DIR": str(Path(temporary) / "host-prep"),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                get_admin_settings.cache_clear()
+                self.addCleanup(get_admin_settings.cache_clear)
+                admin = get_admin_settings()
+                shared = load_read_ui_auth_settings()
+            expected = frozenset({"nas.example.test", "123"})
+            self.assertEqual(admin.allowed_host_names, expected)
+            self.assertEqual(shared.allowed_host_names, expected)
+            with patch.dict(os.environ, {**environment, "ADMIN_ALLOWED_HOSTS": "nas.example.test:8082"}, clear=True):
+                get_admin_settings.cache_clear()
+                with self.assertRaisesRegex(ValueError, "ADMIN_ALLOWED_HOSTS"):
+                    get_admin_settings()
+                with self.assertRaisesRegex(ValueError, "ADMIN_ALLOWED_HOSTS"):
+                    load_read_ui_auth_settings()
 
     def test_basic_mode_browser_mutations_require_same_origin(self) -> None:
         settings = AdminSettings(
@@ -685,6 +824,18 @@ class AdminAuthenticationTests(unittest.TestCase):
         self.assertIn("ADMIN_PUBLIC_ORIGIN", advanced)
         self.assertIn("APP_PUBLIC_ORIGIN", advanced)
         self.assertIn("needs no extra setting", advanced_prose)
+        # #779: one shared allow-list, like the other ADMIN_* operator settings.
+        self.assertIn("ADMIN_ALLOWED_HOSTS=", env_example)
+        self.assertIn("ADMIN_ALLOWED_HOSTS", advanced)
+        self.assertIn("ADMIN_ALLOWED_HOSTS", security_doc)
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            services = yaml.safe_load((root / compose_name).read_text(encoding="utf-8"))["services"]
+            for service in ("enclosure-ui", "enclosure-admin"):
+                with self.subTest(compose=compose_name, service=service):
+                    self.assertEqual(
+                        services[service]["environment"]["ADMIN_ALLOWED_HOSTS"],
+                        "${ADMIN_ALLOWED_HOSTS:-}",
+                    )
         self.assertIn("Anyone who can reach", security_doc)
         self.assertIn("request's own scheme, host, and port", security_doc)
         self.assertIn("firewall", security_doc.lower())

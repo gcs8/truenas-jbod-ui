@@ -2220,6 +2220,56 @@ class SchedulerTests(SchedulerTestBase):
         self.assertFalse(scheduler.catalog.get(remote.artifact_id).verified)
         self.assertFalse(scheduler.serialize(scheduler.get(remote.artifact_id))["restorable"])
 
+    def test_stalled_sftp_target_times_out_and_later_targets_still_ship(self) -> None:
+        # #723: a real loopback SFTP server stalls after authentication. The
+        # shipping job must give up within the target timeout, release its job
+        # reservation, leave no client connection running, and still ship to
+        # the next target.
+        import time as time_module
+
+        from history_service.backup_archive import transport
+        from history_service.backup_archive.settings import ArchiveTargetSettings
+        from tests import sftp_stall_server
+
+        stalled = {**TARGET, "target_id": "stalled", "label": "Stalled SFTP", "root": "/unused-stalled"}
+        second = {**TARGET, "target_id": "cloud", "label": "Cloud", "root": "/unused-cloud"}
+        secret = self.root / "sftp-password"
+        secret.write_text(sftp_stall_server.PASSWORD + "\n", encoding="utf-8")
+        secret.chmod(0o600)
+        known_hosts = self.root / "known_hosts"
+        before = sftp_stall_server.live_client_transports()
+        default_open = self.open_target
+        with sftp_stall_server.StallingSftpServer(stall="request") as server:
+            server.write_known_hosts(known_hosts)
+
+            def open_target(settings):
+                if settings.target_id != "stalled":
+                    return default_open(settings)
+                return transport.open_target(ArchiveTargetSettings(
+                    target_id="stalled", provider="sftp", root="/srv/backups/jbod-ui",
+                    hostname="127.0.0.1", port=server.port, username=sftp_stall_server.USERNAME,
+                    password_file=str(secret), known_hosts_path=str(known_hosts), timeout_seconds=0.5,
+                ))
+
+            self.open_target = open_target  # type: ignore[method-assign]
+            scheduler = self.make({"full": {"enabled": True}, "targets": [stalled, second]})
+            started = time_module.monotonic()
+            scheduler.run_now("full")
+            elapsed = time_module.monotonic() - started
+            self.assertTrue(server.reached.is_set())
+        self.assertLess(elapsed, 4.0)
+        self.assertEqual(sorted(r.location for r in scheduler.catalog.list()), ["cloud", "local"])
+        status = json.loads(self._paths.status_file.read_text())
+        self.assertFalse(status["targets"]["stalled"]["ok"])
+        self.assertIn("TimeoutError", status["targets"]["stalled"]["detail"])
+        self.assertTrue(status["targets"]["cloud"]["ok"])
+        self.assertIsNone(scheduler.running)
+        scheduler.run_now("config")  # the job reservation was released
+        deadline = time_module.monotonic() + 5
+        while sftp_stall_server.live_client_transports() - before and time_module.monotonic() < deadline:
+            time_module.sleep(0.05)
+        self.assertEqual(sftp_stall_server.live_client_transports() - before, set())
+
     def test_disabled_target_gets_no_retention_rule(self) -> None:
         disabled = {**TARGET, "target_id": "cloud", "label": "Cloud", "enabled": False}
         scheduler = self.make({"full": {"enabled": True, "remote_keep": 3}, "targets": [TARGET, disabled]})

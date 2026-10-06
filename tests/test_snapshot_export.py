@@ -1919,6 +1919,44 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive-core|storage-view:boot-doms|0", rendered.history_cache)
         self.assertTrue(rendered.history_cache["archive-core|storage-view:boot-doms|0"]["available"])
 
+    async def test_storage_view_history_keys_a_bay_only_in_its_own_enclosure(self) -> None:
+        # Front and rear enclosures both have a bay 3 holding different disks.
+        runtime = build_storage_view_runtime()
+        view = runtime.views[0]
+        view.slots = [
+            view.slots[0].model_copy(
+                update={"snapshot_slot": 3, "snapshot_enclosure_id": "rear", "serial": "SANITIZED-REAR-3"}
+            ),
+            view.slots[0].model_copy(
+                update={
+                    "slot_index": 1,
+                    "slot_label": "Boot B",
+                    "snapshot_slot": 3,
+                    "snapshot_enclosure_id": "front",
+                    "serial": "SANITIZED-FRONT-3",
+                }
+            ),
+        ]
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=build_snapshot(),
+            smart_summary_cache=build_smart_summary_cache(),
+            storage_view_runtime=runtime,
+            storage_view_smart_summary_cache={},
+            selected_slot=0,
+            history_window_hours=24,
+            history_panel_open=True,
+            io_chart_mode="total",
+        )
+
+        rear_history = rendered.history_cache["archive-core|storage-view:boot-doms|0"]
+        self.assertEqual((rear_history["enclosure_id"], rear_history["slot"]), ("storage-view:boot-doms", 0))
+        front_history = rendered.history_cache["archive-core|front|3"]
+        self.assertEqual((front_history["enclosure_id"], front_history["slot"]), ("front", 3))
+        self.assertNotIn("archive-core|storage-view:boot-doms|1", rendered.history_cache)
+
     def test_request_sanitizes_selected_storage_view_id(self) -> None:
         payload = SnapshotExportRequest(selected_storage_view_id="  boot-doms  ")
 

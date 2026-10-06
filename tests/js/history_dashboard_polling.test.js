@@ -379,6 +379,70 @@ test("overview polling refreshes free space and backup footprint labels (#597)",
   assert.equal(d.element("status-backup-footprint").textContent, "3.0 KiB in 2 copies");
 });
 
+// #833: a segmented deployment without its catalog answers the overview with
+// degraded content: empty counts and scopes, an unknown size and the reason.
+const catalogMissingReason = "Segmented history is configured but its catalog does not exist yet. "
+  + "Run the segmented-history migration or restore a segmented backup.";
+const degradedOverview = reason => ({
+  collector: { collector_running: true }, counts: {}, counts_exact: false, scopes: [],
+  database: {
+    size_bytes: null, reclaimable_bytes: null, main_file_size_bytes: 4096, reclaimable_label: "unknown",
+    backup_footprint: { copies: 0, bytes: 0 }, backup_footprint_label: "no copies",
+  },
+  degraded_reason: reason,
+});
+// Both fixtures expose attributes and nested text differently; read either.
+const attribute = (node, name) => (typeof node.getAttribute === "function" ? node.getAttribute(name) : node[name]);
+const textOf = node => (node.children?.length ? node.children.map(textOf).join("") : node.textContent);
+
+test(`degraded storage ${recoveryFixture}: overview shows the reason and an unknown size, then clears`, async () => {
+  const d = recoveryDashboard();
+  const notice = d.element("history-storage-degraded");
+  d.poll.pollOverviewStatus();
+  await d.reply(0, { ...overview(true, 3), database: { size_bytes: 40960 }, scopes: [{ system_label: "Synthetic", tracked_slots: 3 }] });
+  assert.equal(d.element("db-size-value").textContent, "40.0 KiB");
+
+  d.poll.pollOverviewStatus();
+  await d.reply(1, degradedOverview(catalogMissingReason));
+  assert.equal(d.element("history-overview-freshness").textContent, "Overview checked successfully.");
+  assert.equal(notice.hidden, false);
+  assert.equal(notice.textContent, catalogMissingReason);
+  assert.equal(d.element("db-size-value").textContent, "unknown", "an unread size is not 0 B");
+  assert.equal(d.element("db-reclaimable").textContent, "Free inside the file: unknown");
+  assert.equal(d.element("tracked-slots-value").textContent, "-");
+  assert.equal(attribute(d.element("tracked-slots-value"), "aria-label"), "not counted yet");
+  assert.equal(textOf(d.element("tracked-scopes-body")),
+    "Systems and enclosures are unavailable until stored history can be read.");
+
+  // Missing or malformed evidence keeps the last known notice.
+  for (const unknown of [undefined, 0, false, {}, []]) {
+    d.poll.pollOverviewStatus();
+    await d.reply(d.requests.length - 1, { ...degradedOverview(catalogMissingReason), degraded_reason: unknown });
+    assert.equal(notice.hidden, false);
+    assert.equal(notice.textContent, catalogMissingReason);
+  }
+
+  d.poll.pollOverviewStatus();
+  await d.reply(d.requests.length - 1, { ...overview(true, 3), database: { size_bytes: 40960 }, scopes: [], degraded_reason: null });
+  assert.equal(notice.hidden, true);
+  assert.equal(notice.textContent, "");
+  assert.equal(d.element("db-size-value").textContent, "40.0 KiB");
+  assert.equal(textOf(d.element("tracked-scopes-body")), "No slot history has been collected yet.");
+});
+
+test("degraded storage: a refresh reply, which carries no reason, leaves the notice to the overview", async () => {
+  const d = dashboard();
+  d.poll.pollOverviewStatus();
+  await d.reply(0, degradedOverview(catalogMissingReason));
+  await d.click("fast");
+  const { degraded_reason: _omitted, ...refreshShape } = degradedOverview(catalogMissingReason);
+  await d.reply(1, { ...refreshShape, ok: true, detail: "History fast refresh completed." });
+  assert.equal(d.element("history-refresh-status").textContent, "History fast refresh completed.");
+  assert.equal(d.element("history-storage-degraded").hidden, false);
+  assert.equal(d.element("history-storage-degraded").textContent, catalogMissingReason);
+  assert.equal(d.element("db-size-value").textContent, "unknown");
+});
+
 test("older health cannot replace newer overview collector state", async () => {
   const d = dashboard();
   d.poll.pollCollectorStatus();
