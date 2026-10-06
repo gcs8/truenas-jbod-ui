@@ -307,6 +307,10 @@ class TrueNASRawData:
 # #537: how much longer than one call the whole phase may take before the
 # remaining positions are reported instead of started.
 SMART_BATCH_PHASE_DEADLINE_MULTIPLIER = 2
+# A full inventory read is five middleware calls, and CORE's
+# `smart.test.results` alone can take several times one call's timeout on a
+# large shelf. LED and single-disk SMART calls keep the plain timeout.
+INVENTORY_DEADLINE_MULTIPLIER = 4
 
 
 class TrueNASWebsocketClient:
@@ -345,7 +349,7 @@ class TrueNASWebsocketClient:
             return _JsonRpcCallDispatcher(ws, request_ids=self._jsonrpc_request_ids)
         return _MiddlewareCallDispatcher(ws)
 
-    async def _run_operation(self, operation: Awaitable[Any]) -> Any:
+    async def _run_operation(self, operation: Awaitable[Any], *, multiplier: int = 1) -> Any:
         """One monotonic budget for connect, authentication and all replies.
 
         Transport ping_timeout only measures WebSocket keepalive. Neither those
@@ -354,12 +358,11 @@ class TrueNASWebsocketClient:
         and a late send/close error cannot replace the timeout or cancellation.
         """
         owner = asyncio.ensure_future(operation)
+        budget = self.config.timeout_seconds * multiplier
         try:
-            done, _ = await asyncio.wait({owner}, timeout=self.config.timeout_seconds)
+            done, _ = await asyncio.wait({owner}, timeout=budget)
             if not done:
-                raise TimeoutError(
-                    f"TrueNAS operation did not complete within {self.config.timeout_seconds:g}s."
-                )
+                raise TimeoutError(f"TrueNAS operation did not complete within {budget:g}s.")
             return owner.result()
         except BaseException:
             owner.cancel()
@@ -381,7 +384,7 @@ class TrueNASWebsocketClient:
         return cancelled
 
     async def fetch_all(self) -> TrueNASRawData:
-        return await self._run_operation(self._fetch_all())
+        return await self._run_operation(self._fetch_all(), multiplier=INVENTORY_DEADLINE_MULTIPLIER)
 
     async def _fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
