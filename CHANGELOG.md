@@ -60,9 +60,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the target at a separate directory or disk before upgrading. With a
   filesystem target, `BACKUP_ARCHIVE_DIR` must also be an absolute path.
   (#633, #651)
+- `ADMIN_ALLOWED_HOSTS`: if you open the main UI or admin by a DNS name and
+  set no `APP_PUBLIC_ORIGIN` or `ADMIN_PUBLIC_ORIGIN`, add that name to
+  `ADMIN_ALLOWED_HOSTS` in `.env` (names only, comma-separated) and recreate
+  the containers, or changes return 403. Pages opened by IP address or
+  `localhost` need nothing. (#892)
 
 ### Security
 
+- Without a public origin, the main UI and admin now accept changes only when
+  the browser address is an IP address, `localhost` or a name in the new
+  `ADMIN_ALLOWED_HOSTS`, so a DNS-rebinding page can no longer make changes.
+  (#892)
 - Completed credential scrubbing in shared debug exports, bounded archive
   upload verification reads and persisted newly created archive directories before
   granting verified publication credit. (#878)
