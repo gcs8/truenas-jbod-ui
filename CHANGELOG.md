@@ -63,6 +63,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- An SFTP backup target with `trust_on_first_use` now pins a new host key in
+  the scheduler's own state folder and only reads its `known_hosts_path`, so a
+  target can no longer make the scheduler write to a file it names. (#895)
 - Completed credential scrubbing in shared debug exports, bounded archive
   upload verification reads and persisted newly created archive directories before
   granting verified publication credit. (#878)
