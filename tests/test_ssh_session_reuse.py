@@ -93,8 +93,9 @@ class FakeChannelCloseTests(unittest.TestCase):
         # collection that lands inside another channel's counted close (with
         # the fixture lock held) re-enters it on the same thread; a plain Lock
         # deadlocked CI shard (3.14, 1) there.
-        gc.disable()
-        self.addCleanup(gc.enable)
+        if gc.isenabled():
+            gc.disable()
+            self.addCleanup(gc.enable)
         counters = {"open": 0, "peak": 0}
         exec_command = _exec_ok(counters=counters)
         stale = exec_command("stale")[1].channel
