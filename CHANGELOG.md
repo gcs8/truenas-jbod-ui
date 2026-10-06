@@ -277,6 +277,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Described FTP upload checks as size only: the target test and a copy's
   details no longer claim the content was read back, until an explicit Verify
   downloads the copy and matches its size and SHA-256. (#890)
+- Refused a backup target secret file that another target or field already
+  uses, and required a new secret file once a target points somewhere else, so
+  one target cannot send another's credential to its server. (#887)
+- Rejected multiply-linked regular files before non-root ownership migration,
+  preserving excluded files' ownership and modes, and documented that every
+  writer must stay stopped while `--apply` runs. (#742)
+- Checked the checked-in public demo against the parity rules of the revision
+  it was built from, so a later schema or offline-image change no longer fails
+  it between releases. (#886)
+- Gave the admin orphaned-history preview, adopt scan and purge the long
+  30-minute request limit, reported a timed-out purge as an unknown outcome,
+  and kept Purge disabled when nothing is left to purge. (#883)
 - Kept storage-view history on a candidate's own enclosure, so a disk recorded
   in another enclosure no longer shows the history of a same-numbered local
   bay, in the live view, the history route and offline exports. (#888)

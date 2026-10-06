@@ -71,7 +71,9 @@ function functionSource(name) {
 }
 
 function loadFunctions(names, bindings = {}) {
-  const context = vm.createContext({ URLSearchParams, console, setTimeout, clearTimeout, ...bindings });
+  const context = vm.createContext({
+    URLSearchParams, console, setTimeout, clearTimeout, HISTORY_MAINTENANCE_TIMEOUT_MS: 1800000, ...bindings,
+  });
   vm.runInContext(
     `${names.map(functionSource).join("\n")}\nglobalThis.__tested = { ${names.join(", ")} };`,
     context,
