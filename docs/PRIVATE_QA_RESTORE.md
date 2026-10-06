@@ -185,6 +185,16 @@ This flag does not authorize LED control, locator control, admin changes to save
 systems, credential rotation, production container control, or any write to an
 appliance.
 
+In live read-only mode the restored history collector polls the real
+appliances, so it can record new events, samples and slots before or between
+the three count checks. Those `history` counts may grow but never shrink. Every
+other count stays exact, and egress-blocked runs stay exact for every count.
+After the restart check the controller writes `raw-private/history-growth.json`.
+It holds the growth per history count and the newest events grouped by system,
+event type and changed fields. Status fields such as health show their
+transition. Identity fields such as serials are named without their values. Use
+it to tell real appliance changes from churn the candidate introduced.
+
 ## Browser and performance checks
 
 The offline browser run covers the restored UI shell, auth boundary, sidecar
@@ -227,6 +237,8 @@ retains that private state only for an explicitly supervised follow-up check.
 - restore/restart counts without names or paths;
 - pass/fail for count reconciliation, pencil cleanup, restart survival, browser,
   and performance gates;
+- `history_growth`, the difference per history count between the archive and
+  the restarted stack (always zero in an egress-blocked pass);
 - elapsed time and whether the private stack remains running.
 
 Current application observability is useful but not complete. Services can emit
