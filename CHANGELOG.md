@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Refused a backup target secret file that another target or field already
+  uses, and required a new secret file once a target points somewhere else, so
+  one target cannot send another's credential to its server. (#887)
 - Rejected multiply-linked regular files before non-root ownership migration,
   preserving excluded files' ownership and modes, and documented that every
   writer must stay stopped while `--apply` runs. (#742)

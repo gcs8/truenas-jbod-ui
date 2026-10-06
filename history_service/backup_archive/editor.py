@@ -60,6 +60,15 @@ CLASS_FIELDS = {
 # The scheduler container mounts ./config/backup-secrets at this path; the admin
 # container sees the same folder under its config directory.
 SCHEDULER_SECRET_ROOT = PurePosixPath("/run/backup-secrets")
+
+
+def _secret_path(text: str) -> PurePosixPath:
+    # POSIX lets exactly two leading slashes mean something else, so
+    # PurePosixPath keeps "//run/x" apart from "/run/x". Linux opens the same
+    # file for both, so ownership and folder checks compare the Linux form.
+    return PurePosixPath("/" + text.lstrip("/") if text.startswith("/") else text)
+
+
 # The archive passphrase lives in the same folder. A target must never be able
 # to name it, or the scheduler would send it to that target as a credential.
 PASSPHRASE_ENV_NAMES = ("BACKUP_ARCHIVE_PASSPHRASE_FILE", "SCHEDULED_BACKUP_PASSPHRASE_FILE")
@@ -109,7 +118,7 @@ def _secret_file_state(value: Any, config_dir: Path) -> dict[str, Any]:
     text = str(value or "").strip()
     if not text:
         return {"configured": False, "present": None}
-    candidate = PurePosixPath(text)
+    candidate = _secret_path(text)
     try:
         relative = candidate.relative_to(SCHEDULER_SECRET_ROOT)
     except ValueError:
@@ -231,7 +240,7 @@ def _forbidden_secret_paths(environ: Mapping[str, str]) -> set[str]:
     for name in PASSPHRASE_ENV_NAMES:
         value = str(environ.get(name) or "").strip()
         if value:
-            paths.add(str(PurePosixPath(value)))
+            paths.add(str(_secret_path(value)))
     return paths
 
 
@@ -251,6 +260,26 @@ def _endpoint(values: Mapping[str, Any]) -> tuple[Any, ...]:
     return tuple(endpoint)
 
 
+def _secret_path_key(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return str(_secret_path(value.strip()))
+
+
+def _stored_secret_owners(targets: Any) -> dict[str, set[tuple[str, str]]]:
+    """Map each saved secret path to the (target_id, field) pairs that use it."""
+
+    owners: dict[str, set[tuple[str, str]]] = {}
+    for item in targets or []:
+        if not isinstance(item, Mapping):
+            continue
+        for name in SECRET_FILE_FIELDS:
+            key = _secret_path_key(item.get(name))
+            if key is not None:
+                owners.setdefault(key, set()).add((str(item.get("target_id")), name))
+    return owners
+
+
 def _merge_target(
     index: int,
     incoming: Any,
@@ -258,6 +287,8 @@ def _merge_target(
     problems: list[str],
     *,
     forbidden_secret_paths: set[str] = frozenset(),  # type: ignore[assignment]
+    stored_secret_owners: Mapping[str, set[tuple[str, str]]] | None = None,
+    claimed_secret_paths: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     where = f"backups.targets[{index}]"
     if not isinstance(incoming, Mapping):
@@ -296,7 +327,7 @@ def _merge_target(
             problems.append(f"{where}.{name} must be an absolute path to a secret file, or null to clear it.")
             continue
         text = change.strip()
-        candidate = PurePosixPath(text)
+        candidate = _secret_path(text)
         if not text.startswith("/") or ".." in candidate.parts or "\x00" in text:
             problems.append(f"{where}.{name} must be an absolute path to a secret file.")
             continue
@@ -310,7 +341,29 @@ def _merge_target(
         if str(candidate) in forbidden_secret_paths:
             problems.append(f"{where}.{name} cannot be the backup archive passphrase file.")
             continue
-        merged[name] = str(candidate)
+        # #777: a named secret file must belong to this target and field
+        # alone, or the scheduler would send one credential to another host.
+        path_key = str(candidate)
+        previous_paths = {
+            _secret_path_key(previous.get(field)) for field in SECRET_FILE_FIELDS
+        } if previous else set()
+        if previous and not same_endpoint and path_key in previous_paths:
+            problems.append(
+                f"{where} now points somewhere else, so name a new secret file for {name}; "
+                "the file it used before stays with the old endpoint."
+            )
+            continue
+        own = (str(previous.get("target_id")), name) if previous else None
+        other_owners = (stored_secret_owners or {}).get(path_key, set()) - ({own} if own else set())
+        claimed = claimed_secret_paths if claimed_secret_paths is not None else {}
+        if other_owners or path_key in claimed:
+            problems.append(
+                f"{where}.{name} is already used by another backup secret; "
+                "give each target credential its own file."
+            )
+            continue
+        claimed[path_key] = f"{where}.{name}"
+        merged[name] = path_key
     for key in secrets:
         if key not in SECRET_FILE_FIELDS:
             problems.append(f"{where}.{key} is not a secret file setting.")
@@ -367,6 +420,8 @@ def apply_editor_change(
                     if isinstance(item, dict)
                 }
                 forbidden = _forbidden_secret_paths(environ)
+                stored_owners = _stored_secret_owners(existing.get("targets"))
+                claimed: dict[str, str] = {}
                 merged_targets = []
                 for index, item in enumerate(incoming_targets):
                     # A target is matched to its saved row by the ID it had when
@@ -375,7 +430,8 @@ def apply_editor_change(
                     original_id = item.get("original_target_id") if isinstance(item, Mapping) else None
                     previous = previous_by_id.get(str(original_id)) if original_id else None
                     merged = _merge_target(
-                        index, item, previous, problems, forbidden_secret_paths=forbidden
+                        index, item, previous, problems, forbidden_secret_paths=forbidden,
+                        stored_secret_owners=stored_owners, claimed_secret_paths=claimed,
                     )
                     if merged is not None:
                         merged_targets.append(merged)
