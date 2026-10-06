@@ -274,6 +274,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Rejected multiply-linked regular files before non-root ownership migration,
+  preserving excluded files' ownership and modes, and documented that every
+  writer must stay stopped while `--apply` runs. (#742)
 - Checked the checked-in public demo against the parity rules of the revision
   it was built from, so a later schema or offline-image change no longer fails
   it between releases. (#886)

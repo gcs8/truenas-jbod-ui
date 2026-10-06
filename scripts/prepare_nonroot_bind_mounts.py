@@ -32,7 +32,13 @@ class OwnershipEntries(list[tuple[Path, os.stat_result]]):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Preflight or apply bounded non-root bind-mount ownership on a POSIX deployment host.",
-        epilog="Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; --apply requires root.",
+        epilog=(
+            "Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; "
+            "--apply requires root. Stop every writer first (docker compose down, plus any host job that writes under "
+            "the deployment root) and keep them stopped until --apply finishes. The hard-link and descriptor checks "
+            "are point-in-time: a process that creates hard links or renames files during the run can still steer a "
+            "mode or ownership change onto an excluded file."
+        ),
     )
     parser.add_argument("root", type=Path, help="Deployment directory containing config, data, history and logs, e.g. /srv/enclosure.")
     parser.add_argument("--uid", type=int, default=10001, help="Target numeric user ID, e.g. 10001 (default: 10001).")
@@ -69,6 +75,9 @@ def _validate_entry(
             raise ValueError(f"runtime root is not a directory: {path}")
     elif not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
         raise ValueError(f"refusing non-file runtime entry: {path}")
+    # Ownership and modes belong to the inode, including aliases outside this tree.
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+        raise ValueError(f"refusing multiply-linked regular file: {path}")
     if check_stale and (
         path.name.endswith((".restore", ".tmp"))
         or (path.name.startswith(".") and ".restore-" in path.name)
@@ -124,6 +133,9 @@ def _bind_child(
         raise
     try:
         opened = os.fstat(descriptor)
+        _validate_entry(
+            path, opened, directory_only=directory_only, check_stale=check_stale
+        )
         if not _same_inode(opened, inspected):
             raise ValueError(f"runtime entry changed during descriptor binding: {path}")
         if expected is not None and not _same_inode(opened, expected):
@@ -419,6 +431,7 @@ def apply_ownership(
 
         for descriptor, path, metadata in opened[1:]:
             current = os.fstat(descriptor)
+            _validate_entry(path, current)
             if not _same_inode(current, metadata):
                 raise ValueError(f"runtime descriptor changed before ownership migration: {path}")
 
