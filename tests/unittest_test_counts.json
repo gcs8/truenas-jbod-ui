@@ -101,7 +101,7 @@
     "test_snapshot_export": 90,
     "test_ssh_failure_contexts": 4,
     "test_ssh_probe": 38,
-    "test_ssh_session_reuse": 50,
+    "test_ssh_session_reuse": 51,
     "test_startup_config": 29,
     "test_startup_migration_recovery": 13,
     "test_startup_writability": 20,
