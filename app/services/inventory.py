@@ -1821,13 +1821,27 @@ class InventoryService:
         return sorted(compatible), targets
 
     async def save_sas_fabric_alias_async(self, **request: Any) -> dict[str, Any]:
-        """``save_sas_fabric_alias`` with its topology rebuild in a worker thread (#813)."""
+        """``save_sas_fabric_alias`` with its topology rebuild in a worker thread (#813).
+
+        A refresh can replace the cache while the worker runs, so the save uses
+        a rebuild only when its observation is still current, with no await
+        between that check and the store write.
+        """
 
         if self.sas_fabric_alias_store is None:
             return self.save_sas_fabric_alias(**request)
-        bundle, snapshots, known_enclosures = self._sas_fabric_alias_observation()
-        nodes = await asyncio.to_thread(self._observed_sas_fabric_nodes, bundle, snapshots)
-        return self.save_sas_fabric_alias(**request, _observed=(snapshots, known_enclosures, nodes))
+        for _attempt in range(3):
+            bundle, snapshots, known_enclosures = self._sas_fabric_alias_observation()
+            nodes = await asyncio.to_thread(self._observed_sas_fabric_nodes, bundle, snapshots)
+            now_bundle, now_snapshots, now_known = self._sas_fabric_alias_observation()
+            if (
+                now_bundle is bundle
+                and now_known == known_enclosures
+                and len(now_snapshots) == len(snapshots)
+                and all(now is then for now, then in zip(now_snapshots, snapshots))
+            ):
+                return self.save_sas_fabric_alias(**request, _observed=(snapshots, known_enclosures, nodes))
+        raise ValueError("Storage Fabric topology kept changing during the rename; try again.")
 
     def save_sas_fabric_alias(
         self,
