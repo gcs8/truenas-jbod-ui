@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app import __version__
 from app.config import (
     PerfConfig,
     Settings,
@@ -319,7 +320,7 @@ class PerfTraceTests(unittest.TestCase):
         self.assertEqual(payload["method"], "GET")
         self.assertEqual(payload["status_code"], 200)
         self.assertEqual(payload["component"], "enclosure-ui")
-        self.assertEqual(payload["release"], "0.23.0")
+        self.assertEqual(payload["release"], __version__)
         serialized = json.dumps(payload)
         for forbidden in (
             "private-system-alpha",
