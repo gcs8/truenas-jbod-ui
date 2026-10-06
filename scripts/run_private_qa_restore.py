@@ -98,22 +98,24 @@ HISTORY_SEGMENTS_PATH = "/app/history/segments"
 # Runs as root on the QA host against the restored history. In one read
 # transaction it takes each table's highest rowid as a mark and hashes every
 # row at or below it; given the earlier marks and columns, it rehashes exactly
-# those rows. Append-only tables hash every column, so a restart that rolls the
-# database back cannot hide behind replacement rows that reuse lost IDs. Tables
-# the collector upserts in place hash only rowid and primary key. The segment
-# catalog and sealed segment files are hashed whole.
+# those rows. Events and samples are append-only, and rollups change only
+# through retention, which the drill disables, so those tables hash every
+# column: a rollback cannot hide behind replacement rows or older aggregates.
+# Current slot state, which the collector upserts in place, hashes only rowid
+# and primary key. The segment catalog and sealed segment files are hashed
+# whole.
 HISTORY_FINGERPRINT_SCRIPT = r"""
 import glob, hashlib, json, os, sqlite3, sys, urllib.parse
 path, segments, before = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 db = sqlite3.connect("file:" + urllib.parse.quote(path) + "?mode=ro", uri=True, isolation_level=None)
 db.execute("BEGIN")
 tables = {}
-for table, append_only in (("slot_state_current", False), ("slot_events", True), ("metric_samples", True), ("metric_rollups", False)):
+for table, whole_rows in (("slot_state_current", False), ("slot_events", True), ("metric_samples", True), ("metric_rollups", True)):
     if table in before:
         mark, columns = before[table]["mark"], before[table]["columns"]
     else:
         info = sorted(db.execute(f"PRAGMA table_info({table})"), key=lambda row: (row[5] == 0, row[5], row[0]))
-        columns = [row[1] for row in info if append_only or row[5]]
+        columns = [row[1] for row in info if whole_rows or row[5]]
         mark = db.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
     digest, rows = hashlib.sha256(), 0
     for row in db.execute(f"SELECT rowid, {', '.join(columns)} FROM {table} WHERE rowid <= ? ORDER BY rowid", (mark,)):

@@ -329,13 +329,17 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 INSERT INTO slot_state_current VALUES ('alpha', 'e', 1, 'OK'), ('alpha', 'e', 2, 'OK');
                 INSERT INTO slot_events (observed_at) VALUES ('t1'), ('t2');
                 INSERT INTO metric_samples (observed_at) VALUES ('t1'), ('t2'), ('t3');
+                ALTER TABLE metric_rollups ADD COLUMN sample_count INTEGER;
+                INSERT INTO metric_rollups VALUES (3600, 'h1', 'temp', 12);
             """)
             before = self.module._history_fingerprint(runtime)
             self.assertEqual({table: value["rows"] for table, value in before["tables"].items()}, {
-                "slot_state_current": 2, "slot_events": 2, "metric_samples": 3, "metric_rollups": 0})
+                "slot_state_current": 2, "slot_events": 2, "metric_samples": 3, "metric_rollups": 1})
             self.assertEqual(set(before["segments"]), {"catalog.json", "segment-0001.sqlite3"})
-            # Append-only tables hash whole rows; upserted tables hash only their keys.
+            # Append-only and retention-only tables hash whole rows; upserted slot state hashes its key.
             self.assertEqual(before["tables"]["slot_events"]["columns"], ["id", "observed_at"])
+            self.assertEqual(before["tables"]["metric_rollups"]["columns"],
+                             ["bucket_seconds", "bucket_start", "metric_name", "sample_count"])
             self.assertEqual(before["tables"]["slot_state_current"]["columns"], ["system_id", "enclosure_key", "slot"])
 
             def survived():
@@ -363,9 +367,13 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                     DELETE FROM metric_samples WHERE observed_at = 't2';
                     INSERT INTO metric_samples (observed_at) VALUES ('t6'), ('t7');
                 """), "metric_samples, slot_events"),
-                (lambda: catalog.write_text('{"segments": []}'), "catalog.json, metric_samples, slot_events"),
+                # A rollback restores an older aggregate under the same rollup key.
+                (lambda: database.execute("UPDATE metric_rollups SET sample_count = 5"),
+                 "metric_rollups, metric_samples, slot_events"),
+                (lambda: catalog.write_text('{"segments": []}'),
+                 "catalog.json, metric_rollups, metric_samples, slot_events"),
                 (lambda: segment.write_bytes(b"rewritten"),
-                 "catalog.json, metric_samples, segment-0001.sqlite3, slot_events"),
+                 "catalog.json, metric_rollups, metric_samples, segment-0001.sqlite3, slot_events"),
             ):
                 mutate()
                 with self.subTest(changed=changed), self.assertRaisesRegex(
