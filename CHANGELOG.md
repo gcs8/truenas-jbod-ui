@@ -265,6 +265,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Rebuilt cached Storage Fabric topology for an alias save in a worker thread,
+  so renaming a fabric object no longer stalls every other UI request. (#894)
 - Treated a standard JSON-RPC "method not found" reply from SCALE as an
   unavailable middleware method, so SMART batches fail fast and optional SMART
   test results stop warning on every refresh. (#881)
