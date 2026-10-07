@@ -8,7 +8,7 @@ from app.services.mapping_store import MappingStore
 from app.services.profile_registry import ProfileRegistry
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
-from app.services.ssh_probe import SSHProbe
+from app.services.ssh_probe import SSH_CONNECTION_IDLE_SECONDS, SSHProbe
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.supermicro_bmc import SupermicroBMCService
 from app.services.truenas_ws import TrueNASWebsocketClient
@@ -104,7 +104,7 @@ class InventoryRegistry:
                 settings=self.settings,
                 system=system,
                 truenas_client=api_client,
-                ssh_probe=SSHProbe(system.ssh),
+                ssh_probe=SSHProbe(system.ssh, idle_seconds=SSH_CONNECTION_IDLE_SECONDS),
                 bmc_service=SupermicroBMCService(system.bmc) if system.bmc.enabled else None,
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,

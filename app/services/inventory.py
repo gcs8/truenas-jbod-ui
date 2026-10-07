@@ -1186,6 +1186,8 @@ class InventoryService:
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
+        # One probe per HA node or extra host, so each keeps its own connection.
+        self._ssh_host_probes: dict[str, SSHProbe] = {}
         # Planned SSH sessions waiting for the per-host connection, and the task
         # that runs them. Requests that queue while one round runs share the
         # next round's connection instead of each opening their own.
@@ -3435,11 +3437,10 @@ class InventoryService:
                     self._ssh_inventory_enrichment_probe_commands
                 )
                 logger.info(
-                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: connections=%s commands=%s failures=%s duration=%.3fs",
+                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: commands=%s failures=%s duration=%.3fs",
                     self.system.id,
                     self.system.truenas.platform,
                     self.system.default_profile_id or "auto",
-                    1 if command_results else 0,
                     len(command_results),
                     sum(1 for result in command_results if not result.ok),
                     time.perf_counter() - ssh_started,
@@ -13575,7 +13576,7 @@ class InventoryService:
                         return await ssh_probe.run_command(command)
                     return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
 
-                probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                probe = self._ssh_probe_for_host(target_host)
                 if timeout_seconds is None:
                     return await probe.run_command(command)
                 return await probe.run_command(command, timeout_seconds=timeout_seconds)
@@ -13630,6 +13631,18 @@ class InventoryService:
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
         return normalize_text(host) or normalize_text(self.system.ssh.host) or UNSCOPED_KEY
+
+    def _ssh_probe_for_host(self, target_host: str | None) -> SSHProbe:
+        """The system's probe for its own host; one kept probe for each other host."""
+        if not target_host or target_host == normalize_text(self.system.ssh.host):
+            return self.ssh_probe
+        probe = self._ssh_host_probes.get(target_host)
+        if probe is None:
+            probe = self._ssh_host_probes[target_host] = SSHProbe(
+                self.system.ssh.model_copy(update={"host": target_host}),
+                idle_seconds=getattr(self.ssh_probe, "idle_seconds", 0.0),
+            )
+        return probe
 
     def _ssh_session_lock_for_host(self, host: str | None = None) -> asyncio.Lock:
         key = self._optional_ssh_backoff_key(host)
@@ -13791,11 +13804,7 @@ class InventoryService:
     async def _drain_ssh_plans(self, key: str, host: str | None) -> None:
         queue = self._ssh_plan_queues.setdefault(key, [])
         target_host = normalize_text(host)
-        probe = (
-            self.ssh_probe
-            if not target_host or target_host == normalize_text(self.system.ssh.host)
-            else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-        )
+        probe = self._ssh_probe_for_host(target_host)
         try:
             while True:
                 # Let requests released in the same loop turn join this round.
@@ -13882,7 +13891,7 @@ class InventoryService:
                     else:
                         results = await self.ssh_probe.run_commands(command_list, stdin_data=stdin_data)
                 else:
-                    probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                    probe = self._ssh_probe_for_host(target_host)
                     if stdin_data is None:
                         results = await probe.run_commands(command_list)
                     else:
