@@ -827,6 +827,30 @@ def _index_disk_records(
     return disks_by_key, disks_by_slot, disks_by_sas
 
 
+def _bay_peer_devices(
+    raw_slot_status: dict[str, Any],
+    disk: DiskRecord | None,
+    disks_by_key: dict[str, DiskRecord],
+) -> list[str]:
+    """Other paths the enclosure lists in this disk's own bay.
+
+    A dual-path disk can reach the API on one path while its pool label sits on
+    the other. One bay holds one disk, so when the bay lists this disk's path, a
+    name beside it that no other API disk owns is another path to it. CAM
+    model/target/LUN matches across HBAs are not such evidence (#695).
+    """
+    names = raw_slot_status.get("device_names")
+    if disk is None or not isinstance(names, list):
+        return []
+    listed = list(dict.fromkeys(filter(None, (normalize_device_name(name) for name in names if isinstance(name, str)))))
+    if not any(name.lower() in disk.lookup_keys for name in listed):
+        return []
+    return [
+        peer for peer in listed
+        if peer.lower() not in disk.lookup_keys and disks_by_key.get(peer.lower(), disk) is disk
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class CacheResult(Generic[CacheValueT]):
     value: CacheValueT
@@ -6492,6 +6516,7 @@ class InventoryService:
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
                 api_enclosure_query_failed=raw_data.enclosure_query_failed,
+                bay_peer_devices=_bay_peer_devices(candidate, disk, disks_by_key),
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -12977,6 +13002,7 @@ class InventoryService:
         api_enclosure_query_failed: bool = False,
         resolution_source: str | None = None,
         stale_manual_mapping: bool = False,
+        bay_peer_devices: Iterable[str] = (),
     ) -> SlotView:
         resolution_source = resolution_source or normalize_text(raw_slot_status.get("mapping_resolution_source"))
         stale_manual_mapping = stale_manual_mapping or raw_slot_status.get("stale_manual_mapping") is True
@@ -12994,6 +13020,10 @@ class InventoryService:
             device_name = None
         gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower()) if device_name else None
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
+        for peer in () if zpool else bay_peer_devices:
+            peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
+            if zpool := self._lookup_zpool_member(None, peer, peer_gptid, ssh_data, api_topology_members):
+                break
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
         if not model and device_name:
             model = ssh_data.camcontrol_models.get(device_name.lower())

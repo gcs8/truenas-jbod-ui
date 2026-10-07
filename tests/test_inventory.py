@@ -16908,7 +16908,7 @@ Consumers:
    State: ACTIVE
 """
 
-    def make_service(self, platform, outputs, disks=(), enclosures=()):
+    def make_service(self, platform, outputs, disks=(), enclosures=(), pools=()):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         settings = Settings()
@@ -16921,7 +16921,7 @@ Consumers:
             )]
         client = AsyncMock()
         client.fetch_all.return_value = TrueNASRawData(
-            enclosures=list(enclosures), disks=list(disks), pools=[],
+            enclosures=list(enclosures), disks=list(disks), pools=list(pools),
             systems=[{"id": "synthetic-node", "name": "Synthetic node"}] if platform == "quantastor" else [],
             disk_temperatures={}, smart_test_results=[],
         )
@@ -17223,6 +17223,88 @@ Consumers:
                 self.assertEqual(slot.device_name, "multipath/disk0")
                 self.assertEqual(service._smart_candidate_devices(slot), ["da0", "da1", "multipath/disk0"])
                 self.assertTrue(any("gmultipath list" in warning for warning in snapshot.warnings))
+
+    # Two expanders report the same bay, one path each. The pool label sits on
+    # the path the API disk table does not list.
+    DUAL_PATH_MAP = "".join(
+        f"""ses{i}:
+  Enclosure Name: ExampleCo EvidenceShelf
+  Enclosure ID: synthetic-enclosure
+  Element 7, Type: Array Device Slot
+    Status: OK
+    Description: Slot01
+    Device Names: da{i}, pass{i}
+  Element 9, Type: Array Device Slot
+    Status: Not Installed
+    Description: Slot02
+"""
+        for i in range(2)
+    )
+    PEER_POOL = [{"name": "tank", "topology": {"data": [], "special": [{
+        "type": "MIRROR", "name": "mirror-0", "children": [
+            {"type": "DISK", "path": "/dev/gptid/synthetic-peer", "disk": "da1", "status": "ONLINE"},
+        ],
+    }]}}]
+
+    def dual_path_service(self, ses_map, disks):
+        return self.make_service("core", {
+            "camcontrol devlist -v": "\n".join(self.CAM_ROWS),
+            "sesutil map": ses_map,
+            "glabel status": "gptid/synthetic-peer  N/A  da1p1\n",
+        }, disks, pools=self.PEER_POOL)
+
+    async def test_dual_path_bay_takes_pool_membership_from_its_other_ses_path(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                ses_map = self.DUAL_PATH_MAP
+                if reverse:
+                    first, second = ses_map.split("ses1:")
+                    ses_map = "ses1:" + second + first
+                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}])
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.summary.source_disk_count, 1)
+                slot, empty = snapshot.slots
+                self.assertEqual(sorted(slot.raw_status["device_names"]), ["da0", "da1"])
+                self.assertEqual(slot.serial, "SANITIZED-DUAL-PATH")
+                self.assertEqual(slot.device_name, "da0")
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_class, slot.vdev_name, slot.health),
+                    ("tank", "special", "mirror-0", "ONLINE"),
+                )
+                self.assertEqual((slot.gptid, slot.persistent_id_label), ("gptid/synthetic-peer", "GPTID"))
+                self.assertEqual(service._smart_candidate_devices(slot), ["da0"])
+                self.assertFalse(empty.present)
+                self.assertIsNone(empty.pool_name)
+
+    async def test_bay_peer_owned_by_another_api_disk_never_lends_its_pool(self):
+        independent = [
+            {"name": f"da{i}", "serial": f"SANITIZED-INDEPENDENT-{i}", "model": "SAME-MODEL"} for i in range(2)
+        ]
+        separate_bays = self.CORE_MAP
+        # Contradictory SES lists the other disk's path in this bay as well.
+        shared_listing = self.CORE_MAP.replace("Device Names: da0, pass0", "Device Names: da0, da1, pass0")
+        for name, ses_map in (("separate bays", separate_bays), ("shared listing", shared_listing)):
+            with self.subTest(name):
+                service = self.dual_path_service(ses_map, independent)
+                snapshot = await service.get_snapshot()
+                by_serial = {slot.serial: slot for slot in snapshot.slots if slot.serial}
+                self.assertIsNone(by_serial["SANITIZED-INDEPENDENT-0"].pool_name)
+                self.assertIsNone(by_serial["SANITIZED-INDEPENDENT-0"].vdev_class)
+                self.assertEqual(by_serial["SANITIZED-INDEPENDENT-1"].pool_name, "tank")
+
+    def test_bay_peers_require_the_bay_to_list_the_disks_own_path(self):
+        service = self.make_service("core", {})
+        disk = service._build_disk_records([{"name": "da0"}], ParsedSSHData(), {}, {})[0]
+        for names, expected in (
+            (["da0", "pass0", "da1"], ["pass0", "da1"]),
+            # A bay that never names this disk lends it nothing.
+            (["da1"], []),
+            ([], []),
+            (None, []),
+        ):
+            with self.subTest(names=names):
+                self.assertEqual(inventory_module._bay_peer_devices({"device_names": names}, disk, {}), expected)
+        self.assertEqual(inventory_module._bay_peer_devices({"device_names": ["da0", "da1"]}, None, {}), [])
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
