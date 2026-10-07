@@ -1201,6 +1201,7 @@ class InventoryService:
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
+        self._core_ses_enclosure_id_cache: tuple[list[Any], dict[tuple[str | None, str], str]] | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
 
     @property
@@ -13198,12 +13199,12 @@ class InventoryService:
                 if isinstance(target, dict) and normalize_text(target.get("ses_device", ""))
             )
         )
-        if self.system.truenas.platform == "core":
-            enclosure_ids = _ses_device_enclosure_ids(ssh_data.ses_enclosures)
+        if self.system.truenas.platform == "core" and len(ses_targets) > 1:
+            device_enclosure_ids = self._core_ses_device_enclosure_ids(ssh_data)
             for target in ses_targets:
-                enclosure_id = enclosure_ids.get((normalize_text(target.get("ssh_host")), target["ses_device"]))
-                if enclosure_id:
-                    target["enclosure_id"] = enclosure_id
+                target_enclosure_id = device_enclosure_ids.get((normalize_text(target.get("ssh_host")), target["ses_device"]))
+                if target_enclosure_id:
+                    target["enclosure_id"] = target_enclosure_id
         core_ses_target_invalid = bool(
             self.system.truenas.platform == "core"
             and _core_identify_target(ses_targets) is None
@@ -13577,6 +13578,14 @@ class InventoryService:
         if timeout_seconds is None:
             return await ssh_probe.run_command(command)
         return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
+
+    def _core_ses_device_enclosure_ids(self, ssh_data: ParsedSSHData) -> dict[tuple[str | None, str], str]:
+        # Built once per parsed snapshot, not once per bay: the map walks every SES enclosure.
+        enclosures = ssh_data.ses_enclosures
+        cached = self._core_ses_enclosure_id_cache
+        if cached is None or cached[0] is not enclosures:
+            cached = self._core_ses_enclosure_id_cache = (enclosures, _ses_device_enclosure_ids(enclosures))
+        return cached[1]
 
     def _ssh_destination_authority_approved(self, host: str | None = None) -> bool:
         if host is None:
