@@ -20,8 +20,9 @@ import paramiko
 
 from tests.test_ssh_session_reuse import HOST, OTHER_HOST, _fake_ssh_client, _service
 
-from app.config import SSHConfig
+from app.config import PathConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig
 from app.services import ssh_probe as ssh_probe_module
+from app.services.inventory_registry import InventoryRegistry
 from app.services.ssh_probe import SSH_CONNECTION_IDLE_SECONDS, SSHProbe
 
 
@@ -207,6 +208,37 @@ class KeptConnectionTests(unittest.TestCase):
 
         self.assertIsNone(probe._idle)
         clients[0].close.assert_called()
+
+
+class RegistryReuseScopeTests(unittest.TestCase):
+    """Only the app's long-lived registry keeps connections; per-request registries do not."""
+
+    def _settings(self, root: str) -> Settings:
+        return Settings(
+            systems=[SystemConfig(id="a", truenas=TrueNASConfig(platform="linux"), ssh=_config())],
+            default_system_id="a",
+            paths=PathConfig(
+                mapping_file=f"{root}/mappings.json",
+                sas_fabric_alias_file=f"{root}/aliases.json",
+                slot_detail_cache_file=f"{root}/slot_detail_cache.json",
+                profile_file=f"{root}/profiles.yaml",
+                log_file=f"{root}/app.log",
+            ),
+        )
+
+    def test_the_app_registry_keeps_connections(self) -> None:
+        from app.route_support import _build_inventory_registry
+        from app.settings_reload import SettingsGeneration
+
+        with tempfile.TemporaryDirectory() as root:
+            registry = _build_inventory_registry(SettingsGeneration(1, self._settings(root)))
+            self.assertEqual(registry.get_service("a").ssh_probe.idle_seconds, SSH_CONNECTION_IDLE_SECONDS)
+
+    def test_a_registry_built_per_request_closes_each_connection(self) -> None:
+        # The admin storage-view routes build one of these per request.
+        with tempfile.TemporaryDirectory() as root:
+            registry = InventoryRegistry(self._settings(root))
+            self.assertEqual(registry.get_service("a").ssh_probe.idle_seconds, 0)
 
 
 class InventoryKeepsOneProbePerHostTests(unittest.IsolatedAsyncioTestCase):
