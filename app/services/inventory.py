@@ -2616,7 +2616,10 @@ class InventoryService:
         reasons = self._candidate_match_reasons(storage_view, candidate)
         if storage_view.binding.mode == "auto":
             return bool(reasons)
-        if storage_view.binding.mode == "pool":
+        # "Pool" is pool-only once the view names a pool. One that names none
+        # can match only on its saved drive hints, so use them rather than
+        # leave every slot empty.
+        if storage_view.binding.mode == "pool" and any(normalize_text(name) for name in storage_view.binding.pool_names):
             return "pool" in reasons
         if storage_view.binding.mode == "serial":
             return bool([reason for reason in reasons if reason in {"serial", "device", "pcie"}])

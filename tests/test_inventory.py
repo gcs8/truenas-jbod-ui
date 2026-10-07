@@ -21258,14 +21258,38 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
             label="Tank",
             kind="manual",
             template_id="manual",
-            binding=StorageViewBindingConfig(mode="pool"),
+            binding=StorageViewBindingConfig(mode="pool", pool_names=["tank"]),
         )
         auto_view = pool_view.model_copy(update={"binding": StorageViewBindingConfig(mode="auto")})
+        # The admin form offers "Pool" for boot and NVMe views but no pool field.
+        unnamed_pool_view = pool_view.model_copy(
+            update={"binding": StorageViewBindingConfig(mode="pool", pool_names=["  "])}
+        )
 
         with patch.object(service, "_candidate_match_reasons", return_value=["serial", "device"]):
             self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
             self.assertTrue(service._candidate_matches_storage_view(auto_view, {}))
+            self.assertTrue(service._candidate_matches_storage_view(unnamed_pool_view, {}))
         with patch.object(service, "_candidate_match_reasons", return_value=["pool", "serial"]):
             self.assertTrue(service._candidate_matches_storage_view(pool_view, {}))
         with patch.object(service, "_candidate_match_reasons", return_value=[]):
             self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
+            self.assertFalse(service._candidate_matches_storage_view(unnamed_pool_view, {}))
+
+    def test_pool_bound_boot_view_without_a_pool_name_places_its_saved_drives(self) -> None:
+        service = object.__new__(InventoryService)
+        storage_view = StorageViewConfig.model_validate({
+            "id": "boot-doms",
+            "label": "Boot SATADOMs",
+            "kind": "boot_devices",
+            "template_id": "satadom-pair-2",
+            "binding": {"mode": "pool", "serials": ["SER-B", "SER-A"], "device_names": ["ada1", "ada0"]},
+        })
+        candidates = [
+            {"candidate_id": f"disk-{name[-1]}", "device_names": [name], "serial": serial, "pool_name": "boot-pool"}
+            for name, serial in (("ada0", "SER-A"), ("ada1", "SER-B"), ("ada2", "SER-OTHER"))
+        ]
+
+        ordered = service._ordered_storage_view_candidates(storage_view, candidates, set())
+
+        self.assertEqual([candidate["candidate_id"] for candidate in ordered], ["disk-1", "disk-0"])
