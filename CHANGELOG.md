@@ -280,6 +280,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Restored the drives in a boot or NVMe storage view saved with "Match drives
+  by: Pool" but no pool name. It matched nothing after "Pool" became pool-only,
+  so every slot showed empty. Such a view now matches its saved serials and
+  device names; a view that names a pool stays pool-only. (#903)
 - Restored pool, vdev and GPT label on a dual-path CORE disk that the disk
   table lists on one path while its pool member sits on the other. The other
   path now comes from the same bay in `sesutil map`, not from matching CAM
