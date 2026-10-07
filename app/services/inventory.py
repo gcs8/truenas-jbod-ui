@@ -3333,7 +3333,8 @@ class InventoryService:
         ]
 
     def _resolve_esxi_storcli_forms(self, command_results: list[SSHCommandResult]) -> list[SSHCommandResult]:
-        """Keep one result per StorCLI read: the form that answered, else the one tried first.
+        """Keep one result per StorCLI read: the form that answered, else a failed form so the refresh
+        still warns (ESXi 8 before its reboot: the binary prints XML, the plugin is missing), else the first.
 
         The answering form is remembered, so the next refresh tries it first.
         """
@@ -3345,7 +3346,9 @@ class InventoryService:
         for attempts in reads.values():
             if len(attempts) < 2:
                 continue
-            keep = next((result for result in attempts if self._storcli_answered(result)), attempts[0])
+            keep = next((result for result in attempts if self._storcli_answered(result)), None) or next(
+                (result for result in attempts if not result.ok), attempts[0]
+            )
             dropped.update(id(result) for result in attempts if result is not keep)
             if self._storcli_answered(keep):
                 self._esxi_storcli_swapped = keep.command not in self.system.ssh.commands

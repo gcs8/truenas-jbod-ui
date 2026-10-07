@@ -15767,6 +15767,42 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                     # The first refresh may try both forms; later ones go straight to the one that answered.
                     self.assertEqual(probe.sessions[-1], ["esxcli software vib list", expected])
 
+    async def test_esxi_storcli_keeps_the_failed_form_when_neither_returns_json(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0 show all J"
+        plugin = "esxcli storcli controller show all --id=0 --json --nolog"
+        vib = "esxcli software vib list"
+        answers = {
+            vib: SSHCommandResult(command=vib, ok=True, stdout="storcli 007.2414.0000.0000-01 BCM\n", exit_code=0),
+            # ESXi 8 before its post-install reboot: the binary prints XML, the plugin is not registered yet.
+            binary: SSHCommandResult(command=binary, ok=True, stdout="<?xml version='1.0'?>", exit_code=0),
+            plugin: SSHCommandResult(command=plugin, ok=False, stderr="Error: Unknown namespace storcli", exit_code=1),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi8-pending-reboot",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.32", user="root", commands=[vib, binary]),
+            )
+            probe = AsyncMock()
+
+            async def run_planned_commands(planner, *, initial_commands=None):
+                results: list[SSHCommandResult] = []
+                batch = list(initial_commands or [])
+                while batch:
+                    results.extend(answers[command] for command in batch)
+                    batch = list(planner(list(results)))
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned_commands)
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+            bundle = await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertEqual(set(bundle.ssh_outputs), {vib})
+            self.assertEqual([detail["command"] for detail in bundle.ssh_failure_details], [plugin])
+            self.assertTrue(bundle.warnings)
+            self.assertFalse(service._esxi_storcli_swapped)
+
     async def test_esxi_without_storcli_skips_the_plugin_retry_and_keeps_the_missing_storcli_warning(self) -> None:
         binary = "/opt/lsi/storcli64/storcli64 /c0 show all J"
         with tempfile.TemporaryDirectory() as temp_dir:
