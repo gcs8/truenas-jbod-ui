@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +13,16 @@ from unittest.mock import patch
 from admin_service.services.esxi_host_prep import ESXiHostPrepService
 from app.models.domain import ESXiHostPrepInstallRequest
 from app.services.ssh_probe import SSHCommandResult
+
+# The host-prep executable check, matched verbatim by FakeClient.
+STORCLI_PATH_CHECK = (
+    "if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
+    "printf 'executable\\n'; "
+    "elif [ -f /opt/storcli/bin/storcli64 ] && [ -x /opt/storcli/bin/storcli64 ]; then "
+    "printf 'executable\\n'; "
+    "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
+    "printf 'absent\\n'; else exit 1; fi"
+)
 
 
 class FakeChannel:
@@ -738,10 +749,7 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                     install_command: (0, "Installation Result\nMessage: Operation finished successfully.\n", ""),
                     "esxcli --formatter=csv software component list": (0, 'Name,Version\nBCM-vmware-storcli64,1\n', ""),
                     "esxcli --formatter=csv software vib list": (0, 'Name,Version\nvmware-storcli64,1\n', ""),
-                    ("if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
-                     "printf 'executable\\n'; "
-                     "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
-                     "printf 'absent\\n'; else exit 1; fi"): (0, "executable", ""),
+                    STORCLI_PATH_CHECK: (0, "executable", ""),
                     "/opt/lsi/storcli64/storcli64 show J": (
                         0,
                         "CLI Version = 007.2705.0000.0000\nNumber of Controllers = 0\n",
@@ -800,10 +808,7 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
                     install_command: (0, "Message: Operation finished successfully.\n", ""),
                     "esxcli --formatter=csv software component list": (0, "", ""),
                     "esxcli --formatter=csv software vib list": (0, 'Name,Version\nvmware-storcli64,1\n', ""),
-                    ("if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
-                     "printf 'executable\\n'; "
-                     "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
-                     "printf 'absent\\n'; else exit 1; fi"): (0, "executable", ""),
+                    STORCLI_PATH_CHECK: (0, "executable", ""),
                     "/opt/lsi/storcli64/storcli64 show J": (0, "Number of Controllers = 1\n", ""),
                     "esxcli storage core adapter list": (0, "vmhba2 lsi_mr3\n", ""),
                     "esxcli hardware pci pcipassthru list": (0, "", ""),
@@ -1124,12 +1129,15 @@ class ESXiHostPrepServiceTests(unittest.TestCase):
 class StorCLIVerificationEvidenceTests(unittest.TestCase):
     def verify(self, *, component=(0, 'Name,Version\n', ''), vib=(0, 'Name,Version\n', ''),
                executable=(0, 'absent', ''), show=(127, '', 'storcli64: not found'),
+               plugin=(1, '', 'Error: Unknown command or namespace storcli'),
                pci=(0, '', ''), passthrough=(0, '', '')):
         commands = []
 
         def run(client, command, timeout):
             commands.append(command)
-            if 'component list' in command:
+            if command.startswith('esxcli storcli '):
+                value = plugin
+            elif 'component list' in command:
                 value = component
             elif 'vib list' in command:
                 value = vib
@@ -1221,6 +1229,44 @@ class StorCLIVerificationEvidenceTests(unittest.TestCase):
                     self.assertEqual(summary['controller_count'], count)
                     self.assertEqual(summary['controller_visible'], count > 0)
                     self.assertTrue(summary['storcli_installed'])
+
+    def test_esxi8_plugin_controller_count_proves_installation(self):
+        # Shape read back from an ESXi 8.0.3 host after the StorCLI 007.2414 package and its reboot.
+        ctrlcount = json.dumps({'Controllers': [{
+            'Command Status': {'CLI Version': '007.2414.0000.0000 Mar 17, 2023', 'Operating system': 'VMkernel 8.0.3',
+                               'Status Code': 0, 'Status': 'Success', 'Description': 'None'},
+            'Response Data': {'Controller Count': 1}}]})
+        for output in (ctrlcount, 'Status = Success\n\nController Count = 1\n'):
+            with self.subTest(output=output[:20]):
+                summary, commands = self.verify(executable=(1, '', ''), plugin=(0, output, ''))
+                self.assertEqual(summary['controller_count'], 1)
+                self.assertTrue(summary['controller_visible'])
+                self.assertIs(summary['storcli_installed'], True)
+                self.assertIn('esxcli storcli system show ctrlcount --json --nolog', commands)
+        summary, _ = self.verify(plugin=(0, json.dumps({'Controllers': [{
+            'Command Status': {'Status': 'Failure'}, 'Response Data': {'Controller Count': 1}}]}), ''))
+        self.assertIsNone(summary['controller_count'])
+
+    def test_executable_check_covers_esxi7_and_esxi8_install_paths(self):
+        _, commands = self.verify()
+        path_check = next(command for command in commands if command.startswith('if [ -f '))
+        self.assertIn('/opt/lsi/storcli64/storcli64', path_check)
+        self.assertIn('/opt/storcli/bin/storcli64', path_check)
+
+    def test_install_detail_reports_a_pending_esxi_reboot(self):
+        installed = SSHCommandResult(
+            command='esxcli software component apply -d /tmp/x.zip', ok=True, exit_code=0,
+            stdout=('Installation Result\n   Message: The update completed successfully, but the system needs to be '
+                    'rebooted for the changes to be effective.\n   Components Installed: BCM-storcli_007.2414\n'
+                    '   Reboot Required: true\n'))
+        verification = {'summary': {'detail': 'StorCLI package or executable evidence is present; '
+                                              'controller visibility is unknown.'}}
+        detail = ESXiHostPrepService._build_install_detail({'filename': 'storcli.zip'}, installed, verification)
+        self.assertIn('controller visibility is unknown.', detail)
+        self.assertIn('must reboot before the package takes effect', detail)
+        quiet = ESXiHostPrepService._build_install_detail(
+            {'filename': 'storcli.zip'}, replace(installed, stdout='Reboot Required: false\n'), verification)
+        self.assertNotIn('reboot', quiet)
 
     def test_passthrough_evidence_requires_success_and_does_not_imply_storcli(self):
         pci = '0000:01:00.0 RAID bus controller: Broadcom MegaRAID\n'

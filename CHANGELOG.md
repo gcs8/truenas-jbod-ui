@@ -142,6 +142,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
+- ESXi 8 hosts now show drive details from StorCLI. ESXi 8 only runs StorCLI
+  as `esxcli storcli`, so the app retries each StorCLI command in that form
+  and uses whichever form the host answers on later refreshes. ESXi 7 keeps
+  the direct command, and saved command lists need no edit. Host Prep also
+  recognizes the ESXi 8 package and says when the host must reboot. (#908)
 
 ### Changed
 

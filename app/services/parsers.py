@@ -3731,6 +3731,51 @@ TRAILING_CASEFOLDED_SSH_COMMAND_PREFIXES = {
     ("nvme", ("list", "-o", "json")): "nvme list -o json",
 }
 SIMPLE_SSH_EXECUTABLES = {"lspci": "lspci"}
+# ESXi 8 runs StorCLI only through its esxcli plugin (`esxcli storcli ...`); ESXi 7
+# runs the binary. Both print the same JSON, so both forms share one parser key.
+ESXI_STORCLI_BINARY = "/opt/lsi/storcli64/storcli64"
+ESXCLI_STORCLI_SCOPES = {
+    "controller": ("", ()),
+    "virtualdrive": ("/vall", ("vid",)),
+    "physicaldrive": ("/eall/sall", ("eid", "sid")),
+}
+ESXCLI_STORCLI_SHORT_OPTIONS = {"-i": "id", "-v": "vid", "-e": "eid", "-s": "sid"}
+
+
+def _esxcli_storcli_key(args: list[str]) -> str | None:
+    """`esxcli storcli <noun> show all --id=N [--vid/--eid/--sid=all] --json` -> `storcli /cN<scope> show all J`."""
+    if len(args) < 4 or args[0] != "storcli" or args[2:4] != ["show", "all"] or args[1] not in ESXCLI_STORCLI_SCOPES:
+        return None
+    scope, selectors = ESXCLI_STORCLI_SCOPES[args[1]]
+    options: dict[str, str] = {}
+    tokens = iter(args[4:])
+    for token in tokens:
+        if token in {"--json", "--nolog"}:
+            options[token[2:]] = ""
+        elif token.startswith("--") and "=" in token:
+            name, _, value = token[2:].partition("=")
+            options[name] = value
+        else:
+            options[ESXCLI_STORCLI_SHORT_OPTIONS.get(token, token.lstrip("-"))] = next(tokens, "")
+    controller = options.get("id", "").lower()
+    if "json" not in options or not re.fullmatch(r"\d+|all", controller) or any(
+        options.get(selector, "").lower() != "all" for selector in selectors
+    ):
+        return None
+    return f"storcli /c{controller}{scope} show all J"
+
+
+def esxi_storcli_fallback_command(command: str) -> str | None:
+    """The same StorCLI read in the other ESXi form (esxcli plugin <-> binary), or None if `command` is not one."""
+    match = re.fullmatch(r"storcli /c(\d+|all)(/vall|/eall/sall)? show all J", canonicalize_ssh_command(command))
+    if not match:
+        return None
+    controller, scope = match.group(1), match.group(2) or ""
+    if command.split()[0].rsplit("/", 1)[-1] == "esxcli":
+        return f"{ESXI_STORCLI_BINARY} /c{controller}{scope} show all J"
+    noun, selectors = next((noun, names) for noun, (at, names) in ESXCLI_STORCLI_SCOPES.items() if at == scope)
+    selector_flags = (f"--{name}=all" for name in selectors)
+    return " ".join(["esxcli storcli", noun, "show all", f"--id={controller}", *selector_flags, "--json --nolog"])
 
 
 def _lookup_simple_ssh_command(executable: str, args: list[str]) -> str | None:
@@ -3790,6 +3835,8 @@ def canonicalize_ssh_command(command: str) -> str:
     simple_command = _lookup_simple_ssh_command(executable, args)
     if simple_command:
         return simple_command
+    if executable == "esxcli" and (storcli_key := _esxcli_storcli_key(args)):
+        return storcli_key
     if executable == "zpool" and args[:1] == ["status"]:
         return "zpool status -gP" if "-gP" in args[1:] else "zpool status"
     if executable == "camcontrol" and args[:1] == ["devlist"]:

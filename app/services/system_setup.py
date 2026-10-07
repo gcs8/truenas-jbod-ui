@@ -125,7 +125,11 @@ _PLATFORM_SETUP_REQUIREMENTS: dict[str, dict[str, object]] = {
         "optional": (
             "Management controller (BMC) access for chassis and drive lights.",
         ),
-        "guidance": "If StorCLI shows your controller as something other than /c0, change /c0 in the SSH commands (to /cN or /call) before saving.",
+        "guidance": (
+            "If StorCLI shows your controller as something other than /c0, change /c0 in the SSH commands "
+            "(to /cN or /call) before saving. The same commands work on ESXi 7 and 8: on ESXi 8 the app runs "
+            "them through esxcli storcli, which needs a host reboot after installing StorCLI."
+        ),
     },
     "ipmi": {
         "summary": "Uses only the server's management controller (BMC / IPMI). Pick a chassis layout so empty bays can be drawn.",

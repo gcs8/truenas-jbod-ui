@@ -15713,6 +15713,92 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(truenas_client.fetch_all_calls, 1)
             self.assertIs(first, second)
 
+    async def test_esxi_storcli_reads_follow_the_host_esxi_version(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J"
+        plugin = "esxcli storcli physicaldrive show all --id=0 --eid=all --sid=all --json --nolog"
+        drives = json.dumps({"Controllers": [{"Command Status": {"Status": "Success"}, "Response Data": {
+            "Drive Information": [{"EID:Slt": "252:2", "State": "JBOD"}]}}]})
+        storcli_vib = "storcli 007.2414.0000.0000-01 BCM PartnerSupported\n"
+
+        class HostProbe:
+            def __init__(self, answers: dict[str, tuple[int, str]]) -> None:
+                self.answers = answers
+                self.sessions: list[list[str]] = []
+
+            async def run_planned_commands(self, planner, *, initial_commands=None):
+                results: list[SSHCommandResult] = []
+                session: list[str] = []
+                batch = list(initial_commands or [])
+                while batch:
+                    session.extend(batch)
+                    for command in batch:
+                        code, stdout = self.answers.get(command, (127, ""))
+                        results.append(SSHCommandResult(command=command, ok=code == 0, stdout=stdout, exit_code=code))
+                    batch = list(planner(list(results)))
+                self.sessions.append(session)
+                return results
+
+        vib = {"esxcli software vib list": (0, storcli_vib)}
+        hosts = {
+            # ESXi 8 blocks the binary path and prints XML for a direct call.
+            "esxi8": ({**vib, binary: (0, "<?xml version='1.0'?>"), plugin: (0, drives)}, plugin),
+            "esxi7": ({**vib, binary: (0, drives), plugin: (1, "")}, binary),
+        }
+        for name, (answers, expected) in hosts.items():
+            for configured in (binary, plugin):
+                with self.subTest(host=name, configured=configured), tempfile.TemporaryDirectory() as temp_dir:
+                    system = SystemConfig(
+                        id=name,
+                        truenas=TrueNASConfig(platform="esxi"),
+                        ssh=SSHConfig(enabled=True, host="192.0.2.30", user="root",
+                                      commands=["esxcli software vib list", configured]),
+                    )
+                    probe = HostProbe(answers)
+                    service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+                    for _refresh in range(2):
+                        bundle = await service._get_inventory_source_bundle(force_refresh=True)
+                        self.assertEqual(set(bundle.ssh_outputs), {"esxcli software vib list", expected})
+                        self.assertEqual(bundle.ssh_failure_details, [])
+                        self.assertEqual(
+                            parse_ssh_outputs(bundle.ssh_outputs, 8, None).esxi_storcli_physical_drives[0]["slot_key"],
+                            "252:2",
+                        )
+                    # The first refresh may try both forms; later ones go straight to the one that answered.
+                    self.assertEqual(probe.sessions[-1], ["esxcli software vib list", expected])
+
+    async def test_esxi_without_storcli_skips_the_plugin_retry_and_keeps_the_missing_storcli_warning(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0 show all J"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-no-storcli",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.31", user="root",
+                              commands=["vmware -v", "esxcli software vib list", binary]),
+            )
+            probe = AsyncMock()
+
+            async def run_planned_commands(planner, *, initial_commands=None):
+                results = [
+                    SSHCommandResult(command="vmware -v", ok=True, stdout="VMware ESXi 8.0.3 build-24022510",
+                                     exit_code=0),
+                    SSHCommandResult(command="esxcli software vib list", ok=True,
+                                     stdout="lsi-mr3 7.728.02.00-1OEM BCM VMwareCertified\n", exit_code=0),
+                    SSHCommandResult(command=binary, ok=False, stderr="sh: storcli64: not found", exit_code=127),
+                ]
+                self.assertEqual(list(initial_commands), ["vmware -v", "esxcli software vib list", binary])
+                self.assertEqual(planner(results), [])
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned_commands)
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+            bundle = await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertEqual(len(bundle.warnings), 1)
+            self.assertIn("install the Broadcom StorCLI VIB", bundle.warnings[0])
+            self.assertIn("ESXi 8 needs Broadcom's ESXi 8 StorCLI package and a host reboot", bundle.warnings[0])
+
     async def test_inventory_ssh_payload_batches_dynamic_enrichment_without_single_command_calls(self) -> None:
         class DummySSHProbe:
             def __init__(self) -> None:

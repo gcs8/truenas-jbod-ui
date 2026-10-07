@@ -13,6 +13,7 @@ from app.services.parsers import (
     SESMapSlot,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    esxi_storcli_fallback_command,
     merge_slot_candidate_maps,
     normalize_device_name,
     parse_camcontrol_devlist,
@@ -510,6 +511,43 @@ Additional element status diagnostic page:
             "storcli /c0/eall/sall show all J",
         )
 
+    def test_esxi8_storcli_plugin_reads_share_the_binary_parser_keys(self) -> None:
+        for command, key in (
+            ("esxcli storcli controller show all --id=0 --json --nolog", "storcli /c0 show all J"),
+            ("esxcli storcli virtualdrive show all --id=1 --vid=all --json", "storcli /c1/vall show all J"),
+            ("esxcli storcli physicaldrive show all -i 0 -e all -s all --json", "storcli /c0/eall/sall show all J"),
+            ("esxcli storcli physicaldrive show all --id all --eid all --sid all --json",
+             "storcli /call/eall/sall show all J"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(canonicalize_ssh_command(command), key)
+        for command in (
+            "esxcli storcli controller show all --id=0",  # text output, not JSON
+            "esxcli storcli controller show all --json",  # no controller
+            "esxcli storcli physicaldrive show all --id=0 --sid=all --json",  # one enclosure only
+            "esxcli storcli virtualdrive show all --id=0 --vid=0 --json",  # one drive only
+            "esxcli storcli system show ctrlcount --json",
+        ):
+            with self.subTest(command=command):
+                self.assertNotRegex(canonicalize_ssh_command(command), r"^storcli /c")
+
+    def test_esxi_storcli_fallback_command_swaps_between_binary_and_plugin(self) -> None:
+        pairs = (
+            ("/opt/lsi/storcli64/storcli64 /c0 show all J", "esxcli storcli controller show all --id=0 --json --nolog"),
+            ("/opt/lsi/storcli64/storcli64 /c1/vall show all J",
+             "esxcli storcli virtualdrive show all --id=1 --vid=all --json --nolog"),
+            ("/opt/lsi/storcli64/storcli64 /call/eall/sall show all J",
+             "esxcli storcli physicaldrive show all --id=all --eid=all --sid=all --json --nolog"),
+        )
+        for binary, plugin in pairs:
+            with self.subTest(binary=binary):
+                self.assertEqual(esxi_storcli_fallback_command(binary), plugin)
+                self.assertEqual(esxi_storcli_fallback_command(plugin), binary)
+                self.assertEqual(canonicalize_ssh_command(binary), canonicalize_ssh_command(plugin))
+        for command in ("esxcli storage core device list", "/opt/lsi/storcli64/storcli64 show J", "vmware -v"):
+            with self.subTest(command=command):
+                self.assertIsNone(esxi_storcli_fallback_command(command))
+
     def test_parse_esxi_storcli_json_maps_physical_members(self) -> None:
         virtual_drives = """
 {
@@ -597,6 +635,16 @@ Additional element status diagnostic page:
             slot_count=2,
             enclosure_filter=None,
         )
+        plugin_parsed = parse_ssh_outputs(
+            {
+                "esxcli storcli virtualdrive show all --id=0 --vid=all --json --nolog": virtual_drives,
+                "esxcli storcli physicaldrive show all --id=0 --eid=all --sid=all --json --nolog": physical_drives,
+            },
+            slot_count=2,
+            enclosure_filter=None,
+        )
+        self.assertEqual(plugin_parsed.esxi_storcli_virtual_drives, parsed.esxi_storcli_virtual_drives)
+        self.assertEqual(plugin_parsed.esxi_storcli_physical_drives, parsed.esxi_storcli_physical_drives)
 
         self.assertEqual(parsed.esxi_storcli_virtual_drives[0]["name"], "ESXi")
         self.assertEqual(parsed.esxi_storcli_virtual_drives[0]["physical_drives"][0]["slot_key"], "13:0")
