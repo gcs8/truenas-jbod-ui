@@ -3774,8 +3774,9 @@ def esxi_storcli_fallback_command(command: str) -> str | None:
     if command.split()[0].rsplit("/", 1)[-1] == "esxcli":
         return f"{ESXI_STORCLI_BINARY} /c{controller}{scope} show all J"
     noun, selectors = next((noun, names) for noun, (at, names) in ESXCLI_STORCLI_SCOPES.items() if at == scope)
-    selector_flags = (f"--{name}=all" for name in selectors)
-    return " ".join(["esxcli storcli", noun, "show all", f"--id={controller}", *selector_flags, "--json --nolog"])
+    # Broadcom's ESXi 8 readme lists plugin options alphabetically; emit them in that order.
+    options = sorted([f"--id={controller}", *(f"--{name}=all" for name in selectors), "--json", "--nolog"])
+    return " ".join(["esxcli storcli", noun, "show all", *options])
 
 
 def _lookup_simple_ssh_command(executable: str, args: list[str]) -> str | None:

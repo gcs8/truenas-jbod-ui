@@ -15715,7 +15715,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_esxi_storcli_reads_follow_the_host_esxi_version(self) -> None:
         binary = "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J"
-        plugin = "esxcli storcli physicaldrive show all --id=0 --eid=all --sid=all --json --nolog"
+        plugin = "esxcli storcli physicaldrive show all --eid=all --id=0 --json --nolog --sid=all"
         drives = json.dumps({"Controllers": [{"Command Status": {"Status": "Success"}, "Response Data": {
             "Drive Information": [{"EID:Slt": "252:2", "State": "JBOD"}]}}]})
         storcli_vib = "storcli 007.2414.0000.0000-01 BCM PartnerSupported\n"

@@ -535,9 +535,9 @@ Additional element status diagnostic page:
         pairs = (
             ("/opt/lsi/storcli64/storcli64 /c0 show all J", "esxcli storcli controller show all --id=0 --json --nolog"),
             ("/opt/lsi/storcli64/storcli64 /c1/vall show all J",
-             "esxcli storcli virtualdrive show all --id=1 --vid=all --json --nolog"),
+             "esxcli storcli virtualdrive show all --id=1 --json --nolog --vid=all"),
             ("/opt/lsi/storcli64/storcli64 /call/eall/sall show all J",
-             "esxcli storcli physicaldrive show all --id=all --eid=all --sid=all --json --nolog"),
+             "esxcli storcli physicaldrive show all --eid=all --id=all --json --nolog --sid=all"),
         )
         for binary, plugin in pairs:
             with self.subTest(binary=binary):
