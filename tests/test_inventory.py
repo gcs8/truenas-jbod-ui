@@ -17240,27 +17240,30 @@ Consumers:
 """
         for i in range(2)
     )
-    PEER_POOL = [{"name": "tank", "topology": {"data": [], "special": [{
-        "type": "MIRROR", "name": "mirror-0", "children": [
-            {"type": "DISK", "path": "/dev/gptid/synthetic-peer", "disk": "da1", "status": "ONLINE"},
-        ],
-    }]}}]
+    # pool.query may name the member by its GPT path or only by its disk.
+    PEER_LEAVES = {
+        "gptid path": {"path": "/dev/gptid/synthetic-peer", "disk": "da1"},
+        "disk only": {"disk": "da1"},
+    }
 
-    def dual_path_service(self, ses_map, disks):
+    def dual_path_service(self, ses_map, disks, leaf=PEER_LEAVES["gptid path"]):
+        pools = [{"name": "tank", "topology": {"data": [], "special": [{
+            "type": "MIRROR", "name": "mirror-0", "children": [{"type": "DISK", "status": "ONLINE", **leaf}],
+        }]}}]
         return self.make_service("core", {
             "camcontrol devlist -v": "\n".join(self.CAM_ROWS),
             "sesutil map": ses_map,
             "glabel status": "gptid/synthetic-peer  N/A  da1p1\n",
-        }, disks, pools=self.PEER_POOL)
+        }, disks, pools=pools)
 
     async def test_dual_path_bay_takes_pool_membership_from_its_other_ses_path(self):
-        for reverse in (False, True):
-            with self.subTest(reverse=reverse):
+        for reverse, (leaf_name, leaf) in itertools.product((False, True), self.PEER_LEAVES.items()):
+            with self.subTest(reverse=reverse, leaf=leaf_name):
                 ses_map = self.DUAL_PATH_MAP
                 if reverse:
                     first, second = ses_map.split("ses1:")
                     ses_map = "ses1:" + second + first
-                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}])
+                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}], leaf)
                 snapshot = await service.get_snapshot()
                 self.assertEqual(snapshot.summary.source_disk_count, 1)
                 slot, empty = snapshot.slots

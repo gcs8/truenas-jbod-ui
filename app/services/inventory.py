@@ -13023,6 +13023,7 @@ class InventoryService:
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
             if zpool := self._lookup_zpool_member(None, peer, peer_gptid, ssh_data, api_topology_members):
+                gptid = gptid or peer_gptid
                 break
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
         if not model and device_name:
