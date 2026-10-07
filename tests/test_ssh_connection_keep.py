@@ -152,6 +152,22 @@ class KeptConnectionTests(unittest.TestCase):
         self.assertEqual(len(clients), 2)
         clients[0].close.assert_called_once()
 
+    def test_a_kept_connection_that_aged_out_while_idle_is_not_handed_out(self, ssh_client_cls: MagicMock) -> None:
+        clients = _clients(ssh_client_cls)
+        probe = SSHProbe(_config(), idle_seconds=60)
+        self.addCleanup(probe.close_idle)
+
+        probe._run_commands_sync(["a"])
+        self.assertIsNotNone(probe._idle)
+        # It was young when kept; the age limit passes before the next call.
+        with patch.object(ssh_probe_module, "SSH_CONNECTION_MAX_AGE_SECONDS", 0):
+            probe._run_planned_commands_sync(lambda _r: [], ["b"])
+
+        self.assertEqual(len(clients), 2)
+        clients[0].close.assert_called_once()
+        self.assertEqual(clients[0].exec_command.call_count, 1)
+        self.assertEqual(clients[1].exec_command.call_args.args[0], "b")
+
     def test_overlapping_calls_never_share_one_connection(self, ssh_client_cls: MagicMock) -> None:
         clients = _clients(ssh_client_cls)
         probe = SSHProbe(_config(), idle_seconds=60)

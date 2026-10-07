@@ -314,17 +314,19 @@ class SSHProbe:
             return None
         client, timer = idle
         timer.cancel()
-        transport = client.get_transport()
-        if transport is not None and transport.is_active():
+        if self._reusable(client):
             return client
         self._close(client)
         return None
 
-    def _keep_idle(self, client: paramiko.SSHClient, cancellation: _WorkerCancellation) -> bool:
+    def _reusable(self, client: paramiko.SSHClient) -> bool:
+        """Still connected and young enough; checked both when kept and when handed out."""
         transport = client.get_transport()
         age = time.monotonic() - self._opened_at.get(id(client), float("-inf"))
-        if (self.idle_seconds <= 0 or age >= SSH_CONNECTION_MAX_AGE_SECONDS or cancellation.cancelled.is_set()
-                or transport is None or not transport.is_active()):
+        return transport is not None and transport.is_active() and age < SSH_CONNECTION_MAX_AGE_SECONDS
+
+    def _keep_idle(self, client: paramiko.SSHClient, cancellation: _WorkerCancellation) -> bool:
+        if self.idle_seconds <= 0 or cancellation.cancelled.is_set() or not self._reusable(client):
             return False
         timer = threading.Timer(self.idle_seconds, self._expire_idle, args=(client,))
         timer.daemon = True
