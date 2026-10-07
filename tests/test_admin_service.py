@@ -4304,7 +4304,10 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
              "isVirtualInterface": False},
             {"name": "eno1:gm", "storageSystemId": "node-b", "ipAddress": "192.0.2.40", "gateway": "192.0.2.1",
              "isVirtualInterface": True, "isVirtualPort": True},
-            {"name": "eno1", "storageSystemId": "node-b", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"},
+            {"name": "bond0.1337:hab0", "storageSystemId": "node-b", "ipAddress": "192.0.2.41", "gateway": "192.0.2.1",
+             "isVirtualInterface": True, "isVirtualPort": True},
+            {"name": "bond0.1337", "storageSystemId": "node-b", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1",
+             "isVirtualInterface": False, "isVirtualPort": True, "isVlan": True},
             {"name": "ens192", "storageSystemId": "helper-vm", "ipAddress": "198.51.100.30", "gateway": "198.51.100.1"},
         ]
         for typed, expected in (({}, ["192.0.2.30", "192.0.2.31"]), ({"node-a": "192.0.2.130"}, ["192.0.2.130", "192.0.2.31"])):

@@ -10388,8 +10388,9 @@ class InventoryService:
 
     @classmethod
     def _extract_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> str | None:
-        # A virtual port (eno1:gm, an HA VIP) floats between nodes; only a physical one names its node.
-        if row.get("isVirtualInterface") is True or row.get("isVirtualPort") is True:
+        # An alias interface (eno1:gm, an HA VIP) floats between nodes. isVirtualPort also marks
+        # bonds and VLANs, which stay on their node and may carry its only default route.
+        if row.get("isVirtualInterface") is True:
             return None
         if not cls._quantastor_network_port_has_default_gateway(row):
             return None

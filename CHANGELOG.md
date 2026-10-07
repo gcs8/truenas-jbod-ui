@@ -281,10 +281,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - "Load Nodes From Quantastor API" now fills each HA node's SSH address from
-  QuantaStor's port list: the node's physical port with a default gateway,
-  never the grid VIP. Before, a grid whose nodes were all blank never got
-  addresses and showed "no QuantaStor node address" twice. An address you type
-  still wins, for example after a rebuild. (#905)
+  QuantaStor's port list: the node's own port, bond or VLAN with a default
+  gateway, never the grid VIP or another floating alias. Before, a grid whose
+  nodes were all blank never got addresses and showed "no QuantaStor node
+  address" twice. An address you type still wins, for example after a
+  rebuild. (#905)
 - Restored Identify on every bay of a dual-path TrueNAS CORE shelf. Each bay
   is listed once per path, which looked like an ambiguous bay and turned
   Identify off. Paths that name the same element in the same enclosure now
