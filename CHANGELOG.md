@@ -280,6 +280,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- "Load Nodes From Quantastor API" now fills each HA node's SSH address from
+  QuantaStor's port list: the node's physical port with a default gateway,
+  never the grid VIP. Before, a grid whose nodes were all blank never got
+  addresses and showed "no QuantaStor node address" twice. An address you type
+  still wins, for example after a rebuild. (#905)
 - Restored the drives in a boot or NVMe storage view saved with "Match drives
   by: Pool" but no pool name. It matched nothing after "Pool" became pool-only,
   so every slot showed empty. Such a view now matches its saved serials and
