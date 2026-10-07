@@ -280,6 +280,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Restored pool, vdev and GPT label on a dual-path CORE disk that the disk
+  table lists on one path while its pool member sits on the other. The other
+  path now comes from the same bay in `sesutil map`, not from matching CAM
+  model, target and LUN across HBAs. (#902)
 - Gave a TrueNAS inventory read four times `TRUENAS_TIMEOUT`, 60 seconds by
   default, so a large CORE shelf whose SMART test history takes longer than
   one call's timeout no longer fails every refresh. LED and single-disk SMART
