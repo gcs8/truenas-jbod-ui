@@ -17295,6 +17295,24 @@ Consumers:
                 self.assertIsNone(by_serial["SANITIZED-INDEPENDENT-0"].vdev_class)
                 self.assertEqual(by_serial["SANITIZED-INDEPENDENT-1"].pool_name, "tank")
 
+    async def test_multipath_core_bay_identifies_its_one_element_over_one_path(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                ses_map = self.DUAL_PATH_MAP
+                if reverse:
+                    first, second = ses_map.split("ses1:")
+                    ses_map = "ses1:" + second + first
+                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}])
+                slot = (await service.get_snapshot()).slots[0]
+                self.assertEqual(sorted(t["ses_device"] for t in slot.ssh_ses_targets), ["/dev/ses0", "/dev/ses1"])
+                self.assertEqual((slot.led_supported, slot.led_backend, slot.led_reason), (True, "ssh", None))
+
+                await service.set_slot_led(slot.slot, LedAction.identify, invalidate_snapshot=False)
+
+                service._run_ssh_command.assert_awaited_once_with(
+                    f"sudo -n /usr/sbin/sesutil locate -u {slot.ssh_ses_targets[0]['ses_device']} 7 on", None
+                )
+
     def test_bay_peers_require_the_bay_to_list_the_disks_own_path(self):
         service = self.make_service("core", {})
         disk = service._build_disk_records([{"name": "da0"}], ParsedSSHData(), {}, {})[0]
@@ -17353,6 +17371,84 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
             self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
+
+    async def test_core_multipath_bay_needs_one_element_in_one_known_enclosure_for_identify(self) -> None:
+        def shelf(device, enclosure_id):
+            return SESMapEnclosure(ses_device=device, ses_devices=[device], enclosure_id=enclosure_id)
+
+        targets = [{"ses_device": "/dev/ses0", "ses_element_id": 7}, {"ses_device": "/dev/ses1", "ses_element_id": 7}]
+        cases = {
+            "both paths, one enclosure": (targets, [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a")], True),
+            "two enclosures": (targets, [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-b")], False),
+            "one path's enclosure unknown": (targets, [shelf("/dev/ses0", "shelf-a")], False),
+            "no enclosure IDs": (targets, [shelf("/dev/ses0", None), shelf("/dev/ses1", None)], False),
+            "two elements, one enclosure": (
+                [targets[0], {**targets[1], "ses_element_id": 8}],
+                [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a")],
+                False,
+            ),
+            "device reports two enclosures": (
+                targets,
+                [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a"), shelf("/dev/ses1", "shelf-b")],
+                False,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="core-multipath", truenas=TrueNASConfig(platform="core"), ssh=SSHConfig(enabled=True))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+            )
+            for name, (ses_targets, enclosures, allowed) in cases.items():
+                with self.subTest(name):
+                    service._run_ssh_command.reset_mock()
+                    slot = service._build_slot_view(
+                        slot=0, row_index=0, column_index=0,
+                        # A combined front+rear view keeps its own scope; target IDs never replace it.
+                        enclosure_meta={"id": "front+rear"},
+                        raw_slot_status={"ses_targets": ses_targets},
+                        disk=None, mapping=None,
+                        ssh_data=ParsedSSHData(ses_enclosures=enclosures),
+                        api_topology_members={}, api_enclosure_ids=set(),
+                    )
+                    self.assertEqual(slot.enclosure_id, "front+rear")
+                    self.assertEqual(slot.led_supported, allowed)
+                    if not allowed:
+                        self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
+                        # The locate path rechecks the targets it is given, too.
+                        slot.led_supported, slot.led_backend = True, "ssh"
+                        with self.assertRaisesRegex(TrueNASAPIError, "not tied to exactly one enclosure element"):
+                            await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                        service._run_ssh_command.assert_not_awaited()
+                        continue
+                    await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                    service._run_ssh_command.assert_awaited_once_with(
+                        "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None
+                    )
+
+    def test_core_ses_enclosure_map_is_built_once_per_snapshot_and_only_for_multipath_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="core-map-once", truenas=TrueNASConfig(platform="core"), ssh=SSHConfig(enabled=True))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            two = [{"ses_device": "/dev/ses0", "ses_element_id": 7}, {"ses_device": "/dev/ses1", "ses_element_id": 7}]
+            one = two[:1]
+
+            def build(ssh_data, targets):
+                return service._build_slot_view(
+                    slot=0, row_index=0, column_index=0, enclosure_meta={"id": "shelf-a"},
+                    raw_slot_status={"ses_targets": [dict(target) for target in targets]},
+                    disk=None, mapping=None, ssh_data=ssh_data, api_topology_members={}, api_enclosure_ids=set(),
+                )
+
+            shelves = [SESMapEnclosure(ses_device=d, ses_devices=[d], enclosure_id="shelf-a") for d in ("/dev/ses0", "/dev/ses1")]
+            with patch.object(inventory_module, "_ses_device_enclosure_ids", wraps=inventory_module._ses_device_enclosure_ids) as built:
+                build(ParsedSSHData(ses_enclosures=shelves), one)
+                self.assertEqual(built.call_count, 0, "a single-path bay needs no enclosure map")
+                snapshot = ParsedSSHData(ses_enclosures=list(shelves))
+                self.assertTrue(all(build(snapshot, two).led_supported for _ in range(60)))
+                self.assertEqual(built.call_count, 1, "one map per parsed snapshot, not one per bay")
+                self.assertTrue(build(ParsedSSHData(ses_enclosures=list(shelves)), two).led_supported)
+                self.assertEqual(built.call_count, 2, "a new snapshot rebuilds the map")
 
     async def test_core_non_ses_device_disables_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

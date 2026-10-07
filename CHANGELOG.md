@@ -280,6 +280,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Restored Identify on every bay of a dual-path TrueNAS CORE shelf. Each bay
+  is listed once per path, which looked like an ambiguous bay and turned
+  Identify off. Paths that name the same element in the same enclosure now
+  count as one bay, and the light is switched once; bays whose paths disagree
+  stay off. (#904)
 - Restored the drives in a boot or NVMe storage view saved with "Match drives
   by: Pool" but no pool name. It matched nothing after "Pool" became pool-only,
   so every slot showed empty. Such a view now matches its saved serials and
