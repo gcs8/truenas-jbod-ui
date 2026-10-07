@@ -1274,7 +1274,26 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bundle.sources["bmc"].ok)
 
 
+    async def test_quantastor_cli_and_ses_share_one_setup_failure_warning(self):
+        service, _, _ = self.make_service("quantastor")
+        message = "SSH is turned on but no QuantaStor node address is set."
+        service._fetch_quantastor_cli_overlay = AsyncMock(return_value=({"cli_disks": []}, [message]))
+        service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), [message, "SES-only failure."]))
+        bundle = await service._collect_inventory_source_bundle()
+        self.assertEqual(bundle.warnings.count(message), 1)
+        self.assertIn("SES-only failure.", bundle.warnings)
+        self.assertFalse(bundle.sources["ssh"].ok)
+
+
 class InventoryHelpersTests(unittest.TestCase):
+    def test_quantastor_virtual_gateway_port_is_never_a_node_host(self) -> None:
+        port = {"name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"}
+        self.assertEqual(InventoryService._extract_quantastor_gateway_port_host(port), "192.0.2.31")
+        for flag in ("isVirtualInterface", "isVirtualPort"):
+            with self.subTest(flag=flag):
+                floating = {**port, "name": "eno1:gm", "ipAddress": "192.0.2.40", flag: True}
+                self.assertIsNone(InventoryService._extract_quantastor_gateway_port_host(floating))
+
     def test_first_ses_overlay_preserves_secondary_path_unplaced_binding_warning(self) -> None:
         overlay = ParsedSSHData(
             ses_enclosures=[

@@ -45,8 +45,13 @@ docker compose --profile admin up -d enclosure-admin
 Enable SSH only after API inventory works. In the admin UI:
 
 1. Turn on Quantastor HA cluster mode.
-2. Use `Load Nodes From Quantastor API` to load node IDs and labels.
-3. Add a direct SSH host for each hardware node if the API does not return one.
+2. Use `Load Nodes From Quantastor API` to load node IDs, labels and SSH hosts.
+   Each node's SSH host is the address of its physical port that has a default
+   gateway, as QuantaStor's port list reports it. Virtual ports, such as the
+   grid VIP, are skipped.
+3. Type a direct SSH host for any node the API leaves blank. A host you type
+   takes precedence over the discovered one, so you can also use it to correct an
+   address after a rebuild.
 4. Do not use the shared API or grid-management VIP as an HA node SSH target.
 5. Ignore management-only helper VMs that do not share the enclosure hardware.
 

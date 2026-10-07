@@ -44,7 +44,6 @@ from admin_service.route_support import (
     get_runtime_service,
     limited_request_content_length,
     logger,
-    merge_quantastor_node_hosts,
     observe_backup_route,
     project_runtime_observation,
     quantastor_node_discovery_seed_hosts,
@@ -903,8 +902,13 @@ def build_router(admin_settings: Any) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surface discovery failures directly in setup.
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # targetPortEnum names each node's physical default-gateway port by node UUID; no SSH needed.
+        raw_data.cli_network_ports = await client.fetch_network_ports()
         nodes = serialize_quantastor_nodes(raw_data)
-        merge_quantastor_node_hosts(nodes, quantastor_request_node_host_map(payload))
+        # A host the operator typed wins over a discovered one, for rebuilds or odd routing.
+        typed_hosts = quantastor_request_node_host_map(payload)
+        for node in nodes:
+            node["host"] = next(iter(typed_hosts.get(node["system_id"], [])), node["host"])
         host_discovery = await enrich_quantastor_nodes_from_ssh(
             payload,
             raw_data,
