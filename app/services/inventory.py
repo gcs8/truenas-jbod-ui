@@ -431,6 +431,34 @@ def _is_authentic_core_ses_target(target: Any) -> bool:
     )
 
 
+def _core_identify_target(targets: list[Any]) -> dict[str, Any] | None:
+    """The one `sesutil locate` target for a CORE bay, or None when its paths disagree.
+
+    A multipath shelf lists each bay once per expander path. Those paths are one
+    physical element only when every target is a /dev/sesN element with the same
+    index in the same SES enclosure, so one locate on the first path is enough.
+    """
+    if not targets or not all(_is_authentic_core_ses_target(target) for target in targets):
+        return None
+    if len(targets) == 1:
+        return targets[0]
+    enclosure_ids = {normalize_text(target.get("enclosure_id")) for target in targets}
+    if len({target["ses_element_id"] for target in targets}) != 1 or len(enclosure_ids) != 1 or None in enclosure_ids:
+        return None
+    return targets[0]
+
+
+def _ses_device_enclosure_ids(enclosures: Iterable[Any]) -> dict[tuple[str | None, str], str]:
+    """Map each (host, SES device) to the enclosure ID it reports; a device seen with two IDs maps to none."""
+    seen: dict[tuple[str | None, str], set[str | None]] = {}
+    for enclosure in enclosures:
+        for device in {enclosure.ses_device, *enclosure.ses_devices} - {None}:
+            seen.setdefault((normalize_text(enclosure.ssh_host), device), set()).add(
+                normalize_text(enclosure.enclosure_id)
+            )
+    return {key: only for key, ids in seen.items() if len(ids) == 1 for only in ids if only}
+
+
 def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
     layout_rows: list[list[int | None]] = []
     for row_index in reversed(range(rows)):
@@ -13170,12 +13198,15 @@ class InventoryService:
                 if isinstance(target, dict) and normalize_text(target.get("ses_device", ""))
             )
         )
+        if self.system.truenas.platform == "core":
+            enclosure_ids = _ses_device_enclosure_ids(ssh_data.ses_enclosures)
+            for target in ses_targets:
+                enclosure_id = enclosure_ids.get((normalize_text(target.get("ssh_host")), target["ses_device"]))
+                if enclosure_id:
+                    target["enclosure_id"] = enclosure_id
         core_ses_target_invalid = bool(
             self.system.truenas.platform == "core"
-            and (
-                len(ses_targets) != 1
-                or not _is_authentic_core_ses_target(ses_targets[0])
-            )
+            and _core_identify_target(ses_targets) is None
         )
         ssh_led_supported = bool(
             self.system.ssh.enabled
@@ -13426,17 +13457,13 @@ class InventoryService:
                 )
 
         if self.system.truenas.platform == "core":
-            authentic_targets = [
-                target
-                for target in ses_targets
-                if _is_authentic_core_ses_target(target)
-            ]
-            if len(ses_targets) != 1 or len(authentic_targets) != 1:
+            core_target = _core_identify_target(ses_targets)
+            if core_target is None:
                 raise TrueNASAPIError(
                     f"Bay {slot_view.slot_label} is not tied to exactly one enclosure element, "
                     "so its light cannot be switched safely."
                 )
-            ses_targets = authentic_targets
+            ses_targets = [core_target]
 
         if action == LedAction.identify:
             locate_state = "on"
