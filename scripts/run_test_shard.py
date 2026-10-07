@@ -81,6 +81,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_screenshots",
         "test_segment_sealer",
         "test_snapshot_export",
+        "test_ssh_connection_keep",
         "test_ssh_failure_contexts",
         "test_ssh_session_reuse",
         "test_storage_view_smart_batch",

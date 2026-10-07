@@ -870,6 +870,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Performance
 
+- SSH calls to the same host now reuse one connection for 90 seconds, so a
+  refresh and the automatic refreshes after it log in once per host instead
+  of 7 to 17 times in two minutes. This keeps the app under sshd
+  `MaxStartups` and IPS "SSH scan" rules that block five connections in two
+  minutes. (#906)
 - A snapshot refresh no longer rewrites the slot-detail cache file when
   nothing but the row timestamps changed. SMART freshness still comes from
   its own read time and stale flag, which still count as changes. (#607)

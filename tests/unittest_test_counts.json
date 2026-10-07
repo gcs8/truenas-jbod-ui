@@ -99,6 +99,7 @@
     "test_slot_detail_store": 17,
     "test_smart_grid_io": 47,
     "test_snapshot_export": 91,
+    "test_ssh_connection_keep": 15,
     "test_ssh_failure_contexts": 4,
     "test_ssh_probe": 38,
     "test_ssh_session_reuse": 51,
