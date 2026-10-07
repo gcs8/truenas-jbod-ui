@@ -311,7 +311,8 @@ test("rendering the Quantastor HA rows normalizes the node list once and caches 
   functions.renderQuantastorHaSection();
   assert.equal(normalizeCalls, 1, "one normalizeHaNodes per HA render");
   assert.equal(queries, 9, "three rows times three fields are looked up on the first render");
-  assert.match(elements.setupHaNodesResult.textContent, /Loaded 2 nodes\. 1 of them has no address yet/);
+  assert.match(elements.setupHaNodesResult.textContent, /Loaded 2 nodes\. 1 of them has no address yet\. .*type the node's own SSH address/);
+  assert.doesNotMatch(elements.setupHaNodesResult.textContent, /will find it/, "never promise discovery that cannot run");
 
   functions.renderQuantastorHaSection();
   assert.equal(normalizeCalls, 2);

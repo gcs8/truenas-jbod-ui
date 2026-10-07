@@ -72,6 +72,10 @@ class QuantastorRESTClient:
             hw_enclosures=hw_enclosures,
         )
 
+    async def fetch_network_ports(self) -> list[dict[str, Any]]:
+        # Every grid node's ports, with owner UUID and gateway, through any one endpoint.
+        return await asyncio.to_thread(self._fetch_optional_list, "targetPortEnum")
+
     def _fetch_required_list(self, endpoint: str) -> list[dict[str, Any]]:
         payload = self._request_json(endpoint, {"flags": 0})
         if self._is_error_payload(payload):

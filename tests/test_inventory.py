@@ -1274,7 +1274,31 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bundle.sources["bmc"].ok)
 
 
+    async def test_quantastor_cli_and_ses_share_one_setup_failure_warning(self):
+        service, _, _ = self.make_service("quantastor")
+        message = "SSH is turned on but no QuantaStor node address is set."
+        service._fetch_quantastor_cli_overlay = AsyncMock(return_value=({"cli_disks": []}, [message]))
+        service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), [message, "SES-only failure."]))
+        bundle = await service._collect_inventory_source_bundle()
+        self.assertEqual(bundle.warnings.count(message), 1)
+        self.assertIn("SES-only failure.", bundle.warnings)
+        self.assertFalse(bundle.sources["ssh"].ok)
+
+
 class InventoryHelpersTests(unittest.TestCase):
+    def test_quantastor_floating_alias_is_never_a_node_host_but_bonds_and_vlans_are(self) -> None:
+        extract = InventoryService._extract_quantastor_gateway_port_host
+        port = {"name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"}
+        self.assertEqual(extract(port), "192.0.2.31")
+        # QuantaStor marks the grid VIP and HA addresses as alias interfaces.
+        floating = {**port, "name": "eno1:gm", "ipAddress": "192.0.2.40", "isVirtualInterface": True, "isVirtualPort": True}
+        self.assertIsNone(extract(floating))
+        # isVirtualPort alone marks a bond or VLAN, which stays on its node.
+        for name, kind in (("bond0", "isBond"), ("bond0.1337", "isVlan")):
+            with self.subTest(port=name):
+                routed = {**port, "name": name, "isVirtualInterface": False, "isVirtualPort": True, kind: True}
+                self.assertEqual(extract(routed), "192.0.2.31")
+
     def test_first_ses_overlay_preserves_secondary_path_unplaced_binding_warning(self) -> None:
         overlay = ParsedSSHData(
             ses_enclosures=[

@@ -4283,6 +4283,51 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual([node["system_id"] for node in payload["nodes"]], ["node-a", "node-b"])
         self.assertEqual(payload["nodes"][1]["host"], "192.0.2.31")
 
+    def test_quantastor_node_discovery_route_fills_hosts_from_rest_gateway_ports(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
+        client = AsyncMock()
+        client.fetch_all.return_value = TrueNASRawData(
+            enclosures=[],
+            systems=[
+                {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+                {"id": "helper-vm", "name": "ExampleQS Helper", "storageSystemClusterId": "cluster-a"},
+            ],
+            disks=[], pools=[], pool_devices=[], ha_groups=[], hw_disks=[],
+            hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}, {"id": "enc-b", "storageSystemId": "node-b"}],
+            disk_temperatures={}, smart_test_results=[],
+        )
+        # targetPortEnum through the grid VIP lists every node's ports.
+        client.fetch_network_ports.return_value = [
+            {"name": "bond0.1338", "storageSystemId": "node-a", "ipAddress": "192.0.2.20", "gateway": None},
+            {"name": "eno1", "storageSystemId": "node-a", "ipAddress": "192.0.2.30", "gateway": "192.0.2.1",
+             "isVirtualInterface": False},
+            {"name": "eno1:gm", "storageSystemId": "node-b", "ipAddress": "192.0.2.40", "gateway": "192.0.2.1",
+             "isVirtualInterface": True, "isVirtualPort": True},
+            {"name": "bond0.1337:hab0", "storageSystemId": "node-b", "ipAddress": "192.0.2.41", "gateway": "192.0.2.1",
+             "isVirtualInterface": True, "isVirtualPort": True},
+            {"name": "bond0.1337", "storageSystemId": "node-b", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1",
+             "isVirtualInterface": False, "isVirtualPort": True, "isVlan": True},
+            {"name": "ens192", "storageSystemId": "helper-vm", "ipAddress": "198.51.100.30", "gateway": "198.51.100.1"},
+        ]
+        for typed, expected in (({}, ["192.0.2.30", "192.0.2.31"]), ({"node-a": "192.0.2.130"}, ["192.0.2.130", "192.0.2.31"])):
+            with self.subTest(typed=typed):
+                with patch("admin_service.routes.QuantastorRESTClient", return_value=client):
+                    with patch("admin_service.route_support.SSHProbe") as ssh_probe:
+                        response = asyncio.run(route.endpoint(QuantastorNodeDiscoveryRequest(
+                            truenas_host="https://192.0.2.40", api_user="jbodmap", api_password="secret",
+                            verify_ssl=False, ssh_enabled=True, ssh_host="192.0.2.40", ssh_user="jbodmap",
+                            ssh_key_path="/run/ssh/id_jbodmap", ssh_strict_host_key_checking=False,
+                            ha_nodes=[{"system_id": system_id, "label": label, "host": typed.get(system_id)}
+                                      for system_id, label in (("node-a", "ExampleQS Left"), ("node-b", "ExampleQS Right"))],
+                        )))
+                payload = json.loads(response.body.decode("utf-8"))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual([(n["system_id"], n["host"]) for n in payload["nodes"]],
+                                 list(zip(["node-a", "node-b"], expected)))
+                self.assertFalse(payload["host_discovery"]["attempted"])
+                ssh_probe.assert_not_called()
+
     def test_quantastor_node_discovery_route_fills_hosts_from_ssh_gateway_ports(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/system-setup/quantastor-nodes")
         settings = Settings(ssh=SSHConfig(known_hosts_path="/runtime/data/known_hosts"))
@@ -5400,6 +5445,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         )
         client = MagicMock()
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
+        client.fetch_network_ports = AsyncMock(return_value=[])
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
         with patch("admin_service.routes.reload_app_settings", return_value=settings):
@@ -5459,6 +5505,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         )
         client = MagicMock()
         client.fetch_all = AsyncMock(return_value=SimpleNamespace())
+        client.fetch_network_ports = AsyncMock(return_value=[])
         enrich = AsyncMock(return_value={"attempted": False, "ok": True})
 
         with patch("admin_service.routes.reload_app_settings", return_value=settings):
@@ -5650,6 +5697,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         client = MagicMock()
         client.fetch_all = AsyncMock(return_value=raw_data)
+        client.fetch_network_ports = AsyncMock(return_value=[])
         with (
             patch("admin_service.routes.reload_app_settings", return_value=settings),
             patch("admin_service.routes.QuantastorRESTClient", return_value=client),

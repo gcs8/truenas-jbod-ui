@@ -3602,7 +3602,8 @@ class InventoryService:
                 )
             else:
                 quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-            warnings.extend(quantastor_ses_failures)
+            # A setup failure such as a missing node address reaches both overlays; say it once.
+            warnings.extend(failure for failure in quantastor_ses_failures if failure not in quantastor_cli_failures)
 
             # Failed attempts matter even when they contributed no overlay rows.
             if quantastor_cli_failures or quantastor_ses_failures:
@@ -10387,6 +10388,10 @@ class InventoryService:
 
     @classmethod
     def _extract_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> str | None:
+        # An alias interface (eno1:gm, an HA VIP) floats between nodes. isVirtualPort also marks
+        # bonds and VLANs, which stay on their node and may carry its only default route.
+        if row.get("isVirtualInterface") is True:
+            return None
         if not cls._quantastor_network_port_has_default_gateway(row):
             return None
         for key in ("ipAddress", "ipAddr", "ip", "address", "hostAddress"):
