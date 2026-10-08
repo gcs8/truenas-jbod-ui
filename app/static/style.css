@@ -3708,6 +3708,9 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-layout-mode="dense-2.5"] {
   --chassis-min-height: clamp(390px, 46vh, 500px);
   --slot-grid-justify: space-between;
+  /* A 24-bay 2.5" front fits a desktop chassis at 40px sleds; the 72px legacy
+     floor below is sized for 3.5" trays and forced it to scroll. */
+  --slot-track-min-width: 40px;
 }
 
 .chassis-shell[data-layout-mode="standard-3.5"] {
@@ -3726,7 +3729,9 @@ button.fabric-trace-crumb:hover {
   --slot-grid-gap: 14px;
 }
 
-.chassis-shell[data-layout-mode="compact"][data-drive-scale="2.5"] {
+.chassis-shell[data-layout-mode="compact"][data-drive-scale="2.5"]:not([data-face-style="drawer"]) {
+  /* :not() keeps this rule at least as specific as the drive-scale rule above,
+     so the tall 2.5" sleds win. */
   --chassis-min-height: 330px;
   --slot-bay-width: 108px;
   --slot-bay-aspect: 0.41 / 1;

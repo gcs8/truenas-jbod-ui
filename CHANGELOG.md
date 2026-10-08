@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- 2.5" bays no longer draw like 3.5" trays. The Supermicro SSG-2028R front
+  shows its 24 bays as narrow 2.5" sleds that fit without scrolling, and the
+  SYS-2029GP-TR rear NVMe pair is back to tall sleds. Both broke in v0.23.0.
+  (#PR)
+
 ## v0.24.0-beta.1 - 2026-10-08
 
 This prerelease includes every pull request merged after `v0.23.0` through the
