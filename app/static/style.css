@@ -3713,6 +3713,15 @@ button.fabric-trace-crumb:hover {
   --slot-track-min-width: 40px;
 }
 
+/* A 40px sled has no room beside its latch and LED, so the state chip sits in
+   the empty middle. Selection rings and heat-map badges keep their own spots. */
+.chassis-shell[data-layout-mode="dense-2.5"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight, .heatmap-active, .heatmap-missing)::after {
+  top: 50%;
+  right: auto;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
 .chassis-shell[data-layout-mode="standard-3.5"] {
   --chassis-min-height: clamp(360px, 44vh, 460px);
   --slot-grid-justify: center;

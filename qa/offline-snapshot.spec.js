@@ -633,6 +633,41 @@ for (const { faceStyle, profileId, layoutMode, minHeightRatio } of [
   });
 }
 
+test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and labels", async ({ page }) => {
+  const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive", "supermicro-ssg-2028r-shared-front-24");
+  for (const width of [1920, 1100]) {
+    await page.setViewportSize({ width, height: 1100 });
+    await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+    const { chips, collisions } = await page.locator("#chassis-shell").evaluate((shell) => {
+      const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+      const hits = [];
+      let chipCount = 0;
+      // The fixture selects slot 0 and its vdev peers, which draw rings
+      // instead of chips; clear that so every bay shows its state chip.
+      for (const tile of shell.querySelectorAll(".slot-tile")) tile.classList.remove("selected", "peer-highlight");
+      for (const tile of shell.querySelectorAll(".slot-tile")) {
+        const tileRect = tile.getBoundingClientRect();
+        const chip = getComputedStyle(tile, "::after");
+        if (chip.content === "none" || chip.content === '""') continue;
+        chipCount += 1;
+        const width = parseFloat(chip.width);
+        const height = parseFloat(chip.height);
+        const centered = chip.transform !== "none";
+        const left = tileRect.left + parseFloat(chip.left) - (centered ? width / 2 : 0);
+        const top = tileRect.top + parseFloat(chip.top) - (centered ? height / 2 : 0);
+        const chipRect = { left, top, right: left + width, bottom: top + height };
+        for (const part of [".slot-status-led", ".slot-latch", ".slot-number", ".slot-device", ".slot-pool"]) {
+          const element = tile.querySelector(part);
+          if (element && overlaps(chipRect, element.getBoundingClientRect())) hits.push(`${tile.dataset.slot}${part}`);
+        }
+      }
+      return { chips: chipCount, collisions: hits };
+    });
+    expect(chips, `viewport ${width}`).toBe(24);
+    expect(collisions, `viewport ${width}`).toEqual([]);
+  }
+});
+
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
   const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
 
