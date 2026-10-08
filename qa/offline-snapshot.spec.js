@@ -635,36 +635,44 @@ for (const { faceStyle, profileId, layoutMode, minHeightRatio } of [
 
 test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and labels", async ({ page }) => {
   const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive", "supermicro-ssg-2028r-shared-front-24");
-  for (const width of [1920, 1100]) {
-    await page.setViewportSize({ width, height: 1100 });
-    await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
-    const { chips, collisions } = await page.locator("#chassis-shell").evaluate((shell) => {
-      const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-      const hits = [];
-      let chipCount = 0;
-      // The fixture selects slot 0 and its vdev peers, which draw rings
-      // instead of chips; clear that so every bay shows its state chip.
-      for (const tile of shell.querySelectorAll(".slot-tile")) tile.classList.remove("selected", "peer-highlight");
-      for (const tile of shell.querySelectorAll(".slot-tile")) {
-        const tileRect = tile.getBoundingClientRect();
-        const chip = getComputedStyle(tile, "::after");
-        if (chip.content === "none" || chip.content === '""') continue;
-        chipCount += 1;
-        const width = parseFloat(chip.width);
-        const height = parseFloat(chip.height);
-        const centered = chip.transform !== "none";
-        const left = tileRect.left + parseFloat(chip.left) - (centered ? width / 2 : 0);
-        const top = tileRect.top + parseFloat(chip.top) - (centered ? height / 2 : 0);
-        const chipRect = { left, top, right: left + width, bottom: top + height };
-        for (const part of [".slot-status-led", ".slot-latch", ".slot-number", ".slot-device", ".slot-pool"]) {
-          const element = tile.querySelector(part);
-          if (element && overlaps(chipRect, element.getBoundingClientRect())) hits.push(`${tile.dataset.slot}${part}`);
-        }
+  for (const heatmap of [false, true]) {
+    for (const width of [1920, 1100]) {
+      const label = `${heatmap ? "heat map" : "plain"} at ${width}px`;
+      await page.setViewportSize({ width, height: 1100 });
+      await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+      if (heatmap) {
+        await page.locator("#heatmap-toggle-button").click();
+        await expect(page.locator("#slot-grid .slot-heatmap-value")).toHaveCount(24);
       }
-      return { chips: chipCount, collisions: hits };
-    });
-    expect(chips, `viewport ${width}`).toBe(24);
-    expect(collisions, `viewport ${width}`).toEqual([]);
+      const { chips, collisions } = await page.locator("#chassis-shell").evaluate((shell) => {
+        const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        const hits = [];
+        let chipCount = 0;
+        // The fixture selects slot 0 and its vdev peers, which draw rings
+        // instead of chips; clear that so every bay shows its state chip.
+        for (const tile of shell.querySelectorAll(".slot-tile")) tile.classList.remove("selected", "peer-highlight");
+        for (const tile of shell.querySelectorAll(".slot-tile")) {
+          const tileRect = tile.getBoundingClientRect();
+          const chip = getComputedStyle(tile, "::after");
+          if (chip.content === "none" || chip.content === '""') continue;
+          chipCount += 1;
+          const shift = new DOMMatrixReadOnly(chip.transform === "none" ? undefined : chip.transform);
+          const left = tileRect.left + parseFloat(chip.left) + shift.m41;
+          const top = tileRect.top + parseFloat(chip.top) + shift.m42;
+          const chipRect = { left, top, right: left + parseFloat(chip.width), bottom: top + parseFloat(chip.height) };
+          const parts = [".slot-status-led", ".slot-latch", ".slot-number", ".slot-heatmap-value", ".slot-device", ".slot-pool"];
+          for (const part of parts) {
+            const element = tile.querySelector(part);
+            if (!element || getComputedStyle(element).visibility === "hidden") continue;
+            if (overlaps(chipRect, element.getBoundingClientRect())) hits.push(`${tile.dataset.slot}${part}`);
+          }
+          if (chipRect.bottom > tileRect.bottom) hits.push(`${tile.dataset.slot} below the sled`);
+        }
+        return { chips: chipCount, collisions: hits };
+      });
+      expect(chips, label).toBe(24);
+      expect(collisions, label).toEqual([]);
+    }
   }
 });
 

@@ -34,8 +34,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   shows its 24 bays as narrow 2.5" sleds that fit without scrolling, and the
   SYS-2029GP-TR rear NVMe pair is back to tall sleds. Both broke in v0.23.0.
   (#912)
-- On 24-bay 2.5" fronts, each bay's state icon sits in the empty middle of the
-  sled instead of covering its latch and status LED. (#913)
+- On 24-bay 2.5" fronts, each bay's state icon no longer covers its latch and
+  status LED. It sits in the empty middle of the sled, or at its foot while a
+  heat map shows its value there. (#913)
 
 ## v0.24.0-beta.1 - 2026-10-08
 
