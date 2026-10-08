@@ -26,7 +26,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## v0.24.0-beta.1 - 2026-10-07
+## v0.24.0-beta.1 - 2026-10-08
 
 This prerelease includes every pull request merged after `v0.23.0` through the
 v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;

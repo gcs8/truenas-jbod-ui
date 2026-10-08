@@ -35,7 +35,7 @@ class ReleaseStatusTests(unittest.TestCase):
         self.assertEqual(package_lock["version"], "0.24.0-beta.1")
         self.assertEqual(package_lock["packages"][""]["version"], "0.24.0-beta.1")
         self.assertIn("# Release Notes - v0.24.0-beta.1", beta_notes)
-        self.assertIn("## v0.24.0-beta.1 - 2026-10-07", changelog)
+        self.assertIn("## v0.24.0-beta.1 - 2026-10-08", changelog)
         self.assertLess(changelog.index("## v0.24.0-beta.1"), changelog.index("## v0.23.0"))
         # A prerelease leaves v0.23.0 as the latest stable release.
         self.assertIn("## v0.23.0 - 2026-09-08", changelog)
