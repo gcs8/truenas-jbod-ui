@@ -675,16 +675,30 @@ test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and 
     }
   }
 
-  // Only the top latch leaves the middle free; other edges keep the corner chip.
+  // Only a single row of top-latched sleds is that narrow. Other latch edges and
+  // multi-row faces keep the corner chip and, under a heat map, their labels.
   const placements = await page.locator("#chassis-shell").evaluate((shell) => {
     const tile = shell.querySelector(".slot-tile:not(.selected):not(.peer-highlight)");
-    return ["bottom", "left", "right"].map((edge) => {
-      shell.dataset.latchEdge = edge;
+    const describe = (name) => {
       const chip = getComputedStyle(tile, "::after");
-      return `${edge}:${chip.top}/${chip.right}/${chip.transform}`;
+      const pool = getComputedStyle(tile.querySelector(".slot-pool")).visibility;
+      return `${name}:${chip.top}/${chip.right}/${chip.transform}/${pool}`;
+    };
+    const results = ["bottom", "left", "right"].map((edge) => {
+      shell.dataset.latchEdge = edge;
+      return describe(edge);
     });
+    shell.dataset.latchEdge = "top";
+    shell.dataset.layoutRows = "2";
+    results.push(describe("two-rows"));
+    return results;
   });
-  expect(placements).toEqual(["bottom:6px/6px/none", "left:6px/6px/none", "right:6px/6px/none"]);
+  expect(placements).toEqual([
+    "bottom:6px/6px/none/visible",
+    "left:6px/6px/none/visible",
+    "right:6px/6px/none/visible",
+    "two-rows:6px/6px/none/visible",
+  ]);
 });
 
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {

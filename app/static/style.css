@@ -3713,10 +3713,11 @@ button.fabric-trace-crumb:hover {
   --slot-track-min-width: 40px;
 }
 
-/* A 40px top-latched sled has no room beside its latch and LED, so the state
-   chip sits in the empty middle; selection rings reuse ::after and keep their
-   own box. Other latch edges keep the corner chip. */
-.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after {
+/* A single row of 20+ top-latched 2.5" sleds leaves each about 40px wide, with
+   no room beside the latch and LED, so the state chip sits in the empty middle;
+   selection rings reuse ::after and keep their own box. Other latch edges and
+   multi-row faces, whose sleds are wider, keep the corner chip. */
+.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after {
   top: 50%;
   right: auto;
   left: 50%;
@@ -3725,13 +3726,13 @@ button.fabric-trace-crumb:hover {
 
 /* With a heat map the value badge takes the middle, so the chip drops to the
    foot over the device and pool labels, which a 40px sled truncates anyway. */
-.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"] .slot-tile:is(.heatmap-active, .heatmap-missing):not(.selected, .peer-highlight, .fabric-highlight)::after {
+.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing):not(.selected, .peer-highlight, .fabric-highlight)::after {
   top: auto;
   bottom: 10px;
   transform: translateX(-50%);
 }
 
-.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"] .slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool) {
+.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool) {
   visibility: hidden;
 }
 
