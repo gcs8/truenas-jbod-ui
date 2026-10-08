@@ -29,8 +29,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ## v0.24.0-beta.1 - 2026-10-08
 
 This prerelease includes every pull request merged after `v0.23.0` through the
-v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
-`latest` stays on `v0.23.0`.
+v0.24.0-beta.1 release candidate. GHCR gets the fixed `v0.24.0-beta.1` and
+`0.24.0-beta.1` tags and moves `dev` to it; `latest` stays on `v0.23.0`.
 
 ### Highlights
 
@@ -49,9 +49,9 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 
 ### Upgrade notes
 
-- This is a prerelease, published as the `dev` image tag only. The
-  pre-release security review in #737 still has open items, which will be
-  closed before `v0.24.0`.
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. The pre-release security review in #737 still
+  has open items, which will be closed before `v0.24.0`.
 - config.yaml: `app.host` and `app.port` are gone, and the `APP_HOST`
   environment variable is no longer read. They never changed where the UI
   answers. Set the port with `APP_PORT` and the address with

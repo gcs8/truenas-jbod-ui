@@ -5,9 +5,9 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 const { createHash } = require("node:crypto");
-const { version: APP_VERSION } = require("../package.json");
-
 const root = path.resolve(process.env.UPGRADE_NOTICE_SOURCE_ROOT || path.join(__dirname, ".."));
+// The fixture imports the app from root, so the version it renders is root's.
+const { version: APP_VERSION } = require(path.join(root, "package.json"));
 const fixture = path.join(__dirname, "fixtures/upgrade_notice_server.py");
 const python = process.env.PYTHON || "python3";
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");

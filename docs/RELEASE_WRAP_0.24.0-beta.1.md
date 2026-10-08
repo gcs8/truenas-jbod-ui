@@ -5,15 +5,16 @@ Date: `2026-10-08`
 ## Scope
 
 v0.24.0-beta.1 is a prerelease of v0.24.0. It contains every pull request
-merged after `v0.23.0`, through #908, and publishes the `dev` image tag only.
-`latest` stays on `v0.23.0`.
+merged after `v0.23.0`, through #908. GHCR gets the fixed `v0.24.0-beta.1`
+and `0.24.0-beta.1` tags and moves `dev` to it; `latest` stays on `v0.23.0`.
 
-Release preparation branch: `release/v0.24.0-beta.1` (PR #897), merged into
-`main` with a merge commit. The tag goes on that `main` merge commit.
+Release preparation branch: `release/v0.24.0-beta.1` (PR #897). It is merged
+into `main` with a merge commit, never squashed, so the validated commit stays
+reachable from the tag, which goes on that `main` merge commit.
 
 Validated release-branch commit: `b0656fbe175d2963f6bffe1763793d36d132254d`.
-Later commits change only this wrap, the restore guide and a code comment in
-the QA restore controller; none of them ship in the image.
+Later commits change only docs, a code comment in the QA restore controller
+and the upgrade-notice browser spec; none of them ship in the image.
 
 Validated Linux QA image: `sha256:c6702aeb699808fb2d847628d92df51f3c8f2f0354ec2af30e995022936109ae`,
 built on the Linux QA host from that commit with
