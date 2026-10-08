@@ -42,6 +42,8 @@ APP_CONTAINER_NAMES = (
 )
 APPROVAL = "I_APPROVE_PRIVATE_QA_RESTORE"
 LIVE_APPROVAL = "I_APPROVE_LIVE_READ_ONLY_QA"
+# 409 details from history_service/main.py that mean another pass got there first.
+HISTORY_REFRESH_BUSY_DETAILS = frozenset({"History collection already running.", "History refresh already running."})
 INSPECTION_FIELDS = {
     "ok",
     "schema_version",
@@ -1141,12 +1143,19 @@ def _run_full_history_pass(
                 },
             )
             response = connection.getresponse()
-            response.read(4 * 1024 * 1024)
+            body = response.read(4 * 1024 * 1024)
         finally:
             connection.close()
-        # 409: a scheduled pass started first; wait for it and look again.
-        if response.status not in (200, 409):
-            raise QaRestoreError(f"history full refresh returned HTTP {response.status}")
+        if response.status == 200:
+            continue
+        try:
+            detail = json.loads(body).get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        # Only a pass that started first is worth waiting for; a paused
+        # (damaged) history database also answers 409 and never clears.
+        if response.status != 409 or detail not in HISTORY_REFRESH_BUSY_DETAILS:
+            raise QaRestoreError(f"history full refresh returned HTTP {response.status}: {detail or 'no detail'}")
     raise QaRestoreError(f"history collector did not finish a full live pass after {timeout_seconds}s")
 
 

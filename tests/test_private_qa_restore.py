@@ -939,7 +939,7 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         shortcut = {"collector": {"collection_running": False, "last_success_at": late, "last_slow_metrics_at": None}}
         done = {"collector": {"collection_running": False, "last_success_at": late, "last_slow_metrics_at": late}}
         posts: list[tuple[str, str, bytes, dict[str, str]]] = []
-        statuses: list[int] = []
+        statuses: list[tuple[int, dict[str, object]]] = []
 
         class FakeConnection:
             def __init__(self, host, port, timeout):
@@ -949,7 +949,8 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
                 posts.append((method, path, body, headers))
 
             def getresponse(self):
-                return SimpleNamespace(status=statuses.pop(0), read=lambda _limit: b"{}")
+                status, payload = statuses.pop(0)
+                return SimpleNamespace(status=status, read=lambda _limit: json.dumps(payload).encode())
 
             def close(self):
                 return None
@@ -968,20 +969,26 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertIs(result, done)
         self.assertEqual(posts, [])
         # Startup shortcut only: one Full refresh, then the completed pass.
-        result, wait = run([shortcut, done], [200])
+        ok = (200, {"ok": True})
+        result, wait = run([shortcut, done], [ok])
         self.assertIs(result, done)
         self.assertEqual(wait.call_count, 2)
         [(method, path, body, headers)] = posts
         self.assertEqual((method, path, json.loads(body)), ("POST", "/api/history/refresh", {"mode": "full"}))
         self.assertEqual(headers["Origin"], "http://127.0.0.1:28081")
         self.assertTrue(headers["Authorization"].startswith("Basic "))
-        # A scheduled pass won the race (409): wait for it, then ask again.
-        result, wait = run([shortcut, shortcut, done], [409, 200])
-        self.assertIs(result, done)
-        self.assertEqual(len(posts), 2)
+        # A pass that started first (409, busy): wait for it, then ask again.
+        for busy in sorted(self.module.HISTORY_REFRESH_BUSY_DETAILS):
+            result, wait = run([shortcut, shortcut, done], [(409, {"ok": False, "detail": busy}), ok])
+            self.assertIs(result, done)
+            self.assertEqual(len(posts), 2)
+        # A paused (damaged) database also answers 409 but never clears: fail now.
+        with self.assertRaisesRegex(self.module.QaRestoreError, "HTTP 409: The history database is damaged"):
+            run([shortcut], [(409, {"ok": False, "detail": "The history database is damaged; collection is paused to protect it."})])
+        self.assertEqual(len(posts), 1)
         # Any other answer fails the gate.
         with self.assertRaisesRegex(self.module.QaRestoreError, "history full refresh returned HTTP 500"):
-            run([shortcut], [500])
+            run([shortcut], [(500, {"ok": False})])
         # A pass that never completes fails the gate by name.
         with (
             patch.object(self.module, "_wait_history_idle", return_value=shortcut),
@@ -989,8 +996,13 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
             patch.object(self.module.time, "monotonic", side_effect=[0, 0, 1, 901]),
             self.assertRaisesRegex(self.module.QaRestoreError, "did not finish a full live pass after 900s"),
         ):
-            statuses[:] = [200]
+            statuses[:] = [ok]
             self.module._run_full_history_pass(28081, "qa-user", "qa-password")
+
+    def test_busy_refresh_details_match_the_history_service(self) -> None:
+        main = (ROOT / "history_service" / "main.py").read_text(encoding="utf-8")
+        for detail in self.module.HISTORY_REFRESH_BUSY_DETAILS:
+            self.assertIn(json.dumps(detail), main)
 
     def test_live_checks_start_only_after_a_completed_full_history_pass(self) -> None:
         for live in (True, False):
