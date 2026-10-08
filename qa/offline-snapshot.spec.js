@@ -65,7 +65,6 @@ import importlib.util
 import pathlib
 import sys
 
-from app.config import get_settings
 from app.models.domain import EnclosureProfileView
 from app.services.profile_registry import ProfileRegistry
 
@@ -80,8 +79,8 @@ async def main():
     face_style = sys.argv[2]
     builtin_id = sys.argv[3]
     if builtin_id:
-        # A real built-in profile, so the test draws the shipped geometry.
-        profile = ProfileRegistry(get_settings()).get(builtin_id)
+        # The shipped built-in profile; default Settings() never reads local config.
+        profile = ProfileRegistry(module.Settings()).get(builtin_id)
         assert profile is not None and profile.face_style == face_style, builtin_id
         layout = profile.slot_layout
         columns = profile.columns
