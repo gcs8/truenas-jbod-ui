@@ -946,20 +946,21 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         ):
             self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
 
-    def test_live_browser_checks_start_only_after_a_completed_history_pass(self) -> None:
-        events: list[str] = []
-        with tempfile.TemporaryDirectory() as raw_root:
-            with (
-                patch.object(self.module, "_run", side_effect=lambda command, **_: events.append(
-                    "live-browser" if "qa/ui-switching.spec.js" in command else "run")),
-                patch.object(self.module, "_wait_history_idle", side_effect=lambda *_, **kwargs: events.append(
-                    f"history-pass:{kwargs.get('live_pass')}")),
-            ):
-                results = self.module._run_browser_and_perf(
-                    ROOT, (28080, 28081, 28082), "qa-user", "qa-password", Path(raw_root), live_read_only=True,
-                )
-        self.assertLess(events.index("history-pass:True"), events.index("live-browser"))
-        self.assertTrue(results["history_live_pass"])
+    def test_live_checks_start_only_after_a_completed_history_pass(self) -> None:
+        for live in (True, False):
+            events: list[str] = []
+            with self.subTest(live=live), tempfile.TemporaryDirectory() as raw_root:
+                with (
+                    patch.object(self.module, "_run", side_effect=lambda command, **_: events.append("run")),
+                    patch.object(self.module, "_wait_history_idle", side_effect=lambda *_, **kwargs: events.append(
+                        f"history-pass:{kwargs.get('live_pass')}")),
+                ):
+                    results = self.module._run_browser_and_perf(
+                        ROOT, (28080, 28081, 28082), "qa-user", "qa-password", Path(raw_root), live_read_only=live,
+                    )
+                # Every browser and timed check, history perf included, follows the pass.
+                self.assertEqual(events, ["history-pass:True", *["run"] * 4] if live else ["run"] * 2)
+                self.assertEqual(results.get("history_live_pass", False), live)
 
     def test_observed_state_paths_follow_restored_config_and_stay_in_mounts(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

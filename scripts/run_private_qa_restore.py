@@ -1672,6 +1672,10 @@ def _run_browser_and_perf(
                 "PYTHON": sys.executable,
             }
         )
+        if live_read_only:
+            # Until its first pass succeeds the collector retries every 30 s with
+            # forced inventory, which races every timed check on slow appliances.
+            _wait_history_idle(ports[1], username, password, timeout_seconds=900, live_pass=True)
         _run(
             [
                 "npx",
@@ -1705,9 +1709,6 @@ def _run_browser_and_perf(
         )
         results = {"offline_browser": True, "history_performance": True}
         if live_read_only:
-            # Until its first pass succeeds the collector retries every 30 s with
-            # forced inventory, which races the live checks on slow appliances.
-            _wait_history_idle(ports[1], username, password, timeout_seconds=900, live_pass=True)
             env["PLAYWRIGHT_LIVE_APPLIANCE_QA"] = "1"
             _run(
                 [
