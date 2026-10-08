@@ -701,6 +701,35 @@ test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and 
   ]);
 });
 
+test("offline bay state chips use their legend colors", async ({ page }) => {
+  const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive");
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+  const fills = await page.locator("#chassis-shell").evaluate((shell) => {
+    const states = ["healthy", "empty", "identify", "fault", "unknown", "unmapped"];
+    // The fixture selects slot 0 and its vdev peers, which draw rings instead.
+    const tile = shell.querySelector(".slot-tile");
+    tile.classList.remove("selected", "peer-highlight");
+    const fill = (style) => `${style.backgroundColor} ${style.backgroundImage}`;
+    const result = {};
+    for (const state of states) {
+      tile.classList.remove(...states.map((name) => `state-${name}`));
+      tile.classList.add(`state-${state}`);
+      result[state] = {
+        chip: fill(getComputedStyle(tile, "::after")),
+        legend: fill(getComputedStyle(document.querySelector(`.swatch.${state}`))),
+      };
+    }
+    // A selected bay draws a ring, not a filled chip.
+    tile.classList.add("selected");
+    result.selectedRing = getComputedStyle(tile, "::after").backgroundColor;
+    return result;
+  });
+  for (const state of ["healthy", "empty", "identify", "fault", "unknown", "unmapped"]) {
+    expect(fills[state].chip, state).toBe(fills[state].legend);
+  }
+  expect(fills.selectedRing).toBe("rgba(0, 0, 0, 0)");
+});
+
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
   const snapshotPath = buildOfflineTopLoaderSnapshotFixture();
 

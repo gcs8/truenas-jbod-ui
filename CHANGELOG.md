@@ -36,7 +36,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#912)
 - On 24-bay 2.5" fronts, each bay's state icon no longer covers its latch and
   status LED. It sits in the empty middle of the sled, or at its foot while a
-  heat map shows its value there. (#913)
+  heat map shows its value there. Every bay's state icon now uses the same
+  color as its legend entry instead of a dark box. (#913)
 
 ## v0.24.0-beta.1 - 2026-10-08
 

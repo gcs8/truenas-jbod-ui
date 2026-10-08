@@ -3348,12 +3348,21 @@ button.fabric-trace-crumb:hover {
   line-height: 1;
 }
 
-.swatch.healthy { background: var(--healthy); }
-.swatch.empty { background: var(--empty); }
-.swatch.identify { background: var(--identify); }
-.swatch.fault { background: var(--fault); }
-.swatch.unknown { background: var(--unknown); }
-.swatch.unmapped { background: var(--unmapped); }
+/* The legend swatch and each bay's state chip share one fill, so a chip reads
+   as its legend entry. Fault, unknown and unmapped add a stripe as a non-color
+   cue. */
+.swatch.healthy,
+.slot-tile.state-healthy::after { background: var(--healthy); }
+.swatch.empty,
+.slot-tile.state-empty::after { background: var(--empty); }
+.swatch.identify,
+.slot-tile.state-identify::after { background: var(--identify); }
+.swatch.fault,
+.slot-tile.state-fault::after { background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.36) 0 4px, transparent 4px 8px), var(--fault); }
+.swatch.unknown,
+.slot-tile.state-unknown::after { background: repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.36) 0 3px, transparent 3px 6px), var(--unknown); }
+.swatch.unmapped,
+.slot-tile.state-unmapped::after { background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.36) 0 3px, transparent 3px 7px), var(--unmapped); }
 
 .mapping-health-panel {
   margin-bottom: 12px;
@@ -3423,9 +3432,9 @@ button.fabric-trace-crumb:hover {
 .slot-tile.state-healthy::after { content: "✓"; border-style: solid; }
 .slot-tile.state-empty::after { content: "○"; border-style: dotted; }
 .slot-tile.state-identify::after { content: "◎"; border-style: double; }
-.slot-tile.state-fault::after { content: "!"; border-style: solid; background: repeating-linear-gradient(135deg, #611 0 4px, #211 4px 8px); }
-.slot-tile.state-unknown::after { content: "?"; border-style: dashed; background: repeating-linear-gradient(0deg, #173457 0 3px, #10161c 3px 6px); }
-.slot-tile.state-unmapped::after { content: "◇"; border-style: dashed; background: repeating-linear-gradient(135deg, #6a3d18 0 3px, #17110d 3px 7px); }
+.slot-tile.state-fault::after { content: "!"; border-style: solid; }
+.slot-tile.state-unknown::after { content: "?"; border-style: dashed; }
+.slot-tile.state-unmapped::after { content: "◇"; border-style: dashed; }
 
 @media (forced-colors: active) {
   .slot-tile::after,
