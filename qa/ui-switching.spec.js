@@ -212,6 +212,8 @@ test.describe("browser qa smoke", () => {
   test("manual refresh restores focus to the same slot", async ({ page }) => {
     test.setTimeout(SYSTEM_SETTLE_TIMEOUT_MS + 30_000);
     await gotoApp(page);
+    // A timed refresh during a slow live forced refresh would supersede it.
+    await setAutoRefresh(page, false);
     const tile = page.locator("#slot-grid .slot-tile:not(.filtered-out)").first();
     test.skip((await tile.count()) === 0, "Need at least one visible slot tile.");
     const slotNumber = await tile.getAttribute("data-slot");

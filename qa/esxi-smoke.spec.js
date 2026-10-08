@@ -91,7 +91,11 @@ test.describe("ESXi smoke", () => {
 
     await tiles.first().click();
     await expect(page.locator("#detail-content")).toBeVisible();
-    await expect(page.locator("#detail-content")).toContainText("Samsung SSD 970 EVO 2TB");
+    // A host without StorCLI keeps the carrier layout and says why the drive model is missing.
+    const warnings = (await page.locator("#warning-list").textContent()) || "";
+    await expect(page.locator("#detail-content")).toContainText(
+      /StorCLI is not (installed|available) on this ESXi host/.test(warnings) ? "13:1" : "Samsung SSD 970 EVO 2TB"
+    );
     await expect(page.locator("#detail-led-controls")).toBeHidden();
     await expect(page.locator("#detail-smart-note")).toBeVisible();
     await expect(page.locator(".nvme-carrier-edge-note")).toContainText("M2-1 lower slot");
