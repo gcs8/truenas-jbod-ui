@@ -922,10 +922,9 @@ class ESXiHostPrepService:
             payload = json.loads(output)
         except ValueError:
             # Some supported StorCLI versions emit text despite the J argument.
-            matches = re.findall(
-                r"^(?:Number of Controllers|Controller Count)\s*=\s*([0-9]+)\s*$", output, re.MULTILINE
-            )
-            return int(matches[0]) if len(matches) == 1 else None
+            matches = [match for line in output.splitlines() if (
+                match := re.fullmatch(r"(?:Number of Controllers|Controller Count)\s*=\s*([0-9]+)\s*", line))]
+            return int(matches[0][1]) if len(matches) == 1 else None
         if not isinstance(payload, dict):
             return None
         controllers = payload.get("Controllers")
@@ -1018,7 +1017,9 @@ class ESXiHostPrepService:
             if isinstance(verification_summary, dict)
             else None
         )
-        if re.search(r"^\s*Reboot Required:\s*true\s*$", install_result.stdout, re.IGNORECASE | re.MULTILINE):
+        # Match per line: the host controls this output, and `^\s*` under MULTILINE rescans it from every line.
+        if any(re.fullmatch(r"\s*Reboot Required:\s*true\s*", line, re.IGNORECASE)
+               for line in install_result.stdout.splitlines()):
             detail = (
                 f"{detail or ''} ESXi says the host must reboot before the package takes effect. "
                 "On ESXi 8 the `esxcli storcli` commands this app reads appear only after that reboot."

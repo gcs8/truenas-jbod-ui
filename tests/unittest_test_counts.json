@@ -30,7 +30,7 @@
     "test_disk_retention_accounting": 16,
     "test_enclosure_aliases": 3,
     "test_enclosure_option_labels": 16,
-    "test_esxi_host_prep": 46,
+    "test_esxi_host_prep": 48,
     "test_full_backup_benchmark": 31,
     "test_ghcr_release_contract": 11,
     "test_heap_probe": 4,

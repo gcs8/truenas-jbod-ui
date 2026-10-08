@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -1267,6 +1268,24 @@ class StorCLIVerificationEvidenceTests(unittest.TestCase):
         quiet = ESXiHostPrepService._build_install_detail(
             {'filename': 'storcli.zip'}, replace(installed, stdout='Reboot Required: false\n'), verification)
         self.assertNotIn('reboot', quiet)
+
+    def test_reboot_notice_reads_one_line_at_a_time(self):
+        installed = SSHCommandResult(command='esxcli software component apply -d /tmp/x.zip', ok=True, exit_code=0)
+        build = ESXiHostPrepService._build_install_detail
+        crlf = build({'filename': 'x.zip'}, replace(installed, stdout='Reboot Required: true\r\n'), {})
+        self.assertIn('must reboot', crlf)
+        split = build({'filename': 'x.zip'}, replace(installed, stdout='Reboot Required:\n true\n'), {})
+        self.assertNotIn('reboot', split)
+        # A host can send any install output; a pattern that spans lines took over 3 s on this.
+        hostile = replace(installed, stdout=' \n' * 16384 + 'Reboot Required: false')
+        started = time.perf_counter()
+        self.assertNotIn('reboot', build({'filename': 'x.zip'}, hostile, {}))
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_text_controller_count_reads_one_line_at_a_time(self):
+        count = ESXiHostPrepService._extract_controller_count
+        self.assertEqual(count('Status = Success\r\n\r\nController Count = 1\r\n'), 1)
+        self.assertIsNone(count('Controller Count =\n1\n'))
 
     def test_passthrough_evidence_requires_success_and_does_not_imply_storcli(self):
         pci = '0000:01:00.0 RAID bus controller: Broadcom MegaRAID\n'
