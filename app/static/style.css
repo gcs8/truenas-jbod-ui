@@ -3364,6 +3364,11 @@ button.fabric-trace-crumb:hover {
 .swatch.unmapped,
 .slot-tile.state-unmapped::after { background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.36) 0 3px, transparent 3px 7px), var(--unmapped); }
 
+/* A white glyph falls under 3:1 on the lighter unstriped fills, so they use
+   dark ink; the striped fills keep white, which their dark stripes favor. */
+.swatch:is(.healthy, .identify),
+.slot-tile:is(.state-healthy, .state-identify)::after { color: #10161c; }
+
 .mapping-health-panel {
   margin-bottom: 12px;
   padding: 14px 18px;
@@ -3743,6 +3748,13 @@ button.fabric-trace-crumb:hover {
 
 .chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool) {
   visibility: hidden;
+}
+
+/* A saved view's third label (size or placement) shows a few letters on a 40px
+   sled and pushes the device label into the chip, so these sleds drop it; the
+   slot details panel still shows it. */
+.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tertiary {
+  display: none;
 }
 
 .chassis-shell[data-layout-mode="standard-3.5"] {

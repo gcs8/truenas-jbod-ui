@@ -650,7 +650,15 @@ test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and 
         let chipCount = 0;
         // The fixture selects slot 0 and its vdev peers, which draw rings
         // instead of chips; clear that so every bay shows its state chip.
-        for (const tile of shell.querySelectorAll(".slot-tile")) tile.classList.remove("selected", "peer-highlight");
+        // Saved-view bays also carry a third label (size or placement); add
+        // one so the check covers that layout too.
+        for (const tile of shell.querySelectorAll(".slot-tile")) {
+          tile.classList.remove("selected", "peer-highlight");
+          const tertiary = document.createElement("span");
+          tertiary.className = "slot-tertiary";
+          tertiary.textContent = "3.84 TB";
+          tile.querySelector(".slot-latch").before(tertiary);
+        }
         for (const tile of shell.querySelectorAll(".slot-tile")) {
           const tileRect = tile.getBoundingClientRect();
           const chip = getComputedStyle(tile, "::after");
@@ -660,10 +668,10 @@ test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and 
           const left = tileRect.left + parseFloat(chip.left) + shift.m41;
           const top = tileRect.top + parseFloat(chip.top) + shift.m42;
           const chipRect = { left, top, right: left + parseFloat(chip.width), bottom: top + parseFloat(chip.height) };
-          const parts = [".slot-status-led", ".slot-latch", ".slot-number", ".slot-heatmap-value", ".slot-device", ".slot-pool"];
+          const parts = [".slot-status-led", ".slot-latch", ".slot-number", ".slot-heatmap-value", ".slot-device", ".slot-pool", ".slot-tertiary"];
           for (const part of parts) {
             const element = tile.querySelector(part);
-            if (!element || getComputedStyle(element).visibility === "hidden") continue;
+            if (!element || getComputedStyle(element).visibility === "hidden" || getComputedStyle(element).display === "none") continue;
             if (overlaps(chipRect, element.getBoundingClientRect())) hits.push(`${tile.dataset.slot}${part}`);
           }
           if (chipRect.bottom > tileRect.bottom) hits.push(`${tile.dataset.slot} below the sled`);
@@ -709,14 +717,28 @@ test("offline bay state chips use their legend colors", async ({ page }) => {
     // The fixture selects slot 0 and its vdev peers, which draw rings instead.
     const tile = shell.querySelector(".slot-tile");
     tile.classList.remove("selected", "peer-highlight");
-    const fill = (style) => `${style.backgroundColor} ${style.backgroundImage}`;
+    const look = (style) => `${style.backgroundColor} ${style.backgroundImage} ink ${style.color}`;
+    const luminance = (rgb, scale = 1) => {
+      const [r, g, b] = rgb.match(/\d+(\.\d+)?/g).slice(0, 3).map((value) => {
+        const channel = (Number(value) * scale) / 255;
+        return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const contrast = (a, b) => (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
     const result = {};
     for (const state of states) {
       tile.classList.remove(...states.map((name) => `state-${name}`));
       tile.classList.add(`state-${state}`);
+      const chip = getComputedStyle(tile, "::after");
+      const ink = luminance(chip.color);
+      // Striped fills lay a 36% black stripe over the state color.
+      const fills = [luminance(chip.backgroundColor)];
+      if (chip.backgroundImage !== "none") fills.push(luminance(chip.backgroundColor, 0.64));
       result[state] = {
-        chip: fill(getComputedStyle(tile, "::after")),
-        legend: fill(getComputedStyle(document.querySelector(`.swatch.${state}`))),
+        chip: look(chip),
+        legend: look(getComputedStyle(document.querySelector(`.swatch.${state}`))),
+        glyphContrast: Math.min(...fills.map((fill) => contrast(ink, fill))),
       };
     }
     // A selected bay draws a ring, not a filled chip.
@@ -726,6 +748,7 @@ test("offline bay state chips use their legend colors", async ({ page }) => {
   });
   for (const state of ["healthy", "empty", "identify", "fault", "unknown", "unmapped"]) {
     expect(fills[state].chip, state).toBe(fills[state].legend);
+    expect(fills[state].glyphContrast, `${state} glyph contrast`).toBeGreaterThanOrEqual(3);
   }
   expect(fills.selectedRing).toBe("rgba(0, 0, 0, 0)");
 });
