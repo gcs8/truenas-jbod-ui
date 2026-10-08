@@ -50,7 +50,7 @@ asyncio.run(main())
   return outputPath;
 }
 
-function buildOfflineLegacyFaceSnapshotFixture(faceStyle) {
+function buildOfflineLegacyFaceSnapshotFixture(faceStyle, builtinProfileId = "") {
   const supportedFaces = new Set(["generic", "front-drive", "rear-drive"]);
   if (!supportedFaces.has(faceStyle)) {
     throw new Error(`Unsupported synthetic legacy face: ${faceStyle}`);
@@ -66,6 +66,7 @@ import pathlib
 import sys
 
 from app.models.domain import EnclosureProfileView
+from app.services.profile_registry import ProfileRegistry
 
 root = pathlib.Path.cwd()
 spec = importlib.util.spec_from_file_location("snapshot_export_fixtures", root / "tests" / "test_snapshot_export.py")
@@ -76,18 +77,26 @@ spec.loader.exec_module(module)
 
 async def main():
     face_style = sys.argv[2]
-    columns = 14
-    layout = [list(range(columns))]
-    profile = EnclosureProfileView(
-        id=f"synthetic-{face_style}-14",
-        label=f"Synthetic {face_style} 14-column face",
-        face_style=face_style,
-        latch_edge="bottom",
-        bay_size="3.5",
-        rows=1,
-        columns=columns,
-        slot_layout=layout,
-    )
+    builtin_id = sys.argv[3]
+    if builtin_id:
+        # The shipped built-in profile; default Settings() never reads local config.
+        profile = ProfileRegistry(module.Settings()).get(builtin_id)
+        assert profile is not None and profile.face_style == face_style, builtin_id
+        layout = profile.slot_layout
+        columns = profile.columns
+    else:
+        columns = 14
+        layout = [list(range(columns))]
+        profile = EnclosureProfileView(
+            id=f"synthetic-{face_style}-14",
+            label=f"Synthetic {face_style} 14-column face",
+            face_style=face_style,
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=1,
+            columns=columns,
+            slot_layout=layout,
+        )
     slots = [
         module.SlotView(
             slot=slot_number,
@@ -158,7 +167,7 @@ async def main():
 
 asyncio.run(main())
 `;
-  const result = spawnSync(python, ["-c", script, outputPath, faceStyle], {
+  const result = spawnSync(python, ["-c", script, outputPath, faceStyle, builtinProfileId], {
     cwd: repoRoot,
     encoding: "utf8",
   });
@@ -594,6 +603,33 @@ for (const faceStyle of ["generic", "front-drive", "rear-drive"]) {
     expect(geometry.minTileWidth).toBeGreaterThanOrEqual(72);
     expect(geometry.controlsOverlap).toBe(false);
     expect(consoleErrors).toEqual([]);
+  });
+}
+
+// 2.5" sleds are tall and narrow and fit a desktop chassis without scrolling.
+for (const { faceStyle, profileId, layoutMode, minHeightRatio } of [
+  { faceStyle: "front-drive", profileId: "supermicro-ssg-2028r-shared-front-24", layoutMode: "dense-2.5", minHeightRatio: 2.5 },
+  { faceStyle: "rear-drive", profileId: "supermicro-sys-2029gp-tr-right-nvme-2", layoutMode: "compact", minHeightRatio: 2 },
+]) {
+  test(`offline ${profileId} draws 2.5-inch sleds`, async ({ page }) => {
+    const snapshotPath = buildOfflineLegacyFaceSnapshotFixture(faceStyle, profileId);
+    await page.setViewportSize({ width: 1920, height: 1100 });
+    await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+    const shell = page.locator("#chassis-shell");
+    await expect(shell).toHaveAttribute("data-drive-scale", "2.5");
+    await expect(shell).toHaveAttribute("data-layout-mode", layoutMode);
+    const geometry = await shell.evaluate((element) => {
+      const grid = element.querySelector(".slot-grid");
+      const tiles = [...element.querySelectorAll(".slot-tile")].map((tile) => tile.getBoundingClientRect());
+      return {
+        minHeightRatio: Math.min(...tiles.map((rect) => rect.height / rect.width)),
+        gridScrollWidth: grid.scrollWidth,
+        gridClientWidth: grid.clientWidth,
+      };
+    });
+    expect(geometry.minHeightRatio).toBeGreaterThanOrEqual(minHeightRatio);
+    expect(geometry.gridScrollWidth).toBeLessThanOrEqual(geometry.gridClientWidth + 1);
   });
 }
 

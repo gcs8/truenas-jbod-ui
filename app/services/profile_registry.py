@@ -307,7 +307,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="front-drive",
             latch_edge="top",
-            bay_size="3.5",
+            bay_size="2.5",
             rows=1,
             columns=24,
             slot_layout=[

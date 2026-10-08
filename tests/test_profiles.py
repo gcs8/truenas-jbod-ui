@@ -208,7 +208,8 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile.id, QUANTASTOR_SSG_SHARED_24_PROFILE_ID)
         self.assertEqual(profile.latch_edge, "top")
-        self.assertEqual(profile.bay_size, "3.5")
+        # The SSG-2028R front takes 24 x 2.5" bays.
+        self.assertEqual(profile.bay_size, "2.5")
         self.assertEqual(profile.rows, 1)
         self.assertEqual(profile.columns, 24)
         self.assertEqual(profile.slot_layout, [list(range(24))])
