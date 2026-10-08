@@ -516,6 +516,8 @@ Additional element status diagnostic page:
             ("esxcli storcli controller show all --id=0 --json --nolog", "storcli /c0 show all J"),
             ("esxcli storcli virtualdrive show all --id=1 --vid=all --json", "storcli /c1/vall show all J"),
             ("esxcli storcli physicaldrive show all -i 0 -e all -s all --json", "storcli /c0/eall/sall show all J"),
+            ("esxcli storcli physicaldrive show all -i=0 -e=all -s=all --json", "storcli /c0/eall/sall show all J"),
+            ("esxcli storcli virtualdrive show all -i=1 -v=all --json", "storcli /c1/vall show all J"),
             ("esxcli storcli physicaldrive show all --id all --eid all --sid all --json",
              "storcli /call/eall/sall show all J"),
         ):

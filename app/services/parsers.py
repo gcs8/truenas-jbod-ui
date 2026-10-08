@@ -3752,11 +3752,11 @@ def _esxcli_storcli_key(args: list[str]) -> str | None:
     for token in tokens:
         if token in {"--json", "--nolog"}:
             options[token[2:]] = ""
-        elif token.startswith("--") and "=" in token:
-            name, _, value = token[2:].partition("=")
-            options[name] = value
-        else:
-            options[ESXCLI_STORCLI_SHORT_OPTIONS.get(token, token.lstrip("-"))] = next(tokens, "")
+            continue
+        # `--id=0`, `--id 0`, `-i=0` and `-i 0` are all valid esxcli forms.
+        flag, has_value, value = token.partition("=")
+        name = ESXCLI_STORCLI_SHORT_OPTIONS.get(flag, flag.lstrip("-"))
+        options[name] = value if has_value else next(tokens, "")
     controller = options.get("id", "").lower()
     if "json" not in options or not re.fullmatch(r"\d+|all", controller) or any(
         options.get(selector, "").lower() != "all" for selector in selectors
