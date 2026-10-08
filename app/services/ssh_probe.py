@@ -29,6 +29,15 @@ MAX_SSH_OUTPUT_BYTES = 4 * 1024 * 1024
 # server with a lower MaxSessions refuses the extra channel opens; the run then
 # settles on the channel count that opened (see _ChannelGate).
 MAX_PARALLEL_CHANNELS_PER_CONNECTION = 8
+# How long the app keeps a finished connection open for the next SSH call to the
+# same host. A refresh makes several SSH calls, and the browser refreshes every
+# 30 s by default; outliving that interval lets them all share one login, which
+# stays under sshd MaxStartups and IPS "SSH scan" rules (five connections in two
+# minutes).
+SSH_CONNECTION_IDLE_SECONDS = 90.0
+# A connection that keeps being reused is still replaced after this long, so a
+# changed host key or credential is checked again by a fresh login within minutes.
+SSH_CONNECTION_MAX_AGE_SECONDS = 300.0
 
 
 class _ChannelGate:
@@ -54,6 +63,10 @@ class _ChannelGate:
         with self._condition:
             self._stopped = True
             self._condition.notify_all()
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
 
     def release(self) -> None:
         with self._condition:
@@ -279,8 +292,88 @@ class _CommandDeadline:
 
 
 class SSHProbe:
-    def __init__(self, config: SSHConfig) -> None:
+    def __init__(self, config: SSHConfig, *, idle_seconds: float = 0.0) -> None:
+        """``idle_seconds`` > 0 keeps one finished connection for the next call.
+
+        Only one caller uses a connection at a time: a call that finds the spare
+        connection in use opens its own, as before. A connection is kept only
+        when its call finished cleanly, its transport is still up and it is
+        younger than ``SSH_CONNECTION_MAX_AGE_SECONDS``; it is closed once it has
+        sat unused for ``idle_seconds``.
+        """
         self.config = config
+        self.idle_seconds = idle_seconds
+        self._idle: tuple[paramiko.SSHClient, threading.Timer] | None = None
+        self._idle_lock = threading.Lock()
+        self._opened_at: dict[int, float] = {}
+
+    def _take_idle_client(self) -> paramiko.SSHClient | None:
+        with self._idle_lock:
+            idle, self._idle = self._idle, None
+        if idle is None:
+            return None
+        client, timer = idle
+        timer.cancel()
+        if self._reusable(client):
+            return client
+        self._close(client)
+        return None
+
+    def _reusable(self, client: paramiko.SSHClient) -> bool:
+        """Still connected and young enough; checked both when kept and when handed out."""
+        transport = client.get_transport()
+        age = time.monotonic() - self._opened_at.get(id(client), float("-inf"))
+        return transport is not None and transport.is_active() and age < SSH_CONNECTION_MAX_AGE_SECONDS
+
+    def _keep_idle(self, client: paramiko.SSHClient, cancellation: _WorkerCancellation) -> bool:
+        if self.idle_seconds <= 0 or cancellation.cancelled.is_set() or not self._reusable(client):
+            return False
+        timer = threading.Timer(self.idle_seconds, self._expire_idle, args=(client,))
+        timer.daemon = True
+        with self._idle_lock:
+            if self._idle is not None:
+                return False
+            self._idle = (client, timer)
+            timer.start()
+        return True
+
+    def _close(self, client: paramiko.SSHClient) -> None:
+        self._opened_at.pop(id(client), None)
+        client.close()
+
+    def _expire_idle(self, client: paramiko.SSHClient) -> None:
+        with self._idle_lock:
+            if self._idle is None or self._idle[0] is not client:
+                return
+            self._idle = None
+        self._close(client)
+
+    def close_idle(self) -> None:
+        """Close the kept connection now, if there is one."""
+        client = self._take_idle_client()
+        if client is not None:
+            self._close(client)
+
+    def _lease_client(self, cancellation: _WorkerCancellation) -> tuple[paramiko.SSHClient, bool]:
+        """Return the kept connection, or a new one, and whether it was reused."""
+        cancellation.check()
+        client = self._take_idle_client()
+        if client is not None:
+            try:
+                cancellation.register(client)
+            except BaseException:
+                self._close(client)
+                raise
+            return client, True
+        client = self._client(_cancel=cancellation)
+        if self.idle_seconds > 0:
+            self._opened_at[id(client)] = time.monotonic()
+        return client, False
+
+    def _return_client(self, client: paramiko.SSHClient, cancellation: _WorkerCancellation, *, reusable: bool) -> None:
+        cancellation.discard(client)
+        if not (reusable and self._keep_idle(client, cancellation)):
+            self._close(client)
 
     def open_client(self) -> paramiko.SSHClient:
         if not self.config.enabled:
@@ -367,17 +460,15 @@ class SSHProbe:
 
     @contextmanager
     def _owned_client(self, cancellation: _WorkerCancellation):
-        cancellation.check()
-        client = self._client(_cancel=cancellation)
+        client, reused = self._lease_client(cancellation)
+        reusable = False
         try:
             cancellation.register(client)
             cancellation.check()
-            yield client
+            yield client, reused
+            reusable = True
         finally:
-            try:
-                client.close()
-            finally:
-                cancellation.discard(client)
+            self._return_client(client, cancellation, reusable=reusable)
 
     def open_session(self) -> SSHSession:
         """One reusable connection for a series of commands; see :class:`SSHSession`."""
@@ -431,8 +522,9 @@ class SSHProbe:
 
         results: list[SSHCommandResult] = []
         started = time.perf_counter()
+        reused = False
         try:
-            with self._owned_client(_cancel) as client:
+            with self._owned_client(_cancel) as (client, reused):
                 for command in command_list:
                     _cancel.check()
                     results.append(self._run_single_command(client, command, stdin_data=stdin_data, _cancel=_cancel))
@@ -451,9 +543,10 @@ class SSHProbe:
             return results
 
         logger.info(
-            "SSH command batch completed for %s@%s: connections=1 commands=%s failures=%s duration=%.3fs",
+            "SSH command batch completed for %s@%s: connections=%s commands=%s failures=%s duration=%.3fs",
             self.config.user,
             self.config.host,
+            0 if reused else 1,
             len(results),
             sum(1 for result in results if not result.ok),
             time.perf_counter() - started,
@@ -494,8 +587,7 @@ class SSHProbe:
 
         started = time.perf_counter()
         try:
-            _cancel.check()
-            client = self._client(_cancel=_cancel)
+            client, reused = self._lease_client(_cancel)
         except Exception as exc:
             logger.warning(
                 "SSH planned command session failed for %s@%s: %s",
@@ -571,6 +663,7 @@ class SSHProbe:
                 error_message = str(session_error) or session_error.__class__.__name__
                 results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
 
+        reusable = False
         try:
             _cancel.register(client)
             _cancel.check()
@@ -582,17 +675,17 @@ class SSHProbe:
                 with ThreadPoolExecutor(max_workers=width, thread_name_prefix="ssh-channel") as executor:
                     for future in [executor.submit(drive, *item) for item in pending]:
                         future.result()
+            # A stopped gate means a channel's cleanup was never confirmed.
+            reusable = not gate.stopped
         finally:
-            try:
-                client.close()
-            finally:
-                _cancel.discard(client)
+            self._return_client(client, _cancel, reusable=reusable)
 
         results_count = sum(len(outcomes[index]) for index, _commands, _seen in pending)
         logger.info(
-            "SSH planned command session completed for %s@%s: connections=1 plans=%s batches=%s commands=%s failures=%s duration=%.3fs",
+            "SSH planned command session completed for %s@%s: connections=%s plans=%s batches=%s commands=%s failures=%s duration=%.3fs",
             self.config.user,
             self.config.host,
+            0 if reused else 1,
             len(pending),
             sum(batch_counts),
             results_count,
@@ -610,7 +703,7 @@ class SSHProbe:
     ) -> SSHCommandResult:
         _cancel = _cancel or _WorkerCancellation()
         try:
-            with self._owned_client(_cancel) as client:
+            with self._owned_client(_cancel) as (client, _reused):
                 return self._run_single_command(
                     client,
                     command,
@@ -749,7 +842,7 @@ class SSHProbe:
         channel = None
         try:
             deadline.check()
-            stdin, stdout, stderr = streams = client.exec_command(effective_command, timeout=command_timeout)
+            stdin, stdout, _stderr = streams = client.exec_command(effective_command, timeout=command_timeout)
             channel = stdout.channel
             deadline.channel(channel)
             _cancel.check()
@@ -831,6 +924,11 @@ class SSHProbe:
                         stream.close()
                     except Exception:
                         logger.warning("SSH command stream close failed", exc_info=False)
+                # The error that ended the command keeps this frame alive, often in a
+                # reference cycle. Paramiko's BufferedFile.__del__ flushes even a closed
+                # file, so if the cycle collector frees its buffer first it prints
+                # "I/O operation on closed file" (paramiko#2153). Free them now instead.
+                stdin = stdout = _stderr = stream = streams = effective_error = None
 
     @staticmethod
     def _failure_result(command: str, error_message: str) -> SSHCommandResult:

@@ -357,6 +357,12 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload.hw_disks[0]["endpoint"], "hwDiskEnum")
         self.assertEqual(payload.hw_enclosures[0]["endpoint"], "hwEnclosureEnum")
 
+    async def test_fetch_network_ports_reads_target_port_enum_as_optional(self) -> None:
+        client = QuantastorRESTClient(TrueNASConfig(api_user="admin", api_password="secret", platform="quantastor"))
+        with patch.object(client, "_fetch_optional_list", return_value=[{"name": "eno1"}]) as fetch:
+            self.assertEqual(await client.fetch_network_ports(), [{"name": "eno1"}])
+        fetch.assert_called_once_with("targetPortEnum")
+
     async def test_fetch_all_tolerates_an_appliance_with_no_storage_pools(self) -> None:
         responses = {
             "storageSystemEnum": [{"id": "sys-1", "name": "node-a"}],

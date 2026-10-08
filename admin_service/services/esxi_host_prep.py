@@ -819,13 +819,18 @@ class ESXiHostPrepService:
         command_map = {
             "component_list": "esxcli --formatter=csv software component list",
             "vib_list": "esxcli --formatter=csv software vib list",
+            # ESXi 7 installs /opt/lsi/storcli64; ESXi 8 installs /opt/storcli/bin and runs it only
+            # through `esxcli storcli`, which appears after the post-install reboot.
             "storcli_paths": (
                 "if [ -f /opt/lsi/storcli64/storcli64 ] && [ -x /opt/lsi/storcli64/storcli64 ]; then "
+                "printf 'executable\\n'; "
+                "elif [ -f /opt/storcli/bin/storcli64 ] && [ -x /opt/storcli/bin/storcli64 ]; then "
                 "printf 'executable\\n'; "
                 "elif [ -d /opt/lsi/storcli64 ] && [ -r /opt/lsi/storcli64 ] && [ -x /opt/lsi/storcli64 ]; then "
                 "printf 'absent\\n'; else exit 1; fi"
             ),
             "storcli_show": "/opt/lsi/storcli64/storcli64 show J",
+            "storcli_plugin_show": "esxcli storcli system show ctrlcount --json --nolog",
             "adapter_list": "esxcli storage core adapter list",
             "pcipassthru_list": "esxcli hardware pci pcipassthru list",
             "megaraid_pci": "lspci",
@@ -846,7 +851,11 @@ class ESXiHostPrepService:
         package_installed = self._combine_presence(package_states)
         executable_output = successful_stdout("storcli_paths")
         executable_available = {"executable": True, "absent": False}.get(executable_output)
-        controller_count = self._extract_controller_count(successful_stdout("storcli_show") or "")
+        controller_count = next(
+            (count for name in ("storcli_show", "storcli_plugin_show")
+             if (count := self._extract_controller_count(successful_stdout(name) or "")) is not None),
+            None,
+        )
         installed = self._combine_presence([package_installed, executable_available])
         if controller_count is not None:
             installed = True
@@ -913,8 +922,9 @@ class ESXiHostPrepService:
             payload = json.loads(output)
         except ValueError:
             # Some supported StorCLI versions emit text despite the J argument.
-            matches = re.findall(r"^Number of Controllers\s*=\s*([0-9]+)\s*$", output, re.MULTILINE)
-            return int(matches[0]) if len(matches) == 1 else None
+            matches = [match for line in output.splitlines() if (
+                match := re.fullmatch(r"(?:Number of Controllers|Controller Count)\s*=\s*([0-9]+)\s*", line))]
+            return int(matches[0][1]) if len(matches) == 1 else None
         if not isinstance(payload, dict):
             return None
         controllers = payload.get("Controllers")
@@ -928,7 +938,8 @@ class ESXiHostPrepService:
             data = controller.get("Response Data")
             if not isinstance(status, dict) or status.get("Status") != "Success" or not isinstance(data, dict):
                 return None
-            count = data.get("Number of Controllers")
+            # `storcli show J` says "Number of Controllers"; ESXi 8's ctrlcount says "Controller Count".
+            count = data.get("Number of Controllers", data.get("Controller Count"))
             if type(count) is not int or count < 0:
                 return None
             counts.append(count)
@@ -1006,6 +1017,13 @@ class ESXiHostPrepService:
             if isinstance(verification_summary, dict)
             else None
         )
+        # Match per line: the host controls this output, and `^\s*` under MULTILINE rescans it from every line.
+        if any(re.fullmatch(r"\s*Reboot Required:\s*true\s*", line, re.IGNORECASE)
+               for line in install_result.stdout.splitlines()):
+            detail = (
+                f"{detail or ''} ESXi says the host must reboot before the package takes effect. "
+                "On ESXi 8 the `esxcli storcli` commands this app reads appear only after that reboot."
+            ).strip()
         if detail:
             return f"Uploaded {filename} and completed the ESXi install command. {detail}"
         return f"Uploaded {filename} and completed the ESXi install command."

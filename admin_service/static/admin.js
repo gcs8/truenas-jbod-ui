@@ -1396,7 +1396,7 @@
         const nodeCount = nodes.length;
         const nodesMissingHosts = nodes.filter((node) => !node.host).length;
         elements.setupHaNodesResult.textContent = nodesMissingHosts
-          ? `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}. ${nodesMissingHosts} of them ${nodesMissingHosts === 1 ? "has" : "have"} no address yet; fill it in or leave it blank and the app will find it once one node answers.`
+          ? `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}. ${nodesMissingHosts} of them ${nodesMissingHosts === 1 ? "has" : "have"} no address yet. QuantaStor did not report a physical port with a default gateway for ${nodesMissingHosts === 1 ? "it" : "them"}, so type the node's own SSH address, not the shared API address.`
           : `Loaded ${nodeCount} node${nodeCount === 1 ? "" : "s"}.`;
       } else {
         elements.setupHaNodesResult.textContent = "Up to three nodes.";

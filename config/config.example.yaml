@@ -303,7 +303,8 @@ admin:
 #       known_hosts_path: /app/data/known_hosts
 #       strict_host_key_checking: true
 #       # The bundle admin fills in for an ESXi system: esxcli storage context
-#       # plus StorCLI drive JSON when the StorCLI VIB is installed.
+#       # plus StorCLI drive JSON when the StorCLI VIB is installed. On ESXi 8
+#       # the app runs each StorCLI line as `esxcli storcli ...` instead.
 #       commands:
 #         - vmware -v
 #         - esxcli system version get

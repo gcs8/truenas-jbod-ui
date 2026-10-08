@@ -103,6 +103,7 @@ from app.services.parsers import (
     _ses_enclosures_share_identity,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    esxi_storcli_fallback_command,
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
     extract_enclosure_slot_count,
@@ -429,6 +430,34 @@ def _is_authentic_core_ses_target(target: Any) -> bool:
         )
         and isinstance(target.get("ses_element_id"), int)
     )
+
+
+def _core_identify_target(targets: list[Any]) -> dict[str, Any] | None:
+    """The one `sesutil locate` target for a CORE bay, or None when its paths disagree.
+
+    A multipath shelf lists each bay once per expander path. Those paths are one
+    physical element only when every target is a /dev/sesN element with the same
+    index in the same SES enclosure, so one locate on the first path is enough.
+    """
+    if not targets or not all(_is_authentic_core_ses_target(target) for target in targets):
+        return None
+    if len(targets) == 1:
+        return targets[0]
+    enclosure_ids = {normalize_text(target.get("enclosure_id")) for target in targets}
+    if len({target["ses_element_id"] for target in targets}) != 1 or len(enclosure_ids) != 1 or None in enclosure_ids:
+        return None
+    return targets[0]
+
+
+def _ses_device_enclosure_ids(enclosures: Iterable[Any]) -> dict[tuple[str | None, str], str]:
+    """Map each (host, SES device) to the enclosure ID it reports; a device seen with two IDs maps to none."""
+    seen: dict[tuple[str | None, str], set[str | None]] = {}
+    for enclosure in enclosures:
+        for device in {enclosure.ses_device, *enclosure.ses_devices} - {None}:
+            seen.setdefault((normalize_text(enclosure.ssh_host), device), set()).add(
+                normalize_text(enclosure.enclosure_id)
+            )
+    return {key: only for key, ids in seen.items() if len(ids) == 1 for only in ids if only}
 
 
 def build_layout_rows(rows: int, columns: int, slot_count: int) -> list[list[int | None]]:
@@ -827,6 +856,30 @@ def _index_disk_records(
     return disks_by_key, disks_by_slot, disks_by_sas
 
 
+def _bay_peer_devices(
+    raw_slot_status: dict[str, Any],
+    disk: DiskRecord | None,
+    disks_by_key: dict[str, DiskRecord],
+) -> list[str]:
+    """Other paths the enclosure lists in this disk's own bay.
+
+    A dual-path disk can reach the API on one path while its pool label sits on
+    the other. One bay holds one disk, so when the bay lists this disk's path, a
+    name beside it that no other API disk owns is another path to it. CAM
+    model/target/LUN matches across HBAs are not such evidence (#695).
+    """
+    names = raw_slot_status.get("device_names")
+    if disk is None or not isinstance(names, list):
+        return []
+    listed = list(dict.fromkeys(filter(None, (normalize_device_name(name) for name in names if isinstance(name, str)))))
+    if not any(name.lower() in disk.lookup_keys for name in listed):
+        return []
+    return [
+        peer for peer in listed
+        if peer.lower() not in disk.lookup_keys and disks_by_key.get(peer.lower(), disk) is disk
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class CacheResult(Generic[CacheValueT]):
     value: CacheValueT
@@ -1134,6 +1187,8 @@ class InventoryService:
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
+        # One probe per HA node or extra host, so each keeps its own connection.
+        self._ssh_host_probes: dict[str, SSHProbe] = {}
         # Planned SSH sessions waiting for the per-host connection, and the task
         # that runs them. Requests that queue while one round runs share the
         # next round's connection instead of each opening their own.
@@ -1144,11 +1199,15 @@ class InventoryService:
         self._disk_inventory_sync_clock = time.monotonic
         self._disk_inventory_sync_sleep = asyncio.sleep
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
+        # ESXi 7 runs the StorCLI binary, ESXi 8 only `esxcli storcli`. True once
+        # this host answered StorCLI reads only in the form the saved commands lack.
+        self._esxi_storcli_swapped = False
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
+        self._core_ses_enclosure_id_cache: tuple[list[Any], dict[tuple[str | None, str], str]] | None = None
         self._sg_ses_device_cache: dict[str, tuple[list[str], datetime]] = {}
 
     @property
@@ -2592,7 +2651,10 @@ class InventoryService:
         reasons = self._candidate_match_reasons(storage_view, candidate)
         if storage_view.binding.mode == "auto":
             return bool(reasons)
-        if storage_view.binding.mode == "pool":
+        # "Pool" is pool-only once the view names a pool. One that names none
+        # can match only on its saved drive hints, so use them rather than
+        # leave every slot empty.
+        if storage_view.binding.mode == "pool" and any(normalize_text(name) for name in storage_view.binding.pool_names):
             return "pool" in reasons
         if storage_view.binding.mode == "serial":
             return bool([reason for reason in reasons if reason in {"serial", "device", "pcie"}])
@@ -2969,6 +3031,12 @@ class InventoryService:
                     "StorCLI is not available on this ESXi host, so drive details behind the RAID "
                     "controller are missing for this refresh."
                 )
+            esxi_major = re.search(r"\bESXi (\d+)\.", normalized_outputs.get("vmware -v") or "")
+            if esxi_major and int(esxi_major.group(1)) >= 8:
+                warning = (
+                    f"{warning} ESXi 8 needs Broadcom's ESXi 8 StorCLI package and a host reboot "
+                    "after installing it; the app then reads it through `esxcli storcli`."
+                )
             if detail:
                 warning = f"{warning} Detail: {detail}."
             return ([warning], "StorCLI commands unavailable.")
@@ -3228,7 +3296,63 @@ class InventoryService:
         commands.extend(self._esxi_controller_diagnostic_commands(command_results))
         if any(result.ok for result in command_results):
             commands.extend(self._linux_storage_enrichment_probe_commands(command_results))
-        return self._dedupe_unseen_ssh_commands(commands, command_results)
+        # A fallback shares its parser key with the read it replaces, so it skips the canonical dedupe.
+        return self._esxi_storcli_fallback_commands(command_results) + self._dedupe_unseen_ssh_commands(
+            commands, command_results
+        )
+
+    @staticmethod
+    def _storcli_answered(result: SSHCommandResult) -> bool:
+        # ESXi 8 prints XML for a direct StorCLI call; only JSON is an answer.
+        return result.ok and result.stdout.lstrip().startswith("{")
+
+    def _esxi_storcli_initial_commands(self) -> list[str]:
+        commands = list(self.system.ssh.commands)
+        if not self._esxi_storcli_swapped:
+            return commands
+        return [esxi_storcli_fallback_command(command) or command for command in commands]
+
+    def _esxi_storcli_fallback_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        """Retry each unanswered StorCLI read in the other ESXi form (binary <-> `esxcli storcli`)."""
+        if self.system.truenas.platform != "esxi":
+            return []
+        vib_list = next(
+            (result.stdout for result in command_results
+             if result.ok and canonicalize_ssh_command(result.command) == "esxcli software vib list"),
+            None,
+        )
+        if vib_list is not None and "storcli" not in vib_list.lower():
+            return []  # No StorCLI package, so neither form can answer.
+        attempts = Counter(canonicalize_ssh_command(result.command) for result in command_results)
+        return [
+            fallback
+            for result in command_results
+            if not self._storcli_answered(result)
+            and attempts[canonicalize_ssh_command(result.command)] == 1
+            and (fallback := esxi_storcli_fallback_command(result.command))
+        ]
+
+    def _resolve_esxi_storcli_forms(self, command_results: list[SSHCommandResult]) -> list[SSHCommandResult]:
+        """Keep one result per StorCLI read: the form that answered, else a failed form so the refresh
+        still warns (ESXi 8 before its reboot: the binary prints XML, the plugin is missing), else the first.
+
+        The answering form is remembered, so the next refresh tries it first.
+        """
+        reads: dict[str, list[SSHCommandResult]] = {}
+        for result in command_results:
+            if esxi_storcli_fallback_command(result.command):
+                reads.setdefault(canonicalize_ssh_command(result.command), []).append(result)
+        dropped: set[int] = set()
+        for attempts in reads.values():
+            if len(attempts) < 2:
+                continue
+            keep = next((result for result in attempts if self._storcli_answered(result)), None) or next(
+                (result for result in attempts if not result.ok), attempts[0]
+            )
+            dropped.update(id(result) for result in attempts if result is not keep)
+            if self._storcli_answered(keep):
+                self._esxi_storcli_swapped = keep.command not in self.system.ssh.commands
+        return [result for result in command_results if id(result) not in dropped]
 
     @staticmethod
     def _dedupe_unseen_ssh_commands(
@@ -3375,15 +3499,22 @@ class InventoryService:
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
                 ssh_started = time.perf_counter()
-                command_results = await self.ssh_probe.run_planned_commands(
-                    self._ssh_inventory_enrichment_probe_commands
-                )
+                if self.system.truenas.platform == "esxi":
+                    command_results = self._resolve_esxi_storcli_forms(
+                        await self.ssh_probe.run_planned_commands(
+                            self._ssh_inventory_enrichment_probe_commands,
+                            initial_commands=self._esxi_storcli_initial_commands(),
+                        )
+                    )
+                else:
+                    command_results = await self.ssh_probe.run_planned_commands(
+                        self._ssh_inventory_enrichment_probe_commands
+                    )
                 logger.info(
-                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: connections=%s commands=%s failures=%s duration=%.3fs",
+                    "Inventory SSH refresh completed for system=%s platform=%s profile=%s: commands=%s failures=%s duration=%.3fs",
                     self.system.id,
                     self.system.truenas.platform,
                     self.system.default_profile_id or "auto",
-                    1 if command_results else 0,
                     len(command_results),
                     sum(1 for result in command_results if not result.ok),
                     time.perf_counter() - ssh_started,
@@ -3546,7 +3677,8 @@ class InventoryService:
                 )
             else:
                 quantastor_ses_loaded = bool(quantastor_ses_data.ses_enclosures)
-            warnings.extend(quantastor_ses_failures)
+            # A setup failure such as a missing node address reaches both overlays; say it once.
+            warnings.extend(failure for failure in quantastor_ses_failures if failure not in quantastor_cli_failures)
 
             # Failed attempts matter even when they contributed no overlay rows.
             if quantastor_cli_failures or quantastor_ses_failures:
@@ -6492,6 +6624,7 @@ class InventoryService:
                 api_topology_members=api_topology_members,
                 api_enclosure_ids=api_enclosure_ids,
                 api_enclosure_query_failed=raw_data.enclosure_query_failed,
+                bay_peer_devices=_bay_peer_devices(candidate, disk, disks_by_key),
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
             slot_views.append(slot_view)
@@ -10330,6 +10463,10 @@ class InventoryService:
 
     @classmethod
     def _extract_quantastor_gateway_port_host(cls, row: dict[str, Any]) -> str | None:
+        # An alias interface (eno1:gm, an HA VIP) floats between nodes. isVirtualPort also marks
+        # bonds and VLANs, which stay on their node and may carry its only default route.
+        if row.get("isVirtualInterface") is True:
+            return None
         if not cls._quantastor_network_port_has_default_gateway(row):
             return None
         for key in ("ipAddress", "ipAddr", "ip", "address", "hostAddress"):
@@ -12977,6 +13114,7 @@ class InventoryService:
         api_enclosure_query_failed: bool = False,
         resolution_source: str | None = None,
         stale_manual_mapping: bool = False,
+        bay_peer_devices: Iterable[str] = (),
     ) -> SlotView:
         resolution_source = resolution_source or normalize_text(raw_slot_status.get("mapping_resolution_source"))
         stale_manual_mapping = stale_manual_mapping or raw_slot_status.get("stale_manual_mapping") is True
@@ -12994,6 +13132,11 @@ class InventoryService:
             device_name = None
         gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower()) if device_name else None
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
+        for peer in () if zpool else bay_peer_devices:
+            peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
+            if zpool := self._lookup_zpool_member(None, peer, peer_gptid, ssh_data, api_topology_members):
+                gptid = gptid or peer_gptid
+                break
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
         if not model and device_name:
             model = ssh_data.camcontrol_models.get(device_name.lower())
@@ -13136,12 +13279,15 @@ class InventoryService:
                 if isinstance(target, dict) and normalize_text(target.get("ses_device", ""))
             )
         )
+        if self.system.truenas.platform == "core" and len(ses_targets) > 1:
+            device_enclosure_ids = self._core_ses_device_enclosure_ids(ssh_data)
+            for target in ses_targets:
+                target_enclosure_id = device_enclosure_ids.get((normalize_text(target.get("ssh_host")), target["ses_device"]))
+                if target_enclosure_id:
+                    target["enclosure_id"] = target_enclosure_id
         core_ses_target_invalid = bool(
             self.system.truenas.platform == "core"
-            and (
-                len(ses_targets) != 1
-                or not _is_authentic_core_ses_target(ses_targets[0])
-            )
+            and _core_identify_target(ses_targets) is None
         )
         ssh_led_supported = bool(
             self.system.ssh.enabled
@@ -13392,17 +13538,13 @@ class InventoryService:
                 )
 
         if self.system.truenas.platform == "core":
-            authentic_targets = [
-                target
-                for target in ses_targets
-                if _is_authentic_core_ses_target(target)
-            ]
-            if len(ses_targets) != 1 or len(authentic_targets) != 1:
+            core_target = _core_identify_target(ses_targets)
+            if core_target is None:
                 raise TrueNASAPIError(
                     f"Bay {slot_view.slot_label} is not tied to exactly one enclosure element, "
                     "so its light cannot be switched safely."
                 )
-            ses_targets = authentic_targets
+            ses_targets = [core_target]
 
         if action == LedAction.identify:
             locate_state = "on"
@@ -13508,7 +13650,7 @@ class InventoryService:
                         return await ssh_probe.run_command(command)
                     return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
 
-                probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                probe = self._ssh_probe_for_host(target_host)
                 if timeout_seconds is None:
                     return await probe.run_command(command)
                 return await probe.run_command(command, timeout_seconds=timeout_seconds)
@@ -13516,6 +13658,14 @@ class InventoryService:
         if timeout_seconds is None:
             return await ssh_probe.run_command(command)
         return await ssh_probe.run_command(command, timeout_seconds=timeout_seconds)
+
+    def _core_ses_device_enclosure_ids(self, ssh_data: ParsedSSHData) -> dict[tuple[str | None, str], str]:
+        # Built once per parsed snapshot, not once per bay: the map walks every SES enclosure.
+        enclosures = ssh_data.ses_enclosures
+        cached = self._core_ses_enclosure_id_cache
+        if cached is None or cached[0] is not enclosures:
+            cached = self._core_ses_enclosure_id_cache = (enclosures, _ses_device_enclosure_ids(enclosures))
+        return cached[1]
 
     def _ssh_destination_authority_approved(self, host: str | None = None) -> bool:
         if host is None:
@@ -13555,6 +13705,18 @@ class InventoryService:
 
     def _optional_ssh_backoff_key(self, host: str | None = None) -> str:
         return normalize_text(host) or normalize_text(self.system.ssh.host) or UNSCOPED_KEY
+
+    def _ssh_probe_for_host(self, target_host: str | None) -> SSHProbe:
+        """The system's probe for its own host; one kept probe for each other host."""
+        if not target_host or target_host == normalize_text(self.system.ssh.host):
+            return self.ssh_probe
+        probe = self._ssh_host_probes.get(target_host)
+        if probe is None:
+            probe = self._ssh_host_probes[target_host] = SSHProbe(
+                self.system.ssh.model_copy(update={"host": target_host}),
+                idle_seconds=getattr(self.ssh_probe, "idle_seconds", 0.0),
+            )
+        return probe
 
     def _ssh_session_lock_for_host(self, host: str | None = None) -> asyncio.Lock:
         key = self._optional_ssh_backoff_key(host)
@@ -13716,11 +13878,7 @@ class InventoryService:
     async def _drain_ssh_plans(self, key: str, host: str | None) -> None:
         queue = self._ssh_plan_queues.setdefault(key, [])
         target_host = normalize_text(host)
-        probe = (
-            self.ssh_probe
-            if not target_host or target_host == normalize_text(self.system.ssh.host)
-            else SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
-        )
+        probe = self._ssh_probe_for_host(target_host)
         try:
             while True:
                 # Let requests released in the same loop turn join this round.
@@ -13807,7 +13965,7 @@ class InventoryService:
                     else:
                         results = await self.ssh_probe.run_commands(command_list, stdin_data=stdin_data)
                 else:
-                    probe = SSHProbe(self.system.ssh.model_copy(update={"host": target_host}))
+                    probe = self._ssh_probe_for_host(target_host)
                     if stdin_data is None:
                         results = await probe.run_commands(command_list)
                     else:

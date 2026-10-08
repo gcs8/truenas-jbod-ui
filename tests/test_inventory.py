@@ -1274,7 +1274,31 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bundle.sources["bmc"].ok)
 
 
+    async def test_quantastor_cli_and_ses_share_one_setup_failure_warning(self):
+        service, _, _ = self.make_service("quantastor")
+        message = "SSH is turned on but no QuantaStor node address is set."
+        service._fetch_quantastor_cli_overlay = AsyncMock(return_value=({"cli_disks": []}, [message]))
+        service._fetch_quantastor_ses_overlay = AsyncMock(return_value=(ParsedSSHData(), [message, "SES-only failure."]))
+        bundle = await service._collect_inventory_source_bundle()
+        self.assertEqual(bundle.warnings.count(message), 1)
+        self.assertIn("SES-only failure.", bundle.warnings)
+        self.assertFalse(bundle.sources["ssh"].ok)
+
+
 class InventoryHelpersTests(unittest.TestCase):
+    def test_quantastor_floating_alias_is_never_a_node_host_but_bonds_and_vlans_are(self) -> None:
+        extract = InventoryService._extract_quantastor_gateway_port_host
+        port = {"name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"}
+        self.assertEqual(extract(port), "192.0.2.31")
+        # QuantaStor marks the grid VIP and HA addresses as alias interfaces.
+        floating = {**port, "name": "eno1:gm", "ipAddress": "192.0.2.40", "isVirtualInterface": True, "isVirtualPort": True}
+        self.assertIsNone(extract(floating))
+        # isVirtualPort alone marks a bond or VLAN, which stays on its node.
+        for name, kind in (("bond0", "isBond"), ("bond0.1337", "isVlan")):
+            with self.subTest(port=name):
+                routed = {**port, "name": name, "isVirtualInterface": False, "isVirtualPort": True, kind: True}
+                self.assertEqual(extract(routed), "192.0.2.31")
+
     def test_first_ses_overlay_preserves_secondary_path_unplaced_binding_warning(self) -> None:
         overlay = ParsedSSHData(
             ses_enclosures=[
@@ -15689,6 +15713,128 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(truenas_client.fetch_all_calls, 1)
             self.assertIs(first, second)
 
+    async def test_esxi_storcli_reads_follow_the_host_esxi_version(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0/eall/sall show all J"
+        plugin = "esxcli storcli physicaldrive show all --eid=all --id=0 --json --nolog --sid=all"
+        drives = json.dumps({"Controllers": [{"Command Status": {"Status": "Success"}, "Response Data": {
+            "Drive Information": [{"EID:Slt": "252:2", "State": "JBOD"}]}}]})
+        storcli_vib = "storcli 007.2414.0000.0000-01 BCM PartnerSupported\n"
+
+        class HostProbe:
+            def __init__(self, answers: dict[str, tuple[int, str]]) -> None:
+                self.answers = answers
+                self.sessions: list[list[str]] = []
+
+            async def run_planned_commands(self, planner, *, initial_commands=None):
+                results: list[SSHCommandResult] = []
+                session: list[str] = []
+                batch = list(initial_commands or [])
+                while batch:
+                    session.extend(batch)
+                    for command in batch:
+                        code, stdout = self.answers.get(command, (127, ""))
+                        results.append(SSHCommandResult(command=command, ok=code == 0, stdout=stdout, exit_code=code))
+                    batch = list(planner(list(results)))
+                self.sessions.append(session)
+                return results
+
+        vib = {"esxcli software vib list": (0, storcli_vib)}
+        hosts = {
+            # ESXi 8 blocks the binary path and prints XML for a direct call.
+            "esxi8": ({**vib, binary: (0, "<?xml version='1.0'?>"), plugin: (0, drives)}, plugin),
+            "esxi7": ({**vib, binary: (0, drives), plugin: (1, "")}, binary),
+        }
+        for name, (answers, expected) in hosts.items():
+            for configured in (binary, plugin):
+                with self.subTest(host=name, configured=configured), tempfile.TemporaryDirectory() as temp_dir:
+                    system = SystemConfig(
+                        id=name,
+                        truenas=TrueNASConfig(platform="esxi"),
+                        ssh=SSHConfig(enabled=True, host="192.0.2.30", user="root",
+                                      commands=["esxcli software vib list", configured]),
+                    )
+                    probe = HostProbe(answers)
+                    service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+                    for _refresh in range(2):
+                        bundle = await service._get_inventory_source_bundle(force_refresh=True)
+                        self.assertEqual(set(bundle.ssh_outputs), {"esxcli software vib list", expected})
+                        self.assertEqual(bundle.ssh_failure_details, [])
+                        self.assertEqual(
+                            parse_ssh_outputs(bundle.ssh_outputs, 8, None).esxi_storcli_physical_drives[0]["slot_key"],
+                            "252:2",
+                        )
+                    # The first refresh may try both forms; later ones go straight to the one that answered.
+                    self.assertEqual(probe.sessions[-1], ["esxcli software vib list", expected])
+
+    async def test_esxi_storcli_keeps_the_failed_form_when_neither_returns_json(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0 show all J"
+        plugin = "esxcli storcli controller show all --id=0 --json --nolog"
+        vib = "esxcli software vib list"
+        answers = {
+            vib: SSHCommandResult(command=vib, ok=True, stdout="storcli 007.2414.0000.0000-01 BCM\n", exit_code=0),
+            # ESXi 8 before its post-install reboot: the binary prints XML, the plugin is not registered yet.
+            binary: SSHCommandResult(command=binary, ok=True, stdout="<?xml version='1.0'?>", exit_code=0),
+            plugin: SSHCommandResult(command=plugin, ok=False, stderr="Error: Unknown namespace storcli", exit_code=1),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi8-pending-reboot",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.32", user="root", commands=[vib, binary]),
+            )
+            probe = AsyncMock()
+
+            async def run_planned_commands(planner, *, initial_commands=None):
+                results: list[SSHCommandResult] = []
+                batch = list(initial_commands or [])
+                while batch:
+                    results.extend(answers[command] for command in batch)
+                    batch = list(planner(list(results)))
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned_commands)
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+            bundle = await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertEqual(set(bundle.ssh_outputs), {vib})
+            self.assertEqual([detail["command"] for detail in bundle.ssh_failure_details], [plugin])
+            self.assertTrue(bundle.warnings)
+            self.assertFalse(service._esxi_storcli_swapped)
+
+    async def test_esxi_without_storcli_skips_the_plugin_retry_and_keeps_the_missing_storcli_warning(self) -> None:
+        binary = "/opt/lsi/storcli64/storcli64 /c0 show all J"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-no-storcli",
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="192.0.2.31", user="root",
+                              commands=["vmware -v", "esxcli software vib list", binary]),
+            )
+            probe = AsyncMock()
+
+            async def run_planned_commands(planner, *, initial_commands=None):
+                results = [
+                    SSHCommandResult(command="vmware -v", ok=True, stdout="VMware ESXi 8.0.3 build-24022510",
+                                     exit_code=0),
+                    SSHCommandResult(command="esxcli software vib list", ok=True,
+                                     stdout="lsi-mr3 7.728.02.00-1OEM BCM VMwareCertified\n", exit_code=0),
+                    SSHCommandResult(command=binary, ok=False, stderr="sh: storcli64: not found", exit_code=127),
+                ]
+                self.assertEqual(list(initial_commands), ["vmware -v", "esxcli software vib list", binary])
+                self.assertEqual(planner(results), [])
+                return results
+
+            probe.run_planned_commands = AsyncMock(side_effect=run_planned_commands)
+            service = build_inventory_service(Settings(systems=[system]), system, AsyncMock(), probe, temp_dir)
+
+            bundle = await service._get_inventory_source_bundle(force_refresh=True)
+
+            self.assertEqual(len(bundle.warnings), 1)
+            self.assertIn("install the Broadcom StorCLI VIB", bundle.warnings[0])
+            self.assertIn("ESXi 8 needs Broadcom's ESXi 8 StorCLI package and a host reboot", bundle.warnings[0])
+
     async def test_inventory_ssh_payload_batches_dynamic_enrichment_without_single_command_calls(self) -> None:
         class DummySSHProbe:
             def __init__(self) -> None:
@@ -16908,7 +17054,7 @@ Consumers:
    State: ACTIVE
 """
 
-    def make_service(self, platform, outputs, disks=(), enclosures=()):
+    def make_service(self, platform, outputs, disks=(), enclosures=(), pools=()):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         settings = Settings()
@@ -16921,7 +17067,7 @@ Consumers:
             )]
         client = AsyncMock()
         client.fetch_all.return_value = TrueNASRawData(
-            enclosures=list(enclosures), disks=list(disks), pools=[],
+            enclosures=list(enclosures), disks=list(disks), pools=list(pools),
             systems=[{"id": "synthetic-node", "name": "Synthetic node"}] if platform == "quantastor" else [],
             disk_temperatures={}, smart_test_results=[],
         )
@@ -17224,6 +17370,109 @@ Consumers:
                 self.assertEqual(service._smart_candidate_devices(slot), ["da0", "da1", "multipath/disk0"])
                 self.assertTrue(any("gmultipath list" in warning for warning in snapshot.warnings))
 
+    # Two expanders report the same bay, one path each. The pool label sits on
+    # the path the API disk table does not list.
+    DUAL_PATH_MAP = "".join(
+        f"""ses{i}:
+  Enclosure Name: ExampleCo EvidenceShelf
+  Enclosure ID: synthetic-enclosure
+  Element 7, Type: Array Device Slot
+    Status: OK
+    Description: Slot01
+    Device Names: da{i}, pass{i}
+  Element 9, Type: Array Device Slot
+    Status: Not Installed
+    Description: Slot02
+"""
+        for i in range(2)
+    )
+    # pool.query may name the member by its GPT path or only by its disk.
+    PEER_LEAVES = {
+        "gptid path": {"path": "/dev/gptid/synthetic-peer", "disk": "da1"},
+        "disk only": {"disk": "da1"},
+    }
+
+    def dual_path_service(self, ses_map, disks, leaf=PEER_LEAVES["gptid path"]):
+        pools = [{"name": "tank", "topology": {"data": [], "special": [{
+            "type": "MIRROR", "name": "mirror-0", "children": [{"type": "DISK", "status": "ONLINE", **leaf}],
+        }]}}]
+        return self.make_service("core", {
+            "camcontrol devlist -v": "\n".join(self.CAM_ROWS),
+            "sesutil map": ses_map,
+            "glabel status": "gptid/synthetic-peer  N/A  da1p1\n",
+        }, disks, pools=pools)
+
+    async def test_dual_path_bay_takes_pool_membership_from_its_other_ses_path(self):
+        for reverse, (leaf_name, leaf) in itertools.product((False, True), self.PEER_LEAVES.items()):
+            with self.subTest(reverse=reverse, leaf=leaf_name):
+                ses_map = self.DUAL_PATH_MAP
+                if reverse:
+                    first, second = ses_map.split("ses1:")
+                    ses_map = "ses1:" + second + first
+                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}], leaf)
+                snapshot = await service.get_snapshot()
+                self.assertEqual(snapshot.summary.source_disk_count, 1)
+                slot, empty = snapshot.slots
+                self.assertEqual(sorted(slot.raw_status["device_names"]), ["da0", "da1"])
+                self.assertEqual(slot.serial, "SANITIZED-DUAL-PATH")
+                self.assertEqual(slot.device_name, "da0")
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_class, slot.vdev_name, slot.health),
+                    ("tank", "special", "mirror-0", "ONLINE"),
+                )
+                self.assertEqual((slot.gptid, slot.persistent_id_label), ("gptid/synthetic-peer", "GPTID"))
+                self.assertEqual(service._smart_candidate_devices(slot), ["da0"])
+                self.assertFalse(empty.present)
+                self.assertIsNone(empty.pool_name)
+
+    async def test_bay_peer_owned_by_another_api_disk_never_lends_its_pool(self):
+        independent = [
+            {"name": f"da{i}", "serial": f"SANITIZED-INDEPENDENT-{i}", "model": "SAME-MODEL"} for i in range(2)
+        ]
+        separate_bays = self.CORE_MAP
+        # Contradictory SES lists the other disk's path in this bay as well.
+        shared_listing = self.CORE_MAP.replace("Device Names: da0, pass0", "Device Names: da0, da1, pass0")
+        for name, ses_map in (("separate bays", separate_bays), ("shared listing", shared_listing)):
+            with self.subTest(name):
+                service = self.dual_path_service(ses_map, independent)
+                snapshot = await service.get_snapshot()
+                by_serial = {slot.serial: slot for slot in snapshot.slots if slot.serial}
+                self.assertIsNone(by_serial["SANITIZED-INDEPENDENT-0"].pool_name)
+                self.assertIsNone(by_serial["SANITIZED-INDEPENDENT-0"].vdev_class)
+                self.assertEqual(by_serial["SANITIZED-INDEPENDENT-1"].pool_name, "tank")
+
+    async def test_multipath_core_bay_identifies_its_one_element_over_one_path(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                ses_map = self.DUAL_PATH_MAP
+                if reverse:
+                    first, second = ses_map.split("ses1:")
+                    ses_map = "ses1:" + second + first
+                service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}])
+                slot = (await service.get_snapshot()).slots[0]
+                self.assertEqual(sorted(t["ses_device"] for t in slot.ssh_ses_targets), ["/dev/ses0", "/dev/ses1"])
+                self.assertEqual((slot.led_supported, slot.led_backend, slot.led_reason), (True, "ssh", None))
+
+                await service.set_slot_led(slot.slot, LedAction.identify, invalidate_snapshot=False)
+
+                service._run_ssh_command.assert_awaited_once_with(
+                    f"sudo -n /usr/sbin/sesutil locate -u {slot.ssh_ses_targets[0]['ses_device']} 7 on", None
+                )
+
+    def test_bay_peers_require_the_bay_to_list_the_disks_own_path(self):
+        service = self.make_service("core", {})
+        disk = service._build_disk_records([{"name": "da0"}], ParsedSSHData(), {}, {})[0]
+        for names, expected in (
+            (["da0", "pass0", "da1"], ["pass0", "da1"]),
+            # A bay that never names this disk lends it nothing.
+            (["da1"], []),
+            ([], []),
+            (None, []),
+        ):
+            with self.subTest(names=names):
+                self.assertEqual(inventory_module._bay_peer_devices({"device_names": names}, disk, {}), expected)
+        self.assertEqual(inventory_module._bay_peer_devices({"device_names": ["da0", "da1"]}, None, {}), [])
+
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
     async def test_core_duplicate_slot_descriptions_disable_ssh_identify_capability(self) -> None:
@@ -17268,6 +17517,84 @@ class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(slot.led_supported)
             self.assertIsNone(slot.led_backend)
             self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
+
+    async def test_core_multipath_bay_needs_one_element_in_one_known_enclosure_for_identify(self) -> None:
+        def shelf(device, enclosure_id):
+            return SESMapEnclosure(ses_device=device, ses_devices=[device], enclosure_id=enclosure_id)
+
+        targets = [{"ses_device": "/dev/ses0", "ses_element_id": 7}, {"ses_device": "/dev/ses1", "ses_element_id": 7}]
+        cases = {
+            "both paths, one enclosure": (targets, [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a")], True),
+            "two enclosures": (targets, [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-b")], False),
+            "one path's enclosure unknown": (targets, [shelf("/dev/ses0", "shelf-a")], False),
+            "no enclosure IDs": (targets, [shelf("/dev/ses0", None), shelf("/dev/ses1", None)], False),
+            "two elements, one enclosure": (
+                [targets[0], {**targets[1], "ses_element_id": 8}],
+                [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a")],
+                False,
+            ),
+            "device reports two enclosures": (
+                targets,
+                [shelf("/dev/ses0", "shelf-a"), shelf("/dev/ses1", "shelf-a"), shelf("/dev/ses1", "shelf-b")],
+                False,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="core-multipath", truenas=TrueNASConfig(platform="core"), ssh=SSHConfig(enabled=True))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service._run_ssh_command = AsyncMock(
+                return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+            )
+            for name, (ses_targets, enclosures, allowed) in cases.items():
+                with self.subTest(name):
+                    service._run_ssh_command.reset_mock()
+                    slot = service._build_slot_view(
+                        slot=0, row_index=0, column_index=0,
+                        # A combined front+rear view keeps its own scope; target IDs never replace it.
+                        enclosure_meta={"id": "front+rear"},
+                        raw_slot_status={"ses_targets": ses_targets},
+                        disk=None, mapping=None,
+                        ssh_data=ParsedSSHData(ses_enclosures=enclosures),
+                        api_topology_members={}, api_enclosure_ids=set(),
+                    )
+                    self.assertEqual(slot.enclosure_id, "front+rear")
+                    self.assertEqual(slot.led_supported, allowed)
+                    if not allowed:
+                        self.assertIn("not tied to exactly one enclosure element", slot.led_reason or "")
+                        # The locate path rechecks the targets it is given, too.
+                        slot.led_supported, slot.led_backend = True, "ssh"
+                        with self.assertRaisesRegex(TrueNASAPIError, "not tied to exactly one enclosure element"):
+                            await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                        service._run_ssh_command.assert_not_awaited()
+                        continue
+                    await service._set_slot_led_over_ssh(slot, LedAction.identify)
+                    service._run_ssh_command.assert_awaited_once_with(
+                        "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None
+                    )
+
+    def test_core_ses_enclosure_map_is_built_once_per_snapshot_and_only_for_multipath_bays(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="core-map-once", truenas=TrueNASConfig(platform="core"), ssh=SSHConfig(enabled=True))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            two = [{"ses_device": "/dev/ses0", "ses_element_id": 7}, {"ses_device": "/dev/ses1", "ses_element_id": 7}]
+            one = two[:1]
+
+            def build(ssh_data, targets):
+                return service._build_slot_view(
+                    slot=0, row_index=0, column_index=0, enclosure_meta={"id": "shelf-a"},
+                    raw_slot_status={"ses_targets": [dict(target) for target in targets]},
+                    disk=None, mapping=None, ssh_data=ssh_data, api_topology_members={}, api_enclosure_ids=set(),
+                )
+
+            shelves = [SESMapEnclosure(ses_device=d, ses_devices=[d], enclosure_id="shelf-a") for d in ("/dev/ses0", "/dev/ses1")]
+            with patch.object(inventory_module, "_ses_device_enclosure_ids", wraps=inventory_module._ses_device_enclosure_ids) as built:
+                build(ParsedSSHData(ses_enclosures=shelves), one)
+                self.assertEqual(built.call_count, 0, "a single-path bay needs no enclosure map")
+                snapshot = ParsedSSHData(ses_enclosures=list(shelves))
+                self.assertTrue(all(build(snapshot, two).led_supported for _ in range(60)))
+                self.assertEqual(built.call_count, 1, "one map per parsed snapshot, not one per bay")
+                self.assertTrue(build(ParsedSSHData(ses_enclosures=list(shelves)), two).led_supported)
+                self.assertEqual(built.call_count, 2, "a new snapshot rebuilds the map")
 
     async def test_core_non_ses_device_disables_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -21173,14 +21500,38 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
             label="Tank",
             kind="manual",
             template_id="manual",
-            binding=StorageViewBindingConfig(mode="pool"),
+            binding=StorageViewBindingConfig(mode="pool", pool_names=["tank"]),
         )
         auto_view = pool_view.model_copy(update={"binding": StorageViewBindingConfig(mode="auto")})
+        # The admin form offers "Pool" for boot and NVMe views but no pool field.
+        unnamed_pool_view = pool_view.model_copy(
+            update={"binding": StorageViewBindingConfig(mode="pool", pool_names=["  "])}
+        )
 
         with patch.object(service, "_candidate_match_reasons", return_value=["serial", "device"]):
             self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
             self.assertTrue(service._candidate_matches_storage_view(auto_view, {}))
+            self.assertTrue(service._candidate_matches_storage_view(unnamed_pool_view, {}))
         with patch.object(service, "_candidate_match_reasons", return_value=["pool", "serial"]):
             self.assertTrue(service._candidate_matches_storage_view(pool_view, {}))
         with patch.object(service, "_candidate_match_reasons", return_value=[]):
             self.assertFalse(service._candidate_matches_storage_view(pool_view, {}))
+            self.assertFalse(service._candidate_matches_storage_view(unnamed_pool_view, {}))
+
+    def test_pool_bound_boot_view_without_a_pool_name_places_its_saved_drives(self) -> None:
+        service = object.__new__(InventoryService)
+        storage_view = StorageViewConfig.model_validate({
+            "id": "boot-doms",
+            "label": "Boot SATADOMs",
+            "kind": "boot_devices",
+            "template_id": "satadom-pair-2",
+            "binding": {"mode": "pool", "serials": ["SER-B", "SER-A"], "device_names": ["ada1", "ada0"]},
+        })
+        candidates = [
+            {"candidate_id": f"disk-{name[-1]}", "device_names": [name], "serial": serial, "pool_name": "boot-pool"}
+            for name, serial in (("ada0", "SER-A"), ("ada1", "SER-B"), ("ada2", "SER-OTHER"))
+        ]
+
+        ordered = service._ordered_storage_view_candidates(storage_view, candidates, set())
+
+        self.assertEqual([candidate["candidate_id"] for candidate in ordered], ["disk-1", "disk-0"])

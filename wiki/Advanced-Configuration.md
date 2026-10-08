@@ -250,8 +250,15 @@ That split helps keep the standing SSH probe lighter.
 ## SSH refresh load
 
 Inventory refreshes batch configured commands and dynamic enrichment through one
-SSH session per target where possible, but operators should still keep refreshes
-friendly to storage appliances:
+SSH session per target where possible. The app also keeps each host's last
+connection open for 90 seconds after a call finishes and hands it to the next
+SSH call for that host, so the inventory, storage-view and SMART reads of a
+refresh, and the automatic refreshes after it, reuse one login. That keeps
+refreshes under sshd `MaxStartups` and under IPS "SSH scan" rules that block
+five connections in two minutes. A kept connection is replaced after five
+minutes, or sooner if it drops, and every replacement goes through the same
+host-key check. Operators should still keep refreshes friendly to storage
+appliances:
 
 - keep `refresh_interval_seconds` at `30` or higher unless you are actively
   debugging

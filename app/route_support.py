@@ -50,6 +50,7 @@ from app.services.inventory import (
     UnknownEnclosureError,
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
+from app.services.ssh_probe import SSH_CONNECTION_IDLE_SECONDS
 from app.services.mapping_store import (
     MappingDurabilityError,
     MappingScopeConflict,
@@ -214,7 +215,11 @@ get_settings.cache_clear = load_current_settings.cache_clear  # type: ignore[att
 
 def _build_inventory_registry(generation: SettingsGeneration) -> InventoryRegistry:
     configure_logging(generation.settings)
-    return InventoryRegistry(generation.settings, previous=generation.inherited("inventory_registry"))
+    return InventoryRegistry(
+        generation.settings,
+        previous=generation.inherited("inventory_registry"),
+        ssh_idle_seconds=SSH_CONNECTION_IDLE_SECONDS,
+    )
 
 
 def _build_history_backend(generation: SettingsGeneration) -> HistoryBackendClient:

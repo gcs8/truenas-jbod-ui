@@ -164,6 +164,11 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 - Added a client-only, one-session SMART WebSocket batch API with bounded
   concurrency and DDP heartbeat handling; inventory integration remained
   separate (#503).
+- ESXi 8 hosts now show drive details from StorCLI. ESXi 8 only runs StorCLI
+  as `esxcli storcli`, so the app retries each StorCLI command in that form
+  and uses whichever form the host answers on later refreshes. ESXi 7 keeps
+  the direct command, and saved command lists need no edit. Host Prep also
+  recognizes the ESXi 8 package and says when the host must reboot. (#908)
 
 ### Changed
 
@@ -302,6 +307,29 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 
 ### Fixed
 
+- A failed or cancelled SSH command no longer leaves Paramiko's `Exception
+  ignored in BufferedFile.__del__ ... I/O operation on closed file` in the
+  logs. The command's streams are now freed when it returns, not later by
+  the garbage collector (paramiko/paramiko#2153). (#907)
+- "Load Nodes From Quantastor API" now fills each HA node's SSH address from
+  QuantaStor's port list: the node's own port, bond or VLAN with a default
+  gateway, never the grid VIP or another floating alias. Before, a grid whose
+  nodes were all blank never got addresses and showed "no QuantaStor node
+  address" twice. An address you type still wins, for example after a
+  rebuild. (#905)
+- Restored Identify on every bay of a dual-path TrueNAS CORE shelf. Each bay
+  is listed once per path, which looked like an ambiguous bay and turned
+  Identify off. Paths that name the same element in the same enclosure now
+  count as one bay, and the light is switched once; bays whose paths disagree
+  stay off. (#904)
+- Restored the drives in a boot or NVMe storage view saved with "Match drives
+  by: Pool" but no pool name. It matched nothing after "Pool" became pool-only,
+  so every slot showed empty. Such a view now matches its saved serials and
+  device names; a view that names a pool stays pool-only. (#903)
+- Restored pool, vdev and GPT label on a dual-path CORE disk that the disk
+  table lists on one path while its pool member sits on the other. The other
+  path now comes from the same bay in `sesutil map`, not from matching CAM
+  model, target and LUN across HBAs. (#902)
 - Gave a TrueNAS inventory read four times `TRUENAS_TIMEOUT`, 60 seconds by
   default, so a large CORE shelf whose SMART test history takes longer than
   one call's timeout no longer fails every refresh. LED and single-disk SMART
@@ -873,6 +901,11 @@ v0.24.0-beta.1 release candidate. It publishes the `dev` image tag only;
 
 ### Performance
 
+- SSH calls to the same host now reuse one connection for 90 seconds, so a
+  refresh and the automatic refreshes after it log in once per host instead
+  of 7 to 17 times in two minutes. This keeps the app under sshd
+  `MaxStartups` and IPS "SSH scan" rules that block five connections in two
+  minutes. (#906)
 - A snapshot refresh no longer rewrites the slot-detail cache file when
   nothing but the row timestamps changed. SMART freshness still comes from
   its own read time and stale flag, which still count as changes. (#607)

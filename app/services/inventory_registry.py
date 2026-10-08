@@ -28,7 +28,13 @@ class SystemNotConfiguredError(LookupError):
 class InventoryRegistry:
     """Create and reuse one inventory service per configured system."""
 
-    def __init__(self, settings: Settings, *, previous: InventoryRegistry | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        previous: InventoryRegistry | None = None,
+        ssh_idle_seconds: float = 0.0,
+    ) -> None:
         """Build the registry for ``settings``.
 
         ``previous`` is the registry of the settings this replaces after a
@@ -36,8 +42,13 @@ class InventoryRegistry:
         not move, and each system's new service takes over the previous
         service's appliance answers when the connection settings are the same,
         so a rename does not re-query every appliance.
+
+        ``ssh_idle_seconds`` keeps each host's last SSH connection open that
+        long for the next call. Only a registry that outlives one request
+        should set it; a per-request registry would just leave it idle.
         """
         self.settings = settings
+        self.ssh_idle_seconds = ssh_idle_seconds
         reuse_stores = previous is not None and previous.settings.paths == settings.paths
         if reuse_stores:
             assert previous is not None
@@ -104,7 +115,7 @@ class InventoryRegistry:
                 settings=self.settings,
                 system=system,
                 truenas_client=api_client,
-                ssh_probe=SSHProbe(system.ssh),
+                ssh_probe=SSHProbe(system.ssh, idle_seconds=self.ssh_idle_seconds),
                 bmc_service=SupermicroBMCService(system.bmc) if system.bmc.enabled else None,
                 mapping_store=self.mapping_store,
                 profile_registry=self.profile_registry,
