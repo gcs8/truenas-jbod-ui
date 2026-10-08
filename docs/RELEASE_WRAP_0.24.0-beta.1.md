@@ -13,8 +13,9 @@ into `main` with a merge commit, never squashed, so the validated commit stays
 reachable from the tag, which goes on that `main` merge commit.
 
 Validated release-branch commit: `b0656fbe175d2963f6bffe1763793d36d132254d`.
-Later commits change only docs, a code comment in the QA restore controller
-and the upgrade-notice browser spec; none of them ship in the image.
+Later commits change only docs, the upgrade-notice browser spec, and the QA
+restore controller's handling of a refused history refresh (it now fails at
+once when collection is paused); none of them ship in the image.
 
 Validated Linux QA image: `sha256:c6702aeb699808fb2d847628d92df51f3c8f2f0354ec2af30e995022936109ae`,
 built on the Linux QA host from that commit with
@@ -59,10 +60,11 @@ receipts on that host.
 group the source had; import restored the history database and every saved
 system with 0 restart failures; counts reconciled, with history growth limited
 to the empty-bay corrections v0.23.0 #189 makes; restored rows survived the
-restart; the SAS Fabric label and slot-mapping pencil cycles cleaned up. The
-controller requested a full history pass and waited for it before any browser
-or performance check. The source deployment was stopped during the run so
-only one collector polled the appliances, and came back healthy.
+restart; the SAS Fabric label and slot-mapping pencil cycles cleaned up.
+Before any browser or performance check the controller confirmed a completed
+full history pass with forced inventory; the collector had already finished
+one, so no Full refresh was needed. The source deployment was stopped during
+the run so only one collector polled the appliances, and came back healthy.
 
 **Default-format round trip (`tar.zst`), egress-blocked.** A `0.22.2`
 deployment exports `7z` by default, so the beta made the default-format
