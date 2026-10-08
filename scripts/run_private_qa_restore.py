@@ -1104,7 +1104,9 @@ def _wait_json(
 def _completed_full_pass(collector: dict[str, Any]) -> bool:
     # A slow pass forces inventory across the whole fleet. The startup shortcut
     # reads only the cached root and never sets last_slow_metrics_at; a slow
-    # pass that failed later leaves last_success_at older than its start.
+    # pass that failed later leaves last_success_at older than its start. A
+    # pass that skipped degraded systems still completes, as in production:
+    # this settles the collector, it does not certify fleet health.
     success, slow = collector.get("last_success_at"), collector.get("last_slow_metrics_at")
     return isinstance(success, str) and isinstance(slow, str) and success >= slow
 
