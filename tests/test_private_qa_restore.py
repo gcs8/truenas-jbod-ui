@@ -921,6 +921,46 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertFalse(result["collector"]["collection_running"])
         self.assertEqual(get_json.call_count, 2)
 
+    def test_live_pass_wait_needs_an_idle_collector_with_a_completed_pass(self) -> None:
+        idle_failed = {"collector": {"collection_running": False, "last_success_at": None}}
+        busy_passed = {"collector": {"collection_running": True, "last_success_at": "2026-10-08T04:22:56+00:00"}}
+        idle_passed = {"collector": {"collection_running": False, "last_success_at": "2026-10-08T04:22:56+00:00"}}
+        with (
+            patch.object(self.module, "get_json", side_effect=[idle_failed, busy_passed, idle_passed]) as get_json,
+            patch.object(self.module.time, "sleep"),
+        ):
+            result = self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
+        self.assertIs(result, idle_passed)
+        self.assertEqual(get_json.call_count, 3)
+
+        # Without live_pass the first idle snapshot is enough, as before.
+        with patch.object(self.module, "get_json", return_value=idle_failed), patch.object(self.module.time, "sleep"):
+            self.assertIs(self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30), idle_failed)
+
+        # A collector that never finishes a pass fails the gate by name.
+        with (
+            patch.object(self.module, "get_json", return_value=idle_failed),
+            patch.object(self.module.time, "sleep"),
+            patch.object(self.module.time, "monotonic", side_effect=[0, 0, 31]),
+            self.assertRaisesRegex(self.module.QaRestoreError, "did not finish a live pass after 30s"),
+        ):
+            self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
+
+    def test_live_browser_checks_start_only_after_a_completed_history_pass(self) -> None:
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as raw_root:
+            with (
+                patch.object(self.module, "_run", side_effect=lambda command, **_: events.append(
+                    "live-browser" if "qa/ui-switching.spec.js" in command else "run")),
+                patch.object(self.module, "_wait_history_idle", side_effect=lambda *_, **kwargs: events.append(
+                    f"history-pass:{kwargs.get('live_pass')}")),
+            ):
+                results = self.module._run_browser_and_perf(
+                    ROOT, (28080, 28081, 28082), "qa-user", "qa-password", Path(raw_root), live_read_only=True,
+                )
+        self.assertLess(events.index("history-pass:True"), events.index("live-browser"))
+        self.assertTrue(results["history_live_pass"])
+
     def test_observed_state_paths_follow_restored_config_and_stay_in_mounts(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             runtime = Path(raw_root)

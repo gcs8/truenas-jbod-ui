@@ -176,6 +176,10 @@ that restored appliance endpoints are reachable or compatible.
 phrase `I_APPROVE_LIVE_READ_ONLY_QA`. Use it only after confirming the QA host is
 allowed to contact the restored endpoints. This mode adds:
 
+- a wait of up to 15 minutes for the restored history collector to finish one
+  live pass. Until that pass succeeds it retries every 30 seconds with forced
+  inventory, which would race the browser checks on slow appliances. A
+  collector that never finishes a pass fails the run;
 - full saved-system and saved-view browser checks;
 - platform-specific read-only checks such as ESXi rendering when applicable;
 - the app API performance runner with mapping mutation disabled;

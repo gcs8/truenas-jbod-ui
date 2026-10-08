@@ -1107,7 +1107,9 @@ def _wait_history_idle(
     password: str,
     *,
     timeout_seconds: int = 600,
+    live_pass: bool = False,
 ) -> dict[str, Any]:
+    """Wait for an idle collector; ``live_pass`` also needs one finished pass."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         payload = get_json(
@@ -1120,13 +1122,13 @@ def _wait_history_idle(
         if not isinstance(collector, dict):
             raise QaRestoreError("history overview omitted collector state")
         collection_running = collector.get("collection_running")
-        if collection_running is False:
+        if collection_running is False and (not live_pass or isinstance(collector.get("last_success_at"), str)):
             return payload
-        if collection_running is not True:
+        if not isinstance(collection_running, bool):
             raise QaRestoreError("history overview omitted collector state")
         time.sleep(1)
     raise QaRestoreError(
-        f"history collector remained active after {timeout_seconds}s"
+        f"history collector {'did not finish a live pass' if live_pass else 'remained active'} after {timeout_seconds}s"
     )
 
 
@@ -1703,6 +1705,9 @@ def _run_browser_and_perf(
         )
         results = {"offline_browser": True, "history_performance": True}
         if live_read_only:
+            # Until its first pass succeeds the collector retries every 30 s with
+            # forced inventory, which races the live checks on slow appliances.
+            _wait_history_idle(ports[1], username, password, timeout_seconds=900, live_pass=True)
             env["PLAYWRIGHT_LIVE_APPLIANCE_QA"] = "1"
             _run(
                 [
@@ -1740,7 +1745,7 @@ def _run_browser_and_perf(
                 timeout=1800,
                 env=env,
             )
-            results.update({"live_browser": True, "app_performance": True})
+            results.update({"history_live_pass": True, "live_browser": True, "app_performance": True})
         return results
     finally:
         for path in created_credentials:
