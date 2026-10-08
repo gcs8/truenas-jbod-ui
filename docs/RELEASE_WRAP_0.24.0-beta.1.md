@@ -15,7 +15,9 @@ reachable from the tag, which goes on that `main` merge commit.
 Validated release-branch commit: `b0656fbe175d2963f6bffe1763793d36d132254d`.
 Later commits change only docs, the upgrade-notice browser spec, and the QA
 restore controller's handling of a refused history refresh (it now fails at
-once when collection is paused); none of them ship in the image.
+once when collection is paused); none of them ship in the image. The full
+source gate and CI reran on `115938f`, the last of those before this wrap
+update.
 
 Validated Linux QA image: `sha256:c6702aeb699808fb2d847628d92df51f3c8f2f0354ec2af30e995022936109ae`,
 built on the Linux QA host from that commit with
@@ -31,8 +33,8 @@ Changelog coverage: pass (219 PRs)
 | Gate | Required | Evidence | Result | N/A Reason |
 | --- | --- | --- | --- | --- |
 | Scope and branch | yes | `release/v0.24.0-beta.1` at `b0656fbe175d2963f6bffe1763793d36d132254d` contains `main` at `a161782147c306aea5def97403840acfc98f31ce` (#902-#908) and the prerelease version bump; `## v0.24.0-beta.1 - 2026-10-08` covers 219 PRs | Pass |  |
-| Python unit and syntax gates | yes | `python scripts/dev_check.py --full` at `b0656fb`: 4,114 Python tests OK (6 skipped), compileall, bounded Ruff, diff hygiene, test-count manifest, performance baseline and checked public-demo artifact passed. Locally `promtool` is absent, so the alert-rule gate ran in CI only. CI on `b0656fb`: 24 checks passed, 11 routing skips, 0 failed | Pass |  |
-| JavaScript syntax gates | yes | Same full source gate: syntax checks for app, admin, history, SAS Fabric and every `qa/*.spec.js`, plus 1,161 JavaScript unit tests, 0 failed | Pass |  |
+| Python unit and syntax gates | yes | `python scripts/dev_check.py --full` at `115938f48b454b271920ca9e4c116f2cfd7b90ff`, the release head before this wrap update: 4,115 Python tests OK (6 skipped), compileall, bounded Ruff, diff hygiene, test-count manifest, performance baseline and checked public-demo artifact passed. Locally `promtool` is absent, so the alert-rule gate ran in CI only. CI on `115938f`: 24 checks passed, 11 routing skips, 0 failed. The image candidate `b0656fb` also passed the same gate (4,114 tests) and CI | Pass |  |
+| JavaScript syntax gates | yes | Same full source gate at `115938f`: syntax checks for app, admin, history, SAS Fabric and every `qa/*.spec.js`, plus 1,161 JavaScript unit tests, 0 failed | Pass |  |
 | Docker build and health gates | yes | QA image `sha256:c6702aeb699808fb2d847628d92df51f3c8f2f0354ec2af30e995022936109ae` built from `b0656fb` with a matching revision label; reports `0.24.0-beta.1`. UI, history and admin `/livez` and `/healthz` passed in the matrix and every restore drill. CI production container, image-only upgrade and hardened upgrade smokes passed | Pass |  |
 | Optional-sidecar runtime matrix | yes | `scripts/run_compose_runtime_matrix.py` on the Linux QA host at `0d204c8`; the image inputs, the matrix script, `docker-compose.yml` and the config fixture are identical at `b0656fb`. 7 variants passed (UI only, UI+history, admin only, UI+admin, UI+history+admin, scheduler disabled, scheduler enabled); 4 alias cycles, 4 mapping cycles, 1 admin setup, 1 scheduler backup; no containers left | Pass |  |
 | Full Playwright/browser gates | yes | Live read-only restore at `b0656fb`: 16 passed, 2 skipped (history refresh actions and auto-refresh-after-switch need fixtures the restored data lacks) for `qa/ui-switching.spec.js` and `qa/esxi-smoke.spec.js`; 16 passed, 1 skipped for `qa/private-restore.spec.js` and `qa/admin-operations.spec.js`. CI ran the fixture-only specs, `qa/admin-operations.spec.js` and `qa/public-demo.spec.js` | Pass |  |
