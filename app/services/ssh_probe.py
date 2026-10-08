@@ -842,7 +842,7 @@ class SSHProbe:
         channel = None
         try:
             deadline.check()
-            stdin, stdout, stderr = streams = client.exec_command(effective_command, timeout=command_timeout)
+            stdin, stdout, _stderr = streams = client.exec_command(effective_command, timeout=command_timeout)
             channel = stdout.channel
             deadline.channel(channel)
             _cancel.check()
@@ -924,6 +924,11 @@ class SSHProbe:
                         stream.close()
                     except Exception:
                         logger.warning("SSH command stream close failed", exc_info=False)
+                # The error that ended the command keeps this frame alive, often in a
+                # reference cycle. Paramiko's BufferedFile.__del__ flushes even a closed
+                # file, so if the cycle collector frees its buffer first it prints
+                # "I/O operation on closed file" (paramiko#2153). Free them now instead.
+                stdin = stdout = _stderr = stream = streams = effective_error = None
 
     @staticmethod
     def _failure_result(command: str, error_message: str) -> SSHCommandResult:

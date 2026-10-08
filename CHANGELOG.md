@@ -280,6 +280,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A failed or cancelled SSH command no longer leaves Paramiko's `Exception
+  ignored in BufferedFile.__del__ ... I/O operation on closed file` in the
+  logs. The command's streams are now freed when it returns, not later by
+  the garbage collector (paramiko/paramiko#2153). (#907)
 - "Load Nodes From Quantastor API" now fills each HA node's SSH address from
   QuantaStor's port list: the node's own port, bond or VLAN with a default
   gateway, never the grid VIP or another floating alias. Before, a grid whose
