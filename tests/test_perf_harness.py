@@ -64,6 +64,41 @@ class PerfHarnessTests(unittest.TestCase):
                     password_file,
                 )
 
+    def test_client_honours_busy_retry_after_and_fails_on_other_errors(self) -> None:
+        from urllib.error import HTTPError
+
+        def busy(code=503, retry_after="1"):
+            return HTTPError("http://127.0.0.1:8080/api/inventory", code, "busy", {"Retry-After": retry_after} if retry_after else {}, None)
+
+        ok = MagicMock()
+        ok.read.return_value = b'{"ok":true}'
+        ok.headers.items.return_value = []
+        ok.__enter__.return_value = ok
+        ok.__exit__.return_value = False
+        client = run_perf_harness.ApiClient("http://127.0.0.1:8080")
+        # A busy answer with Retry-After is retried after that delay, capped.
+        with (
+            patch.object(run_perf_harness, "urlopen", side_effect=[busy(), busy(retry_after="60"), ok]) as open_url,
+            patch.object(run_perf_harness.time, "sleep") as sleep,
+        ):
+            self.assertEqual(client.get_json("/api/inventory", params={"force": "true"}), {"ok": True})
+        self.assertEqual(open_url.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, run_perf_harness.BUSY_RETRY_MAX_SECONDS])
+        # Retries are bounded, and other failures are never retried.
+        for side_effect, calls in (
+            ([busy()] * run_perf_harness.BUSY_RETRY_ATTEMPTS, run_perf_harness.BUSY_RETRY_ATTEMPTS),
+            ([busy(retry_after=None)], 1),
+            ([busy(code=500)], 1),
+        ):
+            with (
+                self.subTest(calls=calls, first=side_effect[0].code),
+                patch.object(run_perf_harness, "urlopen", side_effect=side_effect) as open_url,
+                patch.object(run_perf_harness.time, "sleep"),
+                self.assertRaises(HTTPError),
+            ):
+                client.get_json("/api/inventory")
+            self.assertEqual(open_url.call_count, calls)
+
     def test_mapping_import_confirmation_uses_preview_revision_and_digest(self) -> None:
         bundle = {"schema_version": 1, "mappings": []}
         preview = {

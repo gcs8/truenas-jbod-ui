@@ -51,7 +51,9 @@ CHANGELOG_TEMPLATE = """# Changelog
 class ChangelogStructureTests(unittest.TestCase):
     def test_unreleased_has_no_duplicate_headings_or_bullet_blocks(self) -> None:
         changelog = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
-        section = coverage.changelog_section(changelog, "## Unreleased")
+        # The newest section: Unreleased, or the release cut from it.
+        newest = next(line for line in changelog.splitlines() if line.startswith("## "))
+        section = coverage.changelog_section(changelog, newest)
         headings = [line for line in section.splitlines() if line.startswith("### ")]
         duplicate_headings = sorted(heading for heading, count in Counter(headings).items() if count > 1)
 

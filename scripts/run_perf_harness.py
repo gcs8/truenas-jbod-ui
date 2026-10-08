@@ -15,10 +15,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+BUSY_RETRY_ATTEMPTS = 3
+BUSY_RETRY_MAX_SECONDS = 5
 
 
 @dataclass(slots=True)
@@ -103,6 +106,26 @@ class ApiClient:
         query = urlencode({key: value for key, value in merged.items() if value is not None})
         return f"{self.base_url}{path}" + (f"?{query}" if query else "")
 
+    @staticmethod
+    def _open_json(request: Request) -> ApiResponse:
+        # The app answers 503 with Retry-After while another refresh owns the
+        # snapshot; a client that honours it is the documented contract.
+        for attempt in range(1, BUSY_RETRY_ATTEMPTS + 1):
+            try:
+                with urlopen(request, timeout=120) as response:
+                    body = response.read()
+                    return ApiResponse(
+                        data=json.loads(body.decode("utf-8")),
+                        headers={key.lower(): value for key, value in response.headers.items()},
+                        response_bytes=len(body),
+                    )
+            except HTTPError as exc:
+                retry_after = (exc.headers or {}).get("Retry-After", "")
+                if exc.code != 503 or not retry_after.isdigit() or attempt == BUSY_RETRY_ATTEMPTS:
+                    raise
+                time.sleep(min(int(retry_after), BUSY_RETRY_MAX_SECONDS))
+        raise AssertionError("unreachable")
+
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.get_json_with_headers(path, params=params).data
 
@@ -112,13 +135,7 @@ class ApiClient:
             method="GET",
             headers=self._headers(),
         )
-        with urlopen(request, timeout=120) as response:
-            body = response.read()
-            return ApiResponse(
-                data=json.loads(body.decode("utf-8")),
-                headers={key.lower(): value for key, value in response.headers.items()},
-                response_bytes=len(body),
-            )
+        return self._open_json(request)
 
     def post_json(self, path: str, payload: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.post_json_with_headers(path, payload, params=params).data
@@ -136,13 +153,7 @@ class ApiClient:
             method="POST",
             headers=self._headers(content_type="application/json"),
         )
-        with urlopen(request, timeout=120) as response:
-            body = response.read()
-            return ApiResponse(
-                data=json.loads(body.decode("utf-8")),
-                headers={key.lower(): value for key, value in response.headers.items()},
-                response_bytes=len(body),
-            )
+        return self._open_json(request)
 
 
 def percentile(values: list[float], ratio: float) -> float:

@@ -5,8 +5,9 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 const { createHash } = require("node:crypto");
-
 const root = path.resolve(process.env.UPGRADE_NOTICE_SOURCE_ROOT || path.join(__dirname, ".."));
+// The fixture imports the app from root, so the version it renders is root's.
+const { version: APP_VERSION } = require(path.join(root, "package.json"));
 const fixture = path.join(__dirname, "fixtures/upgrade_notice_server.py");
 const python = process.env.PYTHON || "python3";
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -96,8 +97,10 @@ test("basic notice: local failures preserve drafts, install dismissal survives c
     const page = await openPage(a, server.origin);
     const other = await openPage(b, server.origin);
     await expect(page.locator("#upgrade-notice")).toHaveCount(1);
-    await expect(page.locator("#upgrade-notice-text")).toContainText("Previous version unknown");
-    await expect(page.locator("#upgrade-notice-text")).toContainText("Sign-in is required");
+    await expect(page.locator("#upgrade-notice-text")).toContainText(`Running v${APP_VERSION}. Previous version unknown`);
+    // Basic mode never shows the network-mode write warning. The v0.23.0-only
+    // sign-in sentence is pinned in tests/test_upgrade_notice.py.
+    await expect(page.locator("#upgrade-notice-text")).not.toContainText("In network mode");
     await expect(page.locator("#upgrade-notice-text")).not.toContainText("Updated to");
     let attempts = 0;
     page.on("request", (r) => { if (r.url().endsWith("/api/upgrade-notice/dismiss")) attempts += 1; });
@@ -130,7 +133,7 @@ test("basic notice: local failures preserve drafts, install dismissal survives c
     await expect(draft).toHaveValue("synthetic-unsaved-draft");
     expect(attempts).toBe(2);
     console.log("notice QA: 401/503/200 and draft preservation verified");
-    expect(JSON.parse(fs.readFileSync(path.join(directory, "last_seen_version.json")))).toEqual({ last_seen_version: "0.23.0" });
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "last_seen_version.json")))).toEqual({ last_seen_version: APP_VERSION });
     page.once("dialog", (dialog) => dialog.accept());
     await page.reload();
     await other.reload();
@@ -181,7 +184,7 @@ test("network notice: uninstrumented install, real 403 refusal, and later versio
     await page.evaluate(() => localStorage.clear());
     await page.reload();
     await expect(page.locator("#upgrade-notice")).toHaveCount(1);
-    await expect(page.locator("#upgrade-notice-text")).toContainText("Updated to v0.23.0");
+    await expect(page.locator("#upgrade-notice-text")).toContainText(`Updated to v${APP_VERSION}`);
     expect(JSON.parse(fs.readFileSync(path.join(directory, "last_seen_version.json"))).notice.previous).toBe("0.22.2");
   } finally {
     if (context) await context.close();

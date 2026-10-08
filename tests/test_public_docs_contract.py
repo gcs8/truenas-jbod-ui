@@ -908,7 +908,12 @@ class PublicDocsContractTests(unittest.TestCase):
             + "".join((ROOT / page).read_text(encoding="utf-8") for page in sorted(EXPECTED_WIKI_PAGES))
             + (ROOT / "README.md").read_text(encoding="utf-8")
         )
-        current_release_files = {"RELEASE_NOTES_0.23.0.md", "RELEASE_WRAP_0.23.0.md"}
+        current_release_files = {
+            "RELEASE_NOTES_0.23.0.md",
+            "RELEASE_WRAP_0.23.0.md",
+            "RELEASE_NOTES_0.24.0-beta.1.md",
+            "RELEASE_WRAP_0.24.0-beta.1.md",
+        }
         unlinked = [
             path.name
             for path in sorted((ROOT / "docs").glob("*.md"))

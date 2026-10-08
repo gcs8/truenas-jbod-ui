@@ -653,10 +653,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("headroom on production-scale databases remain unqualified", matrix)
         self.assertIn("chronological indexes", matrix)
         self.assertIn("chronological indexes", scripts_guide)
-        self.assertRegex(
-            changelog.split("## Unreleased", 1)[1].split("\n## ", 1)[0],
-            r"\(#637(?:, #\d+)*\)",
-        )
+        # Any section: #637 moves from Unreleased into its release and stays there.
+        self.assertRegex(changelog, r"\(#637(?:, #\d+)*\)")
 
 
 class UpgradeScenarioContractTests(unittest.TestCase):

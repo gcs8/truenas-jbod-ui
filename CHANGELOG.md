@@ -26,10 +26,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.1 - 2026-10-08
+
+This prerelease includes every pull request merged after `v0.23.0` through the
+v0.24.0-beta.1 release candidate. GHCR gets the fixed `v0.24.0-beta.1` and
+`0.24.0-beta.1` tags and moves `dev` to it; `latest` stays on `v0.23.0`.
+
+### Highlights
+
+- An optional backup scheduler and an admin Backups page take config and FULL
+  backups on a schedule, copy them to SFTP, FTP, SMB, S3, NFS or filesystem
+  targets, and keep them by per-class retention rules (#574, #579, #580, #599).
+- FULL backups now default to a faster encrypted `tar.zst` stream format;
+  existing `.7z` backups still restore, and `7z` remains a setting (#600, #611).
+- The main UI picks up edits to its YAML settings files without a restart, and
+  `/healthz` now tells remote trouble apart from a local fault (#578, #614).
+- TrueNAS hosts can use the JSON-RPC 2.0 websocket API, and the main page shows
+  what each system supports for bay layout, SMART and the locate light (#529,
+  #623).
+- Without a public origin, the main UI and admin accept changes only from an IP
+  address, `localhost` or a name in `ADMIN_ALLOWED_HOSTS` (#892).
 
 ### Upgrade notes
 
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. The pre-release security review in #737 still
+  has open items, which will be closed before `v0.24.0`.
 - config.yaml: `app.host` and `app.port` are gone, and the `APP_HOST`
   environment variable is no longer read. They never changed where the UI
   answers. Set the port with `APP_PORT` and the address with

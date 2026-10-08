@@ -42,6 +42,8 @@ APP_CONTAINER_NAMES = (
 )
 APPROVAL = "I_APPROVE_PRIVATE_QA_RESTORE"
 LIVE_APPROVAL = "I_APPROVE_LIVE_READ_ONLY_QA"
+# 409 details from history_service/main.py that mean another pass got there first.
+HISTORY_REFRESH_BUSY_DETAILS = frozenset({"History collection already running.", "History refresh already running."})
 INSPECTION_FIELDS = {
     "ok",
     "schema_version",
@@ -1101,6 +1103,62 @@ def _wait_json(
     raise QaRestoreError(f"health wait expired after {timeout_seconds}s") from last_error
 
 
+def _completed_full_pass(collector: dict[str, Any]) -> bool:
+    # A slow pass forces inventory across the whole fleet. The startup shortcut
+    # reads only the cached root and never sets last_slow_metrics_at; a slow
+    # pass that failed later leaves last_success_at older than its start. A
+    # pass that skipped degraded systems still completes, as in production:
+    # this settles the collector, it does not certify fleet health.
+    success, slow = collector.get("last_success_at"), collector.get("last_slow_metrics_at")
+    return isinstance(success, str) and isinstance(slow, str) and success >= slow
+
+
+def _run_full_history_pass(
+    port: int,
+    username: str,
+    password: str,
+    *,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
+    """Run one full live history pass through the operator's Full refresh route.
+
+    The collector's startup pass reads only the cached default system and its next
+    scheduled pass is an hour away, so live checks ask for the full pass themselves.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while (remaining := int(deadline - time.monotonic())) > 0:
+        payload = _wait_history_idle(port, username, password, timeout_seconds=remaining)
+        if _completed_full_pass(payload["collector"]):
+            return payload
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=max(1, int(deadline - time.monotonic())))
+        try:
+            connection.request(
+                "POST",
+                "/api/history/refresh",
+                body=b'{"mode":"full"}',
+                headers={
+                    "Authorization": _basic_authorization(username, password),
+                    "Content-Type": "application/json",
+                    "Origin": f"http://127.0.0.1:{port}",
+                },
+            )
+            response = connection.getresponse()
+            body = response.read(4 * 1024 * 1024)
+        finally:
+            connection.close()
+        if response.status == 200:
+            continue
+        try:
+            detail = json.loads(body).get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        # Only a pass that started first is worth waiting for; a paused
+        # (damaged) history database also answers 409 and never clears.
+        if response.status != 409 or detail not in HISTORY_REFRESH_BUSY_DETAILS:
+            raise QaRestoreError(f"history full refresh returned HTTP {response.status}: {detail or 'no detail'}")
+    raise QaRestoreError(f"history collector did not finish a full live pass after {timeout_seconds}s")
+
+
 def _wait_history_idle(
     port: int,
     username: str,
@@ -1670,6 +1728,10 @@ def _run_browser_and_perf(
                 "PYTHON": sys.executable,
             }
         )
+        if live_read_only:
+            # A collector still owing its first full pass retries every 30 s with
+            # forced inventory, which races every timed check on slow appliances.
+            _run_full_history_pass(ports[1], username, password)
         _run(
             [
                 "npx",
@@ -1740,7 +1802,7 @@ def _run_browser_and_perf(
                 timeout=1800,
                 env=env,
             )
-            results.update({"live_browser": True, "app_performance": True})
+            results.update({"history_live_pass": True, "live_browser": True, "app_performance": True})
         return results
     finally:
         for path in created_credentials:
