@@ -185,6 +185,15 @@ esxcli storage san sas list
 /opt/lsi/storcli64/storcli64 /c0/eall/sall show all J
 ```
 
+Keep these StorCLI lines on ESXi 7 and ESXi 8. ESXi 8 refuses a direct
+StorCLI call and installs Broadcom's ESXi 8 package under `/opt/storcli`,
+so the app re-runs each read as its `esxcli storcli` equivalent (for
+example `esxcli storcli physicaldrive show all --eid=all --id=0 --json
+--nolog --sid=all`). It remembers which form the host answered and tries that
+one first on the next refresh. ESXi 8 adds the `esxcli storcli` commands
+only after the host reboots following the install. ESXi 7 support is
+best effort.
+
 On validated Broadcom / AVAGO MegaRAID hosts, `lsi_mr3` and
 `lsuv2-lsiv2-drivers-plugin` alone are not enough for the richer member-detail
 path. If StorCLI is missing, the Admin's `Host Prep / Vendor Tool

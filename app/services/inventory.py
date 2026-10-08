@@ -103,6 +103,7 @@ from app.services.parsers import (
     _ses_enclosures_share_identity,
     build_slot_candidates_from_ses_enclosures,
     canonicalize_ssh_command,
+    esxi_storcli_fallback_command,
     extract_nvme_controller_name,
     extract_enclosure_slot_candidates,
     extract_enclosure_slot_count,
@@ -1198,6 +1199,9 @@ class InventoryService:
         self._disk_inventory_sync_clock = time.monotonic
         self._disk_inventory_sync_sleep = asyncio.sleep
         self._optional_ssh_backoff_until: dict[str, datetime] = {}
+        # ESXi 7 runs the StorCLI binary, ESXi 8 only `esxcli storcli`. True once
+        # this host answered StorCLI reads only in the form the saved commands lack.
+        self._esxi_storcli_swapped = False
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
@@ -3027,6 +3031,12 @@ class InventoryService:
                     "StorCLI is not available on this ESXi host, so drive details behind the RAID "
                     "controller are missing for this refresh."
                 )
+            esxi_major = re.search(r"\bESXi (\d+)\.", normalized_outputs.get("vmware -v") or "")
+            if esxi_major and int(esxi_major.group(1)) >= 8:
+                warning = (
+                    f"{warning} ESXi 8 needs Broadcom's ESXi 8 StorCLI package and a host reboot "
+                    "after installing it; the app then reads it through `esxcli storcli`."
+                )
             if detail:
                 warning = f"{warning} Detail: {detail}."
             return ([warning], "StorCLI commands unavailable.")
@@ -3286,7 +3296,63 @@ class InventoryService:
         commands.extend(self._esxi_controller_diagnostic_commands(command_results))
         if any(result.ok for result in command_results):
             commands.extend(self._linux_storage_enrichment_probe_commands(command_results))
-        return self._dedupe_unseen_ssh_commands(commands, command_results)
+        # A fallback shares its parser key with the read it replaces, so it skips the canonical dedupe.
+        return self._esxi_storcli_fallback_commands(command_results) + self._dedupe_unseen_ssh_commands(
+            commands, command_results
+        )
+
+    @staticmethod
+    def _storcli_answered(result: SSHCommandResult) -> bool:
+        # ESXi 8 prints XML for a direct StorCLI call; only JSON is an answer.
+        return result.ok and result.stdout.lstrip().startswith("{")
+
+    def _esxi_storcli_initial_commands(self) -> list[str]:
+        commands = list(self.system.ssh.commands)
+        if not self._esxi_storcli_swapped:
+            return commands
+        return [esxi_storcli_fallback_command(command) or command for command in commands]
+
+    def _esxi_storcli_fallback_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        """Retry each unanswered StorCLI read in the other ESXi form (binary <-> `esxcli storcli`)."""
+        if self.system.truenas.platform != "esxi":
+            return []
+        vib_list = next(
+            (result.stdout for result in command_results
+             if result.ok and canonicalize_ssh_command(result.command) == "esxcli software vib list"),
+            None,
+        )
+        if vib_list is not None and "storcli" not in vib_list.lower():
+            return []  # No StorCLI package, so neither form can answer.
+        attempts = Counter(canonicalize_ssh_command(result.command) for result in command_results)
+        return [
+            fallback
+            for result in command_results
+            if not self._storcli_answered(result)
+            and attempts[canonicalize_ssh_command(result.command)] == 1
+            and (fallback := esxi_storcli_fallback_command(result.command))
+        ]
+
+    def _resolve_esxi_storcli_forms(self, command_results: list[SSHCommandResult]) -> list[SSHCommandResult]:
+        """Keep one result per StorCLI read: the form that answered, else a failed form so the refresh
+        still warns (ESXi 8 before its reboot: the binary prints XML, the plugin is missing), else the first.
+
+        The answering form is remembered, so the next refresh tries it first.
+        """
+        reads: dict[str, list[SSHCommandResult]] = {}
+        for result in command_results:
+            if esxi_storcli_fallback_command(result.command):
+                reads.setdefault(canonicalize_ssh_command(result.command), []).append(result)
+        dropped: set[int] = set()
+        for attempts in reads.values():
+            if len(attempts) < 2:
+                continue
+            keep = next((result for result in attempts if self._storcli_answered(result)), None) or next(
+                (result for result in attempts if not result.ok), attempts[0]
+            )
+            dropped.update(id(result) for result in attempts if result is not keep)
+            if self._storcli_answered(keep):
+                self._esxi_storcli_swapped = keep.command not in self.system.ssh.commands
+        return [result for result in command_results if id(result) not in dropped]
 
     @staticmethod
     def _dedupe_unseen_ssh_commands(
@@ -3433,9 +3499,17 @@ class InventoryService:
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
             with perf_stage("inventory.ssh.run_commands"):
                 ssh_started = time.perf_counter()
-                command_results = await self.ssh_probe.run_planned_commands(
-                    self._ssh_inventory_enrichment_probe_commands
-                )
+                if self.system.truenas.platform == "esxi":
+                    command_results = self._resolve_esxi_storcli_forms(
+                        await self.ssh_probe.run_planned_commands(
+                            self._ssh_inventory_enrichment_probe_commands,
+                            initial_commands=self._esxi_storcli_initial_commands(),
+                        )
+                    )
+                else:
+                    command_results = await self.ssh_probe.run_planned_commands(
+                        self._ssh_inventory_enrichment_probe_commands
+                    )
                 logger.info(
                     "Inventory SSH refresh completed for system=%s platform=%s profile=%s: commands=%s failures=%s duration=%.3fs",
                     self.system.id,
