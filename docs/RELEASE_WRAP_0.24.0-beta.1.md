@@ -12,7 +12,8 @@ Release preparation branch: `release/v0.24.0-beta.1` (PR #897), merged into
 `main` with a merge commit. The tag goes on that `main` merge commit.
 
 Validated release-branch commit: `c70d87770b30dcf8e9791826217c13802904744f`.
-This file and later wrap-only edits change documentation, not the image.
+Later commits add this wrap and loosen one changelog test; neither ships in
+the image.
 
 Validated Linux QA image: `sha256:cd7347963ff7c2270c79b32b0ff4244d5b1b0d52de1b7cdfb3feda99aec9e926`,
 built on the Linux QA host from that commit with
