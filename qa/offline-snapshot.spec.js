@@ -674,6 +674,17 @@ test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and 
       expect(collisions, label).toEqual([]);
     }
   }
+
+  // Only the top latch leaves the middle free; other edges keep the corner chip.
+  const placements = await page.locator("#chassis-shell").evaluate((shell) => {
+    const tile = shell.querySelector(".slot-tile:not(.selected):not(.peer-highlight)");
+    return ["bottom", "left", "right"].map((edge) => {
+      shell.dataset.latchEdge = edge;
+      const chip = getComputedStyle(tile, "::after");
+      return `${edge}:${chip.top}/${chip.right}/${chip.transform}`;
+    });
+  });
+  expect(placements).toEqual(["bottom:6px/6px/none", "left:6px/6px/none", "right:6px/6px/none"]);
 });
 
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
