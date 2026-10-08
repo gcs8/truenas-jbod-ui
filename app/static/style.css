@@ -3348,9 +3348,7 @@ button.fabric-trace-crumb:hover {
   line-height: 1;
 }
 
-/* The legend swatch and each bay's state chip share one fill, so a chip reads
-   as its legend entry. Fault, unknown and unmapped add a stripe as a non-color
-   cue. */
+/* A chip shares its legend swatch's fill; stripes are the non-color cue. */
 .swatch.healthy,
 .slot-tile.state-healthy::after { background: var(--healthy); }
 .swatch.empty,
@@ -3364,8 +3362,7 @@ button.fabric-trace-crumb:hover {
 .swatch.unmapped,
 .slot-tile.state-unmapped::after { background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.36) 0 3px, transparent 3px 7px), var(--unmapped); }
 
-/* A white glyph falls under 3:1 on the lighter unstriped fills, so they use
-   dark ink; the striped fills keep white, which their dark stripes favor. */
+/* White ink falls under 3:1 on these two fills. */
 .swatch:is(.healthy, .identify),
 .slot-tile:is(.state-healthy, .state-identify)::after { color: #10161c; }
 
@@ -3727,10 +3724,7 @@ button.fabric-trace-crumb:hover {
   --slot-track-min-width: 40px;
 }
 
-/* A single row of 20+ top-latched 2.5" sleds leaves each about 40px wide, with
-   no room beside the latch and LED, so the state chip sits in the empty middle;
-   selection rings reuse ::after and keep their own box. Other latch edges and
-   multi-row faces, whose sleds are wider, keep the corner chip. */
+/* One row of top-latched 40px sleds leaves no room by the latch: chip mid-sled. */
 .chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after {
   top: 50%;
   right: auto;
@@ -3738,8 +3732,7 @@ button.fabric-trace-crumb:hover {
   transform: translate(-50%, -50%);
 }
 
-/* With a heat map the value badge takes the middle, so the chip drops to the
-   foot over the device and pool labels, which a 40px sled truncates anyway. */
+/* The heat-map badge owns the middle; the chip takes the labels' place. */
 .chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing):not(.selected, .peer-highlight, .fabric-highlight)::after {
   top: auto;
   bottom: 10px;
@@ -3750,9 +3743,7 @@ button.fabric-trace-crumb:hover {
   visibility: hidden;
 }
 
-/* A saved view's third label (size or placement) shows a few letters on a 40px
-   sled and pushes the device label into the chip, so these sleds drop it; the
-   slot details panel still shows it. */
+/* No room for a third label; slot details still show it. */
 .chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tertiary {
   display: none;
 }
