@@ -62,7 +62,7 @@
     "test_parsers": 136,
     "test_perf": 9,
     "test_perf_budgets": 19,
-    "test_perf_harness": 14,
+    "test_perf_harness": 15,
     "test_platform_parity_fixtures": 15,
     "test_private_qa_restore": 53,
     "test_process_secrets": 12,
