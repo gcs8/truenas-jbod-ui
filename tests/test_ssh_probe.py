@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import gc
 import os
 import threading
+import weakref
 import time
 import tempfile
 import unittest
@@ -916,6 +919,47 @@ class SSHCommandLifetimeTests(unittest.TestCase):
                     self.assertEqual(result.stderr, "failure")
                 else:
                     self.assertIn("synthetic read failure", result.stderr)
+
+    def test_a_failed_or_cancelled_command_frees_its_streams_without_the_cycle_collector(self):
+        # Paramiko's BufferedFile.__del__ flushes even a closed file. If the cycle
+        # collector finalizes its write buffer first, it prints "Exception ignored
+        # in BufferedFile.__del__ ... I/O operation on closed file" (paramiko#2153).
+        # The error that ends a command must not keep the streams in such a cycle.
+        if gc.isenabled():
+            gc.disable()
+            self.addCleanup(gc.enable)
+        for mode in ("read-error", "cancelled"):
+            with self.subTest(mode=mode):
+                cancel = ssh_probe._WorkerCancellation()
+
+                def respond(channel, _command):
+                    if mode == "cancelled":
+                        cancel.cancelled.set()
+                        return
+                    def fail(_size):
+                        raise OSError("synthetic read failure")
+                    MemorySSHWire.feed(channel, b"data")
+                    channel.recv = fail
+
+                wire = MemorySSHWire(respond)
+                streams = []
+                real_exec = wire.client.exec_command
+
+                def recording_exec(*args, **kwargs):
+                    opened = real_exec(*args, **kwargs)
+                    streams.extend(weakref.ref(stream) for stream in opened)
+                    return opened
+
+                wire.client.exec_command = recording_exec
+                error = None
+                try:
+                    result = self.probe._run_single_command(wire.client, "first", timeout_seconds=5, _cancel=cancel)
+                    self.assertFalse(result.ok)
+                except asyncio.CancelledError as exc:
+                    error = exc  # Held, as the executor future holds it.
+                self.assertEqual(mode == "cancelled", error is not None)
+                self.assertEqual(len(streams), 3)
+                self.assertEqual([ref() for ref in streams], [None, None, None])
 
     def test_group_gate_does_not_release_a_channel_whose_close_failed(self):
         def respond(channel, command):
