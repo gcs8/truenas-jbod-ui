@@ -177,10 +177,11 @@ phrase `I_APPROVE_LIVE_READ_ONLY_QA`. Use it only after confirming the QA host i
 allowed to contact the restored endpoints. This mode adds:
 
 - a wait of up to 15 minutes for the restored history collector to finish one
-  live pass before any browser or performance check. Until that pass succeeds
-  it retries every 30 seconds with forced inventory, which would race those
-  checks on slow appliances. A collector that never finishes a pass fails the
-  run;
+  full live pass, with forced inventory across every saved system, before any
+  browser or performance check. Until that pass succeeds it retries every 30
+  seconds, which would race those checks on slow appliances. The startup pass
+  that reads only the cached default system does not count. A collector that
+  never finishes a full pass fails the run;
 - full saved-system and saved-view browser checks;
 - platform-specific read-only checks such as ESXi rendering when applicable;
 - the app API performance runner with mapping mutation disabled;

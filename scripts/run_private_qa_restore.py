@@ -1101,6 +1101,14 @@ def _wait_json(
     raise QaRestoreError(f"health wait expired after {timeout_seconds}s") from last_error
 
 
+def _completed_full_pass(collector: dict[str, Any]) -> bool:
+    # A slow pass forces inventory across the whole fleet. The startup shortcut
+    # reads only the cached root and never sets last_slow_metrics_at; a slow
+    # pass that failed later leaves last_success_at older than its start.
+    success, slow = collector.get("last_success_at"), collector.get("last_slow_metrics_at")
+    return isinstance(success, str) and isinstance(slow, str) and success >= slow
+
+
 def _wait_history_idle(
     port: int,
     username: str,
@@ -1109,7 +1117,7 @@ def _wait_history_idle(
     timeout_seconds: int = 600,
     live_pass: bool = False,
 ) -> dict[str, Any]:
-    """Wait for an idle collector; ``live_pass`` also needs one finished pass."""
+    """Wait for an idle collector; ``live_pass`` also needs one finished full pass."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         payload = get_json(
@@ -1122,7 +1130,7 @@ def _wait_history_idle(
         if not isinstance(collector, dict):
             raise QaRestoreError("history overview omitted collector state")
         collection_running = collector.get("collection_running")
-        if collection_running is False and (not live_pass or isinstance(collector.get("last_success_at"), str)):
+        if collection_running is False and (not live_pass or _completed_full_pass(collector)):
             return payload
         if not isinstance(collection_running, bool):
             raise QaRestoreError("history overview omitted collector state")

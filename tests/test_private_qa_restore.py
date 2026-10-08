@@ -921,17 +921,27 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertFalse(result["collector"]["collection_running"])
         self.assertEqual(get_json.call_count, 2)
 
-    def test_live_pass_wait_needs_an_idle_collector_with_a_completed_pass(self) -> None:
-        idle_failed = {"collector": {"collection_running": False, "last_success_at": None}}
-        busy_passed = {"collector": {"collection_running": True, "last_success_at": "2026-10-08T04:22:56+00:00"}}
-        idle_passed = {"collector": {"collection_running": False, "last_success_at": "2026-10-08T04:22:56+00:00"}}
+    def test_live_pass_wait_needs_an_idle_collector_with_a_completed_full_pass(self) -> None:
+        def collector(running, success=None, slow=None):
+            return {"collector": {"collection_running": running, "last_success_at": success, "last_slow_metrics_at": slow}}
+        idle_failed = collector(False)
+        early, late = "2026-10-08T04:20:00+00:00", "2026-10-08T04:22:56+00:00"
+        idle_passed = collector(False, late, late)
+        waits = [
+            idle_failed,
+            collector(True, late, late),  # still collecting
+            collector(False, late),  # startup shortcut: cached root only, no slow pass
+            collector(False, early, late),  # slow pass started, then failed
+        ]
         with (
-            patch.object(self.module, "get_json", side_effect=[idle_failed, busy_passed, idle_passed]) as get_json,
+            patch.object(self.module, "get_json", side_effect=[*waits, idle_passed]) as get_json,
             patch.object(self.module.time, "sleep"),
         ):
             result = self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
         self.assertIs(result, idle_passed)
-        self.assertEqual(get_json.call_count, 3)
+        self.assertEqual(get_json.call_count, len(waits) + 1)
+        # A later fast pass keeps the full pass it followed.
+        self.assertTrue(self.module._completed_full_pass(collector(False, late, early)["collector"]))
 
         # Without live_pass the first idle snapshot is enough, as before.
         with patch.object(self.module, "get_json", return_value=idle_failed), patch.object(self.module.time, "sleep"):
