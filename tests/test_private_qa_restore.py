@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import yaml
@@ -921,55 +922,89 @@ class PrivateQaRestoreContractTests(unittest.TestCase):
         self.assertFalse(result["collector"]["collection_running"])
         self.assertEqual(get_json.call_count, 2)
 
-    def test_live_pass_wait_needs_an_idle_collector_with_a_completed_full_pass(self) -> None:
-        def collector(running, success=None, slow=None):
-            return {"collector": {"collection_running": running, "last_success_at": success, "last_slow_metrics_at": slow}}
-        idle_failed = collector(False)
+    def test_full_pass_predicate_rejects_the_startup_shortcut_and_failed_slow_passes(self) -> None:
         early, late = "2026-10-08T04:20:00+00:00", "2026-10-08T04:22:56+00:00"
-        idle_passed = collector(False, late, late)
-        waits = [
-            idle_failed,
-            collector(True, late, late),  # still collecting
-            collector(False, late),  # startup shortcut: cached root only, no slow pass
-            collector(False, early, late),  # slow pass started, then failed
-        ]
-        with (
-            patch.object(self.module, "get_json", side_effect=[*waits, idle_passed]) as get_json,
-            patch.object(self.module.time, "sleep"),
-        ):
-            result = self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
-        self.assertIs(result, idle_passed)
-        self.assertEqual(get_json.call_count, len(waits) + 1)
+        full = self.module._completed_full_pass
+        self.assertFalse(full({"last_success_at": None, "last_slow_metrics_at": None}))
+        # Startup shortcut: cached root only, so no slow pass was ever recorded.
+        self.assertFalse(full({"last_success_at": late, "last_slow_metrics_at": None}))
+        # A slow pass started after the last success, then failed.
+        self.assertFalse(full({"last_success_at": early, "last_slow_metrics_at": late}))
+        self.assertTrue(full({"last_success_at": late, "last_slow_metrics_at": late}))
         # A later fast pass keeps the full pass it followed.
-        self.assertTrue(self.module._completed_full_pass(collector(False, late, early)["collector"]))
+        self.assertTrue(full({"last_success_at": late, "last_slow_metrics_at": early}))
 
-        # Without live_pass the first idle snapshot is enough, as before.
-        with patch.object(self.module, "get_json", return_value=idle_failed), patch.object(self.module.time, "sleep"):
-            self.assertIs(self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30), idle_failed)
+    def test_full_history_pass_requests_a_full_refresh_until_one_completes(self) -> None:
+        late = "2026-10-08T04:22:56+00:00"
+        shortcut = {"collector": {"collection_running": False, "last_success_at": late, "last_slow_metrics_at": None}}
+        done = {"collector": {"collection_running": False, "last_success_at": late, "last_slow_metrics_at": late}}
+        posts: list[tuple[str, str, bytes, dict[str, str]]] = []
+        statuses: list[int] = []
 
-        # A collector that never finishes a pass fails the gate by name.
+        class FakeConnection:
+            def __init__(self, host, port, timeout):
+                self.target = (host, port)
+
+            def request(self, method, path, body, headers):
+                posts.append((method, path, body, headers))
+
+            def getresponse(self):
+                return SimpleNamespace(status=statuses.pop(0), read=lambda _limit: b"{}")
+
+            def close(self):
+                return None
+
+        def run(waits, refresh_statuses):
+            posts.clear()
+            statuses[:] = refresh_statuses
+            with (
+                patch.object(self.module, "_wait_history_idle", side_effect=waits) as wait,
+                patch.object(self.module.http.client, "HTTPConnection", FakeConnection),
+            ):
+                return self.module._run_full_history_pass(28081, "qa-user", "qa-password"), wait
+
+        # Already done: no refresh is requested.
+        result, wait = run([done], [])
+        self.assertIs(result, done)
+        self.assertEqual(posts, [])
+        # Startup shortcut only: one Full refresh, then the completed pass.
+        result, wait = run([shortcut, done], [200])
+        self.assertIs(result, done)
+        self.assertEqual(wait.call_count, 2)
+        [(method, path, body, headers)] = posts
+        self.assertEqual((method, path, json.loads(body)), ("POST", "/api/history/refresh", {"mode": "full"}))
+        self.assertEqual(headers["Origin"], "http://127.0.0.1:28081")
+        self.assertTrue(headers["Authorization"].startswith("Basic "))
+        # A scheduled pass won the race (409): wait for it, then ask again.
+        result, wait = run([shortcut, shortcut, done], [409, 200])
+        self.assertIs(result, done)
+        self.assertEqual(len(posts), 2)
+        # Any other answer fails the gate.
+        with self.assertRaisesRegex(self.module.QaRestoreError, "history full refresh returned HTTP 500"):
+            run([shortcut], [500])
+        # A pass that never completes fails the gate by name.
         with (
-            patch.object(self.module, "get_json", return_value=idle_failed),
-            patch.object(self.module.time, "sleep"),
-            patch.object(self.module.time, "monotonic", side_effect=[0, 0, 31]),
-            self.assertRaisesRegex(self.module.QaRestoreError, "did not finish a live pass after 30s"),
+            patch.object(self.module, "_wait_history_idle", return_value=shortcut),
+            patch.object(self.module.http.client, "HTTPConnection", FakeConnection),
+            patch.object(self.module.time, "monotonic", side_effect=[0, 0, 1, 901]),
+            self.assertRaisesRegex(self.module.QaRestoreError, "did not finish a full live pass after 900s"),
         ):
-            self.module._wait_history_idle(28081, "qa-user", "qa-password", timeout_seconds=30, live_pass=True)
+            statuses[:] = [200]
+            self.module._run_full_history_pass(28081, "qa-user", "qa-password")
 
-    def test_live_checks_start_only_after_a_completed_history_pass(self) -> None:
+    def test_live_checks_start_only_after_a_completed_full_history_pass(self) -> None:
         for live in (True, False):
             events: list[str] = []
             with self.subTest(live=live), tempfile.TemporaryDirectory() as raw_root:
                 with (
                     patch.object(self.module, "_run", side_effect=lambda command, **_: events.append("run")),
-                    patch.object(self.module, "_wait_history_idle", side_effect=lambda *_, **kwargs: events.append(
-                        f"history-pass:{kwargs.get('live_pass')}")),
+                    patch.object(self.module, "_run_full_history_pass", side_effect=lambda *_, **__: events.append("full-pass")),
                 ):
                     results = self.module._run_browser_and_perf(
                         ROOT, (28080, 28081, 28082), "qa-user", "qa-password", Path(raw_root), live_read_only=live,
                     )
                 # Every browser and timed check, history perf included, follows the pass.
-                self.assertEqual(events, ["history-pass:True", *["run"] * 4] if live else ["run"] * 2)
+                self.assertEqual(events, ["full-pass", *["run"] * 4] if live else ["run"] * 2)
                 self.assertEqual(results.get("history_live_pass", False), live)
 
     def test_observed_state_paths_follow_restored_config_and_stay_in_mounts(self) -> None:

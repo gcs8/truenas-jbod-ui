@@ -1109,15 +1109,52 @@ def _completed_full_pass(collector: dict[str, Any]) -> bool:
     return isinstance(success, str) and isinstance(slow, str) and success >= slow
 
 
+def _run_full_history_pass(
+    port: int,
+    username: str,
+    password: str,
+    *,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
+    """Run one full live history pass through the operator's Full refresh route.
+
+    The collector's startup pass reads only the cached default system and its next
+    scheduled pass is an hour away, so live checks ask for the full pass themselves.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while (remaining := int(deadline - time.monotonic())) > 0:
+        payload = _wait_history_idle(port, username, password, timeout_seconds=remaining)
+        if _completed_full_pass(payload["collector"]):
+            return payload
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=max(1, int(deadline - time.monotonic())))
+        try:
+            connection.request(
+                "POST",
+                "/api/history/refresh",
+                body=b'{"mode":"full"}',
+                headers={
+                    "Authorization": _basic_authorization(username, password),
+                    "Content-Type": "application/json",
+                    "Origin": f"http://127.0.0.1:{port}",
+                },
+            )
+            response = connection.getresponse()
+            response.read(4 * 1024 * 1024)
+        finally:
+            connection.close()
+        # 409: a scheduled pass started first; wait for it and look again.
+        if response.status not in (200, 409):
+            raise QaRestoreError(f"history full refresh returned HTTP {response.status}")
+    raise QaRestoreError(f"history collector did not finish a full live pass after {timeout_seconds}s")
+
+
 def _wait_history_idle(
     port: int,
     username: str,
     password: str,
     *,
     timeout_seconds: int = 600,
-    live_pass: bool = False,
 ) -> dict[str, Any]:
-    """Wait for an idle collector; ``live_pass`` also needs one finished full pass."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         payload = get_json(
@@ -1130,13 +1167,13 @@ def _wait_history_idle(
         if not isinstance(collector, dict):
             raise QaRestoreError("history overview omitted collector state")
         collection_running = collector.get("collection_running")
-        if collection_running is False and (not live_pass or _completed_full_pass(collector)):
+        if collection_running is False:
             return payload
-        if not isinstance(collection_running, bool):
+        if collection_running is not True:
             raise QaRestoreError("history overview omitted collector state")
         time.sleep(1)
     raise QaRestoreError(
-        f"history collector {'did not finish a live pass' if live_pass else 'remained active'} after {timeout_seconds}s"
+        f"history collector remained active after {timeout_seconds}s"
     )
 
 
@@ -1681,9 +1718,9 @@ def _run_browser_and_perf(
             }
         )
         if live_read_only:
-            # Until its first pass succeeds the collector retries every 30 s with
+            # A collector still owing its first full pass retries every 30 s with
             # forced inventory, which races every timed check on slow appliances.
-            _wait_history_idle(ports[1], username, password, timeout_seconds=900, live_pass=True)
+            _run_full_history_pass(ports[1], username, password)
         _run(
             [
                 "npx",

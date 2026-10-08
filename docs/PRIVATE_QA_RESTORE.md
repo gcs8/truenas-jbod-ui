@@ -176,12 +176,13 @@ that restored appliance endpoints are reachable or compatible.
 phrase `I_APPROVE_LIVE_READ_ONLY_QA`. Use it only after confirming the QA host is
 allowed to contact the restored endpoints. This mode adds:
 
-- a wait of up to 15 minutes for the restored history collector to finish one
-  full live pass, with forced inventory across every saved system, before any
-  browser or performance check. Until that pass succeeds it retries every 30
-  seconds, which would race those checks on slow appliances. The startup pass
-  that reads only the cached default system does not count. A collector that
-  never finishes a full pass fails the run;
+- one full live history pass, with forced inventory across every saved system,
+  before any browser or performance check. The controller asks for it through
+  the history Full refresh route and allows up to 15 minutes. Until that pass
+  succeeds the collector retries every 30 seconds, which would race those
+  checks on slow appliances. The startup pass that reads only the cached
+  default system does not count. A collector that never finishes a full pass
+  fails the run;
 - full saved-system and saved-view browser checks;
 - platform-specific read-only checks such as ESXi rendering when applicable;
 - the app API performance runner with mapping mutation disabled;

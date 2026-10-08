@@ -64,7 +64,7 @@
     "test_perf_budgets": 19,
     "test_perf_harness": 14,
     "test_platform_parity_fixtures": 15,
-    "test_private_qa_restore": 52,
+    "test_private_qa_restore": 53,
     "test_process_secrets": 12,
     "test_profile_builder": 18,
     "test_profiles": 13,
