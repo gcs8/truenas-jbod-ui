@@ -393,6 +393,30 @@ def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> No
         )
 
 
+_URL_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://([^\s/?#]*)[^\s]*")
+
+
+def _redact_url(match: re.Match[str]) -> str:
+    # Keep scheme, host and port so the operator sees which endpoint failed.
+    # Userinfo, path and query can carry tokens, so they never reach the output.
+    host = match.group(2).rpartition("@")[2]
+    return f"{match.group(1)}://{host}"
+
+
+def _failure_summary(error: BaseException) -> str:
+    """One bounded line naming why activation or rollback failed (#910).
+
+    Helper errors say what failed, but some quote a caller-supplied URL whose
+    path or query may hold a credential; those are cut to scheme://host:port.
+    Any other exception is reported by type only.
+    """
+
+    if isinstance(error, DeploymentError):
+        text = _URL_PATTERN.sub(_redact_url, " ".join(str(error).split()))
+        return text[:300] if text else type(error).__name__
+    return type(error).__name__
+
+
 def _validate_name(value: str, *, label: str, pattern: re.Pattern[str] = NAME_PATTERN) -> None:
     if not pattern.fullmatch(value):
         raise DeploymentError(f"invalid {label}: {value!r}")
@@ -1115,11 +1139,17 @@ def update_deployment(
             return {"status": "active", **result, "retention": receipt["retention"]}
         return {"status": "active", **result}
     except BaseException as activation_error:
+        # Name the cause (#910): "activation failed" alone hid an unhealthy
+        # container behind a first-start index build.
+        cause = _failure_summary(activation_error)
         try:
             _restore_previous(root, receipt_dir, receipt, run=run, probe=probe)
         except BaseException as rollback_error:
-            raise DeploymentError("activation failed and automatic rollback failed") from rollback_error
-        raise DeploymentError("activation failed; automatic rollback completed") from activation_error
+            raise DeploymentError(
+                f"activation failed ({cause}) and automatic rollback failed "
+                f"({_failure_summary(rollback_error)})"
+            ) from rollback_error
+        raise DeploymentError(f"activation failed ({cause}); automatic rollback completed") from activation_error
 
 
 def verify_deployment(

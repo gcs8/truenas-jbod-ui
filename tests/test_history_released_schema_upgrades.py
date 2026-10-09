@@ -218,6 +218,7 @@ KILL_PHASES = {
     "after one committed backfill batch": ("_backfill_disk_identity_batch", 2),
     "after the backfill and version stamp": ("_backfill_disk_identity_keys_once", 1),
     "after the identity index build": ("_ensure_identity_indexes", 1),
+    "after the chronological index build": ("_ensure_chronological_indexes", 1),
     "after the counter sync, before the final commit": ("_synchronize_table_counts", 1),
 }
 

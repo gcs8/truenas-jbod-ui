@@ -310,7 +310,7 @@ def _indent_sql(sql: str, spaces: int) -> str:
     return prefix + sql.replace("\n", f"\n{prefix}")
 
 
-SCHEMA = f"""
+_BASE_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS slot_state_current (
 {_SLOT_STATE_SCHEMA_COLUMNS_SQL},
     PRIMARY KEY (system_id, enclosure_key, slot)
@@ -459,18 +459,6 @@ CREATE INDEX IF NOT EXISTS idx_slot_events_scope
 CREATE INDEX IF NOT EXISTS idx_metric_samples_scope
     ON metric_samples (system_id, enclosure_key, slot, metric_name, observed_at DESC);
 
--- Absolute-time ordering cannot use the older text-time indexes. These
--- additive indexes are copied into newly sealed sources by SQLite backup.
--- Already immutable segments retain their old schema and correct scan path.
-CREATE INDEX IF NOT EXISTS idx_slot_events_scope_chronological
-    ON slot_events (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
-
-CREATE INDEX IF NOT EXISTS idx_metric_samples_slot_chronological
-    ON metric_samples (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC);
-
-CREATE INDEX IF NOT EXISTS idx_metric_samples_scope_chronological
-    ON metric_samples (system_id, enclosure_key, slot, metric_name, julianday(observed_at) DESC, id DESC);
-
 CREATE INDEX IF NOT EXISTS idx_slot_events_observed_at
     ON slot_events (observed_at, id);
 
@@ -490,6 +478,51 @@ CREATE INDEX IF NOT EXISTS idx_metric_rollups_scope
 CREATE INDEX IF NOT EXISTS idx_metric_rollups_retention
     ON metric_rollups (bucket_seconds, bucket_start);
 """
+
+# Absolute-time ordering cannot use the older text-time indexes. These
+# additive indexes are copied into newly sealed sources by SQLite backup.
+# Already immutable segments retain their old schema and correct scan path.
+# The two disk-identity ones need disk_identity_key, which legacy sources only
+# gain at column admission, so they are not part of SCHEMA.
+# The statements keep the exact text earlier releases stored in sqlite_master.
+CHRONOLOGICAL_INDEXES: tuple[tuple[str, str], ...] = (
+    (
+        "idx_slot_events_scope_chronological",
+        "CREATE INDEX IF NOT EXISTS idx_slot_events_scope_chronological\n"
+        "    ON slot_events (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC)",
+    ),
+    (
+        "idx_metric_samples_slot_chronological",
+        "CREATE INDEX IF NOT EXISTS idx_metric_samples_slot_chronological\n"
+        "    ON metric_samples (system_id, enclosure_key, slot, julianday(observed_at) DESC, id DESC)",
+    ),
+    (
+        "idx_metric_samples_scope_chronological",
+        "CREATE INDEX IF NOT EXISTS idx_metric_samples_scope_chronological\n"
+        "    ON metric_samples (system_id, enclosure_key, slot, metric_name, julianday(observed_at) DESC, id DESC)",
+    ),
+    (
+        "idx_metric_samples_disk_chronological",
+        "CREATE INDEX IF NOT EXISTS idx_metric_samples_disk_chronological ON metric_samples "
+        "(disk_identity_key, julianday(observed_at) DESC, id DESC)",
+    ),
+    (
+        "idx_metric_samples_disk_metric_chronological",
+        "CREATE INDEX IF NOT EXISTS idx_metric_samples_disk_metric_chronological ON metric_samples "
+        "(disk_identity_key, metric_name, julianday(observed_at) DESC, id DESC)",
+    ),
+)
+_SCHEMA_CHRONOLOGICAL_INDEX_COUNT = 3
+# Building all five chronological indexes took 58.7 seconds on a 4-million-sample
+# database, longer than the healthcheck allows (#910). Up to this many history
+# rows (a few seconds of work) they are built inline at startup; above it the
+# collector builds them after the service answers, one at a time.
+CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS = 250_000
+
+
+SCHEMA = _BASE_SCHEMA + "".join(
+    f"\n{statement};\n" for _, statement in CHRONOLOGICAL_INDEXES[:_SCHEMA_CHRONOLOGICAL_INDEX_COUNT]
+)
 
 
 class HistoryBackupSourceReplacedError(RuntimeError):
@@ -1688,12 +1721,13 @@ class HistoryStore:
                 # the database is still empty.
                 connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 connection.execute("VACUUM")
-            connection.executescript(SCHEMA)
+            connection.executescript(_BASE_SCHEMA)
             self._ensure_slot_state_columns(connection)
             self._ensure_slot_event_columns(connection)
             self._ensure_metric_sample_columns(connection)
             self._backfill_disk_identity_keys_once(connection)
             self._ensure_identity_indexes(connection)
+            self._ensure_chronological_indexes(connection)
             self._synchronize_table_counts(connection)
             connection.commit()
 
@@ -1849,15 +1883,64 @@ class HistoryStore:
                 ON metric_samples (disk_identity_key, metric_name, observed_at DESC)
             """
         )
-        # Legacy sources can lack disk_identity_key until column admission.
-        for name, columns in (
-            ("idx_metric_samples_disk_chronological", "disk_identity_key"),
-            ("idx_metric_samples_disk_metric_chronological", "disk_identity_key, metric_name"),
-        ):
-            connection.execute(
-                f"CREATE INDEX IF NOT EXISTS {name} ON metric_samples "
-                f"({columns}, julianday(observed_at) DESC, id DESC)"
+
+    @staticmethod
+    def _missing_chronological_indexes(connection: sqlite3.Connection) -> tuple[str, ...]:
+        present = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+        return tuple(name for name, _ in CHRONOLOGICAL_INDEXES if name not in present)
+
+    @staticmethod
+    def _ensure_chronological_indexes(connection: sqlite3.Connection) -> tuple[str, ...]:
+        """Build missing chronological indexes inline when that is quick (#910).
+
+        Returns the indexes left for the collector to build after startup. A
+        large upgraded database answers its healthcheck first and keeps the
+        older scan path until the background build finishes.
+        """
+
+        missing = HistoryStore._missing_chronological_indexes(connection)
+        if not missing:
+            return ()
+        # The AUTOINCREMENT ids bound the row counts from above in O(log n).
+        history_rows = sum(
+            int(connection.execute(f"SELECT coalesce(max(rowid), 0) FROM {table}").fetchone()[0])
+            for table in ("slot_events", "metric_samples")
+        )
+        if history_rows > CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS:
+            logger.info(
+                "Upgrading history database: %s indexes will be built in the background after "
+                "startup; history reads use the older, slower path until they finish.",
+                len(missing),
             )
+            return missing
+        statements = dict(CHRONOLOGICAL_INDEXES)
+        for name in missing:
+            connection.execute(statements[name])
+        return ()
+
+    def pending_chronological_indexes(self) -> tuple[str, ...]:
+        """Chronological indexes this hot database does not have yet."""
+
+        with self._read_connection() as connection:
+            return self._missing_chronological_indexes(connection)
+
+    def build_chronological_index(self, name: str) -> None:
+        """Build one chronological index in its own write transaction.
+
+        Holding only SQLite's write lock, not the history lifecycle lock, keeps
+        reads and healthchecks answering while the index builds; other writers
+        wait or retry exactly as they do for any long write.
+        """
+
+        statement = dict(CHRONOLOGICAL_INDEXES)[name]
+        started = time.monotonic()
+        with closing(self._connect()) as connection:
+            connection.execute(statement)
+            connection.commit()
+        logger.info("Built history index %s in %.1f seconds.", name, time.monotonic() - started)
 
     @staticmethod
     def _ensure_columns(

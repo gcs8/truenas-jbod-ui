@@ -332,6 +332,49 @@ class ImmutableDeploymentTests(unittest.TestCase):
         self.assertTrue(all(prior_closed))
         self.assertTrue(all(payload.closed for payload in payloads))
 
+    def test_a_failed_health_probe_does_not_leak_its_url_into_the_rollback_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root)
+            secret_url = "http://127.0.0.1:8081/healthz?token=SYNTH-SECRET"
+            spec = deployment.DeploymentSpec(**{**self.make_spec(root).__dict__, "health_urls": (secret_url,)})
+            probes: list[str] = []
+
+            def probe(url: str) -> None:
+                probes.append(url)
+                # The candidate's health never converges; the restored one does.
+                if len(probes) == 1:
+                    raise deployment.DeploymentError(f"health probe did not converge: {url}")
+
+            with self.assertRaises(deployment.DeploymentError) as caught:
+                deployment.update_deployment(spec, run=runtime.run, download=runtime.download, probe=probe)
+
+            message = str(caught.exception)
+            self.assertEqual(
+                message,
+                "activation failed (health probe did not converge: http://127.0.0.1:8081); "
+                "automatic rollback completed",
+            )
+            self.assertNotIn("SYNTH-SECRET", message)
+            self.assertNotIn("/healthz", message)
+
+    def test_failure_summary_names_helper_errors_and_only_types_otherwise(self) -> None:
+        self.assertEqual(
+            deployment._failure_summary(deployment.DeploymentError("container  enclosure-history\nis unhealthy")),
+            "container enclosure-history is unhealthy",
+        )
+        self.assertEqual(len(deployment._failure_summary(deployment.DeploymentError("x" * 1000))), 300)
+        # A quoted URL keeps only scheme, host and port.
+        self.assertEqual(
+            deployment._failure_summary(deployment.DeploymentError(
+                "health probe did not converge: http://user:pw@127.0.0.1:8081/healthz?token=SYNTH-SECRET#frag"
+            )),
+            "health probe did not converge: http://127.0.0.1:8081",
+        )
+        # Arbitrary exceptions can carry paths or payloads; only the type is shown.
+        self.assertEqual(deployment._failure_summary(ValueError("/secret/path token=abc")), "ValueError")
+        self.assertEqual(deployment._failure_summary(KeyboardInterrupt()), "KeyboardInterrupt")
+
     def test_candidate_tag_mismatch_fails_before_receipt_or_live_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
@@ -358,7 +401,11 @@ class ImmutableDeploymentTests(unittest.TestCase):
             previous_overlay = (root / "docker-compose.nonroot.yml").read_bytes()
             runtime = FakeRuntime(root, fail_activation=True)
 
-            with self.assertRaisesRegex(deployment.DeploymentError, "activation failed.*rollback completed"):
+            # #910: the message names the cause, not just "activation failed".
+            with self.assertRaisesRegex(
+                deployment.DeploymentError,
+                r"^activation failed \(synthetic activation failure\); automatic rollback completed$",
+            ):
                 deployment.update_deployment(
                     self.make_spec(root),
                     run=runtime.run,

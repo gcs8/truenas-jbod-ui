@@ -85,6 +85,7 @@ KILL_PHASES = (
     "_ensure_metric_sample_columns",
     "_backfill_disk_identity_keys_once",
     "_ensure_identity_indexes",
+    "_ensure_chronological_indexes",
     "_synchronize_table_counts",
 )
 KILL_MARKER = "upgrade_smoke_kill_point_reached"
