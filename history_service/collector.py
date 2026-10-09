@@ -115,13 +115,19 @@ class HistoryCollectionPaused(RuntimeError):
 
 
 COLLECTION_PAUSED_REASON = "The history database is damaged; collection is paused to protect it."
-# Deferred chronological index builds (#910). A failed build is retried before
-# collecting, up to this many times, then collection resumes and the build is
-# retried before each later pass: the indexes speed up reads, and history must
-# not stop for them.
+# Deferred chronological index builds (#910). Scheduled collection never
+# writes a pass to a database that has just refused an index build. The first
+# INDEX_BUILD_QUICK_RETRIES retries are INDEX_BUILD_RETRY_SECONDS apart, for a
+# transient lock or I/O error; after that the build is retried every
+# INDEX_BUILD_SLOW_RETRY_SECONDS and collection stays paused, reported as
+# degraded, until one succeeds.
 INDEX_BUILD_RETRY_SECONDS = 60.0
-INDEX_BUILD_MAX_COLLECTION_DELAYS = 3
-INDEX_BUILD_DEGRADED_REASON = "History indexes could not be built yet; history reads are slower until they are."
+INDEX_BUILD_QUICK_RETRIES = 3
+INDEX_BUILD_SLOW_RETRY_SECONDS = 300.0
+INDEX_BUILD_DEGRADED_REASON = "History indexes could not be built yet; retrying before collecting."
+INDEX_BUILD_PAUSED_REASON = (
+    "History indexes keep failing to build; scheduled collection is paused until they do."
+)
 
 
 def _is_missing_route(exc: HistorySourceError) -> bool:
@@ -623,6 +629,8 @@ class HistoryCollector:
             return "The history database is read-only."
         if self.retention_consecutive_failures >= 2:
             return "History cleanup has failed twice in a row."
+        if self._index_build_failures > INDEX_BUILD_QUICK_RETRIES:
+            return INDEX_BUILD_PAUSED_REASON
         if self._index_build_failures > 0:
             return INDEX_BUILD_DEGRADED_REASON
         return self._scope_collection_degraded_reason
@@ -806,7 +814,7 @@ class HistoryCollector:
                 await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
             except HistoryCollectionAlreadyRunning:
                 return False
-            except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_MAX_COLLECTION_DELAYS.
+            except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
                 self._index_build_failures += 1
                 logger.warning(
                     "Could not build history index %s (%s, attempt %d); it will be retried.",
@@ -852,11 +860,16 @@ class HistoryCollector:
             if not await self._build_pending_indexes():
                 if self._stopping.is_set():
                     break
-                if 0 < self._index_build_failures <= INDEX_BUILD_MAX_COLLECTION_DELAYS:
-                    # Retry the build before writing another pass to a database
-                    # that just refused one (#910).
+                if self._index_build_failures > 0:
+                    # Never write a scheduled pass to a database that just
+                    # refused an index build (#910); retry the build instead.
+                    retry_in = (
+                        INDEX_BUILD_RETRY_SECONDS
+                        if self._index_build_failures <= INDEX_BUILD_QUICK_RETRIES
+                        else INDEX_BUILD_SLOW_RETRY_SECONDS
+                    )
                     try:
-                        await asyncio.wait_for(self._stopping.wait(), timeout=INDEX_BUILD_RETRY_SECONDS)
+                        await asyncio.wait_for(self._stopping.wait(), timeout=retry_in)
                     except asyncio.TimeoutError:
                         pass
                     continue

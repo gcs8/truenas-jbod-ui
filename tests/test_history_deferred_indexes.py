@@ -163,7 +163,7 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             self.assertEqual(degraded, [None])
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
-    def test_a_build_that_keeps_failing_does_not_stop_collection(self) -> None:
+    def test_collection_stays_paused_until_a_persistently_failing_build_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.sqlite3"
             _legacy_database(path, samples=40)
@@ -172,29 +172,59 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             collector = HistoryCollector(
                 HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
             )
+            quick = collector_module.INDEX_BUILD_QUICK_RETRIES
+            failures_before_success = quick + 3
             events: list[str] = []
-            degraded: list[str | None] = []
+            reasons: list[str | None] = []
+            waits: list[float] = []
+            original = store.build_chronological_index
+            original_wait_for = asyncio.wait_for
 
             def build(name: str) -> None:
-                events.append("failed")
-                raise sqlite3.OperationalError("disk I/O")
+                if events.count("failed") < failures_before_success:
+                    events.append("failed")
+                    reasons.append(None)
+                    raise sqlite3.OperationalError("disk I/O")
+                events.append("built")
+                original(name)
 
             def collect(**_kwargs) -> None:
                 events.append("collect")
-                degraded.append(collector.degraded_reason())
                 collector._stopping.set()
 
+            async def short_wait(awaitable, timeout):
+                if timeout in (
+                    collector_module.INDEX_BUILD_RETRY_SECONDS,
+                    collector_module.INDEX_BUILD_SLOW_RETRY_SECONDS,
+                ):
+                    waits.append(timeout)
+                    reasons[-1] = collector.degraded_reason()
+                    timeout = 0.001
+                return await original_wait_for(awaitable, timeout)
+
             with (
-                patch.object(collector_module, "INDEX_BUILD_RETRY_SECONDS", 0.01),
+                patch.object(collector_module.asyncio, "wait_for", side_effect=short_wait),
                 patch.object(store, "build_chronological_index", side_effect=build),
                 patch.object(collector, "run_once", side_effect=collect),
                 self.assertLogs("history_service.collector", "WARNING"),
             ):
-                asyncio.run(asyncio.wait_for(collector._run_loop(), timeout=30))
+                asyncio.run(original_wait_for(collector._run_loop(), timeout=30))
 
-            delays = collector_module.INDEX_BUILD_MAX_COLLECTION_DELAYS
-            self.assertEqual(events, ["failed"] * (delays + 1) + ["collect"])
-            self.assertEqual(degraded, [collector_module.INDEX_BUILD_DEGRADED_REASON])
+            # No scheduled pass ran while the build kept failing.
+            self.assertEqual(events, ["failed"] * failures_before_success + ["built"] * 5 + ["collect"])
+            # Quick retries first, then slower ones while collection stays paused.
+            self.assertEqual(
+                waits,
+                [collector_module.INDEX_BUILD_RETRY_SECONDS] * quick
+                + [collector_module.INDEX_BUILD_SLOW_RETRY_SECONDS] * (failures_before_success - quick),
+            )
+            self.assertEqual(
+                reasons,
+                [collector_module.INDEX_BUILD_DEGRADED_REASON] * quick
+                + [collector_module.INDEX_BUILD_PAUSED_REASON] * (failures_before_success - quick),
+            )
+            self.assertIsNone(collector.degraded_reason())
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
     def test_a_failed_index_build_is_reported_as_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
