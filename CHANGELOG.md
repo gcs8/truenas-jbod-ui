@@ -30,6 +30,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Upgrading a large history database no longer fails its first healthcheck
+  and rolls back. The new history indexes are built after the service
+  starts answering, and a failed update now says why it rolled back. (#918)
 - Every node and bay in the Connections panel can be reached again. Path
   cards list all their bays, and long node lists end in a "+N" button that
   expands in place and collapses with "Show fewer". (#920)
