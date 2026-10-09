@@ -340,11 +340,26 @@ def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> No
         )
 
 
+_URL_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://([^\s/?#]*)[^\s]*")
+
+
+def _redact_url(match: re.Match[str]) -> str:
+    # Keep scheme, host and port so the operator sees which endpoint failed.
+    # Userinfo, path and query can carry tokens, so they never reach the output.
+    host = match.group(2).rpartition("@")[2]
+    return f"{match.group(1)}://{host}"
+
+
 def _failure_summary(error: BaseException) -> str:
-    """One bounded line for a failure; helper errors carry no secrets or identifiers."""
+    """One bounded line naming why activation or rollback failed (#910).
+
+    Helper errors say what failed, but some quote a caller-supplied URL whose
+    path or query may hold a credential; those are cut to scheme://host:port.
+    Any other exception is reported by type only.
+    """
 
     if isinstance(error, DeploymentError):
-        text = " ".join(str(error).split())
+        text = _URL_PATTERN.sub(_redact_url, " ".join(str(error).split()))
         return text[:300] if text else type(error).__name__
     return type(error).__name__
 
