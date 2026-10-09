@@ -33,6 +33,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Every node and bay in the Connections panel can be reached again. Path
   cards list all their bays, and long node lists end in a "+N" button that
   expands in place and collapses with "Show fewer". (#920)
+- A cleared bay mapping's note no longer comes back after a refresh or in
+  later exports. The slot-detail cache now keeps only facts about the
+  disk. (#919)
+- Opening a system without picking an enclosure lands on its default again.
+  Refreshing another enclosure, such as Offsite SCALE's rear bays, made it
+  everyone's default page. Broke in v0.23.0. (#916)
 - 2.5" bays no longer draw like 3.5" trays. The Supermicro SSG-2028R front
   shows its 24 bays as narrow 2.5" sleds that fit without scrolling, and the
   SYS-2029GP-TR rear NVMe pair is back to tall sleds. Both broke in v0.23.0.

@@ -354,10 +354,13 @@ STABLE_SLOT_DETAIL_FIELDS = (
     "enclosure_label",
     "enclosure_name",
     "enclosure_identifier",
-    "mapping_source",
-    "notes",
-    "operator_context",
 )
+# The slot-detail cache keeps facts about the disk only. A mapping's note, how
+# this observation was resolved, and HA ownership context belong to the mapping
+# store and the live inventory; restoring them from the cache brought a cleared
+# note back to its bay (#909). Caches written before that may still hold these
+# keys, so the backfill only ever reads STABLE_SLOT_DETAIL_FIELDS and the next
+# write of each entry drops them.
 # Only the strong tier proves which disk occupies a bay: a serial, a logical
 # unit id and a gptid all belong to the disk and travel with it. sas_address is
 # bay-scoped - the expander reports the same address for whatever is plugged in
@@ -1503,9 +1506,12 @@ class InventoryService:
                 # follows the new default, not the cache key chosen before I/O.
                 if selected_enclosure_id is not None and snapshot.selected_enclosure_id != selected_enclosure_id:
                     if not topology_changed:
+                        # The requested enclosure is gone, so the build fell
+                        # back to the source's own default; record it as one.
                         self._replace_canonical_options_from_trusted_snapshot(
                             snapshot,
                             request_sequence=request_sequence,
+                            default_selection=True,
                         )
                     self._snapshot_invalidated.add(cache_key)
                     raise UnknownEnclosureError()
@@ -1557,6 +1563,7 @@ class InventoryService:
                         self._replace_canonical_options_from_trusted_snapshot(
                             snapshot,
                             request_sequence=request_sequence,
+                            default_selection=selected_enclosure_id is None,
                         )
 
             finally:
@@ -1770,6 +1777,7 @@ class InventoryService:
         snapshot: InventorySnapshot,
         *,
         request_sequence: int,
+        default_selection: bool,
     ) -> bool:
         if request_sequence < self._canonical_options_request_sequence:
             return False
@@ -1778,11 +1786,14 @@ class InventoryService:
             return False
         removed_keys = set(self._canonical_enclosure_options or {}) - set(options)
         self._canonical_enclosure_options = options
-        self._canonical_default_enclosure_id = (
-            snapshot.selected_enclosure_id
-            if snapshot.selected_enclosure_id in options
-            else next(iter(options), None)
-        )
+        # Only a build without a selection says which enclosure is the default.
+        # An explicit refresh keeps the current default unless the refresh
+        # retired it, so viewing one enclosure never moves everyone else's
+        # default page to it (#915).
+        if default_selection and snapshot.selected_enclosure_id in options:
+            self._canonical_default_enclosure_id = snapshot.selected_enclosure_id
+        elif default_selection or self._canonical_default_enclosure_id not in options:
+            self._canonical_default_enclosure_id = next(iter(options), None)
         self._canonical_options_request_sequence = request_sequence
         for key in removed_keys:
             self._remove_snapshot_state_key(key, cancel_task=True)
