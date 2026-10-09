@@ -544,6 +544,57 @@ class SystemWideRetentionTests(unittest.TestCase):
 
             self.assertEqual(asyncio.run(run()).unplaced_disk_count, 0)
 
+    def test_a_refused_forced_request_collects_nothing(self) -> None:
+        # The route's own forced snapshot is admitted together with the
+        # system totals, so a request turned away as busy never refreshes.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                release = asyncio.Event()
+                original = service.get_storage_view_runtime
+
+                async def held(**kwargs):
+                    await release.wait()
+                    return await original(**kwargs)
+
+                service.get_storage_view_runtime = held
+                first = asyncio.create_task(service.get_snapshot_with_system_retention(force_refresh=True))
+                await asyncio.sleep(0)
+                forced_before = sum(1 for call in source_bundle.await_args_list if call.kwargs.get("force_refresh"))
+                with self.assertRaises(inventory_module.SystemRetentionBusyError):
+                    await service.get_snapshot_with_system_retention(force_refresh=True)
+                forced_after = sum(1 for call in source_bundle.await_args_list if call.kwargs.get("force_refresh"))
+                release.set()
+                snapshot, retention = await first
+                return forced_before, forced_after, snapshot, retention
+
+            forced_before, forced_after, snapshot, retention = asyncio.run(run())
+
+        self.assertEqual(forced_after, forced_before)
+        self.assertEqual(snapshot.selected_enclosure_id, "enc-a")
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_a_forced_request_for_another_enclosure_collects_sources_once(self) -> None:
+        # A cold service also collects once to discover its enclosures; warm it
+        # so this measures only the forced request itself.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                await service.get_snapshot()
+                source_bundle.reset_mock()
+                return await service.get_snapshot_with_system_retention(
+                    force_refresh=True, selected_enclosure_id="enc-b",
+                )
+
+            snapshot, retention = asyncio.run(run())
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(snapshot.selected_enclosure_id, "enc-b")
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
     def test_too_many_enclosures_are_refused_before_building_them(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temp_dir,

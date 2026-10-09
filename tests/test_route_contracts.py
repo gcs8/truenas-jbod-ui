@@ -231,8 +231,8 @@ class RouteContractTests(unittest.TestCase):
         )
         service = MagicMock()
         service.get_snapshot = AsyncMock(return_value=snapshot)
-        service.get_system_disk_retention = AsyncMock(
-            return_value=DiskRetentionAccounting(36, 36, 0, 0)
+        service.get_snapshot_with_system_retention = AsyncMock(
+            return_value=(snapshot, DiskRetentionAccounting(36, 36, 0, 0))
         )
         registry = MagicMock()
         registry.get_service.return_value = service
@@ -252,8 +252,14 @@ class RouteContractTests(unittest.TestCase):
             )
 
         self.assertEqual(enclosure["summary"]["unplaced_disk_count"], 12)
-        # The route's own snapshot is reused, so a forced request collects once.
-        service.get_system_disk_retention.assert_awaited_once_with(force_refresh=False, snapshot=snapshot)
+        # The system scope is admitted before its snapshot is built, so a
+        # refused request never refreshes; the plain scope is unchanged.
+        service.get_snapshot.assert_awaited_once_with(
+            force_refresh=False, selected_enclosure_id=None, allow_stale_cache=True,
+        )
+        service.get_snapshot_with_system_retention.assert_awaited_once_with(
+            force_refresh=False, selected_enclosure_id=None,
+        )
         self.assertEqual(
             {key: system["summary"][key] for key in (
                 "source_disk_count",

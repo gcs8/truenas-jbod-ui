@@ -450,19 +450,26 @@ def build_router() -> APIRouter:
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        snapshot = await service.get_snapshot(
-            force_refresh=force,
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=not force,
-        )
-        payload = snapshot.model_dump(mode="json")
         if retention_scope == "system":
             # The upgrade helper's disk-retention check (#911): count a disk as
             # placed when any enclosure or storage view of the system shows it.
-            # Older images ignore the parameter and keep enclosure totals.
-            # Reuse this request's snapshot so a forced request collects the
-            # sources once and the totals describe the same read.
-            retention = await service.get_system_disk_retention(force_refresh=force, snapshot=snapshot)
+            # Older images ignore the parameter and keep enclosure totals. The
+            # check is admitted before this request's snapshot is built, so a
+            # busy refusal never forces a refresh, and a forced request
+            # collects the sources once.
+            snapshot, retention = await service.get_snapshot_with_system_retention(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+            )
+        else:
+            snapshot = await service.get_snapshot(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=not force,
+            )
+            retention = None
+        payload = snapshot.model_dump(mode="json")
+        if retention is not None:
             payload["summary"].update(
                 source_disk_count=retention.source_disk_count,
                 rendered_unique_disk_count=retention.rendered_unique_disk_count,

@@ -2119,6 +2119,44 @@ class InventoryService:
         async with self._system_retention_lock:
             return await self._system_disk_retention_locked(force_refresh=force_refresh, snapshot=snapshot)
 
+    async def get_snapshot_with_system_retention(
+        self,
+        *,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+    ) -> tuple[InventorySnapshot, DiskRetentionAccounting]:
+        """The requested snapshot and the system-wide totals, admitted as one unit.
+
+        GET /api/inventory?retention_scope=system uses this. The check is
+        admitted before the snapshot is built, so a request turned away as busy
+        never forces a source refresh, and the lock is held until the totals
+        are done.
+        """
+        if self._system_retention_lock.locked():
+            raise SystemRetentionBusyError()
+        async with self._system_retention_lock:
+            snapshot = await self.get_snapshot(
+                force_refresh=force_refresh,
+                selected_enclosure_id=selected_enclosure_id,
+                allow_stale_cache=not force_refresh,
+            )
+            default_snapshot = snapshot
+            if selected_enclosure_id is not None:
+                # The totals start from the default enclosure. Build it from
+                # the sources this request just collected, not a second read.
+                default_snapshot = (
+                    await self._get_snapshot_result(
+                        force_refresh=force_refresh,
+                        allow_stale_cache=not force_refresh,
+                        force_source_refresh=False,
+                    )
+                ).value
+            retention = await self._system_disk_retention_locked(
+                force_refresh=force_refresh,
+                snapshot=default_snapshot,
+            )
+            return snapshot, retention
+
     async def _system_disk_retention_locked(
         self,
         *,
