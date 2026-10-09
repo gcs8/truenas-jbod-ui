@@ -1333,6 +1333,12 @@ textarea {
   user-select: none;
 }
 
+.sas-fabric-compact-list > .sas-fabric-slot-overflow,
+.sas-fabric-bay-list > .sas-fabric-slot-overflow {
+  align-self: center;
+  justify-self: start;
+}
+
 .sas-fabric-slot-overflow:hover,
 .sas-fabric-slot-overflow:focus-visible {
   border-color: rgba(85, 214, 235, 0.82);
@@ -1522,7 +1528,6 @@ textarea {
   font-size: 0.75rem;
 }
 
-.sas-fabric-bay-overflow,
 .sas-fabric-empty-note {
   align-self: center;
   color: var(--muted);

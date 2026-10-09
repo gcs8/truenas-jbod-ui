@@ -1968,19 +1968,15 @@
     return sorted.length > limit ? `${visible}, +${sorted.length - limit}` : visible;
   }
 
-  function renderSasFabricSlotList(slots, { limit = 24, expandKey = null } = {}) {
-    const sorted = sasFabricSortedSlots(slots);
-    if (!sorted.length) {
-      return "n/a";
-    }
-    const expanded = expandKey && state.sasFabric.expandedSlotLists[expandKey];
-    const visible = expanded ? sorted : sorted.slice(0, limit);
-    const visibleText = escapeHtml(visible.map(formatSlotLabel).join(", "));
-    const overflow = sorted.length - visible.length;
-    if (!expandKey || overflow <= 0) {
-      return visibleText;
-    }
-    return `${visibleText}, <button type="button" class="sas-fabric-slot-overflow" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}">+${overflow}</button>`;
+  function sasFabricListExpanded(expandKey) {
+    return Boolean(expandKey && state.sasFabric.expandedSlotLists[expandKey]);
+  }
+
+  // The "+N" / "Show fewer" toggle for a capped list (#914). Callers render it
+  // as a sibling of the list's own buttons, never inside one.
+  function renderSasFabricExpandToggle(expandKey, hiddenCount) {
+    const expanded = sasFabricListExpanded(expandKey);
+    return `<button type="button" class="sas-fabric-slot-overflow" data-sas-fabric-expand-slots="${escapeHtml(expandKey)}" aria-expanded="${expanded ? "true" : "false"}">${expanded ? "Show fewer" : `+${hiddenCount}`}</button>`;
   }
 
   function toggleSasFabricSlotList(expandKey) {
@@ -1989,6 +1985,10 @@
     }
     state.sasFabric.expandedSlotLists[expandKey] = !state.sasFabric.expandedSlotLists[expandKey];
     renderAll();
+    // The re-render replaced the toggle; keep keyboard focus on its successor.
+    const successor = Array.from(sasFabricPanel?.querySelectorAll("[data-sas-fabric-expand-slots]") || [])
+      .find((element) => element.dataset.sasFabricExpandSlots === expandKey);
+    successor?.focus({ preventScroll: true });
   }
 
   function formatSasFabricValue(value) {
@@ -2081,19 +2081,20 @@
       <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}">
         <span class="sas-fabric-item-label">${escapeHtml(sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`)}</span>
         <span class="sas-fabric-item-meta">${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"} affected`)}</span>
-        <span class="sas-fabric-item-slots">${renderSasFabricSlotList(slots, { limit: 12, expandKey: `path:${path.id}` })}</span>
+        <span class="sas-fabric-item-slots">${escapeHtml(formatSasFabricSlots(slots, slots.length))}</span>
       </button>
     `;
   }
 
-  function renderSasFabricFlatBayChips(sorted, selectedSlots, limit) {
-    const chips = sorted.slice(0, limit).map((slotNumber) => {
+  function renderSasFabricFlatBayChips(sorted, selectedSlots, limit, expandKey = null) {
+    const capped = Boolean(expandKey) && sorted.length > limit;
+    const visible = capped && !sasFabricListExpanded(expandKey) ? sorted.slice(0, limit) : sorted;
+    const chips = visible.map((slotNumber) => {
       const viewSlot = sasFabricViewSlotForBay(slotNumber);
       const selected = selectedSlots.has(slotNumber) || (viewSlot !== null && state.selectedSlot === viewSlot);
       return `<button type="button" class="sas-fabric-bay-chip${selected ? " is-selected" : ""}" data-sas-fabric-slot="${slotNumber}">${escapeHtml(formatSlotLabel(slotNumber))}</button>`;
     }).join("");
-    const overflow = sorted.length > limit ? `<span class="sas-fabric-bay-overflow">+${sorted.length - limit}</span>` : "";
-    return `${chips}${overflow}`;
+    return `${chips}${capped ? renderSasFabricExpandToggle(expandKey, sorted.length - limit) : ""}`;
   }
 
   function sasFabricBayGridCell(slotNumber, impactedSlots, selectedSlots, slotsByNumber) {
@@ -2115,7 +2116,7 @@
   // same order, same column groups, same gaps, so a bay number never moves
   // between the Enclosure tab and the Storage Fabric tab. `limit` only applies
   // to the flat fallback used when the active view has no layout rows.
-  function renderSasFabricBayChips(slots, limit = 60) {
+  function renderSasFabricBayChips(slots, limit = 60, expandKey = null) {
     const sorted = sasFabricSortedSlots(slots);
     if (!sorted.length) {
       return '<span class="sas-fabric-empty-note">No mapped bays</span>';
@@ -2129,7 +2130,7 @@
     const geometry = buildChassisGeometry(viewProfile, layoutRows);
     const gridRows = buildLayoutGridRows(layoutRows, geometry);
     if (!gridRows.length) {
-      return `${renderSasFabricFlatBayChips(sorted, selectedSlots, limit)}<span class="sas-fabric-bay-layout-note">No enclosure layout for this view; bays are listed in bay order.</span>`;
+      return `${renderSasFabricFlatBayChips(sorted, selectedSlots, limit, expandKey)}<span class="sas-fabric-bay-layout-note">No enclosure layout for this view; bays are listed in bay order.</span>`;
     }
     const impactedSlots = new Set(sorted);
     const slotsByNumber = new Map(sasFabricList(state.snapshot.slots).map((slot) => [slot.slot, slot]));
@@ -2150,13 +2151,16 @@
     `;
   }
 
-  function renderSasFabricCompactNodes(nodes, limit = 8) {
-    const visible = sasFabricList(nodes).slice(0, limit);
-    if (!visible.length) {
+  function renderSasFabricCompactNodes(nodes, limit = 8, expandKey = null) {
+    const all = sasFabricList(nodes);
+    if (!all.length) {
       return '<span class="sas-fabric-empty-note">No objects reported</span>';
     }
-    const overflow = nodes.length > limit ? `<span class="sas-fabric-bay-overflow">+${nodes.length - limit}</span>` : "";
-    return `${visible.map((node) => renderSasFabricNodeButton(node, { meta: sasFabricNodeMeta(node) || node.raw_id || formatSasFabricKind(node.kind), extra: "sas-fabric-compact-node" })).join("")}${overflow}`;
+    // Without a key there is no toggle to reach the rest, so show every node.
+    const capped = Boolean(expandKey) && all.length > limit;
+    const visible = capped && !sasFabricListExpanded(expandKey) ? all.slice(0, limit) : all;
+    const buttons = visible.map((node) => renderSasFabricNodeButton(node, { meta: sasFabricNodeMeta(node) || node.raw_id || formatSasFabricKind(node.kind), extra: "sas-fabric-compact-node" })).join("");
+    return `${buttons}${capped ? renderSasFabricExpandToggle(expandKey, all.length - limit) : ""}`;
   }
 
   function renderSasFabricLane(controllerRecord, fabric, nodeMap) {
@@ -2207,15 +2211,15 @@
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Transport Detail" : "Expanders"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(expanders, 6, `expanders:${controllerId}`)}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Enclosures / Views" : "SES / MPR Enclosures"}</div>
-          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6)}</div>
+          <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(enclosures, 6, `enclosures:${controllerId}`)}</div>
         </div>
         <div class="sas-fabric-stage">
           <div class="sas-fabric-stage-title">${storagePayload ? "Mapped Bays" : "Impacted Bays"}</div>
-          <div class="sas-fabric-bay-list">${renderSasFabricBayChips(laneSlots, 72)}</div>
+          <div class="sas-fabric-bay-list">${renderSasFabricBayChips(laneSlots, 72, `bays:${controllerId}`)}</div>
         </div>
       </section>
     `;
@@ -2290,7 +2294,7 @@
       ${pathStateMarkup}
       <div class="sas-fabric-inspector-section">
         <h4>Trace Nodes</h4>
-        <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(nodes, 12)}</div>
+        <div class="sas-fabric-compact-list">${renderSasFabricCompactNodes(nodes, 12, `trace-nodes:${trace.id}`)}</div>
       </div>
     `;
   }
