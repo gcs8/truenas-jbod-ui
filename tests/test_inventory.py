@@ -14077,6 +14077,71 @@ class InventorySlotDetailCacheTests(unittest.TestCase):
             self.assertIsNone(entry)
             store.load_all.assert_not_called()
 
+    def test_cleared_mapping_note_does_not_return_from_the_slot_detail_cache(self) -> None:
+        # #909: the note belongs to the mapping store. Clearing the mapping must
+        # not let the slot-detail cache put it back on the bay.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            mapped = SlotView(
+                slot=0, slot_label="0", row_index=0, column_index=0, enclosure_id="enc-1",
+                present=True, state=SlotState.healthy, device_name="da0", serial="SYNTH-1",
+                model="Synthetic", notes="temporary operator note",
+                mapping_source="manual", operator_context={"notes": ["ownership note"]},
+            )
+            entry = service._build_slot_detail_entry(mapped, smart_summary=None)
+            assert entry is not None
+            for field_name in ("notes", "mapping_source", "operator_context"):
+                self.assertNotIn(field_name, entry.slot_fields)
+            self.assertEqual(entry.slot_fields["model"], "Synthetic")
+            service.slot_detail_store.save_entries([entry])
+
+            cleared = mapped.model_copy(update={
+                "notes": None, "mapping_source": "unknown", "operator_context": {}, "model": None,
+            })
+            service._apply_persisted_slot_details([cleared])
+
+            self.assertIsNone(cleared.notes)
+            self.assertEqual(cleared.mapping_source, "unknown")
+            self.assertEqual(cleared.operator_context, {})
+            # Hardware facts still come back for the same disk.
+            self.assertEqual(cleared.model, "Synthetic")
+
+    def test_mapping_fields_in_an_older_cache_are_not_restored(self) -> None:
+        # Caches written before #909 hold notes; reading them must not revive one.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.slot_detail_store.save_entries([
+                SlotDetailCacheEntry(
+                    system_id=system.id, enclosure_id="enc-1", slot=0,
+                    identifiers=["da0", "synth-1"],
+                    slot_fields={
+                        "serial": "SYNTH-1", "model": "Synthetic",
+                        "notes": "temporary operator note",
+                        "mapping_source": "manual",
+                        "operator_context": {"notes": ["ownership note"]},
+                    },
+                )
+            ])
+            live = SlotView(
+                slot=0, slot_label="0", row_index=0, column_index=0, enclosure_id="enc-1",
+                present=True, state=SlotState.healthy, device_name="da0", serial="SYNTH-1",
+            )
+            service._apply_persisted_slot_details([live])
+
+            self.assertIsNone(live.notes)
+            self.assertEqual(live.mapping_source, "unknown")
+            self.assertEqual(live.operator_context, {})
+            self.assertEqual(live.model, "Synthetic")
+            # The next write drops the old keys from the file.
+            rebuilt = service._build_slot_detail_entry(live, smart_summary=None)
+            assert rebuilt is not None
+            service.slot_detail_store.save_entries([rebuilt])
+            stored = service.slot_detail_store.get_entry(system.id, "enc-1", 0)
+            assert stored is not None
+            self.assertFalse({"notes", "mapping_source", "operator_context"} & set(stored.slot_fields))
+
     def test_apply_persisted_slot_details_preserves_live_fields_and_rejects_identifier_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(id="default", truenas=TrueNASConfig(platform="core"))
