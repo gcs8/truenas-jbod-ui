@@ -30,6 +30,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Every node and bay in the Connections panel can be reached again. Path
+  cards list all their bays, and long node lists end in a "+N" button that
+  expands in place and collapses with "Show fewer". (#920)
 - A cleared bay mapping's note no longer comes back after a refresh or in
   later exports. The slot-detail cache now keeps only facts about the
   disk. (#919)

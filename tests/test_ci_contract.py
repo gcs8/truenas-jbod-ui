@@ -1002,6 +1002,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         steps = workflow["jobs"]["public-demo-artifact"]["steps"]
         step = next(step for step in steps if step.get("name") == "Run fixture-only browser specs")
         for spec in (
+            "qa/connections-overflow.spec.js",
             "qa/offline-snapshot.spec.js",
             "qa/saved-view-selection.spec.js",
             "qa/ui-scope-safety.spec.js",
