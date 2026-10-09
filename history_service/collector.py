@@ -806,7 +806,6 @@ class HistoryCollector:
             self._run_lock.release()
 
     async def _run_loop(self) -> None:
-        await self._build_pending_indexes()
         if self.settings.startup_grace_seconds > 0:
             self._starting = True
             try:
