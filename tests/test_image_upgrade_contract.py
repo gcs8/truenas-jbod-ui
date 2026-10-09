@@ -274,6 +274,72 @@ class ImmutableRetentionCheckTests(unittest.TestCase):
             self.assertNotIn("SYNTH-SERIAL", receipt_text)
             self.assertNotIn("da0", receipt_text)
 
+    def test_a_busy_system_check_is_retried_instead_of_rolling_back(self):
+        # Another client's system-wide check holds the per-system lock; the
+        # route answers 503 with Retry-After, which is not a failed candidate.
+        busy = deployment.InventoryBusy(retry_after_seconds=5)
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(deployment.time, "sleep") as sleep:
+            root = self.make_root(temp)
+            _, update = self.update(root, [busy, self.inventory(6, 6, 0, 0), busy, busy, self.inventory(6, 6, 0, 0)])
+            update()
+            receipt = deployment.validate_receipt(root)
+        self.assertEqual(receipt["status"], "active")
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 5, 5])
+
+    def test_a_check_that_stays_busy_fails_after_a_bounded_wait(self):
+        busy = deployment.InventoryBusy(retry_after_seconds=30)
+        attempts = deployment.RETENTION_BUSY_MAX_WAIT_SECONDS // 30 + 1
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(deployment.time, "sleep") as sleep:
+            root = self.make_root(temp)
+            runtime, update = self.update(
+                root, [self.inventory(6, 6, 0, 0), *[busy] * attempts],
+            )
+            with self.assertRaisesRegex(deployment.DeploymentError, "automatic rollback completed") as caught:
+                update()
+            receipt = deployment.validate_receipt(root)
+        self.assertIn("stayed busy", str(caught.exception.__cause__))
+        self.assertEqual(receipt["status"], "rolled_back")
+        self.assertLessEqual(sum(call.args[0] for call in sleep.call_args_list), deployment.RETENTION_BUSY_MAX_WAIT_SECONDS)
+        self.assertEqual(runtime.active_image_id, fixtures.OLD_IMAGE_ID)
+
+    def test_only_a_503_with_retry_after_counts_as_busy(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/busy"):
+                    self.send_response(503)
+                    self.send_header("Retry-After", "5")
+                elif self.path.startswith("/huge"):
+                    self.send_response(503)
+                else:
+                    self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": false, "detail": "SYNTH-DETAIL"}')
+
+            def log_message(self, *args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            with self.assertRaises(deployment.InventoryBusy) as caught:
+                deployment._default_fetch_json(f"{base}/busy")
+            self.assertEqual(caught.exception.retry_after_seconds, 5)
+            for path in ("/huge", "/error"):
+                with self.subTest(path=path):
+                    with self.assertRaises(deployment.DeploymentError) as other:
+                        deployment._default_fetch_json(f"{base}{path}")
+                    self.assertNotIsInstance(other.exception, deployment.InventoryBusy)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_unplaced_disk_rolls_back_automatically(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)

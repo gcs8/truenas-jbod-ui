@@ -509,6 +509,16 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         self.assertEqual(retention.unplaced_disk_count, 0)
         self.assertEqual(retention.rendered_unique_disk_count, 1)
 
+    def test_disks_of_a_storage_system_outside_the_pair_are_not_counted(self) -> None:
+        # The QuantaStor grid can hold another storage system (here node-c)
+        # whose disks this system never shows; they are not its disks.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-c", "sdz", "SYNTH-QS-C")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
     def test_a_device_name_still_matches_within_its_own_node(self) -> None:
         retention = self._retention(
             [self._disk("node-a", "sdb"), self._disk("node-b", "sdb")],

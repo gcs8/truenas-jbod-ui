@@ -2213,15 +2213,6 @@ class InventoryService:
         )
         if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
             ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
-        source_disks = self._build_storage_view_candidate_records(
-            source_bundle.raw_data,
-            ssh_data,
-            # QuantaStor filters source disks to the selected HA node; the
-            # system-wide count covers both nodes.
-            None if self.system.truenas.platform == "quantastor" else default_snapshot.selected_enclosure_id,
-            source_bundle.bmc_inventory,
-        )
-
         # On a QuantaStor HA pair device names are node-local, so each record
         # and each rendered slot carries the node it was read from (#917).
         quantastor = self.system.truenas.platform == "quantastor"
@@ -2235,6 +2226,32 @@ class InventoryService:
             return self._quantastor_option_owner_id(
                 source_bundle.raw_data, option_id, enclosure_owner_ids=owner_ids,
             )
+
+        source_scopes: list[str | None] | None = None
+        nodes = list(dict.fromkeys(
+            node for node in (node_of(option.id) for option in default_snapshot.enclosures) if node
+        ))
+        if quantastor and nodes:
+            # The disks of each HA node, built as that node's own page builds
+            # them. Disks of another storage system in the grid are not this
+            # system's; one without an owner is counted once.
+            source_disks = []
+            source_scopes = []
+            for position, node in enumerate(nodes):
+                for record in self._build_quantastor_disk_records(source_bundle.raw_data, node):
+                    owner = self._quantastor_record_owner_id(record.raw)
+                    if owner == node or (owner is None and position == 0):
+                        source_disks.append(record)
+                        source_scopes.append(node)
+        else:
+            source_disks = self._build_storage_view_candidate_records(
+                source_bundle.raw_data,
+                ssh_data,
+                None if quantastor else default_snapshot.selected_enclosure_id,
+                source_bundle.bmc_inventory,
+            )
+            if quantastor:
+                source_scopes = [self._quantastor_record_owner_id(disk.raw) for disk in source_disks]
 
         rendered: dict[tuple[str | None, str | int], tuple[Any, str | None]] = {}
         for snapshot in snapshots:
@@ -2259,9 +2276,7 @@ class InventoryService:
         return build_disk_retention_accounting(
             source_disks=source_disks,
             slots=[slot for slot, _node in rendered.values()],
-            source_scopes=(
-                [self._quantastor_record_owner_id(disk.raw) for disk in source_disks] if quantastor else None
-            ),
+            source_scopes=source_scopes,
             slot_scopes=[node for _slot, node in rendered.values()] if quantastor else None,
         )
 
