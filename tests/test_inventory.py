@@ -14330,6 +14330,48 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
             warnings=["Failed to fetch platform API data"],
         )
 
+    async def test_explicit_refresh_of_another_enclosure_keeps_the_default(self) -> None:
+        # #915: viewing or refreshing the rear enclosure must not move every
+        # later default page load to the rear.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+
+            async def build_snapshot(selected_enclosure_id=None, *, force_source_refresh=False):
+                return self._snapshot(selected_enclosure_id or "enc-a")
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+
+            self.assertEqual((await service.get_snapshot()).selected_enclosure_id, "enc-a")
+            for force_refresh in (False, True):
+                explicit = await service.get_snapshot(
+                    force_refresh=force_refresh, selected_enclosure_id="enc-b",
+                )
+                self.assertEqual(explicit.selected_enclosure_id, "enc-b")
+                self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
+                self.assertEqual((await service.get_snapshot()).selected_enclosure_id, "enc-a")
+
+    async def test_explicit_refresh_that_retires_the_default_moves_it_to_the_first_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._service(temp_dir)
+            retired = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id="bounded",
+                selected_system_platform="core",
+                selected_enclosure_id="enc-b",
+                enclosures=[
+                    EnclosureOption(id="enc-c", label="Shelf C"),
+                    EnclosureOption(id="enc-b", label="Shelf B"),
+                ],
+            )
+            service._build_snapshot = AsyncMock(side_effect=[self._snapshot("enc-a"), retired])
+
+            await service.get_snapshot()
+            await service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-b")
+
+            self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-b", "enc-c"})
+            self.assertEqual(service._canonical_default_enclosure_id, "enc-c")
+
     async def test_unreachable_source_returns_its_snapshot_and_rediscovers_later(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self._service(temp_dir)
@@ -14531,7 +14573,8 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                 await older_request
 
             self.assertEqual(set(service._canonical_enclosure_options or {}), {"enc-a", "enc-b", "enc-c"})
-            self.assertEqual(service._canonical_default_enclosure_id, "enc-c")
+            # The explicit enc-c refresh keeps the existing default (#915).
+            self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
 
     async def test_older_redirect_cannot_restore_a_destination_retired_while_it_was_building(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -15087,6 +15130,7 @@ class InventoryServiceSnapshotStateBoundsTests(unittest.IsolatedAsyncioTestCase)
                     ],
                 ),
                 request_sequence=1,
+                default_selection=True,
             )
 
             service._parsed_ssh_data_for_enclosure(bundle, current_ids[-1])
