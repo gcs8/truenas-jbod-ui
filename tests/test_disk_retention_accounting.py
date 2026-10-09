@@ -520,6 +520,31 @@ class SystemWideRetentionTests(unittest.TestCase):
         forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
         self.assertEqual(len(forced), 1)
 
+    def test_a_disabled_storage_view_does_not_place_its_disk(self) -> None:
+        # A view switched off in the admin UI renders nothing, so its disk
+        # must not satisfy the upgrade check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[{**self.BOOT_VIEW, "enabled": False}])
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_a_route_snapshot_is_reused_instead_of_collecting_again(self) -> None:
+        # GET /api/inventory?retention_scope=system&force=true has already
+        # force-refreshed one snapshot; the system totals build on it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                snapshot = await service.get_snapshot(force_refresh=True)
+                return await service.get_system_disk_retention(force_refresh=True, snapshot=snapshot)
+
+            retention = asyncio.run(run())
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
 
 class VirtualFallbackWarningAndSourceStatusTests(unittest.TestCase):
     """Source health is tested separately from the virtual-rendering warning."""

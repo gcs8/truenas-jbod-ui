@@ -460,7 +460,9 @@ def build_router() -> APIRouter:
             # The upgrade helper's disk-retention check (#911): count a disk as
             # placed when any enclosure or storage view of the system shows it.
             # Older images ignore the parameter and keep enclosure totals.
-            retention = await service.get_system_disk_retention(force_refresh=force)
+            # Reuse this request's snapshot so a forced request collects the
+            # sources once and the totals describe the same read.
+            retention = await service.get_system_disk_retention(force_refresh=force, snapshot=snapshot)
             payload["summary"].update(
                 source_disk_count=retention.source_disk_count,
                 rendered_unique_disk_count=retention.rendered_unique_disk_count,

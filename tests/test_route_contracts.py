@@ -252,7 +252,8 @@ class RouteContractTests(unittest.TestCase):
             )
 
         self.assertEqual(enclosure["summary"]["unplaced_disk_count"], 12)
-        service.get_system_disk_retention.assert_awaited_once_with(force_refresh=False)
+        # The route's own snapshot is reused, so a forced request collects once.
+        service.get_system_disk_retention.assert_awaited_once_with(force_refresh=False, snapshot=snapshot)
         self.assertEqual(
             {key: system["summary"][key] for key in (
                 "source_disk_count",

@@ -2069,7 +2069,12 @@ class InventoryService:
             views=runtime_views,
         )
 
-    async def get_system_disk_retention(self, *, force_refresh: bool = False) -> DiskRetentionAccounting:
+    async def get_system_disk_retention(
+        self,
+        *,
+        force_refresh: bool = False,
+        snapshot: InventorySnapshot | None = None,
+    ) -> DiskRetentionAccounting:
         """Retention totals across every enclosure option and storage view (#911).
 
         The snapshot summary compares the system's source disks with one
@@ -2078,9 +2083,13 @@ class InventoryService:
         Here a disk counts as placed when any enclosure option or inventory-bound
         storage view of the system renders it. Bays seen through several options
         (a drawer view and its whole shelf, or a SES view that mirrors an
-        enclosure) are counted once.
+        enclosure) are counted once. A disabled storage view renders nothing in
+        the UI, so it places nothing here either.
+
+        ``snapshot`` is a snapshot the caller already built in this request;
+        it is reused instead of collecting the sources a second time.
         """
-        default_snapshot = await self.get_snapshot(
+        default_snapshot = snapshot or await self.get_snapshot(
             force_refresh=force_refresh,
             allow_stale_cache=not force_refresh,
         )
@@ -2124,7 +2133,7 @@ class InventoryService:
                 scope = resolve_physical_mapping_scope(slot.enclosure_id or snapshot.selected_enclosure_id)
                 rendered.setdefault((scope, slot.slot), slot)
         for view in runtime.views:
-            if view.source != "inventory_binding":
+            if view.source != "inventory_binding" or not view.enabled:
                 continue
             for runtime_slot in view.slots:
                 if runtime_slot.occupied:
