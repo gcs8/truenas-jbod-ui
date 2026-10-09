@@ -26,7 +26,36 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.2 - 2026-10-09
+
+This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
+fixed `v0.24.0-beta.2` and `0.24.0-beta.2` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- Upgrades no longer roll back healthy systems. The upgrade helper's disk
+  check counts every enclosure and storage view, and a large history database
+  builds its new indexes after startup instead of failing the first
+  healthcheck (#917, #918).
+- Opening a system lands on its default enclosure again, and a cleared bay
+  note stays cleared (#916, #919).
+- 2.5" bays draw as 2.5" sleds again, state icons no longer cover a bay's
+  latch, LED or labels, and every Connections node and bay can be reached
+  (#912, #913, #920).
+
+### Upgrade notes
+
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. The pre-release security review in #737 still
+  has open items, which will be closed before `v0.24.0`.
+- Upgrading from `v0.24.0-beta.1` needs no configuration change. Upgrading
+  from `v0.23.0` or older, read the `v0.24.0-beta.1` upgrade notes below too.
+- History: on a database with more than 250,000 history rows, the first start
+  after upgrading answers its healthcheck before it builds the new history
+  indexes. Collection waits until they are built, and history reads are slower
+  until then. If a build fails, history `/healthz` reports `degraded` while it
+  retries and keeps collection paused until the indexes are built (#918).
 
 ### Fixed
 
