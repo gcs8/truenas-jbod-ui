@@ -285,6 +285,17 @@ class RouteContractTests(unittest.TestCase):
                 self.assertEqual(response.headers["retry-after"], retry_after)
                 self.assertEqual(json.loads(response.body), {"ok": False, "detail": detail})
 
+    def test_system_retention_refusals_map_to_bounded_503s(self) -> None:
+        from app.services.inventory import SystemRetentionBusyError, SystemRetentionTooLargeError
+
+        for error, retry_after in ((SystemRetentionBusyError(), "5"), (SystemRetentionTooLargeError(), None)):
+            with self.subTest(error=type(error).__name__):
+                self.assertIs(app_main.app.exception_handlers[type(error)], app_main.mapped_exception_handler)
+                response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), error))
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.headers.get("retry-after"), retry_after)
+                self.assertEqual(json.loads(response.body), {"ok": False, "detail": str(error)})
+
     def test_unknown_enclosure_maps_to_404_without_a_retry_hint(self) -> None:
         response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), UnknownEnclosureError()))
 

@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import MultipathMember, MultipathView, SlotView, SourceStatus
@@ -519,6 +519,49 @@ class SystemWideRetentionTests(unittest.TestCase):
 
         forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
         self.assertEqual(len(forced), 1)
+
+    def test_a_second_concurrent_system_check_is_refused_as_busy(self) -> None:
+        # One system-wide check per system at a time; a caller that repeats
+        # forced requests cannot stack enclosure builds on the worker.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                release = asyncio.Event()
+                original = service.get_storage_view_runtime
+
+                async def held(**kwargs):
+                    await release.wait()
+                    return await original(**kwargs)
+
+                service.get_storage_view_runtime = held
+                first = asyncio.create_task(service.get_system_disk_retention(force_refresh=True))
+                await asyncio.sleep(0)
+                with self.assertRaises(inventory_module.SystemRetentionBusyError):
+                    await service.get_system_disk_retention(force_refresh=True)
+                release.set()
+                return await first
+
+            self.assertEqual(asyncio.run(run()).unplaced_disk_count, 0)
+
+    def test_too_many_enclosures_are_refused_before_building_them(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(inventory_module, "SYSTEM_RETENTION_MAX_ENCLOSURES", 1),
+        ):
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+            original = service._get_snapshot_result
+            built: list[str | None] = []
+
+            async def recording(*args, **kwargs):
+                built.append(kwargs.get("selected_enclosure_id"))
+                return await original(*args, **kwargs)
+
+            service._get_snapshot_result = recording
+            with self.assertRaises(inventory_module.SystemRetentionTooLargeError):
+                asyncio.run(service.get_system_disk_retention())
+
+        self.assertNotIn("enc-b", built)
 
     def test_a_disabled_storage_view_does_not_place_its_disk(self) -> None:
         # A view switched off in the admin UI renders nothing, so its disk

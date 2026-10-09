@@ -394,6 +394,10 @@ SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
 SNAPSHOT_STATE_MAX_ENTRIES = 64
+# The system-wide retention check (#911) builds one snapshot per enclosure
+# option. Real systems have a handful; refuse a topology far past that rather
+# than let one unauthenticated request occupy the worker for every one of them.
+SYSTEM_RETENTION_MAX_ENCLOSURES = 32
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 # Storage-view bays are numbered from here so they never collide with a real
 # enclosure slot number in the same snapshot.
@@ -900,6 +904,20 @@ class SnapshotStateBusyError(Exception):
         super().__init__("The server is busy. Try again in a moment.")
 
 
+class SystemRetentionBusyError(Exception):
+    """Raised when a system-wide retention check is already running for the system."""
+
+    def __init__(self) -> None:
+        super().__init__("A system-wide disk check is already running. Try again in a moment.")
+
+
+class SystemRetentionTooLargeError(Exception):
+    """Raised when a system has more enclosure options than the check will build."""
+
+    def __init__(self) -> None:
+        super().__init__("This system has too many enclosures for a system-wide disk check.")
+
+
 class _SmartIdentityConflict(ValueError):
     """Returned SMART evidence identifies a different disk from the request."""
 
@@ -1181,6 +1199,7 @@ class InventoryService:
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
         self._snapshot_discovery_lock = asyncio.Lock()
+        self._system_retention_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._canonical_options_request_sequence = 0
@@ -2088,11 +2107,29 @@ class InventoryService:
 
         ``snapshot`` is a snapshot the caller already built in this request;
         it is reused instead of collecting the sources a second time.
+
+        Only one check runs per system at a time, and a system with more than
+        SYSTEM_RETENTION_MAX_ENCLOSURES options is refused before any of its
+        other enclosures is built, so repeated or forced requests cannot tie up
+        the worker.
         """
+        if self._system_retention_lock.locked():
+            raise SystemRetentionBusyError()
+        async with self._system_retention_lock:
+            return await self._system_disk_retention_locked(force_refresh=force_refresh, snapshot=snapshot)
+
+    async def _system_disk_retention_locked(
+        self,
+        *,
+        force_refresh: bool,
+        snapshot: InventorySnapshot | None,
+    ) -> DiskRetentionAccounting:
         default_snapshot = snapshot or await self.get_snapshot(
             force_refresh=force_refresh,
             allow_stale_cache=not force_refresh,
         )
+        if len({option.id for option in default_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            raise SystemRetentionTooLargeError()
         snapshots = [default_snapshot]
         seen_options = {default_snapshot.selected_enclosure_id}
         for option in default_snapshot.enclosures:
