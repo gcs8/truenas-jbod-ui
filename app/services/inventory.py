@@ -2040,7 +2040,17 @@ class InventoryService:
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
         snapshot: InventorySnapshot | None = None,
+        tolerate_hidden_view_targets: bool = False,
     ) -> StorageViewRuntimePayload:
+        """Runtime for every stored view.
+
+        With ``tolerate_hidden_view_targets`` (the system-wide retention check,
+        #917), a disabled or main-page-hidden view whose target no longer
+        resolves, such as a QuantaStor HA node since removed, is serialized with
+        no candidates instead of failing the whole payload. Visible views still
+        raise, and hidden views whose target resolves are built as usual, so the
+        rest of the payload matches what the main page renders.
+        """
         active_snapshot = snapshot or await self.get_snapshot(
             force_refresh=force_refresh,
             selected_enclosure_id=selected_enclosure_id,
@@ -2065,11 +2075,17 @@ class InventoryService:
                 continue
             target_system_id = self._storage_view_target_system_id(storage_view, active_snapshot)
             if target_system_id not in target_snapshots:
-                target_snapshots[target_system_id] = await self.get_snapshot(
-                    force_refresh=force_refresh,
-                    selected_enclosure_id=target_system_id,
-                    allow_stale_cache=not force_refresh,
-                )
+                try:
+                    target_snapshots[target_system_id] = await self.get_snapshot(
+                        force_refresh=force_refresh,
+                        selected_enclosure_id=target_system_id,
+                        allow_stale_cache=not force_refresh,
+                    )
+                except UnknownEnclosureError:
+                    shown_in_main_ui = storage_view.enabled and storage_view.render.show_in_main_ui is not False
+                    if not tolerate_hidden_view_targets or shown_in_main_ui:
+                        raise
+                    continue
             if target_system_id not in candidate_payloads_by_target:
                 candidate_payloads_by_target[target_system_id] = self._build_storage_view_candidate_payloads(
                     source_bundle,
@@ -2184,7 +2200,10 @@ class InventoryService:
                 force_source_refresh=False,
             )
             snapshots.append(result.value)
-        runtime = await self.get_storage_view_runtime(snapshot=default_snapshot)
+        runtime = await self.get_storage_view_runtime(
+            snapshot=default_snapshot,
+            tolerate_hidden_view_targets=True,
+        )
         source_bundle = await self._get_inventory_source_bundle(allow_stale_cache=True)
 
         ssh_data = (

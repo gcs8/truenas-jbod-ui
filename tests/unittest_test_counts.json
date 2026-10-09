@@ -27,7 +27,7 @@
     "test_dev_check": 32,
     "test_disk_inventory_sync": 20,
     "test_disk_inventory_sync_grants": 5,
-    "test_disk_retention_accounting": 26,
+    "test_disk_retention_accounting": 27,
     "test_enclosure_aliases": 3,
     "test_enclosure_option_labels": 16,
     "test_esxi_host_prep": 48,

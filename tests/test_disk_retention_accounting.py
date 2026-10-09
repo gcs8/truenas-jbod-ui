@@ -633,6 +633,44 @@ class SystemWideRetentionTests(unittest.TestCase):
 
         self.assertEqual(retention.unplaced_disk_count, 1)
 
+    def test_an_excluded_view_with_a_stale_target_does_not_break_the_check(self) -> None:
+        # A QuantaStor view kept disabled or hidden after its HA node was
+        # removed still names that node. It is not operator-visible, so the
+        # check must not resolve its target and fail with UnknownEnclosureError.
+        stale = {
+            "id": "stale-node-boot",
+            "label": "Removed node boot",
+            "kind": "boot_devices",
+            "template_id": "satadom-pair-2",
+            "binding": {"mode": "serial", "device_names": ["da2"]},
+        }
+        for excluded in ({"enabled": False}, {"render": {"show_in_main_ui": False}}):
+            with self.subTest(excluded=excluded), tempfile.TemporaryDirectory() as temp_dir:
+                service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW, {**stale, **excluded}])
+                original = service._storage_view_target_system_id
+
+                def target(storage_view, snapshot, *, original=original):
+                    if storage_view.id == "stale-node-boot":
+                        return "removed-node"
+                    return original(storage_view, snapshot)
+
+                service._storage_view_target_system_id = target
+                retention = asyncio.run(service.get_system_disk_retention())
+
+                self.assertEqual(retention.unplaced_disk_count, 0)
+
+        # A visible view with the same stale target still fails the check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW, stale])
+            original = service._storage_view_target_system_id
+            service._storage_view_target_system_id = (
+                lambda storage_view, snapshot: "removed-node"
+                if storage_view.id == "stale-node-boot"
+                else original(storage_view, snapshot)
+            )
+            with self.assertRaises(inventory_module.UnknownEnclosureError):
+                asyncio.run(service.get_system_disk_retention())
+
     def test_a_route_snapshot_is_reused_instead_of_collecting_again(self) -> None:
         # GET /api/inventory?retention_scope=system&force=true has already
         # force-refreshed one snapshot; the system totals build on it.
