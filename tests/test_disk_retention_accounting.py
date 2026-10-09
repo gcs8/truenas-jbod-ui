@@ -435,16 +435,25 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         {"system_id": "node-b", "label": "Right", "host": "192.0.2.31"},
     ]
 
-    def _retention(self, disks, slots_by_node):
+    def _retention(self, disks, slots_by_node, *, other_node=None, configured=True):
         from app.config import SSHConfig
         from app.models.domain import EnclosureOption, InventorySnapshot
 
         system = SystemConfig(
             id="qs",
             truenas=TrueNASConfig(host="https://192.0.2.40", platform="quantastor"),
-            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=self.NODES),
+            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=self.NODES if configured else []),
         )
         options = [EnclosureOption(id="node-a", label="Left"), EnclosureOption(id="node-b", label="Right")]
+        systems = [
+            {"id": "node-a", "name": "Left", "storageSystemClusterId": "c"},
+            {"id": "node-b", "name": "Right", "storageSystemClusterId": "c", "isMaster": True},
+        ]
+        if other_node:
+            # Another hardware-backed storage system in the same grid, in its
+            # own cluster; the grid API lists its enclosure as an option.
+            options.append(EnclosureOption(id=other_node, label="Other appliance"))
+            systems.append({"id": other_node, "name": "Other", "storageSystemClusterId": "other", "isMaster": True})
 
         def snapshot(node):
             return InventorySnapshot(
@@ -464,10 +473,7 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
                 return_value=InventorySourceBundle(
                     raw_data=TrueNASRawData(
                         enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
-                        systems=[
-                            {"id": "node-a", "name": "Left", "storageSystemClusterId": "c"},
-                            {"id": "node-b", "name": "Right", "storageSystemClusterId": "c", "isMaster": True},
-                        ],
+                        systems=systems,
                     ),
                     ssh_outputs={}, ssh_collected=False, warnings=[],
                     sources={"api": SourceStatus(enabled=True, ok=True)},
@@ -518,6 +524,24 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         )
         self.assertEqual(retention.source_disk_count, 1)
         self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_another_storage_system_in_the_grid_is_left_out(self) -> None:
+        # Its unshown disk must not fail the check, and its enclosures must not
+        # count toward the enclosure limit. Found from configured HA nodes or,
+        # without them, from the selected node's cluster.
+        disks = [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")]
+        for configured in (True, False):
+            with self.subTest(configured=configured), patch.object(
+                inventory_module, "SYSTEM_RETENTION_MAX_ENCLOSURES", 2
+            ):
+                retention = self._retention(
+                    disks,
+                    {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+                    other_node="node-x",
+                    configured=configured,
+                )
+                self.assertEqual(retention.source_disk_count, 1)
+                self.assertEqual(retention.unplaced_disk_count, 0)
 
     def test_a_device_name_still_matches_within_its_own_node(self) -> None:
         retention = self._retention(

@@ -2183,11 +2183,41 @@ class InventoryService:
             force_refresh=force_refresh,
             allow_stale_cache=not force_refresh,
         )
-        if len({option.id for option in default_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+        source_bundle = await self._get_inventory_source_bundle(allow_stale_cache=True)
+        # On a QuantaStor HA pair device names are node-local, so each record
+        # and each rendered slot carries the node it was read from (#917).
+        quantastor = self.system.truenas.platform == "quantastor"
+        owner_ids: dict[str, str] = {}
+        if quantastor:
+            owner_ids, _rows_by_owner = self._index_quantastor_hw_enclosures(source_bundle.raw_data)
+
+        def node_of(option_id: str | None) -> str | None:
+            if not quantastor or not option_id:
+                return None
+            return self._quantastor_option_owner_id(
+                source_bundle.raw_data, option_id, enclosure_owner_ids=owner_ids,
+            )
+
+        options = list(default_snapshot.enclosures)
+        pair: set[str] = set()
+        if quantastor:
+            # The grid can list another storage system's enclosures as options;
+            # only this HA pair's are its disks (#917).
+            pair = self._quantastor_ha_pair_ids(
+                source_bundle.raw_data, node_of(default_snapshot.selected_enclosure_id),
+            )
+            if pair:
+                options = [
+                    option for option in options
+                    if option.id == default_snapshot.selected_enclosure_id
+                    or (owner := node_of(option.id)) is None
+                    or owner in pair
+                ]
+        if len({option.id for option in options}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
             raise SystemRetentionTooLargeError()
         snapshots = [default_snapshot]
         seen_options = {default_snapshot.selected_enclosure_id}
-        for option in default_snapshot.enclosures:
+        for option in options:
             if option.id in seen_options:
                 continue
             seen_options.add(option.id)
@@ -2204,7 +2234,6 @@ class InventoryService:
             snapshot=default_snapshot,
             tolerate_hidden_view_targets=True,
         )
-        source_bundle = await self._get_inventory_source_bundle(allow_stale_cache=True)
 
         ssh_data = (
             self._parsed_ssh_data_for_enclosure(source_bundle, default_snapshot.selected_enclosure_id)
@@ -2213,23 +2242,12 @@ class InventoryService:
         )
         if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
             ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
-        # On a QuantaStor HA pair device names are node-local, so each record
-        # and each rendered slot carries the node it was read from (#917).
-        quantastor = self.system.truenas.platform == "quantastor"
-        owner_ids: dict[str, str] = {}
-        if quantastor:
-            owner_ids, _rows_by_owner = self._index_quantastor_hw_enclosures(source_bundle.raw_data)
-
-        def node_of(option_id: str | None) -> str | None:
-            if not quantastor or not option_id:
-                return None
-            return self._quantastor_option_owner_id(
-                source_bundle.raw_data, option_id, enclosure_owner_ids=owner_ids,
-            )
 
         source_scopes: list[str | None] | None = None
         nodes = list(dict.fromkeys(
-            node for node in (node_of(option.id) for option in default_snapshot.enclosures) if node
+            node
+            for node in (node_of(default_snapshot.selected_enclosure_id), *(node_of(o.id) for o in options))
+            if node
         ))
         if quantastor and nodes:
             # The disks of each HA node, built as that node's own page builds
@@ -2268,6 +2286,8 @@ class InventoryService:
             ):
                 continue
             view_node = node_of(view.binding.target_system_id or default_snapshot.selected_enclosure_id)
+            if pair and view_node is not None and view_node not in pair:
+                continue
             for runtime_slot in view.slots:
                 if runtime_slot.occupied:
                     rendered.setdefault(
@@ -2279,6 +2299,32 @@ class InventoryService:
             source_scopes=source_scopes,
             slot_scopes=[node for _slot, node in rendered.values()] if quantastor else None,
         )
+
+    def _quantastor_ha_pair_ids(self, raw_data: TrueNASRawData, selected_owner: str | None) -> set[str]:
+        """The storage systems of this deployment's HA pair (#917).
+
+        The configured HA node ids when there are any; otherwise the members of
+        the selected node's QuantaStor cluster, or just the selected node. An
+        empty set means the pair could not be identified.
+        """
+        configured = {
+            node_id
+            for node_id in (normalize_value_text(node.system_id) for node in self.system.ssh.ha_nodes or [])
+            if node_id
+        }
+        if configured:
+            return configured | ({selected_owner} if selected_owner else set())
+        if not selected_owner:
+            return set()
+        cluster_of = {
+            normalize_value_text(row.get("id")): normalize_value_text(row.get("storageSystemClusterId"))
+            for row in raw_data.systems
+            if normalize_value_text(row.get("id"))
+        }
+        cluster = cluster_of.get(selected_owner)
+        if not cluster:
+            return {selected_owner}
+        return {system_id for system_id, cluster_id in cluster_of.items() if cluster_id == cluster}
 
     @staticmethod
     def _quantastor_record_owner_id(raw: dict[str, Any]) -> str | None:
