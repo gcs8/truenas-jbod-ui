@@ -61,7 +61,7 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
-from app.services.inventory_accounting import build_disk_retention_accounting
+from app.services.inventory_accounting import DiskRetentionAccounting, build_disk_retention_accounting
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -397,6 +397,10 @@ SSH_PLAN_GATHER_TURNS = 3
 PARSED_SSH_BUNDLE_CACHE_MAX_ENTRIES = 64
 QUANTASTOR_ENCLOSURE_OPTIONS_MAX_ENTRIES = 64
 SNAPSHOT_STATE_MAX_ENTRIES = 64
+# The system-wide retention check (#911) builds one snapshot per enclosure
+# option. Real systems have a handful; refuse a topology far past that rather
+# than let one unauthenticated request occupy the worker for every one of them.
+SYSTEM_RETENTION_MAX_ENCLOSURES = 32
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 # Storage-view bays are numbered from here so they never collide with a real
 # enclosure slot number in the same snapshot.
@@ -903,6 +907,20 @@ class SnapshotStateBusyError(Exception):
         super().__init__("The server is busy. Try again in a moment.")
 
 
+class SystemRetentionBusyError(Exception):
+    """Raised when a system-wide retention check is already running for the system."""
+
+    def __init__(self) -> None:
+        super().__init__("A system-wide disk check is already running. Try again in a moment.")
+
+
+class SystemRetentionTooLargeError(Exception):
+    """Raised when a system has more enclosure options than the check will build."""
+
+    def __init__(self) -> None:
+        super().__init__("This system has too many enclosures for a system-wide disk check.")
+
+
 class _SmartIdentityConflict(ValueError):
     """Returned SMART evidence identifies a different disk from the request."""
 
@@ -1184,6 +1202,7 @@ class InventoryService:
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
         self._snapshot_discovery_lock = asyncio.Lock()
+        self._system_retention_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._canonical_options_request_sequence = 0
@@ -2024,7 +2043,17 @@ class InventoryService:
         force_refresh: bool = False,
         selected_enclosure_id: str | None = None,
         snapshot: InventorySnapshot | None = None,
+        tolerate_hidden_view_targets: bool = False,
     ) -> StorageViewRuntimePayload:
+        """Runtime for every stored view.
+
+        With ``tolerate_hidden_view_targets`` (the system-wide retention check,
+        #917), a disabled or main-page-hidden view whose target no longer
+        resolves, such as a QuantaStor HA node since removed, is serialized with
+        no candidates instead of failing the whole payload. Visible views still
+        raise, and hidden views whose target resolves are built as usual, so the
+        rest of the payload matches what the main page renders.
+        """
         active_snapshot = snapshot or await self.get_snapshot(
             force_refresh=force_refresh,
             selected_enclosure_id=selected_enclosure_id,
@@ -2049,11 +2078,17 @@ class InventoryService:
                 continue
             target_system_id = self._storage_view_target_system_id(storage_view, active_snapshot)
             if target_system_id not in target_snapshots:
-                target_snapshots[target_system_id] = await self.get_snapshot(
-                    force_refresh=force_refresh,
-                    selected_enclosure_id=target_system_id,
-                    allow_stale_cache=not force_refresh,
-                )
+                try:
+                    target_snapshots[target_system_id] = await self.get_snapshot(
+                        force_refresh=force_refresh,
+                        selected_enclosure_id=target_system_id,
+                        allow_stale_cache=not force_refresh,
+                    )
+                except UnknownEnclosureError:
+                    shown_in_main_ui = storage_view.enabled and storage_view.render.show_in_main_ui is not False
+                    if not tolerate_hidden_view_targets or shown_in_main_ui:
+                        raise
+                    continue
             if target_system_id not in candidate_payloads_by_target:
                 candidate_payloads_by_target[target_system_id] = self._build_storage_view_candidate_payloads(
                     source_bundle,
@@ -2071,6 +2106,243 @@ class InventoryService:
             system_label=self.system.label or self.system.id,
             views=runtime_views,
         )
+
+    async def get_system_disk_retention(
+        self,
+        *,
+        force_refresh: bool = False,
+        snapshot: InventorySnapshot | None = None,
+    ) -> DiskRetentionAccounting:
+        """Retention totals across every enclosure option and storage view (#911).
+
+        The snapshot summary compares the system's source disks with one
+        enclosure's bays, so a healthy multi-enclosure system always reports
+        disks in its other enclosures or its boot and NVMe views as unplaced.
+        Here a disk counts as placed when any enclosure option or inventory-bound
+        storage view of the system renders it. Bays seen through several options
+        (a drawer view and its whole shelf, or a SES view that mirrors an
+        enclosure) are counted once. A disabled view, or one hidden from the
+        main page, is not part of the inventory an operator sees, so it places
+        nothing here either.
+
+        ``snapshot`` is a snapshot the caller already built in this request;
+        it is reused instead of collecting the sources a second time.
+
+        Only one check runs per system at a time, and a system with more than
+        SYSTEM_RETENTION_MAX_ENCLOSURES options is refused before any of its
+        other enclosures is built, so repeated or forced requests cannot tie up
+        the worker.
+        """
+        if self._system_retention_lock.locked():
+            raise SystemRetentionBusyError()
+        async with self._system_retention_lock:
+            return await self._system_disk_retention_locked(force_refresh=force_refresh, snapshot=snapshot)
+
+    async def get_snapshot_with_system_retention(
+        self,
+        *,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+    ) -> tuple[InventorySnapshot, DiskRetentionAccounting]:
+        """The requested snapshot and the system-wide totals, admitted as one unit.
+
+        GET /api/inventory?retention_scope=system uses this. The check is
+        admitted before the snapshot is built, so a request turned away as busy
+        never forces a source refresh, and the lock is held until the totals
+        are done.
+        """
+        if self._system_retention_lock.locked():
+            raise SystemRetentionBusyError()
+        async with self._system_retention_lock:
+            snapshot = await self.get_snapshot(
+                force_refresh=force_refresh,
+                selected_enclosure_id=selected_enclosure_id,
+                allow_stale_cache=not force_refresh,
+            )
+            default_snapshot = snapshot
+            if selected_enclosure_id is not None:
+                # The totals start from the default enclosure. Build it from
+                # the sources this request just collected, not a second read.
+                default_snapshot = (
+                    await self._get_snapshot_result(
+                        force_refresh=force_refresh,
+                        allow_stale_cache=not force_refresh,
+                        force_source_refresh=False,
+                    )
+                ).value
+            retention = await self._system_disk_retention_locked(
+                force_refresh=force_refresh,
+                snapshot=default_snapshot,
+            )
+            return snapshot, retention
+
+    async def _system_disk_retention_locked(
+        self,
+        *,
+        force_refresh: bool,
+        snapshot: InventorySnapshot | None,
+    ) -> DiskRetentionAccounting:
+        default_snapshot = snapshot or await self.get_snapshot(
+            force_refresh=force_refresh,
+            allow_stale_cache=not force_refresh,
+        )
+        source_bundle = await self._get_inventory_source_bundle(allow_stale_cache=True)
+        # On a QuantaStor HA pair device names are node-local, so each record
+        # and each rendered slot carries the node it was read from (#917).
+        quantastor = self.system.truenas.platform == "quantastor"
+        owner_ids: dict[str, str] = {}
+        if quantastor:
+            owner_ids, _rows_by_owner = self._index_quantastor_hw_enclosures(source_bundle.raw_data)
+
+        def node_of(option_id: str | None) -> str | None:
+            if not quantastor or not option_id:
+                return None
+            return self._quantastor_option_owner_id(
+                source_bundle.raw_data, option_id, enclosure_owner_ids=owner_ids,
+            )
+
+        options = list(default_snapshot.enclosures)
+        pair: set[str] = set()
+
+        def in_pair(owner: str | None) -> bool:
+            return not pair or owner is None or owner in pair
+
+        if quantastor:
+            # The grid can list another storage system's enclosures as options,
+            # and its default page can be one of them; only this HA pair's are
+            # its disks (#917).
+            pair = self._quantastor_ha_pair_ids(
+                source_bundle.raw_data,
+                node_of(default_snapshot.selected_enclosure_id),
+                {owner for owner in (node_of(option.id) for option in options) if owner},
+            )
+            options = [option for option in options if in_pair(node_of(option.id))]
+        if len({option.id for option in options}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            raise SystemRetentionTooLargeError()
+        snapshots = [default_snapshot] if in_pair(node_of(default_snapshot.selected_enclosure_id)) else []
+        seen_options = {default_snapshot.selected_enclosure_id}
+        for option in options:
+            if option.id in seen_options:
+                continue
+            seen_options.add(option.id)
+            # Sources were refreshed once for the default build; the other
+            # options reuse them instead of collecting again per enclosure.
+            result = await self._get_snapshot_result(
+                force_refresh=force_refresh,
+                selected_enclosure_id=option.id,
+                allow_stale_cache=not force_refresh,
+                force_source_refresh=False,
+            )
+            snapshots.append(result.value)
+        runtime = await self.get_storage_view_runtime(
+            snapshot=default_snapshot,
+            tolerate_hidden_view_targets=True,
+        )
+
+        ssh_data = (
+            self._parsed_ssh_data_for_enclosure(source_bundle, default_snapshot.selected_enclosure_id)
+            if source_bundle.ssh_collected
+            else ParsedSSHData()
+        )
+        if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
+            ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
+
+        source_scopes: list[str | None] | None = None
+        nodes = list(dict.fromkeys(
+            node
+            for node in (node_of(default_snapshot.selected_enclosure_id), *(node_of(o.id) for o in options))
+            if node and in_pair(node)
+        ))
+        if quantastor and nodes:
+            # The disks of each HA node, built as that node's own page builds
+            # them. Disks of another storage system in the grid are not this
+            # system's; one without an owner is counted once.
+            source_disks = []
+            source_scopes = []
+            for position, node in enumerate(nodes):
+                for record in self._build_quantastor_disk_records(source_bundle.raw_data, node):
+                    owner = self._quantastor_record_owner_id(record.raw)
+                    if owner == node or (owner is None and position == 0):
+                        source_disks.append(record)
+                        source_scopes.append(node)
+        else:
+            source_disks = self._build_storage_view_candidate_records(
+                source_bundle.raw_data,
+                ssh_data,
+                None if quantastor else default_snapshot.selected_enclosure_id,
+                source_bundle.bmc_inventory,
+            )
+            if quantastor:
+                source_scopes = [self._quantastor_record_owner_id(disk.raw) for disk in source_disks]
+
+        rendered: dict[tuple[str | None, str | int], tuple[Any, str | None]] = {}
+        for snapshot in snapshots:
+            for slot in snapshot.slots:
+                option_id = slot.enclosure_id or snapshot.selected_enclosure_id
+                if not in_pair(node_of(option_id)):
+                    continue
+                scope = resolve_physical_mapping_scope(option_id)
+                rendered.setdefault((scope, slot.slot), (slot, node_of(option_id)))
+        for view in runtime.views:
+            # The same views the main page lists (_filter_storage_view_runtime).
+            if (
+                view.source != "inventory_binding"
+                or view.enabled is False
+                or view.render.show_in_main_ui is False
+            ):
+                continue
+            view_node = node_of(view.binding.target_system_id or default_snapshot.selected_enclosure_id)
+            if not in_pair(view_node):
+                continue
+            for runtime_slot in view.slots:
+                if runtime_slot.occupied:
+                    rendered.setdefault(
+                        (f"storage-view:{view.id}", runtime_slot.slot_index), (runtime_slot, view_node),
+                    )
+        return build_disk_retention_accounting(
+            source_disks=source_disks,
+            slots=[slot for slot, _node in rendered.values()],
+            source_scopes=source_scopes,
+            slot_scopes=[node for _slot, node in rendered.values()] if quantastor else None,
+        )
+
+    def _quantastor_ha_pair_ids(
+        self,
+        raw_data: TrueNASRawData,
+        selected_owner: str | None,
+        option_owners: set[str],
+    ) -> set[str]:
+        """The storage systems of this deployment's HA pair (#917).
+
+        The configured HA node ids, when any of them owns an enclosure the grid
+        reports; the grid-wide default page does not add its owner. Otherwise
+        the members of the selected node's QuantaStor cluster, or just the
+        selected node. An empty set means the pair could not be identified.
+        """
+        configured = {
+            node_id
+            for node_id in (normalize_value_text(node.system_id) for node in self.system.ssh.ha_nodes or [])
+            if node_id
+        }
+        if configured & option_owners:
+            return configured
+        if not selected_owner:
+            return set()
+        cluster_of = {
+            normalize_value_text(row.get("id")): normalize_value_text(row.get("storageSystemClusterId"))
+            for row in raw_data.systems
+            if normalize_value_text(row.get("id"))
+        }
+        cluster = cluster_of.get(selected_owner)
+        if not cluster:
+            return {selected_owner}
+        return {system_id for system_id, cluster_id in cluster_of.items() if cluster_id == cluster}
+
+    @staticmethod
+    def _quantastor_record_owner_id(raw: dict[str, Any]) -> str | None:
+        """The HA node a QuantaStor disk record was reported by, as the builder reads it."""
+        value = raw.get("storageSystemId") or raw.get("systemId") or raw.get("controllerId")
+        return normalize_text(str(value)) if value is not None else None
 
     async def get_storage_view_slot_smart_summary(
         self,

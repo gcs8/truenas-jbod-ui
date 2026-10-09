@@ -11,7 +11,7 @@ from datetime import (
     timedelta,
     timezone,
 )
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -443,18 +443,39 @@ def build_router() -> APIRouter:
         force: bool = False,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        retention_scope: Literal["enclosure", "system"] = "enclosure",
     ) -> JSONResponse:
         service = route_service(
             system_id,
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        snapshot = await service.get_snapshot(
-            force_refresh=force,
-            selected_enclosure_id=enclosure_id,
-            allow_stale_cache=not force,
-        )
+        if retention_scope == "system":
+            # The upgrade helper's disk-retention check (#911): count a disk as
+            # placed when any enclosure or storage view of the system shows it.
+            # Older images ignore the parameter and keep enclosure totals. The
+            # check is admitted before this request's snapshot is built, so a
+            # busy refusal never forces a refresh, and a forced request
+            # collects the sources once.
+            snapshot, retention = await service.get_snapshot_with_system_retention(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+            )
+        else:
+            snapshot = await service.get_snapshot(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=not force,
+            )
+            retention = None
         payload = snapshot.model_dump(mode="json")
+        if retention is not None:
+            payload["summary"].update(
+                source_disk_count=retention.source_disk_count,
+                rendered_unique_disk_count=retention.rendered_unique_disk_count,
+                duplicate_disk_view_count=retention.duplicate_disk_view_count,
+                unplaced_disk_count=retention.unplaced_disk_count,
+            )
         runtime_warnings = await asyncio.to_thread(runtime_warnings_for, request)
         if runtime_warnings:
             payload["warnings"] = [*runtime_warnings, *payload.get("warnings", [])]

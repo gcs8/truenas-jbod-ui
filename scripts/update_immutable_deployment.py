@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,11 @@ RETENTION_KEYS = (
     "unplaced_disk_count",
 )
 MAX_INVENTORY_BYTES = 64 * 1024 * 1024
+# The UI runs one system-wide retention check per system at a time and answers
+# a concurrent one with 503 and Retry-After (#917). Wait for it, up to this long
+# in total, before treating the check as failed.
+RETENTION_BUSY_MAX_WAIT_SECONDS = 120
+RETENTION_BUSY_MAX_RETRY_AFTER_SECONDS = 30
 
 
 class DeploymentError(RuntimeError):
@@ -55,6 +61,14 @@ class DeploymentError(RuntimeError):
 
 class RetentionTotalsUnavailable(DeploymentError):
     """The inventory answered normally but its summary has no retention totals."""
+
+
+class InventoryBusy(DeploymentError):
+    """The inventory answered 503 with Retry-After: another system-wide check is running."""
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("inventory retention check is busy")
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True)
@@ -297,6 +311,12 @@ def _default_fetch_json(url: str) -> object:
             if response.geturl() != url or not 200 <= response.status < 300:
                 raise DeploymentError("inventory response was redirected or unsuccessful")
             data = response.read(MAX_INVENTORY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        retry_after = (exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
+        exc.close()
+        if exc.code == 503 and retry_after.isdigit():
+            raise InventoryBusy(int(retry_after)) from None
+        raise DeploymentError("inventory retention check could not read the inventory") from exc
     except OSError as exc:
         raise DeploymentError("inventory retention check could not read the inventory") from exc
     if len(data) > MAX_INVENTORY_BYTES:
@@ -307,9 +327,42 @@ def _default_fetch_json(url: str) -> object:
         raise DeploymentError("inventory response is not JSON") from exc
 
 
+def _system_retention_url(url: str) -> str:
+    """Ask for totals across every enclosure and storage view of the system (#911).
+
+    Per-enclosure totals count every disk outside the default enclosure as
+    unplaced, so a healthy multi-enclosure system would always roll back.
+    Images that predate the parameter ignore it and answer enclosure totals.
+    """
+    parts = urllib.parse.urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if key != "retention_scope"
+    ]
+    query.append(("retention_scope", "system"))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def _fetch_retention_payload(fetch_json: FetchJson, url: str) -> object:
+    """Fetch the system-wide totals, waiting out another client's check (#917)."""
+    waited = 0
+    while True:
+        try:
+            return fetch_json(url)
+        except InventoryBusy as busy:
+            delay = min(max(busy.retry_after_seconds, 1), RETENTION_BUSY_MAX_RETRY_AFTER_SECONDS)
+            if waited + delay > RETENTION_BUSY_MAX_WAIT_SECONDS:
+                raise DeploymentError(
+                    f"inventory retention check stayed busy for {waited} seconds"
+                ) from None
+            time.sleep(delay)
+            waited += delay
+
+
 def _retention_totals(fetch_json: FetchJson, url: str) -> dict[str, int]:
     """Read only the aggregate retention integers from one inventory response."""
-    payload = fetch_json(url)
+    payload = _fetch_retention_payload(fetch_json, _system_retention_url(url))
     summary = payload.get("summary") if isinstance(payload, dict) else None
     if not isinstance(summary, dict):
         raise DeploymentError("inventory response has no summary")
@@ -1150,7 +1203,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--inventory-url",
         help=(
             "loopback main-UI /api/inventory URL; when given, activation also requires every "
-            "source disk to be represented (aggregate totals only) or rolls back"
+            "source disk to be shown by some enclosure or storage view of the system "
+            "(aggregate totals only) or rolls back"
         ),
     )
     for action in ("verify", "rollback"):

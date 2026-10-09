@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from app.config import Settings, SystemConfig, TrueNASConfig
 from app.models.domain import MultipathMember, MultipathView, SlotView, SourceStatus
@@ -425,6 +425,422 @@ class VirtualFallbackRetentionTests(unittest.TestCase):
         )
         self.assertEqual(predecessor.summary.unplaced_disk_count, 0)
         self.assertEqual(successor.summary.unplaced_disk_count, 0)
+
+
+class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
+    """#917: device names are node-local on a QuantaStor HA pair."""
+
+    NODES = [
+        {"system_id": "node-a", "label": "Left", "host": "192.0.2.30"},
+        {"system_id": "node-b", "label": "Right", "host": "192.0.2.31"},
+    ]
+
+    def _retention(
+        self, disks, slots_by_node, *, other_node=None, configured=True, default_node="node-a", nodes=None,
+    ):
+        from app.config import SSHConfig
+        from app.models.domain import EnclosureOption, InventorySnapshot
+
+        system = SystemConfig(
+            id="qs",
+            truenas=TrueNASConfig(host="https://192.0.2.40", platform="quantastor"),
+            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=(nodes or self.NODES) if configured else []),
+        )
+        options = [EnclosureOption(id="node-a", label="Left"), EnclosureOption(id="node-b", label="Right")]
+        systems = [
+            {"id": "node-a", "name": "Left", "storageSystemClusterId": "c"},
+            {"id": "node-b", "name": "Right", "storageSystemClusterId": "c", "isMaster": True},
+        ]
+        if other_node:
+            # Another hardware-backed storage system in the same grid, in its
+            # own cluster; the grid API lists its enclosure as an option.
+            options.append(EnclosureOption(id=other_node, label="Other appliance"))
+            systems.append({"id": other_node, "name": "Other", "storageSystemClusterId": "other", "isMaster": True})
+
+        def snapshot(node):
+            return InventorySnapshot(
+                slots=[
+                    SlotView(slot=index, slot_label=str(index), row_index=0, column_index=index,
+                             present=True, enclosure_id=node, **fields)
+                    for index, fields in enumerate(slots_by_node.get(node, []))
+                ],
+                refresh_interval_seconds=30,
+                selected_enclosure_id=node,
+                enclosures=options,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+                        systems=systems,
+                    ),
+                    ssh_outputs={}, ssh_collected=False, warnings=[],
+                    sources={"api": SourceStatus(enabled=True, ok=True)},
+                    scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            async def get_snapshot(**kwargs):
+                return snapshot(kwargs.get("selected_enclosure_id") or default_node)
+
+            async def get_snapshot_result(**kwargs):
+                return SimpleNamespace(value=snapshot(kwargs["selected_enclosure_id"]))
+
+            service.get_snapshot = get_snapshot
+            service._get_snapshot_result = get_snapshot_result
+            return asyncio.run(service.get_system_disk_retention())
+
+    @staticmethod
+    def _disk(node, path, serial=None):
+        disk = {"id": f"{node}-{path}", "storageSystemId": node, "devicePath": f"/dev/{path}", "size": 1000}
+        if serial:
+            disk["serialNumber"] = serial
+        return disk
+
+    def test_the_same_device_name_on_two_nodes_is_two_disks(self) -> None:
+        # Each node has a different disk at /dev/sda; node-b's is shown nowhere.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-b", "sda", "SYNTH-QS-B")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+        )
+        self.assertEqual(retention.source_disk_count, 2)
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_a_shared_disk_seen_from_both_nodes_is_one_placed_disk(self) -> None:
+        retention = self._retention(
+            [self._disk("node-a", "sdc", "SYNTH-QS-SHARED"), self._disk("node-b", "sdf", "SYNTH-QS-SHARED")],
+            {"node-b": [{"device_name": "sdf", "serial": "SYNTH-QS-SHARED"}]},
+        )
+        self.assertEqual(retention.unplaced_disk_count, 0)
+        self.assertEqual(retention.rendered_unique_disk_count, 1)
+
+    def test_disks_of_a_storage_system_outside_the_pair_are_not_counted(self) -> None:
+        # The QuantaStor grid can hold another storage system (here node-c)
+        # whose disks this system never shows; they are not its disks.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-c", "sdz", "SYNTH-QS-C")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_another_storage_system_in_the_grid_is_left_out(self) -> None:
+        # Its unshown disk must not fail the check, and its enclosures must not
+        # count toward the enclosure limit. Found from configured HA nodes or,
+        # without them, from the selected node's cluster.
+        disks = [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")]
+        for configured in (True, False):
+            with self.subTest(configured=configured), patch.object(
+                inventory_module, "SYSTEM_RETENTION_MAX_ENCLOSURES", 2
+            ):
+                retention = self._retention(
+                    disks,
+                    {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+                    other_node="node-x",
+                    configured=configured,
+                )
+                self.assertEqual(retention.source_disk_count, 1)
+                self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_a_default_page_outside_the_configured_pair_is_left_out(self) -> None:
+        # The grid-wide default can land on another storage system; with the
+        # pair configured, that system's disks and slots are still not counted.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+            other_node="node-x",
+            default_node="node-x",
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_stale_configured_node_ids_fall_back_to_the_cluster(self) -> None:
+        # Configured ids that own no enclosure in the grid (a replaced node)
+        # must not empty the pair; the selected node's cluster is used instead.
+        stale = [
+            {"system_id": "gone-1", "label": "Left", "host": "192.0.2.30"},
+            {"system_id": "gone-2", "label": "Right", "host": "192.0.2.31"},
+        ]
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+            other_node="node-x",
+            nodes=stale,
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_a_device_name_still_matches_within_its_own_node(self) -> None:
+        retention = self._retention(
+            [self._disk("node-a", "sdb"), self._disk("node-b", "sdb")],
+            {"node-a": [{"device_name": "sdb"}], "node-b": [{"device_name": "sdb"}]},
+        )
+        self.assertEqual(retention.unplaced_disk_count, 0)
+        self.assertEqual(retention.rendered_unique_disk_count, 2)
+
+
+class SystemWideRetentionTests(unittest.TestCase):
+    """#911: disks shown by another enclosure or a storage view are placed."""
+
+    @staticmethod
+    def _shelf(enclosure_id: str, disks: list[dict[str, object]]) -> dict[str, object]:
+        return synthetic_enclosure_rows(disks)[0] | {
+            "id": enclosure_id,
+            "name": f"Shelf {enclosure_id}",
+            "label": f"Shelf {enclosure_id}",
+        }
+
+    def _service(self, temp_dir: str, *, storage_views: list[dict[str, object]] | None = None):
+        system = SystemConfig(
+            id="system-a",
+            truenas=TrueNASConfig(platform="core"),
+            storage_views=storage_views or [],
+        )
+        service = build_service(Settings(systems=[system]), system, temp_dir)
+        raw_data = raw_data_for(
+            MIXED_IDENTITY_DISKS,
+            enclosures=[
+                self._shelf("enc-a", MIXED_IDENTITY_DISKS[:2]),
+                # da3 and da4 are two paths to one disk.
+                self._shelf("enc-b", MIXED_IDENTITY_DISKS[3:5]),
+            ],
+        )
+        source_bundle = AsyncMock(
+            return_value=InventorySourceBundle(
+                raw_data=raw_data,
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+        )
+        service._get_inventory_source_bundle = source_bundle
+        return service, source_bundle
+
+    BOOT_VIEW = {
+        "id": "boot",
+        "label": "Boot",
+        "kind": "boot_devices",
+        "template_id": "satadom-pair-2",
+        "enabled": True,
+        "binding": {"mode": "serial", "device_names": ["da2"]},
+    }
+
+    def test_every_enclosure_and_storage_view_counts_as_placed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                default = await service.get_snapshot()
+                retention = await service.get_system_disk_retention()
+                return default, retention, await service.get_snapshot()
+
+            default, retention, default_after = asyncio.run(run())
+
+        # The default enclosure alone leaves the other shelf and the boot
+        # view's disk unplaced; that is the per-enclosure summary.
+        self.assertEqual(default.selected_enclosure_id, "enc-a")
+        self.assertEqual(default.summary.unplaced_disk_count, 3)
+        self.assertEqual(
+            (
+                retention.source_disk_count,
+                retention.rendered_unique_disk_count,
+                retention.duplicate_disk_view_count,
+                retention.unplaced_disk_count,
+            ),
+            (5, 4, 1, 0),
+        )
+        # Building the other enclosure must not move the default page.
+        self.assertEqual(default_after.selected_enclosure_id, "enc-a")
+
+    def test_a_disk_no_enclosure_or_view_shows_stays_unplaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # No storage view claims da2.
+            service, _ = self._service(temp_dir)
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.source_disk_count, 5)
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_system_totals_collect_sources_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+            asyncio.run(service.get_system_disk_retention(force_refresh=True))
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+
+    def test_a_second_concurrent_system_check_is_refused_as_busy(self) -> None:
+        # One system-wide check per system at a time; a caller that repeats
+        # forced requests cannot stack enclosure builds on the worker.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                release = asyncio.Event()
+                original = service.get_storage_view_runtime
+
+                async def held(**kwargs):
+                    await release.wait()
+                    return await original(**kwargs)
+
+                service.get_storage_view_runtime = held
+                first = asyncio.create_task(service.get_system_disk_retention(force_refresh=True))
+                await asyncio.sleep(0)
+                with self.assertRaises(inventory_module.SystemRetentionBusyError):
+                    await service.get_system_disk_retention(force_refresh=True)
+                release.set()
+                return await first
+
+            self.assertEqual(asyncio.run(run()).unplaced_disk_count, 0)
+
+    def test_a_refused_forced_request_collects_nothing(self) -> None:
+        # The route's own forced snapshot is admitted together with the
+        # system totals, so a request turned away as busy never refreshes.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                release = asyncio.Event()
+                original = service.get_storage_view_runtime
+
+                async def held(**kwargs):
+                    await release.wait()
+                    return await original(**kwargs)
+
+                service.get_storage_view_runtime = held
+                first = asyncio.create_task(service.get_snapshot_with_system_retention(force_refresh=True))
+                await asyncio.sleep(0)
+                forced_before = sum(1 for call in source_bundle.await_args_list if call.kwargs.get("force_refresh"))
+                with self.assertRaises(inventory_module.SystemRetentionBusyError):
+                    await service.get_snapshot_with_system_retention(force_refresh=True)
+                forced_after = sum(1 for call in source_bundle.await_args_list if call.kwargs.get("force_refresh"))
+                release.set()
+                snapshot, retention = await first
+                return forced_before, forced_after, snapshot, retention
+
+            forced_before, forced_after, snapshot, retention = asyncio.run(run())
+
+        self.assertEqual(forced_after, forced_before)
+        self.assertEqual(snapshot.selected_enclosure_id, "enc-a")
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_a_forced_request_for_another_enclosure_collects_sources_once(self) -> None:
+        # A cold service also collects once to discover its enclosures; warm it
+        # so this measures only the forced request itself.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                await service.get_snapshot()
+                source_bundle.reset_mock()
+                return await service.get_snapshot_with_system_retention(
+                    force_refresh=True, selected_enclosure_id="enc-b",
+                )
+
+            snapshot, retention = asyncio.run(run())
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(snapshot.selected_enclosure_id, "enc-b")
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_too_many_enclosures_are_refused_before_building_them(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(inventory_module, "SYSTEM_RETENTION_MAX_ENCLOSURES", 1),
+        ):
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+            original = service._get_snapshot_result
+            built: list[str | None] = []
+
+            async def recording(*args, **kwargs):
+                built.append(kwargs.get("selected_enclosure_id"))
+                return await original(*args, **kwargs)
+
+            service._get_snapshot_result = recording
+            with self.assertRaises(inventory_module.SystemRetentionTooLargeError):
+                asyncio.run(service.get_system_disk_retention())
+
+        self.assertNotIn("enc-b", built)
+
+    def test_a_disabled_storage_view_does_not_place_its_disk(self) -> None:
+        # A view switched off in the admin UI renders nothing, so its disk
+        # must not satisfy the upgrade check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[{**self.BOOT_VIEW, "enabled": False}])
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_a_view_hidden_from_the_main_page_does_not_place_its_disk(self) -> None:
+        # The main page lists only enabled views shown in the main UI; a
+        # maintenance-only view is not part of the inventory an operator sees.
+        hidden = {**self.BOOT_VIEW, "render": {"show_in_main_ui": False}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[hidden])
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_an_excluded_view_with_a_stale_target_does_not_break_the_check(self) -> None:
+        # A QuantaStor view kept disabled or hidden after its HA node was
+        # removed still names that node. It is not operator-visible, so the
+        # check must not resolve its target and fail with UnknownEnclosureError.
+        stale = {
+            "id": "stale-node-boot",
+            "label": "Removed node boot",
+            "kind": "boot_devices",
+            "template_id": "satadom-pair-2",
+            "binding": {"mode": "serial", "device_names": ["da2"]},
+        }
+        for excluded in ({"enabled": False}, {"render": {"show_in_main_ui": False}}):
+            with self.subTest(excluded=excluded), tempfile.TemporaryDirectory() as temp_dir:
+                service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW, {**stale, **excluded}])
+                original = service._storage_view_target_system_id
+
+                def target(storage_view, snapshot, *, original=original):
+                    if storage_view.id == "stale-node-boot":
+                        return "removed-node"
+                    return original(storage_view, snapshot)
+
+                service._storage_view_target_system_id = target
+                retention = asyncio.run(service.get_system_disk_retention())
+
+                self.assertEqual(retention.unplaced_disk_count, 0)
+
+        # A visible view with the same stale target still fails the check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW, stale])
+            original = service._storage_view_target_system_id
+            service._storage_view_target_system_id = (
+                lambda storage_view, snapshot: "removed-node"
+                if storage_view.id == "stale-node-boot"
+                else original(storage_view, snapshot)
+            )
+            with self.assertRaises(inventory_module.UnknownEnclosureError):
+                asyncio.run(service.get_system_disk_retention())
+
+    def test_a_route_snapshot_is_reused_instead_of_collecting_again(self) -> None:
+        # GET /api/inventory?retention_scope=system&force=true has already
+        # force-refreshed one snapshot; the system totals build on it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                snapshot = await service.get_snapshot(force_refresh=True)
+                return await service.get_system_disk_retention(force_refresh=True, snapshot=snapshot)
+
+            retention = asyncio.run(run())
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
 
 
 class VirtualFallbackWarningAndSourceStatusTests(unittest.TestCase):

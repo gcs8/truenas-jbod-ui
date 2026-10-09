@@ -47,6 +47,8 @@ from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory import (
     SnapshotStateBusyError,
+    SystemRetentionBusyError,
+    SystemRetentionTooLargeError,
     UnknownEnclosureError,
 )
 from app.services.inventory_registry import InventoryRegistry, SystemNotConfiguredError
@@ -126,6 +128,8 @@ EXCEPTION_RESPONSES: dict[type[Exception], ErrorResponseSpec] = {
     UnknownEnclosureError: ErrorResponseSpec(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL),
     SnapshotStateBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=1),
     SnapshotExportBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
+    SystemRetentionBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
+    SystemRetentionTooLargeError: ErrorResponseSpec(status_code=503),
 }
 
 

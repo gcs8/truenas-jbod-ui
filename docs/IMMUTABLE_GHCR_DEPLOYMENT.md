@@ -89,7 +89,10 @@ Add `--inventory-url http://127.0.0.1:8080/api/inventory` to also check disk
 retention (#400). The helper reads only the four aggregate integers in the
 inventory `summary` (`source_disk_count`, `rendered_unique_disk_count`,
 `duplicate_disk_view_count`, `unplaced_disk_count`), before the update and
-after the candidate is healthy. It rolls back automatically when any source disk is
+after the candidate is healthy. It requests them with `retention_scope=system`,
+so a disk counts as placed when any enclosure or storage view of the system
+shows it, not only the default enclosure (#911); images that predate the
+parameter ignore it. It rolls back automatically when any source disk is
 unplaced, or when the source disk count falls across the update. A predecessor
 without these totals gives no baseline, but the candidate must still report
 them. The receipt stores the counts under `retention`; it stores no disk
