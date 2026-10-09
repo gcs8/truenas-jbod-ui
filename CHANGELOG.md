@@ -34,6 +34,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   healthy systems with more than one enclosure. A disk now counts as placed
   when any enclosure or storage view of the system shows it, not only the
   default enclosure. (#917)
+- Every node and bay in the Connections panel can be reached again. Path
+  cards list all their bays, and long node lists end in a "+N" button that
+  expands in place and collapses with "Show fewer". (#920)
+- A cleared bay mapping's note no longer comes back after a refresh or in
+  later exports. The slot-detail cache now keeps only facts about the
+  disk. (#919)
 - Opening a system without picking an enclosure lands on its default again.
   Refreshing another enclosure, such as Offsite SCALE's rear bays, made it
   everyone's default page. Broke in v0.23.0. (#916)
