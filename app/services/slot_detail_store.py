@@ -7,9 +7,15 @@ from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator
 
 from app.models.domain import utcnow
+
+# Mapping-owned state that caches written before #909 stored beside the disk's
+# hardware facts. It belongs to the mapping store and the live inventory, so a
+# cache entry never carries it: loading drops it, and a file that still holds
+# it is rewritten on the next save or registry start.
+MAPPING_OWNED_SLOT_FIELDS = frozenset({"notes", "mapping_source", "operator_context"})
 
 
 class SlotDetailCacheEntry(BaseModel):
@@ -35,6 +41,16 @@ class SlotDetailCacheEntry(BaseModel):
     # an existing file loads unchanged.
     identity_unknown: bool = False
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
+    # Set by SlotDetailStore.load_all when the file row still held
+    # mapping-owned fields, so the store knows the file needs a rewrite.
+    _dropped_mapping_fields: bool = PrivateAttr(default=False)
+
+    @field_validator("slot_fields", mode="before")
+    @classmethod
+    def drop_mapping_owned_fields(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: item for key, item in value.items() if key not in MAPPING_OWNED_SLOT_FIELDS}
+        return value
 
 
 class SlotDetailStore:
@@ -67,10 +83,18 @@ class SlotDetailStore:
         loaded: dict[str, SlotDetailCacheEntry] = {}
         for key, value in raw_entries.items():
             try:
-                loaded[key] = SlotDetailCacheEntry.model_validate(value)
+                entry = SlotDetailCacheEntry.model_validate(value)
             except (TypeError, ValidationError):
                 continue
+            raw_slot_fields = value.get("slot_fields") if isinstance(value, dict) else None
+            if isinstance(raw_slot_fields, dict) and MAPPING_OWNED_SLOT_FIELDS & raw_slot_fields.keys():
+                entry._dropped_mapping_fields = True
+            loaded[key] = entry
         return loaded
+
+    @staticmethod
+    def _holds_mapping_owned_fields(entries: Mapping[str, SlotDetailCacheEntry]) -> bool:
+        return any(entry._dropped_mapping_fields for entry in entries.values())
 
     def get_entry(
         self,
@@ -97,6 +121,7 @@ class SlotDetailStore:
 
         with self._lock:
             current = self.load_all()
+            legacy_fields = self._holds_mapping_owned_fields(current)
             merged = current.copy()
             for entry in entries:
                 key = self._slot_key(entry.system_id, entry.enclosure_id, entry.slot)
@@ -122,7 +147,7 @@ class SlotDetailStore:
             # real change forces a write anyway, every entry in the batch is
             # written with its new stamp. Model equality alone conflates JSON
             # booleans, integers and floats, hence the JSON comparison.
-            if all(
+            if not legacy_fields and all(
                 key in current and (
                     entry is current[key]
                     or self._content_json(entry) == self._content_json(current[key])
@@ -142,18 +167,24 @@ class SlotDetailStore:
         return json.dumps(payload, sort_keys=True)
 
     def prune_unknown_systems(self, valid_system_ids: set[str]) -> int:
+        """Drop rows of unknown systems; also scrub mapping-owned fields (#909).
+
+        The registry calls this at startup, so a pre-#909 cache loses its
+        stored notes even for bays whose entries are never rebuilt.
+        """
         with self._lock:
             try:
                 current = self.load_all()
             except (AttributeError, TypeError, ValidationError):
                 return 0
+            legacy_fields = self._holds_mapping_owned_fields(current)
             retained = {
                 key: entry
                 for key, entry in current.items()
                 if entry.system_id in valid_system_ids
             }
             removed = len(current) - len(retained)
-            if removed:
+            if removed or legacy_fields:
                 self._write(retained)
             return removed
 

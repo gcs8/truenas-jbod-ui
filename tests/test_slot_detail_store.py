@@ -224,6 +224,64 @@ class SlotDetailStoreSaveTests(unittest.TestCase):
             self.assertEqual(len(store.load_all()), 2)
 
 
+class SlotDetailStoreMappingFieldTests(unittest.TestCase):
+    """#909: a cache written before the fix must not keep a cleared note on disk."""
+
+    LEGACY = {
+        "system_id": "system-a", "enclosure_id": "enc-1", "slot": 0,
+        "identifiers": ["disk-a"], "identity_unknown": True,
+        "slot_fields": {
+            "model": "model-a",
+            "notes": "temporary operator note",
+            "mapping_source": "manual",
+            "operator_context": {"notes": ["ownership note"]},
+        },
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    def _legacy_file(self, temp_dir: str) -> Path:
+        path = Path(temp_dir) / "slot_detail_cache.json"
+        path.write_text(json.dumps({"version": 1, "slot_details": {"system-a:enc-1:0": self.LEGACY}}), encoding="utf-8")
+        return path
+
+    def test_loading_drops_mapping_owned_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            entry = SlotDetailStore(str(self._legacy_file(temp_dir))).get_entry("system-a", "enc-1", 0)
+        assert entry is not None
+        self.assertEqual(entry.slot_fields, {"model": "model-a"})
+
+    def test_an_unchanged_identity_unknown_entry_is_still_scrubbed_on_disk(self) -> None:
+        # The identity-unknown branch can hand back the stored entry unchanged.
+        # Saving it must still rewrite a file that holds the old keys.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._legacy_file(temp_dir)
+            store = SlotDetailStore(str(path))
+            stored = store.get_entry("system-a", "enc-1", 0)
+            assert stored is not None
+            store.save_entries([stored])
+            text = path.read_text(encoding="utf-8")
+        self.assertNotIn("temporary operator note", text)
+        self.assertNotIn("ownership note", text)
+        self.assertIn("model-a", text)
+
+    def test_registry_start_scrubs_entries_that_are_never_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._legacy_file(temp_dir)
+            removed = SlotDetailStore(str(path)).prune_unknown_systems({"system-a"})
+            text = path.read_text(encoding="utf-8")
+            reloaded = SlotDetailStore(str(path)).load_all()
+        self.assertEqual(removed, 0)
+        self.assertNotIn("temporary operator note", text)
+        self.assertEqual(len(reloaded), 1)
+        # A clean file is not rewritten again.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json"))
+            store.save_entries([SlotDetailCacheEntry.model_validate({**self.LEGACY, "slot_fields": {"model": "m"}})])
+            with patch.object(store, "_write", wraps=store._write) as write:
+                store.prune_unknown_systems({"system-a"})
+            write.assert_not_called()
+
+
 class SlotDetailStorePruneTests(unittest.TestCase):
     @staticmethod
     def _entry(system_id: str, slot: int) -> SlotDetailCacheEntry:
