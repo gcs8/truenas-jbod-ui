@@ -226,6 +226,30 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             self.assertIsNone(collector.degraded_reason())
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
+    def test_damage_found_while_listing_pending_indexes_pauses_collection(self) -> None:
+        # The same damage handling as a failed build: the durable pause marker
+        # and its recovery guidance, not a generic retry loop.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(HistorySettings(sqlite_path=str(path)), store)
+            with (
+                patch.object(
+                    store,
+                    "pending_chronological_indexes",
+                    side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+                ),
+                patch.object(store, "record_collection_pause", wraps=store.record_collection_pause) as recorded,
+                self.assertLogs("history_service.collector", "WARNING"),
+            ):
+                self.assertFalse(asyncio.run(collector._build_pending_indexes()))
+
+            recorded.assert_called_once()
+            self.assertTrue(collector.collection_pause()[0])
+            self.assertEqual(collector.degraded_reason(), collector_module.COLLECTION_PAUSED_REASON)
+
     def test_a_failed_index_build_is_reported_as_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.sqlite3"

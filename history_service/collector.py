@@ -797,9 +797,15 @@ class HistoryCollector:
         reader = getattr(self.store, "pending_chronological_indexes", None)
         try:
             pending = await asyncio.to_thread(reader) if callable(reader) else ()
-        except Exception:  # noqa: BLE001 - an index build must never stop collection.
-            logger.exception("Could not list the history indexes still to build.")
+        except Exception as exc:  # noqa: BLE001 - retried like a failed build.
             self._index_build_failures += 1
+            logger.warning(
+                "Could not list the history indexes still to build (%s, attempt %d); it will be retried.",
+                type(exc).__name__,
+                self._index_build_failures,
+            )
+            if is_database_corruption_error(exc):
+                self._pause_for_damage(exc)
             return False
         if not isinstance(pending, tuple) or not pending:
             self._chronological_indexes_identity = identity
