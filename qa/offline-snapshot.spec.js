@@ -51,7 +51,7 @@ asyncio.run(main())
 }
 
 function buildOfflineLegacyFaceSnapshotFixture(faceStyle, builtinProfileId = "") {
-  const supportedFaces = new Set(["generic", "front-drive", "rear-drive"]);
+  const supportedFaces = new Set(["generic", "front-drive", "rear-drive", "top-loader", "unifi-drive", "drawer"]);
   if (!supportedFaces.has(faceStyle)) {
     throw new Error(`Unsupported synthetic legacy face: ${faceStyle}`);
   }
@@ -97,12 +97,20 @@ async def main():
             columns=columns,
             slot_layout=layout,
         )
+    # Every bay the layout draws, so multi-row built-in faces are fully populated.
+    positions = [
+        (slot_number, row_index, column_index)
+        for row_index, row in enumerate(layout)
+        for column_index, slot_number in enumerate(row)
+        if slot_number is not None
+    ]
+    columns = len(positions)
     slots = [
         module.SlotView(
             slot=slot_number,
             slot_label=f"{slot_number:02}",
-            row_index=0,
-            column_index=slot_number,
+            row_index=row_index,
+            column_index=column_index,
             enclosure_id="synthetic-enclosure",
             enclosure_label="Synthetic Enclosure",
             present=True,
@@ -115,13 +123,13 @@ async def main():
             vdev_name="synthetic-vdev",
             health="ONLINE",
         )
-        for slot_number in range(columns)
+        for slot_number, row_index, column_index in positions
     ]
     snapshot = module.InventorySnapshot(
         slots=slots,
         layout_rows=layout,
         layout_slot_count=columns,
-        layout_columns=columns,
+        layout_columns=max(len(row) for row in layout),
         refresh_interval_seconds=30,
         selected_system_id="synthetic-system",
         selected_system_label="Synthetic System",
@@ -633,80 +641,172 @@ for (const { faceStyle, profileId, layoutMode, minHeightRatio } of [
   });
 }
 
-test("offline 24-bay 2.5-inch front keeps the state chip off the latch, LED and labels", async ({ page }) => {
-  const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive", "supermicro-ssg-2028r-shared-front-24");
+// #913: each tile's state chip is its ::after. getComputedStyle reports its
+// 20px content box and an unresolved left, so read the drawn 24px border box
+// from Chromium's box model instead.
+const STATE_CHIP_PARTS = [
+  ".slot-status-led", ".slot-latch", ".slot-number", ".slot-device", ".slot-pool", ".slot-tertiary",
+  ".slot-heatmap-value", ".storage-view-runtime-card-hole", ".storage-view-runtime-card-latch",
+  ".storage-view-runtime-card-slot", ".storage-view-runtime-card-size-chip", ".storage-view-runtime-card-device",
+  ".storage-view-runtime-card-summary", ".storage-view-runtime-card-tertiary", ".storage-view-runtime-card-label-plate",
+  ".storage-view-runtime-card-boot-chip", ".storage-view-runtime-card-boot-connector",
+];
+
+async function settleFrames(page, frames = 4) {
+  await page.evaluate((count) => new Promise((resolve) => {
+    const step = (left) => (left ? requestAnimationFrame(() => step(left - 1)) : resolve());
+    step(count);
+  }), frames);
+}
+
+async function clearSlotSelection(page) {
+  // The fixture selects slot 0, whose ring hides its chip. A second click on the
+  // selected tile clears it through the grid's delegated handler; dispatch it
+  // directly because the chassis face can cover that tile at some widths.
+  const selected = page.locator("#slot-grid .slot-tile.selected");
+  if (await selected.count()) {
+    await selected.first().dispatchEvent("click");
+    await expect(page.locator("#slot-grid .slot-tile:is(.selected, .peer-highlight, .fabric-highlight)")).toHaveCount(0);
+  }
+  await page.mouse.move(0, 0);
+}
+
+async function measureStateChips(page) {
+  await settleFrames(page);
+  const cdp = await page.context().newCDPSession(page);
+  const chips = {};
+  try {
+    const { root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+    const tiles = [];
+    const walk = (node) => {
+      const attributes = {};
+      for (let index = 0; index + 1 < (node.attributes || []).length; index += 2) {
+        attributes[node.attributes[index]] = node.attributes[index + 1];
+      }
+      if ((attributes.class || "").split(/\s+/).includes("slot-tile") && "data-slot" in attributes) {
+        const after = (node.pseudoElements || []).find((pseudo) => pseudo.pseudoType === "after");
+        if (after) tiles.push({ slot: attributes["data-slot"], nodeId: node.nodeId, afterId: after.nodeId });
+      }
+      (node.children || []).forEach(walk);
+    };
+    walk(root);
+    for (const tile of tiles) {
+      const { model: tileBox } = await cdp.send("DOM.getBoxModel", { nodeId: tile.nodeId });
+      const { model: chipBox } = await cdp.send("DOM.getBoxModel", { nodeId: tile.afterId });
+      const [x, y] = tileBox.border;
+      const quad = chipBox.border;
+      chips[tile.slot] = { left: quad[0] - x, top: quad[1] - y, right: quad[4] - x, bottom: quad[5] - y };
+    }
+  } finally {
+    await cdp.detach();
+  }
+  return page.locator("#chassis-shell").evaluate((shell, { chips, parts }) => {
+    const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    const result = { spot: shell.dataset.chipSpot || null, bays: 0, chips: 0, problems: [] };
+    for (const tile of shell.querySelectorAll("#slot-grid .slot-tile[data-slot]")) {
+      // Selected, peer and fabric tiles draw a ring with ::after instead.
+      if (tile.matches(".selected, .peer-highlight, .fabric-highlight")) continue;
+      result.bays += 1;
+      const slot = tile.dataset.slot;
+      const chip = chips[slot];
+      if (!chip) {
+        result.problems.push(`${slot}: no state chip`);
+        continue;
+      }
+      result.chips += 1;
+      const box = tile.getBoundingClientRect();
+      if (Math.round(chip.right - chip.left) !== 24 || Math.round(chip.bottom - chip.top) !== 24) {
+        result.problems.push(`${slot}: chip is ${chip.right - chip.left}x${chip.bottom - chip.top}`);
+      }
+      if (chip.left < -0.5 || chip.top < -0.5 || chip.right > box.width + 0.5 || chip.bottom > box.height + 0.5) {
+        result.problems.push(`${slot}: chip outside its bay`);
+      }
+      const led = tile.querySelector(".slot-status-led");
+      if (tile.matches(".storage-view-slot-nvme-absolute, .storage-view-slot-boot") && led && getComputedStyle(led).display !== "none") {
+        result.problems.push(`${slot}: card still draws the LED dot beside its chip`);
+      }
+      for (const part of tile.querySelectorAll(parts.join(", "))) {
+        if (getComputedStyle(part).visibility === "hidden") continue;
+        const rect = part.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        const relative = { left: rect.left - box.left, top: rect.top - box.top, right: rect.right - box.left, bottom: rect.bottom - box.top };
+        if (overlaps(chip, relative)) result.problems.push(`${slot}: chip covers ${part.className.split(" ")[0]}`);
+      }
+    }
+    return result;
+  }, { chips, parts: STATE_CHIP_PARTS });
+}
+
+async function checkStateChips(page, url, { label, prepare = async () => {}, bayLabels = true, spots = null }) {
   for (const heatmap of [false, true]) {
     for (const width of [1920, 1100]) {
-      const label = `${heatmap ? "heat map" : "plain"} at ${width}px`;
+      const name = `${label}, ${heatmap ? "heat map" : "plain"} at ${width}px`;
       await page.setViewportSize({ width, height: 1100 });
-      await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+      await page.goto(url, { waitUntil: "load" });
+      await prepare();
+      const tiles = page.locator("#slot-grid .slot-tile[data-slot]");
       if (heatmap) {
         await page.locator("#heatmap-toggle-button").click();
-        await expect(page.locator("#slot-grid .slot-heatmap-value")).toHaveCount(24);
+        await expect(page.locator("#slot-grid .slot-heatmap-value")).toHaveCount(await tiles.count());
       }
-      const { chips, collisions } = await page.locator("#chassis-shell").evaluate((shell) => {
-        const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-        const hits = [];
-        let chipCount = 0;
-        // The fixture selects slot 0 and its vdev peers, which draw rings
-        // instead of chips; clear that so every bay shows its state chip.
-        // Saved-view bays also carry a third label (size or placement); add
-        // one so the check covers that layout too.
-        for (const tile of shell.querySelectorAll(".slot-tile")) {
-          tile.classList.remove("selected", "peer-highlight");
-          const tertiary = document.createElement("span");
-          tertiary.className = "slot-tertiary";
-          tertiary.textContent = "3.84 TB";
-          tile.querySelector(".slot-latch").before(tertiary);
-        }
-        for (const tile of shell.querySelectorAll(".slot-tile")) {
-          const tileRect = tile.getBoundingClientRect();
-          const chip = getComputedStyle(tile, "::after");
-          if (chip.content === "none" || chip.content === '""') continue;
-          chipCount += 1;
-          const shift = new DOMMatrixReadOnly(chip.transform === "none" ? undefined : chip.transform);
-          const left = tileRect.left + parseFloat(chip.left) + shift.m41;
-          const top = tileRect.top + parseFloat(chip.top) + shift.m42;
-          const chipRect = { left, top, right: left + parseFloat(chip.width), bottom: top + parseFloat(chip.height) };
-          const parts = [".slot-status-led", ".slot-latch", ".slot-number", ".slot-heatmap-value", ".slot-device", ".slot-pool", ".slot-tertiary"];
-          for (const part of parts) {
-            const element = tile.querySelector(part);
-            if (!element || getComputedStyle(element).visibility === "hidden" || getComputedStyle(element).display === "none") continue;
-            if (overlaps(chipRect, element.getBoundingClientRect())) hits.push(`${tile.dataset.slot}${part}`);
+      if (bayLabels) {
+        // Saved-view bays carry a third label (size or placement).
+        await page.locator("#slot-grid").evaluate((grid) => {
+          for (const latch of grid.querySelectorAll(".slot-tile .slot-latch")) {
+            const tertiary = document.createElement("span");
+            tertiary.className = "slot-tertiary";
+            tertiary.textContent = "3.84 TB";
+            latch.before(tertiary);
           }
-          if (chipRect.bottom > tileRect.bottom) hits.push(`${tile.dataset.slot} below the sled`);
-        }
-        return { chips: chipCount, collisions: hits };
-      });
-      expect(chips, label).toBe(24);
-      expect(collisions, label).toEqual([]);
+        });
+      }
+      await clearSlotSelection(page);
+      const result = await measureStateChips(page);
+      expect(result.bays, name).toBeGreaterThan(0);
+      expect(result.problems, name).toEqual([]);
+      expect(result.chips, name).toBe(result.bays);
+      if (spots) expect(result.spot, name).toBe(spots[heatmap ? 1 : 0]);
     }
   }
+}
 
-  // Only a single row of top-latched sleds is that narrow. Other latch edges and
-  // multi-row faces keep the corner chip and, under a heat map, their labels.
-  const placements = await page.locator("#chassis-shell").evaluate((shell) => {
-    const tile = shell.querySelector(".slot-tile:not(.selected):not(.peer-highlight)");
-    const describe = (name) => {
-      const chip = getComputedStyle(tile, "::after");
-      const pool = getComputedStyle(tile.querySelector(".slot-pool")).visibility;
-      return `${name}:${chip.top}/${chip.right}/${chip.transform}/${pool}`;
-    };
-    const results = ["bottom", "left", "right"].map((edge) => {
-      shell.dataset.latchEdge = edge;
-      return describe(edge);
-    });
-    shell.dataset.latchEdge = "top";
-    shell.dataset.layoutRows = "2";
-    results.push(describe("two-rows"));
-    return results;
+for (const { faceStyle, profileId, spots } of [
+  { faceStyle: "front-drive", profileId: "supermicro-ssg-2028r-shared-front-24", spots: ["middle", "foot"] },
+  { faceStyle: "front-drive", profileId: "supermicro-ssg-6048r-front-24", spots: ["beside", "beside"] },
+  { faceStyle: "rear-drive", profileId: "supermicro-ssg-6048r-rear-12" },
+  { faceStyle: "front-drive", profileId: "generic-front-12-3x4" },
+  { faceStyle: "front-drive", profileId: "generic-front-60-5x12" },
+  { faceStyle: "front-drive", profileId: "supermicro-fat-twin-front-6" },
+  { faceStyle: "rear-drive", profileId: "supermicro-sys-2029gp-tr-right-nvme-2" },
+  { faceStyle: "top-loader", profileId: "supermicro-cse-946-top-60", spots: ["under", "under"] },
+  { faceStyle: "unifi-drive", profileId: "ubiquiti-unvr-pro-front-7", spots: ["corner", "corner"] },
+  { faceStyle: "drawer", profileId: "dell-md1280-drawer-top-42" },
+  { faceStyle: "generic", profileId: "" },
+]) {
+  const label = profileId || `synthetic ${faceStyle}`;
+  test(`offline ${label} keeps every state chip off its bay's LED, latch and labels`, async ({ page }) => {
+    test.slow();
+    const snapshotPath = buildOfflineLegacyFaceSnapshotFixture(faceStyle, profileId);
+    await checkStateChips(page, pathToFileURL(snapshotPath).href, { label, spots });
   });
-  expect(placements).toEqual([
-    "bottom:6px/6px/none/visible",
-    "left:6px/6px/none/visible",
-    "right:6px/6px/none/visible",
-    "two-rows:6px/6px/none/visible",
-  ]);
+}
+
+test("offline M.2 and boot-media cards show a state chip clear of the card's labels", async ({ page }) => {
+  test.slow();
+  const url = pathToFileURL(buildOfflineSnapshotWithViewsFixture()).href;
+  for (const view of ["view:nvme-carrier", "view:boot-doms"]) {
+    await checkStateChips(page, url, {
+      label: view,
+      bayLabels: false,
+      prepare: async () => {
+        await page.locator("#enclosure-select").selectOption(view);
+        await expect(page.locator("#chassis-shell")).toHaveAttribute(
+          "data-face-style",
+          view === "view:nvme-carrier" ? "nvme-carrier" : "boot-devices",
+        );
+      },
+    });
+  }
 });
 
 test("offline bay state chips use their legend colors", async ({ page }) => {

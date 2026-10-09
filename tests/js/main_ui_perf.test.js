@@ -119,6 +119,7 @@ test("storage-view slot lookups index the view once per slot list", () => {
 
 test("selection-state pass resolves the storage view once per pass, not per tile", () => {
   let viewLookups = 0;
+  let placements = 0;
   const view = { id: "chassis", slots: [] };
   const makeTile = (slot) => ({
     dataset: { slot },
@@ -139,11 +140,13 @@ test("selection-state pass resolves the storage view once per pass, not per tile
         return { slot_index: slotIndex };
       },
       getLiveBackedStorageViewSlot(candidateView, slot) { return { slot: slot.slot_index }; },
+      scheduleStateChipPlacement() { placements += 1; },
     },
   );
 
   refreshGridSelectionState();
   assert.equal(viewLookups, 1);
+  assert.equal(placements, 1, "one placement pass per selection pass, not per tile");
 });
 
 test("hover fetches defer to a queued batch prefetch that already covers the bay", async () => {

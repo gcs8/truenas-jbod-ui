@@ -3431,6 +3431,13 @@ button.fabric-trace-crumb:hover {
   pointer-events: none;
 }
 
+/* placeStateChips() in app.js picks the spot that clears every bay. */
+.chassis-shell[data-chip-spot="beside"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { right: var(--chip-right); }
+.chassis-shell[data-chip-spot="under"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { top: var(--chip-top); }
+.chassis-shell[data-chip-spot="middle"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
+.chassis-shell[data-chip-spot="foot"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: auto auto 10px 50%; transform: translateX(-50%); }
+.chassis-shell[data-chip-spot="start"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: 6px auto auto 6px; }
+
 .slot-tile.state-healthy::after { content: "✓"; border-style: solid; }
 .slot-tile.state-empty::after { content: "○"; border-style: dotted; }
 .slot-tile.state-identify::after { content: "◎"; border-style: double; }
@@ -3724,21 +3731,7 @@ button.fabric-trace-crumb:hover {
   --slot-track-min-width: 40px;
 }
 
-/* One row of top-latched 40px sleds leaves no room by the latch: chip mid-sled. */
-.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after {
-  top: 50%;
-  right: auto;
-  left: 50%;
-  transform: translate(-50%, -50%);
-}
-
-/* The heat-map badge owns the middle; the chip takes the labels' place. */
-.chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing):not(.selected, .peer-highlight, .fabric-highlight)::after {
-  top: auto;
-  bottom: 10px;
-  transform: translateX(-50%);
-}
-
+/* Under a heat map the badge owns the middle and the chip the foot. */
 .chassis-shell[data-layout-mode="dense-2.5"][data-latch-edge="top"][data-layout-rows="1"] .slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool) {
   visibility: hidden;
 }
@@ -4672,6 +4665,17 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.selected::after,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after {
+  display: none;
+}
+
+/* M.2 cards and boot media show the state chip in place of the LED dot. */
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute:not(.selected, .peer-highlight, .fabric-highlight)::after,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute:not(.selected, .peer-highlight, .fabric-highlight)::after,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot:not(.selected, .peer-highlight, .fabric-highlight)::after {
+  display: inline-flex;
+}
+
+.slot-tile:is(.storage-view-slot-nvme-absolute, .storage-view-slot-boot):not(.selected, .peer-highlight, .fabric-highlight) .slot-status-led {
   display: none;
 }
 

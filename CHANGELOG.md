@@ -34,12 +34,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   shows its 24 bays as narrow 2.5" sleds that fit without scrolling, and the
   SYS-2029GP-TR rear NVMe pair is back to tall sleds. Both broke in v0.23.0.
   (#912)
-- On 24-bay 2.5" fronts, each bay's state icon no longer covers its latch and
-  status LED. It sits in the empty middle of the sled, or at its foot while a
-  heat map shows its value there. Every bay's state icon now uses the same
-  color as its legend entry instead of a dark box, with dark ink on the light
-  green and yellow fills. Those narrow sleds no longer show a saved view's
-  size or placement line; the slot details panel still does. (#913)
+- A bay's state icon no longer covers its latch, status LED or labels. The
+  page measures each layout and moves the icon to the first clear spot: the
+  corner, beside the latch, under the LED, the middle of the sled, or its foot
+  while a heat map shows its value in the middle. This fixes right-latch
+  3.5" trays, 60-bay top-loaders and 24-bay 2.5" fronts. M.2 cards and boot
+  media now show the state icon instead of a small LED dot. Every state icon
+  uses the same color as its legend entry instead of a dark box, with dark ink
+  on the light green and yellow fills. Narrow 2.5" sleds no longer show a
+  saved view's size or placement line; the slot details panel still does.
+  (#913)
 
 ## v0.24.0-beta.1 - 2026-10-08
 
