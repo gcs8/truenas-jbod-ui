@@ -58,8 +58,8 @@ receipts on that host.
 `0.22.2` deployment: inspection reported `7z`, encrypted, schema 2, with every
 group the source had; import restored the history database and every saved
 system with 0 restart failures; counts reconciled, with history growth limited
-to the same 13 empty-bay corrections v0.23.0 #189 makes that beta.1's run
-recorded; restored rows survived the restart; the SAS Fabric label and
+to the empty-bay corrections v0.23.0 #189 makes, as in beta.1's run; restored
+rows survived the restart; the SAS Fabric label and
 slot-mapping pencil cycles cleaned up. The controller confirmed a completed
 full history pass with forced inventory before any browser or performance
 check. The QA host's long-running beta deployment was stopped during the run
@@ -108,12 +108,12 @@ release:
 
 - #917: the upgrade helper's `--inventory-url` disk check upgraded that
   deployment on the first try with 0 unplaced disks, where it had rolled back
-  before. A multi-enclosure TrueNAS CORE system reports every disk placed.
+  before. A multi-enclosure system reports every disk placed.
 - #918: in the live read-only restore at `ff3594e`, the restored `0.22.2`
-  production history database (about 4.7 GB) started without the new indexes,
-  logged that 5 would be built in the background, and built them one at a
-  time in 0.3 to 25.9 seconds each, about 90 seconds in all, before the
-  controller's full history pass and the browser and performance checks.
+  history database, well past the deferral threshold, started without the new
+  indexes, logged that 5 would be built in the background, and built them one
+  at a time before the controller's full history pass and the browser and
+  performance checks.
 - #916: after a forced refresh of a system's rear enclosure, opening the
   system without choosing an enclosure still lands on its front default.
 - #919: no cleared mapping note remained in the slot-detail cache.
