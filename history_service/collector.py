@@ -115,6 +115,13 @@ class HistoryCollectionPaused(RuntimeError):
 
 
 COLLECTION_PAUSED_REASON = "The history database is damaged; collection is paused to protect it."
+# Deferred chronological index builds (#910). A failed build is retried before
+# collecting, up to this many times, then collection resumes and the build is
+# retried before each later pass: the indexes speed up reads, and history must
+# not stop for them.
+INDEX_BUILD_RETRY_SECONDS = 60.0
+INDEX_BUILD_MAX_COLLECTION_DELAYS = 3
+INDEX_BUILD_DEGRADED_REASON = "History indexes could not be built yet; history reads are slower until they are."
 
 
 def _is_missing_route(exc: HistorySourceError) -> bool:
@@ -186,7 +193,10 @@ class HistoryCollector:
             tuple[tuple[str | None, str | None, str | None], int],
         ] = {}
         self._run_lock = threading.Lock()
-        self._chronological_indexes_ready = False
+        # (st_dev, st_ino) of the hot database whose indexes are complete. An
+        # online restore publishes a new file, so its indexes are checked again.
+        self._chronological_indexes_identity: tuple[int, int] | None = None
+        self._index_build_failures = 0
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def start(self) -> None:
@@ -613,6 +623,8 @@ class HistoryCollector:
             return "The history database is read-only."
         if self.retention_consecutive_failures >= 2:
             return "History cleanup has failed twice in a row."
+        if self._index_build_failures > 0:
+            return INDEX_BUILD_DEGRADED_REASON
         return self._scope_collection_degraded_reason
 
     def status(self) -> dict[str, Any]:
@@ -752,44 +764,62 @@ class HistoryCollector:
         remaining = (self.background_backoff_until - utcnow()).total_seconds()
         return max(0, int(remaining + 0.999))
 
-    async def _build_pending_indexes(self) -> None:
+    def _history_database_identity(self) -> tuple[int, int] | None:
+        file_path = getattr(self.store, "file_path", None)
+        if not isinstance(file_path, (str, os.PathLike)):
+            return None
+        try:
+            metadata = os.stat(file_path)
+        except OSError:
+            return None
+        return int(metadata.st_dev), int(metadata.st_ino)
+
+    async def _build_pending_indexes(self) -> bool:
         """Build the chronological indexes a large upgraded database deferred (#910).
 
-        Holds the collection lock so no pass writes while SQLite's write lock is
-        taken; reads and /healthz keep answering. A failure or a stop leaves the
-        rest for the next collector pass, and reads use the older path until then.
+        Returns whether the hot database has all of them. Holds the collection
+        lock so no pass writes while SQLite's write lock is taken; reads and
+        /healthz keep answering. A failure is logged, reported as degraded, and
+        retried; reads use the older path until the build succeeds.
         """
 
-        if self._chronological_indexes_ready:
-            return
+        identity = self._history_database_identity()
+        if identity is not None and identity == self._chronological_indexes_identity:
+            return True
         reader = getattr(self.store, "pending_chronological_indexes", None)
         try:
             pending = await asyncio.to_thread(reader) if callable(reader) else ()
         except Exception:  # noqa: BLE001 - an index build must never stop collection.
             logger.exception("Could not list the history indexes still to build.")
-            return
+            self._index_build_failures += 1
+            return False
         if not isinstance(pending, tuple) or not pending:
-            self._chronological_indexes_ready = True
-            return
+            self._chronological_indexes_identity = identity
+            self._index_build_failures = 0
+            return True
         if self.collection_pause()[0]:
-            return
+            return False
         for position, name in enumerate(pending, start=1):
             if self._stopping.is_set():
-                return
+                return False
             try:
                 await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
             except HistoryCollectionAlreadyRunning:
-                return
-            except Exception as exc:  # noqa: BLE001 - retried on the next collector pass.
+                return False
+            except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_MAX_COLLECTION_DELAYS.
+                self._index_build_failures += 1
                 logger.warning(
-                    "Could not build history index %s (%s); it will be retried before the next collection.",
+                    "Could not build history index %s (%s, attempt %d); it will be retried.",
                     name,
                     type(exc).__name__,
+                    self._index_build_failures,
                 )
                 if is_database_corruption_error(exc):
                     self._pause_for_damage(exc)
-                return
-        self._chronological_indexes_ready = True
+                return False
+        self._chronological_indexes_identity = identity
+        self._index_build_failures = 0
+        return True
 
     def _build_index_blocking(self, name: str, position: int, total: int) -> None:
         if not self._run_lock.acquire(blocking=False):
@@ -819,7 +849,17 @@ class HistoryCollector:
                 self._starting = False
 
         while not self._stopping.is_set():
-            await self._build_pending_indexes()
+            if not await self._build_pending_indexes():
+                if self._stopping.is_set():
+                    break
+                if 0 < self._index_build_failures <= INDEX_BUILD_MAX_COLLECTION_DELAYS:
+                    # Retry the build before writing another pass to a database
+                    # that just refused one (#910).
+                    try:
+                        await asyncio.wait_for(self._stopping.wait(), timeout=INDEX_BUILD_RETRY_SECONDS)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
             if self.collection_running:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
                 target_interval = (

@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from history_service import store as store_module
+from history_service import collector as collector_module
 from history_service.collector import HistoryCollector
 from history_service.config import HistorySettings
 from history_service.store import CHRONOLOGICAL_INDEXES, HistoryStore
@@ -120,9 +121,113 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             self.assertFalse(collector.collection_running)
             self.assertEqual(len(store.pending_chronological_indexes()), 5)
             # The collector retries before its next pass.
-            asyncio.run(collector._build_pending_indexes())
+            self.assertTrue(asyncio.run(collector._build_pending_indexes()))
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
-            self.assertTrue(collector._chronological_indexes_ready)
+            self.assertIsNone(collector.degraded_reason())
+
+    def test_collection_waits_until_a_failed_index_build_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            events: list[str] = []
+            degraded: list[str | None] = []
+            original = store.build_chronological_index
+
+            def build(name: str) -> None:
+                if "failed" not in events:
+                    events.append("failed")
+                    raise sqlite3.OperationalError("database is locked")
+                events.append("built")
+                original(name)
+
+            def collect(**_kwargs) -> None:
+                events.append("collect")
+                degraded.append(collector.degraded_reason())
+                collector._stopping.set()
+
+            with (
+                patch.object(collector_module, "INDEX_BUILD_RETRY_SECONDS", 0.01),
+                patch.object(store, "build_chronological_index", side_effect=build),
+                patch.object(collector, "run_once", side_effect=collect),
+                self.assertLogs("history_service.collector", "WARNING"),
+            ):
+                asyncio.run(asyncio.wait_for(collector._run_loop(), timeout=30))
+
+            # No collection pass ran between the failure and the retry.
+            self.assertEqual(events, ["failed", *["built"] * 5, "collect"])
+            self.assertEqual(degraded, [None])
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+
+    def test_a_build_that_keeps_failing_does_not_stop_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            events: list[str] = []
+            degraded: list[str | None] = []
+
+            def build(name: str) -> None:
+                events.append("failed")
+                raise sqlite3.OperationalError("disk I/O")
+
+            def collect(**_kwargs) -> None:
+                events.append("collect")
+                degraded.append(collector.degraded_reason())
+                collector._stopping.set()
+
+            with (
+                patch.object(collector_module, "INDEX_BUILD_RETRY_SECONDS", 0.01),
+                patch.object(store, "build_chronological_index", side_effect=build),
+                patch.object(collector, "run_once", side_effect=collect),
+                self.assertLogs("history_service.collector", "WARNING"),
+            ):
+                asyncio.run(asyncio.wait_for(collector._run_loop(), timeout=30))
+
+            delays = collector_module.INDEX_BUILD_MAX_COLLECTION_DELAYS
+            self.assertEqual(events, ["failed"] * (delays + 1) + ["collect"])
+            self.assertEqual(degraded, [collector_module.INDEX_BUILD_DEGRADED_REASON])
+
+    def test_a_failed_index_build_is_reported_as_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(HistorySettings(sqlite_path=str(path)), store)
+            with (
+                patch.object(store, "build_chronological_index", side_effect=sqlite3.OperationalError("disk I/O")),
+                self.assertLogs("history_service.collector", "WARNING"),
+            ):
+                self.assertFalse(asyncio.run(collector._build_pending_indexes()))
+            self.assertEqual(collector.degraded_reason(), collector_module.INDEX_BUILD_DEGRADED_REASON)
+
+    def test_a_restored_database_is_checked_again(self) -> None:
+        # An online restore replaces the hot file under a running collector.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            backup = Path(directory) / "backup.sqlite3"
+            _legacy_database(path, samples=40)
+            _legacy_database(backup, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+                collector = HistoryCollector(HistorySettings(sqlite_path=str(path)), store)
+                self.assertTrue(asyncio.run(collector._build_pending_indexes()))
+                self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+                store.restore_backup(backup)
+                self.assertEqual(_indexes(path), set())
+
+                self.assertTrue(asyncio.run(collector._build_pending_indexes()))
+
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
     def test_reads_answer_while_an_index_builds(self) -> None:
         import threading
