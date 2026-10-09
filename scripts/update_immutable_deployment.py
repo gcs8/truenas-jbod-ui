@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -307,9 +308,26 @@ def _default_fetch_json(url: str) -> object:
         raise DeploymentError("inventory response is not JSON") from exc
 
 
+def _system_retention_url(url: str) -> str:
+    """Ask for totals across every enclosure and storage view of the system (#911).
+
+    Per-enclosure totals count every disk outside the default enclosure as
+    unplaced, so a healthy multi-enclosure system would always roll back.
+    Images that predate the parameter ignore it and answer enclosure totals.
+    """
+    parts = urllib.parse.urlsplit(url)
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        if key != "retention_scope"
+    ]
+    query.append(("retention_scope", "system"))
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
 def _retention_totals(fetch_json: FetchJson, url: str) -> dict[str, int]:
     """Read only the aggregate retention integers from one inventory response."""
-    payload = fetch_json(url)
+    payload = fetch_json(_system_retention_url(url))
     summary = payload.get("summary") if isinstance(payload, dict) else None
     if not isinstance(summary, dict):
         raise DeploymentError("inventory response has no summary")
@@ -1120,7 +1138,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--inventory-url",
         help=(
             "loopback main-UI /api/inventory URL; when given, activation also requires every "
-            "source disk to be represented (aggregate totals only) or rolls back"
+            "source disk to be shown by some enclosure or storage view of the system "
+            "(aggregate totals only) or rolls back"
         ),
     )
     for action in ("verify", "rollback"):

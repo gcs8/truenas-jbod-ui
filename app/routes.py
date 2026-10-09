@@ -11,7 +11,7 @@ from datetime import (
     timedelta,
     timezone,
 )
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -443,6 +443,7 @@ def build_router() -> APIRouter:
         force: bool = False,
         system_id: str | None = None,
         enclosure_id: str | None = None,
+        retention_scope: Literal["enclosure", "system"] = "enclosure",
     ) -> JSONResponse:
         service = route_service(
             system_id,
@@ -455,6 +456,17 @@ def build_router() -> APIRouter:
             allow_stale_cache=not force,
         )
         payload = snapshot.model_dump(mode="json")
+        if retention_scope == "system":
+            # The upgrade helper's disk-retention check (#911): count a disk as
+            # placed when any enclosure or storage view of the system shows it.
+            # Older images ignore the parameter and keep enclosure totals.
+            retention = await service.get_system_disk_retention(force_refresh=force)
+            payload["summary"].update(
+                source_disk_count=retention.source_disk_count,
+                rendered_unique_disk_count=retention.rendered_unique_disk_count,
+                duplicate_disk_view_count=retention.duplicate_disk_view_count,
+                unplaced_disk_count=retention.unplaced_disk_count,
+            )
         runtime_warnings = await asyncio.to_thread(runtime_warnings_for, request)
         if runtime_warnings:
             payload["warnings"] = [*runtime_warnings, *payload.get("warnings", [])]

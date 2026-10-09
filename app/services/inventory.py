@@ -61,7 +61,7 @@ from app.services.credential_authority import (
     credential_authorities_are_approved,
     ssh_credential_authorities,
 )
-from app.services.inventory_accounting import build_disk_retention_accounting
+from app.services.inventory_accounting import DiskRetentionAccounting, build_disk_retention_accounting
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -2068,6 +2068,68 @@ class InventoryService:
             system_label=self.system.label or self.system.id,
             views=runtime_views,
         )
+
+    async def get_system_disk_retention(self, *, force_refresh: bool = False) -> DiskRetentionAccounting:
+        """Retention totals across every enclosure option and storage view (#911).
+
+        The snapshot summary compares the system's source disks with one
+        enclosure's bays, so a healthy multi-enclosure system always reports
+        disks in its other enclosures or its boot and NVMe views as unplaced.
+        Here a disk counts as placed when any enclosure option or inventory-bound
+        storage view of the system renders it. Bays seen through several options
+        (a drawer view and its whole shelf, or a SES view that mirrors an
+        enclosure) are counted once.
+        """
+        default_snapshot = await self.get_snapshot(
+            force_refresh=force_refresh,
+            allow_stale_cache=not force_refresh,
+        )
+        snapshots = [default_snapshot]
+        seen_options = {default_snapshot.selected_enclosure_id}
+        for option in default_snapshot.enclosures:
+            if option.id in seen_options:
+                continue
+            seen_options.add(option.id)
+            # Sources were refreshed once for the default build; the other
+            # options reuse them instead of collecting again per enclosure.
+            result = await self._get_snapshot_result(
+                force_refresh=force_refresh,
+                selected_enclosure_id=option.id,
+                allow_stale_cache=not force_refresh,
+                force_source_refresh=False,
+            )
+            snapshots.append(result.value)
+        runtime = await self.get_storage_view_runtime(snapshot=default_snapshot)
+        source_bundle = await self._get_inventory_source_bundle(allow_stale_cache=True)
+
+        ssh_data = (
+            self._parsed_ssh_data_for_enclosure(source_bundle, default_snapshot.selected_enclosure_id)
+            if source_bundle.ssh_collected
+            else ParsedSSHData()
+        )
+        if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
+            ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
+        source_disks = self._build_storage_view_candidate_records(
+            source_bundle.raw_data,
+            ssh_data,
+            # QuantaStor filters source disks to the selected HA node; the
+            # system-wide count covers both nodes.
+            None if self.system.truenas.platform == "quantastor" else default_snapshot.selected_enclosure_id,
+            source_bundle.bmc_inventory,
+        )
+
+        rendered: dict[tuple[str | None, str | int], Any] = {}
+        for snapshot in snapshots:
+            for slot in snapshot.slots:
+                scope = resolve_physical_mapping_scope(slot.enclosure_id or snapshot.selected_enclosure_id)
+                rendered.setdefault((scope, slot.slot), slot)
+        for view in runtime.views:
+            if view.source != "inventory_binding":
+                continue
+            for runtime_slot in view.slots:
+                if runtime_slot.occupied:
+                    rendered.setdefault((f"storage-view:{view.id}", runtime_slot.slot_index), runtime_slot)
+        return build_disk_retention_accounting(source_disks=source_disks, slots=list(rendered.values()))
 
     async def get_storage_view_slot_smart_summary(
         self,

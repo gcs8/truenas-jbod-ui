@@ -215,6 +215,61 @@ class RouteContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"caller-controlled-value", body)
 
+    def test_inventory_retention_scope_system_reports_system_wide_totals(self) -> None:
+        from app.models.domain import InventorySnapshot, InventorySummary
+        from app.services.inventory_accounting import DiskRetentionAccounting
+
+        snapshot = InventorySnapshot(
+            slots=[],
+            refresh_interval_seconds=30,
+            summary=InventorySummary(
+                disk_count=36,
+                source_disk_count=36,
+                rendered_unique_disk_count=24,
+                unplaced_disk_count=12,
+            ),
+        )
+        service = MagicMock()
+        service.get_snapshot = AsyncMock(return_value=snapshot)
+        service.get_system_disk_retention = AsyncMock(
+            return_value=DiskRetentionAccounting(36, 36, 0, 0)
+        )
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        route = next(
+            route for route in app_main.create_app().routes
+            if getattr(route, "path", None) == "/api/inventory"
+        )
+        request = MagicMock()
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "runtime_warnings_for", return_value=[]),
+            patch.object(app_routes, "live_write_policy", return_value=None),
+        ):
+            enclosure = json.loads(asyncio.run(route.endpoint(request=request)).body)
+            system = json.loads(
+                asyncio.run(route.endpoint(request=request, retention_scope="system")).body
+            )
+
+        self.assertEqual(enclosure["summary"]["unplaced_disk_count"], 12)
+        service.get_system_disk_retention.assert_awaited_once_with(force_refresh=False)
+        self.assertEqual(
+            {key: system["summary"][key] for key in (
+                "source_disk_count",
+                "rendered_unique_disk_count",
+                "duplicate_disk_view_count",
+                "unplaced_disk_count",
+            )},
+            {
+                "source_disk_count": 36,
+                "rendered_unique_disk_count": 36,
+                "duplicate_disk_view_count": 0,
+                "unplaced_disk_count": 0,
+            },
+        )
+        self.assertEqual(system["summary"]["disk_count"], 36)
+        self.assertEqual(set(system["summary"]), set(enclosure["summary"]))
+
     def test_capacity_errors_map_to_retryable_503_with_their_own_retry_hint(self) -> None:
         cases = (
             (SnapshotStateBusyError(), "1", "The server is busy. Try again in a moment."),

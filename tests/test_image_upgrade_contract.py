@@ -250,7 +250,8 @@ class ImmutableRetentionCheckTests(unittest.TestCase):
         spec = replace(self.make_spec(root), inventory_url=self.INVENTORY_URL)
 
         def fetch_json(url):
-            self.assertEqual(url, self.INVENTORY_URL)
+            # #911: the check asks for totals across every enclosure and view.
+            self.assertEqual(url, self.INVENTORY_URL + "?retention_scope=system")
             answer = answers.pop(0)
             if isinstance(answer, Exception):
                 raise answer
@@ -335,6 +336,18 @@ class ImmutableRetentionCheckTests(unittest.TestCase):
             with self.assertRaises(deployment.DeploymentError) as caught:
                 update()
             self.assertIn("predates retention totals", str(caught.exception.__cause__))
+
+    def test_retention_url_asks_for_system_wide_totals(self):
+        for given, expected in (
+            ("http://127.0.0.1:8080/api/inventory",
+             "http://127.0.0.1:8080/api/inventory?retention_scope=system"),
+            ("http://127.0.0.1:8080/api/inventory?system_id=archive-core",
+             "http://127.0.0.1:8080/api/inventory?system_id=archive-core&retention_scope=system"),
+            ("http://127.0.0.1:8080/api/inventory?retention_scope=enclosure&force=true",
+             "http://127.0.0.1:8080/api/inventory?force=true&retention_scope=system"),
+        ):
+            with self.subTest(given=given):
+                self.assertEqual(deployment._system_retention_url(given), expected)
 
     def test_inventory_url_must_be_loopback(self):
         with tempfile.TemporaryDirectory() as temp:

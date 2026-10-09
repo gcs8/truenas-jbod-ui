@@ -427,6 +427,100 @@ class VirtualFallbackRetentionTests(unittest.TestCase):
         self.assertEqual(successor.summary.unplaced_disk_count, 0)
 
 
+class SystemWideRetentionTests(unittest.TestCase):
+    """#911: disks shown by another enclosure or a storage view are placed."""
+
+    @staticmethod
+    def _shelf(enclosure_id: str, disks: list[dict[str, object]]) -> dict[str, object]:
+        return synthetic_enclosure_rows(disks)[0] | {
+            "id": enclosure_id,
+            "name": f"Shelf {enclosure_id}",
+            "label": f"Shelf {enclosure_id}",
+        }
+
+    def _service(self, temp_dir: str, *, storage_views: list[dict[str, object]] | None = None):
+        system = SystemConfig(
+            id="system-a",
+            truenas=TrueNASConfig(platform="core"),
+            storage_views=storage_views or [],
+        )
+        service = build_service(Settings(systems=[system]), system, temp_dir)
+        raw_data = raw_data_for(
+            MIXED_IDENTITY_DISKS,
+            enclosures=[
+                self._shelf("enc-a", MIXED_IDENTITY_DISKS[:2]),
+                # da3 and da4 are two paths to one disk.
+                self._shelf("enc-b", MIXED_IDENTITY_DISKS[3:5]),
+            ],
+        )
+        source_bundle = AsyncMock(
+            return_value=InventorySourceBundle(
+                raw_data=raw_data,
+                ssh_outputs={},
+                ssh_collected=False,
+                warnings=[],
+                sources={"api": SourceStatus(enabled=True, ok=True)},
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+        )
+        service._get_inventory_source_bundle = source_bundle
+        return service, source_bundle
+
+    BOOT_VIEW = {
+        "id": "boot",
+        "label": "Boot",
+        "kind": "boot_devices",
+        "template_id": "satadom-pair-2",
+        "enabled": True,
+        "binding": {"mode": "serial", "device_names": ["da2"]},
+    }
+
+    def test_every_enclosure_and_storage_view_counts_as_placed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+
+            async def run():
+                default = await service.get_snapshot()
+                retention = await service.get_system_disk_retention()
+                return default, retention, await service.get_snapshot()
+
+            default, retention, default_after = asyncio.run(run())
+
+        # The default enclosure alone leaves the other shelf and the boot
+        # view's disk unplaced; that is the per-enclosure summary.
+        self.assertEqual(default.selected_enclosure_id, "enc-a")
+        self.assertEqual(default.summary.unplaced_disk_count, 3)
+        self.assertEqual(
+            (
+                retention.source_disk_count,
+                retention.rendered_unique_disk_count,
+                retention.duplicate_disk_view_count,
+                retention.unplaced_disk_count,
+            ),
+            (5, 4, 1, 0),
+        )
+        # Building the other enclosure must not move the default page.
+        self.assertEqual(default_after.selected_enclosure_id, "enc-a")
+
+    def test_a_disk_no_enclosure_or_view_shows_stays_unplaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # No storage view claims da2.
+            service, _ = self._service(temp_dir)
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.source_disk_count, 5)
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_system_totals_collect_sources_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, source_bundle = self._service(temp_dir, storage_views=[self.BOOT_VIEW])
+            asyncio.run(service.get_system_disk_retention(force_refresh=True))
+
+        forced = [call for call in source_bundle.await_args_list if call.kwargs.get("force_refresh")]
+        self.assertEqual(len(forced), 1)
+
+
 class VirtualFallbackWarningAndSourceStatusTests(unittest.TestCase):
     """Source health is tested separately from the virtual-rendering warning."""
 
