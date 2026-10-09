@@ -339,9 +339,11 @@ test("the enclosure header has one Connections button and the full page link liv
 
 test("overflow bay counts are real buttons", () => {
   assert.match(
-    functionSource("renderSasFabricSlotList"),
+    functionSource("renderSasFabricExpandToggle"),
     /<button type="button" class="sas-fabric-slot-overflow" data-sas-fabric-expand-slots=/,
   );
   assert.doesNotMatch(APP_SOURCE, /role="button" tabindex="0" data-sas-fabric-expand-slots/);
+  // #914: a "+N" marker is never a dead span.
+  assert.doesNotMatch(APP_SOURCE, /sas-fabric-bay-overflow/);
   assert.match(STYLES, /\.sas-fabric-slot-overflow \{[^}]*font: inherit;/);
 });
