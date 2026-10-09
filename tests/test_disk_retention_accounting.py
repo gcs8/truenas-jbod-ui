@@ -572,6 +572,16 @@ class SystemWideRetentionTests(unittest.TestCase):
 
         self.assertEqual(retention.unplaced_disk_count, 1)
 
+    def test_a_view_hidden_from_the_main_page_does_not_place_its_disk(self) -> None:
+        # The main page lists only enabled views shown in the main UI; a
+        # maintenance-only view is not part of the inventory an operator sees.
+        hidden = {**self.BOOT_VIEW, "render": {"show_in_main_ui": False}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service, _ = self._service(temp_dir, storage_views=[hidden])
+            retention = asyncio.run(service.get_system_disk_retention())
+
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
     def test_a_route_snapshot_is_reused_instead_of_collecting_again(self) -> None:
         # GET /api/inventory?retention_scope=system&force=true has already
         # force-refreshed one snapshot; the system totals build on it.

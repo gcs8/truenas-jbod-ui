@@ -2102,8 +2102,9 @@ class InventoryService:
         Here a disk counts as placed when any enclosure option or inventory-bound
         storage view of the system renders it. Bays seen through several options
         (a drawer view and its whole shelf, or a SES view that mirrors an
-        enclosure) are counted once. A disabled storage view renders nothing in
-        the UI, so it places nothing here either.
+        enclosure) are counted once. A disabled view, or one hidden from the
+        main page, is not part of the inventory an operator sees, so it places
+        nothing here either.
 
         ``snapshot`` is a snapshot the caller already built in this request;
         it is reused instead of collecting the sources a second time.
@@ -2170,7 +2171,12 @@ class InventoryService:
                 scope = resolve_physical_mapping_scope(slot.enclosure_id or snapshot.selected_enclosure_id)
                 rendered.setdefault((scope, slot.slot), slot)
         for view in runtime.views:
-            if view.source != "inventory_binding" or not view.enabled:
+            # The same views the main page lists (_filter_storage_view_runtime).
+            if (
+                view.source != "inventory_binding"
+                or view.enabled is False
+                or view.render.show_in_main_ui is False
+            ):
                 continue
             for runtime_slot in view.slots:
                 if runtime_slot.occupied:
