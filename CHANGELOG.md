@@ -30,6 +30,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The upgrade helper's `--inventory-url` disk check no longer rolls back
+  healthy systems with more than one enclosure. A disk now counts as placed
+  when any enclosure or storage view of the system shows it, not only the
+  default enclosure. (#917)
 - Opening a system without picking an enclosure lands on its default again.
   Refreshing another enclosure, such as Offsite SCALE's rear bays, made it
   everyone's default page. Broke in v0.23.0. (#916)
