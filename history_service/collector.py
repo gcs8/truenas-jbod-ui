@@ -186,6 +186,7 @@ class HistoryCollector:
             tuple[tuple[str | None, str | None, str | None], int],
         ] = {}
         self._run_lock = threading.Lock()
+        self._chronological_indexes_ready = False
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def start(self) -> None:
@@ -751,7 +752,61 @@ class HistoryCollector:
         remaining = (self.background_backoff_until - utcnow()).total_seconds()
         return max(0, int(remaining + 0.999))
 
+    async def _build_pending_indexes(self) -> None:
+        """Build the chronological indexes a large upgraded database deferred (#910).
+
+        Holds the collection lock so no pass writes while SQLite's write lock is
+        taken; reads and /healthz keep answering. A failure or a stop leaves the
+        rest for the next collector pass, and reads use the older path until then.
+        """
+
+        if self._chronological_indexes_ready:
+            return
+        reader = getattr(self.store, "pending_chronological_indexes", None)
+        try:
+            pending = await asyncio.to_thread(reader) if callable(reader) else ()
+        except Exception:  # noqa: BLE001 - an index build must never stop collection.
+            logger.exception("Could not list the history indexes still to build.")
+            return
+        if not isinstance(pending, tuple) or not pending:
+            self._chronological_indexes_ready = True
+            return
+        if self.collection_pause()[0]:
+            return
+        for position, name in enumerate(pending, start=1):
+            if self._stopping.is_set():
+                return
+            try:
+                await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
+            except HistoryCollectionAlreadyRunning:
+                return
+            except Exception as exc:  # noqa: BLE001 - retried on the next collector pass.
+                logger.warning(
+                    "Could not build history index %s (%s); it will be retried before the next collection.",
+                    name,
+                    type(exc).__name__,
+                )
+                if is_database_corruption_error(exc):
+                    self._pause_for_damage(exc)
+                return
+        self._chronological_indexes_ready = True
+
+    def _build_index_blocking(self, name: str, position: int, total: int) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            raise HistoryCollectionAlreadyRunning("History collection already running.")
+        self.current_collection_started_at = isoformat_utc()
+        self.current_collection_kind = "maintenance"
+        self.current_collection_activity = f"building history index {position} of {total}"
+        try:
+            self.store.build_chronological_index(name)
+        finally:
+            self.current_collection_started_at = None
+            self.current_collection_kind = None
+            self.current_collection_activity = None
+            self._run_lock.release()
+
     async def _run_loop(self) -> None:
+        await self._build_pending_indexes()
         if self.settings.startup_grace_seconds > 0:
             self._starting = True
             try:
@@ -765,6 +820,7 @@ class HistoryCollector:
                 self._starting = False
 
         while not self._stopping.is_set():
+            await self._build_pending_indexes()
             if self.collection_running:
                 logger.info("Skipping scheduled history collection because another collection pass is already running.")
                 target_interval = (

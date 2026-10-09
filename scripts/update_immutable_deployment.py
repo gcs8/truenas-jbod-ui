@@ -340,6 +340,15 @@ def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> No
         )
 
 
+def _failure_summary(error: BaseException) -> str:
+    """One bounded line for a failure; helper errors carry no secrets or identifiers."""
+
+    if isinstance(error, DeploymentError):
+        text = " ".join(str(error).split())
+        return text[:300] if text else type(error).__name__
+    return type(error).__name__
+
+
 def _validate_name(value: str, *, label: str, pattern: re.Pattern[str] = NAME_PATTERN) -> None:
     if not pattern.fullmatch(value):
         raise DeploymentError(f"invalid {label}: {value!r}")
@@ -1062,11 +1071,17 @@ def update_deployment(
             return {"status": "active", **result, "retention": receipt["retention"]}
         return {"status": "active", **result}
     except BaseException as activation_error:
+        # Name the cause (#910): "activation failed" alone hid an unhealthy
+        # container behind a first-start index build.
+        cause = _failure_summary(activation_error)
         try:
             _restore_previous(root, receipt_dir, receipt, run=run, probe=probe)
         except BaseException as rollback_error:
-            raise DeploymentError("activation failed and automatic rollback failed") from rollback_error
-        raise DeploymentError("activation failed; automatic rollback completed") from activation_error
+            raise DeploymentError(
+                f"activation failed ({cause}) and automatic rollback failed "
+                f"({_failure_summary(rollback_error)})"
+            ) from rollback_error
+        raise DeploymentError(f"activation failed ({cause}); automatic rollback completed") from activation_error
 
 
 def verify_deployment(

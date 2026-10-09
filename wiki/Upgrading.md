@@ -122,6 +122,12 @@ index step. The two nonchronological identity indexes already exist in a
 database started by v0.22.2; a released-SQL-only fixture also gains those two.
 The real `HistoryStore` constructor test checks this complete delta, released
 definitions and rows, unchanged logical schema version, and idempotent restart.
+On a hot database with more than 250,000 history rows, startup defers the
+missing indexes so the service answers its healthcheck first; the collector
+then builds them one at a time before it collects, and history reads use the
+older, slower path until they finish (#910). A 2-million-row synthetic
+database took 14.6 seconds to start without the deferral; production's
+4-million-row database took 58.7 seconds, past the healthcheck.
 Executing the schema SQL alone does not qualify startup. Existing immutable
 segments retain their exact bytes without reindexing and their older query path;
 newly sealed segments include the indexes. Index construction time and disk
