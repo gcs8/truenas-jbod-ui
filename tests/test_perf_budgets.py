@@ -538,10 +538,10 @@ print("history-store-posix-lock: PASS")
         documentation = (ROOT / "docs" / "PERFORMANCE_BUDGETS.md").read_text(encoding="utf-8")
 
         for case in baseline["cases"].values():
-            self.assertEqual(case["inlined_static_asset_bytes"], 550_407)
+            self.assertEqual(case["inlined_static_asset_bytes"], 610_353)
             self.assertEqual(case["thresholds"]["inlined_static_asset_bytes"], 2_097_152)
         self.assertIn(
-            "550,407 of 2,097,152 bytes (26.25%), leaving 1,546,745 bytes (73.75%)",
+            "610,353 of 2,097,152 bytes (29.10%), leaving 1,486,799 bytes (70.90%)",
             documentation,
         )
         self.assertIn("The 2 MiB ceiling remains unchanged", documentation)

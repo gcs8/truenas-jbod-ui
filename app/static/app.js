@@ -5631,6 +5631,7 @@
       applyHeatmapToTile(tile, heatmapContext, tile.dataset.slot);
     });
     renderHeatmapControls(heatmapContext);
+    scheduleStateChipPlacement();
     const hoveredTile = Number.isInteger(state.hoveredSlot)
       ? Array.from(grid.querySelectorAll(".slot-tile[data-slot]"))
         .find((tile) => Number(tile.dataset.slot) === state.hoveredSlot)
@@ -6390,6 +6391,8 @@
         tile.classList.remove("peer-dimmed");
       }
     });
+    // Ring tiles change with the selection, and so does the set of chips to place.
+    scheduleStateChipPlacement();
   }
 
   // Every tile kind resolves through the same delegated handlers on the grid:
@@ -6622,6 +6625,98 @@
       }
     }
     return true;
+  }
+
+  // #913: the state chip (a bay's ::after, 24px with its border) sits in the
+  // top-right corner, where many bays draw their LED or latch. Pick one spot per
+  // face that clears every bay's parts: corner, beside the latch, under the LED,
+  // mid-sled, the foot, then top-left (above an M.2 card's screw hole). If none
+  // is clear, take the one with fewest overlaps.
+  function chooseStateChipSpot(bays, size = 24, inset = 6) {
+    const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    let right = inset;
+    let top = inset;
+    bays.forEach((bay) => {
+      const corner = { left: bay.width - inset - size, top: inset, right: bay.width - inset, bottom: inset + size };
+      const blocking = bay.parts.filter((part) => overlaps(corner, part));
+      if (blocking.length) {
+        right = Math.max(right, Math.ceil(bay.width - Math.min(...blocking.map((part) => part.left))) + 4);
+        top = Math.max(top, Math.ceil(Math.max(...blocking.map((part) => part.bottom))) + 4);
+      }
+    });
+    const spots = {
+      corner: (bay) => [bay.width - inset - size, inset],
+      beside: (bay) => [bay.width - right - size, inset],
+      under: (bay) => [bay.width - inset - size, top],
+      middle: (bay) => [(bay.width - size) / 2, (bay.height - size) / 2],
+      foot: (bay) => [(bay.width - size) / 2, bay.height - 10 - size],
+      start: () => [inset, inset],
+    };
+    let best = null;
+    for (const [spot, place] of Object.entries(spots)) {
+      let hits = 0;
+      bays.forEach((bay) => {
+        const [left, chipTop] = place(bay);
+        const chip = { left, top: chipTop, right: left + size, bottom: chipTop + size };
+        if (left < 0 || chipTop < 0 || chip.right > bay.width || chip.bottom > bay.height) {
+          hits += 1;
+        }
+        hits += bay.parts.filter((part) => overlaps(chip, part)).length;
+      });
+      if (!best || hits < best.hits) {
+        best = { spot, hits, right, top };
+      }
+      if (!hits) {
+        break;
+      }
+    }
+    return best;
+  }
+
+  let stateChipFrameId = null;
+  const STATE_CHIP_OBSTACLES = [
+    ".slot-status-led, .slot-latch, .slot-number, .slot-device, .slot-pool, .slot-tertiary, .slot-heatmap-value",
+    ...["hole", "latch", "head > *", "device", "summary", "tertiary", "label-plate", "boot-chip", "boot-connector"]
+      .map((part) => `.storage-view-runtime-card-${part}`),
+  ].join(", ");
+
+  function placeStateChips() {
+    stateChipFrameId = null;
+    if (!chassisShell) {
+      return;
+    }
+    const bays = [];
+    // Selected, peer and fabric tiles draw a ring instead of a chip.
+    grid.querySelectorAll(".slot-tile[data-slot]:not(.selected, .peer-highlight, .fabric-highlight)").forEach((tile) => {
+      if (!tile.clientWidth) {
+        return;
+      }
+      const box = tile.getBoundingClientRect();
+      const left = box.left + tile.clientLeft;
+      const top = box.top + tile.clientTop;
+      const parts = [];
+      tile.querySelectorAll(STATE_CHIP_OBSTACLES).forEach((part) => {
+        const rect = part.getBoundingClientRect();
+        if (rect.width && rect.height && getComputedStyle(part).visibility !== "hidden") {
+          parts.push({ left: rect.left - left, top: rect.top - top, right: rect.right - left, bottom: rect.bottom - top });
+        }
+      });
+      bays.push({ width: tile.clientWidth, height: tile.clientHeight, parts });
+    });
+    if (!bays.length) {
+      delete chassisShell.dataset.chipSpot;
+      return;
+    }
+    const choice = chooseStateChipSpot(bays);
+    chassisShell.style.setProperty("--chip-right", `${choice.right}px`);
+    chassisShell.style.setProperty("--chip-top", `${choice.top}px`);
+    chassisShell.dataset.chipSpot = choice.spot;
+  }
+
+  function scheduleStateChipPlacement() {
+    if (stateChipFrameId === null) {
+      stateChipFrameId = requestAnimationFrame(placeStateChips);
+    }
   }
 
   // #461: a refresh used to clear the grid and recreate every tile. Renders now
@@ -11099,6 +11194,9 @@
 
   bindDelegatedGridInteractions();
   bindDelegatedGridKeyboardNavigation();
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(scheduleStateChipPlacement).observe(grid);
+  }
 
   searchBox.addEventListener("input", (event) => {
     state.search = event.target.value.trim().toLowerCase();
