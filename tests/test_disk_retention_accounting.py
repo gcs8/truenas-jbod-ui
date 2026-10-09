@@ -435,14 +435,16 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         {"system_id": "node-b", "label": "Right", "host": "192.0.2.31"},
     ]
 
-    def _retention(self, disks, slots_by_node, *, other_node=None, configured=True):
+    def _retention(
+        self, disks, slots_by_node, *, other_node=None, configured=True, default_node="node-a", nodes=None,
+    ):
         from app.config import SSHConfig
         from app.models.domain import EnclosureOption, InventorySnapshot
 
         system = SystemConfig(
             id="qs",
             truenas=TrueNASConfig(host="https://192.0.2.40", platform="quantastor"),
-            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=self.NODES if configured else []),
+            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=(nodes or self.NODES) if configured else []),
         )
         options = [EnclosureOption(id="node-a", label="Left"), EnclosureOption(id="node-b", label="Right")]
         systems = [
@@ -482,7 +484,7 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
             )
 
             async def get_snapshot(**kwargs):
-                return snapshot(kwargs.get("selected_enclosure_id") or "node-a")
+                return snapshot(kwargs.get("selected_enclosure_id") or default_node)
 
             async def get_snapshot_result(**kwargs):
                 return SimpleNamespace(value=snapshot(kwargs["selected_enclosure_id"]))
@@ -542,6 +544,34 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
                 )
                 self.assertEqual(retention.source_disk_count, 1)
                 self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_a_default_page_outside_the_configured_pair_is_left_out(self) -> None:
+        # The grid-wide default can land on another storage system; with the
+        # pair configured, that system's disks and slots are still not counted.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+            other_node="node-x",
+            default_node="node-x",
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
+
+    def test_stale_configured_node_ids_fall_back_to_the_cluster(self) -> None:
+        # Configured ids that own no enclosure in the grid (a replaced node)
+        # must not empty the pair; the selected node's cluster is used instead.
+        stale = [
+            {"system_id": "gone-1", "label": "Left", "host": "192.0.2.30"},
+            {"system_id": "gone-2", "label": "Right", "host": "192.0.2.31"},
+        ]
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-x", "sdb", "SYNTH-QS-X")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+            other_node="node-x",
+            nodes=stale,
+        )
+        self.assertEqual(retention.source_disk_count, 1)
+        self.assertEqual(retention.unplaced_disk_count, 0)
 
     def test_a_device_name_still_matches_within_its_own_node(self) -> None:
         retention = self._retention(

@@ -2203,22 +2203,23 @@ class InventoryService:
 
         options = list(default_snapshot.enclosures)
         pair: set[str] = set()
+
+        def in_pair(owner: str | None) -> bool:
+            return not pair or owner is None or owner in pair
+
         if quantastor:
-            # The grid can list another storage system's enclosures as options;
-            # only this HA pair's are its disks (#917).
+            # The grid can list another storage system's enclosures as options,
+            # and its default page can be one of them; only this HA pair's are
+            # its disks (#917).
             pair = self._quantastor_ha_pair_ids(
-                source_bundle.raw_data, node_of(default_snapshot.selected_enclosure_id),
+                source_bundle.raw_data,
+                node_of(default_snapshot.selected_enclosure_id),
+                {owner for owner in (node_of(option.id) for option in options) if owner},
             )
-            if pair:
-                options = [
-                    option for option in options
-                    if option.id == default_snapshot.selected_enclosure_id
-                    or (owner := node_of(option.id)) is None
-                    or owner in pair
-                ]
+            options = [option for option in options if in_pair(node_of(option.id))]
         if len({option.id for option in options}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
             raise SystemRetentionTooLargeError()
-        snapshots = [default_snapshot]
+        snapshots = [default_snapshot] if in_pair(node_of(default_snapshot.selected_enclosure_id)) else []
         seen_options = {default_snapshot.selected_enclosure_id}
         for option in options:
             if option.id in seen_options:
@@ -2250,7 +2251,7 @@ class InventoryService:
         nodes = list(dict.fromkeys(
             node
             for node in (node_of(default_snapshot.selected_enclosure_id), *(node_of(o.id) for o in options))
-            if node
+            if node and in_pair(node)
         ))
         if quantastor and nodes:
             # The disks of each HA node, built as that node's own page builds
@@ -2278,6 +2279,8 @@ class InventoryService:
         for snapshot in snapshots:
             for slot in snapshot.slots:
                 option_id = slot.enclosure_id or snapshot.selected_enclosure_id
+                if not in_pair(node_of(option_id)):
+                    continue
                 scope = resolve_physical_mapping_scope(option_id)
                 rendered.setdefault((scope, slot.slot), (slot, node_of(option_id)))
         for view in runtime.views:
@@ -2289,7 +2292,7 @@ class InventoryService:
             ):
                 continue
             view_node = node_of(view.binding.target_system_id or default_snapshot.selected_enclosure_id)
-            if pair and view_node is not None and view_node not in pair:
+            if not in_pair(view_node):
                 continue
             for runtime_slot in view.slots:
                 if runtime_slot.occupied:
@@ -2303,20 +2306,26 @@ class InventoryService:
             slot_scopes=[node for _slot, node in rendered.values()] if quantastor else None,
         )
 
-    def _quantastor_ha_pair_ids(self, raw_data: TrueNASRawData, selected_owner: str | None) -> set[str]:
+    def _quantastor_ha_pair_ids(
+        self,
+        raw_data: TrueNASRawData,
+        selected_owner: str | None,
+        option_owners: set[str],
+    ) -> set[str]:
         """The storage systems of this deployment's HA pair (#917).
 
-        The configured HA node ids when there are any; otherwise the members of
-        the selected node's QuantaStor cluster, or just the selected node. An
-        empty set means the pair could not be identified.
+        The configured HA node ids, when any of them owns an enclosure the grid
+        reports; the grid-wide default page does not add its owner. Otherwise
+        the members of the selected node's QuantaStor cluster, or just the
+        selected node. An empty set means the pair could not be identified.
         """
         configured = {
             node_id
             for node_id in (normalize_value_text(node.system_id) for node in self.system.ssh.ha_nodes or [])
             if node_id
         }
-        if configured:
-            return configured | ({selected_owner} if selected_owner else set())
+        if configured & option_owners:
+            return configured
         if not selected_owner:
             return set()
         cluster_of = {
