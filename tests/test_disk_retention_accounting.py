@@ -427,6 +427,97 @@ class VirtualFallbackRetentionTests(unittest.TestCase):
         self.assertEqual(successor.summary.unplaced_disk_count, 0)
 
 
+class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
+    """#917: device names are node-local on a QuantaStor HA pair."""
+
+    NODES = [
+        {"system_id": "node-a", "label": "Left", "host": "192.0.2.30"},
+        {"system_id": "node-b", "label": "Right", "host": "192.0.2.31"},
+    ]
+
+    def _retention(self, disks, slots_by_node):
+        from app.config import SSHConfig
+        from app.models.domain import EnclosureOption, InventorySnapshot
+
+        system = SystemConfig(
+            id="qs",
+            truenas=TrueNASConfig(host="https://192.0.2.40", platform="quantastor"),
+            ssh=SSHConfig(enabled=False, ha_enabled=True, ha_nodes=self.NODES),
+        )
+        options = [EnclosureOption(id="node-a", label="Left"), EnclosureOption(id="node-b", label="Right")]
+
+        def snapshot(node):
+            return InventorySnapshot(
+                slots=[
+                    SlotView(slot=index, slot_label=str(index), row_index=0, column_index=index,
+                             present=True, enclosure_id=node, **fields)
+                    for index, fields in enumerate(slots_by_node.get(node, []))
+                ],
+                refresh_interval_seconds=30,
+                selected_enclosure_id=node,
+                enclosures=options,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=InventorySourceBundle(
+                    raw_data=TrueNASRawData(
+                        enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+                        systems=[
+                            {"id": "node-a", "name": "Left", "storageSystemClusterId": "c"},
+                            {"id": "node-b", "name": "Right", "storageSystemClusterId": "c", "isMaster": True},
+                        ],
+                    ),
+                    ssh_outputs={}, ssh_collected=False, warnings=[],
+                    sources={"api": SourceStatus(enabled=True, ok=True)},
+                    scale_ses_data=ParsedSSHData(), quantastor_ses_data=ParsedSSHData(),
+                )
+            )
+
+            async def get_snapshot(**kwargs):
+                return snapshot(kwargs.get("selected_enclosure_id") or "node-a")
+
+            async def get_snapshot_result(**kwargs):
+                return SimpleNamespace(value=snapshot(kwargs["selected_enclosure_id"]))
+
+            service.get_snapshot = get_snapshot
+            service._get_snapshot_result = get_snapshot_result
+            return asyncio.run(service.get_system_disk_retention())
+
+    @staticmethod
+    def _disk(node, path, serial=None):
+        disk = {"id": f"{node}-{path}", "storageSystemId": node, "devicePath": f"/dev/{path}", "size": 1000}
+        if serial:
+            disk["serialNumber"] = serial
+        return disk
+
+    def test_the_same_device_name_on_two_nodes_is_two_disks(self) -> None:
+        # Each node has a different disk at /dev/sda; node-b's is shown nowhere.
+        retention = self._retention(
+            [self._disk("node-a", "sda", "SYNTH-QS-A"), self._disk("node-b", "sda", "SYNTH-QS-B")],
+            {"node-a": [{"device_name": "sda", "serial": "SYNTH-QS-A"}]},
+        )
+        self.assertEqual(retention.source_disk_count, 2)
+        self.assertEqual(retention.unplaced_disk_count, 1)
+
+    def test_a_shared_disk_seen_from_both_nodes_is_one_placed_disk(self) -> None:
+        retention = self._retention(
+            [self._disk("node-a", "sdc", "SYNTH-QS-SHARED"), self._disk("node-b", "sdf", "SYNTH-QS-SHARED")],
+            {"node-b": [{"device_name": "sdf", "serial": "SYNTH-QS-SHARED"}]},
+        )
+        self.assertEqual(retention.unplaced_disk_count, 0)
+        self.assertEqual(retention.rendered_unique_disk_count, 1)
+
+    def test_a_device_name_still_matches_within_its_own_node(self) -> None:
+        retention = self._retention(
+            [self._disk("node-a", "sdb"), self._disk("node-b", "sdb")],
+            {"node-a": [{"device_name": "sdb"}], "node-b": [{"device_name": "sdb"}]},
+        )
+        self.assertEqual(retention.unplaced_disk_count, 0)
+        self.assertEqual(retention.rendered_unique_disk_count, 2)
+
+
 class SystemWideRetentionTests(unittest.TestCase):
     """#911: disks shown by another enclosure or a storage view are placed."""
 

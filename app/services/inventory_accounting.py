@@ -42,6 +42,7 @@ __all__ = [
     "build_disk_retention_accounting",
     "disk_record_identity_tokens",
     "logical_disk_identity_tokens",
+    "scope_node_local_tokens",
     "slot_identity_tokens",
 ]
 
@@ -142,6 +143,27 @@ def disk_record_identity_tokens(disk: Any) -> frozenset[str]:
     )
 
 
+def scope_node_local_tokens(tokens: frozenset[str], scope: str | None) -> frozenset[str]:
+    """Namespace node-local identity tokens under ``scope`` (#917).
+
+    On a QuantaStor HA pair each node names its own disks, so ``/dev/sda`` on
+    one node and ``/dev/sda`` on the other can be different disks. Device names,
+    and a GPT identifier that is only a device path, are qualified by the node;
+    serials, LUN ids and real persistent identifiers stay global, so a shared
+    disk seen from both nodes is still one disk.
+    """
+    if scope is None:
+        return tokens
+    device_values = {token[len("dev:"):] for token in tokens if token.startswith("dev:")}
+    scoped: set[str] = set()
+    for token in tokens:
+        node_local = token.startswith("dev:") or (
+            token.startswith("gptid:") and token[len("gptid:"):] in device_values
+        )
+        scoped.add(f"node[{scope}]/{token}" if node_local else token)
+    return frozenset(scoped)
+
+
 @dataclass(frozen=True, slots=True)
 class DiskRetentionAccounting:
     """Bounded totals proving every source disk reached the rendered view."""
@@ -184,15 +206,34 @@ def build_disk_retention_accounting(
     *,
     source_disks: Sequence[Any],
     slots: Sequence[Any],
+    source_scopes: Sequence[str | None] | None = None,
+    slot_scopes: Sequence[str | None] | None = None,
 ) -> DiskRetentionAccounting:
     """Reconcile the rendered inventory against the platform's source disks.
 
     A source disk that carries no usable identifier is reported as unplaced: it
     cannot be proven to have reached the rendered view, and a release gate must
     fail closed rather than assume retention.
+
+    ``source_scopes`` and ``slot_scopes``, when given, name the node each
+    record or slot was read from; see scope_node_local_tokens.
     """
-    source_tokens = [disk_record_identity_tokens(disk) for disk in source_disks]
-    rendered_tokens = [tokens for tokens in (slot_identity_tokens(slot) for slot in slots) if tokens]
+    source_scope_list = list(source_scopes) if source_scopes is not None else [None] * len(source_disks)
+    slot_scope_list = list(slot_scopes) if slot_scopes is not None else [None] * len(slots)
+    if len(source_scope_list) != len(source_disks) or len(slot_scope_list) != len(slots):
+        raise ValueError("one scope is required per source disk and per slot")
+    source_tokens = [
+        scope_node_local_tokens(disk_record_identity_tokens(disk), scope)
+        for disk, scope in zip(source_disks, source_scope_list)
+    ]
+    rendered_tokens = [
+        tokens
+        for tokens in (
+            scope_node_local_tokens(slot_identity_tokens(slot), scope)
+            for slot, scope in zip(slots, slot_scope_list)
+        )
+        if tokens
+    ]
 
     classes = _Classes()
     for tokens in (*source_tokens, *rendered_tokens):

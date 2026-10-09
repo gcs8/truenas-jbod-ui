@@ -2222,11 +2222,26 @@ class InventoryService:
             source_bundle.bmc_inventory,
         )
 
-        rendered: dict[tuple[str | None, str | int], Any] = {}
+        # On a QuantaStor HA pair device names are node-local, so each record
+        # and each rendered slot carries the node it was read from (#917).
+        quantastor = self.system.truenas.platform == "quantastor"
+        owner_ids: dict[str, str] = {}
+        if quantastor:
+            owner_ids, _rows_by_owner = self._index_quantastor_hw_enclosures(source_bundle.raw_data)
+
+        def node_of(option_id: str | None) -> str | None:
+            if not quantastor or not option_id:
+                return None
+            return self._quantastor_option_owner_id(
+                source_bundle.raw_data, option_id, enclosure_owner_ids=owner_ids,
+            )
+
+        rendered: dict[tuple[str | None, str | int], tuple[Any, str | None]] = {}
         for snapshot in snapshots:
             for slot in snapshot.slots:
-                scope = resolve_physical_mapping_scope(slot.enclosure_id or snapshot.selected_enclosure_id)
-                rendered.setdefault((scope, slot.slot), slot)
+                option_id = slot.enclosure_id or snapshot.selected_enclosure_id
+                scope = resolve_physical_mapping_scope(option_id)
+                rendered.setdefault((scope, slot.slot), (slot, node_of(option_id)))
         for view in runtime.views:
             # The same views the main page lists (_filter_storage_view_runtime).
             if (
@@ -2235,10 +2250,26 @@ class InventoryService:
                 or view.render.show_in_main_ui is False
             ):
                 continue
+            view_node = node_of(view.binding.target_system_id or default_snapshot.selected_enclosure_id)
             for runtime_slot in view.slots:
                 if runtime_slot.occupied:
-                    rendered.setdefault((f"storage-view:{view.id}", runtime_slot.slot_index), runtime_slot)
-        return build_disk_retention_accounting(source_disks=source_disks, slots=list(rendered.values()))
+                    rendered.setdefault(
+                        (f"storage-view:{view.id}", runtime_slot.slot_index), (runtime_slot, view_node),
+                    )
+        return build_disk_retention_accounting(
+            source_disks=source_disks,
+            slots=[slot for slot, _node in rendered.values()],
+            source_scopes=(
+                [self._quantastor_record_owner_id(disk.raw) for disk in source_disks] if quantastor else None
+            ),
+            slot_scopes=[node for _slot, node in rendered.values()] if quantastor else None,
+        )
+
+    @staticmethod
+    def _quantastor_record_owner_id(raw: dict[str, Any]) -> str | None:
+        """The HA node a QuantaStor disk record was reported by, as the builder reads it."""
+        value = raw.get("storageSystemId") or raw.get("systemId") or raw.get("controllerId")
+        return normalize_text(str(value)) if value is not None else None
 
     async def get_storage_view_slot_smart_summary(
         self,
