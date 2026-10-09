@@ -30,6 +30,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A cleared bay mapping's note no longer comes back after a refresh or in
+  later exports. The slot-detail cache now keeps only facts about the
+  disk. (#919)
 - Opening a system without picking an enclosure lands on its default again.
   Refreshing another enclosure, such as Offsite SCALE's rear bays, made it
   everyone's default page. Broke in v0.23.0. (#916)

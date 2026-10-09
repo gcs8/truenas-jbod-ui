@@ -354,10 +354,13 @@ STABLE_SLOT_DETAIL_FIELDS = (
     "enclosure_label",
     "enclosure_name",
     "enclosure_identifier",
-    "mapping_source",
-    "notes",
-    "operator_context",
 )
+# The slot-detail cache keeps facts about the disk only. A mapping's note, how
+# this observation was resolved, and HA ownership context belong to the mapping
+# store and the live inventory; restoring them from the cache brought a cleared
+# note back to its bay (#909). Caches written before that may still hold these
+# keys, so the backfill only ever reads STABLE_SLOT_DETAIL_FIELDS and the next
+# write of each entry drops them.
 # Only the strong tier proves which disk occupies a bay: a serial, a logical
 # unit id and a gptid all belong to the disk and travel with it. sas_address is
 # bay-scoped - the expander reports the same address for whatever is plugged in
