@@ -13,7 +13,7 @@ import yaml
 
 from admin_service.config import get_admin_settings
 from app.config import ENV_OVERRIDES as APP_ENV_OVERRIDES
-from app.config import AppConfig, build_unknown_config_key_warnings, get_settings, save_runtime_behavior_overrides
+from app.config import AppConfig, SystemConfig, build_unknown_config_key_warnings, get_settings, save_runtime_behavior_overrides
 from app.config_errors import ConfigurationError
 from app.read_ui_auth_config import load_read_ui_auth_settings
 from history_service.config import get_history_settings
@@ -60,6 +60,25 @@ class _LoaderTestCase(unittest.TestCase):
                 _clear_loader_caches()
                 yield history_dir
             _clear_loader_caches()
+
+
+class SystemViewOrderConfigTests(unittest.TestCase):
+    def test_view_order_is_normalized_deduplicated_and_bounded(self) -> None:
+        raw_order = [
+            " view:boot ",
+            "enclosure:enc-a",
+            "view:boot",
+            "invalid",
+            "view:",
+            *[f"view:synthetic-{index}" for index in range(200)],
+        ]
+
+        system = SystemConfig(view_order=raw_order)
+
+        self.assertEqual(system.view_order[:2], ["view:boot", "enclosure:enc-a"])
+        self.assertNotIn("invalid", system.view_order)
+        self.assertNotIn("view:", system.view_order)
+        self.assertEqual(len(system.view_order), 128)
 
 
 class SettingsAcquisitionTests(_LoaderTestCase):

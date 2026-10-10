@@ -52,6 +52,7 @@ from app.services.inventory import (
     LINUX_ENCLOSURE_SYSFS_MAP_COMMAND,
     build_lunid_alias_tiers,
     build_lunid_aliases,
+    effective_main_view_order,
     index_disks_by_sas,
     infer_slot_count_from_layout,
     lunid_alias_tier_sets,
@@ -1286,6 +1287,60 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InventoryHelpersTests(unittest.TestCase):
+    def test_effective_main_view_order_uses_disk_counts_and_tie_rules(self) -> None:
+        order = effective_main_view_order(
+            enclosure_counts=[("enc-a", 4), ("enc-b", 9), ("enc-c", 4)],
+            view_counts=[("primary-chassis", 9), ("boot", 2), ("nvme", 4)],
+        )
+
+        self.assertEqual(
+            order,
+            [
+                "enclosure:enc-b",
+                "view:primary-chassis",
+                "enclosure:enc-a",
+                "enclosure:enc-c",
+                "view:nvme",
+                "view:boot",
+            ],
+        )
+
+    def test_effective_main_view_order_applies_partial_saved_order_and_skips_stale_entries(self) -> None:
+        order = effective_main_view_order(
+            enclosure_counts=[("enc-a", 4), ("enc-b", 9)],
+            view_counts=[("boot", 2), ("nvme", 4)],
+            saved_order=["view:boot", "enclosure:retired", "view:boot", "enclosure:enc-a"],
+        )
+
+        self.assertEqual(
+            order,
+            ["view:boot", "enclosure:enc-a", "enclosure:enc-b", "view:nvme"],
+        )
+
+    def test_effective_main_view_order_prefers_primary_chassis_only_for_automatic_ha_order(self) -> None:
+        automatic = effective_main_view_order(
+            enclosure_counts=[("node-a", 9), ("node-b", 9)],
+            view_counts=[("primary-chassis", 9), ("boot", 2)],
+            ha_primary_view_id="primary-chassis",
+            ha_owner_enclosure_id="node-b",
+        )
+        explicit = effective_main_view_order(
+            enclosure_counts=[("node-a", 9), ("node-b", 9)],
+            view_counts=[("primary-chassis", 9), ("boot", 2)],
+            saved_order=["enclosure:node-a"],
+            ha_primary_view_id="primary-chassis",
+            ha_owner_enclosure_id="node-b",
+        )
+        without_primary = effective_main_view_order(
+            enclosure_counts=[("node-a", 9), ("node-b", 9)],
+            view_counts=[("boot", 2)],
+            ha_owner_enclosure_id="node-b",
+        )
+
+        self.assertEqual(automatic[0], "view:primary-chassis")
+        self.assertEqual(explicit[0], "enclosure:node-a")
+        self.assertEqual(without_primary[0], "enclosure:node-b")
+
     def test_quantastor_floating_alias_is_never_a_node_host_but_bonds_and_vlans_are(self) -> None:
         extract = InventoryService._extract_quantastor_gateway_port_host
         port = {"name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"}
