@@ -32,7 +32,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Stopped the Connections panel from narrowing the map before an operator picked
   a bay, path or node, and let repeated clicks, Show all and Escape restore every
-  bay without hiding fault states.
+  bay without hiding fault states. (#931)
 
 ## v0.24.0-beta.2 - 2026-10-09
 
