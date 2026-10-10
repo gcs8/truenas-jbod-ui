@@ -1399,6 +1399,25 @@ class SnapshotExportService:
                 )
                 for original, exported in zip(storage_view_runtime.views, storage_view_runtime_for_export.views, strict=True):
                     exported.id = storage_view_aliases[original.id]
+
+                # Map order entries from the original ids. Token redaction can
+                # rewrite a view id that equals an enclosure id to the
+                # enclosure alias, which no longer keys storage_view_aliases.
+                def export_order_entry(entry: str) -> str:
+                    if entry.startswith("view:"):
+                        view_id = entry.removeprefix("view:")
+                        if view_id in storage_view_aliases:
+                            return f"view:{storage_view_aliases[view_id]}"
+                    return redactor.redact_object({"view_order": [entry]})["view_order"][0]
+
+                storage_view_runtime_for_export.view_order = [
+                    export_order_entry(item) for item in storage_view_runtime.view_order
+                ]
+                storage_view_runtime_for_export.default_selection = (
+                    export_order_entry(storage_view_runtime.default_selection)
+                    if storage_view_runtime.default_selection
+                    else storage_view_runtime.default_selection
+                )
             storage_view_smart_summary_cache_for_export = {
                 storage_view_aliases.get(view_id, view_id): redactor.redact_object(slot_cache)
                 for view_id, slot_cache in storage_view_smart_summary_cache_for_export.items()

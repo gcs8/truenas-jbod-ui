@@ -459,6 +459,7 @@ test("a hung status observation is aborted by the per-poll timeout", async () =>
     runtimeActionControllers: new Map(),
   };
   let getCalls = 0;
+  let pollAborted = false;
   const functions = loadRuntimeFunctions({
     state,
     elements: { runtimeCards: { querySelectorAll: () => [uiButton] } },
@@ -470,9 +471,10 @@ test("a hung status observation is aborted by the per-poll timeout", async () =>
       return new Promise((_resolve, reject) => {
         const fallbackTimer = setTimeout(
           () => reject(new Error("test fallback: request was not aborted")),
-          100
+          1000
         );
         options.signal?.addEventListener("abort", () => {
+          pollAborted = true;
           clearTimeout(fallbackTimer);
           reject(new DOMException("Aborted", "AbortError"));
         }, { once: true });
@@ -485,18 +487,16 @@ test("a hung status observation is aborted by the per-poll timeout", async () =>
     encodeURIComponent,
   });
 
-  const startedAt = Date.now();
   const succeeded = await functions.runRuntimeAction("ui", "restart", {
     maxAttempts: 1,
     pollIntervalMs: 0,
     pollTimeoutMs: 10,
     sleep: noDelay,
   });
-  const elapsedMs = Date.now() - startedAt;
 
   assert.equal(succeeded, false);
   assert.equal(getCalls, 1);
-  assert.ok(elapsedMs < 80, `hung poll should abort promptly, elapsed=${elapsedMs}ms`);
+  assert.equal(pollAborted, true, "hung poll should be aborted by its own timeout");
   assert.ok(
     banners.some(([message, tone]) =>
       tone === "error" && /status request timed out after 10 ms/i.test(message)

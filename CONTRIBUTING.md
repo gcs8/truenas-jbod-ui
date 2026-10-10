@@ -229,9 +229,12 @@ test boundary. On Windows, use the project virtualenv interpreter when present:
 Windows runs the centrally classified portable Python suite. It explicitly
 skips and names suites that transitively import the POSIX-only `fcntl` backup
 path or assert POSIX ownership, permission, link, descriptor, or process-ID
-semantics. Do not replace that honest result with full unittest discovery or
-claim those POSIX contracts were validated on Windows. Run the POSIX CI/Linux
-gate for their coverage.
+semantics. Suites that assert sub-200ms cancellation or transport deadlines are
+also excluded because that timing is not reliable under the Windows event loop.
+The performance baseline is skipped because its history-store fixture requires
+POSIX directory-descriptor inspection. Do not replace that honest result with
+full unittest discovery or claim those POSIX contracts were validated on
+Windows. Run the POSIX CI/Linux gate for their coverage.
 
 Windows, including running the app under Docker Desktop, is best-effort. CI has
 no Windows runner and no native Windows `dev_check.py --safe` run is recorded,
@@ -258,10 +261,10 @@ python scripts/build_perf_baseline.py --check
 promtool check rules prometheus/rules/truenas-jbod-ui-alerts-v1.yml
 ```
 
-The exact source-gate set, including the performance baseline, is shared with CI
-and declared fail-closed against `.github/workflows/ci.yml`. `--full` runs the
-same safe, local, no-live-data source gates plus the checked-in public-demo
-artifact check. Set
+The exact source-gate set is shared with CI and declared fail-closed against
+`.github/workflows/ci.yml`; the Windows plan keeps the nonportable performance
+baseline visible as an explicit skip. `--full` runs the same safe, local,
+no-live-data source gates plus the checked-in public-demo artifact check. Set
 `PROMTOOL_BINARY` to an installed executable when it is not on `PATH`.
 
 Install dev-only validation tools before running the wrapper or coverage command

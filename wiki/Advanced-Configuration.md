@@ -185,6 +185,38 @@ systems:
         - sudo -n /usr/bin/sg_ses -p ec /dev/sg38
 ```
 
+## Opening view order
+
+Each system can store a flat `view_order` containing both live enclosures and
+saved storage views. Admin exposes the same setting under **Storage views →
+Opening view order**.
+
+```yaml
+systems:
+  - id: example-scale
+    view_order:
+      - view:primary-chassis
+      - enclosure:enclosure-a
+      - view:boot-devices
+```
+
+Use `enclosure:<id>` for a discovered enclosure and `view:<id>` for a saved or
+implicit storage view. The first available entry opens when the system loads.
+An explicit `enclosure_id` or `storage_view_id` in the URL still wins.
+
+The list may be partial: missing entries are appended automatically, duplicate
+or stale entries are ignored, and **Reset to automatic** stores an empty list.
+Without an explicit order, the app sorts every available entry by occupied disk
+count descending, keeps enclosures ahead of storage views when counts tie, and
+otherwise preserves the existing order within each kind. The computed ranking
+uses the already collected inventory source bundle and is recomputed after that
+source refreshes.
+
+On QuantaStor HA systems, automatic order promotes **Primary Chassis** when that
+view exists, and that view follows the current pool-owner node. Without a
+Primary Chassis view, the owner enclosure is promoted instead. A non-empty
+administrator order takes precedence over this HA promotion.
+
 ## App tuning knobs
 
 Useful app-level settings:

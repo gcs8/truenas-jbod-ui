@@ -19,7 +19,7 @@ from starlette.requests import Request
 
 import app.services.snapshot_export as snapshot_export
 from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
-from app.route_support import templates
+from app.route_support import _filter_storage_view_runtime, templates
 from app.models.domain import (
     EnclosureOption,
     EnclosureProfileView,
@@ -605,6 +605,28 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_export_cache_default_has_a_shared_byte_budget(self) -> None:
         self.assertEqual(Settings().app.export_cache_max_bytes, 32 * 1024 * 1024)
+
+    def test_filtered_runtime_drops_excluded_view_order_and_default_ids(self) -> None:
+        runtime = StorageViewRuntimePayload(
+            system_id="synthetic",
+            view_order=["view:private-view", "enclosure:front", "view:exported-view"],
+            default_selection="view:private-view",
+            views=[
+                StorageViewRuntimeView(
+                    id=view_id,
+                    label=view_id,
+                    kind="manual",
+                    template_id="manual-4",
+                )
+                for view_id in ("private-view", "exported-view")
+            ],
+        )
+
+        filtered = _filter_storage_view_runtime(runtime, ["exported-view"])
+
+        self.assertEqual([view.id for view in filtered.views], ["exported-view"])
+        self.assertEqual(filtered.view_order, ["enclosure:front", "view:exported-view"])
+        self.assertIsNone(filtered.default_selection)
 
     def test_export_cache_shared_byte_budget_accepts_environment_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
@@ -3142,7 +3164,8 @@ class SnapshotRedactorHostnameFormTests(unittest.TestCase):
 
 
 async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
-                                        scope_kind="virtual", redact=False, selected_view="boot"):
+                                        scope_kind="virtual", redact=False, selected_view="boot",
+                                        bound_view_id="bound"):
     """Real disposable store -> route -> client -> HTML, with only transport replaced."""
     from contextlib import closing
 
@@ -3162,6 +3185,8 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
     rear.slots[0].enclosure_id = "rear"
     runtime = StorageViewRuntimePayload(
         system_id=snapshot.selected_system_id,
+        view_order=["view:boot", "enclosure:front", "view:nvme", f"view:{bound_view_id}"],
+        default_selection=f"view:{bound_view_id}",
         views=[StorageViewRuntimeView(
             id=view_id, label=f"Synthetic {view_id}", kind=kind, template_id=template,
             slot_layout=[[0]], slot_count=1, matched_count=1,
@@ -3169,13 +3194,15 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
             slots=[StorageViewRuntimeSlot(
                 slot_index=0, slot_label="00", occupied=True, state="matched",
                 source="snapshot_slot" if bound else "inventory_candidate",
-                snapshot_slot=0 if bound else None, device_name="disk0",
+                snapshot_slot=0 if bound else None,
+                snapshot_enclosure_id="front" if bound else None,
+                device_name="disk0",
                 serial=f"SANITIZED-EXPORT-{view_id.upper()}", temperature_c=temperature,
             )],
         ) for view_id, kind, template, bound, temperature in (
             ("boot", "boot_devices", "boot-devices-2", False, 41),
             ("nvme", "nvme_carrier", "nvme-4", False, 42),
-            ("bound", "boot_devices", "boot-devices-2", True, 37),
+            (bound_view_id, "boot_devices", "boot-devices-2", True, 37),
         )],
     )
     enclosures = ["front"]
@@ -3341,6 +3368,14 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                     rendered, _, _ = await build_bounded_history_fixture(redact=redact, selected_view=selected)
                     runtime = json.loads(re.search(r"storageViewsRuntime: (.*),\n", rendered.html)[1])
                     self.assertEqual(len({view["id"] for view in runtime["views"]}), 3)
+                    runtime_view_ids = {view["id"] for view in runtime["views"]}
+                    ordered_view_ids = {
+                        item.removeprefix("view:")
+                        for item in runtime["view_order"]
+                        if item.startswith("view:")
+                    }
+                    self.assertEqual(ordered_view_ids, runtime_view_ids)
+                    self.assertIn(runtime["default_selection"].removeprefix("view:"), runtime_view_ids)
                     targets = []
                     for view in runtime["views"]:
                         slot = view["slots"][0]
@@ -3352,8 +3387,26 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(rendered.export_meta["selected_storage_view_id"],
                                      runtime["views"][("boot", "nvme", "bound").index(selected)]["id"])
                     if redact:
+                        self.assertTrue({"boot", "nvme", "bound"}.isdisjoint(runtime_view_ids))
                         self.assertNotIn("host.example.test", rendered.html)
                         self.assertNotIn('"enclosure_id": "front"', rendered.html)
+
+    async def test_redacted_view_order_survives_view_id_equal_to_enclosure_id(self) -> None:
+        # A saved view may share its id with a physical enclosure. Token
+        # redaction must not rewrite that view's order entry to the enclosure
+        # alias before the storage-view alias lookup.
+        rendered, _, _ = await build_bounded_history_fixture(redact=True, bound_view_id="front")
+        runtime = json.loads(re.search(r"storageViewsRuntime: (.*),\n", rendered.html)[1])
+        exported_ids = [view["id"] for view in runtime["views"]]
+        self.assertEqual(len(set(exported_ids)), 3)
+        self.assertNotIn("front", exported_ids)
+        self.assertEqual(
+            runtime["view_order"],
+            [f"view:{exported_ids[0]}", runtime["view_order"][1], f"view:{exported_ids[1]}", f"view:{exported_ids[2]}"],
+        )
+        self.assertTrue(runtime["view_order"][1].startswith("enclosure:"))
+        self.assertNotEqual(runtime["view_order"][1].removeprefix("enclosure:"), exported_ids[2])
+        self.assertEqual(runtime["default_selection"], f"view:{exported_ids[2]}")
 
     async def test_real_bulk_handler_store_client_export_keeps_available_history_and_identity(self) -> None:
         snapshot = build_snapshot()

@@ -881,6 +881,59 @@ h3 {
   margin: 0 14px 14px;
 }
 
+.view-order-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.view-order-list {
+  display: grid;
+  gap: 8px;
+}
+
+.view-order-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid rgba(120, 159, 196, 0.18);
+  border-radius: 12px;
+  background: rgba(12, 27, 41, 0.7);
+}
+
+.view-order-position {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.view-order-label {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.view-order-label strong,
+.view-order-label small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.view-order-label small {
+  color: var(--muted);
+}
+
+.view-order-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .storage-view-layout {
   display: grid;
   grid-template-columns: minmax(240px, 0.82fr) minmax(0, 1.18fr);

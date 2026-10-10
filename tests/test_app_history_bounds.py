@@ -123,9 +123,10 @@ class AppHistoryBoundsTests(unittest.TestCase):
         route = self._route("/api/storage-views/{view_id}/history")
         runtime_view = SimpleNamespace(
             id="view-a",
+            source="selected_enclosure_snapshot",
             backing_enclosure_id="front",
             slots=[
-                SimpleNamespace(slot_index=0, snapshot_slot=5, snapshot_enclosure_id=None),
+                SimpleNamespace(slot_index=0, snapshot_slot=5, snapshot_enclosure_id="front"),
                 SimpleNamespace(slot_index=1, snapshot_slot=None, snapshot_enclosure_id=None),
             ],
         )
@@ -151,7 +152,7 @@ class AppHistoryBoundsTests(unittest.TestCase):
                 route.endpoint(
                     view_id="view-a",
                     system_id=None,
-                    enclosure_id=None,
+                    enclosure_id="page-enclosure",
                     window_hours=24,
                     metrics=["temperature_c"],
                     event_limit=0,

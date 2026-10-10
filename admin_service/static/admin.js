@@ -41,6 +41,9 @@
       detail: "No saved TLS certificate bundle has been validated for this host yet.",
     },
     storageViews: [],
+    viewOrder: [],
+    automaticViewOrder: null,
+    automaticViewOrderSystemId: null,
     storageViewCandidates: [],
     storageViewCandidatesLoading: false,
     storageViewCandidatesSystemId: null,
@@ -251,6 +254,9 @@
     setupStorageViewHelp: document.getElementById("setup-storage-view-help"),
     setupStorageViewCount: document.getElementById("setup-storage-view-count"),
     setupStorageViewList: document.getElementById("setup-storage-view-list"),
+    setupViewOrderList: document.getElementById("setup-view-order-list"),
+    setupViewOrderStatus: document.getElementById("setup-view-order-status"),
+    setupViewOrderResetButton: document.getElementById("setup-view-order-reset-button"),
     setupStorageViewTemplateBadge: document.getElementById("setup-storage-view-template-badge"),
     setupStorageViewEmpty: document.getElementById("setup-storage-view-empty"),
     setupStorageViewEditor: document.getElementById("setup-storage-view-editor"),
@@ -1783,6 +1789,14 @@
     return Array.isArray(state.liveEnclosures) ? state.liveEnclosures : [];
   }
 
+  function currentAutomaticViewOrder() {
+    const systemId = currentStorageViewSystemId();
+    if (!systemId || state.automaticViewOrderSystemId !== systemId) {
+      return null;
+    }
+    return Array.isArray(state.automaticViewOrder) ? state.automaticViewOrder : null;
+  }
+
   function liveEnclosureMatchesForProfile(profileId) {
     const normalizedProfileId = String(profileId || "");
     if (!normalizedProfileId) {
@@ -3183,7 +3197,104 @@
     `;
   }
 
+  function orderedAdminViewEntries(enclosures, storageViews, savedOrder = [], automaticOrder = []) {
+    const entries = [
+      ...enclosures.map((enclosure) => ({
+        key: `enclosure:${enclosure.id}`,
+        kind: "Enclosure",
+        label: enclosure.label || enclosure.id,
+      })),
+      ...storageViews
+        .filter((view) => view.enabled !== false && view.render?.show_in_main_ui !== false)
+        .map((view) => ({
+          key: `view:${view.id}`,
+          kind: "Storage view",
+          label: view.label || view.id,
+        })),
+    ];
+    const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+    const ordered = [];
+    const added = new Set();
+    // Saved keys first, then the main page's automatic order, then anything left.
+    [...savedOrder, ...(automaticOrder || [])].forEach((key) => {
+      const entry = byKey.get(key);
+      if (!entry || added.has(key)) return;
+      ordered.push(entry);
+      added.add(key);
+    });
+    entries.forEach((entry) => {
+      if (added.has(entry.key)) return;
+      ordered.push(entry);
+      added.add(entry.key);
+    });
+    return ordered;
+  }
+
+  function moveAdminViewOrder(entries, key, direction, savedOrder = []) {
+    const keys = entries.map((entry) => entry.key);
+    const index = keys.indexOf(key);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= keys.length) return keys;
+    [keys[index], keys[target]] = [keys[target], keys[index]];
+    if (!Array.isArray(savedOrder) || savedOrder.length === 0) {
+      return keys;
+    }
+    const visibleKeys = new Set(keys);
+    const merged = [];
+    const added = new Set();
+    let nextVisibleIndex = 0;
+    savedOrder.forEach((savedKey) => {
+      const mergedKey = visibleKeys.has(savedKey) ? keys[nextVisibleIndex++] : savedKey;
+      if (!mergedKey || added.has(mergedKey)) return;
+      merged.push(mergedKey);
+      added.add(mergedKey);
+    });
+    keys.forEach((visibleKey) => {
+      if (added.has(visibleKey)) return;
+      merged.push(visibleKey);
+      added.add(visibleKey);
+    });
+    return merged;
+  }
+
+  function renderViewOrderEditor() {
+    if (!elements.setupViewOrderList) return;
+    const automaticOrder = currentAutomaticViewOrder();
+    const entries = orderedAdminViewEntries(
+      currentLiveEnclosures(),
+      state.storageViews,
+      state.viewOrder,
+      automaticOrder || [],
+    );
+    // Without a saved order the list is only meaningful once the automatic
+    // order has loaded; discovery order is not what the main page opens.
+    const movable = state.viewOrder.length > 0 || Array.isArray(automaticOrder);
+    if (elements.setupViewOrderStatus) {
+      elements.setupViewOrderStatus.textContent = state.viewOrder.length
+        ? "Custom order. The first available entry opens by default."
+        : movable
+          ? "Automatic order: most occupied disks first; enclosures win ties."
+          : "Automatic order: most occupied disks first. You can reorder once live enclosures load.";
+    }
+    if (elements.setupViewOrderResetButton) {
+      elements.setupViewOrderResetButton.disabled = state.viewOrder.length === 0;
+    }
+    elements.setupViewOrderList.innerHTML = entries.length
+      ? entries.map((entry, index) => `
+          <div class="view-order-row" data-view-order-entry="${escapeHtml(entry.key)}">
+            <span class="view-order-position" aria-hidden="true">${index + 1}</span>
+            <span class="view-order-label"><strong>${escapeHtml(entry.label)}</strong><small>${escapeHtml(entry.kind)}</small></span>
+            <span class="view-order-actions">
+              <button type="button" class="button secondary small" data-view-order-action="up" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} up"${!movable || index === 0 ? " disabled" : ""}>Up</button>
+              <button type="button" class="button secondary small" data-view-order-action="down" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} down"${!movable || index === entries.length - 1 ? " disabled" : ""}>Down</button>
+            </span>
+          </div>
+        `).join("")
+      : '<p class="subtle action-note">Live enclosures and enabled storage views appear here.</p>';
+  }
+
   function renderStorageViewList() {
+    renderViewOrderEditor();
     if (!elements.setupStorageViewList || !elements.setupStorageViewCount) {
       return;
     }
@@ -3500,6 +3611,11 @@
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
       storageView.label = editedLabel;
       storageView.id = uniqueStorageViewId(elements.setupStorageViewId?.value?.trim() || storageView.label, previousId);
+      if (storageView.id !== previousId && Array.isArray(state.viewOrder)) {
+        const previousKey = `view:${previousId}`;
+        const nextKey = `view:${storageView.id}`;
+        state.viewOrder = state.viewOrder.map((entry) => (entry === previousKey ? nextKey : entry));
+      }
       storageView.template_id = elements.setupStorageViewTemplateSelect?.value || storageView.template_id;
       storageView.kind = getStorageViewTemplate(storageView.template_id)?.kind || storageView.kind || "manual";
       storageView.profile_id = storageView.kind === "ses_enclosure"
@@ -3546,6 +3662,8 @@
   function resetLiveEnclosureState() {
     state.liveEnclosuresRequestSeq = (state.liveEnclosuresRequestSeq || 0) + 1;
     state.liveEnclosures = [];
+    state.automaticViewOrder = null;
+    state.automaticViewOrderSystemId = null;
     state.liveEnclosuresLoading = false;
     state.liveEnclosuresSystemId = null;
     state.liveEnclosuresError = null;
@@ -3597,7 +3715,9 @@
         return;
       }
       state.liveEnclosures = Array.isArray(payload.enclosures) ? payload.enclosures : [];
+      state.automaticViewOrder = Array.isArray(payload.automatic_view_order) ? payload.automatic_view_order : null;
       state.liveEnclosuresSystemId = payload.system_id || systemId;
+      state.automaticViewOrderSystemId = state.liveEnclosuresSystemId;
       if (!quiet) {
         setBanner(`Loaded ${state.liveEnclosures.length} discovered live enclosure${state.liveEnclosures.length === 1 ? "" : "s"} for ${state.liveEnclosuresSystemId}.`, "success");
       }
@@ -3606,6 +3726,8 @@
         return;
       }
       state.liveEnclosures = [];
+      state.automaticViewOrder = null;
+      state.automaticViewOrderSystemId = null;
       state.liveEnclosuresSystemId = systemId;
       state.liveEnclosuresError = error.message || String(error);
       if (!quiet) {
@@ -3872,6 +3994,9 @@
     state.setupDirty = true;
     state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = state.storageViews.filter((storageView) => storageView.id !== selectedId);
+    if (Array.isArray(state.viewOrder)) {
+      state.viewOrder = state.viewOrder.filter((entry) => entry !== `view:${selectedId}`);
+    }
     state.selectedStorageViewId = state.storageViews[0]?.id || "";
     renderStorageViews();
   }
@@ -4892,6 +5017,7 @@
     state.sshUserAutoPlatform = null;
     state.sshUserEdited = false;
     state.storageViews = [];
+    state.viewOrder = [];
     resetStorageViewCandidateState();
     resetLiveEnclosureState();
     state.selectedStorageViewId = "";
@@ -5055,6 +5181,7 @@
     state.selectedProfileId = system.default_profile_id || "";
     state.haNodes = normalizeHaNodes(system.ha_nodes || []);
     state.haNodesLoading = false;
+    state.viewOrder = Array.isArray(system.view_order) ? [...system.view_order] : [];
     replaceStorageViewState(system.storage_views || []);
     if (elements.setupSystemLabel) {
       elements.setupSystemLabel.value = system.label || system.id || "";
@@ -5325,6 +5452,7 @@
                 }
               : null,
         })),
+      view_order: Array.isArray(state.viewOrder) ? state.viewOrder.slice() : [],
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
       // The system this payload was cloned FROM. Sent whenever a loaded system
       // is saved under a new id, whatever the operator did to the SSH command
@@ -8238,6 +8366,32 @@
       }
       state.selectedStorageViewId = button.dataset.storageViewId || "";
       renderStorageViews();
+    });
+    elements.setupViewOrderList?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-view-order-action]");
+      if (!button) return;
+      const direction = button.dataset.viewOrderAction === "up" ? -1 : 1;
+      const entries = orderedAdminViewEntries(
+        currentLiveEnclosures(),
+        state.storageViews,
+        state.viewOrder,
+        currentAutomaticViewOrder() || [],
+      );
+      state.viewOrder = moveAdminViewOrder(
+        entries,
+        button.dataset.viewOrderKey || "",
+        direction,
+        state.viewOrder,
+      );
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      renderViewOrderEditor();
+    });
+    elements.setupViewOrderResetButton?.addEventListener("click", () => {
+      state.viewOrder = [];
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      renderViewOrderEditor();
     });
     elements.setupStorageViewCandidatesList?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-storage-view-candidate-id]");

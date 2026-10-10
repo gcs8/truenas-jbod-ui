@@ -19,7 +19,7 @@ const runtime = {
     backing_enclosure_id: "enc-a", backing_enclosure_label: "Live Shelf",
     matched_count: 1, slot_count: 1,
     slots: [{ slot_index: 0, slot_label: "00", occupied: true, state: "matched",
-      source: "snapshot_slot", snapshot_slot: 0, device_name: "sdx",
+      source: "snapshot_slot", snapshot_slot: 0, snapshot_enclosure_id: "enc-a", device_name: "sdx",
       serial: "SANITIZED-SLOT-0", description: "Synthetic saved slot" }],
   }],
 };

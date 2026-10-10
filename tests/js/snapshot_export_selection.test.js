@@ -150,6 +150,49 @@ test("snapshot bootstrap drops a hidden or disabled view together with its slot"
   );
 });
 
+test("live bootstrap opens the server default unless the URL selects a view or enclosure", () => {
+  const { resolveInitialSnapshotSelection } = loadFunctions(
+    ["resolveInitialSnapshotSelection", "isMainUiStorageViewRuntimeOption"],
+    { Boolean, Number, Set, URLSearchParams },
+  );
+  const bootstrap = {
+    storageViewsRuntime: {
+      default_selection: "view:primary-chassis",
+      views: [{ id: "primary-chassis" }, { id: "boot-doms" }],
+    },
+  };
+
+  assert.deepEqual(
+    { ...resolveInitialSnapshotSelection(bootstrap, false, "") },
+    { selectedSlot: null, storageViewId: "primary-chassis" },
+  );
+  assert.deepEqual(
+    { ...resolveInitialSnapshotSelection(bootstrap, false, "?storage_view_id=boot-doms") },
+    { selectedSlot: null, storageViewId: "boot-doms" },
+  );
+  assert.deepEqual(
+    { ...resolveInitialSnapshotSelection(bootstrap, false, "?enclosure_id=enc-a") },
+    { selectedSlot: null, storageViewId: "" },
+  );
+});
+
+test("main selector entries follow the server effective order as one flat list", () => {
+  const { orderedMainSelectorEntries } = loadFunctions(["orderedMainSelectorEntries"], { Array, Map, Set });
+  const enclosures = [{ id: "enc-a" }, { id: "enc-b" }];
+  const views = [{ id: "primary-chassis" }, { id: "boot-doms" }];
+
+  const entries = orderedMainSelectorEntries(
+    enclosures,
+    views,
+    ["view:primary-chassis", "enclosure:enc-b", "view:retired", "enclosure:enc-a"],
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(entries.map((entry) => entry.key))),
+    ["view:primary-chassis", "enclosure:enc-b", "enclosure:enc-a", "view:boot-doms"],
+  );
+});
+
 test("dropping a storage view runtime selection clears its slot index", () => {
   const state = {
     selectedSlot: 41,

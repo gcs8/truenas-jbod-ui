@@ -43,6 +43,7 @@ const syntheticRuntime = {
           state: "matched",
           source: "snapshot_slot",
           snapshot_slot: 0,
+          snapshot_enclosure_id: "enc-a",
           device_name: "sdx",
           serial: "LIVE-SERIAL-0",
           gptid: "synthetic-gptid-0",
@@ -53,12 +54,12 @@ const syntheticRuntime = {
   ],
 };
 
-function buildCurrentSourceFixture() {
+function buildCurrentSourceFixture(runtime = syntheticRuntime) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-saved-view-selection-"));
   const outputPath = path.join(tempDir, "index.html");
   const runtimePath = path.join(tempDir, "storage-view-runtime.json");
   const malformedConfigPath = path.join(tempDir, "malformed-config.yaml");
-  fs.writeFileSync(runtimePath, JSON.stringify(syntheticRuntime), "utf8");
+  fs.writeFileSync(runtimePath, JSON.stringify(runtime), "utf8");
   fs.writeFileSync(malformedConfigPath, "systems: [\n", "utf8");
   const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
   const generatorPath = path.join(repoRoot, "scripts/build_current_source_browser_fixture.py");
@@ -80,13 +81,48 @@ function buildCurrentSourceFixture() {
 }
 
 let fixture;
+let orderedFixture;
+let ownerBackedFixture;
+const orderedRuntime = {
+  ...syntheticRuntime,
+  view_order: ["view:saved-chassis", "enclosure:enc-a"],
+  default_selection: "view:saved-chassis",
+};
+const ownerBackedRuntime = {
+  ...syntheticRuntime,
+  view_order: ["enclosure:enc-a", "view:primary-chassis"],
+  default_selection: "enclosure:enc-a",
+  views: [
+    {
+      ...syntheticRuntime.views[0],
+      id: "primary-chassis",
+      label: "Primary Chassis",
+      backing_enclosure_id: "node-a",
+      backing_enclosure_label: "Owner Chassis",
+      slots: [
+        {
+          ...syntheticRuntime.views[0].slots[0],
+          snapshot_enclosure_id: "node-a",
+          device_name: "sda",
+          serial: "OWNER-SERIAL-0",
+          gptid: "synthetic-owner-gptid-0",
+          led_supported: true,
+        },
+      ],
+    },
+  ],
+};
 
 test.beforeAll(() => {
   fixture = buildCurrentSourceFixture();
+  orderedFixture = buildCurrentSourceFixture(orderedRuntime);
+  ownerBackedFixture = buildCurrentSourceFixture(ownerBackedRuntime);
 });
 
 test.afterAll(() => {
   if (fixture?.tempDir) fs.rmSync(fixture.tempDir, { recursive: true, force: true });
+  if (orderedFixture?.tempDir) fs.rmSync(orderedFixture.tempDir, { recursive: true, force: true });
+  if (ownerBackedFixture?.tempDir) fs.rmSync(ownerBackedFixture.tempDir, { recursive: true, force: true });
 });
 
 test("saved-view selection protects and then rebinds the real mapping form", async ({ page }) => {
@@ -203,4 +239,110 @@ test("saved-view selection protects and then rebinds the real mapping form", asy
   await expect(page.locator('#mapping-form [name="gptid"]')).toHaveValue("synthetic-gptid-0");
   await expect(page.locator('#mapping-form [name="notes"]')).toHaveValue("Saved mapping note");
   expect(consoleErrors).toEqual([]);
+});
+
+test("effective order is flat, opens first, and explicit URL selection wins", async ({ page }) => {
+  await page.route("https://synthetic.invalid/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === "/") {
+      await route.fulfill({ status: 200, contentType: "text/html", body: orderedFixture.html });
+      return;
+    }
+    if (url.pathname === "/static/app.js") {
+      await route.fulfill({ status: 200, contentType: "text/javascript", body: appSource });
+      return;
+    }
+    if (url.pathname === "/static/style.css") {
+      await route.fulfill({ status: 200, contentType: "text/css", body: styleSource });
+      return;
+    }
+    if (url.pathname === "/api/storage-views") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(orderedRuntime) });
+      return;
+    }
+    if (url.pathname === "/api/history/status") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ configured: false, available: false }) });
+      return;
+    }
+    if (url.pathname.startsWith("/api/smart/")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ available: false, summaries: [] }) });
+      return;
+    }
+    if (url.pathname.startsWith("/api/")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, available: false }) });
+      return;
+    }
+    if (url.pathname.startsWith("/static/")) {
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: "text/plain", body: "not found" });
+  });
+
+  await page.goto("https://synthetic.invalid/", { waitUntil: "domcontentloaded" });
+  const selector = page.locator("#enclosure-select");
+  await expect(selector).toHaveValue("view:saved-chassis");
+  await expect(selector.locator("optgroup")).toHaveCount(0);
+  await expect(selector.locator("option")).toHaveCount(2);
+  expect(await selector.locator("option").evaluateAll((options) => options.map((option) => option.value)))
+    .toEqual(["view:saved-chassis", "enclosure:enc-a"]);
+
+  await page.goto("https://synthetic.invalid/?enclosure_id=enc-a", { waitUntil: "domcontentloaded" });
+  await expect(selector).toHaveValue("enclosure:enc-a");
+});
+
+test("selected enclosure B cannot supply live actions to the owner-backed Primary Chassis", async ({ page }) => {
+  const apiRequests = [];
+  await page.route("https://synthetic.invalid/**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.startsWith("/api/")) {
+      apiRequests.push(`${route.request().method()} ${url.pathname}${url.search}`);
+    }
+    if (url.pathname === "/") {
+      await route.fulfill({ status: 200, contentType: "text/html", body: ownerBackedFixture.html });
+      return;
+    }
+    if (url.pathname === "/static/app.js") {
+      await route.fulfill({ status: 200, contentType: "text/javascript", body: appSource });
+      return;
+    }
+    if (url.pathname === "/static/style.css") {
+      await route.fulfill({ status: 200, contentType: "text/css", body: styleSource });
+      return;
+    }
+    if (url.pathname === "/api/storage-views") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(ownerBackedRuntime) });
+      return;
+    }
+    if (url.pathname === "/api/history/status") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ configured: false, available: false }) });
+      return;
+    }
+    if (url.pathname.startsWith("/api/smart/")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ available: false, summaries: [] }) });
+      return;
+    }
+    if (url.pathname.startsWith("/api/")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true, available: false }) });
+      return;
+    }
+    if (url.pathname.startsWith("/static/")) {
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: "text/plain", body: "not found" });
+  });
+
+  await page.goto("https://synthetic.invalid/", { waitUntil: "domcontentloaded" });
+  const selector = page.locator("#enclosure-select");
+  await expect(selector).toHaveValue("enclosure:enc-a");
+  apiRequests.length = 0;
+  await selector.selectOption("view:primary-chassis");
+  await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
+
+  await expect(page.locator("#detail-slot-title")).toHaveText("Primary Chassis / 00");
+  await expect(page.locator("#detail-kv-grid")).toContainText("OWNER-SERIAL-0");
+  await expect(page.locator("#mapping-form")).toBeHidden();
+  await expect(page.locator("#detail-led-controls")).toBeHidden();
+  expect(apiRequests.filter((request) => request.startsWith("POST /api/slots/") && request.includes("/led"))).toEqual([]);
 });

@@ -474,6 +474,189 @@ test("failed ESXi install refreshes packages before restoring controls", async (
   assert.equal(installButton.disabled, true);
 });
 
+test("admin view-order helpers combine live entries and move them accessibly", () => {
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const { orderedAdminViewEntries, moveAdminViewOrder } = loadFunctions(
+    [helpersSource],
+    ["orderedAdminViewEntries", "moveAdminViewOrder"],
+  );
+  const entries = orderedAdminViewEntries(
+    [{ id: "enc-a", label: "Enclosure A" }, { id: "enc-b", label: "Enclosure B" }],
+    [
+      { id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } },
+      { id: "hidden", label: "Hidden", enabled: true, render: { show_in_main_ui: false } },
+    ],
+    ["view:boot", "enclosure:retired", "enclosure:enc-b"],
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(entries.map((entry) => entry.key))),
+    ["view:boot", "enclosure:enc-b", "enclosure:enc-a"],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(moveAdminViewOrder(entries, "view:boot", 1))),
+    ["enclosure:enc-b", "view:boot", "enclosure:enc-a"],
+  );
+});
+
+test("admin view-order moves preserve unloaded enclosure keys", () => {
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const { orderedAdminViewEntries, moveAdminViewOrder } = loadFunctions(
+    [helpersSource],
+    ["orderedAdminViewEntries", "moveAdminViewOrder"],
+  );
+  const savedOrder = ["enclosure:enc-a", "view:boot", "enclosure:enc-b", "view:nvme"];
+  const entries = orderedAdminViewEntries(
+    [],
+    [
+      { id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } },
+      { id: "nvme", label: "NVMe carrier", enabled: true, render: { show_in_main_ui: true } },
+    ],
+    savedOrder,
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(moveAdminViewOrder(entries, "view:boot", 1, savedOrder))),
+    ["enclosure:enc-a", "view:nvme", "enclosure:enc-b", "view:boot"],
+  );
+});
+
+test("admin view-order editor shows the automatic order and waits for it", () => {
+  const escapeSource = sourceBetween("  function escapeHtml(value) {", "\n  function setBanner");
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const renderSource = sourceBetween(
+    "  function renderViewOrderEditor() {",
+    "\n  function renderStorageViewList"
+  );
+  const elements = sparseElements({
+    setupViewOrderList: { innerHTML: "" },
+    setupViewOrderStatus: { textContent: "" },
+    setupViewOrderResetButton: { disabled: false },
+  });
+  const state = {
+    storageViews: [{ id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } }],
+    viewOrder: [],
+  };
+  let automaticOrder = null;
+  const { renderViewOrderEditor } = loadFunctions(
+    [escapeSource, helpersSource, renderSource],
+    ["renderViewOrderEditor"],
+    {
+      elements,
+      state,
+      // Discovery order puts the empty shelf first.
+      currentLiveEnclosures: () => [{ id: "enc-a", label: "Empty shelf" }, { id: "enc-b", label: "Full shelf" }],
+      currentAutomaticViewOrder: () => automaticOrder,
+    },
+  );
+  const rows = () => [...elements.setupViewOrderList.innerHTML.matchAll(/data-view-order-entry="([^"]+)"/g)]
+    .map((match) => match[1]);
+  const enabledMoves = () => (elements.setupViewOrderList.innerHTML.match(/">(?:Up|Down)<\/button>/g) || []).length;
+
+  renderViewOrderEditor();
+  assert.equal(enabledMoves(), 0, "discovery order is not offered for reordering");
+  assert.match(elements.setupViewOrderStatus.textContent, /once live enclosures load/);
+
+  automaticOrder = ["enclosure:enc-b", "view:boot", "enclosure:enc-a"];
+  renderViewOrderEditor();
+  assert.deepEqual(rows(), automaticOrder);
+  assert.equal(enabledMoves(), 4);
+
+  state.viewOrder = ["view:boot"];
+  renderViewOrderEditor();
+  assert.deepEqual(rows(), ["view:boot", "enclosure:enc-b", "enclosure:enc-a"]);
+});
+
+test("renaming a storage view rewrites its saved view-order key in place", () => {
+  const saveSource = sourceBetween(
+    "  function saveStorageViewEditorToState() {",
+    "\n  function currentStorageViewSystemId"
+  );
+  const storageView = {
+    id: "old-id",
+    label: "Old label",
+    template_id: "manual-4",
+    kind: "manual",
+    order: 10,
+    enabled: true,
+    render: { show_in_main_ui: true, show_in_admin_ui: true, default_collapsed: false },
+    binding: { mode: "auto" },
+  };
+  const state = {
+    storageViews: [storageView],
+    viewOrder: ["enclosure:enc-a", "view:old-id", "enclosure:enc-b"],
+  };
+  const elements = sparseElements({
+    setupStorageViewId: { value: "new-id" },
+    setupStorageViewLabel: { value: "New label" },
+    setupStorageViewTemplateSelect: { value: "manual-4" },
+    setupStorageViewOrder: { value: "10" },
+    setupStorageViewEnabled: { checked: true },
+    setupStorageViewShowMain: { checked: true },
+    setupStorageViewCollapsed: { checked: false },
+    setupStorageViewBindingMode: { value: "auto" },
+  });
+  const { saveStorageViewEditorToState } = loadFunctions(
+    [saveSource],
+    ["saveStorageViewEditorToState"],
+    {
+      elements,
+      flushStorageViewRender: () => {},
+      getStorageViewTemplate: () => ({ kind: "manual" }),
+      nextStorageViewOrder: () => 20,
+      parseSlotLabelsText: () => ({}),
+      parseSlotSizesText: () => ({}),
+      splitDelimitedLines: () => [],
+      state,
+      uniqueStorageViewId: (value) => value,
+      updateSelectedStorageView: (mutator) => mutator(storageView),
+    }
+  );
+
+  saveStorageViewEditorToState();
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.viewOrder)),
+    ["enclosure:enc-a", "view:new-id", "enclosure:enc-b"],
+  );
+});
+
+test("deleting a storage view removes its saved view-order key", () => {
+  const deleteSource = sourceBetween(
+    "  function deleteSelectedStorageView() {",
+    "\n  function duplicateSelectedStorageView"
+  );
+  const state = {
+    selectedStorageViewId: "retired-view",
+    storageViews: [
+      { id: "retired-view" },
+      { id: "kept-view" },
+    ],
+    viewOrder: ["enclosure:enc-a", "view:retired-view", "view:kept-view"],
+  };
+  const { deleteSelectedStorageView } = loadFunctions(
+    [deleteSource],
+    ["deleteSelectedStorageView"],
+    { renderStorageViews: () => {}, state }
+  );
+
+  deleteSelectedStorageView();
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.viewOrder)),
+    ["enclosure:enc-a", "view:kept-view"],
+  );
+});
+
 test("ESXi host prep uses canonical preserved secrets and configured timeout", () => {
   const collectEsxiSource = sourceBetween(
     "  function collectEsxiHostPrepInstallPayload",

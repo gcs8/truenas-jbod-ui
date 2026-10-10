@@ -524,6 +524,31 @@ class SystemConfig(BaseModel):
     default_profile_id: str | None = None
     enclosure_profiles: dict[str, str] = Field(default_factory=dict)
     storage_views: list[StorageViewConfig] = Field(default_factory=list)
+    view_order: list[str] = Field(default_factory=list)
+
+    @field_validator("view_order", mode="before")
+    @classmethod
+    def _normalize_view_order(cls, value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_entry in value:
+            entry = str(raw_entry or "").strip()
+            prefix, separator, identifier = entry.partition(":")
+            if separator != ":" or prefix not in {"enclosure", "view"}:
+                continue
+            identifier = identifier.strip()
+            if not identifier:
+                continue
+            entry = f"{prefix}:{identifier[:512]}"
+            if entry in seen:
+                continue
+            seen.add(entry)
+            normalized.append(entry)
+            if len(normalized) >= 128:
+                break
+        return normalized
 
 
 class Settings(BaseModel):

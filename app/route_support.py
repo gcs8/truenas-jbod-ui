@@ -404,10 +404,25 @@ def _filter_storage_view_runtime(
         and view.render.show_in_main_ui is not False
         and (not selected_ids or view.id in selected_ids)
     ]
+    exported_view_ids = {view.id for view in views}
+    view_order = [
+        item
+        for item in runtime.view_order
+        if not item.startswith("view:") or item.removeprefix("view:") in exported_view_ids
+    ]
+    default_selection = runtime.default_selection
+    if (
+        default_selection
+        and default_selection.startswith("view:")
+        and default_selection.removeprefix("view:") not in exported_view_ids
+    ):
+        default_selection = None
     return StorageViewRuntimePayload(
         system_id=runtime.system_id,
         system_label=runtime.system_label,
         views=views,
+        view_order=view_order,
+        default_selection=default_selection,
     )
 
 

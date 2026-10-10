@@ -103,23 +103,17 @@ CI_SOURCE_GATE_MARKER = re.compile(
 WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_command_state",
     "tests.test_admin_config",
-    "tests.test_admin_maintenance",
     "tests.test_admin_secret_models",
-    "tests.test_backup_integration",
     "tests.test_changelog_entry_gate",
-    "tests.test_ci_contract",
     "tests.test_config_example",
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",
-    "tests.test_ghcr_release_contract",
     "tests.test_heap_probe",
     "tests.test_history_backend",
     "tests.test_history_backend_bounds",
-    "tests.test_history_config_contract",
     "tests.test_history_diagnostics",
     "tests.test_history_operation_bounds",
     "tests.test_history_released_schema_upgrades",
-    "tests.test_history_schema_version_gate",
     "tests.test_logging_config",
     "tests.test_nonroot_cli",
     "tests.test_parsers",
@@ -128,9 +122,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_prometheus_alert_rules",
     "tests.test_public_demo_deployment",
     "tests.test_public_demo_deterministic",
-    "tests.test_public_demo_fixture",
     "tests.test_public_demo_history_consistency",
-    "tests.test_public_demo_provenance",
     "tests.test_public_doc_privacy",
     "tests.test_public_docs_contract",
     "tests.test_public_screenshots",
@@ -139,22 +131,13 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
-    "tests.test_settings_reload",
     "tests.test_ssh_connection_keep",
     "tests.test_ssh_failure_contexts",
     "tests.test_script_platform_guards",
-    "tests.test_ssh_probe",
-    "tests.test_ssh_session_reuse",
     "tests.test_startup_config",
-    "tests.test_startup_migration_recovery",
-    "tests.test_startup_writability",
     "tests.test_system_setup_api_dialect",
     "tests.test_tls_trust",
-    "tests.test_truenas_ws",
-    "tests.test_truenas_ws_jsonrpc",
-    "tests.test_ui_health_and_admin_probe",
     "tests.test_unittest_shards",
-    "tests.test_upgrade_notice",
     "tests.test_wiki_drift_verifier",
 )
 
@@ -176,6 +159,7 @@ WINDOWS_EXCLUSIONS = (
         modules=(
             "tests.test_admin_auth",
             "tests.test_admin_error_correlation",
+            "tests.test_admin_maintenance",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
             "tests.test_admin_safety",
@@ -188,12 +172,14 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
             "tests.test_backup_archive_journal",
+            "tests.test_backup_integration",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
             "tests.test_history_backup_coupling",
             "tests.test_history_runtime_damage_pause",
             "tests.test_history_health_states",
             "tests.test_history_deferred_indexes",
+            "tests.test_history_schema_version_gate",
             "tests.test_history_service",
             "tests.test_inventory",
             "tests.test_inventory_registry_routes",
@@ -231,10 +217,13 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_account_bootstrap",
             "tests.test_backup_archive_lifecycle",
             "tests.test_backup_archive_transport",
+            "tests.test_ci_contract",
             "tests.test_compose_runtime_matrix",
             "tests.test_container_contract",
             "tests.test_esxi_host_prep",
             "tests.test_full_backup_benchmark",
+            "tests.test_ghcr_release_contract",
+            "tests.test_history_config_contract",
             "tests.test_immutable_deployment",
             "tests.test_image_upgrade_contract",
             "tests.test_mapping_store",
@@ -242,6 +231,26 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_perf_harness",
             "tests.test_private_qa_restore",
             "tests.test_process_secrets",
+            "tests.test_public_demo_fixture",
+            "tests.test_public_demo_provenance",
+            "tests.test_settings_reload",
+            "tests.test_ssh_probe",
+            "tests.test_startup_migration_recovery",
+            "tests.test_startup_writability",
+            "tests.test_ui_health_and_admin_probe",
+            "tests.test_upgrade_notice",
+        ),
+    ),
+    WindowsExclusion(
+        category="Windows event-loop timing",
+        reason=(
+            "these suites assert sub-200ms cancellation and transport deadlines that "
+            "are not reliable under the Windows event loop"
+        ),
+        modules=(
+            "tests.test_ssh_session_reuse",
+            "tests.test_truenas_ws",
+            "tests.test_truenas_ws_jsonrpc",
         ),
     ),
     WindowsExclusion(
@@ -564,6 +573,8 @@ def validate_planned_ci_source_gate_commands(
         allowed = (expected[gate],)
         if gate == "prometheus-rules":
             allowed += ((("<skip>",),),)
+        if gate == "performance-baseline" and platform.startswith("win"):
+            allowed += ((("<skip>",),),)
         if commands not in allowed:
             raise PlanError(f"Local source gate command drift: {gate}")
 
@@ -684,13 +695,24 @@ def build_plan(
                 platform=platform,
                 ci_gate="javascript-unit-tests",
             ),
+        )
+    )
+    if platform == "win32":
+        skips.append(
+            Skip(
+                "Performance baseline",
+                "the history-store fixture requires POSIX directory-descriptor inspection",
+                ci_gate="performance-baseline",
+            )
+        )
+    else:
+        checks.append(
             Check(
                 "Performance baseline",
                 (python_executable, "scripts/build_perf_baseline.py", "--check"),
                 ci_gate="performance-baseline",
-            ),
+            )
         )
-    )
     if mode == "full":
         checks.append(
             Check(

@@ -949,6 +949,8 @@ class StorageViewRuntimePayload(BaseModel):
     system_id: str | None = None
     system_label: str | None = None
     views: list[StorageViewRuntimeView] = Field(default_factory=list)
+    view_order: list[str] = Field(default_factory=list)
+    default_selection: str | None = None
 
 
 class HANodeRequest(BaseModel):
@@ -1004,6 +1006,7 @@ class SystemSetupRequest(BaseModel):
     bmc_timeout_seconds: int = 15
     default_profile_id: str | None = None
     storage_views: list[StorageViewRequest] | None = None
+    view_order: list[str] | None = None
     replace_existing: bool = False
     make_default: bool = False
 
@@ -1043,6 +1046,32 @@ class SystemSetupRequest(BaseModel):
             if cleaned:
                 cleaned_items.append(cleaned[:1024])
         return cleaned_items
+
+    @field_validator("view_order", mode="before")
+    @classmethod
+    def sanitize_view_order(cls, value: Any) -> list[str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, (list, tuple)):
+            return []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw_entry in value:
+            entry = str(raw_entry or "").strip()
+            prefix, separator, identifier = entry.partition(":")
+            if separator != ":" or prefix not in {"enclosure", "view"}:
+                continue
+            identifier = identifier.strip()
+            if not identifier:
+                continue
+            entry = f"{prefix}:{identifier[:512]}"
+            if entry in seen:
+                continue
+            seen.add(entry)
+            cleaned.append(entry)
+            if len(cleaned) >= 128:
+                break
+        return cleaned
 
     @field_validator("ha_nodes", mode="after")
     @classmethod

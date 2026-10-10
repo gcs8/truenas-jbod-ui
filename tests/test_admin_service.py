@@ -4468,6 +4468,53 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(payload["enclosures"][0]["profile_label"], "Supermicro SSG-6048R Front 24")
         service.get_snapshot.assert_awaited_once_with(force_refresh=False)
 
+    def test_live_enclosures_route_returns_the_automatic_view_order(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/storage-views/live-enclosures")
+        settings = Settings(
+            systems=[
+                SystemConfig(
+                    id="synthetic-system",
+                    label="Synthetic system",
+                    truenas=TrueNASConfig(host="https://synthetic.example.test", api_key="token", platform="core"),
+                )
+            ],
+            default_system_id="synthetic-system",
+        )
+        snapshot = MagicMock(
+            enclosures=[
+                EnclosureOption(id="enc-a", label="Empty shelf", slot_count=24),
+                EnclosureOption(id="enc-b", label="Full shelf", slot_count=24),
+            ]
+        )
+        service = MagicMock()
+        service.system = settings.systems[0]
+        service.settings = settings
+        service.get_snapshot = AsyncMock(return_value=snapshot)
+        service.get_storage_view_runtime = AsyncMock(
+            return_value=MagicMock(view_order=["enclosure:enc-b", "view:boot", "enclosure:enc-a"])
+        )
+        service.profile_registry.resolve_for_enclosure.return_value = None
+        registry = MagicMock()
+        registry.get_service.return_value = service
+
+        def call() -> tuple[int, dict]:
+            with patch("admin_service.routes.reload_app_settings", return_value=settings):
+                with patch("admin_service.routes.InventoryRegistry", return_value=registry):
+                    response = asyncio.run(route.endpoint(system_id="synthetic-system", force=False))
+            return response.status_code, json.loads(response.body.decode("utf-8"))
+
+        status, payload = call()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["automatic_view_order"], ["enclosure:enc-b", "view:boot", "enclosure:enc-a"])
+        # The order comes from the snapshot this request already built.
+        service.get_storage_view_runtime.assert_awaited_once_with(snapshot=snapshot, ignore_saved_view_order=True)
+
+        service.get_storage_view_runtime = AsyncMock(side_effect=RuntimeError("busy"))
+        status, payload = call()
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload["automatic_view_order"])
+        self.assertEqual([item["id"] for item in payload["enclosures"]], ["enc-a", "enc-b"])
+
     def test_save_profile_route_returns_updated_profile_list(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/profiles" and "POST" in getattr(route, "methods", set()))
         initial_settings = Settings(

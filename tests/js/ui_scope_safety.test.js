@@ -36,7 +36,8 @@ for (const action of ["sendLedAction", "saveMapping", "clearMapping", "importMap
       let applied=0, requests=0;
       const context = {state, URLSearchParams, mappingForm:{}, FormData:class { get() { return "draft"; } }, window:{confirm:()=>true}, mappingImportFile:{value:""}, mappingImportUnavailableReason:()=>"", mappingImportPreviewMessage:()=>"confirm", writeBlockedByPolicy:()=>false, getSlotById:()=>({slot:0,slot_label:"00",led_supported:true,mapping_revision:"r",mapping_clear_revision:"r"}), setStatus(){}, sendScopedRequest:async url=>{requests++; return url.endsWith("preview") ? {revision:"r"} : pending.promise;}, applySnapshot(){applied++;}, invalidateHistoryCaches(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic", handleWriteRejection(){} };
       // Before the fix the handlers have no completion guard. Load new helpers only once present.
-      const available = guardNames.filter(n => source.includes(`function ${n}(`));
+      const available = [...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch"]
+        .filter(n => source.includes(`function ${n}(`));
       const c=load([...available, "mappingFormScopeKey", action],context);
       const args = action === "saveMapping" ? [{preventDefault(){}}] : action === "importMappingsFromFile" ? [{name:"synthetic.json",text:async()=>"{}"}] : ["IDENTIFY"];
       const run=c[action](...args);
@@ -272,13 +273,26 @@ function bayScopeFixture({ liveEnclosureId, selectedEnclosureId = liveEnclosureI
 }
 const rearCandidate = { slot_index: 0, slot_label: "R0", snapshot_slot: 3, snapshot_enclosure_id: "rear", serial: "SANITIZED-REAR-3" };
 const frontCandidate = { slot_index: 1, slot_label: "R1", snapshot_slot: 3, snapshot_enclosure_id: "front", serial: "SANITIZED-FRONT-3" };
+
+test("HA saved chassis history requests use the backing enclosure", () => {
+  const c = load(["storageViewHistoryParams"], {
+    URLSearchParams,
+    buildSelectionParams: () => new URLSearchParams("system_id=ha&enclosure_id=node-a"),
+  });
+  const params = c.storageViewHistoryParams({
+    source: "selected_enclosure_snapshot",
+    backing_enclosure_id: "node-b",
+  });
+  assert.equal(params.get("system_id"), "ha");
+  assert.equal(params.get("enclosure_id"), "node-b");
+});
 for (const [name, liveEnclosureId, slot, expectedSerial] of [
   ["foreign rear bay on the front shelf", "front", rearCandidate, null],
   ["own front bay on the front shelf", "front", frontCandidate, "SANITIZED-FRONT-3"],
   ["foreign front bay on the rear shelf", "rear", frontCandidate, null],
   ["own rear bay on the rear shelf", "rear", rearCandidate, "SANITIZED-REAR-3"],
-  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, "SANITIZED-FRONT-3"],
-  ["bay with null recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3, snapshot_enclosure_id: null }, "SANITIZED-FRONT-3"],
+  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, null],
+  ["bay with null recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3, snapshot_enclosure_id: null }, null],
   ["recorded enclosure with no rendered enclosure", undefined, frontCandidate, null],
 ]) {
   test(`live-backed storage view slot stays in its own enclosure: ${name}`, () => {
@@ -288,12 +302,91 @@ for (const [name, liveEnclosureId, slot, expectedSerial] of [
     assert.equal(liveSlot?.serial ?? null, expectedSerial);
   });
 }
+
+test("mismatched saved chassis cannot send LED or mapping writes to the page enclosure", async () => {
+  const storageView = {
+    id: "primary-chassis",
+    kind: "ses_enclosure",
+    backing_enclosure_id: "node-a",
+  };
+  const storageViewSlot = {
+    slot_index: 0,
+    slot_label: "00",
+    snapshot_slot: 3,
+    snapshot_enclosure_id: "node-a",
+  };
+  const state = {
+    snapshotMode: false,
+    snapshot: { selected_system_id: "synthetic-system", selected_enclosure_id: "node-b" },
+    selectedSystemId: "synthetic-system",
+    selectedEnclosureId: "node-b",
+    selectedStorageViewRuntimeId: "primary-chassis",
+    selectedSlot: 0,
+    latestRefreshToken: 1,
+    mappingDraftRevision: 0,
+  };
+  const requests = [];
+  const statuses = [];
+  const context = {
+    state,
+    Number,
+    Boolean,
+    URLSearchParams,
+    mappingForm: {},
+    FormData: class { get() { return "draft"; } },
+    writeBlockedByPolicy: () => false,
+    getSelectedStorageViewRuntime: () => storageView,
+    getSelectedStorageViewRuntimeSlot: () => storageViewSlot,
+    getSlotById: () => ({
+      slot: 3,
+      slot_label: "03",
+      enclosure_id: "node-b",
+      led_supported: true,
+      mapping_supported: true,
+      mapping_revision: "revision-b",
+    }),
+    setStatus: (message, tone) => statuses.push({ message, tone }),
+    sendScopedRequest: async (url) => {
+      requests.push(url);
+      return { snapshot: state.snapshot };
+    },
+    captureMutationContext: () => ({ operation: "synthetic" }),
+    mutationContextIsCurrent: () => true,
+    finishMutationContext: () => {},
+    applySnapshot: () => {},
+    invalidateHistoryCaches: () => {},
+    renderAll: () => {},
+    scheduleSmartPrefetch: () => {},
+    locateLightSourceLabel: () => "synthetic",
+    handleWriteRejection: () => {},
+  };
+  const optionalFunctions = ["reportStorageViewActionMismatch"]
+    .filter((name) => source.includes(`function ${name}(`));
+  const c = load([
+    "storageViewSlotBayInEnclosure",
+    "isLiveStyledStorageView",
+    "getLiveBackedStorageViewSlot",
+    ...optionalFunctions,
+    "mappingFormScopeKey",
+    "sendLedAction",
+    "saveMapping",
+  ], context);
+
+  assert.equal(c.getLiveBackedStorageViewSlot(storageView, storageViewSlot), null);
+  await c.sendLedAction("IDENTIFY");
+  await c.saveMapping({ preventDefault() {} });
+
+  assert.deepEqual(requests, []);
+  assert.equal(statuses.length, 2);
+  assert.match(statuses[0].message, /different enclosure/i);
+  assert.match(statuses[1].message, /different enclosure/i);
+});
 for (const [name, backing, slot, expected] of [
   ["foreign rear bay on a front-backed view", "front", rearCandidate, { slot: 0, enclosure_id: "storage-view:boot", history_source_label: null }],
   ["own front bay on a front-backed view", "front", frontCandidate, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
   ["own rear bay on a rear-backed view", "rear", rearCandidate, { slot: 3, enclosure_id: "rear", history_source_label: "Backing Shelf" }],
   ["foreign front bay on a rear-backed view", "rear", frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
-  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
+  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, { slot: 2, enclosure_id: "storage-view:boot", history_source_label: null }],
   ["recorded enclosure with no backing or live enclosure", null, frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
 ]) {
   test(`storage view history target stays in its own enclosure: ${name}`, () => {
