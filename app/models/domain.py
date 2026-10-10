@@ -292,6 +292,10 @@ class SourceStatus(BaseModel):
     enabled: bool
     ok: bool
     message: str | None = None
+    # SSH only (#927): True when every failed command was optional enrichment,
+    # so the bay map is complete although `ok` is False. None, and left out of
+    # the JSON, where nothing assessed it.
+    required_ok: bool | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SystemOption(BaseModel):

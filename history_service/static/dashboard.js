@@ -81,6 +81,20 @@
     return value === null || value === undefined || value === "" ? fallback : String(value);
   }
 
+  // Missing or malformed evidence is "not recorded", never "none".
+  function skippedScopesLabel(scopes) {
+    if (!Array.isArray(scopes)) return "not recorded";
+    if (!scopes.length) return "none";
+    const parts = [];
+    for (const scope of scopes) {
+      if (!scope || typeof scope.system_id !== "string" || typeof scope.detail !== "string") return "not recorded";
+      const name = scope.system_label || scope.system_id;
+      const enclosure = scope.enclosure_label || scope.enclosure_id;
+      parts.push(enclosure ? `${name} / ${enclosure}: ${scope.detail}` : `${name}: ${scope.detail}`);
+    }
+    return parts.join(" ");
+  }
+
   function collectionInventoryLabel(value) {
     if (value === true) {
       return "fresh inventory";
@@ -191,6 +205,13 @@
       document.getElementById("status-history-collection-paused")?.classList?.toggle("status-error", collector.history_collection_paused);
     }
     setText("status-last-inventory-at", formatTimestamp(collector.last_inventory_at));
+    // #927: scopes the last scan read but did not record, with the reason.
+    const skippedLabel = skippedScopesLabel(collector.last_skipped_scopes);
+    setText("status-last-skipped-scopes", skippedLabel);
+    document.getElementById("status-last-skipped-scopes")?.classList?.toggle(
+      "status-error",
+      skippedLabel !== "none" && skippedLabel !== "not recorded",
+    );
     setText("status-last-fast-metrics-at", formatTimestamp(collector.last_fast_metrics_at));
     setText("status-last-slow-metrics-at", formatTimestamp(collector.last_slow_metrics_at));
     setText("status-last-backup-at", formatTimestamp(collector.last_backup_at));

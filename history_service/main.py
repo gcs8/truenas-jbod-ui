@@ -28,6 +28,7 @@ from app.services.history_status import project_public_collector_status
 from app.services.release_status import ReleaseStatusService
 from history_service.collector import (
     COLLECTION_PAUSED_REASON,
+    SCOPE_SKIP_REASONS,
     HistoryCollectionAlreadyRunning,
     HistoryCollectionPaused,
     HistoryCollector,
@@ -397,7 +398,59 @@ def public_collector_status(
         for field in HISTORY_DIAGNOSTIC_STATUS_FIELDS:
             if field in status:
                 projected[field] = status[field]
+        if "last_skipped_scopes" in status:
+            projected["last_skipped_scopes"] = public_skipped_scopes(status["last_skipped_scopes"])
     return projected
+
+
+SKIPPED_SCOPE_TEXT_FIELDS = ("system_id", "system_label", "enclosure_id", "enclosure_label")
+
+
+def public_skipped_scopes(value: object) -> list[dict[str, object]] | None:
+    """Scopes the last scan skipped, rebuilt from an allowlist (#927).
+
+    Labels and ids pass through as text; the reason is a known code, and the
+    detail is that code's fixed sentence, never collector-supplied text. A
+    malformed list is unknown (None), not a shorter list that reads as fewer
+    skips.
+    """
+
+    if not isinstance(value, list):
+        return None
+    projected: list[dict[str, object]] = []
+    for entry in value:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("system_id"), str):
+            return None
+        reason = entry.get("reason")
+        code = reason if isinstance(reason, str) and reason in SCOPE_SKIP_REASONS else "untrusted"
+        projected.append(
+            {
+                **{
+                    field: entry.get(field) if isinstance(entry.get(field), str) else None
+                    for field in SKIPPED_SCOPE_TEXT_FIELDS
+                },
+                "reason": code,
+                "detail": SCOPE_SKIP_REASONS[code],
+            }
+        )
+    return projected
+
+
+def skipped_scopes_label(value: object) -> str:
+    """One line for the dashboard: 'System / Enclosure: reason.' per skipped scope."""
+
+    if not isinstance(value, list):
+        return "not recorded"
+    if not value:
+        return "none"
+    parts = []
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            return "not recorded"
+        name = entry.get("system_label") or entry.get("system_id") or "unknown system"
+        enclosure = entry.get("enclosure_label") or entry.get("enclosure_id")
+        parts.append(f"{name} / {enclosure}: {entry.get('detail')}" if enclosure else f"{name}: {entry.get('detail')}")
+    return " ".join(parts)
 
 
 def refresh_cooldown_status() -> dict[str, object]:
@@ -1086,6 +1139,7 @@ def build_dashboard_context(
         "latest_url": safe_http_url(release_payload.get("latest_url")),
         "backoff_label": f"{backoff_seconds}s remaining" if backoff_seconds > 0 else "inactive",
         "collector_state_label": collector_state_label(status),
+        "skipped_scopes_label": skipped_scopes_label(status.get("last_skipped_scopes")),
         "current_collection_label": current_collection_label,
         "collector_banner_text": collector_banner_text,
         "direct_refresh_enabled": settings.refresh_auth_mode == "network",

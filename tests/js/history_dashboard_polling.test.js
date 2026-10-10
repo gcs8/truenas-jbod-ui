@@ -329,6 +329,35 @@ test("missing counts stay distinct from zero with accessible explanations", asyn
   assert.equal(cells[5].textContent, new Date("2026-09-09T12:00:00Z").toLocaleString());
 });
 
+const skippedScope = {
+  system_id: "nvr", system_label: "Synthetic NVR", enclosure_id: "nvr-bay", enclosure_label: "Front",
+  reason: "ssh_required_failed", detail: "SSH commands needed for the bay map failed.",
+};
+
+test(`skipped scopes ${recoveryFixture}: health names each skipped scope and its reason (#927)`, async () => {
+  const d = recoveryDashboard({ initial: { collector_running: true, last_skipped_scopes: [skippedScope] } });
+  const listed = "Synthetic NVR / Front: SSH commands needed for the bay map failed.";
+  assert.equal(d.element("status-last-skipped-scopes").textContent, listed);
+  assert.equal(d.element("status-last-skipped-scopes").classList.contains("status-error"), true);
+  const steps = [
+    [[skippedScope, { system_id: "esx", system_label: null, enclosure_id: null, enclosure_label: null,
+      reason: "untrusted", detail: "The inventory was degraded or untrusted." }],
+    `${listed} esx: The inventory was degraded or untrusted.`, true],
+    [[], "none", false],
+    [undefined, "not recorded", false],
+    ["bad", "not recorded", false],
+    [[{ system_id: 7 }], "not recorded", false],
+  ];
+  for (const [value, text, warning] of steps) {
+    const index = d.requests.length;
+    d.poll.pollCollectorStatus();
+    assert.equal(d.requests[index].url, "/healthz");
+    await d.reply(index, { status: "ok", collector: { collector_running: true, last_skipped_scopes: value } });
+    assert.equal(d.element("status-last-skipped-scopes").textContent, text);
+    assert.equal(d.element("status-last-skipped-scopes").classList.contains("status-error"), warning);
+  }
+});
+
 test("status template uses semantic terms and plain labels", () => {
   const template = fs.readFileSync(path.resolve(__dirname, "../../history_service/templates/dashboard.html"), "utf8");
   assert.match(template, /<dl/);
