@@ -1252,6 +1252,8 @@ class InventoryService:
         self._system_retention_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
+        self._view_order_source_bundle: InventorySourceBundle | None = None
+        self._cached_effective_view_order: list[str] = []
         self._canonical_options_request_sequence = 0
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
@@ -2084,6 +2086,67 @@ class InventoryService:
         )
         return candidates
 
+    def _runtime_ha_owner_enclosure_id(
+        self,
+        source_bundle: InventorySourceBundle,
+        snapshot: InventorySnapshot,
+    ) -> str | None:
+        if self.system.truenas.platform != "quantastor":
+            return None
+        raw_data = source_bundle.raw_data
+        has_ha = bool(
+            self.system.ssh.ha_enabled
+            or self.system.ssh.ha_nodes
+            or raw_data.ha_groups
+            or self._quantastor_has_cluster_peers(raw_data)
+        )
+        if not has_ha:
+            return None
+        return self._select_quantastor_default_enclosure_id(raw_data, snapshot.enclosures)
+
+    async def _effective_runtime_view_order(
+        self,
+        *,
+        source_bundle: InventorySourceBundle,
+        active_snapshot: InventorySnapshot,
+        runtime_views: list[StorageViewRuntimeView],
+        known_snapshots: dict[str | None, InventorySnapshot],
+        ha_primary_view_id: str | None,
+        ha_owner_enclosure_id: str | None,
+    ) -> list[str]:
+        if self._view_order_source_bundle is source_bundle and self._cached_effective_view_order:
+            return list(self._cached_effective_view_order)
+
+        enclosure_counts: list[tuple[str, int]] = []
+        for option in active_snapshot.enclosures:
+            snapshot = known_snapshots.get(option.id)
+            if snapshot is None:
+                # The request already collected the source bundle. Building each
+                # option from that bundle adds no appliance/API/SSH refresh.
+                snapshot = await self.get_snapshot(
+                    force_refresh=False,
+                    selected_enclosure_id=option.id,
+                    allow_stale_cache=True,
+                )
+                known_snapshots[option.id] = snapshot
+            enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+
+        view_counts = [
+            (view.id, view.matched_count)
+            for view in runtime_views
+            if view.enabled and view.render.show_in_main_ui is not False
+        ]
+        order = effective_main_view_order(
+            enclosure_counts=enclosure_counts,
+            view_counts=view_counts,
+            saved_order=self.system.view_order,
+            ha_primary_view_id=ha_primary_view_id,
+            ha_owner_enclosure_id=ha_owner_enclosure_id,
+        )
+        self._view_order_source_bundle = source_bundle
+        self._cached_effective_view_order = list(order)
+        return order
+
     async def get_storage_view_runtime(
         self,
         *,
@@ -2119,6 +2182,30 @@ class InventoryService:
         target_snapshots: dict[str | None, InventorySnapshot] = {
             active_snapshot.selected_enclosure_id: active_snapshot,
         }
+        ha_owner_enclosure_id = self._runtime_ha_owner_enclosure_id(
+            source_bundle,
+            active_snapshot,
+        )
+        primary_view = next(
+            (
+                storage_view
+                for storage_view in storage_views
+                if storage_view.kind == "ses_enclosure"
+                and storage_view.id == "primary-chassis"
+                and storage_view.binding.mode == "auto"
+            ),
+            None,
+        )
+        ses_snapshots_by_view_id: dict[str, InventorySnapshot] = {}
+        if primary_view is not None and ha_owner_enclosure_id:
+            if ha_owner_enclosure_id not in target_snapshots:
+                target_snapshots[ha_owner_enclosure_id] = await self.get_snapshot(
+                    force_refresh=False,
+                    selected_enclosure_id=ha_owner_enclosure_id,
+                    allow_stale_cache=True,
+                )
+            ses_snapshots_by_view_id[primary_view.id] = target_snapshots[ha_owner_enclosure_id]
+
         candidate_payloads_by_target: dict[str | None, list[dict[str, Any]]] = {}
         for storage_view in storage_views:
             if storage_view.kind == "ses_enclosure":
@@ -2147,11 +2234,22 @@ class InventoryService:
             storage_views,
             target_snapshots,
             candidate_payloads_by_target,
+            ses_snapshots_by_view_id=ses_snapshots_by_view_id,
+        )
+        view_order = await self._effective_runtime_view_order(
+            source_bundle=source_bundle,
+            active_snapshot=active_snapshot,
+            runtime_views=runtime_views,
+            known_snapshots=target_snapshots,
+            ha_primary_view_id=primary_view.id if primary_view is not None and ha_owner_enclosure_id else None,
+            ha_owner_enclosure_id=ha_owner_enclosure_id,
         )
         return StorageViewRuntimePayload(
             system_id=self.system.id,
             system_label=self.system.label or self.system.id,
             views=runtime_views,
+            view_order=view_order,
+            default_selection=view_order[0] if view_order else None,
         )
 
     async def get_system_disk_retention(
@@ -2615,12 +2713,20 @@ class InventoryService:
         storage_views: list[StorageViewConfig],
         snapshots_by_target: dict[str | None, InventorySnapshot],
         candidate_payloads_by_target: dict[str | None, list[dict[str, Any]]],
+        *,
+        ses_snapshots_by_view_id: dict[str, InventorySnapshot] | None = None,
     ) -> list[StorageViewRuntimeView]:
         claimed_candidate_ids: set[str] = set()
         runtime_views: list[StorageViewRuntimeView] = []
+        ses_snapshots = ses_snapshots_by_view_id or {}
         for storage_view in storage_views:
             if storage_view.kind == "ses_enclosure":
-                runtime_views.append(self._build_ses_storage_view_runtime(storage_view, snapshot))
+                runtime_views.append(
+                    self._build_ses_storage_view_runtime(
+                        storage_view,
+                        ses_snapshots.get(storage_view.id, snapshot),
+                    )
+                )
                 continue
 
             target_system_id = self._storage_view_target_system_id(storage_view, snapshot)

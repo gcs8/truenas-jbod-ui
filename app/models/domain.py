@@ -949,6 +949,8 @@ class StorageViewRuntimePayload(BaseModel):
     system_id: str | None = None
     system_label: str | None = None
     views: list[StorageViewRuntimeView] = Field(default_factory=list)
+    view_order: list[str] = Field(default_factory=list)
+    default_selection: str | None = None
 
 
 class HANodeRequest(BaseModel):

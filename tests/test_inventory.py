@@ -3789,7 +3789,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
             runtime = asyncio.run(service.get_storage_view_runtime())
 
-        self.assertEqual(runtime.view_order, ["enclosure:enc-b", "enclosure:enc-a"])
+        self.assertEqual(
+            runtime.view_order,
+            ["enclosure:enc-b", "enclosure:enc-a", "view:primary-chassis"],
+        )
         self.assertEqual(runtime.default_selection, "enclosure:enc-b")
         self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
         service._get_inventory_source_bundle.assert_awaited_once()
