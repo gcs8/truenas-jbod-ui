@@ -112,6 +112,9 @@ test("selection passes, renders and heat-map refreshes all re-place the chips", 
   assert.match(functionSource("refreshGridSelectionState"), /scheduleStateChipPlacement\(\)/);
   assert.match(functionSource("refreshHeatmapTileOverlays"), /scheduleStateChipPlacement\(\)/);
   assert.match(APP_SOURCE, /new ResizeObserver\(scheduleStateChipPlacement\)\.observe\(grid\)/);
-  // Ring tiles draw no chip, so they must not steer where the others go.
-  assert.match(functionSource("placeStateChips"), /:not\(\.selected, \.peer-highlight, \.fabric-highlight\)/);
+  // #925: selected, peer and Connections bays keep their chip too, so every bay
+  // steers the spot and no bay is skipped.
+  const place = functionSource("placeStateChips");
+  assert.match(place, /grid\.querySelectorAll\("\.slot-tile\[data-slot\]"\)/);
+  assert.doesNotMatch(place, /:not\(|selected|peer-highlight|fabric-highlight/);
 });
