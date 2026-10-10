@@ -33,7 +33,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The system-wide disk check no longer counts different QuantaStor disks as
   one. On HA pairs with encrypted multipath disks, a shared `dm-N` device name
   had merged them, so a missing disk could still count as placed. Records
-  with different serials or LUN ids now always count as different disks.
+  with different serials now always count as different disks, and so do
+  records with different LUN ids unless one serial ties them together.
   (#930)
 
 ## v0.24.0-beta.2 - 2026-10-09
