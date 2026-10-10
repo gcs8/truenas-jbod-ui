@@ -157,12 +157,20 @@ class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
                                   build_slot_candidates_from_ses_enclosures(merged.ses_enclosures, 1, None, "shelf-a")[0][0]):
                     slot = service._build_slot_view(0, 0, 0, {"id": "shelf-a"}, candidate,
                                                     None, None, ParsedSSHData(), {}, set())
-                    service._run_ssh_command = AsyncMock(side_effect=lambda command, host=None: SSHCommandResult(
-                        command=command, ok=True, stdout="", stderr="", exit_code=0))
+                    service._run_led_ssh_sequence = AsyncMock(
+                        side_effect=lambda _host, commands: [
+                            (SSHCommandResult(command=command, ok=True, stdout="", stderr="", exit_code=0), 0.01)
+                            for command in commands
+                        ]
+                    )
                     await service._set_slot_led_over_ssh(slot, LedAction.identify)
-                    self.assertTrue(service._run_ssh_command.await_count)
-                    self.assertTrue(all(call.args[1] != "node-b.example.test"
-                                        for call in service._run_ssh_command.await_args_list))
+                    self.assertTrue(service._run_led_ssh_sequence.await_count)
+                    self.assertTrue(
+                        all(
+                            call.args[0] != "node-b.example.test"
+                            for call in service._run_led_ssh_sequence.await_args_list
+                        )
+                    )
 
     def test_redundant_same_shelf_requires_the_same_physical_bay(self):
         for second_bay, expected in ((0, 2), (1, 1)):

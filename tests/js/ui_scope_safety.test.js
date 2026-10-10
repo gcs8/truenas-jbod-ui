@@ -98,6 +98,45 @@ test("locate completion keeps and patches the originating result after a scope c
   assert.equal(state.mutationResults[JSON.stringify([JSON.stringify(["a", "one"]), "sendLedAction"])].succeeded, true);
 });
 
+test("locate completion patches the newest snapshot after a same-scope refresh", async () => {
+  const pending = deferred();
+  const originSlot = {slot:0, slot_label:"00", led_supported:true, identify_active:false};
+  const state = {
+    snapshotMode:false,
+    snapshot:{selected_system_id:"a", selected_enclosure_id:"one", slots:[originSlot]},
+    selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0,
+    latestRefreshToken:1, selectionEpoch:0, mappingDraftRevision:0,
+    snapshotReuseCache:{}, mutationsInFlight:{}, mutationResults:{},
+  };
+  const context = {
+    state, URLSearchParams,
+    writeBlockedByPolicy:()=>false,
+    getSlotById:()=>originSlot,
+    setStatus(){}, sendScopedRequest:async()=>pending.promise,
+    applySnapshot(){}, renderAll(){}, locateLightSourceLabel:()=>"synthetic enclosure",
+    handleWriteRejection(){},
+  };
+  const c = load(["cloneJsonValue", "snapshotReuseCacheKey", ...guardNames, "sendLedAction"], context);
+  const run = c.sendLedAction("IDENTIFY");
+  await new Promise(resolve=>setImmediate(resolve));
+  state.latestRefreshToken++;
+  const refreshedSnapshot = {
+    selected_system_id:"a", selected_enclosure_id:"one", refreshed_marker:true,
+    slots:[{slot:0, slot_label:"00", identify_active:false}],
+  };
+  state.snapshot = refreshedSnapshot;
+  pending.resolve({
+    ok:true, system_id:"a", enclosure_id:"one", slot:0, slot_label:"00",
+    requested_active:true, identify_active:true, confirmed:true, readback_supported:true, paths:[],
+  });
+  await run;
+
+  assert.equal(state.snapshot, refreshedSnapshot, "the completed refresh remains authoritative");
+  assert.equal(state.snapshot.slots[0].identify_active, true);
+  assert.equal(state.snapshotReuseCache["a::one"].refreshed_marker, true);
+  assert.equal(state.snapshotReuseCache["a::one"].slots[0].identify_active, true);
+});
+
 test("locate mismatch patches the readback state and shows a plain warning", async () => {
   const statuses = [];
   const slot = {slot:0, slot_label:"00", led_supported:true, identify_active:true};

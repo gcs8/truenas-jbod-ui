@@ -10507,10 +10507,14 @@
         if (matchingSlot) matchingSlot.identify_active = payload.identify_active;
         return snapshot;
       };
-      retainedSnapshot = patchResult(originSnapshot);
-      if (mutationContextIsCurrent(mutation)) {
+      const currentSnapshotMatchesOrigin = mutation.scope === currentUiScopeKey()
+        && inventoryScopeMatchesSelection();
+      if (currentSnapshotMatchesOrigin) {
         patchResult(state.snapshot);
+        retainedSnapshot = cloneJsonValue(state.snapshot);
         renderAll();
+      } else {
+        retainedSnapshot = patchResult(originSnapshot);
       }
 
       const requestedState = payload.requested_active === false ? "off" : "on";
