@@ -26,6 +26,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Prevented overlapping history and background inventory refreshes from
+  returning retryable busy errors when another enclosure published first (#932).
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
