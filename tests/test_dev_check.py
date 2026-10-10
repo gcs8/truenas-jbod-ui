@@ -115,24 +115,36 @@ class DevCheckPlanTests(unittest.TestCase):
         )
         self.assertFalse(any(skip.name.startswith("Windows exclusion:") for skip in full.skips))
 
-    def test_performance_baseline_is_a_shared_portable_ci_source_gate(self) -> None:
-        for mode, platform in (("safe", "linux"), ("full", "win32")):
-            with self.subTest(mode=mode, platform=platform):
-                plan = dev_check.build_plan(
-                    mode,
-                    platform=platform,
-                    root=ROOT,
-                    python_executable="python",
-                    environment={},
-                    find_executable=lambda _name: None,
-                )
-                checks = [check for check in plan.checks if check.name == "Performance baseline"]
-                self.assertEqual(len(checks), 1)
-                self.assertEqual(
-                    checks[0].argv,
-                    ("python", "scripts/build_perf_baseline.py", "--check"),
-                )
-                self.assertEqual(checks[0].ci_gate, "performance-baseline")
+    def test_performance_baseline_runs_on_posix_and_is_explicitly_skipped_on_windows(self) -> None:
+        posix = dev_check.build_plan(
+            "safe",
+            platform="linux",
+            root=ROOT,
+            python_executable="python",
+            environment={},
+            find_executable=lambda _name: None,
+        )
+        checks = [check for check in posix.checks if check.name == "Performance baseline"]
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(
+            checks[0].argv,
+            ("python", "scripts/build_perf_baseline.py", "--check"),
+        )
+        self.assertEqual(checks[0].ci_gate, "performance-baseline")
+
+        windows = dev_check.build_plan(
+            "full",
+            platform="win32",
+            root=ROOT,
+            python_executable="python",
+            environment={},
+            find_executable=lambda _name: None,
+        )
+        self.assertFalse(any(check.name == "Performance baseline" for check in windows.checks))
+        skips = [skip for skip in windows.skips if skip.name == "Performance baseline"]
+        self.assertEqual(len(skips), 1)
+        self.assertIn("POSIX directory-descriptor", skips[0].reason)
+        self.assertEqual(skips[0].ci_gate, "performance-baseline")
 
         self.assertIn("performance-baseline", dev_check.read_ci_source_gate_contract(ROOT))
 
@@ -271,13 +283,19 @@ class DevCheckPlanTests(unittest.TestCase):
         self.assertTrue(parser.parse_args(["--safe", "--verbose"]).verbose)
         self.assertFalse(parser.parse_args(["--safe"]).verbose)
 
-    def test_smart_grid_io_is_classified_by_inventory_import_graph(self) -> None:
+    def test_fcntl_import_graph_suites_are_classified_as_posix_only(self) -> None:
         exclusion = next(
             item for item in dev_check.WINDOWS_EXCLUSIONS
             if item.category == "fcntl-dependent history/backup import graph"
         )
-        self.assertNotIn("tests.test_smart_grid_io", dev_check.WINDOWS_PORTABLE_TEST_MODULES)
-        self.assertIn("tests.test_smart_grid_io", exclusion.modules)
+        for module in (
+            "tests.test_admin_maintenance",
+            "tests.test_backup_integration",
+            "tests.test_smart_grid_io",
+        ):
+            with self.subTest(module=module):
+                self.assertNotIn(module, dev_check.WINDOWS_PORTABLE_TEST_MODULES)
+                self.assertIn(module, exclusion.modules)
 
     def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
         self,
