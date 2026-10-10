@@ -16475,10 +16475,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service._canonical_enclosure_options = service._canonical_enclosure_options or {}
             service._cache[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = snapshot
             service._cache_until[inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._remember_led_snapshot(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, snapshot)
 
             await service.set_slot_led(0, LedAction.identify, invalidate_snapshot=False)
 
-            self.assertEqual(service.get_snapshot.await_count, 1)
+            self.assertEqual(service.get_snapshot.await_count, 0)
             self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
             self.assertEqual(truenas_client.calls, [("enc-1", 1, LedAction.identify.value)])
 
@@ -16514,6 +16515,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service.get_snapshot = AsyncMock(return_value=snapshot)
             service._cache["enc-1"] = snapshot
             service._cache_until["enc-1"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+            service._remember_led_snapshot("enc-1", snapshot)
             service._cache["enc-2"] = InventorySnapshot(
                 slots=[SlotView(slot=1, slot_label="01", row_index=0, column_index=1, enclosure_id="enc-2")],
                 refresh_interval_seconds=30,
@@ -16522,7 +16524,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             service._source_bundle = object()  # type: ignore[assignment]
             service._source_bundle_until = datetime.now(timezone.utc) + timedelta(seconds=30)
 
-            await service.set_slot_led(0, LedAction.identify)
+            await service.set_slot_led(0, LedAction.identify, selected_enclosure_id="enc-1")
 
             self.assertEqual(truenas_client.calls, [("enc-1", 1, LedAction.identify.value)])
             self.assertIsNone(service._source_bundle)
@@ -17210,7 +17212,29 @@ Consumers:
         service._run_ssh_command = AsyncMock(
             return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
         )
+
+        async def run_led_sequence(_host, commands):
+            results = []
+            for command in commands:
+                stdout = next(
+                    (output for marker, output in outputs.items() if marker in command),
+                    "",
+                )
+                results.append(
+                    (SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0), 0.01)
+                )
+            return results
+
+        service._run_led_ssh_sequence = AsyncMock(side_effect=run_led_sequence)
         return service
+
+    @staticmethod
+    def led_sequence_commands(service):
+        return [
+            command
+            for call in service._run_led_ssh_sequence.await_args_list
+            for command in call.args[1]
+        ]
 
     async def test_ec_only_public_snapshot_keeps_status_but_refuses_led(self):
         for platform in ("scale", "quantastor", "linux"):
@@ -17249,11 +17273,17 @@ Consumers:
                 self.assertTrue(slot.identify_active)
                 self.assertEqual(slot.ssh_ses_targets[0]["ses_slot_number"], 2)
                 for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
-                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
-                    service._run_ssh_command.assert_awaited_with(
-                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9", None
+                    await service.set_slot_led(
+                        slot.slot,
+                        action,
+                        selected_enclosure_id=snapshot.selected_enclosure_id,
+                        invalidate_snapshot=False,
                     )
-                self.assertEqual(service._run_ssh_command.await_count, 2)
+                    self.assertIn(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9",
+                        self.led_sequence_commands(service),
+                    )
+                self.assertEqual(service._run_led_ssh_sequence.await_count, 2)
 
     def invalid_aes_outputs(self):
         return self.AES.replace(
@@ -17292,11 +17322,17 @@ Consumers:
                 anchor = next(item for item in snapshot.slots if item.ssh_ses_element_id == 0)
                 self.assertTrue(anchor.led_supported)
                 for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
-                    await service.set_slot_led(anchor.slot, action, invalidate_snapshot=False)
-                    service._run_ssh_command.assert_awaited_with(
-                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=1 {flag} /dev/sg9", None,
+                    await service.set_slot_led(
+                        anchor.slot,
+                        action,
+                        selected_enclosure_id=snapshot.selected_enclosure_id,
+                        invalidate_snapshot=False,
                     )
-                self.assertEqual(service._run_ssh_command.await_count, 2)
+                    self.assertIn(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=1 {flag} /dev/sg9",
+                        self.led_sequence_commands(service),
+                    )
+                self.assertEqual(service._run_led_ssh_sequence.await_count, 2)
 
     async def test_invalid_aes_without_offset_remains_unavailable(self):
         invalid = self.invalid_aes_outputs().replace(
@@ -17337,11 +17373,17 @@ Consumers:
                     "ses_device": device, "ses_element_id": 1, "ses_slot_number": 2,
                 }])
                 for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
-                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
-                    service._run_ssh_command.assert_awaited_with(
-                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} {device}", None,
+                    await service.set_slot_led(
+                        slot.slot,
+                        action,
+                        selected_enclosure_id=snapshot.selected_enclosure_id,
+                        invalidate_snapshot=False,
                     )
-                self.assertEqual(service._run_ssh_command.await_count, 2)
+                    self.assertIn(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} {device}",
+                        self.led_sequence_commands(service),
+                    )
+                self.assertEqual(service._run_led_ssh_sequence.await_count, 2)
                 service.truenas_client.set_slot_status.assert_not_awaited()
 
     async def test_descriptor_only_join_keeps_display_but_never_plans_led(self):
@@ -17390,11 +17432,17 @@ Consumers:
                 self.assertTrue(slot.led_supported)
                 self.assertEqual(slot.ssh_ses_targets[0]["ses_slot_number"], 2)
                 for action, flag in ((LedAction.identify, "--set=ident"), (LedAction.clear, "--clear=ident")):
-                    await service.set_slot_led(slot.slot, action, invalidate_snapshot=False)
-                    service._run_ssh_command.assert_awaited_with(
-                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9", None
+                    await service.set_slot_led(
+                        slot.slot,
+                        action,
+                        selected_enclosure_id=snapshot.selected_enclosure_id,
+                        invalidate_snapshot=False,
                     )
-                self.assertEqual(service._run_ssh_command.await_count, 2)
+                    self.assertIn(
+                        f"sudo -n /usr/bin/sg_ses --dev-slot-num=2 {flag} /dev/sg9",
+                        self.led_sequence_commands(service),
+                    )
+                self.assertEqual(service._run_led_ssh_sequence.await_count, 2)
                 service.truenas_client.set_slot_status.assert_not_awaited()
 
     async def test_sg_dispatch_refuses_missing_coordinates_without_ui_fallback(self):
@@ -17424,9 +17472,17 @@ Consumers:
         snapshot = await service.get_snapshot()
         slot = snapshot.slots[0]
         self.assertTrue(slot.led_supported)
-        await service.set_slot_led(slot.slot, LedAction.identify)
-        service._run_ssh_command.assert_awaited_once_with(
-            "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None
+        await service.set_slot_led(
+            slot.slot,
+            LedAction.identify,
+            selected_enclosure_id=snapshot.selected_enclosure_id,
+        )
+        self.assertEqual(
+            self.led_sequence_commands(service),
+            [
+                "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on",
+                "sudo -n /usr/sbin/sesutil map",
+            ],
         )
 
     async def test_cross_controller_disks_stay_distinct_in_public_snapshot_and_smart(self):
@@ -17567,14 +17623,24 @@ Consumers:
                     first, second = ses_map.split("ses1:")
                     ses_map = "ses1:" + second + first
                 service = self.dual_path_service(ses_map, [{"name": "da0", "serial": "SANITIZED-DUAL-PATH"}])
-                slot = (await service.get_snapshot()).slots[0]
+                snapshot = await service.get_snapshot()
+                slot = snapshot.slots[0]
                 self.assertEqual(sorted(t["ses_device"] for t in slot.ssh_ses_targets), ["/dev/ses0", "/dev/ses1"])
                 self.assertEqual((slot.led_supported, slot.led_backend, slot.led_reason), (True, "ssh", None))
 
-                await service.set_slot_led(slot.slot, LedAction.identify, invalidate_snapshot=False)
+                await service.set_slot_led(
+                    slot.slot,
+                    LedAction.identify,
+                    selected_enclosure_id=snapshot.selected_enclosure_id,
+                    invalidate_snapshot=False,
+                )
 
-                service._run_ssh_command.assert_awaited_once_with(
-                    f"sudo -n /usr/sbin/sesutil locate -u {slot.ssh_ses_targets[0]['ses_device']} 7 on", None
+                self.assertEqual(
+                    self.led_sequence_commands(service),
+                    [
+                        f"sudo -n /usr/sbin/sesutil locate -u {slot.ssh_ses_targets[0]['ses_device']} 7 on",
+                        "sudo -n /usr/sbin/sesutil map",
+                    ],
                 )
 
     def test_bay_peers_require_the_bay_to_list_the_disks_own_path(self):

@@ -1177,6 +1177,7 @@ class InventoryService:
         # published, identity-checked target for each enclosure view while a
         # post-write background refresh replaces the main cache.
         self._led_slot_targets: dict[tuple[str, int], SlotView] = {}
+        self._led_slot_target_sequences: dict[str, int] = {}
         self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
         self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
         self._smart_negative_cache: OrderedDict[
@@ -1528,6 +1529,11 @@ class InventoryService:
                         )
                         return CacheResult(cached, "trusted-fallback")
                     self._observe_inventory_snapshot_request(refresh_trigger)
+                    self._remember_led_snapshot(
+                        cache_key,
+                        snapshot,
+                        request_sequence=request_sequence,
+                    )
                     return CacheResult(snapshot, refresh_trigger)
                 # Fresh trusted discovery retires obsolete options even when an
                 # explicit old selection must be rejected. An omitted selection
@@ -1658,16 +1664,31 @@ class InventoryService:
         self._cache_until[cache_key] = utcnow() + timedelta(
             seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
         )
-        self._remember_led_snapshot(cache_key, snapshot)
+        self._remember_led_snapshot(
+            cache_key,
+            snapshot,
+            request_sequence=request_sequence,
+        )
         self._snapshot_published_sequence[cache_key] = request_sequence
         self._touch_snapshot_key(cache_key)
         return snapshot, True
 
-    def _remember_led_snapshot(self, cache_key: str, snapshot: InventorySnapshot) -> None:
+    def _remember_led_snapshot(
+        self,
+        cache_key: str,
+        snapshot: InventorySnapshot,
+        *,
+        request_sequence: int | None = None,
+    ) -> None:
         scope_keys = {cache_key}
         if snapshot.selected_enclosure_id:
             scope_keys.add(snapshot.selected_enclosure_id)
         for scope_key in scope_keys:
+            if request_sequence is not None:
+                previous_sequence = self._led_slot_target_sequences.get(scope_key, -1)
+                if previous_sequence > request_sequence:
+                    continue
+                self._led_slot_target_sequences[scope_key] = request_sequence
             for target_key in tuple(self._led_slot_targets):
                 if target_key[0] == scope_key:
                     self._led_slot_targets.pop(target_key, None)
@@ -4609,6 +4630,9 @@ class InventoryService:
 
     def _resolve_led_slot(self, slot: int, selected_enclosure_id: str | None) -> SlotView | None:
         request_scope = selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+        remembered = self._led_slot_targets.get((request_scope, slot))
+        if remembered is not None:
+            return remembered
         snapshot = (
             self._cache.get(selected_enclosure_id)
             if selected_enclosure_id is not None
