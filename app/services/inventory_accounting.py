@@ -28,6 +28,7 @@ snapshot without handling serials, WWNs or GPT identifiers.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -45,6 +46,12 @@ __all__ = [
     "scope_node_local_tokens",
     "slot_identity_tokens",
 ]
+
+
+# A bare device-mapper minor name (dm-12) is handed out in creation order on
+# each node, so two disks can carry the same one and it names neither (#921).
+# Stable device-mapper names such as by-id/dm-uuid-mpath-... stay identity.
+_BARE_DEVICE_MAPPER_NAME = re.compile(r"^(?:/dev/)?dm-\d+$", re.IGNORECASE)
 
 
 def _clean(value: Any) -> str | None:
@@ -73,6 +80,7 @@ def logical_disk_identity_tokens(
 
     ``persistent_id_label`` is accepted for caller compatibility but ignored:
     labels such as "GPTID" describe an identifier type, not a disk identity.
+    A bare device-mapper name such as ``dm-12`` is not identity either.
     """
     tokens: set[str] = set()
     serial_value = _clean(serial)
@@ -82,12 +90,12 @@ def logical_disk_identity_tokens(
     if lun_value:
         tokens.add(f"lun:{lun_value}")
     gptid_value = _clean(gptid)
-    if gptid_value:
+    if gptid_value and not _BARE_DEVICE_MAPPER_NAME.match(gptid_value):
         normalized_gptid = normalize_gptid(gptid_value)
         tokens.add(f"gptid:{(normalized_gptid or gptid_value).lower()}")
     for raw_device in device_names:
         device_value = _clean(raw_device)
-        if not device_value:
+        if not device_value or _BARE_DEVICE_MAPPER_NAME.match(device_value):
             continue
         normalized_device = normalize_device_name(device_value)
         tokens.add(f"dev:{(normalized_device or device_value).lower()}")
