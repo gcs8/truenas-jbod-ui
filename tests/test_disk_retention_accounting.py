@@ -437,6 +437,7 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
 
     def _retention(
         self, disks, slots_by_node, *, other_node=None, configured=True, default_node="node-a", nodes=None,
+        pool_devices=(),
     ):
         from app.config import SSHConfig
         from app.models.domain import EnclosureOption, InventorySnapshot
@@ -475,7 +476,7 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
                 return_value=InventorySourceBundle(
                     raw_data=TrueNASRawData(
                         enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
-                        systems=systems,
+                        systems=systems, pool_devices=list(pool_devices),
                     ),
                     ssh_outputs={}, ssh_collected=False, warnings=[],
                     sources={"api": SourceStatus(enabled=True, ok=True)},
@@ -580,6 +581,242 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         )
         self.assertEqual(retention.unplaced_disk_count, 0)
         self.assertEqual(retention.rendered_unique_disk_count, 2)
+
+    # #921: an HA pair with encrypted multipath disks. Each shared disk is
+    # reported by both nodes as a raw by-id record, a dm-uuid-mpath record and
+    # a dm-name-enc (dm-crypt) record; each node also has two boot disks. The
+    # pool (owned by node-a) names node-a's crypt device, so on node-b every
+    # record of a shared disk also carries node-a's dm-N number, which node-b
+    # uses for a different disk's multipath device.
+    SHARED_DISKS = 9
+    # node-b's dm-N for disk i's multipath device is node-a's crypt dm-N for
+    # disk PERMUTATION[i]: one three-disk cycle and three swapped pairs.
+    PERMUTATION = (1, 2, 0, 4, 3, 6, 5, 8, 7)
+
+    @classmethod
+    def _dm_shaped_pair(cls):
+        disks, pool_devices = [], []
+        dm_numbers = {
+            "node-a": {"mpath": lambda i: 3 + i, "crypt": lambda i: 12 + i},
+            "node-b": {"mpath": lambda i: 12 + cls.PERMUTATION[i], "crypt": lambda i: 3 + i},
+        }
+        for i in range(cls.SHARED_DISKS):
+            serial = f"TESTSER{i + 1:04d}"
+            lun = f"TESTLUN{i + 1:04d}"
+            by_id = f"scsi-SSYNTH_MODEL_{serial}"
+            for node, numbers in dm_numbers.items():
+                common = {"storageSystemId": node, "serialNumber": serial, "scsiId": lun, "size": 1000}
+                sd = f"sd{chr(ord('c') + i)}"
+                disks += [
+                    common | {"id": f"{node}-raw-{i}", "devicePath": f"/dev/disk/by-id/{by_id}",
+                              "altDevicePath": f"/dev/{sd}", "name": f"{sd} ({by_id})"},
+                    common | {"id": f"{node}-mpath-{i}", "devicePath": f"/dev/disk/by-id/dm-uuid-mpath-{lun}",
+                              "altDevicePath": f"/dev/dm-{numbers['mpath'](i)}",
+                              "name": f"dm-uuid-mpath-{lun}"},
+                    common | {"id": f"{node}-crypt-{i}",
+                              "devicePath": f"/dev/disk/by-id/dm-name-enc-dm-uuid-mpath-{lun}",
+                              "altDevicePath": f"/dev/dm-{numbers['crypt'](i)}",
+                              "name": f"dm-name-enc-dm-uuid-mpath-{lun}"},
+                ]
+            crypt_path = f"/dev/disk/by-id/dm-name-enc-dm-uuid-mpath-{lun}"
+            pool_devices.append({
+                "id": f"pool-device-{i}", "storageSystemId": "node-a", "slot": i,
+                "name": crypt_path.rsplit("/", 1)[-1], "devicePath": crypt_path,
+                "physicalDiskSerialNumber": serial, "physicalDiskScsiId": lun,
+                "physicalDiskObj": {"name": crypt_path.rsplit("/", 1)[-1], "devicePath": crypt_path,
+                                    "altDevicePath": f"/dev/dm-{12 + i}", "serialNumber": serial,
+                                    "scsiId": lun},
+            })
+        for node, boot_serials in (("node-a", ("TESTSER0101", "TESTSER0102")),
+                                   ("node-b", ("TESTSER0201", "TESTSER0202"))):
+            for k, serial in enumerate(boot_serials):
+                disks.append({
+                    "id": f"{node}-boot-{k}", "storageSystemId": node, "serialNumber": serial, "size": 100,
+                    "devicePath": f"/dev/disk/by-id/ata-SYNTH_SATADOM_{serial}", "altDevicePath": f"/dev/sd{'ab'[k]}",
+                })
+        return disks, pool_devices
+
+    def _dm_shaped_slots(self, disks, pool_devices):
+        """Each node's bays and boot views, built from that node's raw by-id records."""
+        system = SystemConfig(id="qs", truenas=TrueNASConfig(platform="quantastor"))
+        raw = TrueNASRawData(enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+                             pool_devices=pool_devices)
+        slots_by_node = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            for node in ("node-a", "node-b"):
+                slots_by_node[node] = [
+                    {"device_name": record.device_name, "serial": record.serial,
+                     "logical_unit_id": record.lunid, "gptid": record.identifier,
+                     "smart_device_names": list(record.smart_devices)}
+                    for record in service._build_quantastor_disk_records(raw, node)
+                    if record.raw.get("storageSystemId") == node
+                    and not str(record.device_name).startswith("disk/by-id/dm-")
+                ]
+        return slots_by_node
+
+    def test_dm_n_aliases_do_not_merge_distinct_disks_of_an_encrypted_multipath_pair(self) -> None:
+        disks, pool_devices = self._dm_shaped_pair()
+        slots_by_node = self._dm_shaped_slots(disks, pool_devices)
+        self.assertEqual(len(disks), 58)
+        self.assertEqual(len({disk["serialNumber"] for disk in disks}), 13)
+        self.assertEqual([len(slots) for slots in slots_by_node.values()], [11, 11])
+        # The fixture reproduces the collision: on node-b one dm-N name is
+        # held by records of two different disks.
+        holders: dict[str, set[str | None]] = {}
+        system = SystemConfig(id="qs", truenas=TrueNASConfig(platform="quantastor"))
+        raw = TrueNASRawData(enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+                             pool_devices=pool_devices)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            for record in service._build_quantastor_disk_records(raw, "node-b"):
+                for name in record.smart_devices:
+                    if name.startswith("dm-") and name[3:].isdigit():
+                        holders.setdefault(name, set()).add(record.serial)
+        self.assertTrue(any(len(serials) > 1 for serials in holders.values()))
+
+        retention = self._retention(disks, slots_by_node, pool_devices=pool_devices)
+
+        self.assertEqual(
+            (
+                retention.source_disk_count,
+                retention.rendered_unique_disk_count,
+                retention.duplicate_disk_view_count,
+                retention.unplaced_disk_count,
+            ),
+            (58, 13, 9, 0),
+        )
+
+    def test_a_missing_disk_of_the_pair_is_not_hidden_by_a_dm_n_alias(self) -> None:
+        # Neither node shows TESTSER0002 any more. Before #921 its records
+        # shared a node-b dm-N name with a shown disk and counted as placed.
+        disks, pool_devices = self._dm_shaped_pair()
+        slots_by_node = {
+            node: [slot for slot in slots if slot["serial"] != "TESTSER0002"]
+            for node, slots in self._dm_shaped_slots(disks, pool_devices).items()
+        }
+
+        retention = self._retention(disks, slots_by_node, pool_devices=pool_devices)
+
+        # Six records describe the missing disk: raw, mpath and crypt per node.
+        self.assertEqual(retention.unplaced_disk_count, 6)
+        self.assertEqual(retention.rendered_unique_disk_count, 12)
+
+
+class IdentityConflictTests(unittest.TestCase):
+    """#921: a shared node-local name never joins two different stable identities."""
+
+    @staticmethod
+    def _record(**fields):
+        return SimpleNamespace(**fields)
+
+    @staticmethod
+    def _slot(**fields) -> SlotView:
+        return SlotView(**({"slot": 0, "slot_label": "0", "row_index": 0, "column_index": 0} | fields))
+
+    def test_bare_device_mapper_names_are_not_identity(self) -> None:
+        self.assertEqual(
+            logical_disk_identity_tokens(device_names=("dm-16", "/dev/dm-3", "DM-7"), gptid="/dev/dm-4"),
+            frozenset(),
+        )
+        # Stable device-mapper names keep working.
+        self.assertEqual(
+            logical_disk_identity_tokens(device_names=("/dev/disk/by-id/dm-uuid-mpath-TESTLUN0001",)),
+            frozenset({"dev:disk/by-id/dm-uuid-mpath-testlun0001"}),
+        )
+
+    def test_a_shared_device_name_does_not_join_two_serials(self) -> None:
+        sources = [
+            self._record(serial="TESTSER0001", device_name="sdc"),
+            self._record(serial="TESTSER0002", device_name="sdc"),
+        ]
+        slots = [self._slot(serial="TESTSER0001", device_name="sdc")]
+        for scopes in (None, ["node-a", "node-a"]):
+            with self.subTest(scopes=scopes):
+                accounting = build_disk_retention_accounting(
+                    source_disks=sources, slots=slots, source_scopes=scopes,
+                    slot_scopes=None if scopes is None else ["node-a"],
+                )
+                self.assertEqual(accounting.rendered_unique_disk_count, 1)
+                self.assertEqual(accounting.unplaced_disk_count, 1)
+
+    def test_a_record_without_a_serial_cannot_bridge_two_serials(self) -> None:
+        sources = [
+            self._record(serial="TESTSER0001", device_name="sdc"),
+            self._record(serial="TESTSER0002", device_name="sdd"),
+            # One record naming both devices, with no identity of its own.
+            self._record(device_name="sdc", path_device_name="sdd"),
+        ]
+        for order in (sources, sources[::-1]):
+            with self.subTest(reversed=order is not sources):
+                accounting = build_disk_retention_accounting(
+                    source_disks=order,
+                    slots=[self._slot(serial="TESTSER0001", device_name="sdc")],
+                )
+                self.assertEqual(accounting.rendered_unique_disk_count, 1)
+                # TESTSER0002 is shown nowhere, and the bridging record
+                # cannot be credited to either disk: both stay unplaced.
+                self.assertEqual(accounting.unplaced_disk_count, 2)
+
+    def test_a_shared_device_name_does_not_join_two_lun_ids(self) -> None:
+        sources = [
+            self._record(lunid="TESTLUN0001", device_name="dm-name-a"),
+            self._record(lunid="TESTLUN0002", device_name="dm-name-a"),
+        ]
+        accounting = build_disk_retention_accounting(
+            source_disks=sources, slots=[self._slot(logical_unit_id="TESTLUN0001")],
+        )
+        self.assertEqual(accounting.rendered_unique_disk_count, 1)
+        self.assertEqual(accounting.unplaced_disk_count, 1)
+
+    def test_a_lun_id_reported_with_two_serials_identifies_neither(self) -> None:
+        # A RAID volume id carried by both member disks is not a disk identity.
+        sources = [
+            self._record(serial="TESTSER0001", lunid="TESTLUN0009", device_name="sdc"),
+            self._record(serial="TESTSER0002", lunid="TESTLUN0009", device_name="sdd"),
+        ]
+        accounting = build_disk_retention_accounting(
+            source_disks=sources,
+            slots=[self._slot(serial="TESTSER0001", logical_unit_id="TESTLUN0009", device_name="sdc")],
+        )
+        self.assertEqual(accounting.rendered_unique_disk_count, 1)
+        self.assertEqual(accounting.unplaced_disk_count, 1)
+
+    def test_one_serial_reported_with_two_lun_formats_is_one_disk(self) -> None:
+        sources = [
+            self._record(serial="TESTSER0001", lunid="TESTLUN0001", device_name="da0"),
+            self._record(serial="TESTSER0001", lunid="naa.TESTLUN0001", device_name="da1"),
+        ]
+        accounting = build_disk_retention_accounting(
+            source_disks=sources, slots=[self._slot(serial="TESTSER0001", device_name="da0")],
+        )
+        self.assertEqual(accounting.rendered_unique_disk_count, 1)
+        self.assertEqual(accounting.unplaced_disk_count, 0)
+
+    def test_core_multipath_paths_still_join_without_a_serial_on_every_path(self) -> None:
+        sources = [
+            self._record(serial="TESTSER0001", device_name="multipath/disk1", path_device_name="da3",
+                         multipath_name="multipath/disk1", multipath_member="da3"),
+            self._record(device_name="da4", multipath_name="multipath/disk1", multipath_member="da4"),
+        ]
+        slots = [
+            self._slot(
+                serial="TESTSER0001",
+                device_name="multipath/disk1",
+                multipath=MultipathView(
+                    name="disk1",
+                    device_name="multipath/disk1",
+                    members=[MultipathMember(device_name="da3"), MultipathMember(device_name="da4")],
+                ),
+            ),
+            self._slot(slot=1, device_name="da4"),
+        ]
+        accounting = build_disk_retention_accounting(source_disks=sources, slots=slots)
+        self.assertEqual(
+            (accounting.rendered_unique_disk_count, accounting.duplicate_disk_view_count,
+             accounting.unplaced_disk_count),
+            (1, 1, 0),
+        )
 
 
 class SystemWideRetentionTests(unittest.TestCase):
