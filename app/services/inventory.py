@@ -178,6 +178,53 @@ VIRTUAL_INVENTORY_PHYSICAL_LOCATION_WARNING = (
 
 logger = logging.getLogger(__name__)
 METRICS_SERVICE_NAME = "enclosure-ui"
+
+
+def effective_main_view_order(
+    *,
+    enclosure_counts: list[tuple[str, int]],
+    view_counts: list[tuple[str, int]],
+    saved_order: Iterable[str] = (),
+    ha_primary_view_id: str | None = None,
+    ha_owner_enclosure_id: str | None = None,
+) -> list[str]:
+    """Order main-page entries by saved preference, then occupied disks.
+
+    The incoming sequence is the existing order within each entry kind. Live
+    enclosures win ties with storage views; order inside the same kind remains
+    stable. HA promotion is an automatic-order rule only, so an administrator's
+    first valid saved entry remains the opening view.
+    """
+
+    automatic = [
+        key
+        for key, _count, _kind_rank, _current_rank in sorted(
+            [
+                (f"enclosure:{entry_id}", max(0, int(count)), 0, index)
+                for index, (entry_id, count) in enumerate(enclosure_counts)
+                if entry_id
+            ]
+            + [
+                (f"view:{entry_id}", max(0, int(count)), 1, index)
+                for index, (entry_id, count) in enumerate(view_counts)
+                if entry_id
+            ],
+            key=lambda item: (-item[1], item[2], item[3]),
+        )
+    ]
+    available = set(automatic)
+    saved = list(dict.fromkeys(entry for entry in saved_order if entry in available))
+    if saved:
+        return [*saved, *(entry for entry in automatic if entry not in saved)]
+
+    preferred = None
+    if ha_primary_view_id and f"view:{ha_primary_view_id}" in available:
+        preferred = f"view:{ha_primary_view_id}"
+    elif ha_owner_enclosure_id and f"enclosure:{ha_owner_enclosure_id}" in available:
+        preferred = f"enclosure:{ha_owner_enclosure_id}"
+    if preferred:
+        return [preferred, *(entry for entry in automatic if entry != preferred)]
+    return automatic
 QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
