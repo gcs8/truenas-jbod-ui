@@ -297,7 +297,7 @@ class DevCheckPlanTests(unittest.TestCase):
                 self.assertNotIn(module, dev_check.WINDOWS_PORTABLE_TEST_MODULES)
                 self.assertIn(module, exclusion.modules)
 
-    def test_mapping_store_suite_is_classified_as_posix_filesystem_semantics(
+    def test_nonportable_filesystem_and_event_loop_suites_are_classified_for_windows(
         self,
     ) -> None:
         posix_exclusion = next(
@@ -305,14 +305,35 @@ class DevCheckPlanTests(unittest.TestCase):
             for exclusion in dev_check.WINDOWS_EXCLUSIONS
             if exclusion.category == "POSIX filesystem and identity semantics"
         )
-        self.assertNotIn(
+        for module in (
+            "tests.test_ci_contract",
+            "tests.test_ghcr_release_contract",
+            "tests.test_history_config_contract",
             "tests.test_mapping_store",
-            dev_check.WINDOWS_PORTABLE_TEST_MODULES,
+            "tests.test_public_demo_fixture",
+            "tests.test_public_demo_provenance",
+            "tests.test_startup_migration_recovery",
+            "tests.test_startup_writability",
+            "tests.test_ui_health_and_admin_probe",
+            "tests.test_upgrade_notice",
+        ):
+            with self.subTest(module=module):
+                self.assertNotIn(module, dev_check.WINDOWS_PORTABLE_TEST_MODULES)
+                self.assertIn(module, posix_exclusion.modules)
+
+        timing_exclusion = next(
+            exclusion
+            for exclusion in dev_check.WINDOWS_EXCLUSIONS
+            if exclusion.category == "Windows event-loop timing"
         )
-        self.assertIn(
-            "tests.test_mapping_store",
-            posix_exclusion.modules,
-        )
+        for module in (
+            "tests.test_ssh_session_reuse",
+            "tests.test_truenas_ws",
+            "tests.test_truenas_ws_jsonrpc",
+        ):
+            with self.subTest(module=module):
+                self.assertNotIn(module, dev_check.WINDOWS_PORTABLE_TEST_MODULES)
+                self.assertIn(module, timing_exclusion.modules)
 
     def test_bash_ci_contract_has_a_named_windows_tooling_exclusion(self) -> None:
         bash_exclusions = [
