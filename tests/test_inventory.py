@@ -3806,6 +3806,44 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
         service._get_inventory_source_bundle.assert_awaited_once()
 
+    def test_runtime_view_order_recomputes_after_targeted_snapshot_invalidation(self) -> None:
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            "enc-a": self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options),
+            "enc-b": self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 3, options),
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            source_bundle = self._empty_source_bundle()
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+
+            before = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
+            self.assertEqual(before.view_order[:2], ["enclosure:enc-b", "enclosure:enc-a"])
+            self.assertEqual(before.default_selection, "enclosure:enc-b")
+
+            snapshots["enc-a"] = self._view_order_snapshot(
+                "synthetic-system", "enc-a", "Enclosure A", 4, options,
+            )
+            service.invalidate_physical_enclosure_snapshot_cache(
+                reason="test.mapping_changed",
+                enclosure_id="enc-a",
+            )
+
+            after = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
+
+        self.assertIs(service._get_inventory_source_bundle.return_value, source_bundle)
+        self.assertEqual(after.view_order[:2], ["enclosure:enc-a", "enclosure:enc-b"])
+        self.assertEqual(after.default_selection, "enclosure:enc-a")
+
     def test_quantastor_ha_primary_chassis_uses_pool_owner_even_when_another_node_is_selected(self) -> None:
         options = [
             EnclosureOption(id="node-a", label="ExampleQS Left"),
