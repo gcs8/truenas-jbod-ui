@@ -7668,6 +7668,31 @@ class SecretWhitespaceModelTests(unittest.TestCase):
 
 
 class SystemSetupServiceTests(unittest.TestCase):
+    def test_create_system_persists_normalized_view_order(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        config_path = temp_dir / "config.yaml"
+        write_yaml(config_path, {})
+
+        service = SystemSetupService(str(config_path))
+        created = service.create_system(
+            SystemSetupRequest(
+                label="Example SCALE",
+                platform="scale",
+                truenas_host="https://scale.example.test",
+                view_order=[
+                    " view:boot ",
+                    "enclosure:enc-a",
+                    "view:boot",
+                    "retired",
+                ],
+            )
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        expected = ["view:boot", "enclosure:enc-a"]
+        self.assertEqual(created.view_order, expected)
+        self.assertEqual(saved["systems"][0]["view_order"], expected)
+
     def test_create_system_appends_new_configured_system(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"

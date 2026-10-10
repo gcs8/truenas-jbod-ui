@@ -474,6 +474,34 @@ test("failed ESXi install refreshes packages before restoring controls", async (
   assert.equal(installButton.disabled, true);
 });
 
+test("admin view-order helpers combine live entries and move them accessibly", () => {
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const { orderedAdminViewEntries, moveAdminViewOrder } = loadFunctions(
+    [helpersSource],
+    ["orderedAdminViewEntries", "moveAdminViewOrder"],
+  );
+  const entries = orderedAdminViewEntries(
+    [{ id: "enc-a", label: "Enclosure A" }, { id: "enc-b", label: "Enclosure B" }],
+    [
+      { id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } },
+      { id: "hidden", label: "Hidden", enabled: true, render: { show_in_main_ui: false } },
+    ],
+    ["view:boot", "enclosure:retired", "enclosure:enc-b"],
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(entries.map((entry) => entry.key))),
+    ["view:boot", "enclosure:enc-b", "enclosure:enc-a"],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(moveAdminViewOrder(entries, "view:boot", 1))),
+    ["enclosure:enc-b", "view:boot", "enclosure:enc-a"],
+  );
+});
+
 test("ESXi host prep uses canonical preserved secrets and configured timeout", () => {
   const collectEsxiSource = sourceBetween(
     "  function collectEsxiHostPrepInstallPayload",
