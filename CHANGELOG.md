@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- The system-wide disk check no longer counts different QuantaStor disks as
+  one. On HA pairs with encrypted multipath disks, a shared `dm-N` device name
+  had merged them, so a missing disk could still count as placed. Records
+  with different serials or LUN ids now always count as different disks.
+  (#930)
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
