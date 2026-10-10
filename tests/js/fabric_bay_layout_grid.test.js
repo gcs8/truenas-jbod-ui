@@ -405,7 +405,11 @@ for (const [name, enclosure, slots, expected, extraView = {}] of [
 ]) {
   test(`physical bay selection rejects ambiguity: ${name}`, () => {
     const selected = [];
-    const state = { snapshot: { selected_enclosure_id: enclosure }, selectedSlot: 99 };
+    const state = {
+      snapshot: { selected_enclosure_id: enclosure },
+      selectedSlot: 99,
+      sasFabric: { selectedTraceId: null, selectedNodeId: null },
+    };
     const view = { backing_enclosure_id: "front", source: "inventory_binding", slots, ...extraView };
     const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
       state,
@@ -422,6 +426,7 @@ for (const [name, enclosure, slots, expected, extraView = {}] of [
 test("live enclosure bay selection remains direct and invalid inputs never select", () => {
   const selected = [];
   const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
+    state: { sasFabric: { selectedTraceId: null, selectedNodeId: null } },
     getSelectedStorageViewRuntime: () => null,
     selectSlot(value) { selected.push(value); return true; },
   });
@@ -434,7 +439,11 @@ test("live enclosure bay selection remains direct and invalid inputs never selec
 test("with a storage view selected a bay chip selects the view slot that bay backs", () => {
   const selected = [];
   const fabricEvents = [];
-  const state = { selectedSlot: 0, snapshot: { selected_enclosure_id: "front" } };
+  const state = {
+    selectedSlot: 0,
+    snapshot: { selected_enclosure_id: "front" },
+    sasFabric: { selectedTraceId: null, selectedNodeId: null },
+  };
   const loaded = loadFunctions([...BAY_TO_VIEW_SLOT_FUNCTIONS, "selectSasFabricSlot"], {
     Number,
     state,

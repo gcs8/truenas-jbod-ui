@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Stopped the Connections panel from narrowing the map before an operator picked
+  a bay, path or node, and let repeated clicks, Show all and Escape restore every
+  bay without hiding fault states. (#931)
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
