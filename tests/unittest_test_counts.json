@@ -99,7 +99,7 @@
     "test_slot_bounds_routes": 35,
     "test_slot_detail_store": 20,
     "test_smart_grid_io": 47,
-    "test_snapshot_export": 91,
+    "test_snapshot_export": 92,
     "test_ssh_connection_keep": 15,
     "test_ssh_failure_contexts": 4,
     "test_ssh_probe": 39,
