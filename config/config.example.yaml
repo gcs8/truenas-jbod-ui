@@ -191,6 +191,11 @@ admin:
 #     # shown in admin under the system's enclosures.
 #     enclosure_profiles:
 #       "<enclosure-id-from-admin>": supermicro-cse-946-top-60
+#     # Optional flat main-page order. Entries not listed are appended using the
+#     # occupied-disk fallback; stale ids are ignored. An empty list is automatic.
+#     view_order:
+#       - view:primary-chassis
+#       - "enclosure:<enclosure-id-from-admin>"
 #   - id: offsite-scale
 #     label: Offsite SCALE
 #     default_profile_id: supermicro-ssg-6048r-front-24

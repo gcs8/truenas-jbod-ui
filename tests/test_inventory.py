@@ -1341,6 +1341,15 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(explicit[0], "enclosure:node-a")
         self.assertEqual(without_primary[0], "enclosure:node-b")
 
+    def test_view_order_is_display_only_for_inventory_cache_adoption(self) -> None:
+        original = SystemConfig(id="example", label="Example", view_order=["enclosure:enc-a"])
+        reordered = original.model_copy(update={"view_order": ["view:primary-chassis"]})
+
+        self.assertEqual(
+            inventory_module._system_without_display_fields(original),
+            inventory_module._system_without_display_fields(reordered),
+        )
+
     def test_quantastor_floating_alias_is_never_a_node_host_but_bonds_and_vlans_are(self) -> None:
         extract = InventoryService._extract_quantastor_gateway_port_host
         port = {"name": "eno1", "ipAddress": "192.0.2.31", "gateway": "192.0.2.1"}

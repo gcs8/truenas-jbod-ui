@@ -1189,8 +1189,8 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
 
 
 def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
-    """``system`` minus what only changes how it is shown: its name and storage views."""
-    return system.model_copy(update={"label": None, "storage_views": []})
+    """``system`` minus what only changes how it is shown: its name and view ordering."""
+    return system.model_copy(update={"label": None, "storage_views": [], "view_order": []})
 
 
 class InventoryService:
