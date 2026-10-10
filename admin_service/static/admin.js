@@ -5402,7 +5402,7 @@
                 }
               : null,
         })),
-      view_order: state.viewOrder.slice(),
+      view_order: Array.isArray(state.viewOrder) ? state.viewOrder.slice() : [],
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
       // The system this payload was cloned FROM. Sent whenever a loaded system
       // is saved under a new id, whatever the operator did to the SSH command
