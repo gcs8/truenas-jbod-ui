@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Selecting a bay, or a path in the Connections panel, no longer removes the
+  state chip from that bay and its highlighted peers. Every bay, including
+  NVMe carrier and boot-device cards, keeps its LED dot, and a bay with its
+  locate light on blinks the dot and says "Locate light on" in its tooltip and
+  accessible name. (#935)
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the

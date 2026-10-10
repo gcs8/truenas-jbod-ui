@@ -177,17 +177,24 @@ test("slot states have glyph legends and patterned high-contrast cues", () => {
   assert.match(STYLE, /repeating-linear-gradient/);
 });
 
-test("selection and topology rings reset the state-chip geometry", () => {
-  for (const selector of [
-    ".slot-tile.selected::after",
-    ".slot-tile.peer-highlight::after",
-    ".slot-tile.fabric-highlight::after",
-  ]) {
-    const rule = cssRule(selector);
-    assert.match(rule, /width:\s*auto;/);
-    assert.match(rule, /height:\s*auto;/);
-    assert.match(rule, /background:\s*none;/);
+test("selection and topology rings leave every bay's state chip in place", () => {
+  // #925: ::after is the state chip on every bay. The rings are the tile's
+  // outline, set through custom properties so :focus-visible still wins.
+  for (const [ring, color] of Object.entries({
+    selected: "91, 183, 255",
+    "peer-highlight": "76, 216, 164",
+    "fabric-highlight": "85, 214, 235",
+  })) {
+    assert.doesNotMatch(STYLE, new RegExp(`\\.${ring}::after`), `${ring} must not redraw the chip as a ring`);
+    const rule = cssDeclarationsForSelector(`.slot-tile.${ring}`);
+    assert.match(rule, new RegExp(`--bay-ring-color:\\s*rgba\\(${escapeRegex(color)},`), ring);
+    assert.match(rule, /--bay-ring-width:\s*[12]px;/, ring);
   }
+  const tile = cssRule(".slot-tile");
+  assert.match(tile, /outline:\s*var\(--bay-ring-width, 0px\) solid var\(--bay-ring-color, transparent\);/);
+  assert.match(tile, /outline-offset:\s*var\(--bay-ring-offset, -5px\);/);
+  assert.match(cssRule(".slot-tile:focus-visible"), /outline:\s*3px solid var\(--selected\);/);
+  assert.doesNotMatch(STYLE, /:not\(\.selected, \.peer-highlight, \.fabric-highlight\)/);
 });
 
 test("drawer faces floor tray widths and own horizontal scrolling", () => {

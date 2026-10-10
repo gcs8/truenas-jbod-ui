@@ -50,7 +50,7 @@ asyncio.run(main())
   return outputPath;
 }
 
-function buildOfflineLegacyFaceSnapshotFixture(faceStyle, builtinProfileId = "") {
+function buildOfflineLegacyFaceSnapshotFixture(faceStyle, builtinProfileId = "", { locateSlots = [] } = {}) {
   const supportedFaces = new Set(["generic", "front-drive", "rear-drive", "top-loader", "unifi-drive", "drawer"]);
   if (!supportedFaces.has(faceStyle)) {
     throw new Error(`Unsupported synthetic legacy face: ${faceStyle}`);
@@ -78,6 +78,8 @@ spec.loader.exec_module(module)
 async def main():
     face_style = sys.argv[2]
     builtin_id = sys.argv[3]
+    # Bays whose locate light is on (the server reports them as identify).
+    locate_slots = {int(value) for value in sys.argv[4].split(",") if value}
     if builtin_id:
         # The shipped built-in profile; default Settings() never reads local config.
         profile = ProfileRegistry(module.Settings()).get(builtin_id)
@@ -114,13 +116,15 @@ async def main():
             enclosure_id="synthetic-enclosure",
             enclosure_label="Synthetic Enclosure",
             present=True,
-            state=module.SlotState.healthy,
+            state=module.SlotState.identify if slot_number in locate_slots else module.SlotState.healthy,
+            identify_active=slot_number in locate_slots,
             device_name=f"disk{slot_number}",
             serial=f"SYNTH{slot_number:04}",
             model="Synthetic Disk",
             size_human="1 TB",
             pool_name="synthetic-pool",
-            vdev_name="synthetic-vdev",
+            # Two vdevs, so selecting slot 0 rings the even bays and dims the odd ones.
+            vdev_name=f"synthetic-vdev-{slot_number % 2}",
             health="ONLINE",
         )
         for slot_number, row_index, column_index in positions
@@ -175,7 +179,7 @@ async def main():
 
 asyncio.run(main())
 `;
-  const result = spawnSync(python, ["-c", script, outputPath, faceStyle, builtinProfileId], {
+  const result = spawnSync(python, ["-c", script, outputPath, faceStyle, builtinProfileId, locateSlots.join(",")], {
     cwd: repoRoot,
     encoding: "utf8",
   });
@@ -659,16 +663,17 @@ async function settleFrames(page, frames = 4) {
   }), frames);
 }
 
-async function clearSlotSelection(page) {
-  // The fixture selects slot 0, whose ring hides its chip. A second click on the
-  // selected tile clears it through the grid's delegated handler; dispatch it
-  // directly because the chassis face can cover that tile at some widths.
-  const selected = page.locator("#slot-grid .slot-tile.selected");
-  if (await selected.count()) {
-    await selected.first().dispatchEvent("click");
-    await expect(page.locator("#slot-grid .slot-tile:is(.selected, .peer-highlight, .fabric-highlight)")).toHaveCount(0);
-  }
-  await page.mouse.move(0, 0);
+const STATE_GLYPHS = { healthy: "✓", empty: "○", identify: "◎", fault: "!", unknown: "?", unmapped: "◇" };
+const RING_COLORS = { selected: "91, 183, 255", "peer-highlight": "76, 216, 164", "fabric-highlight": "85, 214, 235" };
+
+// The legacy fixtures select slot 0, which rings the even bays and dims the
+// odd ones. Put the first bay without a ring in a Connections trace too, the
+// way refreshGridSelectionState does, so every ring kind is on the face.
+async function highlightFabricBay(page) {
+  await page.locator("#slot-grid").evaluate((grid) => {
+    const tile = grid.querySelector(".slot-tile[data-slot]:not(.selected, .peer-highlight)");
+    if (tile) tile.classList.replace("peer-dimmed", "fabric-highlight") || tile.classList.add("fabric-highlight");
+  });
 }
 
 async function measureStateChips(page) {
@@ -700,14 +705,45 @@ async function measureStateChips(page) {
   } finally {
     await cdp.detach();
   }
-  return page.locator("#chassis-shell").evaluate((shell, { chips, parts }) => {
+  return page.locator("#chassis-shell").evaluate((shell, { chips, parts, glyphs, ringColors }) => {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-    const result = { spot: shell.dataset.chipSpot || null, bays: 0, chips: 0, problems: [] };
+    const result = { spot: shell.dataset.chipSpot || null, bays: 0, chips: 0, rings: 0, problems: [] };
+    const ringed = (value) => Object.values(ringColors).some((color) => value.includes(`rgba(${color}`) || value.includes(`rgb(${color})`));
+    // #925: selected, peer and Connections bays keep their chip and LED dot too.
     for (const tile of shell.querySelectorAll("#slot-grid .slot-tile[data-slot]")) {
-      // Selected, peer and fabric tiles draw a ring with ::after instead.
-      if (tile.matches(".selected, .peer-highlight, .fabric-highlight")) continue;
       result.bays += 1;
       const slot = tile.dataset.slot;
+      const state = [...tile.classList].find((name) => name.startsWith("state-"))?.slice(6);
+      const content = getComputedStyle(tile, "::after").content;
+      if (content !== `"${glyphs[state]}"`) {
+        result.problems.push(`${slot}: chip shows ${content}, not the ${state} glyph`);
+      }
+      const led = tile.querySelector(".slot-status-led");
+      if (led) {
+        const ledStyle = getComputedStyle(led);
+        if (ledStyle.display === "none" || ledStyle.visibility === "hidden" || !led.getBoundingClientRect().width) {
+          result.problems.push(`${slot}: LED dot hidden`);
+        } else if (tile.matches(".peer-dimmed, .fabric-dimmed") && !tile.matches(".state-identify") && Number(ledStyle.opacity) < 1) {
+          result.problems.push(`${slot}: dimmed bay fades its LED dot to ${ledStyle.opacity}`);
+        } else if (!tile.matches(".filtered-out")) {
+          // A filter on the dot or any box around it greys the dot as well. A
+          // bay the search hides fades whole, dot included, on purpose.
+          for (let node = led; node && node.id !== "slot-grid"; node = node.parentElement) {
+            const filter = getComputedStyle(node).filter;
+            if (filter !== "none") result.problems.push(`${slot}: LED dot drawn through ${filter}`);
+          }
+        }
+      }
+      if (tile.matches(".selected, .peer-highlight, .fabric-highlight")) {
+        // Cards ring the card itself; every other bay rings the tile.
+        const card = tile.querySelector(".storage-view-runtime-card");
+        const style = getComputedStyle(tile);
+        const ring = card
+          ? getComputedStyle(card).boxShadow
+          : style.outlineStyle === "solid" && parseFloat(style.outlineWidth) >= 1 ? style.outlineColor : "";
+        if (ringed(ring)) result.rings += 1;
+        else result.problems.push(`${slot}: ${[...tile.classList].join(".")} draws no ring`);
+      }
       const chip = chips[slot];
       if (!chip) {
         result.problems.push(`${slot}: no state chip`);
@@ -721,10 +757,6 @@ async function measureStateChips(page) {
       if (chip.left < -0.5 || chip.top < -0.5 || chip.right > box.width + 0.5 || chip.bottom > box.height + 0.5) {
         result.problems.push(`${slot}: chip outside its bay`);
       }
-      const led = tile.querySelector(".slot-status-led");
-      if (tile.matches(".storage-view-slot-nvme-absolute, .storage-view-slot-boot") && led && getComputedStyle(led).display !== "none") {
-        result.problems.push(`${slot}: card still draws the LED dot beside its chip`);
-      }
       for (const part of tile.querySelectorAll(parts.join(", "))) {
         if (getComputedStyle(part).visibility === "hidden") continue;
         const rect = part.getBoundingClientRect();
@@ -734,10 +766,10 @@ async function measureStateChips(page) {
       }
     }
     return result;
-  }, { chips, parts: STATE_CHIP_PARTS });
+  }, { chips, parts: STATE_CHIP_PARTS, glyphs: STATE_GLYPHS, ringColors: RING_COLORS });
 }
 
-async function checkStateChips(page, url, { label, prepare = async () => {}, bayLabels = true, spots = null }) {
+async function checkStateChips(page, url, { label, prepare = async () => {}, bayLabels = true, spots = null, rings = 1 }) {
   for (const heatmap of [false, true]) {
     for (const width of [1920, 1100]) {
       const name = `${label}, ${heatmap ? "heat map" : "plain"} at ${width}px`;
@@ -760,11 +792,14 @@ async function checkStateChips(page, url, { label, prepare = async () => {}, bay
           }
         });
       }
-      await clearSlotSelection(page);
+      // Keep the fixture's selection: ringed bays must keep their chip (#925).
+      await highlightFabricBay(page);
+      await page.mouse.move(0, 0);
       const result = await measureStateChips(page);
       expect(result.bays, name).toBeGreaterThan(0);
       expect(result.problems, name).toEqual([]);
       expect(result.chips, name).toBe(result.bays);
+      expect(result.rings, name).toBeGreaterThanOrEqual(Math.min(rings, result.bays));
       if (spots) expect(result.spot, name).toBe(spots[heatmap ? 1 : 0]);
     }
   }
@@ -787,7 +822,8 @@ for (const { faceStyle, profileId, spots } of [
   test(`offline ${label} keeps every state chip off its bay's LED, latch and labels`, async ({ page }) => {
     test.slow();
     const snapshotPath = buildOfflineLegacyFaceSnapshotFixture(faceStyle, profileId);
-    await checkStateChips(page, pathToFileURL(snapshotPath).href, { label, spots });
+    // Selected, peer and Connections rings are all on the face.
+    await checkStateChips(page, pathToFileURL(snapshotPath).href, { label, spots, rings: 3 });
   });
 }
 
@@ -798,12 +834,17 @@ test("offline M.2 and boot-media cards show a state chip clear of the card's lab
     await checkStateChips(page, url, {
       label: view,
       bayLabels: false,
+      // The selected card and a Connections card ring the card itself.
+      rings: 2,
       prepare: async () => {
         await page.locator("#enclosure-select").selectOption(view);
         await expect(page.locator("#chassis-shell")).toHaveAttribute(
           "data-face-style",
           view === "view:nvme-carrier" ? "nvme-carrier" : "boot-devices",
         );
+        // Select the first card through the grid's delegated handler.
+        await page.locator("#slot-grid .slot-tile[data-slot]").first().dispatchEvent("click");
+        await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(1);
       },
     });
   }
@@ -814,9 +855,8 @@ test("offline bay state chips use their legend colors", async ({ page }) => {
   await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
   const fills = await page.locator("#chassis-shell").evaluate((shell) => {
     const states = ["healthy", "empty", "identify", "fault", "unknown", "unmapped"];
-    // The fixture selects slot 0 and its vdev peers, which draw rings instead.
-    const tile = shell.querySelector(".slot-tile");
-    tile.classList.remove("selected", "peer-highlight");
+    // The fixture selects slot 0; a selected bay's chip keeps its fill (#925).
+    const tile = shell.querySelector(".slot-tile.selected");
     const look = (style) => `${style.backgroundColor} ${style.backgroundImage} ink ${style.color}`;
     const luminance = (rgb, scale = 1) => {
       const [r, g, b] = rgb.match(/\d+(\.\d+)?/g).slice(0, 3).map((value) => {
@@ -841,16 +881,82 @@ test("offline bay state chips use their legend colors", async ({ page }) => {
         glyphContrast: Math.min(...fills.map((fill) => contrast(ink, fill))),
       };
     }
-    // A selected bay draws a ring, not a filled chip.
-    tile.classList.add("selected");
-    result.selectedRing = getComputedStyle(tile, "::after").backgroundColor;
+    // The ring is the tile's outline, not a second ::after.
+    const ring = getComputedStyle(tile);
+    result.selectedRing = `${ring.outlineStyle} ${ring.outlineColor}`;
     return result;
   });
   for (const state of ["healthy", "empty", "identify", "fault", "unknown", "unmapped"]) {
     expect(fills[state].chip, state).toBe(fills[state].legend);
     expect(fills[state].glyphContrast, `${state} glyph contrast`).toBeGreaterThanOrEqual(3);
   }
-  expect(fills.selectedRing).toBe("rgba(0, 0, 0, 0)");
+  expect(fills.selectedRing).toMatch(/^solid rgba\(91, 183, 255, 0\.\d+\)$/);
+});
+
+test("offline selected bay keeps its chip under the keyboard focus ring", async ({ page }) => {
+  const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive");
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+  const selected = page.locator("#slot-grid .slot-tile.selected");
+  await expect(selected).toHaveCount(1);
+  await page.keyboard.press("Shift");
+  await selected.focus();
+  const look = await selected.evaluate((tile) => {
+    const style = getComputedStyle(tile);
+    return {
+      focusVisible: tile.matches(":focus-visible"),
+      outline: `${style.outlineStyle} ${style.outlineWidth} ${style.outlineColor} offset ${style.outlineOffset}`,
+      chip: getComputedStyle(tile, "::after").content,
+    };
+  });
+  expect(look.focusVisible).toBe(true);
+  expect(look.outline).toBe("solid 3px rgb(91, 183, 255) offset 3px");
+  expect(look.chip).toBe('"✓"');
+});
+
+test("offline bay with its locate light on blinks its LED dot and says so", async ({ page }) => {
+  // Slot 1 is in the other vdev from the selected slot 0, so it is also dimmed.
+  const snapshotPath = buildOfflineLegacyFaceSnapshotFixture("front-drive", "", { locateSlots: [1] });
+  const url = pathToFileURL(snapshotPath).href;
+  const readDot = () => page.locator('#slot-grid .slot-tile[data-slot="1"]').evaluate((tile) => {
+    const led = tile.querySelector(".slot-status-led");
+    const style = getComputedStyle(led);
+    return {
+      classes: tile.className,
+      label: tile.getAttribute("aria-label"),
+      chip: getComputedStyle(tile, "::after").content,
+      display: style.display,
+      background: style.backgroundColor,
+      animation: `${style.animationName} ${style.animationIterationCount}`,
+      running: led.getAnimations().length,
+      outline: `${style.outlineStyle} ${style.outlineColor}`,
+      filters: [led, tile].map((node) => getComputedStyle(node).filter),
+    };
+  });
+
+  await page.goto(url, { waitUntil: "load" });
+  const blinking = await readDot();
+  expect(blinking.classes).toContain("state-identify");
+  expect(blinking.classes).toContain("peer-dimmed");
+  expect(blinking.label).toContain("Locate light on");
+  expect(blinking.chip).toBe('"◎"');
+  expect(blinking.display).not.toBe("none");
+  expect(blinking.background).toBe("rgb(215, 182, 43)");
+  // The bay dims, but its dot keeps its colour.
+  expect(blinking.filters).toEqual(["none", "none"]);
+  expect(blinking.animation).toBe("slot-led-locate infinite");
+  expect(blinking.running).toBeGreaterThan(0);
+  // The page shell can sit over the face at this size, so point at the bay
+  // through the grid's delegated mouseover handler.
+  await page.locator('#slot-grid .slot-tile[data-slot="1"]').dispatchEvent("mouseover");
+  await expect(page.locator("#slot-tooltip")).toContainText("Locate light on");
+
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto(url, { waitUntil: "load" });
+  const steady = await readDot();
+  expect(steady.background).toBe("rgb(215, 182, 43)");
+  expect(steady.animation).toBe("none 1");
+  expect(steady.running).toBe(0);
+  expect(steady.outline).toBe("solid rgb(215, 182, 43)");
 });
 
 test("offline top-loader snapshot keeps exported row geometry", async ({ page }) => {
