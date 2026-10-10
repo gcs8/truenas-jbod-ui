@@ -1839,10 +1839,8 @@
       return;
     }
     const traceId = `bay:${slotNumber}`;
-    if (sasFabricTraceById(traceId)) {
-      state.sasFabric.selectedTraceId = traceId;
-      state.sasFabric.selectedNodeId = null;
-    }
+    state.sasFabric.selectedTraceId = sasFabricTraceById(traceId) ? traceId : null;
+    state.sasFabric.selectedNodeId = null;
   }
 
   function clearSasFabricBaySelection() {
