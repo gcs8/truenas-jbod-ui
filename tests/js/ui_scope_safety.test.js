@@ -70,7 +70,7 @@ for (const outcome of ["success", "failure"]) {
       sendScopedRequest:async ()=>pending.promise,
       applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
       handleWriteRejection(){ rejections++; } };
-    const c = load([...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch", "sendLedAction", "scheduleAutoRefresh"], context);
+    const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
     c.scheduleAutoRefresh();
     const run = c.sendLedAction("IDENTIFY");
     await new Promise(r => setImmediate(r));
@@ -100,7 +100,7 @@ test("a write started before a manual refresh does not hold the next auto-refres
     setStatus(){}, sendScopedRequest:async ()=>pending.promise,
     applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
     handleWriteRejection(){} };
-  const c = load([...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch", "sendLedAction", "scheduleAutoRefresh"], context);
+  const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
   c.scheduleAutoRefresh();
   const run = c.sendLedAction("IDENTIFY");
   await new Promise(r => setImmediate(r));
@@ -347,7 +347,7 @@ test("mismatched saved chassis cannot send LED or mapping writes to the page enc
     locateLightSourceLabel: () => "synthetic",
     handleWriteRejection: () => {},
   };
-  const optionalFunctions = ["selectedLiveActionSlot", "reportStorageViewActionMismatch"]
+  const optionalFunctions = ["reportStorageViewActionMismatch"]
     .filter((name) => source.includes(`function ${name}(`));
   const c = load([
     "storageViewSlotBayInEnclosure",

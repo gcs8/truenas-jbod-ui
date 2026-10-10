@@ -3575,15 +3575,6 @@
     return getSlotById(slot.snapshot_slot);
   }
 
-  function selectedLiveActionSlot() {
-    if (!state.selectedStorageViewRuntimeId) {
-      return getSlotById(state.selectedSlot);
-    }
-    const selectedView = getSelectedStorageViewRuntime();
-    const selectedViewSlot = getSelectedStorageViewRuntimeSlot(state.selectedSlot);
-    return getLiveBackedStorageViewSlot(selectedView, selectedViewSlot);
-  }
-
   function reportStorageViewActionMismatch() {
     if (!state.selectedStorageViewRuntimeId) {
       return false;
@@ -10553,7 +10544,12 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = selectedLiveActionSlot();
+    const slot = state.selectedStorageViewRuntimeId
+      ? getLiveBackedStorageViewSlot(
+          getSelectedStorageViewRuntime(),
+          getSelectedStorageViewRuntimeSlot(state.selectedSlot),
+        )
+      : getSlotById(state.selectedSlot);
     if (!slot) {
       reportStorageViewActionMismatch();
       return;
@@ -10755,7 +10751,12 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = selectedLiveActionSlot();
+    const slot = state.selectedStorageViewRuntimeId
+      ? getLiveBackedStorageViewSlot(
+          getSelectedStorageViewRuntime(),
+          getSelectedStorageViewRuntimeSlot(state.selectedSlot),
+        )
+      : getSlotById(state.selectedSlot);
     if (!slot) {
       reportStorageViewActionMismatch();
       return;
@@ -10817,7 +10818,12 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = selectedLiveActionSlot();
+    const slot = state.selectedStorageViewRuntimeId
+      ? getLiveBackedStorageViewSlot(
+          getSelectedStorageViewRuntime(),
+          getSelectedStorageViewRuntimeSlot(state.selectedSlot),
+        )
+      : getSlotById(state.selectedSlot);
     if (!slot) {
       reportStorageViewActionMismatch();
       return;

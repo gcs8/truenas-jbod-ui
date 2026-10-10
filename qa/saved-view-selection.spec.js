@@ -43,6 +43,7 @@ const syntheticRuntime = {
           state: "matched",
           source: "snapshot_slot",
           snapshot_slot: 0,
+          snapshot_enclosure_id: "enc-a",
           device_name: "sdx",
           serial: "LIVE-SERIAL-0",
           gptid: "synthetic-gptid-0",
@@ -101,6 +102,7 @@ const ownerBackedRuntime = {
       slots: [
         {
           ...syntheticRuntime.views[0].slots[0],
+          snapshot_enclosure_id: "node-a",
           device_name: "sda",
           serial: "OWNER-SERIAL-0",
           gptid: "synthetic-owner-gptid-0",
