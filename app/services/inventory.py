@@ -2111,6 +2111,27 @@ class InventoryService:
             return None
         return self._select_quantastor_default_enclosure_id(raw_data, snapshot.enclosures)
 
+    async def _get_secondary_runtime_snapshot(
+        self,
+        enclosure_id: str,
+        *,
+        force_refresh: bool,
+    ) -> InventorySnapshot:
+        if not force_refresh:
+            return await self.get_snapshot(
+                force_refresh=False,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=True,
+            )
+        return (
+            await self._get_snapshot_result(
+                force_refresh=True,
+                selected_enclosure_id=enclosure_id,
+                allow_stale_cache=False,
+                force_source_refresh=False,
+            )
+        ).value
+
     async def _effective_runtime_view_order(
         self,
         *,
@@ -2120,6 +2141,7 @@ class InventoryService:
         known_snapshots: dict[str | None, InventorySnapshot],
         ha_primary_view_id: str | None,
         ha_owner_enclosure_id: str | None,
+        force_refresh: bool,
     ) -> list[str]:
         def cached_order() -> list[str] | None:
             if (
@@ -2149,10 +2171,9 @@ class InventoryService:
                 if snapshot is None:
                     # The request already collected the source bundle. Building each
                     # option from that bundle adds no appliance/API/SSH refresh.
-                    snapshot = await self.get_snapshot(
-                        force_refresh=False,
-                        selected_enclosure_id=option.id,
-                        allow_stale_cache=True,
+                    snapshot = await self._get_secondary_runtime_snapshot(
+                        option.id,
+                        force_refresh=force_refresh,
                     )
                     known_snapshots[option.id] = snapshot
                 enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
@@ -2231,10 +2252,9 @@ class InventoryService:
         ses_snapshots_by_view_id: dict[str, InventorySnapshot] = {}
         if primary_view is not None and ha_owner_enclosure_id:
             if ha_owner_enclosure_id not in target_snapshots:
-                target_snapshots[ha_owner_enclosure_id] = await self.get_snapshot(
-                    force_refresh=False,
-                    selected_enclosure_id=ha_owner_enclosure_id,
-                    allow_stale_cache=True,
+                target_snapshots[ha_owner_enclosure_id] = await self._get_secondary_runtime_snapshot(
+                    ha_owner_enclosure_id,
+                    force_refresh=force_refresh,
                 )
             ses_snapshots_by_view_id[primary_view.id] = target_snapshots[ha_owner_enclosure_id]
 
@@ -2276,6 +2296,7 @@ class InventoryService:
                 known_snapshots=target_snapshots,
                 ha_primary_view_id=primary_view.id if primary_view is not None and ha_owner_enclosure_id else None,
                 ha_owner_enclosure_id=ha_owner_enclosure_id,
+                force_refresh=force_refresh,
             )
             if include_view_order
             else []
