@@ -93,6 +93,17 @@ test("dimmed bays fade the tile but keep the LED dot at full opacity", () => {
   }
 });
 
+test("dimmed bays filter their parts, not the tile, so the LED dot keeps its colour", () => {
+  // A filter on the tile also greys the dot inside it, and no rule on the dot
+  // can undo that.
+  for (const [selectors, body] of cssRules(STYLE)) {
+    const tiles = selectors.filter((selector) => /\.slot-tile[^\s>+~]*\.(peer|fabric)-dimmed[^\s>+~:]*$/.test(selector));
+    if (!tiles.length) continue;
+    const filter = body.match(/(?:^|[;\s])filter:\s*([^;]+)/);
+    assert.ok(!filter || filter[1].trim() === "none", `${tiles.join(", ")} filters the whole tile: ${filter?.[1]}`);
+  }
+});
+
 test("the dot blinks amber while the locate light is on, and holds a steady ring under reduced motion", () => {
   const keyframes = STYLE.match(/@keyframes\s+slot-led-locate\s*\{([\s\S]*?)\}\s*\}/);
   assert.ok(keyframes, "@keyframes slot-led-locate must exist");

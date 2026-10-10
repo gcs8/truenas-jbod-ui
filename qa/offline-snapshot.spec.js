@@ -725,6 +725,13 @@ async function measureStateChips(page) {
           result.problems.push(`${slot}: LED dot hidden`);
         } else if (tile.matches(".peer-dimmed, .fabric-dimmed") && !tile.matches(".state-identify") && Number(ledStyle.opacity) < 1) {
           result.problems.push(`${slot}: dimmed bay fades its LED dot to ${ledStyle.opacity}`);
+        } else if (!tile.matches(".filtered-out")) {
+          // A filter on the dot or any box around it greys the dot as well. A
+          // bay the search hides fades whole, dot included, on purpose.
+          for (let node = led; node && node.id !== "slot-grid"; node = node.parentElement) {
+            const filter = getComputedStyle(node).filter;
+            if (filter !== "none") result.problems.push(`${slot}: LED dot drawn through ${filter}`);
+          }
         }
       }
       if (tile.matches(".selected, .peer-highlight, .fabric-highlight")) {
@@ -922,6 +929,7 @@ test("offline bay with its locate light on blinks its LED dot and says so", asyn
       animation: `${style.animationName} ${style.animationIterationCount}`,
       running: led.getAnimations().length,
       outline: `${style.outlineStyle} ${style.outlineColor}`,
+      filters: [led, tile].map((node) => getComputedStyle(node).filter),
     };
   });
 
@@ -933,6 +941,8 @@ test("offline bay with its locate light on blinks its LED dot and says so", asyn
   expect(blinking.chip).toBe('"◎"');
   expect(blinking.display).not.toBe("none");
   expect(blinking.background).toBe("rgb(215, 182, 43)");
+  // The bay dims, but its dot keeps its colour.
+  expect(blinking.filters).toEqual(["none", "none"]);
   expect(blinking.animation).toBe("slot-led-locate infinite");
   expect(blinking.running).toBeGreaterThan(0);
   // The page shell can sit over the face at this size, so point at the bay
