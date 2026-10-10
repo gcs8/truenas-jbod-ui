@@ -566,24 +566,41 @@ def build_router() -> APIRouter:
     ) -> JSONResponse:
         registry = get_inventory_registry()
         service = registry.get_service(system_id)
-        await ensure_slot_bounds(slot, service, enclosure_id)
+        if slot < 0:
+            logger.info(
+                "Locate light refusal system=%s bay %s action=%s reason=%s",
+                service.system.id,
+                slot,
+                payload.action.value,
+                "slot number is negative",
+            )
+            raise HTTPException(status_code=404, detail=f"Slot {slot} is outside the configured layout.")
         add_perf_metadata(system_id=service.system.id, platform=service.system.truenas.platform, slot=slot, enclosure_id=enclosure_id)
         try:
-            await service.set_slot_led(
+            result = await service.set_slot_led(
                 slot,
                 payload.action,
                 selected_enclosure_id=enclosure_id,
                 invalidate_snapshot=False,
             )
         except TrueNASAPIError as exc:
+            logger.info(
+                "Locate light refusal system=%s bay %s action=%s reason=%s",
+                service.system.id,
+                slot,
+                payload.action.value,
+                exc,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        service.invalidate_physical_enclosure_snapshot_cache(
-            reason="route.set_slot_led",
-            enclosure_id=enclosure_id,
-            invalidate_source_bundle=True,
+        service.schedule_led_snapshot_refresh(enclosure_id=enclosure_id)
+        return JSONResponse(
+            {
+                "ok": True,
+                "system_id": service.system.id,
+                "enclosure_id": enclosure_id,
+                **result,
+            }
         )
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
-        return JSONResponse({"ok": True, "snapshot": snapshot.model_dump(mode="json")})
 
     @router.post(
         "/api/systems/{system_id}/disk-inventory-sync",

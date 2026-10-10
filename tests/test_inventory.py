@@ -12,7 +12,7 @@ import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from tests.mapping_fixtures import write_v1_mappings
 from app.config import (
@@ -17623,6 +17623,34 @@ ses1:
         )
         return service
 
+    async def test_led_sequence_uses_one_owned_session_without_the_inventory_lock(self) -> None:
+        service = self.led_service(
+            "core",
+            SlotView(slot=0, slot_label="00", row_index=0, column_index=0),
+        )
+        probe = SSHProbe(service.system.ssh)
+        service.ssh_probe = probe
+        service._ssh_session_lock_for_host = Mock(
+            side_effect=AssertionError("locate must not take the shared inventory SSH lock")
+        )
+        session = Mock()
+        session.run_command_owned = AsyncMock(
+            side_effect=[
+                SSHCommandResult(command="locate", ok=True, exit_code=0),
+                SSHCommandResult(command="map", ok=True, stdout=self.CORE_MAP_ON, exit_code=0),
+            ]
+        )
+        session.close_owned = AsyncMock()
+
+        with patch.object(probe, "open_session", return_value=session) as opened:
+            results = await service._run_led_ssh_sequence(None, ["locate", "map"])
+
+        opened.assert_called_once_with()
+        self.assertEqual([call.args[0] for call in session.run_command_owned.await_args_list], ["locate", "map"])
+        session.close_owned.assert_awaited_once_with()
+        service._ssh_session_lock_for_host.assert_not_called()
+        self.assertEqual([result.command for result, _duration in results], ["locate", "map"])
+
     async def test_core_locate_uses_cached_target_one_short_sequence_and_reports_each_path(self) -> None:
         slot = SlotView(
             slot=7,
@@ -17635,8 +17663,8 @@ ses1:
             ssh_ses_device="/dev/ses0",
             ssh_ses_element_id=7,
             ssh_ses_targets=[
-                {"ses_device": "/dev/ses0", "ses_element_id": 7, "ses_slot_number": 7},
-                {"ses_device": "/dev/ses1", "ses_element_id": 7, "ses_slot_number": 7},
+                {"ses_device": "/dev/ses0", "ses_element_id": 7, "ses_slot_number": 7, "enclosure_id": "5000c50000000001"},
+                {"ses_device": "/dev/ses1", "ses_element_id": 7, "ses_slot_number": 7, "enclosure_id": "5000c50000000001"},
             ],
         )
         service = self.led_service("core", slot)
@@ -17689,8 +17717,8 @@ ses1:
             slot=7, slot_label="07", row_index=0, column_index=0,
             enclosure_id="shelf-a", led_supported=True, led_backend="ssh",
             ssh_ses_targets=[
-                {"ses_device": "/dev/ses0", "ses_element_id": 7},
-                {"ses_device": "/dev/ses1", "ses_element_id": 7},
+                {"ses_device": "/dev/ses0", "ses_element_id": 7, "enclosure_id": "5000c50000000001"},
+                {"ses_device": "/dev/ses1", "ses_element_id": 7, "enclosure_id": "5000c50000000001"},
             ],
         )
         service = self.led_service("core", slot)
@@ -17707,7 +17735,7 @@ ses1:
         self.assertFalse(result["identify_active"])
         self.assertEqual(
             sum(
-                " sesutil locate " in command
+                "sesutil locate " in command
                 for call in service._run_led_ssh_sequence.await_args_list
                 for command in call.args[1]
             ),
@@ -17821,8 +17849,12 @@ ses1:
                         service._run_ssh_command.assert_not_awaited()
                         continue
                     await service._set_slot_led_over_ssh(slot, LedAction.identify)
-                    service._run_ssh_command.assert_awaited_once_with(
-                        "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None
+                    self.assertEqual(
+                        [call.args for call in service._run_ssh_command.await_args_list],
+                        [
+                            ("sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on", None),
+                            ("sudo -n /usr/sbin/sesutil map", None),
+                        ],
                     )
 
     def test_core_ses_enclosure_map_is_built_once_per_snapshot_and_only_for_multipath_bays(self) -> None:
@@ -17957,8 +17989,12 @@ ses1:
 
             await service._set_slot_led_over_ssh(slot, LedAction.identify)
 
-            service._run_ssh_command.assert_awaited_once_with(
-                "sudo -n /usr/sbin/sesutil locate -u /dev/ses2 2 on", None
+            self.assertEqual(
+                [call.args for call in service._run_ssh_command.await_args_list],
+                [
+                    ("sudo -n /usr/sbin/sesutil locate -u /dev/ses2 2 on", None),
+                    ("sudo -n /usr/sbin/sesutil map", None),
+                ],
             )
 
     async def test_core_led_control_fails_closed_for_duplicate_slot_descriptions(self) -> None:
@@ -18286,10 +18322,25 @@ Enclosure Status diagnostic page:
         class DummySSHProbe:
             def __init__(self) -> None:
                 self.commands: list[str] = []
+                self.identify_active = False
 
             async def run_command(self, command: str) -> SSHCommandResult:
                 self.commands.append(command)
-                return SSHCommandResult(command=command, ok=True, stdout="", exit_code=0)
+                if "--set=ident" in command:
+                    self.identify_active = True
+                elif "--clear=ident" in command:
+                    self.identify_active = False
+                stdout = ""
+                if " -p ec " in command:
+                    stdout = (
+                        "ExampleCo ScaleShelf 0001\n"
+                        "Enclosure status diagnostic page:\n"
+                        "  Element type: Array device slot, subenclosure id: 0 [ti=0]\n"
+                        "    Element 0 descriptor:\n"
+                        "      Predicted failure=0, Disabled=0, Swap=0, status: OK\n"
+                        f"      Ident={int(self.identify_active)}\n"
+                    )
+                return SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
@@ -18321,9 +18372,13 @@ Enclosure Status diagnostic page:
                 ],
             )
 
-            await service._set_slot_led_over_ssh(slot, LedAction.identify)
-            await service._set_slot_led_over_ssh(slot, LedAction.clear)
+            turned_on = await service._set_slot_led_over_ssh(slot, LedAction.identify)
+            turned_off = await service._set_slot_led_over_ssh(slot, LedAction.clear)
 
+            self.assertTrue(turned_on["confirmed"])
+            self.assertTrue(turned_on["identify_active"])
+            self.assertTrue(turned_off["confirmed"])
+            self.assertFalse(turned_off["identify_active"])
             self.assertIn(
                 "sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg27",
                 service.ssh_probe.commands,
@@ -18355,8 +18410,11 @@ Enclosure Status diagnostic page:
                 DummySSHProbe(),
                 temp_dir,
             )
-            service._run_ssh_command = AsyncMock(
-                return_value=SSHCommandResult(command="", ok=True, stdout="", exit_code=0)
+            service._run_led_ssh_sequence = AsyncMock(
+                side_effect=lambda _host, commands: [
+                    (SSHCommandResult(command=command, ok=True, stdout="", exit_code=0), 0.01)
+                    for command in commands
+                ]
             )
             slot = SlotView(
                 slot=0,
@@ -18378,13 +18436,17 @@ Enclosure Status diagnostic page:
             await service._set_slot_led_over_ssh(slot, LedAction.identify)
             await service._set_slot_led_over_ssh(slot, LedAction.clear)
 
-            awaited = [call.args for call in service._run_ssh_command.await_args_list]
+            awaited = [
+                (call.args[0], command)
+                for call in service._run_led_ssh_sequence.await_args_list
+                for command in call.args[1]
+            ]
             self.assertIn(
-                ("sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg11", "10.0.0.20"),
+                ("10.0.0.20", "sudo -n /usr/bin/sg_ses --dev-slot-num=0 --set=ident /dev/sg11"),
                 awaited,
             )
             self.assertIn(
-                ("sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg11", "10.0.0.20"),
+                ("10.0.0.20", "sudo -n /usr/bin/sg_ses --dev-slot-num=0 --clear=ident /dev/sg11"),
                 awaited,
             )
 
@@ -18419,7 +18481,7 @@ Enclosure Status diagnostic page:
                 },
             )
             snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
-            service.get_snapshot = AsyncMock(return_value=snapshot)
+            service._remember_led_snapshot(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, snapshot)
 
             await service.set_slot_led(0, LedAction.identify, invalidate_snapshot=False)
             await service.set_slot_led(0, LedAction.clear, invalidate_snapshot=False)
