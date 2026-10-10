@@ -769,6 +769,19 @@ class IdentityConflictTests(unittest.TestCase):
         self.assertEqual(accounting.rendered_unique_disk_count, 1)
         self.assertEqual(accounting.unplaced_disk_count, 1)
 
+    def test_a_lun_id_reported_with_two_serials_identifies_neither(self) -> None:
+        # A RAID volume id carried by both member disks is not a disk identity.
+        sources = [
+            self._record(serial="TESTSER0001", lunid="5000c50000000009", device_name="sdc"),
+            self._record(serial="TESTSER0002", lunid="5000c50000000009", device_name="sdd"),
+        ]
+        accounting = build_disk_retention_accounting(
+            source_disks=sources,
+            slots=[self._slot(serial="TESTSER0001", logical_unit_id="5000c50000000009", device_name="sdc")],
+        )
+        self.assertEqual(accounting.rendered_unique_disk_count, 1)
+        self.assertEqual(accounting.unplaced_disk_count, 1)
+
     def test_one_serial_reported_with_two_lun_formats_is_one_disk(self) -> None:
         sources = [
             self._record(serial="TESTSER0001", lunid="5000c50000000001", device_name="da0"),

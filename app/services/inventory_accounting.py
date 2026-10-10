@@ -180,7 +180,7 @@ class _Classes:
     def __init__(self) -> None:
         self._parent: dict[str, str] = {}
 
-    def _find(self, token: str) -> str:
+    def find(self, token: str) -> str:
         parent = self._parent.setdefault(token, token)
         while parent != token:
             token = parent
@@ -188,18 +188,106 @@ class _Classes:
         return token
 
     def union(self, tokens: Iterable[str]) -> None:
-        roots = {self._find(token) for token in tokens}
+        roots = {self.find(token) for token in tokens}
         if len(roots) <= 1:
             return
         primary = min(roots)
         for root in roots:
             self._parent[root] = primary
 
-    def classify(self, tokens: Iterable[str]) -> str | None:
-        roots = sorted({self._find(token) for token in tokens})
-        if not roots:
-            return None
-        return roots[0]
+
+# Serials and LUN ids name a disk wherever it is seen; device names and GPT
+# identifiers only name a path to it.
+_STABLE_PREFIXES = ("serial:", "lun:")
+
+
+def _identity_classes(token_sets: Sequence[frozenset[str]]) -> list[str | None]:
+    """The logical disk of each token set, or None when it has none (#921).
+
+    Token sets that share any token are one disk, unless that would put two
+    different stable identities in one class: two serials, or two LUN ids that
+    no serial ties together. Such a group is split by its stable identities.
+    A record without a serial or LUN id of its own then joins the one identity
+    its names lead to; if they lead to several, it is ambiguous and is credited
+    to none of them.
+    """
+    # A LUN id reported with two different serials (a RAID volume id carried
+    # by every member disk, say) identifies none of them; it is kept only as
+    # a shared name, like a device name.
+    lun_serials: dict[str, set[str]] = {}
+    for tokens in token_sets:
+        serials = {token for token in tokens if token.startswith("serial:")}
+        for token in tokens:
+            if token.startswith("lun:"):
+                lun_serials.setdefault(token, set()).update(serials)
+    shared_luns = {lun for lun, serials in lun_serials.items() if len(serials) > 1}
+    if shared_luns:
+        token_sets = [
+            frozenset(f"shared-{token}" if token in shared_luns else token for token in tokens)
+            for tokens in token_sets
+        ]
+
+    stable = _Classes()
+    components = _Classes()
+    for tokens in token_sets:
+        stable.union(token for token in tokens if token.startswith(_STABLE_PREFIXES))
+        components.union(tokens)
+
+    # A component conflicts when more than one of its stable classes carries
+    # a serial, or more than one carries a LUN id.
+    carriers: dict[tuple[str, str], set[str]] = {}
+    for tokens in token_sets:
+        for token in tokens:
+            if token.startswith(_STABLE_PREFIXES):
+                kind = token.split(":", 1)[0]
+                carriers.setdefault((kind, components.find(token)), set()).add(stable.find(token))
+    conflicting = {component for (_kind, component), roots in carriers.items() if len(roots) > 1}
+
+    def stable_tokens(tokens: frozenset[str]) -> list[str]:
+        return [token for token in tokens if token.startswith(_STABLE_PREFIXES)]
+
+    # Inside a conflicting component a name never joins two stable classes.
+    # It is attached to the stable classes of the records that carry it, and
+    # records without a stable identity are grouped by their shared names.
+    names = _Classes()
+    attached: dict[str, set[str]] = {}
+    for tokens in token_sets:
+        if not tokens or components.find(next(iter(tokens))) not in conflicting:
+            continue
+        own = stable_tokens(tokens)
+        if own:
+            root = stable.find(own[0])
+            for token in tokens:
+                if not token.startswith(_STABLE_PREFIXES):
+                    attached.setdefault(token, set()).add(root)
+        else:
+            names.union(tokens)
+    attached_by_group: dict[str, set[str]] = {}
+    for token, roots in attached.items():
+        attached_by_group.setdefault(names.find(token), set()).update(roots)
+
+    classes: list[str | None] = []
+    for tokens in token_sets:
+        if not tokens:
+            classes.append(None)
+            continue
+        component = components.find(next(iter(tokens)))
+        if component not in conflicting:
+            classes.append(f"disk:{component}")
+            continue
+        own = stable_tokens(tokens)
+        if own:
+            classes.append(f"stable:{stable.find(own[0])}")
+            continue
+        group = names.find(next(iter(tokens)))
+        roots = attached_by_group.get(group, set())
+        if len(roots) == 1:
+            classes.append(f"stable:{next(iter(roots))}")
+        elif not roots:
+            classes.append(f"names:{group}")
+        else:
+            classes.append(None)
+    return classes
 
 
 def build_disk_retention_accounting(
@@ -235,22 +323,20 @@ def build_disk_retention_accounting(
         if tokens
     ]
 
-    classes = _Classes()
-    for tokens in (*source_tokens, *rendered_tokens):
-        classes.union(tokens)
+    identities = _identity_classes([*source_tokens, *rendered_tokens])
+    source_identities = identities[: len(source_tokens)]
+    rendered_identities = identities[len(source_tokens):]
 
     rendered_classes: set[str] = set()
     rendered_view_count = 0
-    for tokens in rendered_tokens:
-        identity = classes.classify(tokens)
+    for identity in rendered_identities:
         if identity is None:
             continue
         rendered_view_count += 1
         rendered_classes.add(identity)
 
     unplaced = 0
-    for tokens in source_tokens:
-        identity = classes.classify(tokens)
+    for identity in source_identities:
         if identity is None or identity not in rendered_classes:
             unplaced += 1
 
