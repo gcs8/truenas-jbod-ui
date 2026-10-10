@@ -44,6 +44,7 @@ from app.models.domain import (
     StorageViewRuntimeView,
     SystemLocatorStatusView,
 )
+from app import route_support
 from app.services import inventory as inventory_module
 from app.services.inventory import (
     DiskRecord,
@@ -3845,6 +3846,125 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(after.view_order[0], "enclosure:enc-a")
         self.assertIn("enclosure:enc-b", after.view_order)
         self.assertEqual(after.default_selection, "enclosure:enc-a")
+
+    def test_runtime_view_order_recomputes_after_background_snapshot_publication(self) -> None:
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            "enc-a": self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options),
+            "enc-b": self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 3, options),
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            source_bundle = self._empty_source_bundle()
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+
+            before = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-b"))
+            self.assertLess(
+                before.view_order.index("enclosure:enc-b"),
+                before.view_order.index("enclosure:enc-a"),
+            )
+            self.assertTrue(service._cached_effective_view_order)
+
+            refreshed = self._view_order_snapshot(
+                "synthetic-system", "enc-a", "Enclosure A", 4, options,
+            )
+            snapshots["enc-a"] = refreshed
+            service._publish_snapshot_locked("enc-a", refreshed, request_sequence=1)
+
+            after = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-b"))
+
+        self.assertEqual(after.view_order[0], "enclosure:enc-a")
+        self.assertNotEqual(after.view_order, before.view_order)
+
+    def test_runtime_view_order_refuses_oversized_enclosure_enumeration(self) -> None:
+        options = [
+            EnclosureOption(id=f"enc-{index}", label=f"Enclosure {index}")
+            for index in range(inventory_module.SYSTEM_RETENTION_MAX_ENCLOSURES + 1)
+        ]
+        snapshots = {
+            option.id: self._view_order_snapshot(
+                "synthetic-system", option.id, option.label, 0, options,
+            )
+            for option in options
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or options[0].id]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+
+            with self.assertRaises(inventory_module.SystemRetentionTooLargeError):
+                asyncio.run(service.get_storage_view_runtime(selected_enclosure_id=options[0].id))
+
+        self.assertEqual(service.get_snapshot.await_count, 1)
+
+    def test_runtime_view_order_recomputation_has_single_flight_admission(self) -> None:
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            option.id: self._view_order_snapshot(
+                "synthetic-system", option.id, option.label, 0, options,
+            )
+            for option in options
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        async def exercise(service: InventoryService) -> None:
+            await service._view_order_recompute_lock.acquire()
+            try:
+                with self.assertRaises(inventory_module.SystemRetentionBusyError):
+                    await service.get_storage_view_runtime(selected_enclosure_id="enc-a")
+            finally:
+                service._view_order_recompute_lock.release()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service._view_order_recompute_lock = asyncio.Lock()
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+
+            asyncio.run(exercise(service))
+
+        self.assertEqual(service.get_snapshot.await_count, 1)
+
+    def test_filtered_storage_view_runtime_preserves_opening_order_metadata(self) -> None:
+        runtime = StorageViewRuntimePayload(
+            system_id="synthetic-system",
+            system_label="Synthetic system",
+            views=[
+                StorageViewRuntimeView(
+                    id="boot-doms",
+                    label="Boot SATADOMs",
+                    kind="boot_devices",
+                    template_id="boot-devices-2",
+                )
+            ],
+            view_order=["enclosure:enc-a", "view:boot-doms"],
+            default_selection="view:boot-doms",
+        )
+
+        filtered = route_support._filter_storage_view_runtime(runtime, ["boot-doms"])
+
+        self.assertEqual(filtered.view_order, runtime.view_order)
+        self.assertEqual(filtered.default_selection, runtime.default_selection)
 
     def test_quantastor_ha_primary_chassis_uses_pool_owner_even_when_another_node_is_selected(self) -> None:
         options = [
