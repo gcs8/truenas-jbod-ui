@@ -1300,11 +1300,22 @@ def build_router(admin_settings: Any) -> APIRouter:
             snapshot = await service.get_snapshot(force_refresh=force)
         except Exception as exc:  # noqa: BLE001 - surface inventory issues as an admin-side error.
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # The order the main page uses when no order is saved. The editor needs
+        # occupied-disk counts to show it, and this response has none. None means
+        # it could not be computed now; the editor then offers no reordering.
+        automatic_view_order: list[str] | None
+        try:
+            runtime = await service.get_storage_view_runtime(snapshot=snapshot, ignore_saved_view_order=True)
+            automatic_view_order = list(runtime.view_order)
+        except Exception:  # noqa: BLE001 - the enclosure list is still useful without the order.
+            logger.warning("Automatic view order unavailable for system %s", service.system.id, exc_info=True)
+            automatic_view_order = None
         return JSONResponse(
             {
                 "ok": True,
                 "system_id": service.system.id,
                 "enclosures": serialize_live_enclosures(service, snapshot.enclosures),
+                "automatic_view_order": automatic_view_order,
             }
         )
 

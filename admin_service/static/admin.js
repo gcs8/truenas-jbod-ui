@@ -42,6 +42,8 @@
     },
     storageViews: [],
     viewOrder: [],
+    automaticViewOrder: null,
+    automaticViewOrderSystemId: null,
     storageViewCandidates: [],
     storageViewCandidatesLoading: false,
     storageViewCandidatesSystemId: null,
@@ -1787,6 +1789,14 @@
     return Array.isArray(state.liveEnclosures) ? state.liveEnclosures : [];
   }
 
+  function currentAutomaticViewOrder() {
+    const systemId = currentStorageViewSystemId();
+    if (!systemId || state.automaticViewOrderSystemId !== systemId) {
+      return null;
+    }
+    return Array.isArray(state.automaticViewOrder) ? state.automaticViewOrder : null;
+  }
+
   function liveEnclosureMatchesForProfile(profileId) {
     const normalizedProfileId = String(profileId || "");
     if (!normalizedProfileId) {
@@ -3187,7 +3197,7 @@
     `;
   }
 
-  function orderedAdminViewEntries(enclosures, storageViews, savedOrder = []) {
+  function orderedAdminViewEntries(enclosures, storageViews, savedOrder = [], automaticOrder = []) {
     const entries = [
       ...enclosures.map((enclosure) => ({
         key: `enclosure:${enclosure.id}`,
@@ -3205,7 +3215,8 @@
     const byKey = new Map(entries.map((entry) => [entry.key, entry]));
     const ordered = [];
     const added = new Set();
-    savedOrder.forEach((key) => {
+    // Saved keys first, then the main page's automatic order, then anything left.
+    [...savedOrder, ...(automaticOrder || [])].forEach((key) => {
       const entry = byKey.get(key);
       if (!entry || added.has(key)) return;
       ordered.push(entry);
@@ -3248,15 +3259,22 @@
 
   function renderViewOrderEditor() {
     if (!elements.setupViewOrderList) return;
+    const automaticOrder = currentAutomaticViewOrder();
     const entries = orderedAdminViewEntries(
       currentLiveEnclosures(),
       state.storageViews,
       state.viewOrder,
+      automaticOrder || [],
     );
+    // Without a saved order the list is only meaningful once the automatic
+    // order has loaded; discovery order is not what the main page opens.
+    const movable = state.viewOrder.length > 0 || Array.isArray(automaticOrder);
     if (elements.setupViewOrderStatus) {
       elements.setupViewOrderStatus.textContent = state.viewOrder.length
         ? "Custom order. The first available entry opens by default."
-        : "Automatic order: most occupied disks first; enclosures win ties.";
+        : movable
+          ? "Automatic order: most occupied disks first; enclosures win ties."
+          : "Automatic order: most occupied disks first. You can reorder once live enclosures load.";
     }
     if (elements.setupViewOrderResetButton) {
       elements.setupViewOrderResetButton.disabled = state.viewOrder.length === 0;
@@ -3267,8 +3285,8 @@
             <span class="view-order-position" aria-hidden="true">${index + 1}</span>
             <span class="view-order-label"><strong>${escapeHtml(entry.label)}</strong><small>${escapeHtml(entry.kind)}</small></span>
             <span class="view-order-actions">
-              <button type="button" class="button secondary small" data-view-order-action="up" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} up"${index === 0 ? " disabled" : ""}>Up</button>
-              <button type="button" class="button secondary small" data-view-order-action="down" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} down"${index === entries.length - 1 ? " disabled" : ""}>Down</button>
+              <button type="button" class="button secondary small" data-view-order-action="up" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} up"${!movable || index === 0 ? " disabled" : ""}>Up</button>
+              <button type="button" class="button secondary small" data-view-order-action="down" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} down"${!movable || index === entries.length - 1 ? " disabled" : ""}>Down</button>
             </span>
           </div>
         `).join("")
@@ -3644,6 +3662,8 @@
   function resetLiveEnclosureState() {
     state.liveEnclosuresRequestSeq = (state.liveEnclosuresRequestSeq || 0) + 1;
     state.liveEnclosures = [];
+    state.automaticViewOrder = null;
+    state.automaticViewOrderSystemId = null;
     state.liveEnclosuresLoading = false;
     state.liveEnclosuresSystemId = null;
     state.liveEnclosuresError = null;
@@ -3695,7 +3715,9 @@
         return;
       }
       state.liveEnclosures = Array.isArray(payload.enclosures) ? payload.enclosures : [];
+      state.automaticViewOrder = Array.isArray(payload.automatic_view_order) ? payload.automatic_view_order : null;
       state.liveEnclosuresSystemId = payload.system_id || systemId;
+      state.automaticViewOrderSystemId = state.liveEnclosuresSystemId;
       if (!quiet) {
         setBanner(`Loaded ${state.liveEnclosures.length} discovered live enclosure${state.liveEnclosures.length === 1 ? "" : "s"} for ${state.liveEnclosuresSystemId}.`, "success");
       }
@@ -3704,6 +3726,8 @@
         return;
       }
       state.liveEnclosures = [];
+      state.automaticViewOrder = null;
+      state.automaticViewOrderSystemId = null;
       state.liveEnclosuresSystemId = systemId;
       state.liveEnclosuresError = error.message || String(error);
       if (!quiet) {
@@ -8347,7 +8371,12 @@
       const button = event.target.closest("[data-view-order-action]");
       if (!button) return;
       const direction = button.dataset.viewOrderAction === "up" ? -1 : 1;
-      const entries = orderedAdminViewEntries(currentLiveEnclosures(), state.storageViews, state.viewOrder);
+      const entries = orderedAdminViewEntries(
+        currentLiveEnclosures(),
+        state.storageViews,
+        state.viewOrder,
+        currentAutomaticViewOrder() || [],
+      );
       state.viewOrder = moveAdminViewOrder(
         entries,
         button.dataset.viewOrderKey || "",

@@ -2144,7 +2144,9 @@ class InventoryService:
         ha_primary_view_id: str | None,
         ha_owner_enclosure_id: str | None,
         force_refresh: bool,
+        ignore_saved_order: bool = False,
     ) -> list[str]:
+        saved_order = () if ignore_saved_order else tuple(self.system.view_order)
         view_counts = [
             (view.id, view.matched_count)
             for view in runtime_views
@@ -2157,6 +2159,7 @@ class InventoryService:
             tuple(view_counts),
             ha_primary_view_id,
             ha_owner_enclosure_id,
+            saved_order,
         )
 
         def cached_order() -> list[str] | None:
@@ -2198,7 +2201,7 @@ class InventoryService:
             order = effective_main_view_order(
                 enclosure_counts=enclosure_counts,
                 view_counts=view_counts,
-                saved_order=self.system.view_order,
+                saved_order=saved_order,
                 ha_primary_view_id=ha_primary_view_id,
                 ha_owner_enclosure_id=ha_owner_enclosure_id,
             )
@@ -2220,6 +2223,7 @@ class InventoryService:
         snapshot: InventorySnapshot | None = None,
         tolerate_hidden_view_targets: bool = False,
         include_view_order: bool = True,
+        ignore_saved_view_order: bool = False,
     ) -> StorageViewRuntimePayload:
         """Runtime for every stored view.
 
@@ -2310,6 +2314,7 @@ class InventoryService:
                 ha_primary_view_id=primary_view.id if primary_view is not None and ha_owner_enclosure_id else None,
                 ha_owner_enclosure_id=ha_owner_enclosure_id,
                 force_refresh=force_refresh,
+                ignore_saved_order=ignore_saved_view_order,
             )
             if include_view_order
             else []
