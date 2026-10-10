@@ -3844,6 +3844,41 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(reused.default_selection, fresh.default_selection)
         self.assertEqual(again.view_order, fresh.view_order)
 
+    def test_runtime_automatic_view_order_ignores_the_saved_order(self) -> None:
+        # The admin editor shows the automatic order beside a saved one, so the
+        # two must not share a cached result.
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            "enc-a": self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options),
+            "enc-b": self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 3, options),
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="synthetic-system", label="Synthetic system", view_order=["enclosure:enc-a"],
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            saved = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
+            automatic = asyncio.run(
+                service.get_storage_view_runtime(selected_enclosure_id="enc-a", ignore_saved_view_order=True)
+            )
+            saved_again = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
+
+        def enclosures(order: list[str]) -> list[str]:
+            return [key for key in order if key.startswith("enclosure:")]
+
+        self.assertEqual(saved.view_order[0], "enclosure:enc-a")
+        self.assertEqual(enclosures(automatic.view_order), ["enclosure:enc-b", "enclosure:enc-a"])
+        self.assertEqual(saved_again.view_order, saved.view_order)
+
     def test_runtime_view_order_recomputes_after_targeted_snapshot_invalidation(self) -> None:
         options = [
             EnclosureOption(id="enc-a", label="Enclosure A"),

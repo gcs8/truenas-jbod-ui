@@ -527,6 +527,55 @@ test("admin view-order moves preserve unloaded enclosure keys", () => {
   );
 });
 
+test("admin view-order editor shows the automatic order and waits for it", () => {
+  const escapeSource = sourceBetween("  function escapeHtml(value) {", "\n  function setBanner");
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const renderSource = sourceBetween(
+    "  function renderViewOrderEditor() {",
+    "\n  function renderStorageViewList"
+  );
+  const elements = sparseElements({
+    setupViewOrderList: { innerHTML: "" },
+    setupViewOrderStatus: { textContent: "" },
+    setupViewOrderResetButton: { disabled: false },
+  });
+  const state = {
+    storageViews: [{ id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } }],
+    viewOrder: [],
+  };
+  let automaticOrder = null;
+  const { renderViewOrderEditor } = loadFunctions(
+    [escapeSource, helpersSource, renderSource],
+    ["renderViewOrderEditor"],
+    {
+      elements,
+      state,
+      // Discovery order puts the empty shelf first.
+      currentLiveEnclosures: () => [{ id: "enc-a", label: "Empty shelf" }, { id: "enc-b", label: "Full shelf" }],
+      currentAutomaticViewOrder: () => automaticOrder,
+    },
+  );
+  const rows = () => [...elements.setupViewOrderList.innerHTML.matchAll(/data-view-order-entry="([^"]+)"/g)]
+    .map((match) => match[1]);
+  const enabledMoves = () => (elements.setupViewOrderList.innerHTML.match(/">(?:Up|Down)<\/button>/g) || []).length;
+
+  renderViewOrderEditor();
+  assert.equal(enabledMoves(), 0, "discovery order is not offered for reordering");
+  assert.match(elements.setupViewOrderStatus.textContent, /once live enclosures load/);
+
+  automaticOrder = ["enclosure:enc-b", "view:boot", "enclosure:enc-a"];
+  renderViewOrderEditor();
+  assert.deepEqual(rows(), automaticOrder);
+  assert.equal(enabledMoves(), 4);
+
+  state.viewOrder = ["view:boot"];
+  renderViewOrderEditor();
+  assert.deepEqual(rows(), ["view:boot", "enclosure:enc-b", "enclosure:enc-a"]);
+});
+
 test("renaming a storage view rewrites its saved view-order key in place", () => {
   const saveSource = sourceBetween(
     "  function saveStorageViewEditorToState() {",
