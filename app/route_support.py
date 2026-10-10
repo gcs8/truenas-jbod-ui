@@ -408,6 +408,8 @@ def _filter_storage_view_runtime(
         system_id=runtime.system_id,
         system_label=runtime.system_label,
         views=views,
+        view_order=list(runtime.view_order),
+        default_selection=runtime.default_selection,
     )
 
 

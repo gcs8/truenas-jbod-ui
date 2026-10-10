@@ -1248,8 +1248,10 @@ class InventoryService:
         self._snapshot_invalidated: set[str] = set()
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
+        self._snapshot_publication_generation = 0
         self._snapshot_discovery_lock = asyncio.Lock()
         self._system_retention_lock = asyncio.Lock()
+        self._view_order_recompute_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
@@ -1700,6 +1702,10 @@ class InventoryService:
             seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
         )
         self._snapshot_published_sequence[cache_key] = request_sequence
+        self._snapshot_publication_generation += 1
+        self._view_order_source_bundle = None
+        self._view_order_topology_generation = -1
+        self._cached_effective_view_order = []
         self._touch_snapshot_key(cache_key)
         return snapshot, True
 
@@ -2115,43 +2121,62 @@ class InventoryService:
         ha_primary_view_id: str | None,
         ha_owner_enclosure_id: str | None,
     ) -> list[str]:
-        if (
-            self._view_order_source_bundle is source_bundle
-            and self._view_order_topology_generation == self._snapshot_topology_generation
-            and self._cached_effective_view_order
-        ):
-            return list(self._cached_effective_view_order)
+        def cached_order() -> list[str] | None:
+            if (
+                self._view_order_source_bundle is source_bundle
+                and self._view_order_topology_generation == self._snapshot_topology_generation
+                and self._cached_effective_view_order
+            ):
+                return list(self._cached_effective_view_order)
+            return None
 
-        enclosure_counts: list[tuple[str, int]] = []
-        for option in active_snapshot.enclosures:
-            snapshot = known_snapshots.get(option.id)
-            if snapshot is None:
-                # The request already collected the source bundle. Building each
-                # option from that bundle adds no appliance/API/SSH refresh.
-                snapshot = await self.get_snapshot(
-                    force_refresh=False,
-                    selected_enclosure_id=option.id,
-                    allow_stale_cache=True,
-                )
-                known_snapshots[option.id] = snapshot
-            enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+        cached = cached_order()
+        if cached is not None:
+            return cached
+        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            raise SystemRetentionTooLargeError()
+        if self._view_order_recompute_lock.locked():
+            raise SystemRetentionBusyError()
 
-        view_counts = [
-            (view.id, view.matched_count)
-            for view in runtime_views
-            if view.enabled and view.render.show_in_main_ui is not False
-        ]
-        order = effective_main_view_order(
-            enclosure_counts=enclosure_counts,
-            view_counts=view_counts,
-            saved_order=self.system.view_order,
-            ha_primary_view_id=ha_primary_view_id,
-            ha_owner_enclosure_id=ha_owner_enclosure_id,
-        )
-        self._view_order_source_bundle = source_bundle
-        self._view_order_topology_generation = self._snapshot_topology_generation
-        self._cached_effective_view_order = list(order)
-        return order
+        async with self._view_order_recompute_lock:
+            cached = cached_order()
+            if cached is not None:
+                return cached
+            publication_generation = self._snapshot_publication_generation
+            enclosure_counts: list[tuple[str, int]] = []
+            for option in active_snapshot.enclosures:
+                snapshot = known_snapshots.get(option.id)
+                if snapshot is None:
+                    # The request already collected the source bundle. Building each
+                    # option from that bundle adds no appliance/API/SSH refresh.
+                    snapshot = await self.get_snapshot(
+                        force_refresh=False,
+                        selected_enclosure_id=option.id,
+                        allow_stale_cache=True,
+                    )
+                    known_snapshots[option.id] = snapshot
+                enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+
+            view_counts = [
+                (view.id, view.matched_count)
+                for view in runtime_views
+                if view.enabled and view.render.show_in_main_ui is not False
+            ]
+            order = effective_main_view_order(
+                enclosure_counts=enclosure_counts,
+                view_counts=view_counts,
+                saved_order=self.system.view_order,
+                ha_primary_view_id=ha_primary_view_id,
+                ha_owner_enclosure_id=ha_owner_enclosure_id,
+            )
+            # A stale-hit can publish a refreshed snapshot while another option
+            # is awaited. Return this request's coherent result, but only cache it
+            # when no snapshot publication raced the computation.
+            if publication_generation == self._snapshot_publication_generation:
+                self._view_order_source_bundle = source_bundle
+                self._view_order_topology_generation = self._snapshot_topology_generation
+                self._cached_effective_view_order = list(order)
+            return order
 
     async def get_storage_view_runtime(
         self,
