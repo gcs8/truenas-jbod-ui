@@ -31,7 +31,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Made locate-light actions use a short independent session, return immediate
-  hardware confirmation, and retain their result across page refreshes (#931).
+  hardware confirmation, and retain their result across page refreshes (#934).
 
 ## v0.24.0-beta.2 - 2026-10-09
 
