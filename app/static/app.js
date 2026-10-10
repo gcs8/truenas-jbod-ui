@@ -124,6 +124,7 @@
     refreshesInFlight: 0,
     latestRefreshToken: 0,
     storageViewsRuntimeRequestToken: 0,
+    pendingDefaultSelection: false,
     snapshotExportSourceGeneration: 0,
     smartSummaries: {},
     preloadedSmartSummariesBySlot,
@@ -538,11 +539,21 @@
     const availableViews = Array.isArray(bootstrapData.storageViewsRuntime?.views)
       ? bootstrapData.storageViewsRuntime.views
       : [];
+    const locationParams = new URLSearchParams(locationSearch);
+    const explicitStorageViewId = locationParams.get("storage_view_id") || "";
+    const explicitEnclosureId = locationParams.get("enclosure_id") || "";
+    const defaultSelection = String(bootstrapData.storageViewsRuntime?.default_selection || "");
+    const defaultStorageViewId = defaultSelection.startsWith("view:")
+      ? defaultSelection.slice("view:".length)
+      : "";
+    const validDefaultStorageViewId = availableViews.some(
+      (view) => view.id === defaultStorageViewId && isMainUiStorageViewRuntimeOption(view)
+    ) ? defaultStorageViewId : "";
     const storageViewId = isSnapshotMode
       ? (availableViews.some((view) => view.id === requestedStorageViewId && isMainUiStorageViewRuntimeOption(view))
         ? requestedStorageViewId
         : "")
-      : (new URLSearchParams(locationSearch).get("storage_view_id") || "");
+      : (explicitStorageViewId || (explicitEnclosureId ? "" : validDefaultStorageViewId));
     const unresolvedSnapshotView = Boolean(
       isSnapshotMode && requestedStorageViewId && !storageViewId
     );
@@ -10102,6 +10113,28 @@
     staticText.classList.toggle("hidden", !asText);
   }
 
+  function orderedMainSelectorEntries(enclosures, storageViews, effectiveOrder = []) {
+    const entries = [
+      ...enclosures.map((item) => ({ key: `enclosure:${item.id}`, kind: "enclosure", item })),
+      ...storageViews.map((item) => ({ key: `view:${item.id}`, kind: "view", item })),
+    ];
+    const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+    const ordered = [];
+    const added = new Set();
+    effectiveOrder.forEach((key) => {
+      const entry = byKey.get(key);
+      if (!entry || added.has(key)) return;
+      ordered.push(entry);
+      added.add(key);
+    });
+    entries.forEach((entry) => {
+      if (added.has(entry.key)) return;
+      ordered.push(entry);
+      added.add(entry.key);
+    });
+    return ordered;
+  }
+
   function renderSelectors() {
     const systems = state.snapshot.systems || [];
     const enclosures = state.snapshot.enclosures || [];
@@ -10136,22 +10169,17 @@
       if (!visibleEnclosures.length && !storageViews.length) {
         enclosureOptionsHtml = '<option value="">No enclosures found</option>';
       } else {
-        const enclosureOptions = visibleEnclosures
-          .map((enclosure) => `<option value="enclosure:${escapeHtml(enclosure.id)}">${escapeHtml(selectorLabelForEnclosureOption(enclosure))}</option>`)
-          .join("");
-        const savedChassisViewOptions = storageViews
-          .filter((view) => isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
-          .join("");
-        const virtualStorageViewOptions = storageViews
-          .filter((view) => !isSavedChassisView(view))
-          .map((view) => `<option value="view:${escapeHtml(view.id)}"${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(view))}${state.storageViewsRuntimeLoading || state.storageViewsRuntimeError ? " (previous)" : ""}</option>`)
-          .join("");
-        enclosureOptionsHtml = [
-          enclosureOptions ? `<optgroup label="Enclosures">${enclosureOptions}</optgroup>` : "",
-          savedChassisViewOptions ? `<optgroup label="Saved layouts">${savedChassisViewOptions}</optgroup>` : "",
-          virtualStorageViewOptions ? `<optgroup label="Other disk groups">${virtualStorageViewOptions}</optgroup>` : "",
-        ].filter(Boolean).join("");
+        enclosureOptionsHtml = orderedMainSelectorEntries(
+          visibleEnclosures,
+          storageViews,
+          Array.isArray(state.storageViewsRuntime?.view_order) ? state.storageViewsRuntime.view_order : [],
+        ).map((entry) => {
+          if (entry.kind === "view") {
+            const disabled = state.storageViewsRuntimeLoading || state.storageViewsRuntimeError;
+            return `<option value="view:${escapeHtml(entry.item.id)}"${disabled ? " disabled" : ""}>${escapeHtml(selectorLabelForStorageViewOption(entry.item))}${disabled ? " (previous)" : ""}</option>`;
+          }
+          return `<option value="enclosure:${escapeHtml(entry.item.id)}">${escapeHtml(selectorLabelForEnclosureOption(entry.item))}</option>`;
+        }).join("");
       }
       const selectedValue = state.selectedStorageViewRuntimeId
         ? `view:${state.selectedStorageViewRuntimeId}`
@@ -10280,7 +10308,29 @@
       }
       if (payload.system_id !== state.selectedSystemId) throw new Error("Storage view response did not match the selected system.");
       state.storageViewsRuntimeError = null;
+      const applyDefaultSelection = state.pendingDefaultSelection;
       applyStorageViewRuntime(payload);
+      if (applyDefaultSelection) {
+        state.pendingDefaultSelection = false;
+        const defaultSelection = String(payload.default_selection || "");
+        if (defaultSelection.startsWith("view:")) {
+          const defaultViewId = defaultSelection.slice("view:".length);
+          if (getMainUiStorageViewRuntimeOptions().some((view) => view.id === defaultViewId)) {
+            state.selectedStorageViewRuntimeId = defaultViewId;
+            state.selectedSlot = null;
+            syncLocation();
+          }
+        } else if (defaultSelection.startsWith("enclosure:")) {
+          const defaultEnclosureId = defaultSelection.slice("enclosure:".length);
+          if (defaultEnclosureId && defaultEnclosureId !== currentLiveEnclosureId()) {
+            state.selectedEnclosureId = defaultEnclosureId;
+            syncLocation();
+            await refreshSnapshot(false, "opening-view");
+            return;
+          }
+          syncLocation();
+        }
+      }
       if (!quiet) {
         setStatus(`Loaded ${Array.isArray(payload.views) ? payload.views.length : 0} storage view${Array.isArray(payload.views) && payload.views.length === 1 ? "" : "s"} for ${payload.system_label || payload.system_id || "the selected system"}.`);
       }
@@ -11242,6 +11292,7 @@
       };
       state.storageViewsRuntimeLoading = true;
       state.selectedStorageViewRuntimeId = "";
+      state.pendingDefaultSelection = true;
       invalidateSnapshotExportEstimateIfBasisChanged(previousEstimateBasisKey);
       resetHeatmapHistoryCache();
       resetSasFabricData();

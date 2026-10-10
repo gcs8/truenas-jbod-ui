@@ -339,6 +339,23 @@ def build_router() -> APIRouter:
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
         )
+        explicit_storage_view_id = request.query_params.get("storage_view_id")
+        default_selection = storage_view_runtime.default_selection or ""
+        if (
+            enclosure_id is None
+            and not explicit_storage_view_id
+            and default_selection.startswith("enclosure:")
+        ):
+            default_enclosure_id = default_selection.removeprefix("enclosure:")
+            if default_enclosure_id and default_enclosure_id != snapshot.selected_enclosure_id:
+                snapshot = await service.get_snapshot(
+                    selected_enclosure_id=default_enclosure_id,
+                    allow_stale_cache=True,
+                )
+                storage_view_runtime = await service.get_storage_view_runtime(
+                    selected_enclosure_id=default_enclosure_id,
+                    snapshot=snapshot,
+                )
         startup_problems = await asyncio.to_thread(runtime_warnings_for, request)
         if startup_problems:
             snapshot = snapshot.model_copy(update={"warnings": [*startup_problems, *snapshot.warnings]})

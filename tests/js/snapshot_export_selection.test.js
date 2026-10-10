@@ -188,7 +188,7 @@ test("main selector entries follow the server effective order as one flat list",
   );
 
   assert.deepEqual(
-    entries.map((entry) => entry.key),
+    JSON.parse(JSON.stringify(entries.map((entry) => entry.key))),
     ["view:primary-chassis", "enclosure:enc-b", "enclosure:enc-a", "view:boot-doms"],
   );
 });
