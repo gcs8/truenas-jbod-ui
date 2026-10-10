@@ -95,7 +95,7 @@ test("export enclosure rows show the bay count, not the profile id", () => {
   assert.doesNotMatch(APP_SOURCE, /enclosure\.profile_id \|\| ""\]/);
 });
 
-test("locate-light status names where the change was sent and flags experimental paths", () => {
+test("locate-light confirmation names the backend and flags experimental paths", () => {
   const start = APP_SOURCE.indexOf("  function locateLightSourceLabel(");
   assert.notEqual(start, -1);
   const body = APP_SOURCE.slice(start, APP_SOURCE.indexOf("\n  }\n", start) + 4);
@@ -103,7 +103,7 @@ test("locate-light status names where the change was sent and flags experimental
   assert.equal(locateLightSourceLabel({ led_backend: "api" }), "the TrueNAS API");
   assert.equal(locateLightSourceLabel({ led_backend: "unifi_fault", raw_status: { experimental_led: true } }), "UniFi over SSH (experimental)");
   assert.equal(locateLightSourceLabel({ led_backend: "unifi_fault" }), "UniFi over SSH");
-  assert.match(APP_SOURCE, /sent through \$\{locateLightSourceLabel\(slot\)\}/);
+  assert.match(APP_SOURCE, /confirmed through \$\{locateLightSourceLabel\(slot\)\}/);
 });
 
 test("the sharing summary names every identifier class the masking option covers", () => {

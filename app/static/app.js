@@ -10488,6 +10488,8 @@
     }
     const mutation = captureMutationContext("sendLedAction");
     if (!mutation) return;
+    const originSnapshot = cloneJsonValue(state.snapshot);
+    let retainedSnapshot = null;
     let succeeded = false;
     try {
       setStatus(`${action === "IDENTIFY" ? "Turning on" : "Turning off"} the locate light for slot ${slot.slot_label}...`);
@@ -10497,17 +10499,38 @@
         body: JSON.stringify({ action }),
       });
       succeeded = true;
-      if (!mutationContextIsCurrent(mutation)) return;
-      applySnapshot(payload.snapshot);
-      renderAll();
-      scheduleSmartPrefetch();
-      setStatus(`Locate light ${action === "IDENTIFY" ? "on" : "off"} for slot ${slot.slot_label}, sent through ${locateLightSourceLabel(slot)}.`);
+      const patchResult = (snapshot) => {
+        if (!snapshot || !Array.isArray(snapshot.slots) || typeof payload.identify_active !== "boolean") {
+          return snapshot;
+        }
+        const matchingSlot = snapshot.slots.find((item) => Number(item.slot) === Number(payload.slot));
+        if (matchingSlot) matchingSlot.identify_active = payload.identify_active;
+        return snapshot;
+      };
+      retainedSnapshot = patchResult(originSnapshot);
+      if (mutationContextIsCurrent(mutation)) {
+        patchResult(state.snapshot);
+        renderAll();
+      }
+
+      const requestedState = payload.requested_active === false ? "off" : "on";
+      if (payload.confirmed === true) {
+        setStatus(`Locate light ${requestedState} for slot ${slot.slot_label}, confirmed through ${locateLightSourceLabel(slot)}.`);
+      } else if (payload.confirmed === false) {
+        setStatus(`The enclosure did not confirm the locate light is ${requestedState} for slot ${slot.slot_label}.`, "warning");
+      } else {
+        setStatus(`The locate light request was sent for slot ${slot.slot_label}, but this system cannot confirm it immediately.`, "warning");
+      }
     } catch (error) {
-      if (!mutationContextIsCurrent(mutation)) return;
       handleWriteRejection(error);
-      setStatus(`Could not change the locate light: ${error.message || error}`, "error");
+      setStatus(`Could not change the locate light for slot ${slot.slot_label}: ${error.message || error}`, "error");
     } finally {
       finishMutationContext(mutation, succeeded);
+      if (retainedSnapshot) {
+        state.snapshotReuseCache ||= {};
+        const enclosureId = retainedSnapshot.selected_enclosure_id || null;
+        state.snapshotReuseCache[snapshotReuseCacheKey(mutation.systemId, enclosureId)] = retainedSnapshot;
+      }
     }
   }
 
