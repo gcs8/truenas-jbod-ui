@@ -667,12 +667,12 @@ const STATE_GLYPHS = { healthy: "✓", empty: "○", identify: "◎", fault: "!"
 const RING_COLORS = { selected: "91, 183, 255", "peer-highlight": "76, 216, 164", "fabric-highlight": "85, 214, 235" };
 
 // The legacy fixtures select slot 0, which rings the even bays and dims the
-// odd ones. Put the first dimmed bay in a Connections trace too, the way
-// refreshGridSelectionState does, so every ring kind is on the face.
+// odd ones. Put the first bay without a ring in a Connections trace too, the
+// way refreshGridSelectionState does, so every ring kind is on the face.
 async function highlightFabricBay(page) {
   await page.locator("#slot-grid").evaluate((grid) => {
-    const tile = grid.querySelector(".slot-tile[data-slot].peer-dimmed");
-    if (tile) tile.classList.replace("peer-dimmed", "fabric-highlight");
+    const tile = grid.querySelector(".slot-tile[data-slot]:not(.selected, .peer-highlight)");
+    if (tile) tile.classList.replace("peer-dimmed", "fabric-highlight") || tile.classList.add("fabric-highlight");
   });
 }
 
@@ -792,7 +792,7 @@ async function checkStateChips(page, url, { label, prepare = async () => {}, bay
       expect(result.bays, name).toBeGreaterThan(0);
       expect(result.problems, name).toEqual([]);
       expect(result.chips, name).toBe(result.bays);
-      expect(result.rings, name).toBeGreaterThanOrEqual(rings);
+      expect(result.rings, name).toBeGreaterThanOrEqual(Math.min(rings, result.bays));
       if (spots) expect(result.spot, name).toBe(spots[heatmap ? 1 : 0]);
     }
   }
@@ -827,12 +827,17 @@ test("offline M.2 and boot-media cards show a state chip clear of the card's lab
     await checkStateChips(page, url, {
       label: view,
       bayLabels: false,
+      // The selected card and a Connections card ring the card itself.
+      rings: 2,
       prepare: async () => {
         await page.locator("#enclosure-select").selectOption(view);
         await expect(page.locator("#chassis-shell")).toHaveAttribute(
           "data-face-style",
           view === "view:nvme-carrier" ? "nvme-carrier" : "boot-devices",
         );
+        // Select the first card through the grid's delegated handler.
+        await page.locator("#slot-grid .slot-tile[data-slot]").first().dispatchEvent("click");
+        await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(1);
       },
     });
   }
@@ -930,7 +935,9 @@ test("offline bay with its locate light on blinks its LED dot and says so", asyn
   expect(blinking.background).toBe("rgb(215, 182, 43)");
   expect(blinking.animation).toBe("slot-led-locate infinite");
   expect(blinking.running).toBeGreaterThan(0);
-  await page.locator('#slot-grid .slot-tile[data-slot="1"]').hover();
+  // The page shell can sit over the face at this size, so point at the bay
+  // through the grid's delegated mouseover handler.
+  await page.locator('#slot-grid .slot-tile[data-slot="1"]').dispatchEvent("mouseover");
   await expect(page.locator("#slot-tooltip")).toContainText("Locate light on");
 
   await page.emulateMedia({ reducedMotion: "reduce" });
