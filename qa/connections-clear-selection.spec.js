@@ -106,6 +106,10 @@ async function openConnections(page) {
   });
   await page.goto("https://synthetic.invalid/");
   await page.locator("#auto-refresh-toggle").uncheck();
+  const selectedGridBay = page.locator("#slot-grid .slot-tile.selected");
+  await expect(selectedGridBay).toHaveCount(1);
+  await selectedGridBay.click();
+  await expect(selectedGridBay).toHaveCount(0);
   await page.locator("#sas-fabric-toggle-button").click();
   await expect(page.locator("#sas-fabric-lanes .sas-fabric-lane")).toHaveCount(1);
   return errors;
@@ -113,6 +117,7 @@ async function openConnections(page) {
 
 async function expectFullMap(page) {
   await expect(page.locator("#sas-fabric-panel .is-selected")).toHaveCount(0);
+  await expect(page.locator("#slot-grid .fabric-highlight")).toHaveCount(0);
   await expect(page.locator("#slot-grid .fabric-dimmed")).toHaveCount(0);
   await expect(page.locator("#sas-fabric-show-all-button")).toBeHidden();
   await expect(page.locator(`[data-sas-fabric-trace="${FAILED_PATH}"]`)).toHaveClass(/status-fail/);
@@ -129,7 +134,7 @@ test("path, node and bay selections can return to the full map without clearing 
   await failedPath.click();
   await expect(failedPath).toHaveClass(/is-selected/);
   await expect(showAll).toBeVisible();
-  await expect(page.locator("#slot-grid .fabric-dimmed")).not.toHaveCount(0);
+  await expect(page.locator("#slot-grid .fabric-highlight")).toHaveCount(1);
   await failedPath.click();
   await expectFullMap(page);
 
@@ -141,7 +146,7 @@ test("path, node and bay selections can return to the full map without clearing 
   const bay = page.locator('[data-sas-fabric-slot="0"]').first();
   await bay.click();
   await expect(page.locator('#slot-grid .slot-tile[data-slot="0"]')).toHaveClass(/selected/);
-  await expect(page.locator("#slot-grid .fabric-dimmed")).not.toHaveCount(0);
+  await expect(page.locator("#slot-grid .fabric-highlight")).toHaveCount(1);
   await bay.click();
   await expect(page.locator("#slot-grid .slot-tile.selected")).toHaveCount(0);
   await expectFullMap(page);
