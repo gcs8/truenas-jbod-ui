@@ -50,6 +50,7 @@ from app.services.inventory import (
     InventoryService,
     InventorySourceBundle,
     LINUX_ENCLOSURE_SYSFS_MAP_COMMAND,
+    SnapshotStateBusyError,
     build_lunid_alias_tiers,
     build_lunid_aliases,
     index_disks_by_sas,
@@ -17584,6 +17585,149 @@ Consumers:
 
 
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    CORE_MAP_ON = """
+ses0:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000c50000000001
+  Element 7, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x02 0x00)
+    Description: Slot07
+    Extra status:
+      - LED=locate
+ses1:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000c50000000001
+  Element 7, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x00 0x00)
+    Description: Slot07
+""".strip()
+    CORE_MAP_OFF = CORE_MAP_ON.replace(" (0x05 0x00 0x02 0x00)", " (0x05 0x00 0x00 0x00)").replace(
+        "    Extra status:\n      - LED=locate\n", ""
+    )
+
+    def led_service(self, platform: str, slot: SlotView):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(
+            id=f"{platform}-led-test",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="host.example.test"),
+        )
+        service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name)
+        service._cache["shelf-a"] = InventorySnapshot(
+            slots=[slot],
+            selected_system_id=system.id,
+            selected_system_platform=platform,
+            selected_enclosure_id="shelf-a",
+            refresh_interval_seconds=30,
+        )
+        return service
+
+    async def test_core_locate_uses_cached_target_one_short_sequence_and_reports_each_path(self) -> None:
+        slot = SlotView(
+            slot=7,
+            slot_label="07",
+            row_index=0,
+            column_index=0,
+            enclosure_id="shelf-a",
+            led_supported=True,
+            led_backend="ssh",
+            ssh_ses_device="/dev/ses0",
+            ssh_ses_element_id=7,
+            ssh_ses_targets=[
+                {"ses_device": "/dev/ses0", "ses_element_id": 7, "ses_slot_number": 7},
+                {"ses_device": "/dev/ses1", "ses_element_id": 7, "ses_slot_number": 7},
+            ],
+        )
+        service = self.led_service("core", slot)
+        service.get_snapshot = AsyncMock(side_effect=SnapshotStateBusyError())
+        locate_on = "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on"
+        locate_off = "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 off"
+        readback = "sudo -n /usr/sbin/sesutil map"
+        service._run_led_ssh_sequence = AsyncMock(
+            side_effect=[
+                [
+                    (SSHCommandResult(command=locate_on, ok=True, exit_code=0), 0.05),
+                    (SSHCommandResult(command=readback, ok=True, stdout=self.CORE_MAP_ON, exit_code=0), 0.06),
+                ],
+                [
+                    (SSHCommandResult(command=locate_off, ok=True, exit_code=0), 0.05),
+                    (SSHCommandResult(command=readback, ok=True, stdout=self.CORE_MAP_OFF, exit_code=0), 0.06),
+                ],
+            ]
+        )
+
+        with self.assertLogs(inventory_module.logger, level="INFO") as logged:
+            turned_on = await service.set_slot_led(7, LedAction.identify, "shelf-a", invalidate_snapshot=False)
+        self.assertTrue(turned_on["confirmed"])
+        self.assertTrue(turned_on["identify_active"])
+        self.assertEqual(
+            turned_on["paths"],
+            [
+                {"ses_device": "/dev/ses0", "ses_element_id": 7, "identify_active": True},
+                {"ses_device": "/dev/ses1", "ses_element_id": 7, "identify_active": False},
+            ],
+        )
+        log_text = " ".join(logged.output)
+        for expected in ("core-led-test", "bay=07", "device=/dev/ses0", "element=7", "action=IDENTIFY", "exit_status=0", "duration_seconds="):
+            self.assertIn(expected, log_text)
+        service.get_snapshot.assert_not_awaited()
+        service._run_led_ssh_sequence.assert_awaited_once_with(None, [locate_on, readback])
+
+        # The background refresh may have invalidated the snapshot-state cache;
+        # a follow-up light action still uses the retained, identity-checked target.
+        service._cache.clear()
+        turned_off = await service.set_slot_led(7, LedAction.clear, "shelf-a", invalidate_snapshot=False)
+        self.assertTrue(turned_off["confirmed"])
+        self.assertFalse(turned_off["identify_active"])
+        self.assertTrue(all(path["identify_active"] is False for path in turned_off["paths"]))
+        service.get_snapshot.assert_not_awaited()
+        self.assertEqual(service._run_led_ssh_sequence.await_args_list[-1].args, (None, [locate_off, readback]))
+
+    async def test_core_locate_readback_mismatch_is_not_confirmed(self) -> None:
+        slot = SlotView(
+            slot=7, slot_label="07", row_index=0, column_index=0,
+            enclosure_id="shelf-a", led_supported=True, led_backend="ssh",
+            ssh_ses_targets=[
+                {"ses_device": "/dev/ses0", "ses_element_id": 7},
+                {"ses_device": "/dev/ses1", "ses_element_id": 7},
+            ],
+        )
+        service = self.led_service("core", slot)
+        locate = "sudo -n /usr/sbin/sesutil locate -u /dev/ses0 7 on"
+        readback = "sudo -n /usr/sbin/sesutil map"
+        service._run_led_ssh_sequence = AsyncMock(return_value=[
+            (SSHCommandResult(command=locate, ok=True, exit_code=0), 0.05),
+            (SSHCommandResult(command=readback, ok=True, stdout=self.CORE_MAP_OFF, exit_code=0), 0.06),
+        ])
+
+        result = await service.set_slot_led(7, LedAction.identify, "shelf-a", invalidate_snapshot=False)
+
+        self.assertFalse(result["confirmed"])
+        self.assertFalse(result["identify_active"])
+        self.assertEqual(
+            sum(
+                " sesutil locate " in command
+                for call in service._run_led_ssh_sequence.await_args_list
+                for command in call.args[1]
+            ),
+            1,
+        )
+
+    async def test_api_led_backend_returns_an_explicit_unconfirmed_result(self) -> None:
+        slot = SlotView(
+            slot=0, slot_label="00", row_index=0, column_index=0,
+            enclosure_id="shelf-a", led_supported=True, led_backend="api",
+        )
+        service = self.led_service("scale", slot)
+        service.truenas_client.set_slot_status = AsyncMock()
+
+        result = await service.set_slot_led(0, LedAction.identify, "shelf-a", invalidate_snapshot=False)
+
+        self.assertIsNone(result["confirmed"])
+        self.assertIsNone(result["identify_active"])
+        self.assertFalse(result["readback_supported"])
+
     async def test_core_duplicate_slot_descriptions_disable_ssh_identify_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(

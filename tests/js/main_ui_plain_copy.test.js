@@ -87,6 +87,7 @@ test("locate-light, offline-copy and restore wording replaces the old labels", (
   }
   assert.match(TEMPLATE, /data-led-action="IDENTIFY">Locate light on</);
   assert.match(TEMPLATE, /data-led-action="CLEAR">Locate light off</);
+  assert.match(APP_SOURCE, /The enclosure did not confirm the locate light is/);
   assert.match(TEMPLATE, /id="export-snapshot-button"[^>]*>Save offline copy</);
 });
 
