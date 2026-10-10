@@ -745,6 +745,7 @@ def serialize_systems(settings: Settings) -> list[dict[str, Any]]:
             "bmc_verify_ssl": bool(system.bmc.verify_ssl),
             "bmc_timeout_seconds": system.bmc.timeout_seconds,
             "storage_views": serialize_storage_views(system, profile_registry),
+            "view_order": list(system.view_order),
         }
         for system in settings.systems
     ]

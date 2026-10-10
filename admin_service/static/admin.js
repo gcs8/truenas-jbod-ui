@@ -41,6 +41,7 @@
       detail: "No saved TLS certificate bundle has been validated for this host yet.",
     },
     storageViews: [],
+    viewOrder: [],
     storageViewCandidates: [],
     storageViewCandidatesLoading: false,
     storageViewCandidatesSystemId: null,
@@ -251,6 +252,9 @@
     setupStorageViewHelp: document.getElementById("setup-storage-view-help"),
     setupStorageViewCount: document.getElementById("setup-storage-view-count"),
     setupStorageViewList: document.getElementById("setup-storage-view-list"),
+    setupViewOrderList: document.getElementById("setup-view-order-list"),
+    setupViewOrderStatus: document.getElementById("setup-view-order-status"),
+    setupViewOrderResetButton: document.getElementById("setup-view-order-reset-button"),
     setupStorageViewTemplateBadge: document.getElementById("setup-storage-view-template-badge"),
     setupStorageViewEmpty: document.getElementById("setup-storage-view-empty"),
     setupStorageViewEditor: document.getElementById("setup-storage-view-editor"),
@@ -3183,7 +3187,78 @@
     `;
   }
 
+  function orderedAdminViewEntries(enclosures, storageViews, savedOrder = []) {
+    const entries = [
+      ...enclosures.map((enclosure) => ({
+        key: `enclosure:${enclosure.id}`,
+        kind: "Enclosure",
+        label: enclosure.label || enclosure.id,
+      })),
+      ...storageViews
+        .filter((view) => view.enabled !== false && view.render?.show_in_main_ui !== false)
+        .map((view) => ({
+          key: `view:${view.id}`,
+          kind: "Storage view",
+          label: view.label || view.id,
+        })),
+    ];
+    const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+    const ordered = [];
+    const added = new Set();
+    savedOrder.forEach((key) => {
+      const entry = byKey.get(key);
+      if (!entry || added.has(key)) return;
+      ordered.push(entry);
+      added.add(key);
+    });
+    entries.forEach((entry) => {
+      if (added.has(entry.key)) return;
+      ordered.push(entry);
+      added.add(entry.key);
+    });
+    return ordered;
+  }
+
+  function moveAdminViewOrder(entries, key, direction) {
+    const keys = entries.map((entry) => entry.key);
+    const index = keys.indexOf(key);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= keys.length) return keys;
+    [keys[index], keys[target]] = [keys[target], keys[index]];
+    return keys;
+  }
+
+  function renderViewOrderEditor() {
+    if (!elements.setupViewOrderList) return;
+    const entries = orderedAdminViewEntries(
+      currentLiveEnclosures(),
+      state.storageViews,
+      state.viewOrder,
+    );
+    if (elements.setupViewOrderStatus) {
+      elements.setupViewOrderStatus.textContent = state.viewOrder.length
+        ? "Custom order. The first available entry opens by default."
+        : "Automatic order: most occupied disks first; enclosures win ties.";
+    }
+    if (elements.setupViewOrderResetButton) {
+      elements.setupViewOrderResetButton.disabled = state.viewOrder.length === 0;
+    }
+    elements.setupViewOrderList.innerHTML = entries.length
+      ? entries.map((entry, index) => `
+          <div class="view-order-row" data-view-order-entry="${escapeHtml(entry.key)}">
+            <span class="view-order-position" aria-hidden="true">${index + 1}</span>
+            <span class="view-order-label"><strong>${escapeHtml(entry.label)}</strong><small>${escapeHtml(entry.kind)}</small></span>
+            <span class="view-order-actions">
+              <button type="button" class="button secondary small" data-view-order-action="up" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} up"${index === 0 ? " disabled" : ""}>Up</button>
+              <button type="button" class="button secondary small" data-view-order-action="down" data-view-order-key="${escapeHtml(entry.key)}" aria-label="Move ${escapeHtml(entry.label)} down"${index === entries.length - 1 ? " disabled" : ""}>Down</button>
+            </span>
+          </div>
+        `).join("")
+      : '<p class="subtle action-note">Live enclosures and enabled storage views appear here.</p>';
+  }
+
   function renderStorageViewList() {
+    renderViewOrderEditor();
     if (!elements.setupStorageViewList || !elements.setupStorageViewCount) {
       return;
     }
@@ -4892,6 +4967,7 @@
     state.sshUserAutoPlatform = null;
     state.sshUserEdited = false;
     state.storageViews = [];
+    state.viewOrder = [];
     resetStorageViewCandidateState();
     resetLiveEnclosureState();
     state.selectedStorageViewId = "";
@@ -5055,6 +5131,7 @@
     state.selectedProfileId = system.default_profile_id || "";
     state.haNodes = normalizeHaNodes(system.ha_nodes || []);
     state.haNodesLoading = false;
+    state.viewOrder = Array.isArray(system.view_order) ? [...system.view_order] : [];
     replaceStorageViewState(system.storage_views || []);
     if (elements.setupSystemLabel) {
       elements.setupSystemLabel.value = system.label || system.id || "";
@@ -5325,6 +5402,7 @@
                 }
               : null,
         })),
+      view_order: state.viewOrder.slice(),
       replace_existing: Boolean(state.loadedSystemId && normalizedSystemId === state.loadedSystemId),
       // The system this payload was cloned FROM. Sent whenever a loaded system
       // is saved under a new id, whatever the operator did to the SSH command
@@ -8238,6 +8316,22 @@
       }
       state.selectedStorageViewId = button.dataset.storageViewId || "";
       renderStorageViews();
+    });
+    elements.setupViewOrderList?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-view-order-action]");
+      if (!button) return;
+      const direction = button.dataset.viewOrderAction === "up" ? -1 : 1;
+      const entries = orderedAdminViewEntries(currentLiveEnclosures(), state.storageViews, state.viewOrder);
+      state.viewOrder = moveAdminViewOrder(entries, button.dataset.viewOrderKey || "", direction);
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      renderViewOrderEditor();
+    });
+    elements.setupViewOrderResetButton?.addEventListener("click", () => {
+      state.viewOrder = [];
+      state.setupDirty = true;
+      state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
+      renderViewOrderEditor();
     });
     elements.setupStorageViewCandidatesList?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-storage-view-candidate-id]");
