@@ -34,7 +34,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   state chip from that bay and its highlighted peers. Every bay, including
   NVMe carrier and boot-device cards, keeps its LED dot, and a bay with its
   locate light on blinks the dot and says "Locate light on" in its tooltip and
-  accessible name. (#PR)
+  accessible name. (#935)
 
 ## v0.24.0-beta.2 - 2026-10-09
 
