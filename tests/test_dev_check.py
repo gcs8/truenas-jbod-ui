@@ -291,6 +291,7 @@ class DevCheckPlanTests(unittest.TestCase):
         for module in (
             "tests.test_admin_maintenance",
             "tests.test_backup_integration",
+            "tests.test_history_schema_version_gate",
             "tests.test_smart_grid_io",
         ):
             with self.subTest(module=module):
@@ -312,6 +313,8 @@ class DevCheckPlanTests(unittest.TestCase):
             "tests.test_mapping_store",
             "tests.test_public_demo_fixture",
             "tests.test_public_demo_provenance",
+            "tests.test_settings_reload",
+            "tests.test_ssh_probe",
             "tests.test_startup_migration_recovery",
             "tests.test_startup_writability",
             "tests.test_ui_health_and_admin_probe",
