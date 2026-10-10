@@ -3866,6 +3866,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(primary.backing_enclosure_id, "node-b")
         self.assertEqual(primary.backing_enclosure_label, "ExampleQS Right")
         self.assertEqual(primary.matched_count, 2)
+        self.assertEqual(
+            {slot.snapshot_enclosure_id for slot in primary.slots},
+            {"node-b"},
+        )
         self.assertEqual(runtime.default_selection, "view:primary-chassis")
         self.assertEqual(runtime.view_order[0], "view:primary-chassis")
         service._get_inventory_source_bundle.assert_awaited_once()
