@@ -102,6 +102,33 @@ test("an unselected grid opens Connections without auto-selecting a failed path"
   assert.equal(defaultSasFabricTraceId(), null, "an explicit clear survives later resolution");
 });
 
+test("grid synchronization drops a stale fabric selection when the bay has no trace", () => {
+  for (const selected of [
+    { selectedTraceId: "bay:0", selectedNodeId: null },
+    { selectedTraceId: null, selectedNodeId: "controller:synthetic-hba" },
+  ]) {
+    const state = {
+      sasFabric: {
+        data: fabricFixture(),
+        ...selected,
+        selectionCleared: true,
+      },
+    };
+    const { syncSasFabricTraceToSlot } = loadFunctions([
+      "syncSasFabricTraceToSlot",
+    ], {
+      state,
+      sasFabricTraceById: () => null,
+    });
+
+    syncSasFabricTraceToSlot(7);
+
+    assert.equal(state.sasFabric.selectedTraceId, null);
+    assert.equal(state.sasFabric.selectedNodeId, null);
+    assert.equal(state.sasFabric.selectionCleared, false);
+  }
+});
+
 test("clearing a selected bay clears only selection state", () => {
   const fabric = fabricFixture();
   const state = {
