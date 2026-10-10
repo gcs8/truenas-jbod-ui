@@ -3885,6 +3885,40 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(after.view_order[0], "enclosure:enc-a")
         self.assertNotEqual(after.view_order, before.view_order)
 
+    def test_forced_runtime_order_rebuilds_nonactive_snapshots_without_recollecting_sources(self) -> None:
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        active = self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options)
+        stale_other = self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 4, options)
+        fresh_other = self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 0, options)
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return active if selected_enclosure_id in {None, "enc-a"} else stale_other
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            source_bundle = self._empty_source_bundle()
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_snapshot_result = AsyncMock(
+                return_value=inventory_module.CacheResult(fresh_other, "forced")
+            )
+            service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+
+            runtime = asyncio.run(
+                service.get_storage_view_runtime(force_refresh=True, selected_enclosure_id="enc-a")
+            )
+
+        self.assertEqual(runtime.view_order[0], "enclosure:enc-a")
+        service._get_snapshot_result.assert_awaited_once_with(
+            force_refresh=True,
+            selected_enclosure_id="enc-b",
+            allow_stale_cache=False,
+            force_source_refresh=False,
+        )
+
     def test_runtime_view_order_refuses_oversized_enclosure_enumeration(self) -> None:
         options = [
             EnclosureOption(id=f"enc-{index}", label=f"Enclosure {index}")
@@ -4033,6 +4067,78 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(runtime.default_selection, "view:primary-chassis")
         self.assertEqual(runtime.view_order[0], "view:primary-chassis")
         service._get_inventory_source_bundle.assert_awaited_once()
+
+    def test_forced_quantastor_ha_runtime_rebuilds_backing_snapshot_without_recollecting_sources(self) -> None:
+        options = [
+            EnclosureOption(id="node-a", label="ExampleQS Left"),
+            EnclosureOption(id="node-b", label="ExampleQS Right"),
+        ]
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            systems=[
+                {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+            ],
+            pools=[{"id": "pool-a", "activeStorageSystemId": "node-b"}],
+            disks=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                default_profile_id=SCALE_SSG_FRONT_24_PROFILE_ID,
+                storage_views=[
+                    {
+                        "id": "primary-chassis",
+                        "label": "Primary Chassis",
+                        "kind": "ses_enclosure",
+                        "template_id": "ses-auto",
+                        "profile_id": SCALE_SSG_FRONT_24_PROFILE_ID,
+                        "binding": {"mode": "auto"},
+                    }
+                ],
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(ha_enabled=True),
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            profile = service.profile_registry.get(SCALE_SSG_FRONT_24_PROFILE_ID)
+            active = self._view_order_snapshot(
+                "example-qs-ha", "node-a", "ExampleQS Left", 1, options, selected_profile=profile,
+            )
+            stale_backing = self._view_order_snapshot(
+                "example-qs-ha", "node-b", "ExampleQS Right", 1, options, selected_profile=profile,
+            )
+            fresh_backing = self._view_order_snapshot(
+                "example-qs-ha", "node-b", "ExampleQS Right", 3, options, selected_profile=profile,
+            )
+
+            async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+                return active if selected_enclosure_id in {None, "node-a"} else stale_backing
+
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_snapshot_result = AsyncMock(
+                return_value=inventory_module.CacheResult(fresh_backing, "forced")
+            )
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=self._empty_source_bundle(raw_data=raw_data)
+            )
+
+            runtime = asyncio.run(
+                service.get_storage_view_runtime(force_refresh=True, selected_enclosure_id="node-a")
+            )
+
+        primary = next(view for view in runtime.views if view.id == "primary-chassis")
+        self.assertEqual(primary.backing_enclosure_id, "node-b")
+        self.assertEqual(primary.matched_count, 3)
+        service._get_snapshot_result.assert_awaited_once_with(
+            force_refresh=True,
+            selected_enclosure_id="node-b",
+            allow_stale_cache=False,
+            force_source_refresh=False,
+        )
 
     def test_storage_view_candidate_build_reuses_parsed_ssh_bundle_per_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
