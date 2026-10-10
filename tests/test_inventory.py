@@ -5822,7 +5822,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                             kind="ses_enclosure",
                             template_id="ses-auto",
                             source="selected_enclosure_snapshot",
-                            backing_enclosure_id="enc-a",
+                            backing_enclosure_id="node-b",
                             slots=[
                                 StorageViewRuntimeSlot(
                                     slot_index=0,
@@ -5830,6 +5830,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                                     occupied=True,
                                     source="snapshot_slot",
                                     snapshot_slot=12,
+                                    snapshot_enclosure_id="node-b",
                                     device_name="da12",
                                 )
                             ],
@@ -5842,11 +5843,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 service.resolve_storage_view_slot_history_target(
                     "primary-chassis",
                     0,
-                    selected_enclosure_id="enc-a",
+                    selected_enclosure_id="node-a",
                 )
             )
 
-        self.assertEqual(target, (12, "enc-a"))
+        self.assertEqual(target, (12, "node-b"))
 
     def test_resolve_storage_view_slot_history_target_uses_storage_view_scope_for_inventory_bound_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -108,6 +108,7 @@ test("dead storage-view panel contract stays absent while the main saved-view pa
   const handlerSource = APP_SOURCE.slice(handlerStart, handlerStart + 1800);
   assert.match(handlerSource, /confirmMappingDraftDiscard\(\)/);
   assert.match(handlerSource, /closeEnclosureAliasEditor\(false\);/);
+  assert.match(handlerSource, /state\.pendingDefaultSelection = false;/);
   assert.match(handlerSource, /state\.selectedStorageViewRuntimeId = rawValue\.slice\("view:"\.length\);/);
   assert.match(handlerSource, /renderAll\(\);/);
   assert.match(handlerSource, /syncLocation\(\);/);

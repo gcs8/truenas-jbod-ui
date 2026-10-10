@@ -273,6 +273,19 @@ function bayScopeFixture({ liveEnclosureId, selectedEnclosureId = liveEnclosureI
 }
 const rearCandidate = { slot_index: 0, slot_label: "R0", snapshot_slot: 3, snapshot_enclosure_id: "rear", serial: "SANITIZED-REAR-3" };
 const frontCandidate = { slot_index: 1, slot_label: "R1", snapshot_slot: 3, snapshot_enclosure_id: "front", serial: "SANITIZED-FRONT-3" };
+
+test("HA saved chassis history requests use the backing enclosure", () => {
+  const c = load(["storageViewHistoryParams"], {
+    URLSearchParams,
+    buildSelectionParams: () => new URLSearchParams("system_id=ha&enclosure_id=node-a"),
+  });
+  const params = c.storageViewHistoryParams({
+    source: "selected_enclosure_snapshot",
+    backing_enclosure_id: "node-b",
+  });
+  assert.equal(params.get("system_id"), "ha");
+  assert.equal(params.get("enclosure_id"), "node-b");
+});
 for (const [name, liveEnclosureId, slot, expectedSerial] of [
   ["foreign rear bay on the front shelf", "front", rearCandidate, null],
   ["own front bay on the front shelf", "front", frontCandidate, "SANITIZED-FRONT-3"],

@@ -3162,6 +3162,8 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
     rear.slots[0].enclosure_id = "rear"
     runtime = StorageViewRuntimePayload(
         system_id=snapshot.selected_system_id,
+        view_order=["view:boot", "enclosure:front", "view:nvme", "view:bound"],
+        default_selection="view:bound",
         views=[StorageViewRuntimeView(
             id=view_id, label=f"Synthetic {view_id}", kind=kind, template_id=template,
             slot_layout=[[0]], slot_count=1, matched_count=1,
@@ -3343,6 +3345,14 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                     rendered, _, _ = await build_bounded_history_fixture(redact=redact, selected_view=selected)
                     runtime = json.loads(re.search(r"storageViewsRuntime: (.*),\n", rendered.html)[1])
                     self.assertEqual(len({view["id"] for view in runtime["views"]}), 3)
+                    runtime_view_ids = {view["id"] for view in runtime["views"]}
+                    ordered_view_ids = {
+                        item.removeprefix("view:")
+                        for item in runtime["view_order"]
+                        if item.startswith("view:")
+                    }
+                    self.assertEqual(ordered_view_ids, runtime_view_ids)
+                    self.assertIn(runtime["default_selection"].removeprefix("view:"), runtime_view_ids)
                     targets = []
                     for view in runtime["views"]:
                         slot = view["slots"][0]
@@ -3354,6 +3364,7 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(rendered.export_meta["selected_storage_view_id"],
                                      runtime["views"][("boot", "nvme", "bound").index(selected)]["id"])
                     if redact:
+                        self.assertTrue({"boot", "nvme", "bound"}.isdisjoint(runtime_view_ids))
                         self.assertNotIn("host.example.test", rendered.html)
                         self.assertNotIn('"enclosure_id": "front"', rendered.html)
 
