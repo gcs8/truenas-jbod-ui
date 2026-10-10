@@ -1256,6 +1256,7 @@ class InventoryService:
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
         self._view_order_topology_generation = -1
+        self._view_order_context: tuple[Any, ...] | None = None
         self._cached_effective_view_order: list[str] = []
         self._canonical_options_request_sequence = 0
         self._snapshot_topology_generation = 0
@@ -1705,6 +1706,7 @@ class InventoryService:
         self._snapshot_publication_generation += 1
         self._view_order_source_bundle = None
         self._view_order_topology_generation = -1
+        self._view_order_context = None
         self._cached_effective_view_order = []
         self._touch_snapshot_key(cache_key)
         return snapshot, True
@@ -2143,10 +2145,25 @@ class InventoryService:
         ha_owner_enclosure_id: str | None,
         force_refresh: bool,
     ) -> list[str]:
+        view_counts = [
+            (view.id, view.matched_count)
+            for view in runtime_views
+            if view.enabled and view.render.show_in_main_ui is not False
+        ]
+        # Auto-bound and profile-inferred views resolve against the active
+        # enclosure, so their counts (and the HA preference) belong in the key.
+        order_context = (
+            active_snapshot.selected_enclosure_id,
+            tuple(view_counts),
+            ha_primary_view_id,
+            ha_owner_enclosure_id,
+        )
+
         def cached_order() -> list[str] | None:
             if (
                 self._view_order_source_bundle is source_bundle
                 and self._view_order_topology_generation == self._snapshot_topology_generation
+                and self._view_order_context == order_context
                 and self._cached_effective_view_order
             ):
                 return list(self._cached_effective_view_order)
@@ -2178,11 +2195,6 @@ class InventoryService:
                     known_snapshots[option.id] = snapshot
                 enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
 
-            view_counts = [
-                (view.id, view.matched_count)
-                for view in runtime_views
-                if view.enabled and view.render.show_in_main_ui is not False
-            ]
             order = effective_main_view_order(
                 enclosure_counts=enclosure_counts,
                 view_counts=view_counts,
@@ -2196,6 +2208,7 @@ class InventoryService:
             if publication_generation == self._snapshot_publication_generation:
                 self._view_order_source_bundle = source_bundle
                 self._view_order_topology_generation = self._snapshot_topology_generation
+                self._view_order_context = order_context
                 self._cached_effective_view_order = list(order)
             return order
 
