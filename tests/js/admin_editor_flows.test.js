@@ -502,6 +502,87 @@ test("admin view-order helpers combine live entries and move them accessibly", (
   );
 });
 
+test("renaming a storage view rewrites its saved view-order key in place", () => {
+  const saveSource = sourceBetween(
+    "  function saveStorageViewEditorToState() {",
+    "\n  function currentStorageViewSystemId"
+  );
+  const storageView = {
+    id: "old-id",
+    label: "Old label",
+    template_id: "manual-4",
+    kind: "manual",
+    order: 10,
+    enabled: true,
+    render: { show_in_main_ui: true, show_in_admin_ui: true, default_collapsed: false },
+    binding: { mode: "auto" },
+  };
+  const state = {
+    storageViews: [storageView],
+    viewOrder: ["enclosure:enc-a", "view:old-id", "enclosure:enc-b"],
+  };
+  const elements = sparseElements({
+    setupStorageViewId: { value: "new-id" },
+    setupStorageViewLabel: { value: "New label" },
+    setupStorageViewTemplateSelect: { value: "manual-4" },
+    setupStorageViewOrder: { value: "10" },
+    setupStorageViewEnabled: { checked: true },
+    setupStorageViewShowMain: { checked: true },
+    setupStorageViewCollapsed: { checked: false },
+    setupStorageViewBindingMode: { value: "auto" },
+  });
+  const { saveStorageViewEditorToState } = loadFunctions(
+    [saveSource],
+    ["saveStorageViewEditorToState"],
+    {
+      elements,
+      flushStorageViewRender: () => {},
+      getStorageViewTemplate: () => ({ kind: "manual" }),
+      nextStorageViewOrder: () => 20,
+      parseSlotLabelsText: () => ({}),
+      parseSlotSizesText: () => ({}),
+      splitDelimitedLines: () => [],
+      state,
+      uniqueStorageViewId: (value) => value,
+      updateSelectedStorageView: (mutator) => mutator(storageView),
+    }
+  );
+
+  saveStorageViewEditorToState();
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.viewOrder)),
+    ["enclosure:enc-a", "view:new-id", "enclosure:enc-b"],
+  );
+});
+
+test("deleting a storage view removes its saved view-order key", () => {
+  const deleteSource = sourceBetween(
+    "  function deleteSelectedStorageView() {",
+    "\n  function duplicateSelectedStorageView"
+  );
+  const state = {
+    selectedStorageViewId: "retired-view",
+    storageViews: [
+      { id: "retired-view" },
+      { id: "kept-view" },
+    ],
+    viewOrder: ["enclosure:enc-a", "view:retired-view", "view:kept-view"],
+  };
+  const { deleteSelectedStorageView } = loadFunctions(
+    [deleteSource],
+    ["deleteSelectedStorageView"],
+    { renderStorageViews: () => {}, state }
+  );
+
+  deleteSelectedStorageView();
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.viewOrder)),
+    ["enclosure:enc-a", "view:kept-view"],
+  );
+});
+
 test("ESXi host prep uses canonical preserved secrets and configured timeout", () => {
   const collectEsxiSource = sourceBetween(
     "  function collectEsxiHostPrepInstallPayload",
