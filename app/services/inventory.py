@@ -2674,7 +2674,11 @@ class InventoryService:
         if not runtime_slot:
             raise TrueNASAPIError(f"Storage view slot {slot_index} is not present in {runtime_view.label}.")
 
-        history_enclosure_id = selected_enclosure_id or runtime_view.backing_enclosure_id
+        history_enclosure_id = (
+            runtime_view.backing_enclosure_id
+            if runtime_view.source == "selected_enclosure_snapshot" and runtime_view.backing_enclosure_id
+            else selected_enclosure_id or runtime_view.backing_enclosure_id
+        )
         # A bay number only names a disk inside its own enclosure; a candidate
         # from another enclosure reads the view's own history scope instead.
         if runtime_slot.snapshot_slot is not None and runtime_slot.snapshot_enclosure_id in {None, history_enclosure_id}:

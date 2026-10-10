@@ -3865,13 +3865,21 @@
     };
   }
 
+  function storageViewHistoryParams(view) {
+    const params = buildSelectionParams();
+    if (view?.source === "selected_enclosure_snapshot" && view.backing_enclosure_id) {
+      params.set("enclosure_id", view.backing_enclosure_id);
+    }
+    return params;
+  }
+
   function getSelectedHistoryTarget() {
     const selectedStorageView = getSelectedStorageViewRuntime();
     const storageViewSlot = selectedStorageView ? getSelectedStorageViewRuntimeSlot(state.selectedSlot) : null;
     const windowHours = currentHistoryWindowHours();
     if (selectedStorageView && storageViewSlot) {
       const slot = buildStorageViewHistoryContextSlot(selectedStorageView, storageViewSlot);
-      const params = buildSelectionParams();
+      const params = storageViewHistoryParams(selectedStorageView);
       if (Number.isInteger(windowHours)) {
         params.set("window_hours", String(windowHours));
       }
@@ -5713,7 +5721,9 @@
       return null;
     }
     const selectedView = getSelectedStorageViewRuntime();
-    const params = buildSelectionParams();
+    const params = selectedView
+      ? storageViewHistoryParams(selectedView)
+      : buildSelectionParams();
     const windowHours = currentHeatmapWindowHours();
     const boundedWindowHours = Number.isInteger(windowHours)
       ? Math.max(1, Math.min(8760, windowHours))
@@ -11356,6 +11366,7 @@
         return;
       }
       if (rawValue === currentValue) return;
+      state.pendingDefaultSelection = false;
       invalidateSmartRequests();
       state.selectionEpoch = (state.selectionEpoch || 0) + 1;
       const previousEstimateBasisKey = snapshotExportEstimateBasisKey();

@@ -1399,6 +1399,18 @@ class SnapshotExportService:
                 )
                 for original, exported in zip(storage_view_runtime.views, storage_view_runtime_for_export.views, strict=True):
                     exported.id = storage_view_aliases[original.id]
+                storage_view_runtime_for_export.view_order = [
+                    f"view:{storage_view_aliases.get(item.removeprefix('view:'), item.removeprefix('view:'))}"
+                    if item.startswith("view:")
+                    else item
+                    for item in storage_view_runtime_for_export.view_order
+                ]
+                default_selection = storage_view_runtime_for_export.default_selection
+                if default_selection and default_selection.startswith("view:"):
+                    default_view_id = default_selection.removeprefix("view:")
+                    storage_view_runtime_for_export.default_selection = (
+                        f"view:{storage_view_aliases.get(default_view_id, default_view_id)}"
+                    )
             storage_view_smart_summary_cache_for_export = {
                 storage_view_aliases.get(view_id, view_id): redactor.redact_object(slot_cache)
                 for view_id, slot_cache in storage_view_smart_summary_cache_for_export.items()
