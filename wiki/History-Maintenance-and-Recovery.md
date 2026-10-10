@@ -67,6 +67,7 @@ service logs.
 | --- | --- |
 | `Last error` | A collection pass failed. The text stays generic on purpose. |
 | `What went wrong` | The classified reason for that failure, such as not reaching the main UI, a request timeout, or a rejected request with its status code. |
+| `Skipped in last scan` | Each system or enclosure the last scan did not record, and why: its inventory could not be read, or its bay map is not trustworthy (for example SSH commands needed for the bay map failed). `none` means every scope was recorded. A failed optional SSH command, such as `lsscsi -g -t` on a UNVR, does not skip a scope. `/healthz` carries the same list as `collector.last_skipped_scopes`. |
 | `Backup error` | The last snapshot attempt failed, named in plain words: a full disk, an unwritable backup directory, or a read-only database. |
 | `Cleanup error` | The last retention pass failed, named in plain words (read-only database, full disk, missing permission). Retention selects each batch with a bounded subquery, so any `HISTORY_RETENTION_BATCH_SIZE` works; a very large value only makes each cleanup transaction longer. |
 | `Cleanup waiting` | Retention is holding off because no recent backup exists. |
