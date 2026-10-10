@@ -502,6 +502,31 @@ test("admin view-order helpers combine live entries and move them accessibly", (
   );
 });
 
+test("admin view-order moves preserve unloaded enclosure keys", () => {
+  const helpersSource = sourceBetween(
+    "  function orderedAdminViewEntries(",
+    "\n  function renderViewOrderEditor"
+  );
+  const { orderedAdminViewEntries, moveAdminViewOrder } = loadFunctions(
+    [helpersSource],
+    ["orderedAdminViewEntries", "moveAdminViewOrder"],
+  );
+  const savedOrder = ["enclosure:enc-a", "view:boot", "enclosure:enc-b", "view:nvme"];
+  const entries = orderedAdminViewEntries(
+    [],
+    [
+      { id: "boot", label: "Boot devices", enabled: true, render: { show_in_main_ui: true } },
+      { id: "nvme", label: "NVMe carrier", enabled: true, render: { show_in_main_ui: true } },
+    ],
+    savedOrder,
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(moveAdminViewOrder(entries, "view:boot", 1, savedOrder))),
+    ["enclosure:enc-a", "view:nvme", "enclosure:enc-b", "view:boot"],
+  );
+});
+
 test("renaming a storage view rewrites its saved view-order key in place", () => {
   const saveSource = sourceBetween(
     "  function saveStorageViewEditorToState() {",

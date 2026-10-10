@@ -19,7 +19,7 @@ from starlette.requests import Request
 
 import app.services.snapshot_export as snapshot_export
 from app.config import BMCConfig, HANodeConfig, HistoryConfig, SSHConfig, Settings, SystemConfig, TrueNASConfig, get_settings
-from app.route_support import templates
+from app.route_support import _filter_storage_view_runtime, templates
 from app.models.domain import (
     EnclosureOption,
     EnclosureProfileView,
@@ -605,6 +605,28 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_export_cache_default_has_a_shared_byte_budget(self) -> None:
         self.assertEqual(Settings().app.export_cache_max_bytes, 32 * 1024 * 1024)
+
+    def test_filtered_runtime_drops_excluded_view_order_and_default_ids(self) -> None:
+        runtime = StorageViewRuntimePayload(
+            system_id="synthetic",
+            view_order=["view:private-view", "enclosure:front", "view:exported-view"],
+            default_selection="view:private-view",
+            views=[
+                StorageViewRuntimeView(
+                    id=view_id,
+                    label=view_id,
+                    kind="manual",
+                    template_id="manual-4",
+                )
+                for view_id in ("private-view", "exported-view")
+            ],
+        )
+
+        filtered = _filter_storage_view_runtime(runtime, ["exported-view"])
+
+        self.assertEqual([view.id for view in filtered.views], ["exported-view"])
+        self.assertEqual(filtered.view_order, ["enclosure:front", "view:exported-view"])
+        self.assertIsNone(filtered.default_selection)
 
     def test_export_cache_shared_byte_budget_accepts_environment_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(

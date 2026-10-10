@@ -5584,6 +5584,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             )
 
         self.assertIs(summary, expected_summary)
+        service.get_storage_view_runtime.assert_awaited_once_with(
+            force_refresh=False,
+            selected_enclosure_id="enc-a",
+            include_view_order=False,
+        )
         service.get_slot_smart_summary.assert_awaited_once_with(
             12,
             selected_enclosure_id="enc-a",
@@ -5795,6 +5800,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             )
 
         self.assertEqual(service.get_slot_smart_summaries.await_args.args[0], [5])
+        service.get_storage_view_runtime.assert_awaited_once_with(
+            force_refresh=False,
+            selected_enclosure_id="front-a",
+            include_view_order=False,
+        )
         self.assertEqual(service.get_slot_smart_summaries.await_args.kwargs["selected_enclosure_id"], "front-a")
         self.assertEqual([(item.slot, item.summary) for item in items], [(0, rear_summary), (1, front_summary)])
         self.assertEqual(service._get_slot_smart_summary_for_slot_view.await_args.args[0].serial, "SANITIZED-REAR-3")
@@ -5848,6 +5858,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             )
 
         self.assertEqual(target, (12, "node-b"))
+        service.get_storage_view_runtime.assert_awaited_once_with(
+            force_refresh=False,
+            selected_enclosure_id="node-a",
+            include_view_order=False,
+        )
 
     def test_resolve_storage_view_slot_history_target_uses_storage_view_scope_for_inventory_bound_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
