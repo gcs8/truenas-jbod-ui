@@ -103,9 +103,7 @@ CI_SOURCE_GATE_MARKER = re.compile(
 WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_command_state",
     "tests.test_admin_config",
-    "tests.test_admin_maintenance",
     "tests.test_admin_secret_models",
-    "tests.test_backup_integration",
     "tests.test_changelog_entry_gate",
     "tests.test_ci_contract",
     "tests.test_config_example",
@@ -176,6 +174,7 @@ WINDOWS_EXCLUSIONS = (
         modules=(
             "tests.test_admin_auth",
             "tests.test_admin_error_correlation",
+            "tests.test_admin_maintenance",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
             "tests.test_admin_safety",
@@ -188,6 +187,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_app_history_body_bound",
             "tests.test_app_history_bounds",
             "tests.test_backup_archive_journal",
+            "tests.test_backup_integration",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
             "tests.test_history_backup_coupling",
@@ -564,6 +564,8 @@ def validate_planned_ci_source_gate_commands(
         allowed = (expected[gate],)
         if gate == "prometheus-rules":
             allowed += ((("<skip>",),),)
+        if gate == "performance-baseline" and platform.startswith("win"):
+            allowed += ((("<skip>",),),)
         if commands not in allowed:
             raise PlanError(f"Local source gate command drift: {gate}")
 
@@ -684,13 +686,24 @@ def build_plan(
                 platform=platform,
                 ci_gate="javascript-unit-tests",
             ),
+        )
+    )
+    if platform == "win32":
+        skips.append(
+            Skip(
+                "Performance baseline",
+                "the history-store fixture requires POSIX directory-descriptor inspection",
+                ci_gate="performance-baseline",
+            )
+        )
+    else:
+        checks.append(
             Check(
                 "Performance baseline",
                 (python_executable, "scripts/build_perf_baseline.py", "--check"),
                 ci_gate="performance-baseline",
-            ),
+            )
         )
-    )
     if mode == "full":
         checks.append(
             Check(
