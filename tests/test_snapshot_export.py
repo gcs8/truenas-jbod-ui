@@ -3169,7 +3169,9 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
             slots=[StorageViewRuntimeSlot(
                 slot_index=0, slot_label="00", occupied=True, state="matched",
                 source="snapshot_slot" if bound else "inventory_candidate",
-                snapshot_slot=0 if bound else None, device_name="disk0",
+                snapshot_slot=0 if bound else None,
+                snapshot_enclosure_id="front" if bound else None,
+                device_name="disk0",
                 serial=f"SANITIZED-EXPORT-{view_id.upper()}", temperature_c=temperature,
             )],
         ) for view_id, kind, template, bound, temperature in (
