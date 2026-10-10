@@ -3841,7 +3841,9 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             after = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
 
         self.assertIs(service._get_inventory_source_bundle.return_value, source_bundle)
-        self.assertEqual(after.view_order[:2], ["enclosure:enc-a", "enclosure:enc-b"])
+        self.assertNotEqual(after.view_order, before.view_order)
+        self.assertEqual(after.view_order[0], "enclosure:enc-a")
+        self.assertIn("enclosure:enc-b", after.view_order)
         self.assertEqual(after.default_selection, "enclosure:enc-a")
 
     def test_quantastor_ha_primary_chassis_uses_pool_owner_even_when_another_node_is_selected(self) -> None:

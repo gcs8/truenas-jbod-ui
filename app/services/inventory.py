@@ -1253,6 +1253,7 @@ class InventoryService:
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
+        self._view_order_topology_generation = -1
         self._cached_effective_view_order: list[str] = []
         self._canonical_options_request_sequence = 0
         self._snapshot_topology_generation = 0
@@ -2114,7 +2115,11 @@ class InventoryService:
         ha_primary_view_id: str | None,
         ha_owner_enclosure_id: str | None,
     ) -> list[str]:
-        if self._view_order_source_bundle is source_bundle and self._cached_effective_view_order:
+        if (
+            self._view_order_source_bundle is source_bundle
+            and self._view_order_topology_generation == self._snapshot_topology_generation
+            and self._cached_effective_view_order
+        ):
             return list(self._cached_effective_view_order)
 
         enclosure_counts: list[tuple[str, int]] = []
@@ -2144,6 +2149,7 @@ class InventoryService:
             ha_owner_enclosure_id=ha_owner_enclosure_id,
         )
         self._view_order_source_bundle = source_bundle
+        self._view_order_topology_generation = self._snapshot_topology_generation
         self._cached_effective_view_order = list(order)
         return order
 
