@@ -2781,6 +2781,7 @@ class InventoryService:
                     match_reasons=["selected enclosure snapshot"],
                     placement_key="live enclosure slot",
                     snapshot_slot=slot.slot if slot else slot_value,
+                    snapshot_enclosure_id=snapshot.selected_enclosure_id,
                     device_name=slot.device_name if slot else None,
                     smart_device_names=list(slot.smart_device_names) if slot else [],
                     smart_device_type=slot.smart_device_type if slot else None,

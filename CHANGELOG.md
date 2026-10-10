@@ -32,7 +32,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Added a per-system opening order for live enclosures and saved views. Without
   one, the main page opens the entry with the most occupied disks and keeps
-  QuantaStor Primary Chassis on the pool owner. (#933)
+  QuantaStor Primary Chassis on the pool owner. A saved chassis backed by a
+  different enclosure stays read-only instead of borrowing that enclosure's
+  mapping or locate-light controls. (#933)
 
 ## v0.24.0-beta.2 - 2026-10-09
 

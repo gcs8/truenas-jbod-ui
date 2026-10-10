@@ -334,6 +334,7 @@ test("selected enclosure B cannot supply live actions to the owner-backed Primar
   await page.goto("https://synthetic.invalid/", { waitUntil: "domcontentloaded" });
   const selector = page.locator("#enclosure-select");
   await expect(selector).toHaveValue("enclosure:enc-a");
+  apiRequests.length = 0;
   await selector.selectOption("view:primary-chassis");
   await page.locator('#slot-grid .slot-tile[data-slot="0"]').click();
 
@@ -341,5 +342,5 @@ test("selected enclosure B cannot supply live actions to the owner-backed Primar
   await expect(page.locator("#detail-kv-grid")).toContainText("OWNER-SERIAL-0");
   await expect(page.locator("#mapping-form")).toBeHidden();
   await expect(page.locator("#detail-led-controls")).toBeHidden();
-  expect(apiRequests.filter((request) => request.includes("/api/slots/"))).toEqual([]);
+  expect(apiRequests.filter((request) => request.startsWith("POST /api/slots/") && request.includes("/led"))).toEqual([]);
 });

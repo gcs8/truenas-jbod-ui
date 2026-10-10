@@ -3561,7 +3561,7 @@
   // candidate was recorded in another enclosure must not borrow this bay.
   function storageViewSlotBayInEnclosure(slot, enclosureId) {
     const slotEnclosureId = slot?.snapshot_enclosure_id ?? null;
-    return slotEnclosureId === null || (Boolean(enclosureId) && slotEnclosureId === enclosureId);
+    return Boolean(slotEnclosureId) && Boolean(enclosureId) && slotEnclosureId === enclosureId;
   }
 
   function getLiveBackedStorageViewSlot(view, slot) {
@@ -3573,6 +3573,26 @@
       return null;
     }
     return getSlotById(slot.snapshot_slot);
+  }
+
+  function selectedLiveActionSlot() {
+    if (!state.selectedStorageViewRuntimeId) {
+      return getSlotById(state.selectedSlot);
+    }
+    const selectedView = getSelectedStorageViewRuntime();
+    const selectedViewSlot = getSelectedStorageViewRuntimeSlot(state.selectedSlot);
+    return getLiveBackedStorageViewSlot(selectedView, selectedViewSlot);
+  }
+
+  function reportStorageViewActionMismatch() {
+    if (!state.selectedStorageViewRuntimeId) {
+      return false;
+    }
+    setStatus(
+      "Live actions are unavailable because this saved chassis is backed by a different enclosure than the page snapshot.",
+      "error",
+    );
+    return true;
   }
 
   function persistentIdLabel(slot) {
@@ -8963,6 +8983,9 @@
       detailContent.classList.remove("hidden");
       detailSecondary.classList.add("hidden");
       detailLedControls.classList.add("hidden");
+      ledButtons.forEach((button) => {
+        button.disabled = true;
+      });
       detailSlotTitle.textContent = `${selectedStorageView.label} / ${storageViewSlot.slot_label}`;
       detailStatePill.textContent = stateLabel(storageViewSlot);
       detailStatePill.className = `state-pill state-${storageViewSlot.state === "matched" ? "healthy" : (storageViewSlot.state || "unknown")}`;
@@ -10530,8 +10553,11 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = getSlotById(state.selectedSlot);
-    if (!slot) return;
+    const slot = selectedLiveActionSlot();
+    if (!slot) {
+      reportStorageViewActionMismatch();
+      return;
+    }
     if (!slot.led_supported) {
       setStatus(slot.led_reason || `LED control is unavailable for slot ${slot.slot_label}.`, "error");
       return;
@@ -10729,8 +10755,11 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = getSlotById(state.selectedSlot);
-    if (!slot) return;
+    const slot = selectedLiveActionSlot();
+    if (!slot) {
+      reportStorageViewActionMismatch();
+      return;
+    }
     if (slot.mapping_supported === false) {
       setStatus(
         slot.mapping_reason
@@ -10788,8 +10817,11 @@
     if (writeBlockedByPolicy()) {
       return;
     }
-    const slot = getSlotById(state.selectedSlot);
-    if (!slot) return;
+    const slot = selectedLiveActionSlot();
+    if (!slot) {
+      reportStorageViewActionMismatch();
+      return;
+    }
     if (slot.mapping_supported === false) {
       setStatus(
         slot.mapping_reason

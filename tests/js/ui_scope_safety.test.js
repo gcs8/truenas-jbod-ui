@@ -36,7 +36,8 @@ for (const action of ["sendLedAction", "saveMapping", "clearMapping", "importMap
       let applied=0, requests=0;
       const context = {state, URLSearchParams, mappingForm:{}, FormData:class { get() { return "draft"; } }, window:{confirm:()=>true}, mappingImportFile:{value:""}, mappingImportUnavailableReason:()=>"", mappingImportPreviewMessage:()=>"confirm", writeBlockedByPolicy:()=>false, getSlotById:()=>({slot:0,slot_label:"00",led_supported:true,mapping_revision:"r",mapping_clear_revision:"r"}), setStatus(){}, sendScopedRequest:async url=>{requests++; return url.endsWith("preview") ? {revision:"r"} : pending.promise;}, applySnapshot(){applied++;}, invalidateHistoryCaches(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic", handleWriteRejection(){} };
       // Before the fix the handlers have no completion guard. Load new helpers only once present.
-      const available = guardNames.filter(n => source.includes(`function ${n}(`));
+      const available = [...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch"]
+        .filter(n => source.includes(`function ${n}(`));
       const c=load([...available, "mappingFormScopeKey", action],context);
       const args = action === "saveMapping" ? [{preventDefault(){}}] : action === "importMappingsFromFile" ? [{name:"synthetic.json",text:async()=>"{}"}] : ["IDENTIFY"];
       const run=c[action](...args);
@@ -69,7 +70,7 @@ for (const outcome of ["success", "failure"]) {
       sendScopedRequest:async ()=>pending.promise,
       applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
       handleWriteRejection(){ rejections++; } };
-    const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
+    const c = load([...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch", "sendLedAction", "scheduleAutoRefresh"], context);
     c.scheduleAutoRefresh();
     const run = c.sendLedAction("IDENTIFY");
     await new Promise(r => setImmediate(r));
@@ -99,7 +100,7 @@ test("a write started before a manual refresh does not hold the next auto-refres
     setStatus(){}, sendScopedRequest:async ()=>pending.promise,
     applySnapshot(){}, renderAll(){}, scheduleSmartPrefetch(){}, locateLightSourceLabel:()=>"synthetic",
     handleWriteRejection(){} };
-  const c = load([...guardNames, "sendLedAction", "scheduleAutoRefresh"], context);
+  const c = load([...guardNames, "selectedLiveActionSlot", "reportStorageViewActionMismatch", "sendLedAction", "scheduleAutoRefresh"], context);
   c.scheduleAutoRefresh();
   const run = c.sendLedAction("IDENTIFY");
   await new Promise(r => setImmediate(r));
@@ -346,7 +347,7 @@ test("mismatched saved chassis cannot send LED or mapping writes to the page enc
     locateLightSourceLabel: () => "synthetic",
     handleWriteRejection: () => {},
   };
-  const optionalFunctions = ["selectedLiveActionSlot"]
+  const optionalFunctions = ["selectedLiveActionSlot", "reportStorageViewActionMismatch"]
     .filter((name) => source.includes(`function ${name}(`));
   const c = load([
     "storageViewSlotBayInEnclosure",
@@ -372,7 +373,7 @@ for (const [name, backing, slot, expected] of [
   ["own front bay on a front-backed view", "front", frontCandidate, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
   ["own rear bay on a rear-backed view", "rear", rearCandidate, { slot: 3, enclosure_id: "rear", history_source_label: "Backing Shelf" }],
   ["foreign front bay on a rear-backed view", "rear", frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
-  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, { slot: 3, enclosure_id: "front", history_source_label: "Backing Shelf" }],
+  ["bay without recorded enclosure", "front", { slot_index: 2, snapshot_slot: 3 }, { slot: 2, enclosure_id: "storage-view:boot", history_source_label: null }],
   ["recorded enclosure with no backing or live enclosure", null, frontCandidate, { slot: 1, enclosure_id: "storage-view:boot", history_source_label: null }],
 ]) {
   test(`storage view history target stays in its own enclosure: ${name}`, () => {
