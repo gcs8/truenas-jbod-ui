@@ -89,6 +89,8 @@ SCOPE_SKIP_REASONS: dict[str, str] = {
     "ssh_required_failed": "SSH commands needed for the bay map failed.",
     "bmc_untrusted": "The BMC could not be read.",
     "topology_incomplete": "The storage topology was incomplete.",
+    "inventory_unavailable": "The inventory could not be read.",
+    "storage_views_unavailable": "The storage views could not be read.",
     "untrusted": "The inventory was degraded or untrusted.",
 }
 SMART_FAILURE_STATUSES = {
@@ -205,6 +207,8 @@ class HistoryCollector:
         # Scopes the last scan read but did not record, with why (#927). None
         # until a scan has looked; a root-only scan updates only its own scope.
         self.last_skipped_scopes: list[dict[str, Any]] | None = None
+        # Systems, enclosures and storage views this enumeration could not read.
+        self._unreadable_scopes: list[dict[str, Any]] = []
         self.next_collection_at: datetime | None = None
         self._pending_topology_changes: dict[
             tuple[str, str, int],
@@ -1774,7 +1778,7 @@ class HistoryCollector:
         A fleet scan replaces the list. A root-only scan looked at one scope,
         so it replaces only that scope's entry and keeps the rest of the fleet.
         """
-        skipped = [
+        skipped = [*self._unreadable_scopes] + [
             self._skipped_scope_entry(scope, reason)
             for scope in scopes
             if (reason := self._scope_skip_reason(scope.snapshot)) is not None
@@ -1794,11 +1798,29 @@ class HistoryCollector:
 
     @staticmethod
     def _skipped_scope_entry(scope: ScopeSnapshot, reason: str) -> dict[str, Any]:
+        return HistoryCollector._skip_entry(
+            reason,
+            system_id=scope.system_id,
+            system_label=scope.system_label,
+            enclosure_id=scope.enclosure_id,
+            enclosure_label=scope.enclosure_label,
+        )
+
+    @staticmethod
+    def _skip_entry(
+        reason: str,
+        *,
+        system_id: str,
+        system_label: str | None = None,
+        enclosure_id: str | None = None,
+        enclosure_label: str | None = None,
+    ) -> dict[str, Any]:
+        # The fixed sentence, never the exception text: that can name hosts.
         return {
-            "system_id": scope.system_id,
-            "system_label": scope.system_label,
-            "enclosure_id": scope.enclosure_id,
-            "enclosure_label": scope.enclosure_label,
+            "system_id": system_id,
+            "system_label": system_label,
+            "enclosure_id": enclosure_id,
+            "enclosure_label": enclosure_label,
             "reason": reason,
             "detail": SCOPE_SKIP_REASONS[reason],
         }
@@ -1910,6 +1932,7 @@ class HistoryCollector:
     ) -> list[ScopeSnapshot]:
         # A selected root is not a fleet census, even when its sources are healthy.
         self._scope_enumeration_complete = not cached_root_only
+        self._unreadable_scopes = []
         root_started = time.perf_counter()
         root_snapshot = await self._fetch_inventory(force=force_inventory)
         self._record_collection_stage(
@@ -1980,6 +2003,7 @@ class HistoryCollector:
             except Exception as exc:  # noqa: BLE001 - keep broad saved-fleet sweeps moving.
                 self._scope_enumeration_complete = False
                 self._clear_pending_topology_changes_for_system(system_id)
+                self._unreadable_scopes.append(self._skip_entry("inventory_unavailable", system_id=system_id))
                 logger.warning("Skipping history scope enumeration for %s: %s", system_id, exc)
                 self._record_collection_stage(
                     "inventory.system_failed",
@@ -2046,6 +2070,14 @@ class HistoryCollector:
                     except Exception as exc:  # noqa: BLE001 - preserve the rest of the full-fleet pass.
                         self._scope_enumeration_complete = False
                         self._clear_pending_topology_changes_for_scope(system_id, enclosure_id)
+                        self._unreadable_scopes.append(
+                            self._skip_entry(
+                                "inventory_unavailable",
+                                system_id=system_id,
+                                system_label=normalize_text(system_snapshot.get("selected_system_label")),
+                                enclosure_id=enclosure_id,
+                            )
+                        )
                         logger.warning(
                             "Skipping history scope enumeration for %s enclosure %s: %s",
                             system_id,
@@ -2110,6 +2142,13 @@ class HistoryCollector:
         except Exception as exc:  # noqa: BLE001 - storage views should not kill the whole sweep.
             self._scope_enumeration_complete = False
             self._clear_pending_topology_changes_for_storage_views(system_id)
+            self._unreadable_scopes.append(
+                self._skip_entry(
+                    "storage_views_unavailable",
+                    system_id=system_id,
+                    system_label=normalize_text(system_snapshot.get("selected_system_label")),
+                )
+            )
             logger.warning("Skipping history storage-view enumeration for %s: %s", system_id, exc)
             self._record_collection_stage(
                 "storage_views.failed",

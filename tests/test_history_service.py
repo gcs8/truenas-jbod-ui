@@ -12184,6 +12184,8 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
             "esx": {"enabled": True, "ok": False, "required_ok": False,
                     "message": "StorCLI commands unavailable."},
         }
+        self.unreachable: set[tuple[str, str | None]] = set()
+        self.extra_enclosures: dict[str, str] = {}
         transport = patch.object(self.collector, "_fetch_json_sync", side_effect=self._source)
         transport.start()
         self.addCleanup(transport.stop)
@@ -12191,7 +12193,10 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
     def _source(self, path, params, method, body, headers, timeout):
         if path == "/api/inventory":
             system = params.get("system_id") or "nvr"
+            if (system, params.get("enclosure_id")) in self.unreachable:
+                raise HistorySourceError.unreachable("Synthetic host.example.test unavailable")
             system_label, enclosure_label = self.LABELS[system]
+            extra = self.extra_enclosures.get(system)
             return {
                 "systems": [{"id": "nvr"}, {"id": "esx"}],
                 "selected_system_id": system,
@@ -12199,7 +12204,7 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
                 "selected_system_platform": self.PLATFORMS[system],
                 "selected_enclosure_id": f"{system}-bay",
                 "selected_enclosure_label": enclosure_label,
-                "enclosures": [{"id": f"{system}-bay"}],
+                "enclosures": [{"id": f"{system}-bay"}, *([{"id": extra}] if extra else [])],
                 "sources": {
                     "api": {"enabled": False, "ok": True},
                     "ssh": dict(self.ssh[system]),
@@ -12258,6 +12263,25 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self._recorded("nvr"))
         self.assertIsNone(self._recorded("esx"))
         self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("nvr"), self._skipped("esx")])
+
+    async def test_unreadable_inventory_is_listed_too(self):
+        # A system or enclosure whose inventory request failed is not recorded
+        # either; the list must not read "none" while it is missing.
+        self.ssh["esx"]["required_ok"] = True
+        self.unreachable = {("esx", None), ("nvr", "nvr-rear")}
+        self.extra_enclosures = {"nvr": "nvr-rear"}
+        status = await self._pass()
+        unavailable = history_collector_module.SCOPE_SKIP_REASONS["inventory_unavailable"]
+        # Fleet order: nvr's unreadable rear enclosure, then the unreachable esx system.
+        self.assertEqual(status["last_skipped_scopes"], [
+            {"system_id": "nvr", "system_label": "Synthetic NVR", "enclosure_id": "nvr-rear",
+             "enclosure_label": None, "reason": "inventory_unavailable", "detail": unavailable},
+            {"system_id": "esx", "system_label": None, "enclosure_id": None, "enclosure_label": None,
+             "reason": "inventory_unavailable", "detail": unavailable},
+        ])
+        self.assertNotIn("host.example.test", json.dumps(status["last_skipped_scopes"]))
+        self.assertEqual(self.collector.degraded_reason(), self.PARTIAL)
+        self.assertIsNotNone(self._recorded("nvr"))
 
     async def test_root_only_pass_keeps_the_fleet_list_and_adds_its_own_skip(self):
         await self._pass()
