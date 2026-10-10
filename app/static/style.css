@@ -3436,12 +3436,14 @@ button.fabric-trace-crumb:hover {
   pointer-events: none;
 }
 
-/* placeStateChips() in app.js picks the spot that clears every bay. */
-.chassis-shell[data-chip-spot="beside"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { right: var(--chip-right); }
-.chassis-shell[data-chip-spot="under"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { top: var(--chip-top); }
-.chassis-shell[data-chip-spot="middle"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
-.chassis-shell[data-chip-spot="foot"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: auto auto 10px 50%; transform: translateX(-50%); }
-.chassis-shell[data-chip-spot="start"] .slot-tile:not(.selected, .peer-highlight, .fabric-highlight)::after { inset: 6px auto auto 6px; }
+/* placeStateChips() in app.js picks the spot that clears every bay. Selected,
+   peer and Connections bays keep their chip: their ring is the tile's outline
+   (#925). */
+.chassis-shell[data-chip-spot="beside"] .slot-tile::after { right: var(--chip-right); }
+.chassis-shell[data-chip-spot="under"] .slot-tile::after { top: var(--chip-top); }
+.chassis-shell[data-chip-spot="middle"] .slot-tile::after { inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
+.chassis-shell[data-chip-spot="foot"] .slot-tile::after { inset: auto auto 10px 50%; transform: translateX(-50%); }
+.chassis-shell[data-chip-spot="start"] .slot-tile::after { inset: 6px auto auto 6px; }
 
 .slot-tile.state-healthy::after { content: "✓"; border-style: solid; }
 .slot-tile.state-empty::after { content: "○"; border-style: dotted; }
@@ -3990,6 +3992,12 @@ button.fabric-trace-crumb:hover {
   cursor: pointer;
   text-align: left;
   color: var(--text);
+  /* Selected, peer and Connections rings (#925). An inset outline survives the
+     state and face rules that replace box-shadow, and leaves ::after to the
+     state chip. It paints under the tray face, so it sits in the gap between
+     the tile edge and the face; :focus-visible below replaces it. */
+  outline: var(--bay-ring-width, 0px) solid var(--bay-ring-color, transparent);
+  outline-offset: var(--bay-ring-offset, -5px);
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
 }
 
@@ -4206,6 +4214,8 @@ button.fabric-trace-crumb:hover {
 }
 
 .slot-tile.selected {
+  --bay-ring-width: 2px;
+  --bay-ring-color: rgba(91, 183, 255, 0.42);
   border-color: rgba(91, 183, 255, 0.9);
   box-shadow:
     0 0 0 2px rgba(91, 183, 255, 0.72),
@@ -4215,36 +4225,9 @@ button.fabric-trace-crumb:hover {
     inset 0 -10px 16px rgba(0, 0, 0, 0.34);
 }
 
-.slot-tile.selected::after {
-  content: "";
-  position: absolute;
-  inset: 2px;
-  /* The base .slot-tile::after state chip pins a 20px box and a dark fill;
-     reset them so the ring spans the tile instead of covering the number. */
-  width: auto;
-  height: auto;
-  border-radius: 6px 6px 10px 10px;
-  border: 2px solid rgba(91, 183, 255, 0.42);
-  background: none;
-  pointer-events: none;
-}
-
-.chassis-shell[data-latch-edge="right"] .slot-tile.selected::after,
-.chassis-shell[data-latch-edge="right"] .slot-tile.peer-highlight::after {
-  border-radius: 6px 10px 10px 6px;
-}
-
-.chassis-shell[data-latch-edge="top"] .slot-tile.selected::after,
-.chassis-shell[data-latch-edge="top"] .slot-tile.peer-highlight::after {
-  border-radius: 10px 10px 6px 6px;
-}
-
-.chassis-shell[data-latch-edge="left"] .slot-tile.selected::after,
-.chassis-shell[data-latch-edge="left"] .slot-tile.peer-highlight::after {
-  border-radius: 10px 6px 6px 10px;
-}
-
 .slot-tile.peer-highlight {
+  --bay-ring-width: 1px;
+  --bay-ring-color: rgba(76, 216, 164, 0.4);
   border-color: rgba(76, 216, 164, 0.72);
   box-shadow:
     0 0 0 1px rgba(76, 216, 164, 0.34),
@@ -4253,16 +4236,9 @@ button.fabric-trace-crumb:hover {
     inset 0 -10px 16px rgba(0, 0, 0, 0.34);
 }
 
-.slot-tile.peer-highlight::after {
-  content: "";
-  position: absolute;
-  inset: 2px;
-  width: auto;
-  height: auto;
-  border-radius: 6px 6px 10px 10px;
-  border: 1px solid rgba(76, 216, 164, 0.4);
-  background: none;
-  pointer-events: none;
+/* A top-loader's tray face starts 3px in, so its ring hugs the edge. */
+.chassis-shell[data-layout-mode^="top-loader"] .slot-tile {
+  --bay-ring-offset: -3px;
 }
 
 .slot-tile.peer-highlight .slot-number {
@@ -4292,10 +4268,6 @@ button.fabric-trace-crumb:hover {
     linear-gradient(90deg, rgba(255,255,255,0.02), transparent 18%, transparent 82%, rgba(255,255,255,0.02));
 }
 
-.slot-tile.peer-dimmed .slot-status-led {
-  opacity: 0.45;
-}
-
 .slot-tile.peer-dimmed .slot-number,
 .slot-tile.peer-dimmed .slot-device,
 .slot-tile.peer-dimmed .slot-pool {
@@ -4311,24 +4283,14 @@ button.fabric-trace-crumb:hover {
 }
 
 .slot-tile.fabric-highlight {
+  --bay-ring-width: 1px;
+  --bay-ring-color: rgba(85, 214, 235, 0.56);
   border-color: rgba(85, 214, 235, 0.86);
   box-shadow:
     0 0 0 2px rgba(85, 214, 235, 0.38),
     0 0 24px rgba(85, 214, 235, 0.22),
     inset 0 1px 0 rgba(255, 255, 255, 0.09),
     inset 0 -10px 16px rgba(0, 0, 0, 0.34);
-}
-
-.slot-tile.fabric-highlight::after {
-  content: "";
-  position: absolute;
-  inset: 2px;
-  width: auto;
-  height: auto;
-  border-radius: 6px 6px 10px 10px;
-  border: 1px solid rgba(85, 214, 235, 0.56);
-  background: none;
-  pointer-events: none;
 }
 
 .slot-tile.fabric-highlight .slot-number {
@@ -4346,23 +4308,12 @@ button.fabric-trace-crumb:hover {
     linear-gradient(90deg, rgba(255,255,255,0.018), transparent 18%, transparent 82%, rgba(255,255,255,0.018));
 }
 
-.slot-tile.fabric-dimmed .slot-status-led,
+/* The LED dot stays at full strength on dimmed bays, so a fault or locate
+   light still reads (#925). */
 .slot-tile.fabric-dimmed .slot-number,
 .slot-tile.fabric-dimmed .slot-device,
 .slot-tile.fabric-dimmed .slot-pool {
   opacity: 0.42;
-}
-
-.chassis-shell[data-latch-edge="right"] .slot-tile.fabric-highlight::after {
-  border-radius: 6px 10px 10px 6px;
-}
-
-.chassis-shell[data-latch-edge="top"] .slot-tile.fabric-highlight::after {
-  border-radius: 10px 10px 6px 6px;
-}
-
-.chassis-shell[data-latch-edge="left"] .slot-tile.fabric-highlight::after {
-  border-radius: 10px 6px 6px 10px;
 }
 
 .slot-tile.filtered-out {
@@ -4492,11 +4443,6 @@ button.fabric-trace-crumb:hover {
   position: relative;
   z-index: 1;
   opacity: 0.45;
-}
-
-.slot-tile.selected::after,
-.slot-tile.peer-highlight::after {
-  z-index: 7;
 }
 
 .slot-tile.selected .slot-number {
@@ -4633,15 +4579,14 @@ button.fabric-trace-crumb:hover {
   z-index: 2;
 }
 
+/* M.2 cards and boot media keep the state chip (::after) and the LED dot. */
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute::before,
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute::after,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-number,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-device,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-pool,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-tertiary,
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute .slot-latch,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute::before,
-.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute::after,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-number,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-device,
 .nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute .slot-pool,
@@ -4666,22 +4611,11 @@ button.fabric-trace-crumb:hover {
     0 16px 28px rgba(0, 0, 0, 0.22);
 }
 
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected::after,
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after,
-.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.selected::after,
-.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-highlight::after {
-  display: none;
-}
-
-/* M.2 cards and boot media show the state chip in place of the LED dot. */
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute:not(.selected, .peer-highlight, .fabric-highlight)::after,
-.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute:not(.selected, .peer-highlight, .fabric-highlight)::after,
-.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot:not(.selected, .peer-highlight, .fabric-highlight)::after {
-  display: inline-flex;
-}
-
-.slot-tile:is(.storage-view-slot-nvme-absolute, .storage-view-slot-boot):not(.selected, .peer-highlight, .fabric-highlight) .slot-status-led {
-  display: none;
+/* Cards ring the card itself, so the tile draws no outline ring. */
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot {
+  --bay-ring-width: 0px;
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.selected .storage-view-runtime-card--nvme,
@@ -4699,6 +4633,15 @@ button.fabric-trace-crumb:hover {
   box-shadow:
     0 0 0 1px rgba(76, 216, 164, 0.22),
     0 0 16px rgba(76, 216, 164, 0.08),
+    inset 0 0 0 1px rgba(7, 18, 30, 0.34);
+}
+
+.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.fabric-highlight .storage-view-runtime-card--nvme,
+.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.fabric-highlight .storage-view-runtime-card--nvme {
+  border-color: rgba(85, 214, 235, 0.68);
+  box-shadow:
+    0 0 0 1px rgba(85, 214, 235, 0.38),
+    0 0 18px rgba(85, 214, 235, 0.12),
     inset 0 0 0 1px rgba(7, 18, 30, 0.34);
 }
 
@@ -4882,7 +4825,6 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot::before,
-.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot::after,
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-number,
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-device,
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot .slot-pool,
@@ -5157,6 +5099,14 @@ button.fabric-trace-crumb:hover {
     0 18px 30px rgba(0, 0, 0, 0.2);
 }
 
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.fabric-highlight .storage-view-runtime-card--satadom,
+.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.fabric-highlight .storage-view-runtime-card--boot-media {
+  box-shadow:
+    0 0 0 1px rgba(85, 214, 235, 0.38),
+    0 0 18px rgba(85, 214, 235, 0.12),
+    0 18px 30px rgba(0, 0, 0, 0.2);
+}
+
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed {
   filter: none;
 }
@@ -5417,10 +5367,26 @@ button.fabric-trace-crumb:hover {
 
 .slot-tile.state-healthy .slot-status-led { background: var(--healthy); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(44, 172, 103, 0.34); }
 .slot-tile.state-empty .slot-status-led { background: #d6dce3; box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.24); }
-.slot-tile.state-identify .slot-status-led { background: var(--identify); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(215, 182, 43, 0.42); }
+.slot-tile.state-identify .slot-status-led { background: var(--identify); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(215, 182, 43, 0.42); animation: slot-led-locate 1.2s linear infinite; }
 .slot-tile.state-fault .slot-status-led { background: var(--fault); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(210, 74, 74, 0.42); }
 .slot-tile.state-unknown .slot-status-led { background: var(--unknown); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(47, 110, 187, 0.34); }
 .slot-tile.state-unmapped .slot-status-led { background: var(--unmapped); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.34), 0 0 12px rgba(197, 125, 58, 0.34); }
+
+/* A bay with its locate light on blinks its dot, so it stands apart from a
+   healthy bay (#925). Without motion, an amber ring marks it instead; an
+   outline, because the card and UniFi dots set their own box-shadow. */
+@keyframes slot-led-locate {
+  0%, 55% { opacity: 1; }
+  60%, 100% { opacity: 0.2; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slot-tile.state-identify .slot-status-led {
+    animation: none;
+    outline: 2px solid var(--identify);
+    outline-offset: 2px;
+  }
+}
 
 .slot-tooltip {
   position: fixed;
