@@ -455,10 +455,10 @@
         "sha256:12c01b41995df68196d0f7811b34603c9222d1e26c3448ee6dd9d001b9fdde2a": 116
       },
       "sas_wwn_identifier": {
-        "sha256:2c8dbc70a37989b3cc35308223030ceb38c3689e2a711d7afa09e9054ff6b308": 210
+        "sha256:6949995716f0c7c49f40c9fd71d21bd1698027c2f9a73d677380a46f08a6c407": 216
       }
     },
-    "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. PR874 adds five literal occurrences of invented NVMe namespace EUI64 values zero, one and two, including a normalized eui. value; no captured device identity is added."
+    "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. Issue 926 adds six literal occurrences of one invented enclosure identifier for dual-path locate-light confirmation; no captured device identity is added."
   },
   "tests/test_parsers.py": {
     "findings": {
@@ -466,10 +466,10 @@
         "sha256:39de09fc25e538bb2bb7ccf330b7ffbdfaf157185f2e123cf78e2ddb148909e8": 1
       },
       "sas_wwn_identifier": {
-        "sha256:35dfe18e699c2f5eeb2fc286b784db75736295c6449e954afeb3b2474e3c2007": 136
+        "sha256:a7e5f19f8c912483ea3d736e2b964213b5fd92122b14c2b7cc3db7a80ce857b0": 140
       }
     },
-    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+    "reason": "Synthetic or adversarial test literals; exact detector counts are pinned. Issue 926 adds four literal occurrences of one invented enclosure identifier for dual-path locate-light parsing; no captured device identity is added."
   },
   "tests/test_perf.py": {
     "findings": {

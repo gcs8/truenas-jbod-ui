@@ -14192,20 +14192,20 @@ class InventoryService:
 
     async def _run_led_ssh_sequence(
         self,
-        host: str | None,
+        target_host: str | None,
         commands: list[str],
     ) -> list[tuple[SSHCommandResult, float]]:
-        if not self._ssh_destination_authority_approved(host):
+        if not self._ssh_destination_authority_approved(target_host):
             return [
                 (result, 0.0)
                 for result in self._ssh_authority_failure_results(commands)
             ]
-        probe: Any = self._ssh_probe_for_host(normalize_text(host))
+        probe: Any = self._ssh_probe_for_host(normalize_text(target_host))
         if not isinstance(probe, SSHProbe):
             fallback_results: list[tuple[SSHCommandResult, float]] = []
             for command in commands:
                 started = time.perf_counter()
-                result = await self._run_ssh_command(command, host)
+                result = await self._run_ssh_command(command, target_host)
                 fallback_results.append((result, max(0.0, time.perf_counter() - started)))
             return fallback_results
 
