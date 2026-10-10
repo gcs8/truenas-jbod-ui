@@ -1194,6 +1194,7 @@ class InventoryService:
         self._core_grid_reservation_lock = asyncio.Lock()
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_generation = 0
+        self._source_bundle_published_sequence = 0
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._snapshot_activity: dict[str, int] = {}
@@ -1412,6 +1413,7 @@ class InventoryService:
             detail_commits=discovery_detail_commits,
         )
         topology_generation = self._snapshot_topology_generation
+        observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
         self._admit_snapshot_key(cache_key)
         if discovered_snapshot is not None:
             if cache_key != SNAPSHOT_NO_ENCLOSURE_KEY and discovered_snapshot.selected_enclosure_id != cache_key:
@@ -1477,6 +1479,16 @@ class InventoryService:
                 cached = self._cache.get(cache_key)
                 cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
                 now = utcnow()
+                if (
+                    cached is not None
+                    and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
+                ):
+                    # A refresh that published while this request waited satisfies
+                    # even a forced caller; rebuilding would only repeat source I/O.
+                    self._touch_snapshot_key(cache_key)
+                    add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
+                    self._observe_inventory_snapshot_request("hit-after-wait")
+                    return CacheResult(cached, "hit-after-wait")
                 if not force_refresh and cached and now < cache_until:
                     self._touch_snapshot_key(cache_key)
                     add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
@@ -1539,10 +1551,15 @@ class InventoryService:
             # the old key before taking the destination lock so opposite redirects
             # cannot deadlock. Request ordering prevents an older redirected build
             # from overwriting a newer explicit refresh that won the destination.
-            if request_sequence < self._canonical_options_request_sequence and not (
-                self._snapshot_published_sequence.get(publication_key, -1) > request_sequence
-                and publication_key in self._cache
-            ):
+            if request_sequence < self._canonical_options_request_sequence:
+                current = self._current_snapshot_for_superseded_refresh(
+                    publication_key,
+                    request_sequence=request_sequence,
+                )
+                if current is not None:
+                    add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=publication_key)
+                    self._observe_inventory_snapshot_request("hit-after-wait")
+                    return CacheResult(current, "hit-after-wait")
                 # Reject before admission so a stale redirect cannot evict an
                 # unrelated valid key merely to fail the sequence fence below.
                 raise SnapshotStateBusyError()
@@ -1626,6 +1643,30 @@ class InventoryService:
         self._snapshot_lru[cache_key] = None
         self._snapshot_lru.move_to_end(cache_key)
 
+    def _current_snapshot_for_superseded_refresh(
+        self,
+        cache_key: str,
+        *,
+        request_sequence: int,
+    ) -> InventorySnapshot | None:
+        if request_sequence >= self._canonical_options_request_sequence:
+            return None
+        if cache_key in self._snapshot_invalidated:
+            return None
+        current = self._cache.get(cache_key)
+        if current is None:
+            return None
+        # A system-wide options publication can supersede another enclosure's
+        # candidate. Keep serving its already-public value; never publish the
+        # older candidate over the newer canonical topology.
+        self._touch_snapshot_key(cache_key)
+        logger.debug(
+            "Snapshot refresh for %s was superseded by canonical options sequence %s.",
+            cache_key,
+            self._canonical_options_request_sequence,
+        )
+        return current
+
     def _publish_snapshot_locked(
         self,
         cache_key: str,
@@ -1641,9 +1682,14 @@ class InventoryService:
             raise SnapshotStateBusyError()
         if request_sequence < self._canonical_options_request_sequence:
             # Another request published trusted topology after this build began.
-            # If its destination watermark survived, the branch above returns the
-            # newer value. Otherwise fail closed: canonical retirement or LRU may
-            # have removed the destination while this request was still building.
+            # Reuse a still-valid public value without publishing this candidate;
+            # otherwise canonical retirement or LRU must continue to fail closed.
+            current = self._current_snapshot_for_superseded_refresh(
+                cache_key,
+                request_sequence=request_sequence,
+            )
+            if current is not None:
+                return current, False
             raise SnapshotStateBusyError()
         self._cache[cache_key] = snapshot
         self._cache_until[cache_key] = utcnow() + timedelta(
@@ -3149,6 +3195,7 @@ class InventoryService:
         allow_stale_cache: bool = False,
         invalidate_sg_ses_device_cache: bool = True,
     ) -> CacheResult[InventorySourceBundle]:
+        observed_source_publication = self._source_bundle_published_sequence
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
             add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
@@ -3161,6 +3208,15 @@ class InventoryService:
             return CacheResult(self._source_bundle, "stale-hit")
 
         async with self._source_bundle_lock:
+            if (
+                self._source_bundle is not None
+                and self._source_bundle_published_sequence != observed_source_publication
+            ):
+                # A source collection completed while this caller waited. It is
+                # the same single flight even for a forced request.
+                add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
+                self._observe_inventory_source_bundle_request("hit-after-wait")
+                return CacheResult(self._source_bundle, "hit-after-wait")
             now = utcnow()
             if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
                 add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
@@ -3193,6 +3249,7 @@ class InventoryService:
                         "TrueNAS could not list enclosures this time, so the last known bay layout is shown."
                     )
             self._source_bundle = bundle
+            self._source_bundle_published_sequence += 1
             self._source_bundle_until = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
             )
@@ -4028,8 +4085,16 @@ class InventoryService:
 
     async def _background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
         try:
+            observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
             source_refresh_succeeded = await _await_retained(self._schedule_background_source_bundle_refresh())
             if not source_refresh_succeeded:
+                return
+            if (
+                cache_key not in self._snapshot_invalidated
+                and cache_key in self._cache
+                and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
+            ):
+                logger.debug("Background snapshot refresh reused newer publication for %s.", cache_key)
                 return
             await self._get_snapshot_result(
                 force_refresh=True,
