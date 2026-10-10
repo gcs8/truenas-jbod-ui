@@ -116,7 +116,6 @@ class HealthzShapeTests(unittest.TestCase):
                      "enclosure_label": "Front", "reason": "ssh_required_failed",
                      "detail": "skip-leak-Q927", "internal": "skip-leak-Q927"},
                     {"system_id": "esx", "system_label": 7, "reason": "skip-leak-Q927"},
-                    "skip-leak-Q927",
                 ],
             },
             partial,
@@ -137,7 +136,8 @@ class HealthzShapeTests(unittest.TestCase):
         self.assertNotIn("skip-leak-Q927", json.dumps(payload))
 
     def test_healthz_marks_malformed_skipped_scopes_as_not_recorded(self) -> None:
-        for value in (None, "skip-leak-Q927", {"system_id": "nvr"}, 3):
+        # A list with a malformed entry is unknown, never a shorter list or "none".
+        for value in (None, "skip-leak-Q927", {"system_id": "nvr"}, 3, ["skip-leak-Q927"], [{"system_id": 7}]):
             with self.subTest(value=value):
                 payload = self._healthz({"collector_running": True, "last_skipped_scopes": value}, None)
                 self.assertIsNone(payload["collector"]["last_skipped_scopes"])

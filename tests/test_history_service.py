@@ -659,23 +659,28 @@ class HistoryDashboardRouteTests(unittest.TestCase):
             "enclosure_label": "Front", "reason": "ssh_required_failed",
             "detail": "ignored-skip-leak-Q927", "internal": "skip-leak-Q927",
         }
-        counts = {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0}
-        for value, label in (
+        counts: dict[str, object] = {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0}
+        for value, label, warning in (
             ([skipped, {**skipped, "enclosure_id": None, "enclosure_label": None, "reason": "unexpected"}],
              "Synthetic NVR / Front: SSH commands needed for the bay map failed. "
-             "Synthetic NVR: The inventory was degraded or untrusted."),
-            ([], "none"),
-            ("bad", "not recorded"),
-            (None, "not recorded"),
+             "Synthetic NVR: The inventory was degraded or untrusted.", True),
+            ([], "none", False),
+            ("bad", "not recorded", False),
+            (None, "not recorded", False),
         ):
             with self.subTest(label=label):
                 status: dict[str, object] = {"collector_running": True}
                 if value is not None:
                     status["last_skipped_scopes"] = value
                 markup = self._render_dashboard(status, counts, [])
-                self.assertIn(
-                    f'<dt>Skipped in last scan</dt><dd id="status-last-skipped-scopes">{label}</dd>', markup
+                match = re.search(
+                    r'<dt>Skipped in last scan</dt><dd id="status-last-skipped-scopes" class="([^"]*)">(.*?)</dd>',
+                    markup,
                 )
+                self.assertIsNotNone(match)
+                assert match is not None
+                self.assertEqual(match.group(2), label)
+                self.assertEqual(match.group(1), "status-error" if warning else "")
                 self.assertNotIn("skip-leak-Q927", markup)
 
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:

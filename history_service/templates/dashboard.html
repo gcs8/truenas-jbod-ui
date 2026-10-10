@@ -82,6 +82,7 @@
           <dt>History quarantined at</dt><dd id="status-history-quarantined-at">{{ timestamp(status.get('history_quarantined_at'), 'never') }}</dd>
           <dt>Collecting now</dt><dd id="status-current-collection">{{ current_collection_label if status.get('collection_running') else 'no' }}</dd>
           <dt>Last shelf scan</dt><dd id="status-last-inventory-at">{{ timestamp(status.get('last_inventory_at'), 'never') }}</dd>
+          <dt>Skipped in last scan</dt><dd id="status-last-skipped-scopes" class="{{ 'status-error' if status.get('last_skipped_scopes') else '' }}">{{ skipped_scopes_label | default('not recorded') }}</dd>
           <dt>Last temperature collection attempt</dt><dd id="status-last-fast-metrics-at">{{ timestamp(status.get('last_fast_metrics_at'), 'never') }}</dd>
           <dt>Last full SMART collection attempt</dt><dd id="status-last-slow-metrics-at">{{ timestamp(status.get('last_slow_metrics_at'), 'never') }}</dd>
           <dt>Last backup</dt><dd id="status-last-backup-at">{{ timestamp(status.get('last_backup_at'), 'never') }}</dd>
