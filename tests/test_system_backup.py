@@ -7693,6 +7693,20 @@ class SystemSetupServiceTests(unittest.TestCase):
         self.assertEqual(created.view_order, expected)
         self.assertEqual(saved["systems"][0]["view_order"], expected)
 
+        updated, replaced = service.save_system(
+            SystemSetupRequest(
+                system_id=created.id,
+                label="Example SCALE renamed",
+                platform="scale",
+                truenas_host="https://scale.example.test",
+                replace_existing=True,
+            )
+        )
+        saved_after_legacy_update = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertTrue(replaced)
+        self.assertEqual(updated.view_order, expected)
+        self.assertEqual(saved_after_legacy_update["systems"][0]["view_order"], expected)
+
     def test_create_system_appends_new_configured_system(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         config_path = temp_dir / "config.yaml"

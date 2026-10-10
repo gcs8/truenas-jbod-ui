@@ -1006,7 +1006,7 @@ class SystemSetupRequest(BaseModel):
     bmc_timeout_seconds: int = 15
     default_profile_id: str | None = None
     storage_views: list[StorageViewRequest] | None = None
-    view_order: list[str] = Field(default_factory=list)
+    view_order: list[str] | None = None
     replace_existing: bool = False
     make_default: bool = False
 
@@ -1049,7 +1049,9 @@ class SystemSetupRequest(BaseModel):
 
     @field_validator("view_order", mode="before")
     @classmethod
-    def sanitize_view_order(cls, value: Any) -> list[str]:
+    def sanitize_view_order(cls, value: Any) -> list[str] | None:
+        if value is None:
+            return None
         if not isinstance(value, (list, tuple)):
             return []
         cleaned: list[str] = []

@@ -551,7 +551,11 @@ class SystemSetupService:
                 default_profile_id=payload.default_profile_id,
                 enclosure_profiles=dict(existing_system.enclosure_profiles) if existing_system else {},
                 storage_views=storage_views,
-                view_order=list(payload.view_order),
+                view_order=list(
+                    payload.view_order
+                    if payload.view_order is not None
+                    else (existing_system.view_order if existing_system else [])
+                ),
                 truenas=TrueNASConfig(
                     host=payload.truenas_host,
                     api_key=resolve_secret(
