@@ -3164,7 +3164,8 @@ class SnapshotRedactorHostnameFormTests(unittest.TestCase):
 
 
 async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
-                                        scope_kind="virtual", redact=False, selected_view="boot"):
+                                        scope_kind="virtual", redact=False, selected_view="boot",
+                                        bound_view_id="bound"):
     """Real disposable store -> route -> client -> HTML, with only transport replaced."""
     from contextlib import closing
 
@@ -3184,8 +3185,8 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
     rear.slots[0].enclosure_id = "rear"
     runtime = StorageViewRuntimePayload(
         system_id=snapshot.selected_system_id,
-        view_order=["view:boot", "enclosure:front", "view:nvme", "view:bound"],
-        default_selection="view:bound",
+        view_order=["view:boot", "enclosure:front", "view:nvme", f"view:{bound_view_id}"],
+        default_selection=f"view:{bound_view_id}",
         views=[StorageViewRuntimeView(
             id=view_id, label=f"Synthetic {view_id}", kind=kind, template_id=template,
             slot_layout=[[0]], slot_count=1, matched_count=1,
@@ -3201,7 +3202,7 @@ async def build_bounded_history_fixture(*, metric_count=16, event_count=12,
         ) for view_id, kind, template, bound, temperature in (
             ("boot", "boot_devices", "boot-devices-2", False, 41),
             ("nvme", "nvme_carrier", "nvme-4", False, 42),
-            ("bound", "boot_devices", "boot-devices-2", True, 37),
+            (bound_view_id, "boot_devices", "boot-devices-2", True, 37),
         )],
     )
     enclosures = ["front"]
@@ -3389,6 +3390,23 @@ class HistoryResponseContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue({"boot", "nvme", "bound"}.isdisjoint(runtime_view_ids))
                         self.assertNotIn("host.example.test", rendered.html)
                         self.assertNotIn('"enclosure_id": "front"', rendered.html)
+
+    async def test_redacted_view_order_survives_view_id_equal_to_enclosure_id(self) -> None:
+        # A saved view may share its id with a physical enclosure. Token
+        # redaction must not rewrite that view's order entry to the enclosure
+        # alias before the storage-view alias lookup.
+        rendered, _, _ = await build_bounded_history_fixture(redact=True, bound_view_id="front")
+        runtime = json.loads(re.search(r"storageViewsRuntime: (.*),\n", rendered.html)[1])
+        exported_ids = [view["id"] for view in runtime["views"]]
+        self.assertEqual(len(set(exported_ids)), 3)
+        self.assertNotIn("front", exported_ids)
+        self.assertEqual(
+            runtime["view_order"],
+            [f"view:{exported_ids[0]}", runtime["view_order"][1], f"view:{exported_ids[1]}", f"view:{exported_ids[2]}"],
+        )
+        self.assertTrue(runtime["view_order"][1].startswith("enclosure:"))
+        self.assertNotEqual(runtime["view_order"][1].removeprefix("enclosure:"), exported_ids[2])
+        self.assertEqual(runtime["default_selection"], f"view:{exported_ids[2]}")
 
     async def test_real_bulk_handler_store_client_export_keeps_available_history_and_identity(self) -> None:
         snapshot = build_snapshot()

@@ -3807,6 +3807,43 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
         service._get_inventory_source_bundle.assert_awaited_once()
 
+    def test_runtime_view_order_cache_is_scoped_to_the_active_enclosure(self) -> None:
+        # The auto-bound primary-chassis count follows the selected enclosure,
+        # so an order computed for one enclosure must not serve another.
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            "enc-a": self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options),
+            "enc-b": self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 3, options),
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        def build_service(temp_dir: str) -> InventoryService:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            return service
+
+        with tempfile.TemporaryDirectory() as primed_dir, tempfile.TemporaryDirectory() as fresh_dir:
+            primed = build_service(primed_dir)
+            asyncio.run(primed.get_storage_view_runtime(selected_enclosure_id="enc-a"))
+            reused = asyncio.run(primed.get_storage_view_runtime(selected_enclosure_id="enc-b"))
+            fresh = asyncio.run(build_service(fresh_dir).get_storage_view_runtime(selected_enclosure_id="enc-b"))
+            again = asyncio.run(primed.get_storage_view_runtime(selected_enclosure_id="enc-b"))
+
+        self.assertEqual(
+            fresh.view_order,
+            ["enclosure:enc-b", "view:primary-chassis", "enclosure:enc-a"],
+        )
+        self.assertEqual(reused.view_order, fresh.view_order)
+        self.assertEqual(reused.default_selection, fresh.default_selection)
+        self.assertEqual(again.view_order, fresh.view_order)
+
     def test_runtime_view_order_recomputes_after_targeted_snapshot_invalidation(self) -> None:
         options = [
             EnclosureOption(id="enc-a", label="Enclosure A"),
