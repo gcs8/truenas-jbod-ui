@@ -1952,7 +1952,7 @@
     if (!Number.isInteger(slotNumber)) {
       return false;
     }
-    if (state.sasFabric.selectedTraceId === `bay:${slotNumber}` && !state.sasFabric.selectedNodeId) {
+    if (state.sasFabric?.selectedTraceId === `bay:${slotNumber}` && !state.sasFabric.selectedNodeId) {
       return clearSasFabricSelection();
     }
     const viewSlot = sasFabricViewSlotForBay(slotNumber);

@@ -141,7 +141,7 @@ test("Enclosures / Views expands to every node and collapses again", async ({ pa
 
 test("Selected Bay trace nodes are all reachable", async ({ page }) => {
   const errors = await openConnections(page);
-  await page.evaluate(() => document.querySelector('[data-sas-fabric-slot="0"]').click());
+  await expect(page.locator('[data-sas-fabric-slot="0"]').first()).toHaveClass(/is-selected/);
   const inspector = page.locator("#sas-fabric-inspector-body");
   await expect(inspector.locator("h4", { hasText: "Trace Nodes" })).toBeVisible();
   const nodes = inspector.locator("[data-sas-fabric-node]");

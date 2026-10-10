@@ -527,6 +527,7 @@ test("fabric slot controls do not synchronize trace state before dirty navigatio
   const events = [];
   const selectSasFabricSlot = loadFunction("selectSasFabricSlot", {
     Number,
+    state: { sasFabric: { selectedTraceId: null, selectedNodeId: null } },
     syncSasFabricTraceToSlot(slot) { events.push(`sync:${slot}`); },
     sasFabricViewSlotForBay: (slot) => slot,
     selectSlot(slot) {
