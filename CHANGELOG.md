@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- History records UNVR and UNVR Pro bays again when only an optional SSH
+  command, such as `lsscsi -g -t`, fails. Hosts whose bay-map commands fail,
+  such as ESXi without StorCLI, are still skipped. The history dashboard and
+  `/healthz` now list every skipped system and the reason. Broke in
+  v0.23.0. (#929)
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
