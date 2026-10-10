@@ -602,7 +602,7 @@ class QuantaStorNodeScopedRetentionTests(unittest.TestCase):
         }
         for i in range(cls.SHARED_DISKS):
             serial = f"TESTSER{i + 1:04d}"
-            lun = f"35000c5000000{i + 1:04d}"
+            lun = f"TESTLUN{i + 1:04d}"
             by_id = f"scsi-SSYNTH_MODEL_{serial}"
             for node, numbers in dm_numbers.items():
                 common = {"storageSystemId": node, "serialNumber": serial, "scsiId": lun, "size": 1000}
@@ -721,8 +721,8 @@ class IdentityConflictTests(unittest.TestCase):
         )
         # Stable device-mapper names keep working.
         self.assertEqual(
-            logical_disk_identity_tokens(device_names=("/dev/disk/by-id/dm-uuid-mpath-35000c50000000001",)),
-            frozenset({"dev:disk/by-id/dm-uuid-mpath-35000c50000000001"}),
+            logical_disk_identity_tokens(device_names=("/dev/disk/by-id/dm-uuid-mpath-TESTLUN0001",)),
+            frozenset({"dev:disk/by-id/dm-uuid-mpath-testlun0001"}),
         )
 
     def test_a_shared_device_name_does_not_join_two_serials(self) -> None:
@@ -760,11 +760,11 @@ class IdentityConflictTests(unittest.TestCase):
 
     def test_a_shared_device_name_does_not_join_two_lun_ids(self) -> None:
         sources = [
-            self._record(lunid="5000c50000000001", device_name="dm-name-a"),
-            self._record(lunid="5000c50000000002", device_name="dm-name-a"),
+            self._record(lunid="TESTLUN0001", device_name="dm-name-a"),
+            self._record(lunid="TESTLUN0002", device_name="dm-name-a"),
         ]
         accounting = build_disk_retention_accounting(
-            source_disks=sources, slots=[self._slot(logical_unit_id="5000c50000000001")],
+            source_disks=sources, slots=[self._slot(logical_unit_id="TESTLUN0001")],
         )
         self.assertEqual(accounting.rendered_unique_disk_count, 1)
         self.assertEqual(accounting.unplaced_disk_count, 1)
@@ -772,20 +772,20 @@ class IdentityConflictTests(unittest.TestCase):
     def test_a_lun_id_reported_with_two_serials_identifies_neither(self) -> None:
         # A RAID volume id carried by both member disks is not a disk identity.
         sources = [
-            self._record(serial="TESTSER0001", lunid="5000c50000000009", device_name="sdc"),
-            self._record(serial="TESTSER0002", lunid="5000c50000000009", device_name="sdd"),
+            self._record(serial="TESTSER0001", lunid="TESTLUN0009", device_name="sdc"),
+            self._record(serial="TESTSER0002", lunid="TESTLUN0009", device_name="sdd"),
         ]
         accounting = build_disk_retention_accounting(
             source_disks=sources,
-            slots=[self._slot(serial="TESTSER0001", logical_unit_id="5000c50000000009", device_name="sdc")],
+            slots=[self._slot(serial="TESTSER0001", logical_unit_id="TESTLUN0009", device_name="sdc")],
         )
         self.assertEqual(accounting.rendered_unique_disk_count, 1)
         self.assertEqual(accounting.unplaced_disk_count, 1)
 
     def test_one_serial_reported_with_two_lun_formats_is_one_disk(self) -> None:
         sources = [
-            self._record(serial="TESTSER0001", lunid="5000c50000000001", device_name="da0"),
-            self._record(serial="TESTSER0001", lunid="naa.5000c50000000001", device_name="da1"),
+            self._record(serial="TESTSER0001", lunid="TESTLUN0001", device_name="da0"),
+            self._record(serial="TESTSER0001", lunid="naa.TESTLUN0001", device_name="da1"),
         ]
         accounting = build_disk_retention_accounting(
             source_disks=sources, slots=[self._slot(serial="TESTSER0001", device_name="da0")],
