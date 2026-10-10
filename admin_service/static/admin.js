@@ -3575,6 +3575,11 @@
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
       storageView.label = editedLabel;
       storageView.id = uniqueStorageViewId(elements.setupStorageViewId?.value?.trim() || storageView.label, previousId);
+      if (storageView.id !== previousId && Array.isArray(state.viewOrder)) {
+        const previousKey = `view:${previousId}`;
+        const nextKey = `view:${storageView.id}`;
+        state.viewOrder = state.viewOrder.map((entry) => (entry === previousKey ? nextKey : entry));
+      }
       storageView.template_id = elements.setupStorageViewTemplateSelect?.value || storageView.template_id;
       storageView.kind = getStorageViewTemplate(storageView.template_id)?.kind || storageView.kind || "manual";
       storageView.profile_id = storageView.kind === "ses_enclosure"
@@ -3947,6 +3952,9 @@
     state.setupDirty = true;
     state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
     state.storageViews = state.storageViews.filter((storageView) => storageView.id !== selectedId);
+    if (Array.isArray(state.viewOrder)) {
+      state.viewOrder = state.viewOrder.filter((entry) => entry !== `view:${selectedId}`);
+    }
     state.selectedStorageViewId = state.storageViews[0]?.id || "";
     renderStorageViews();
   }
