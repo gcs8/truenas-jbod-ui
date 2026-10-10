@@ -4255,8 +4255,8 @@ button.fabric-trace-crumb:hover {
 }
 
 .slot-tile.peer-dimmed {
+  --bay-dim-filter: saturate(0.38) brightness(0.72);
   border-color: rgba(255, 255, 255, 0.05);
-  filter: saturate(0.38) brightness(0.72);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.03),
     inset 0 -10px 16px rgba(0, 0, 0, 0.38);
@@ -4279,7 +4279,7 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="unifi-drive"] .slot-tile.peer-dimmed {
-  filter: saturate(0.42) brightness(0.86);
+  --bay-dim-filter: saturate(0.42) brightness(0.86);
 }
 
 .slot-tile.fabric-highlight {
@@ -4299,7 +4299,17 @@ button.fabric-trace-crumb:hover {
 }
 
 .slot-tile.fabric-dimmed {
-  filter: saturate(0.34) brightness(0.64);
+  --bay-dim-filter: saturate(0.34) brightness(0.64);
+}
+
+/* A dimmed bay filters its tray face, chip and labels, not the tile: a filter
+   on the tile would grey the LED dot inside it too, and no rule on the dot can
+   undo that. The dot keeps its colour, so a fault or locate light still reads
+   (#925). */
+.slot-tile:is(.peer-dimmed, .fabric-dimmed)::before,
+.slot-tile:is(.peer-dimmed, .fabric-dimmed)::after,
+.slot-tile:is(.peer-dimmed, .fabric-dimmed) > :not(.slot-status-led) {
+  filter: var(--bay-dim-filter);
 }
 
 .slot-tile.fabric-dimmed::before {
@@ -4643,11 +4653,6 @@ button.fabric-trace-crumb:hover {
     0 0 0 1px rgba(85, 214, 235, 0.38),
     0 0 18px rgba(85, 214, 235, 0.12),
     inset 0 0 0 1px rgba(7, 18, 30, 0.34);
-}
-
-.chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed,
-.nvme-carrier-canvas .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed {
-  filter: none;
 }
 
 .chassis-shell[data-face-style="nvme-carrier"] .slot-tile.storage-view-slot-nvme-absolute.peer-dimmed .storage-view-runtime-card--nvme,
@@ -5105,10 +5110,6 @@ button.fabric-trace-crumb:hover {
     0 0 0 1px rgba(85, 214, 235, 0.38),
     0 0 18px rgba(85, 214, 235, 0.12),
     0 18px 30px rgba(0, 0, 0, 0.2);
-}
-
-.chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed {
-  filter: none;
 }
 
 .chassis-shell[data-face-style="boot-devices"] .slot-tile.storage-view-slot-boot.peer-dimmed .storage-view-runtime-card--satadom,

@@ -51,9 +51,22 @@ function loadFunctions(names, context = {}) {
 function cssRules(source) {
   const rules = [];
   for (const match of source.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-    rules.push([match[1].split(",").map((value) => value.trim()), match[2]]);
+    rules.push([topLevelSplit(match[1], ",").map((value) => value.trim()), match[2]]);
   }
   return rules;
+}
+
+// Split on a separator outside parentheses, so ":is(.a, .b)" stays whole.
+function topLevelSplit(text, separator) {
+  const parts = [""];
+  let depth = 0;
+  for (const character of text) {
+    if (character === "(") depth += 1;
+    else if (character === ")") depth -= 1;
+    if (depth === 0 && separator.includes(character)) parts.push("");
+    else parts[parts.length - 1] += character;
+  }
+  return parts;
 }
 
 function mediaBlock(query) {
@@ -97,7 +110,11 @@ test("dimmed bays filter their parts, not the tile, so the LED dot keeps its col
   // A filter on the tile also greys the dot inside it, and no rule on the dot
   // can undo that.
   for (const [selectors, body] of cssRules(STYLE)) {
-    const tiles = selectors.filter((selector) => /\.slot-tile[^\s>+~]*\.(peer|fabric)-dimmed[^\s>+~:]*$/.test(selector));
+    // Rules whose subject is the dimmed tile itself, not a part or ::before.
+    const tiles = selectors.filter((selector) => {
+      const subject = topLevelSplit(selector, " >+~").filter(Boolean).pop();
+      return /^\.slot-tile\b/.test(subject) && /(peer|fabric)-dimmed/.test(subject) && !subject.includes("::");
+    });
     if (!tiles.length) continue;
     const filter = body.match(/(?:^|[;\s])filter:\s*([^;]+)/);
     assert.ok(!filter || filter[1].trim() === "none", `${tiles.join(", ")} filters the whole tile: ${filter?.[1]}`);
