@@ -33,6 +33,7 @@ from app.services.history_status import PUBLIC_COLLECTOR_STATUS_FIELDS
 from history_service import main as history_main
 from history_service import migration_lock
 from history_service import store as history_store
+from history_service import collector as history_collector_module
 from history_service.collector import (
     TOPOLOGY_CHANGE_CONFIRMATION_COUNT,
     HistoryCollectionStopping,
@@ -650,6 +651,32 @@ class HistoryDashboardRouteTests(unittest.TestCase):
                 )
         self.assertNotIn("Last temperature reading", markup)
         self.assertNotIn("Last full SMART reading", markup)
+
+    def test_dashboard_lists_skipped_scopes_with_their_reason(self) -> None:
+        # #927: a skipped system was visible only in the log.
+        skipped = {
+            "system_id": "nvr", "system_label": "Synthetic NVR", "enclosure_id": "nvr-bay",
+            "enclosure_label": "Front", "reason": "ssh_required_failed",
+            "detail": "ignored-skip-leak-Q927", "internal": "skip-leak-Q927",
+        }
+        counts = {"tracked_slots": 0, "event_count": 0, "metric_sample_count": 0}
+        for value, label in (
+            ([skipped, {**skipped, "enclosure_id": None, "enclosure_label": None, "reason": "unexpected"}],
+             "Synthetic NVR / Front: SSH commands needed for the bay map failed. "
+             "Synthetic NVR: The inventory was degraded or untrusted."),
+            ([], "none"),
+            ("bad", "not recorded"),
+            (None, "not recorded"),
+        ):
+            with self.subTest(label=label):
+                status: dict[str, object] = {"collector_running": True}
+                if value is not None:
+                    status["last_skipped_scopes"] = value
+                markup = self._render_dashboard(status, counts, [])
+                self.assertIn(
+                    f'<dt>Skipped in last scan</dt><dd id="status-last-skipped-scopes">{label}</dd>', markup
+                )
+                self.assertNotIn("skip-leak-Q927", markup)
 
     def test_dashboard_renders_fast_and_full_refresh_controls(self) -> None:
         markup = self._render_dashboard(
@@ -8079,6 +8106,38 @@ class HistoryCollectorTests(unittest.TestCase):
         snapshot["sources"]["bmc"]["ok"] = True
         self.assertTrue(HistoryCollector._should_record_scope_snapshot(snapshot))
 
+    def test_ssh_hosts_record_when_only_optional_commands_failed(self) -> None:
+        # #927: UNVR `lsscsi -g -t` exits 127, yet the bay map is complete.
+        for platform in ("linux", "esxi"):
+            for required_ok, recorded in ((True, True), (False, False), (None, False), ("true", False), (1, False)):
+                with self.subTest(platform=platform, required_ok=required_ok):
+                    ssh = {"enabled": True, "ok": False, "message": "SSH finished with some failed commands."}
+                    if required_ok is not None:
+                        ssh["required_ok"] = required_ok
+                    snapshot = {"selected_system_platform": platform, "sources": {"ssh": ssh}}
+                    self.assertIs(HistoryCollector._should_record_scope_snapshot(snapshot), recorded)
+                    self.assertEqual(
+                        HistoryCollector._scope_skip_reason(snapshot),
+                        None if recorded else "ssh_required_failed",
+                    )
+
+    def test_scope_skip_reasons_name_the_untrusted_source(self) -> None:
+        cases = (
+            ({"selected_system_platform": "core", "sources": {"api": {"enabled": True, "ok": False}}}, "api_untrusted"),
+            ({"selected_system_platform": "ipmi", "sources": {"bmc": {"enabled": True, "ok": False}}}, "bmc_untrusted"),
+            ({"selected_system_platform": "quantastor", "sources": {"api": {"enabled": True, "ok": True}},
+              "platform_context": {"topology_complete": False}}, "topology_incomplete"),
+            ({"selected_system_platform": "esxi",
+              "sources": {"ssh": {"enabled": True, "ok": False, "required_ok": False}}}, "ssh_required_failed"),
+            ({"selected_system_platform": "scale", "sources": {"api": {"enabled": True, "ok": True},
+                                                              "ssh": {"enabled": True, "ok": False}}}, None),
+        )
+        for snapshot, code in cases:
+            with self.subTest(code=code):
+                self.assertEqual(HistoryCollector._scope_skip_reason(snapshot), code)
+                if code is not None:
+                    self.assertIn(code, history_collector_module.SCOPE_SKIP_REASONS)
+
     @staticmethod
     def _topology_history_fixture(
         *,
@@ -12093,6 +12152,119 @@ class HistoryFleetSweepStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["background_consecutive_failures"], 0)
         self.assertIsNone(self.collector.degraded_reason())
         self.assertIsNotNone(self.store.get_slot_state("system-b", None, 0))
+
+
+class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """#927: SSH hosts record unless a bay-map command failed, and every skip is listed with its reason."""
+
+    LABELS = {"nvr": ("Synthetic NVR", "Front"), "esx": ("Synthetic ESXi", "Carrier")}
+    PLATFORMS = {"nvr": "linux", "esx": "esxi"}
+    PARTIAL = "Some history inventory scopes were unavailable; collection was partial."
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.store = HistoryStore(str(root / "history.db"))
+        self.collector = HistoryCollector(
+            HistorySettings(sqlite_path=str(root / "history.db"),
+                            backup_dir=str(root / "backups"), startup_grace_seconds=0),
+            self.store,
+        )
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        # UNVR shape: only `lsscsi -g -t` failed. ESXi shape: StorCLI is missing.
+        self.ssh = {
+            "nvr": {"enabled": True, "ok": False, "required_ok": True,
+                    "message": "SSH finished with some failed commands."},
+            "esx": {"enabled": True, "ok": False, "required_ok": False,
+                    "message": "StorCLI commands unavailable."},
+        }
+        transport = patch.object(self.collector, "_fetch_json_sync", side_effect=self._source)
+        transport.start()
+        self.addCleanup(transport.stop)
+
+    def _source(self, path, params, method, body, headers, timeout):
+        if path == "/api/inventory":
+            system = params.get("system_id") or "nvr"
+            system_label, enclosure_label = self.LABELS[system]
+            return {
+                "systems": [{"id": "nvr"}, {"id": "esx"}],
+                "selected_system_id": system,
+                "selected_system_label": system_label,
+                "selected_system_platform": self.PLATFORMS[system],
+                "selected_enclosure_id": f"{system}-bay",
+                "selected_enclosure_label": enclosure_label,
+                "enclosures": [{"id": f"{system}-bay"}],
+                "sources": {
+                    "api": {"enabled": False, "ok": True},
+                    "ssh": dict(self.ssh[system]),
+                    "bmc": {"enabled": False, "ok": True},
+                },
+                "slots": [{"slot": 0, "present": True, "serial": f"TESTSER-{system}", "state": "healthy"}],
+            }
+        if path == "/api/storage-views":
+            return {"views": []}
+        if path.endswith("smart-batch"):
+            return {"summaries": [{"slot": 0, "summary": {
+                "available": True, "smart_health_status": "PASSED", "temperature_c": 30,
+            }}]}
+        raise AssertionError(f"Unexpected synthetic request: {path}")
+
+    async def _pass(self, **kwargs):
+        options = {"force_fast": True, "force_slow": True, "include_due_intervals": False, **kwargs}
+        with patch("history_service.collector.utcnow", return_value=self.now):
+            await self.collector.run_once(**options)
+        return self.collector.status()
+
+    def _skipped(self, system):
+        system_label, enclosure_label = self.LABELS[system]
+        return {
+            "system_id": system, "system_label": system_label,
+            "enclosure_id": f"{system}-bay", "enclosure_label": enclosure_label,
+            "reason": "ssh_required_failed",
+            "detail": history_collector_module.SCOPE_SKIP_REASONS["ssh_required_failed"],
+        }
+
+    def _recorded(self, system):
+        return self.store.get_slot_state(system, f"{system}-bay", 0)
+
+    async def test_optional_ssh_failure_records_and_required_failure_is_listed(self):
+        status = await self._pass()
+        self.assertIsNotNone(self._recorded("nvr"))
+        self.assertEqual(self._recorded("nvr").serial, "TESTSER-nvr")
+        self.assertIsNone(self._recorded("esx"))
+        self.assertEqual(status["last_skipped_scopes"], [self._skipped("esx")])
+        self.assertEqual(self.collector.degraded_reason(), self.PARTIAL)
+        self.assertTrue(any(stage["stage"] == "scope.skipped" and stage.get("reason") == "ssh_required_failed"
+                            for stage in status["collection_stage_timings"]))
+
+        self.ssh["esx"] = {"enabled": True, "ok": True, "required_ok": True, "message": "SSH probe completed."}
+        self.now += timedelta(minutes=5)
+        status = await self._pass()
+        self.assertEqual(status["last_skipped_scopes"], [])
+        self.assertIsNone(self.collector.degraded_reason())
+        self.assertIsNotNone(self._recorded("esx"))
+
+    async def test_a_snapshot_without_the_signal_is_still_skipped(self):
+        # An older main UI does not send required_ok; keep the 87ec6f6 gate.
+        del self.ssh["nvr"]["required_ok"]
+        with self.assertRaises(HistorySourceError):
+            await self._pass()
+        self.assertIsNone(self._recorded("nvr"))
+        self.assertIsNone(self._recorded("esx"))
+        self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("nvr"), self._skipped("esx")])
+
+    async def test_root_only_pass_keeps_the_fleet_list_and_adds_its_own_skip(self):
+        await self._pass()
+        self.now += timedelta(minutes=5)
+        status = await self._pass(force_slow=False, cached_root_only=True)
+        self.assertEqual(status["last_skipped_scopes"], [self._skipped("esx")])
+
+        self.ssh["nvr"]["required_ok"] = False
+        self.now += timedelta(minutes=5)
+        with self.assertRaises(HistorySourceError):
+            await self._pass(force_slow=False, cached_root_only=True)
+        self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("esx"), self._skipped("nvr")])
 
 
 class HistoryCollectorDiagnosticsTests(unittest.TestCase):

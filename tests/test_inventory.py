@@ -1285,6 +1285,85 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bundle.sources["ssh"].ok)
 
 
+class InventorySSHRequiredCommandTests(unittest.IsolatedAsyncioTestCase):
+    """#927: `sources.ssh.required_ok` separates a failed bay-map command from failed enrichment."""
+
+    STORCLI_MISSING = "sh: /opt/lsi/storcli64/storcli64: not found"
+
+    async def _bundle(self, platform, results=None, *, error=None):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(
+            id=f"synthetic-{platform}",
+            truenas=TrueNASConfig(platform=platform),
+            ssh=SSHConfig(enabled=True, host="192.0.2.10", commands=[result.command for result in results or []]),
+        )
+        ssh = AsyncMock()
+        if error is not None:
+            ssh.run_planned_commands.side_effect = error
+        else:
+            ssh.run_planned_commands.return_value = results
+        service = build_inventory_service(Settings(), system, AsyncMock(), ssh, directory.name)
+        with patch("app.services.inventory.logger.exception"):
+            return await service._collect_inventory_source_bundle()
+
+    async def test_unvr_shape_missing_lsscsi_keeps_required_commands_ok(self):
+        bundle = await self._bundle("linux", [
+            SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=True, stdout='{"blockdevices": []}', exit_code=0),
+            SSHCommandResult(command="/usr/bin/lsscsi -g -t", ok=False, stderr="lsscsi: not found", exit_code=127),
+        ])
+        ssh = bundle.sources["ssh"]
+        self.assertFalse(ssh.ok)
+        self.assertIs(ssh.required_ok, True)
+        self.assertEqual(ssh.message, "SSH finished with some failed commands.")
+        self.assertTrue(any("The bay map still works" in warning for warning in bundle.warnings), bundle.warnings)
+        self.assertIs(ssh.model_dump(mode="json")["required_ok"], True)
+
+    async def test_failed_bay_map_command_is_a_required_failure(self):
+        bundle = await self._bundle("linux", [
+            SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=False, stderr="lsblk: permission denied", exit_code=1),
+            SSHCommandResult(command="/usr/bin/lsscsi -g -t", ok=True, stdout="", exit_code=0),
+        ])
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertIs(bundle.sources["ssh"].required_ok, False)
+
+    async def test_esxi_without_storcli_is_a_required_failure(self):
+        # The AOC carrier bays are mapped from StorCLI rows only; without them
+        # every bay reads absent, which is not evidence that it is empty.
+        storcli = [
+            SSHCommandResult(command=f"/opt/lsi/storcli64/storcli64 {target} show all J", ok=False,
+                             stderr=self.STORCLI_MISSING, exit_code=127)
+            for target in ("/c0", "/c0/vall", "/c0/eall/sall")
+        ]
+        bundle = await self._bundle("esxi", [
+            SSHCommandResult(command="esxcli storage core adapter list", ok=True, stdout="vmhba0 lsi_mr3", exit_code=0),
+            *storcli,
+        ])
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertIs(bundle.sources["ssh"].required_ok, False)
+        self.assertEqual(bundle.sources["ssh"].message, "StorCLI commands unavailable.")
+
+    async def test_clean_ssh_pass_reports_required_commands_ok(self):
+        bundle = await self._bundle("linux", [
+            SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=True, stdout='{"blockdevices": []}', exit_code=0),
+        ])
+        self.assertTrue(bundle.sources["ssh"].ok)
+        self.assertIs(bundle.sources["ssh"].required_ok, True)
+
+    async def test_ssh_collection_error_is_a_required_failure(self):
+        bundle = await self._bundle("linux", error=RuntimeError("synthetic transport failure"))
+        self.assertFalse(bundle.sources["ssh"].ok)
+        self.assertIs(bundle.sources["ssh"].required_ok, False)
+
+    def test_unassessed_sources_serialize_without_the_field(self):
+        # API, BMC and fixture sources never assess it; their JSON stays as it was.
+        self.assertEqual(
+            SourceStatus(enabled=False, ok=True, message="off").model_dump(mode="json"),
+            {"enabled": False, "ok": True, "message": "off"},
+        )
+        self.assertNotIn("required_ok", SourceStatus(enabled=True, ok=False).model_dump_json())
+
+
 class InventoryHelpersTests(unittest.TestCase):
     def test_quantastor_floating_alias_is_never_a_node_host_but_bonds_and_vlans_are(self) -> None:
         extract = InventoryService._extract_quantastor_gateway_port_host
