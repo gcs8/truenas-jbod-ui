@@ -2185,6 +2185,7 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         snapshot: InventorySnapshot | None = None,
         tolerate_hidden_view_targets: bool = False,
+        include_view_order: bool = True,
     ) -> StorageViewRuntimePayload:
         """Runtime for every stored view.
 
@@ -2267,13 +2268,17 @@ class InventoryService:
             candidate_payloads_by_target,
             ses_snapshots_by_view_id=ses_snapshots_by_view_id,
         )
-        view_order = await self._effective_runtime_view_order(
-            source_bundle=source_bundle,
-            active_snapshot=active_snapshot,
-            runtime_views=runtime_views,
-            known_snapshots=target_snapshots,
-            ha_primary_view_id=primary_view.id if primary_view is not None and ha_owner_enclosure_id else None,
-            ha_owner_enclosure_id=ha_owner_enclosure_id,
+        view_order = (
+            await self._effective_runtime_view_order(
+                source_bundle=source_bundle,
+                active_snapshot=active_snapshot,
+                runtime_views=runtime_views,
+                known_snapshots=target_snapshots,
+                ha_primary_view_id=primary_view.id if primary_view is not None and ha_owner_enclosure_id else None,
+                ha_owner_enclosure_id=ha_owner_enclosure_id,
+            )
+            if include_view_order
+            else []
         )
         return StorageViewRuntimePayload(
             system_id=self.system.id,
@@ -2413,6 +2418,7 @@ class InventoryService:
         runtime = await self.get_storage_view_runtime(
             snapshot=default_snapshot,
             tolerate_hidden_view_targets=True,
+            include_view_order=False,
         )
 
         ssh_data = (
