@@ -925,6 +925,12 @@ class _SmartIdentityConflict(ValueError):
     """Returned SMART evidence identifies a different disk from the request."""
 
 
+@dataclass(frozen=True, slots=True)
+class SourcePublication:
+    sequence: int = 0
+    sg_cache_generation: int = 0
+
+
 @dataclass(slots=True)
 class InventorySourceBundle:
     raw_data: TrueNASRawData
@@ -937,6 +943,7 @@ class InventorySourceBundle:
     ssh_failure_details: list[dict[str, Any]] = field(default_factory=list)
     bmc_inventory: BMCInventory | None = None
     parsed_ssh_data_by_enclosure: dict[str, ParsedSSHData] = field(default_factory=dict)
+    publication: SourcePublication = field(default_factory=SourcePublication, repr=False, compare=False)
 
 
 RetainedResultT = TypeVar("RetainedResultT")
@@ -947,6 +954,9 @@ _snapshot_read_inputs: ContextVar[tuple[Any, Any, list[SasFabricAlias]] | None] 
 )
 _snapshot_detail_commits: ContextVar[list[Callable[[Callable[[], bool]], Awaitable[None]]] | None] = ContextVar(
     "snapshot_detail_commits", default=None,
+)
+_snapshot_build_source_publications: ContextVar[list[SourcePublication] | None] = ContextVar(
+    "snapshot_build_source_publications", default=None,
 )
 
 
@@ -1195,6 +1205,7 @@ class InventoryService:
         self._source_bundle: InventorySourceBundle | None = None
         self._source_bundle_generation = 0
         self._source_bundle_published_sequence = 0
+        self._sg_ses_device_cache_generation = 0
         self._source_bundle_until: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self._snapshot_locks: dict[str, asyncio.Lock] = {}
         self._snapshot_activity: dict[str, int] = {}
@@ -1202,6 +1213,7 @@ class InventoryService:
         self._snapshot_invalidated: set[str] = set()
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
+        self._snapshot_source_publications: dict[str, SourcePublication] = {}
         self._snapshot_discovery_lock = asyncio.Lock()
         self._system_retention_lock = asyncio.Lock()
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
@@ -1226,7 +1238,7 @@ class InventoryService:
         # this host answered StorCLI reads only in the form the saved commands lack.
         self._esxi_storcli_swapped = False
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
-        self._source_bundle_refresh_task: asyncio.Task[bool] | None = None
+        self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
@@ -1274,6 +1286,8 @@ class InventoryService:
             # filters bays), so they must be collected again.
             return
         self._source_bundle = previous._source_bundle
+        self._source_bundle_published_sequence = previous._source_bundle_published_sequence
+        self._sg_ses_device_cache_generation = previous._sg_ses_device_cache_generation
         self._source_bundle_until = min(
             previous._source_bundle_until,
             now + timedelta(seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))),
@@ -1305,6 +1319,10 @@ class InventoryService:
             self._cache_until[cache_key] = min(
                 previous._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc)),
                 now + timedelta(seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))),
+            )
+            self._snapshot_source_publications[cache_key] = previous._snapshot_source_publications.get(
+                cache_key,
+                self._source_bundle.publication if self._source_bundle is not None else SourcePublication(),
             )
             self._touch_snapshot_key(cache_key)
         if previous._canonical_enclosure_options is not None:
@@ -1401,17 +1419,33 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         allow_stale_cache: bool = False,
         force_source_refresh: bool | None = None,
+        minimum_source_publication: SourcePublication | None = None,
     ) -> CacheResult[InventorySnapshot]:
         self._snapshot_request_sequence += 1
         request_sequence = self._snapshot_request_sequence
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
-        discovery_detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
-        cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
-            selected_enclosure_id,
-            force_source_refresh=bool(refresh_sources),
-            request_sequence=request_sequence,
-            detail_commits=discovery_detail_commits,
+        observed_source_publication = SourcePublication(
+            sequence=self._source_bundle_published_sequence,
+            sg_cache_generation=self._sg_ses_device_cache_generation,
         )
+        required_source_publication = minimum_source_publication
+        if required_source_publication is None and force_refresh and refresh_sources:
+            required_source_publication = SourcePublication(
+                sequence=observed_source_publication.sequence + 1,
+                sg_cache_generation=observed_source_publication.sg_cache_generation + 1,
+            )
+        source_publications: list[SourcePublication] = []
+        discovery_detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
+        source_token = _snapshot_build_source_publications.set(source_publications)
+        try:
+            cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
+                selected_enclosure_id,
+                force_source_refresh=bool(refresh_sources),
+                request_sequence=request_sequence,
+                detail_commits=discovery_detail_commits,
+            )
+        finally:
+            _snapshot_build_source_publications.reset(source_token)
         topology_generation = self._snapshot_topology_generation
         observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
         self._admit_snapshot_key(cache_key)
@@ -1444,6 +1478,8 @@ class InventoryService:
                         cache_key,
                         discovered_snapshot,
                         request_sequence=request_sequence,
+                        source_publication=self._built_source_publication(source_publications),
+                        minimum_source_publication=required_source_publication,
                     )
             finally:
                 self._finish_snapshot_activity(cache_key)
@@ -1482,9 +1518,10 @@ class InventoryService:
                 if (
                     cached is not None
                     and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
+                    and self._snapshot_meets_source_requirement(cache_key, required_source_publication)
                 ):
-                    # A refresh that published while this request waited satisfies
-                    # even a forced caller; rebuilding would only repeat source I/O.
+                    # Reuse only a publication that meets this waiter's source
+                    # freshness and SG-device invalidation requirements.
                     self._touch_snapshot_key(cache_key)
                     add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
                     self._observe_inventory_snapshot_request("hit-after-wait")
@@ -1504,7 +1541,9 @@ class InventoryService:
                 )
                 build_started = time.perf_counter()
                 detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
+                source_publications.clear()
                 detail_token = _snapshot_detail_commits.set(detail_commits)
+                source_token = _snapshot_build_source_publications.set(source_publications)
                 try:
                     with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
                         snapshot = await self._build_snapshot(
@@ -1512,6 +1551,7 @@ class InventoryService:
                             force_source_refresh=refresh_sources,
                         )
                 finally:
+                    _snapshot_build_source_publications.reset(source_token)
                     _snapshot_detail_commits.reset(detail_token)
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and cache_key in self._snapshot_invalidated:
@@ -1594,6 +1634,8 @@ class InventoryService:
                         publication_key,
                         snapshot,
                         request_sequence=request_sequence,
+                        source_publication=self._built_source_publication(source_publications),
+                        minimum_source_publication=required_source_publication,
                     )
                     if published:
                         self._replace_canonical_options_from_trusted_snapshot(
@@ -1621,6 +1663,7 @@ class InventoryService:
             | set(self._snapshot_activity)
             | set(self._snapshot_lru)
             | set(self._snapshot_published_sequence)
+            | set(self._snapshot_source_publications)
         )
 
     def _snapshot_key_is_active(self, cache_key: str) -> bool:
@@ -1642,6 +1685,33 @@ class InventoryService:
     def _touch_snapshot_key(self, cache_key: str) -> None:
         self._snapshot_lru[cache_key] = None
         self._snapshot_lru.move_to_end(cache_key)
+
+    def _built_source_publication(self, publications: list[SourcePublication]) -> SourcePublication:
+        if publications:
+            return publications[-1]
+        if self._source_bundle is not None:
+            return self._source_bundle.publication
+        return SourcePublication()
+
+    @staticmethod
+    def _source_publication_meets(
+        publication: SourcePublication,
+        minimum: SourcePublication | None,
+    ) -> bool:
+        return minimum is None or (
+            publication.sequence >= minimum.sequence
+            and publication.sg_cache_generation >= minimum.sg_cache_generation
+        )
+
+    def _snapshot_meets_source_requirement(
+        self,
+        cache_key: str,
+        minimum: SourcePublication | None,
+    ) -> bool:
+        return self._source_publication_meets(
+            self._snapshot_source_publications.get(cache_key, SourcePublication()),
+            minimum,
+        )
 
     def _current_snapshot_for_superseded_refresh(
         self,
@@ -1673,10 +1743,15 @@ class InventoryService:
         snapshot: InventorySnapshot,
         *,
         request_sequence: int,
+        source_publication: SourcePublication,
+        minimum_source_publication: SourcePublication | None,
     ) -> tuple[InventorySnapshot, bool]:
         if self._snapshot_published_sequence.get(cache_key, -1) > request_sequence:
             current = self._cache.get(cache_key)
-            if current is not None:
+            if current is not None and self._snapshot_meets_source_requirement(
+                cache_key,
+                minimum_source_publication,
+            ):
                 self._touch_snapshot_key(cache_key)
                 return current, False
             raise SnapshotStateBusyError()
@@ -1696,6 +1771,7 @@ class InventoryService:
             seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
         )
         self._snapshot_published_sequence[cache_key] = request_sequence
+        self._snapshot_source_publications[cache_key] = source_publication
         self._touch_snapshot_key(cache_key)
         return snapshot, True
 
@@ -1728,6 +1804,7 @@ class InventoryService:
         self._snapshot_activity.pop(cache_key, None)
         self._snapshot_lru.pop(cache_key, None)
         self._snapshot_published_sequence.pop(cache_key, None)
+        self._snapshot_source_publications.pop(cache_key, None)
         self._snapshot_invalidated.discard(cache_key)
         return True
 
@@ -1773,6 +1850,9 @@ class InventoryService:
                     # Backfill remains local to the build; observation and writes
                     # wait for the same candidate's authoritative publication.
                     detail_commits.clear()
+                    source_publications = _snapshot_build_source_publications.get()
+                    if source_publications is not None:
+                        source_publications.clear()
                     detail_token = _snapshot_detail_commits.set(detail_commits)
                     try:
                         candidate = await self._build_snapshot(
@@ -3196,6 +3276,7 @@ class InventoryService:
         invalidate_sg_ses_device_cache: bool = True,
     ) -> CacheResult[InventorySourceBundle]:
         observed_source_publication = self._source_bundle_published_sequence
+        observed_sg_cache_generation = self._sg_ses_device_cache_generation
         now = utcnow()
         if not force_refresh and self._source_bundle is not None and now < self._source_bundle_until:
             add_perf_metadata(inventory_source_cache="hit", system_id=self.system.id)
@@ -3211,9 +3292,14 @@ class InventoryService:
             if (
                 self._source_bundle is not None
                 and self._source_bundle_published_sequence != observed_source_publication
+                and (
+                    not force_refresh
+                    or not invalidate_sg_ses_device_cache
+                    or self._source_bundle.publication.sg_cache_generation > observed_sg_cache_generation
+                )
             ):
-                # A source collection completed while this caller waited. It is
-                # the same single flight even for a forced request.
+                # Reuse a completed source flight only when it honored this
+                # caller's SG-device invalidation requirement.
                 add_perf_metadata(inventory_source_cache="hit-after-wait", system_id=self.system.id)
                 self._observe_inventory_source_bundle_request("hit-after-wait")
                 return CacheResult(self._source_bundle, "hit-after-wait")
@@ -3226,6 +3312,7 @@ class InventoryService:
             refresh_trigger: CacheState = "forced-refresh" if force_refresh else "miss"
             if force_refresh and invalidate_sg_ses_device_cache:
                 self._sg_ses_device_cache.clear()
+                self._sg_ses_device_cache_generation += 1
             add_perf_metadata(
                 inventory_source_cache=refresh_trigger,
                 system_id=self.system.id,
@@ -3248,8 +3335,12 @@ class InventoryService:
                     bundle.warnings.append(
                         "TrueNAS could not list enclosures this time, so the last known bay layout is shown."
                     )
-            self._source_bundle = bundle
             self._source_bundle_published_sequence += 1
+            bundle.publication = SourcePublication(
+                sequence=self._source_bundle_published_sequence,
+                sg_cache_generation=self._sg_ses_device_cache_generation,
+            )
+            self._source_bundle = bundle
             self._source_bundle_until = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
             )
@@ -3260,7 +3351,7 @@ class InventoryService:
             self._observe_inventory_source_bundle_request(refresh_trigger)
             return CacheResult(bundle, refresh_trigger)
 
-    def _schedule_background_source_bundle_refresh(self) -> asyncio.Task[bool]:
+    def _schedule_background_source_bundle_refresh(self) -> asyncio.Task[InventorySourceBundle | None]:
         existing = self._source_bundle_refresh_task
         if existing is not None and not existing.done():
             return existing
@@ -3268,7 +3359,7 @@ class InventoryService:
         task = asyncio.create_task(self._background_source_bundle_refresh())
         self._source_bundle_refresh_task = task
 
-        def _cleanup(completed: asyncio.Task[bool]) -> None:
+        def _cleanup(completed: asyncio.Task[InventorySourceBundle | None]) -> None:
             if self._source_bundle_refresh_task is completed:
                 self._source_bundle_refresh_task = None
             if completed.cancelled():
@@ -3280,16 +3371,15 @@ class InventoryService:
         task.add_done_callback(_cleanup)
         return task
 
-    async def _background_source_bundle_refresh(self) -> bool:
+    async def _background_source_bundle_refresh(self) -> InventorySourceBundle | None:
         try:
-            await self._get_inventory_source_bundle(
+            return await self._get_inventory_source_bundle(
                 force_refresh=True,
                 invalidate_sg_ses_device_cache=False,
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background inventory source refresh failed")
-            return False
-        return True
+            return None
 
     def _get_snapshot_lock(self, cache_key: str) -> asyncio.Lock:
         lock = self._snapshot_locks.get(cache_key)
@@ -4086,13 +4176,15 @@ class InventoryService:
     async def _background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
         try:
             observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
-            source_refresh_succeeded = await _await_retained(self._schedule_background_source_bundle_refresh())
-            if not source_refresh_succeeded:
+            source_bundle = await _await_retained(self._schedule_background_source_bundle_refresh())
+            if source_bundle is None:
                 return
+            minimum_source_publication = source_bundle.publication
             if (
                 cache_key not in self._snapshot_invalidated
                 and cache_key in self._cache
                 and self._snapshot_published_sequence.get(cache_key, -1) != observed_snapshot_publication
+                and self._snapshot_meets_source_requirement(cache_key, minimum_source_publication)
             ):
                 logger.debug("Background snapshot refresh reused newer publication for %s.", cache_key)
                 return
@@ -4100,6 +4192,7 @@ class InventoryService:
                 force_refresh=True,
                 selected_enclosure_id=None if default_selection or cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                 force_source_refresh=False,
+                minimum_source_publication=minimum_source_publication,
             )
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
@@ -6178,6 +6271,9 @@ class InventoryService:
         force_source_refresh: bool = False,
     ) -> InventorySnapshot:
         source_bundle = await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
+        source_publications = _snapshot_build_source_publications.get()
+        if source_publications is not None:
+            source_publications.append(source_bundle.publication)
         warnings = list(source_bundle.warnings)
         sources = {
             key: value.model_copy(deep=True)
