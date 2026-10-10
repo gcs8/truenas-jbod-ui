@@ -2538,6 +2538,7 @@ class InventoryService:
         runtime = await self.get_storage_view_runtime(
             force_refresh=False,
             selected_enclosure_id=selected_enclosure_id,
+            include_view_order=False,
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
@@ -2585,6 +2586,7 @@ class InventoryService:
         runtime = await self.get_storage_view_runtime(
             force_refresh=False,
             selected_enclosure_id=selected_enclosure_id,
+            include_view_order=False,
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:
@@ -2666,6 +2668,7 @@ class InventoryService:
         runtime = await self.get_storage_view_runtime(
             force_refresh=False,
             selected_enclosure_id=selected_enclosure_id,
+            include_view_order=False,
         )
         runtime_view = next((view for view in runtime.views if view.id == view_id), None)
         if not runtime_view:

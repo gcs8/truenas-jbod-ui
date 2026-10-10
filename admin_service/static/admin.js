@@ -3219,13 +3219,31 @@
     return ordered;
   }
 
-  function moveAdminViewOrder(entries, key, direction) {
+  function moveAdminViewOrder(entries, key, direction, savedOrder = []) {
     const keys = entries.map((entry) => entry.key);
     const index = keys.indexOf(key);
     const target = index + direction;
     if (index < 0 || target < 0 || target >= keys.length) return keys;
     [keys[index], keys[target]] = [keys[target], keys[index]];
-    return keys;
+    if (!Array.isArray(savedOrder) || savedOrder.length === 0) {
+      return keys;
+    }
+    const visibleKeys = new Set(keys);
+    const merged = [];
+    const added = new Set();
+    let nextVisibleIndex = 0;
+    savedOrder.forEach((savedKey) => {
+      const mergedKey = visibleKeys.has(savedKey) ? keys[nextVisibleIndex++] : savedKey;
+      if (!mergedKey || added.has(mergedKey)) return;
+      merged.push(mergedKey);
+      added.add(mergedKey);
+    });
+    keys.forEach((visibleKey) => {
+      if (added.has(visibleKey)) return;
+      merged.push(visibleKey);
+      added.add(visibleKey);
+    });
+    return merged;
   }
 
   function renderViewOrderEditor() {
@@ -8330,7 +8348,12 @@
       if (!button) return;
       const direction = button.dataset.viewOrderAction === "up" ? -1 : 1;
       const entries = orderedAdminViewEntries(currentLiveEnclosures(), state.storageViews, state.viewOrder);
-      state.viewOrder = moveAdminViewOrder(entries, button.dataset.viewOrderKey || "", direction);
+      state.viewOrder = moveAdminViewOrder(
+        entries,
+        button.dataset.viewOrderKey || "",
+        direction,
+        state.viewOrder,
+      );
       state.setupDirty = true;
       state.setupDraftRevision = (state.setupDraftRevision || 0) + 1;
       renderViewOrderEditor();
