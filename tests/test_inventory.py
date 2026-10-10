@@ -3715,6 +3715,149 @@ class InventoryHelpersTests(unittest.TestCase):
 
 
 class InventoryStorageViewCandidateTests(unittest.TestCase):
+    @staticmethod
+    def _view_order_snapshot(
+        system_id: str,
+        enclosure_id: str,
+        enclosure_label: str,
+        occupied: int,
+        options: list[EnclosureOption],
+        *,
+        selected_profile: EnclosureProfileView | None = None,
+    ) -> InventorySnapshot:
+        return InventorySnapshot(
+            slots=[
+                SlotView(
+                    slot=index,
+                    slot_label=f"{index + 1:02d}",
+                    row_index=0,
+                    column_index=index,
+                    enclosure_id=enclosure_id,
+                    enclosure_label=enclosure_label,
+                    present=True,
+                    state=SlotState.healthy,
+                    serial=f"SANITIZED-{enclosure_id}-{index}",
+                )
+                for index in range(occupied)
+            ],
+            refresh_interval_seconds=30,
+            selected_system_id=system_id,
+            selected_system_label="Synthetic system",
+            selected_enclosure_id=enclosure_id,
+            selected_enclosure_label=enclosure_label,
+            selected_profile=selected_profile,
+            enclosures=options,
+        )
+
+    @staticmethod
+    def _empty_source_bundle(*, raw_data: TrueNASRawData | None = None) -> InventorySourceBundle:
+        return InventorySourceBundle(
+            raw_data=raw_data or TrueNASRawData(
+                enclosures=[],
+                disks=[],
+                pools=[],
+                disk_temperatures={},
+                smart_test_results=[],
+            ),
+            ssh_outputs={},
+            ssh_collected=False,
+            warnings=[],
+            sources={},
+            scale_ses_data=ParsedSSHData(),
+            quantastor_ses_data=ParsedSSHData(),
+        )
+
+    def test_storage_view_runtime_ranks_all_enclosures_without_another_source_fetch(self) -> None:
+        options = [
+            EnclosureOption(id="enc-a", label="Enclosure A"),
+            EnclosureOption(id="enc-b", label="Enclosure B"),
+        ]
+        snapshots = {
+            "enc-a": self._view_order_snapshot("synthetic-system", "enc-a", "Enclosure A", 2, options),
+            "enc-b": self._view_order_snapshot("synthetic-system", "enc-b", "Enclosure B", 3, options),
+        }
+
+        async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+            return snapshots[selected_enclosure_id or "enc-a"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="synthetic-system", label="Synthetic system")
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            service._canonical_default_enclosure_id = "enc-a"
+
+            runtime = asyncio.run(service.get_storage_view_runtime())
+
+        self.assertEqual(runtime.view_order, ["enclosure:enc-b", "enclosure:enc-a"])
+        self.assertEqual(runtime.default_selection, "enclosure:enc-b")
+        self.assertEqual(service._canonical_default_enclosure_id, "enc-a")
+        service._get_inventory_source_bundle.assert_awaited_once()
+
+    def test_quantastor_ha_primary_chassis_uses_pool_owner_even_when_another_node_is_selected(self) -> None:
+        options = [
+            EnclosureOption(id="node-a", label="ExampleQS Left"),
+            EnclosureOption(id="node-b", label="ExampleQS Right"),
+        ]
+        raw_data = TrueNASRawData(
+            enclosures=[],
+            systems=[
+                {"id": "node-a", "name": "ExampleQS Left", "storageSystemClusterId": "cluster-a"},
+                {"id": "node-b", "name": "ExampleQS Right", "storageSystemClusterId": "cluster-a"},
+            ],
+            pools=[{"id": "pool-a", "activeStorageSystemId": "node-b"}],
+            disks=[],
+            disk_temperatures={},
+            smart_test_results=[],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="example-qs-ha",
+                label="ExampleQS HA",
+                default_profile_id=SCALE_SSG_FRONT_24_PROFILE_ID,
+                storage_views=[
+                    {
+                        "id": "primary-chassis",
+                        "label": "Primary Chassis",
+                        "kind": "ses_enclosure",
+                        "template_id": "ses-auto",
+                        "profile_id": SCALE_SSG_FRONT_24_PROFILE_ID,
+                        "binding": {"mode": "auto"},
+                    }
+                ],
+                truenas=TrueNASConfig(platform="quantastor"),
+                ssh=SSHConfig(ha_enabled=True),
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            profile = service.profile_registry.get(SCALE_SSG_FRONT_24_PROFILE_ID)
+            snapshots = {
+                "node-a": self._view_order_snapshot(
+                    "example-qs-ha", "node-a", "ExampleQS Left", 1, options, selected_profile=profile,
+                ),
+                "node-b": self._view_order_snapshot(
+                    "example-qs-ha", "node-b", "ExampleQS Right", 2, options, selected_profile=profile,
+                ),
+            }
+
+            async def get_snapshot(*, selected_enclosure_id: str | None = None, **_kwargs) -> InventorySnapshot:
+                return snapshots[selected_enclosure_id or "node-a"]
+
+            service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_inventory_source_bundle = AsyncMock(
+                return_value=self._empty_source_bundle(raw_data=raw_data)
+            )
+
+            runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="node-a"))
+
+        primary = next(view for view in runtime.views if view.id == "primary-chassis")
+        self.assertEqual(primary.backing_enclosure_id, "node-b")
+        self.assertEqual(primary.backing_enclosure_label, "ExampleQS Right")
+        self.assertEqual(primary.matched_count, 2)
+        self.assertEqual(runtime.default_selection, "view:primary-chassis")
+        self.assertEqual(runtime.view_order[0], "view:primary-chassis")
+        service._get_inventory_source_bundle.assert_awaited_once()
+
     def test_storage_view_candidate_build_reuses_parsed_ssh_bundle_per_enclosure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()
