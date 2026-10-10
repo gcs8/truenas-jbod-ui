@@ -420,7 +420,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
                 service.get_snapshot.assert_not_awaited()
 
-    def test_led_mutation_invalidates_every_view_of_the_physical_enclosure(self) -> None:
+    def test_led_mutation_returns_readback_and_schedules_the_full_refresh(self) -> None:
         route = next(
             route
             for route in app_main.app.routes
@@ -429,20 +429,34 @@ class MappingImportRouteTests(unittest.TestCase):
         )
         service = Mock()
         service.system.id = "system-a"
-        service.system.truenas.platform = "scale"
-        service.set_slot_led = AsyncMock()
-        service.get_snapshot = AsyncMock(
-            return_value=InventorySnapshot(slots=[], refresh_interval_seconds=30)
+        service.system.truenas.platform = "core"
+        service.set_slot_led = AsyncMock(
+            return_value={
+                "slot": 2,
+                "slot_label": "02",
+                "requested_active": True,
+                "identify_active": True,
+                "confirmed": True,
+                "readback_supported": True,
+                "paths": [
+                    {
+                        "ses_device": "/dev/ses0",
+                        "ses_element_id": 7,
+                        "identify_active": True,
+                    }
+                ],
+            }
         )
+        service.get_snapshot = AsyncMock(side_effect=AssertionError("LED POST must not build a snapshot"))
         registry = Mock()
         registry.get_service.return_value = service
 
         with (
             patch.object(app_routes, "get_inventory_registry", return_value=registry),
-            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "ensure_slot_bounds") as ensure_bounds,
             patch.object(app_routes, "add_perf_metadata"),
         ):
-            asyncio.run(
+            response = asyncio.run(
                 route.endpoint(
                     slot=2,
                     payload=LedRequest(action=LedAction.identify),
@@ -451,11 +465,68 @@ class MappingImportRouteTests(unittest.TestCase):
                 )
             )
 
-        service.invalidate_physical_enclosure_snapshot_cache.assert_called_once_with(
-            reason="route.set_slot_led",
-            enclosure_id="enc-a::dell-md1280-drawer-top-42",
-            invalidate_source_bundle=True,
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "ok": True,
+                "system_id": "system-a",
+                "enclosure_id": "enc-a::dell-md1280-drawer-top-42",
+                "slot": 2,
+                "slot_label": "02",
+                "requested_active": True,
+                "identify_active": True,
+                "confirmed": True,
+                "readback_supported": True,
+                "paths": [
+                    {
+                        "ses_device": "/dev/ses0",
+                        "ses_element_id": 7,
+                        "identify_active": True,
+                    }
+                ],
+            },
         )
+        ensure_bounds.assert_not_awaited()
+        service.get_snapshot.assert_not_awaited()
+        service.schedule_led_snapshot_refresh.assert_called_once_with(
+            enclosure_id="enc-a::dell-md1280-drawer-top-42"
+        )
+
+    def test_led_refusal_logs_the_bay_and_reason(self) -> None:
+        route = next(
+            route
+            for route in app_main.app.routes
+            if getattr(route, "path", "") == "/api/slots/{slot}/led"
+            and "POST" in (getattr(route, "methods", None) or set())
+        )
+        service = Mock()
+        service.system.id = "system-a"
+        service.system.truenas.platform = "core"
+        service.set_slot_led = AsyncMock(side_effect=TrueNASAPIError("Synthetic refusal."))
+        registry = Mock()
+        registry.get_service.return_value = service
+
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "ensure_slot_bounds"),
+            patch.object(app_routes, "add_perf_metadata"),
+            self.assertLogs(app_routes.logger, level="INFO") as logged,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            asyncio.run(
+                route.endpoint(
+                    slot=2,
+                    payload=LedRequest(action=LedAction.identify),
+                    system_id="system-a",
+                    enclosure_id="enc-a",
+                )
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("system-a", " ".join(logged.output))
+        self.assertIn("bay 2", " ".join(logged.output))
+        self.assertIn("Synthetic refusal.", " ".join(logged.output))
+        service.schedule_led_snapshot_refresh.assert_not_called()
 
     def test_mapping_save_that_clears_identify_invalidates_the_source_bundle(self) -> None:
         route = next(

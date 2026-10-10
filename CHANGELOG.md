@@ -26,6 +26,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Made locate-light actions use a short independent session, return immediate
+  hardware confirmation, and retain their result across page refreshes (#934).
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the

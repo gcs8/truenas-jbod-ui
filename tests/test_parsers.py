@@ -45,6 +45,45 @@ from app.services.parsers import (
 
 
 class ParserTests(unittest.TestCase):
+    def test_live_style_core_locate_map_and_show_report_on_and_off(self) -> None:
+        map_on = """
+ses4:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000c50000000001
+  Element 13, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x02 0x00)
+    Description: Slot13
+    Extra status:
+      - LED=locate
+ses8:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000c50000000001
+  Element 13, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x00 0x00)
+    Description: Slot13
+""".strip()
+        map_off = map_on.replace(" (0x05 0x00 0x02 0x00)", " (0x05 0x00 0x00 0x00)").replace(
+            "    Extra status:\n      - LED=locate\n", ""
+        )
+        show_on = """
+ses4: <ExampleCo DualPathShelf>; ID: 5000c50000000001
+Desc            Dev     Model                     Ident                Size/Status
+Slot13          -       -                         -                    Not Installed, LED=locate
+ses8: <ExampleCo DualPathShelf>; ID: 5000c50000000001
+Desc            Dev     Model                     Ident                Size/Status
+Slot13          -       -                         -                    Not Installed
+""".strip()
+        show_off = show_on.replace(", LED=locate", "")
+
+        for output, expected in ((map_on, [True, False]), (map_off, [False, False])):
+            with self.subTest(format="map", expected=expected):
+                parsed = parse_sesutil_map(output)
+                self.assertEqual([item.slots[13].identify_active for item in parsed], expected)
+        for output, expected in ((show_on, [True, False]), (show_off, [False, False])):
+            with self.subTest(format="show", expected=expected):
+                parsed = parse_sesutil_show_enclosures(output)
+                self.assertEqual([item.slots[13].identify_active for item in parsed], expected)
+
     def test_ses_merge_never_overrides_contradictory_explicit_enclosure_ids(self):
         for reverse in (False, True):
             rows = [SESMapEnclosure(enclosure_id=name, ses_device="/dev/sg2",

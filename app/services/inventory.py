@@ -120,10 +120,13 @@ from app.services.parsers import (
     parse_nvme_id_ctrl_summary,
     parse_nvme_id_ns_summary,
     parse_nvme_smart_log_summary,
+    parse_sesutil_map,
+    parse_sg_ses_enclosure_status,
     parse_smart_test_results,
     parse_smartctl_text_enrichment,
     parse_smartctl_summary,
     parse_ssh_outputs,
+    parse_unifi_gpio_debug,
     shift_hex_identifier,
 )
 from app.services.ssh_probe import (
@@ -1170,6 +1173,11 @@ class InventoryService:
         self.slot_detail_store = slot_detail_store
         self._cache: dict[str, InventorySnapshot] = {}
         self._cache_until: dict[str, datetime] = {}
+        # LED writes must not wait for snapshot-state admission. Keep the last
+        # published, identity-checked target for each enclosure view while a
+        # post-write background refresh replaces the main cache.
+        self._led_slot_targets: dict[tuple[str, int], SlotView] = {}
+        self._led_slot_target_sequences: dict[str, int] = {}
         self._smart_cache: dict[SmartCacheKey, SmartSummaryView] = {}
         self._smart_cache_until: dict[SmartCacheKey, datetime] = {}
         self._smart_negative_cache: OrderedDict[
@@ -1295,12 +1303,14 @@ class InventoryService:
         for cache_key, snapshot in list(previous._cache.items()):
             if cache_key in previous._snapshot_invalidated:
                 continue
-            self._cache[cache_key] = snapshot.model_copy(
+            adopted_snapshot = snapshot.model_copy(
                 update={
                     "systems": systems,
                     "refresh_interval_seconds": self.settings.app.refresh_interval_seconds,
                 }
             )
+            self._cache[cache_key] = adopted_snapshot
+            self._remember_led_snapshot(cache_key, adopted_snapshot)
             self._cache_until[cache_key] = min(
                 previous._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc)),
                 now + timedelta(seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))),
@@ -1519,6 +1529,11 @@ class InventoryService:
                         )
                         return CacheResult(cached, "trusted-fallback")
                     self._observe_inventory_snapshot_request(refresh_trigger)
+                    self._remember_led_snapshot(
+                        cache_key,
+                        snapshot,
+                        request_sequence=request_sequence,
+                    )
                     return CacheResult(snapshot, refresh_trigger)
                 # Fresh trusted discovery retires obsolete options even when an
                 # explicit old selection must be rejected. An omitted selection
@@ -1649,9 +1664,36 @@ class InventoryService:
         self._cache_until[cache_key] = utcnow() + timedelta(
             seconds=max(0, int(self.settings.app.snapshot_cache_ttl_seconds))
         )
+        self._remember_led_snapshot(
+            cache_key,
+            snapshot,
+            request_sequence=request_sequence,
+        )
         self._snapshot_published_sequence[cache_key] = request_sequence
         self._touch_snapshot_key(cache_key)
         return snapshot, True
+
+    def _remember_led_snapshot(
+        self,
+        cache_key: str,
+        snapshot: InventorySnapshot,
+        *,
+        request_sequence: int | None = None,
+    ) -> None:
+        scope_keys = {cache_key}
+        if snapshot.selected_enclosure_id:
+            scope_keys.add(snapshot.selected_enclosure_id)
+        for scope_key in scope_keys:
+            if request_sequence is not None:
+                previous_sequence = self._led_slot_target_sequences.get(scope_key, -1)
+                if previous_sequence > request_sequence:
+                    continue
+                self._led_slot_target_sequences[scope_key] = request_sequence
+            for target_key in tuple(self._led_slot_targets):
+                if target_key[0] == scope_key:
+                    self._led_slot_targets.pop(target_key, None)
+            for slot_view in snapshot.slots:
+                self._led_slot_targets[(scope_key, slot_view.slot)] = slot_view.model_copy(deep=True)
 
     def _remove_snapshot_state_key(self, cache_key: str, *, cancel_task: bool = False) -> bool:
         if self._snapshot_activity.get(cache_key):
@@ -4503,9 +4545,8 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         invalidate_snapshot: bool = True,
-    ) -> None:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
-        slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
+    ) -> dict[str, Any]:
+        slot_view = self._resolve_led_slot(slot, selected_enclosure_id)
         if not slot_view:
             raise TrueNASAPIError(f"Slot {slot:02d} is not present in the current snapshot.")
         if not slot_view.led_supported or not slot_view.led_backend:
@@ -4514,19 +4555,36 @@ class InventoryService:
                 or f"LED control is not available for slot {slot:02d} on this system."
             )
 
+        requested_active = self._locate_action_state(action)
+        confirmation: dict[str, Any] = {
+            "identify_active": None,
+            "confirmed": None,
+            "readback_supported": False,
+            "paths": [],
+        }
         if slot_view.led_backend == "api":
             api_slot_number = slot + self.settings.layout.api_slot_number_base
+            started = time.perf_counter()
             try:
                 await self.truenas_client.set_slot_status(slot_view.enclosure_id or "", api_slot_number, action.value)
             except TrueNASAPIError:
+                self._log_led_action(
+                    slot_view, device="truenas-api", element=api_slot_number,
+                    action=action, exit_status="error", started=started,
+                )
                 if slot_view.ssh_ses_device and slot_view.ssh_ses_element_id is not None:
-                    await self._set_slot_led_over_ssh(slot_view, action)
+                    confirmation = await self._set_slot_led_over_ssh(slot_view, action)
                 else:
                     raise
+            else:
+                self._log_led_action(
+                    slot_view, device="truenas-api", element=api_slot_number,
+                    action=action, exit_status=0, started=started,
+                )
         elif slot_view.led_backend in {"ssh", "scale_sg_ses", "quantastor_sg_ses"}:
-            await self._set_slot_led_over_ssh(slot_view, action)
+            confirmation = await self._set_slot_led_over_ssh(slot_view, action)
         elif slot_view.led_backend == "unifi_fault":
-            await self._set_unifi_slot_led_over_ssh(slot_view, action)
+            confirmation = await self._set_unifi_slot_led_over_ssh(slot_view, action)
         elif slot_view.led_backend == "supermicro_bmc":
             if self.bmc_service is None:
                 raise TrueNASAPIError("BMC / IPMI access is not configured for this system.")
@@ -4537,15 +4595,21 @@ class InventoryService:
                     slot_view.led_reason
                     or f"Slot {slot:02d} is missing the BMC controller metadata required for identify LED control."
                 )
-            if action == LedAction.identify:
-                active = True
-            elif action == LedAction.clear:
-                active = False
-            else:
+            if requested_active is None:
                 raise TrueNASAPIError(
                     "The Supermicro BMC can only turn the locate light on or off."
                 )
-            await asyncio.to_thread(self.bmc_service.set_drive_identify, controller_id, physical_index, active)
+            started = time.perf_counter()
+            await asyncio.to_thread(
+                self.bmc_service.set_drive_identify,
+                controller_id,
+                physical_index,
+                requested_active,
+            )
+            self._log_led_action(
+                slot_view, device="supermicro-bmc", element=physical_index,
+                action=action, exit_status=0, started=started,
+            )
         else:
             raise TrueNASAPIError(
                 slot_view.led_reason
@@ -4557,6 +4621,94 @@ class InventoryService:
                 enclosure_id=slot_view.enclosure_id,
                 invalidate_source_bundle=True,
             )
+        return {
+            "slot": slot_view.slot,
+            "slot_label": slot_view.slot_label,
+            "requested_active": requested_active,
+            **confirmation,
+        }
+
+    def _resolve_led_slot(self, slot: int, selected_enclosure_id: str | None) -> SlotView | None:
+        request_scope = selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+        remembered = self._led_slot_targets.get((request_scope, slot))
+        if remembered is not None:
+            return remembered
+        snapshot = (
+            self._cache.get(selected_enclosure_id)
+            if selected_enclosure_id is not None
+            else self.peek_cached_snapshot()
+        )
+        if snapshot is not None and (
+            selected_enclosure_id is None
+            or snapshot.selected_enclosure_id == selected_enclosure_id
+        ):
+            self._remember_led_snapshot(request_scope, snapshot)
+        return self._led_slot_targets.get((request_scope, slot))
+
+    @staticmethod
+    def _locate_action_state(action: LedAction) -> bool | None:
+        if action == LedAction.identify:
+            return True
+        if action == LedAction.clear:
+            return False
+        return None
+
+    def _log_led_action(
+        self,
+        slot_view: SlotView,
+        *,
+        device: str,
+        element: int,
+        action: LedAction,
+        exit_status: int | str | None,
+        started: float,
+    ) -> None:
+        self._log_led_action_result(
+            slot_view,
+            device=device,
+            element=element,
+            action=action,
+            exit_status=exit_status,
+            duration_seconds=max(0.0, time.perf_counter() - started),
+        )
+
+    def _log_led_action_result(
+        self,
+        slot_view: SlotView,
+        *,
+        device: str,
+        element: int,
+        action: LedAction,
+        exit_status: int | str | None,
+        duration_seconds: float,
+    ) -> None:
+        logger.info(
+            "Locate light command system=%s bay=%s device=%s element=%s action=%s "
+            "exit_status=%s duration_seconds=%.3f",
+            self.system.id,
+            slot_view.slot_label,
+            device,
+            element,
+            action.value,
+            exit_status,
+            max(0.0, duration_seconds),
+        )
+
+    def schedule_led_snapshot_refresh(self, *, enclosure_id: str | None) -> None:
+        self.invalidate_physical_enclosure_snapshot_cache(
+            reason="route.set_slot_led",
+            enclosure_id=enclosure_id,
+            invalidate_source_bundle=True,
+        )
+        cache_key = (
+            enclosure_id
+            or self._canonical_default_enclosure_id
+            or SNAPSHOT_NO_ENCLOSURE_KEY
+        )
+        self._schedule_background_snapshot_refresh(
+            cache_key,
+            default_selection=enclosure_id is None,
+        )
 
     def disk_inventory_sync_unavailable_reason(self, mode: DiskInventorySyncMode) -> str | None:
         """Return the plain-sentence reason a sync mode cannot run here, or None."""
@@ -13788,10 +13940,14 @@ class InventoryService:
         seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
         return "gpio debug" not in seen_commands
 
-    async def _set_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
+    async def _set_slot_led_over_ssh(
+        self,
+        slot_view: SlotView,
+        action: LedAction,
+    ) -> dict[str, Any]:
         if not self.system.ssh.enabled:
             raise TrueNASAPIError("SSH is off, so bay lights cannot be switched through the enclosure.")
-        ses_targets = slot_view.ssh_ses_targets or []
+        ses_targets = [dict(target) for target in (slot_view.ssh_ses_targets or [])]
         if not ses_targets and slot_view.ssh_ses_device and slot_view.ssh_ses_element_id is not None:
             ses_targets = [
                 {
@@ -13820,6 +13976,10 @@ class InventoryService:
                     "so its light cannot be switched safely."
                 )
 
+        requested_active = self._locate_action_state(action)
+        if requested_active is None:
+            raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
+
         if self.system.truenas.platform == "core":
             core_target = _core_identify_target(ses_targets)
             if core_target is None:
@@ -13827,65 +13987,246 @@ class InventoryService:
                     f"Bay {slot_view.slot_label} is not tied to exactly one enclosure element, "
                     "so its light cannot be switched safely."
                 )
-            ses_targets = [core_target]
+            return await self._set_core_slot_led_over_ssh(
+                slot_view,
+                action,
+                requested_active,
+                core_target,
+                ses_targets,
+            )
+        return await self._set_sg_ses_slot_led_over_ssh(
+            slot_view,
+            action,
+            requested_active,
+            ses_targets,
+        )
 
-        if action == LedAction.identify:
-            locate_state = "on"
-        elif action == LedAction.clear:
-            locate_state = "off"
-        else:
-            raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
+    async def _set_core_slot_led_over_ssh(
+        self,
+        slot_view: SlotView,
+        action: LedAction,
+        requested_active: bool,
+        action_target: dict[str, Any],
+        readback_targets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        target_host = normalize_text(action_target.get("ssh_host"))
+        target_device = normalize_text(action_target.get("ses_device"))
+        target_element = action_target.get("ses_element_id")
+        if not target_device or not isinstance(target_element, int):
+            raise TrueNASAPIError(
+                f"Bay {slot_view.slot_label} is missing the enclosure element needed to switch its light."
+            )
+        locate_state = "on" if requested_active else "off"
+        action_command = shlex.join(
+            [
+                "sudo",
+                "-n",
+                "/usr/sbin/sesutil",
+                "locate",
+                "-u",
+                target_device,
+                str(target_element),
+                locate_state,
+            ]
+        )
+        # Read all SES paths in one plain map immediately after the action. Do
+        # not use `map -u`: per-path observations are needed for dual-path bays.
+        readback_command = "sudo -n /usr/sbin/sesutil map"
+        results = await self._run_led_ssh_sequence(
+            target_host,
+            [action_command, readback_command],
+        )
+        action_result, action_duration = results[0]
+        self._log_led_action_result(
+            slot_view,
+            device=target_device,
+            element=target_element,
+            action=action,
+            exit_status=action_result.exit_code,
+            duration_seconds=action_duration,
+        )
+        if not action_result.ok:
+            raise TrueNASAPIError(
+                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
+            )
 
-        failures: list[str] = []
+        readback_result = results[1]
+        parsed = parse_sesutil_map(readback_result[0].stdout) if readback_result[0].ok else []
+        enclosure_by_device = {item.ses_device: item for item in parsed}
+        paths: list[dict[str, Any]] = []
+        for target in readback_targets:
+            device = normalize_text(target.get("ses_device"))
+            element = target.get("ses_element_id")
+            if not device or not isinstance(element, int):
+                continue
+            enclosure = enclosure_by_device.get(device)
+            observed = None
+            if enclosure is not None:
+                mapped_slot = next(
+                    (
+                        candidate
+                        for candidate in enclosure.slots.values()
+                        if candidate.element_id == element
+                    ),
+                    enclosure.slots.get(element),
+                )
+                if mapped_slot is not None:
+                    observed = bool(mapped_slot.identify_active)
+            paths.append(
+                {
+                    "ses_device": device,
+                    "ses_element_id": element,
+                    "identify_active": observed,
+                }
+            )
+        return self._led_readback_result(requested_active, paths)
+
+    async def _set_sg_ses_slot_led_over_ssh(
+        self,
+        slot_view: SlotView,
+        action: LedAction,
+        requested_active: bool,
+        ses_targets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        by_host: dict[str | None, list[dict[str, Any]]] = {}
         for target in ses_targets:
-            target_host = normalize_text(target.get("ssh_host"))
             target_device = normalize_text(target.get("ses_device"))
             target_element = target.get("ses_element_id")
-            target_slot_number = target.get("ses_slot_number")
-            if not target_device or not isinstance(target_element, int):
-                continue
-            if target_device.startswith("/dev/sg"):
-                if action == LedAction.identify:
-                    sg_action = "--set=ident"
-                elif action == LedAction.clear:
-                    sg_action = "--clear=ident"
-                else:
-                    raise TrueNASAPIError("The enclosure can only turn the locate light on or off.")
+            if not target_device or not target_device.startswith("/dev/sg") or not isinstance(target_element, int):
+                raise TrueNASAPIError(
+                    f"Bay {slot_view.slot_label} has an unsupported SSH enclosure target."
+                )
+            by_host.setdefault(normalize_text(target.get("ssh_host")), []).append(target)
 
-                target_slot = target_slot_number
-                command = shlex.join(
+        failures: list[str] = []
+        paths: list[dict[str, Any]] = []
+        sg_action = "--set=ident" if requested_active else "--clear=ident"
+        for target_host, host_targets in by_host.items():
+            commands: list[str] = []
+            for target in host_targets:
+                target_device = normalize_text(target.get("ses_device"))
+                if not target_device:
+                    continue
+                target_slot = target.get("ses_slot_number")
+                commands.extend(
                     [
-                        "sudo",
-                        "-n",
-                        "/usr/bin/sg_ses",
-                        f"--dev-slot-num={target_slot}",
-                        sg_action,
-                        target_device,
+                        shlex.join(
+                            [
+                                "sudo", "-n", "/usr/bin/sg_ses",
+                                f"--dev-slot-num={target_slot}", sg_action, target_device,
+                            ]
+                        ),
+                        shlex.join(["sudo", "-n", "/usr/bin/sg_ses", "-p", "ec", target_device]),
                     ]
                 )
-            else:
-                command = shlex.join(
-                    [
-                        "sudo",
-                        "-n",
-                        "/usr/sbin/sesutil",
-                        "locate",
-                        "-u",
-                        target_device,
-                        str(target_element),
-                        locate_state,
-                    ]
+            results = await self._run_led_ssh_sequence(target_host, commands)
+            for index, target in enumerate(host_targets):
+                action_result, action_duration = results[index * 2]
+                readback_result, _readback_duration = results[index * 2 + 1]
+                target_device = normalize_text(target.get("ses_device"))
+                if not target_device:
+                    continue
+                target_element = int(target["ses_element_id"])
+                self._log_led_action_result(
+                    slot_view,
+                    device=target_device,
+                    element=target_element,
+                    action=action,
+                    exit_status=action_result.exit_code,
+                    duration_seconds=action_duration,
                 )
-            result = await self._run_ssh_command(command, target_host)
-            if not result.ok:
-                detail = result.stderr.strip() or result.stdout.strip() or "Unknown SSH LED error."
-                target_label = f"{target_host}:{target_device}" if target_host else target_device
-                failures.append(f"{target_label}:{target_element}: {detail}")
-
+                if not action_result.ok:
+                    failures.append(
+                        f"{target_device}:{target_element}: {self._led_command_failure_detail(action_result)}"
+                    )
+                    continue
+                observed = None
+                if readback_result.ok:
+                    enclosure = parse_sg_ses_enclosure_status(
+                        readback_result.stdout,
+                        readback_result.command,
+                    )
+                    if enclosure is not None:
+                        mapped_slot = next(
+                            (
+                                candidate
+                                for candidate in enclosure.slots.values()
+                                if candidate.element_id == target_element
+                            ),
+                            None,
+                        )
+                        if mapped_slot is not None:
+                            observed = bool(mapped_slot.identify_active)
+                paths.append(
+                    {
+                        "ses_device": target_device,
+                        "ses_element_id": target_element,
+                        "identify_active": observed,
+                    }
+                )
         if failures:
             raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+        return self._led_readback_result(requested_active, paths)
 
-    async def _set_unifi_slot_led_over_ssh(self, slot_view: SlotView, action: LedAction) -> None:
+    @staticmethod
+    def _led_readback_result(
+        requested_active: bool,
+        paths: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        observed = [
+            path["identify_active"]
+            for path in paths
+            if isinstance(path.get("identify_active"), bool)
+        ]
+        identify_active = any(observed) if observed else None
+        return {
+            "identify_active": identify_active,
+            "confirmed": bool(
+                observed
+                and len(observed) == len(paths)
+                and identify_active is requested_active
+            ),
+            "readback_supported": True,
+            "paths": paths,
+        }
+
+    async def _run_led_ssh_sequence(
+        self,
+        target_host: str | None,
+        commands: list[str],
+    ) -> list[tuple[SSHCommandResult, float]]:
+        if not self._ssh_destination_authority_approved(target_host):
+            return [
+                (result, 0.0)
+                for result in self._ssh_authority_failure_results(commands)
+            ]
+        probe: Any = self._ssh_probe_for_host(normalize_text(target_host))
+        if not isinstance(probe, SSHProbe):
+            fallback_results: list[tuple[SSHCommandResult, float]] = []
+            for command in commands:
+                started = time.perf_counter()
+                result = await self._run_ssh_command(command, target_host)
+                fallback_results.append((result, max(0.0, time.perf_counter() - started)))
+            return fallback_results
+
+        # This session deliberately bypasses the shared optional-SSH session
+        # lock. A locate click must not queue behind a full inventory scrape.
+        session = probe.open_session()
+        results: list[tuple[SSHCommandResult, float]] = []
+        try:
+            for command in commands:
+                started = time.perf_counter()
+                result = await session.run_command_owned(command)
+                results.append((result, max(0.0, time.perf_counter() - started)))
+        finally:
+            await session.close_owned()
+        return results
+
+    async def _set_unifi_slot_led_over_ssh(
+        self,
+        slot_view: SlotView,
+        action: LedAction,
+    ) -> dict[str, Any]:
         if not self.system.ssh.enabled:
             raise TrueNASAPIError("SSH is off, so bay lights cannot be switched through the UniFi service.")
 
@@ -13896,13 +14237,10 @@ class InventoryService:
                 or f"Slot {slot_view.slot_label} is missing the UniFi vendor bay number required for LED control."
             )
 
-        if action == LedAction.identify:
-            toggle = "True"
-        elif action == LedAction.clear:
-            toggle = "False"
-        else:
+        requested_active = self._locate_action_state(action)
+        if requested_active is None:
             raise TrueNASAPIError("The UniFi service can only turn the locate light on or off.")
-
+        toggle = "True" if requested_active else "False"
         command = shlex.join(
             [
                 "python3",
@@ -13910,10 +14248,41 @@ class InventoryService:
                 f"from ustd.hwmon import sata_led_sm; sata_led_sm.set_fault({vendor_slot_number}, {toggle})",
             ]
         )
-        result = await self._run_ssh_command(command)
-        if not result.ok:
-            detail = result.stderr.strip() or result.stdout.strip() or "Unknown UniFi SSH LED error."
-            raise TrueNASAPIError("SSH LED action failed: " + detail)
+        readback_command = "cat /sys/kernel/debug/gpio"
+        results = await self._run_led_ssh_sequence(None, [command, readback_command])
+        action_result, duration = results[0]
+        self._log_led_action_result(
+            slot_view,
+            device="unifi-gpio",
+            element=vendor_slot_number,
+            action=action,
+            exit_status=action_result.exit_code,
+            duration_seconds=duration,
+        )
+        if not action_result.ok:
+            raise TrueNASAPIError(
+                "SSH LED action failed: " + self._led_command_failure_detail(action_result)
+            )
+        readback_result = results[1][0]
+        states = parse_unifi_gpio_debug(readback_result.stdout) if readback_result.ok else {}
+        observed = states.get(vendor_slot_number)
+        return self._led_readback_result(
+            requested_active,
+            [
+                {
+                    "vendor_slot_number": vendor_slot_number,
+                    "identify_active": observed if isinstance(observed, bool) else None,
+                }
+            ],
+        )
+
+    @staticmethod
+    def _led_command_failure_detail(result: SSHCommandResult) -> str:
+        return (
+            _bounded_middleware_text(result.stderr)
+            or _bounded_middleware_text(result.stdout)
+            or f"exit {result.exit_code}"
+        )
 
     async def _run_ssh_command(
         self, command: str, host: str | None = None, *, timeout_seconds: float | None = None
