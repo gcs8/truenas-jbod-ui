@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Added
+
+- Added a per-system opening order for live enclosures and saved views. Without
+  one, the main page opens the entry with the most occupied disks and keeps
+  QuantaStor Primary Chassis on the pool owner. (#933)
+
 ## v0.24.0-beta.2 - 2026-10-09
 
 This prerelease adds the fixes merged after `v0.24.0-beta.1`. GHCR gets the
