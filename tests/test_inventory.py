@@ -15643,6 +15643,8 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 service._touch_snapshot_key("enc-a")
                 service._source_bundle = stale_bundle
                 service._source_bundle_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+                valid_sg_cache = (["/dev/sg-test"], datetime.now(timezone.utc) + timedelta(minutes=5))
+                service._sg_ses_device_cache["test-host"] = valid_sg_cache
                 collect_started = asyncio.Event()
                 release_collect = asyncio.Event()
 
@@ -15686,9 +15688,156 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                     history_result,
                     refreshed_snapshot if force_refresh else stale_snapshot,
                 )
-                service._collect_inventory_source_bundle.assert_awaited_once_with()
+                self.assertEqual(service._collect_inventory_source_bundle.await_count, 2 if force_refresh else 1)
+                if force_refresh:
+                    self.assertNotIn("test-host", service._sg_ses_device_cache)
+                else:
+                    self.assertEqual(service._sg_ses_device_cache["test-host"], valid_sg_cache)
                 self.assertEqual(service._build_snapshot.await_count, 1)
                 self.assertIs(service._cache["enc-a"], refreshed_snapshot)
+
+    async def test_force_refresh_waiting_for_ordinary_rebuild_still_refreshes_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="force-overlap", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            option = EnclosureOption(id="enc-a", label="Shelf A")
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="scale",
+                selected_enclosure_id="enc-a",
+                enclosures=[option],
+                warnings=["stale snapshot"],
+            )
+            ordinary_snapshot = stale_snapshot.model_copy(update={"warnings": ["ordinary source"]})
+            forced_snapshot = stale_snapshot.model_copy(update={"warnings": ["forced source"]})
+            ordinary_bundle = self._empty_source_bundle(warning="ordinary source")
+            forced_bundle = self._empty_source_bundle(warning="forced source")
+            service._canonical_enclosure_options = {option.id: option}
+            service._canonical_default_enclosure_id = option.id
+            service._cache[option.id] = stale_snapshot
+            service._cache_until[option.id] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._snapshot_published_sequence[option.id] = 0
+            service._touch_snapshot_key(option.id)
+            service._source_bundle = ordinary_bundle
+            service._source_bundle_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+            valid_sg_cache = (["/dev/sg-test"], datetime.now(timezone.utc) + timedelta(minutes=5))
+            service._sg_ses_device_cache["test-host"] = valid_sg_cache
+            service._collect_inventory_source_bundle = AsyncMock(return_value=forced_bundle)
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+                source_publications: list[object] | None = None,
+            ) -> InventorySnapshot:
+                self.assertEqual(selected_enclosure_id, option.id)
+                bundle = await service._get_inventory_source_bundle(force_refresh=force_source_refresh)
+                publication = getattr(bundle, "publication", None)
+                if source_publications is not None and publication is not None:
+                    source_publications.append(publication)
+                self.assertIs(bundle, forced_bundle)
+                return forced_snapshot
+
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            service._snapshot_request_sequence = 1
+            snapshot_lock = service._get_snapshot_lock(option.id)
+            await snapshot_lock.acquire()
+            forced_request = asyncio.create_task(
+                service.get_snapshot(force_refresh=True, selected_enclosure_id=option.id)
+            )
+            for _ in range(10):
+                if service._snapshot_activity.get(option.id) == 1:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(service._snapshot_activity.get(option.id), 1)
+            service._cache[option.id] = ordinary_snapshot
+            service._cache_until[option.id] = datetime.now(timezone.utc) + timedelta(minutes=1)
+            service._snapshot_published_sequence[option.id] = 1
+            snapshot_lock.release()
+            forced_result = await forced_request
+
+            self.assertIs(forced_result, forced_snapshot)
+            service._collect_inventory_source_bundle.assert_awaited_once_with()
+            service._build_snapshot.assert_awaited_once_with(
+                selected_enclosure_id=option.id,
+                force_source_refresh=True,
+            )
+            self.assertNotIn("test-host", service._sg_ses_device_cache)
+
+    async def test_background_refresh_renders_the_source_publication_it_awaited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(id="source-generation", truenas=TrueNASConfig(platform="scale"))
+            service = build_inventory_service(
+                settings,
+                system,
+                AsyncMock(),
+                AsyncMock(),
+                temp_dir,
+            )
+            option = EnclosureOption(id="enc-a", label="Shelf A")
+            stale_snapshot = InventorySnapshot(
+                slots=[],
+                refresh_interval_seconds=30,
+                selected_system_id=system.id,
+                selected_system_platform="scale",
+                selected_enclosure_id=option.id,
+                enclosures=[option],
+                warnings=["stale snapshot"],
+            )
+            ordinary_snapshot = stale_snapshot.model_copy(update={"warnings": ["ordinary source"]})
+            refreshed_snapshot = stale_snapshot.model_copy(update={"warnings": ["refreshed source"]})
+            ordinary_bundle = self._empty_source_bundle(warning="ordinary source")
+            refreshed_bundle = self._empty_source_bundle(warning="refreshed source")
+            service._canonical_enclosure_options = {option.id: option}
+            service._canonical_default_enclosure_id = option.id
+            service._cache[option.id] = stale_snapshot
+            service._cache_until[option.id] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            service._snapshot_published_sequence[option.id] = 0
+            service._touch_snapshot_key(option.id)
+            service._source_bundle = ordinary_bundle
+            service._source_bundle_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+            collect_started = asyncio.Event()
+            release_collect = asyncio.Event()
+
+            async def collect_source_bundle() -> InventorySourceBundle:
+                collect_started.set()
+                await release_collect.wait()
+                return refreshed_bundle
+
+            async def build_snapshot(
+                selected_enclosure_id: str | None = None,
+                *,
+                force_source_refresh: bool = False,
+                source_publications: list[object] | None = None,
+            ) -> InventorySnapshot:
+                self.assertEqual(selected_enclosure_id, option.id)
+                bundle = await service._get_inventory_source_bundle(force_refresh=force_source_refresh)
+                publication = getattr(bundle, "publication", None)
+                if source_publications is not None and publication is not None:
+                    source_publications.append(publication)
+                return refreshed_snapshot if bundle is refreshed_bundle else ordinary_snapshot
+
+            service._collect_inventory_source_bundle = AsyncMock(side_effect=collect_source_bundle)
+            service._build_snapshot = AsyncMock(side_effect=build_snapshot)
+            background_task = asyncio.create_task(service._background_snapshot_refresh(option.id))
+            await asyncio.wait_for(collect_started.wait(), timeout=0.5)
+            self.assertIs(await service.get_snapshot(selected_enclosure_id=option.id), ordinary_snapshot)
+            release_collect.set()
+            await asyncio.wait_for(background_task, timeout=0.5)
+
+            service._collect_inventory_source_bundle.assert_awaited_once_with()
+            self.assertEqual(service._build_snapshot.await_count, 2)
+            self.assertIs(service._cache[option.id], refreshed_snapshot)
 
     async def test_background_refresh_superseded_by_other_key_does_not_log_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
