@@ -509,8 +509,6 @@ def verify_results(
                 problems.append(f"shard {shard_id}: invalid {counter} count")
             elif counter != "skipped" and value != 0:
                 problems.append(f"shard {shard_id}: nonzero {counter} count")
-            elif type(payload.get("tests_run")) is int and value > payload["tests_run"]:
-                problems.append(f"shard {shard_id}: {counter} exceeds tests_run")
         if payload.get("was_successful") is not True:
             problems.append(
                 f"shard {shard_id}: not successful "

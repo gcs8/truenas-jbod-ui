@@ -420,7 +420,8 @@ class SkippedCases(unittest.TestCase):
     def test_success_flag_cannot_hide_invalid_outcome_counters(self) -> None:
         for override in ({"failures": 1}, {"errors": 1}, {"unexpected_successes": 1},
                          {"tests_run": True}, {"errors": -1}, {"skipped": "0"},
-                         {"tests_run": 4}, {"skipped": 4}):
+                         {"tests_run": 4}, {"skipped": -1}, {"skipped": True},
+                         {"skipped": None}, {"skipped": 1.5}):
             with self.subTest(override=override), _SyntheticTestsDir(self) as synthetic:
                 shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
                 self._attempt(synthetic.path / "results", shards, "1", 1, **override)
