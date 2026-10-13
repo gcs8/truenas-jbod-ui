@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -141,7 +142,19 @@ class FullBackupBenchmarkTests(unittest.TestCase):
             self.assertLessEqual(db.execute("SELECT MAX(length(details_json)) FROM slot_events").fetchone()[0], 4096)
 
     def run_cli(self, argv, *, cwd, timeout):
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        # The path-only CLI probe stays in this session. Kill its descendants
+        # before the caller removes case scratch, including on timeout/assertion.
+        with subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+                return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
 
     def test_cli_timeout_reaps_process_group_and_cleans_case_scratch(self):
         import time
@@ -183,18 +196,46 @@ class FullBackupBenchmarkTests(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_relative_output_cli_outside_repository(self):
+        # Exercise the real CLI, root resolution, owned_run and phase-directory
+        # cleanup. Only phase measurement is replaced: full production codec
+        # coverage lives in the dedicated self-test contracts below.
+        probe = f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(ROOT)!r})
+from scripts import benchmark_full_backup as b
+expected_parent = Path(sys.argv[sys.argv.index("--output-root") + 1]).resolve(strict=True)
+
+def path_phase(argv, request, scratch, *, timeout, owned_phase):
+    root = Path(request["root"])
+    assert root.is_absolute() and scratch.is_absolute()
+    assert root.parent == expected_parent
+    assert scratch.parent == root
+    b.admit_run(root, request["target_bytes"])
+    (scratch / "synthetic-phase-sentinel").write_text(owned_phase)
+    (root / (owned_phase + ".synthetic")).touch()
+    return {{"state": "complete", "input_bytes": 0, "output_bytes": 0}}
+
+b.measure_process = path_phase
+raise SystemExit(b.main())
+"""
         for relative in (".", "child space/..", "child space"):
-            with self.subTest(relative=relative):
-                child = self.root / "child space"
-                child.mkdir(mode=0o700, exist_ok=True)
-                proc = subprocess.run([sys.executable, "-B", str(SCRIPT), "--self-test",
-                                       "--output-root", relative], cwd=self.root,
-                                      capture_output=True, text=True, timeout=120)
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory(dir=self.root) as name:
+                case_root = Path(name)
+                child = case_root / "child space"
+                child.mkdir(mode=0o700)
+                proc = self.run_cli([sys.executable, "-B", "-c", probe, "--self-test",
+                                     "--format", "tar.zst-stream", "--output-root", relative],
+                                    cwd=case_root, timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
                 report = json.loads(proc.stdout)
-                self.assertEqual(report["phases"][0]["state"], "complete")
+                self.assertEqual([p["phase"] for p in report["phases"]], list(self.b.PHASES))
+                self.assertTrue(all(p["state"] == "complete" for p in report["phases"]))
                 self.assertTrue(report["scratch_cleaned"])
                 self.assertEqual(list(child.iterdir()), [])
-                self.assertEqual(list(self.root.iterdir()), [child])
+                self.assertEqual(list(case_root.iterdir()), [child])
+            self.assertFalse(case_root.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_scaled_production_ceiling_export_and_size_prevalidation(self):
         from history_service import system_backup as sb
