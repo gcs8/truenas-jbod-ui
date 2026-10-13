@@ -381,6 +381,42 @@ class ShardVerifyTests(unittest.TestCase):
             self._attempt(results, shards, "1", 2, python_version="3.12")
             self.assertTrue(any("expected '3.14'" in p for p in self._verify_attempts(synthetic.path, shards)))
 
+    def test_successful_shard_with_multiple_skipped_subtests_is_admitted(self) -> None:
+        body = """
+import unittest
+
+class SkippedCases(unittest.TestCase):
+    def test_cases(self):
+        for index in range(3):
+            with self.subTest(index=index):
+                self.skipTest("synthetic unavailable feature")
+"""
+        for attempt in (None, 2):
+            with self.subTest(attempt=attempt), _SyntheticTestsDir(self) as synthetic:
+                module = synthetic.write("test_skipped_cases", body)
+                shards = {"1": (module,)}
+                results = synthetic.path / "results"
+                self.assertEqual(
+                    run_test_shard.run_shard(
+                        "1", shards=shards, tests_dir=synthetic.path,
+                        results_dir=results, stream=io.StringIO(), run_attempt=attempt,
+                    ),
+                    0,
+                )
+                receipt = json.loads(
+                    run_test_shard.result_path(results, "1", attempt).read_text(encoding="utf-8")
+                )
+                self.assertEqual(receipt["tests_run"], 1)
+                self.assertEqual(receipt["skipped"], 3)
+                self.assertIs(receipt["was_successful"], True)
+                self.assertEqual(
+                    run_test_shard.verify_results(
+                        results, run_test_shard.python_version_label(), shards=shards,
+                        tests_dir=synthetic.path, expected_counts={module: 1},
+                    ),
+                    [],
+                )
+
     def test_success_flag_cannot_hide_invalid_outcome_counters(self) -> None:
         for override in ({"failures": 1}, {"errors": 1}, {"unexpected_successes": 1},
                          {"tests_run": True}, {"errors": -1}, {"skipped": "0"},
