@@ -140,6 +140,48 @@ class FullBackupBenchmarkTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0], first["rows"]["slot_events"])
             self.assertLessEqual(db.execute("SELECT MAX(length(details_json)) FROM slot_events").fetchone()[0], 4096)
 
+    def run_cli(self, argv, *, cwd, timeout):
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    def test_cli_timeout_reaps_process_group_and_cleans_case_scratch(self):
+        import time
+
+        marker = self.root / "late-cli-write"
+        processes = []
+        original_popen = subprocess.Popen
+        original_communicate = subprocess.Popen.communicate
+        with tempfile.TemporaryDirectory(dir=self.root) as name:
+            case_root = Path(name)
+            ready = case_root / "ready"
+            child = (f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); "
+                     f"time.sleep(1); Path({str(marker)!r}).touch()")
+            code = ("import subprocess,sys,time; "
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}]); time.sleep(30)")
+
+            def observed(*args, **kwargs):
+                process = original_popen(*args, **kwargs)
+                processes.append(process)
+                return process
+
+            def after_ready(process, *args, **kwargs):
+                if kwargs.get("timeout") is not None:
+                    deadline = time.monotonic() + 10
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists(), "synthetic descendant did not start")
+                    kwargs["timeout"] = 0.05
+                return original_communicate(process, *args, **kwargs)
+
+            with patch.object(subprocess, "Popen", side_effect=observed), \
+                    patch.object(original_popen, "communicate", after_ready):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.run_cli([sys.executable, "-c", code], cwd=case_root, timeout=10)
+            self.assertIsNotNone(processes[0].returncode, "CLI supervisor was not reaped")
+        self.assertFalse(case_root.exists())
+        time.sleep(1.1)
+        self.assertFalse(marker.exists(), "CLI descendant survived timeout cleanup")
+        self.assertEqual(list(self.root.iterdir()), [])
+
     def test_relative_output_cli_outside_repository(self):
         for relative in (".", "child space/..", "child space"):
             with self.subTest(relative=relative):
