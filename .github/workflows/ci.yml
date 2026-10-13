@@ -196,6 +196,9 @@ jobs:
         shard: ["1", "2", "3", "4"]
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      # Keep the source-gate command contract unchanged; the runner uses this
+      # default for both plain and report-only coverage legs.
+      SHARD_RUN_ATTEMPT: ${{ github.run_attempt }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -265,14 +268,14 @@ jobs:
         if: matrix.python-version == '3.14'
         env:
           COVERAGE_CORE: sysmon
-          COVERAGE_FILE: shard-results/.coverage.shard-${{ matrix.shard }}
+          COVERAGE_FILE: shard-results/.coverage.shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
         run: coverage run scripts/run_test_shard.py run --shard "${{ matrix.shard }}" --results-dir shard-results
 
       - name: Upload shard result
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: python-unittest-${{ matrix.python-version }}-shard-${{ matrix.shard }}
+          name: python-unittest-${{ matrix.python-version }}-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: shard-results/
           include-hidden-files: true
           if-no-files-found: error
@@ -318,15 +321,24 @@ jobs:
         with:
           pattern: python-unittest-${{ matrix.python-version }}-shard-*
           path: shard-results
-          merge-multiple: true
+          # Preserve all attempts, including unaffected shards from failed-only
+          # reruns. The verifier selects the latest numeric attempt per shard.
+          merge-multiple: false
 
       - name: Require a green result from every shard
         run: python scripts/run_test_shard.py verify --results-dir shard-results --python-version "${{ matrix.python-version }}"
 
+      # A rerun may fail before writing a receipt. An older passing receipt
+      # must not hide a failed, skipped or otherwise incomplete shard job.
+      - name: Require successful shard jobs
+        env:
+          SHARD_JOB_RESULT: ${{ needs.python-unittest.result }}
+        run: test "$SHARD_JOB_RESULT" = success
+
       - name: Combine report-only coverage
         if: matrix.python-version == '3.14'
         run: |
-          coverage combine shard-results/.coverage.shard-*
+          coverage combine shard-results/*/.coverage.shard-*
           coverage report
           coverage xml -o coverage.xml
 
@@ -334,7 +346,7 @@ jobs:
         if: matrix.python-version == '3.14'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: python-coverage-xml
+          name: python-coverage-xml-attempt-${{ github.run_attempt }}
           path: coverage.xml
           if-no-files-found: error
 

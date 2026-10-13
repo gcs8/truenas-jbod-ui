@@ -17,7 +17,7 @@
     "test_backup_archive_journal": 35,
     "test_backup_archive_lifecycle": 40,
     "test_backup_archive_transport": 76,
-    "test_backup_integration": 133,
+    "test_backup_integration": 134,
     "test_bash_ci_contract": 6,
     "test_changelog_entry_gate": 23,
     "test_ci_contract": 48,
@@ -114,7 +114,7 @@
     "test_truenas_ws": 66,
     "test_truenas_ws_jsonrpc": 52,
     "test_ui_health_and_admin_probe": 72,
-    "test_unittest_shards": 15,
+    "test_unittest_shards": 31,
     "test_upgrade_notice": 24,
     "test_wiki_drift_verifier": 21
   }
