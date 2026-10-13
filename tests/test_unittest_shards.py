@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -154,6 +155,38 @@ class ShardRunTests(unittest.TestCase):
         self.assertEqual((second["tests_run"], second["failures"], second["was_successful"]), (1, 1, False))
         self.assertEqual(first["python_version"], run_test_shard.python_version_label())
 
+    def test_run_attempt_receipts_are_distinct_and_record_identity(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_attempt", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            for attempt in (1, 2):
+                self.assertEqual(run_test_shard.run_shard(
+                    "1", shards=shards, tests_dir=synthetic.path, results_dir=results,
+                    stream=io.StringIO(), run_attempt=attempt,
+                ), 0)
+            self.assertEqual(len(list(results.glob("*.json"))), 2)
+            for attempt in (1, 2):
+                payload = json.loads((results / f"shard-1-attempt-{attempt}.json").read_text())
+                self.assertEqual(payload["run_attempt"], attempt)
+            with mock.patch.object(run_test_shard, "build_suite_and_counts") as build:
+                self.assertEqual(run_test_shard.run_shard(
+                    "1", shards=shards, tests_dir=synthetic.path, results_dir=results,
+                    stream=io.StringIO(), run_attempt=2,
+                ), 2)
+                build.assert_not_called()
+
+    def test_run_rejects_invalid_attempt_before_execution(self) -> None:
+        for attempt in (True, 0, -1, "2"):
+            with self.subTest(attempt=attempt), mock.patch.object(run_test_shard, "build_suite_and_counts") as build:
+                self.assertEqual(run_test_shard.run_shard("1", run_attempt=attempt), 2)
+                build.assert_not_called()
+
+    def test_cli_uses_ci_attempt_environment_and_allows_explicit_override(self) -> None:
+        with mock.patch.dict(os.environ, {"SHARD_RUN_ATTEMPT": "2"}):
+            parser = run_test_shard._build_parser()
+            self.assertEqual(parser.parse_args(["run", "--shard", "1"]).run_attempt, 2)
+            self.assertEqual(parser.parse_args(["run", "--shard", "1", "--run-attempt", "10"]).run_attempt, 10)
+
     def test_suite_is_loaded_in_discovery_form(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
             synthetic.write("test_form_probe", PASSING_MODULE)
@@ -235,6 +268,164 @@ class ShardVerifyTests(unittest.TestCase):
                     expected_counts=expected_counts,
                 )[0],
             )
+
+    def _attempt(self, results_dir, shards, shard_id, attempt, **overrides):
+        self._results(results_dir, {shard_id: shards[shard_id]})
+        source = run_test_shard.result_path(results_dir, shard_id)
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload.update(run_attempt=attempt, **overrides)
+        source.unlink()
+        target = results_dir / f"shard-{shard_id}-attempt-{attempt}.json"
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return target
+
+    def _verify_attempts(self, tests_dir, shards):
+        return run_test_shard.verify_results(
+            tests_dir / "results", "3.14", shards=shards, tests_dir=tests_dir,
+            expected_counts={module: 3 for modules in shards.values() for module in modules},
+        )
+
+    def test_latest_attempt_replaces_failure_and_keeps_unaffected_shards(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),),
+                      "2": (synthetic.write("test_b", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            self._attempt(results, shards, "1", 2, was_successful=False, failures=1,
+                          test_counts={"test_a": 2})
+            self._attempt(results, shards, "2", 2)
+            self._attempt(results, shards, "1", 10)
+            paths = list(results.glob("*.json"))
+            for order in (paths, list(reversed(paths))):
+                with self.subTest(order=[p.name for p in order]), mock.patch.object(
+                    Path, "rglob", return_value=iter(order)
+                ):
+                    self.assertEqual(self._verify_attempts(synthetic.path, shards), [])
+
+    def test_latest_failed_attempt_cannot_fall_back_to_older_success(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            self._attempt(results, shards, "1", 1)
+            self._attempt(results, shards, "1", 2, was_successful=False, failures=1)
+            self.assertTrue(any("not successful" in p for p in self._verify_attempts(synthetic.path, shards)))
+
+    def test_malformed_receipt_identity_fails_closed_even_with_newer_success(self) -> None:
+        cases = [None, True, 0, -1, "1", 1.5, 3]
+        for attempt in cases:
+            with self.subTest(attempt=attempt), _SyntheticTestsDir(self) as synthetic:
+                shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+                results = synthetic.path / "results"
+                path = self._attempt(results, shards, "1", 1)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["run_attempt"] = attempt
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                self._attempt(results, shards, "1", 10)
+                self.assertTrue(self._verify_attempts(synthetic.path, shards))
+
+    def test_receipt_shard_must_match_filename(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            self._attempt(synthetic.path / "results", shards, "1", 1, shard="2")
+            self.assertTrue(self._verify_attempts(synthetic.path, shards))
+
+    def test_duplicate_same_attempt_in_separate_artifacts_is_ambiguous(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            first = self._attempt(results / "artifact-a", shards, "1", 1)
+            second = results / "artifact-b" / first.name
+            second.parent.mkdir()
+            second.write_bytes(first.read_bytes())
+            problems = self._verify_attempts(synthetic.path, shards)
+            self.assertTrue(any("ambiguous" in p for p in problems), problems)
+
+    def test_legacy_receipt_is_attempt_one_and_cannot_tie_explicit_attempt_one(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            self._attempt(results, shards, "1", 2)
+            self._results(results, shards, **{"1": {"was_successful": False, "failures": 1}})
+            self.assertEqual(self._verify_attempts(synthetic.path, shards), [])
+            path = self._attempt(results, shards, "1", 1)
+            (results / "shard-1.json").write_bytes(path.read_bytes())
+            self.assertTrue(self._verify_attempts(synthetic.path, shards))
+
+    def test_unreadable_newest_receipt_cannot_fall_back_to_success(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            self._attempt(results, shards, "1", 1)
+            (results / "shard-1-attempt-2.json").write_text("{", encoding="utf-8")
+            self.assertTrue(self._verify_attempts(synthetic.path, shards))
+
+    def test_duplicate_json_keys_are_ambiguous_receipts(self) -> None:
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            path = self._attempt(synthetic.path / "results", shards, "1", 1)
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace('"run_attempt": 1', '"run_attempt": 2, "run_attempt": 1'), encoding="utf-8")
+            self.assertTrue(self._verify_attempts(synthetic.path, shards))
+
+    def test_invalid_attempt_filenames_and_newest_version_fail_closed(self) -> None:
+        for filename in ("shard-1-attempt-0.json", "shard-1-attempt--1.json", "shard-1-attempt-x.json"):
+            with self.subTest(filename=filename), _SyntheticTestsDir(self) as synthetic:
+                shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+                results = synthetic.path / "results"
+                path = self._attempt(results, shards, "1", 1)
+                (results / filename).write_bytes(path.read_bytes())
+                self.assertTrue(self._verify_attempts(synthetic.path, shards))
+        with _SyntheticTestsDir(self) as synthetic:
+            shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+            results = synthetic.path / "results"
+            self._attempt(results, shards, "1", 1)
+            self._attempt(results, shards, "1", 2, python_version="3.12")
+            self.assertTrue(any("expected '3.14'" in p for p in self._verify_attempts(synthetic.path, shards)))
+
+    def test_successful_shard_with_multiple_skipped_subtests_is_admitted(self) -> None:
+        body = """
+import unittest
+
+class SkippedCases(unittest.TestCase):
+    def test_cases(self):
+        for index in range(3):
+            with self.subTest(index=index):
+                self.skipTest("synthetic unavailable feature")
+"""
+        for attempt in (None, 2):
+            with self.subTest(attempt=attempt), _SyntheticTestsDir(self) as synthetic:
+                module = synthetic.write("test_skipped_cases", body)
+                shards = {"1": (module,)}
+                results = synthetic.path / "results"
+                self.assertEqual(
+                    run_test_shard.run_shard(
+                        "1", shards=shards, tests_dir=synthetic.path,
+                        results_dir=results, stream=io.StringIO(), run_attempt=attempt,
+                    ),
+                    0,
+                )
+                receipt = json.loads(
+                    run_test_shard.result_path(results, "1", attempt).read_text(encoding="utf-8")
+                )
+                self.assertEqual(receipt["tests_run"], 1)
+                self.assertEqual(receipt["skipped"], 3)
+                self.assertIs(receipt["was_successful"], True)
+                self.assertEqual(
+                    run_test_shard.verify_results(
+                        results, run_test_shard.python_version_label(), shards=shards,
+                        tests_dir=synthetic.path, expected_counts={module: 1},
+                    ),
+                    [],
+                )
+
+    def test_success_flag_cannot_hide_invalid_outcome_counters(self) -> None:
+        for override in ({"failures": 1}, {"errors": 1}, {"unexpected_successes": 1},
+                         {"tests_run": True}, {"errors": -1}, {"skipped": "0"},
+                         {"tests_run": 4}, {"skipped": -1}, {"skipped": True},
+                         {"skipped": None}, {"skipped": 1.5}):
+            with self.subTest(override=override), _SyntheticTestsDir(self) as synthetic:
+                shards = {"1": (synthetic.write("test_a", PASSING_MODULE),)}
+                self._attempt(synthetic.path / "results", shards, "1", 1, **override)
+                self.assertTrue(self._verify_attempts(synthetic.path, shards))
 
     def test_verify_rejects_a_removed_test_method_while_the_module_remains(self) -> None:
         with _SyntheticTestsDir(self) as synthetic:
@@ -395,6 +586,31 @@ class CIShardContractTests(unittest.TestCase):
         verify = next(step for step in gate["steps"] if "run_test_shard.py verify" in str(step.get("run") or ""))
         self.assertIn('--python-version "${{ matrix.python-version }}"', verify["run"])
         self.assertNotIn("if", verify, "the verify step must run unconditionally in the gate")
+
+    def test_artifact_and_coverage_paths_are_attempt_scoped(self) -> None:
+        shard_job = self.workflow["jobs"]["python-unittest"]
+        self.assertEqual(shard_job["env"]["SHARD_RUN_ATTEMPT"], "${{ github.run_attempt }}")
+        for step in shard_job["steps"]:
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@"):
+                self.assertIn("${{ github.run_attempt }}", step["with"]["name"])
+        coverage = next(s for s in shard_job["steps"] if "COVERAGE_FILE" in s.get("env", {}))
+        self.assertIn("${{ github.run_attempt }}", coverage["env"]["COVERAGE_FILE"])
+        gate = self.workflow["jobs"]["python-source"]
+        download = next(s for s in gate["steps"] if "actions/download-artifact@" in s.get("uses", ""))
+        self.assertIs(download["with"]["merge-multiple"], False)
+        self.assertNotIn("github.run_attempt", download["with"]["pattern"],
+                         "failed-only reruns need unaffected shards from earlier attempts")
+        combine = next(s for s in gate["steps"] if "coverage combine" in str(s.get("run") or ""))
+        self.assertIn("shard-results/*/.coverage.shard-*", combine["run"])
+        upload = next(s for s in gate["steps"] if "actions/upload-artifact@" in s.get("uses", ""))
+        self.assertIn("${{ github.run_attempt }}", upload["with"]["name"])
+
+    def test_gate_cannot_reuse_old_receipt_when_rerun_fails_before_writing(self) -> None:
+        gate = self.workflow["jobs"]["python-source"]
+        status = next(s for s in gate["steps"] if s.get("env", {}).get("SHARD_JOB_RESULT"))
+        self.assertEqual(status["env"]["SHARD_JOB_RESULT"], "${{ needs.python-unittest.result }}")
+        self.assertIn('test "$SHARD_JOB_RESULT" = success', status["run"])
+        self.assertNotIn("if", status)
 
     def test_report_only_coverage_runs_on_the_sysmon_capable_leg_and_is_combined_in_the_gate(self) -> None:
         shard_job = self.workflow["jobs"]["python-unittest"]

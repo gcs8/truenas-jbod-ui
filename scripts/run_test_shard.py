@@ -14,8 +14,13 @@ asserts the same partition and that ``.github/workflows/ci.yml`` runs every shar
 
 ``run`` imports the shard's modules the way discovery does (``tests`` is the
 top-level directory, so a module is ``test_x``, not ``tests.test_x``) and writes
-``shard-<id>.json`` with the outcome and per-module discovered test counts.
-``verify`` requires one successful result for every shard of the expected Python
+``shard-<id>-attempt-<attempt>.json`` in CI, with the outcome and per-module
+discovered test counts. ``--run-attempt`` defaults to ``SHARD_RUN_ATTEMPT``;
+without either, local runs retain the legacy ``shard-<id>.json`` shape.
+``verify`` recursively selects the highest numeric attempt for each shard,
+allowing unaffected shards from earlier attempts of a failed-only rerun. Legacy
+receipts count as attempt one; ambiguous or malformed identities fail closed.
+It requires one successful latest result for every shard of the expected Python
 version and compares those counts with the reviewed manifest at
 ``tests/unittest_test_counts.json``. Skipped tests still count because the
 contract records discovery, not platform-dependent outcomes.
@@ -32,6 +37,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import unittest
 from collections import Counter
@@ -212,8 +219,9 @@ def partition_problems(
     return problems
 
 
-def result_path(results_dir: Path, shard_id: str) -> Path:
-    return results_dir / f"{RESULT_PREFIX}{shard_id}{RESULT_SUFFIX}"
+def result_path(results_dir: Path, shard_id: str, run_attempt: int | None = None) -> Path:
+    attempt = "" if run_attempt is None else f"-attempt-{run_attempt}"
+    return results_dir / f"{RESULT_PREFIX}{shard_id}{attempt}{RESULT_SUFFIX}"
 
 
 def python_version_label() -> str:
@@ -348,7 +356,11 @@ def run_shard(
     tests_dir: Path = TESTS_DIR,
     results_dir: Path | None = None,
     stream=None,
+    run_attempt: int | None = None,
 ) -> int:
+    if run_attempt is not None and (type(run_attempt) is not int or run_attempt <= 0):
+        print("run attempt must be a positive integer", file=sys.stderr)
+        return 2
     problems = partition_problems(shards, tests_dir)
     if problems:
         for problem in problems:
@@ -360,6 +372,9 @@ def run_shard(
 
     modules = shards[shard_id]
     if results_dir is not None:
+        if run_attempt is not None and result_path(results_dir, shard_id, run_attempt).exists():
+            print(f"shard {shard_id}: attempt {run_attempt} already has a result", file=sys.stderr)
+            return 2
         # Created before the run so a coverage data file pointed here by
         # COVERAGE_FILE has somewhere to land even when the run aborts early.
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -382,11 +397,22 @@ def run_shard(
             "unexpected_successes": len(result.unexpectedSuccesses),
             "was_successful": result.wasSuccessful(),
         }
-        result_path(results_dir, shard_id).write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        if run_attempt is not None:
+            payload["run_attempt"] = run_attempt
+        # CI receipts are immutable, including if another writer raced the check.
+        mode = "w" if run_attempt is None else "x"
+        with result_path(results_dir, shard_id, run_attempt).open(mode, encoding="utf-8") as target:
+            target.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return 0 if result.wasSuccessful() else 1
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"duplicate JSON key: {key}")
+        payload[key] = value
+    return payload
 
 
 def verify_results(
@@ -412,17 +438,40 @@ def verify_results(
             expected_counts = {}
             compare_counts = False
     actual_counts: dict[str, int] = {}
-    for path in sorted(results_dir.glob(f"{RESULT_PREFIX}*{RESULT_SUFFIX}")):
-        shard_id = path.name[len(RESULT_PREFIX) : -len(RESULT_SUFFIX)]
+    attempts: dict[str, int] = {}
+    seen: set[tuple[str, int]] = set()
+    # Keep artifact directories separate in CI; never let download order decide
+    # which receipt survives. Legacy, unversioned receipts count as attempt one.
+    for path in sorted(results_dir.rglob(f"{RESULT_PREFIX}*{RESULT_SUFFIX}")):
+        match = re.fullmatch(r"shard-([1-9][0-9]*)(?:-attempt-([1-9][0-9]*))?\.json", path.name)
+        if match is None:
+            problems.append(f"invalid result filename: {path.name}")
+            continue
+        shard_id, attempt_label = match.groups()
+        attempt = int(attempt_label) if attempt_label is not None else 1
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
         except (OSError, ValueError) as exc:
             problems.append(f"shard {shard_id}: unreadable result ({exc})")
             continue
         if not isinstance(payload, dict):
             problems.append(f"shard {shard_id}: result is not an object")
             continue
-        found[shard_id] = payload
+        recorded_attempt = payload.get("run_attempt", 1 if attempt_label is None else None)
+        if type(recorded_attempt) is not int or recorded_attempt != attempt:
+            problems.append(f"shard {shard_id}: invalid or mismatched run_attempt in {path.name}")
+            continue
+        if payload.get("shard") != shard_id:
+            problems.append(f"shard {shard_id}: receipt shard does not match {path.name}")
+            continue
+        identity = (shard_id, attempt)
+        if identity in seen:
+            problems.append(f"shard {shard_id}: ambiguous duplicate result for attempt {attempt}")
+            continue
+        seen.add(identity)
+        if attempt > attempts.get(shard_id, 0):
+            attempts[shard_id] = attempt
+            found[shard_id] = payload
 
     for shard_id in sorted(set(found) - set(shards)):
         problems.append(f"shard {shard_id}: result present but the shard is not in the table")
@@ -449,8 +498,17 @@ def verify_results(
                     problems.append(f"shard {shard_id}: {module} has invalid test count {count!r}")
                 elif module in modules:
                     actual_counts[module] = count
-        if not isinstance(payload.get("tests_run"), int) or payload["tests_run"] <= 0:
+        if type(payload.get("tests_run")) is not int or payload["tests_run"] <= 0:
             problems.append(f"shard {shard_id}: ran no tests")
+        elif isinstance(shard_counts, dict) and all(type(c) is int and c > 0 for c in shard_counts.values()):
+            if payload["tests_run"] != sum(shard_counts.values()):
+                problems.append(f"shard {shard_id}: tests_run differs from discovered counts")
+        for counter in ("failures", "errors", "skipped", "unexpected_successes"):
+            value = payload.get(counter)
+            if type(value) is not int or value < 0:
+                problems.append(f"shard {shard_id}: invalid {counter} count")
+            elif counter != "skipped" and value != 0:
+                problems.append(f"shard {shard_id}: nonzero {counter} count")
         if payload.get("was_successful") is not True:
             problems.append(
                 f"shard {shard_id}: not successful "
@@ -469,14 +527,18 @@ def _build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run one shard's test modules")
     run.add_argument("--shard", required=True, choices=sorted(SHARDS), help="shard id from the SHARDS table")
     run.add_argument(
+        "--run-attempt", type=int, default=os.environ.get("SHARD_RUN_ATTEMPT"),
+        help="positive CI run attempt (default: SHARD_RUN_ATTEMPT); writes an immutable receipt",
+    )
+    run.add_argument(
         "--results-dir",
         type=Path,
         default=None,
-        help="directory that receives shard-<id>.json with the outcome (omit to skip)",
+        help="directory that receives shard outcome JSON (attempt-scoped in CI; omit to skip)",
     )
 
-    verify = commands.add_parser("verify", help="require one successful result per shard")
-    verify.add_argument("--results-dir", type=Path, required=True, help="directory holding shard-<id>.json files")
+    verify = commands.add_parser("verify", help="require a successful latest result per shard")
+    verify.add_argument("--results-dir", type=Path, required=True, help="directory holding shard outcome JSON recursively")
     verify.add_argument(
         "--python-version",
         required=True,
@@ -538,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "run":
-        return run_shard(args.shard, results_dir=args.results_dir)
+        return run_shard(args.shard, results_dir=args.results_dir, run_attempt=args.run_attempt)
     problems = verify_results(args.results_dir, args.python_version)
     if problems:
         for problem in problems:

@@ -114,7 +114,7 @@
     "test_truenas_ws": 66,
     "test_truenas_ws_jsonrpc": 52,
     "test_ui_health_and_admin_probe": 72,
-    "test_unittest_shards": 15,
+    "test_unittest_shards": 31,
     "test_upgrade_notice": 24,
     "test_wiki_drift_verifier": 21
   }
