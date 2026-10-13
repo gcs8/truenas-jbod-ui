@@ -50,19 +50,114 @@ def asgi_call(app: Any, method: str, path: str, body: Any = None, headers: dict[
     messages = [{"type": "http.request", "body": payload, "more_body": False}]
     sent: list[dict[str, Any]] = []
 
+    response_complete = asyncio.Event()
+
     async def receive():
         if messages:
             return messages.pop(0)
-        await asyncio.sleep(0.01)
+        # Exhausting the request is not a client disconnect. File/stream responses
+        # may still be waiting for I/O, especially under coverage.
+        await response_complete.wait()
         return {"type": "http.disconnect"}
 
     async def send(message):
         sent.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            response_complete.set()
 
-    asyncio.run(app(scope, receive, send))
+    async def invoke():
+        await asyncio.wait_for(app(scope, receive, send), 10)
+
+    asyncio.run(invoke())
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
     content = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
     return status, content
+
+
+class ASGIClientTests(unittest.TestCase):
+    def test_completed_file_and_stream_transfers_keep_connection_open(self) -> None:
+        from starlette.responses import FileResponse, StreamingResponse
+
+        expected = bytes(range(256)) * 1024
+        for spec_version in (None, "2.3", "2.4"):
+            for response_kind in ("file", "stream"):
+                with self.subTest(spec_version=spec_version, response=response_kind):
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory) / "synthetic-archive.bin"
+                        path.write_bytes(expected)
+                        received: list[dict[str, Any]] = []
+                        terminal: list[bool] = []
+
+                        async def app(scope, receive, send):
+                            if spec_version is not None:
+                                scope["asgi"]["spec_version"] = spec_version
+                            request = await receive()
+                            self.assertEqual(request["type"], "http.request")
+                            self.assertEqual(request["body"], b'{"probe": true}')
+                            entered = asyncio.Event()
+                            release = asyncio.Event()
+                            pending = asyncio.create_task(receive())
+                            response = FileResponse(path, stat_result=path.stat())
+                            response.chunk_size = 4096
+                            original_open = response._open_file
+
+                            @contextlib.asynccontextmanager
+                            async def gated_open():
+                                entered.set()
+                                await release.wait()
+                                async with original_open() as file:
+                                    yield file
+
+                            async def chunks():
+                                entered.set()
+                                await release.wait()
+                                for start in range(0, len(expected), 4096):
+                                    yield expected[start:start + 4096]
+
+                            if response_kind == "file":
+                                response._open_file = gated_open
+                            else:
+                                response = StreamingResponse(chunks())
+
+                            async def tracked_receive():
+                                return await asyncio.shield(pending)
+
+                            async def tracked_send(message):
+                                if message["type"] == "http.response.body":
+                                    terminal.append(not message.get("more_body", False))
+                                await send(message)
+
+                            owner = asyncio.create_task(response(scope, tracked_receive, tracked_send))
+                            try:
+                                await asyncio.wait_for(entered.wait(), 2)
+                                # Hold file I/O / stream production while an actual receive is
+                                # outstanding. The old 10ms disconnect wins deterministically;
+                                # the completed-transfer client must instead remain connected.
+                                try:
+                                    received.append(await asyncio.wait_for(asyncio.shield(pending), 0.05))
+                                except TimeoutError:
+                                    release.set()
+                                else:
+                                    if spec_version == "2.4":
+                                        release.set()  # send-only path still needs the client check
+                                await asyncio.wait_for(owner, 2)
+                                self.assertTrue(terminal and terminal[-1])
+                                self.assertEqual(
+                                    await asyncio.wait_for(pending, 2),
+                                    {"type": "http.disconnect"},
+                                )
+                            finally:
+                                release.set()
+                                for task in (owner, pending):
+                                    task.cancel()
+                                await asyncio.gather(owner, pending, return_exceptions=True)
+
+                        status, content = asgi_call(app, "POST", "/download", {"probe": True})
+                        self.assertEqual(status, 200)
+                        self.assertEqual(hashlib.sha256(content).hexdigest(), hashlib.sha256(expected).hexdigest())
+                        self.assertEqual(content, path.read_bytes())
+                        self.assertEqual(terminal, [False] * (len(terminal) - 1) + [True])
+                        self.assertEqual(received, [])
 
 
 class CronTests(unittest.TestCase):
