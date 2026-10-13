@@ -107,6 +107,100 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
             },
         )
 
+    def test_nonroot_variant_uses_the_inherited_overlay_and_prepares_ownership(self) -> None:
+        module = self.load_matrix_module()
+        variant = next(v for v in module.VARIANTS if v.name == "ui-nonroot")
+        self.assertTrue(variant.ui_enabled)
+        self.assertTrue(variant.nonroot)
+        self.assertTrue(variant.journal_read)
+        self.assertEqual(variant.services, ("enclosure-ui",))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / variant.name
+            with patch.object(module, "_run") as run:
+                module._prepare_variant_root(
+                    root, variant=variant, compose_path=ROOT / "docker-compose.yml",
+                    config_fixture=ROOT / "config/config.example.yaml",
+                    image="sha256:" + "a" * 64, ports=module.Ports(19080, 19081, 19082),
+                )
+            self.assertEqual((root / "nonroot.yaml").read_bytes(), (ROOT / "docker-compose.nonroot.yml").read_bytes())
+            self.assertEqual(stat.S_IMODE((root / "nonroot.yaml").stat().st_mode), 0o600)
+            command = list(run.call_args_list[-1].args[0])
+            self.assertEqual(command, [
+                "sudo", "-n", "--", module.sys.executable,
+                str(ROOT / "scripts/prepare_nonroot_bind_mounts.py"), str(root),
+                "--uid", str(module.APP_UID), "--gid", str(module.APP_GID), "--apply",
+            ])
+            prefix = module._compose_prefix(root, variant)
+            files = [prefix[i + 1] for i, arg in enumerate(prefix) if arg == "-f"]
+            self.assertEqual(files, [str(root / "compose.yaml"), str(root / "nonroot.yaml")])
+            self.assertIn("backup-scheduler", prefix)
+
+    def test_ui_owners_are_bound_to_base_overlay_and_rendered_user(self) -> None:
+        import yaml
+
+        module = self.load_matrix_module()
+        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())
+        self.assertEqual(base["services"]["enclosure-ui"]["user"], "0:0")
+        self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        for name, user, expected in (("ui-only", "0:0", (0, 0)), ("ui-nonroot", "10001:10001", (module.APP_UID, module.APP_GID))):
+            variant = next(v for v in module.VARIANTS if v.name == name)
+            model = {"services": {"enclosure-ui": {"user": user}}}
+            self.assertEqual(module._ui_writer_owner(model, variant), expected)
+            for wrong in ("", "root", "0", "10001:0", "0:10001", None):
+                with self.subTest(name=name, user=wrong), self.assertRaisesRegex(RuntimeError, "writer identity"):
+                    module._ui_writer_owner({"services": {"enclosure-ui": {"user": wrong}}}, variant)
+            module._require_ui_written_file(*expected, 0o100660, "alias", expected_owner=expected)
+            with self.assertRaisesRegex(RuntimeError, "ownership failed"):
+                module._require_ui_written_file(9999, expected[1], 0o100660, "mapping", expected_owner=expected)
+
+    def test_scheduler_journal_probe_checks_effective_identity_and_actual_ui_entries(self) -> None:
+        module = self.load_matrix_module()
+        prefix = ("docker", "compose", "--project-name", "synthetic")
+        for owner in ((0, 0), (module.APP_UID, module.APP_GID)):
+            with patch.object(module, "_run", return_value=Mock(stdout="journal_read=ok\n")) as run:
+                module._verify_ui_journal_read(prefix, owner)
+            command = list(run.call_args.args[0])
+            self.assertEqual(command[:len(prefix)], list(prefix))
+            self.assertEqual(command[len(prefix):-3], ["run", "--rm", "--no-deps", "--pull", "never", "-T", "--entrypoint", "python", "enclosure-backup-scheduler", "-c"])
+            self.assertEqual(command[-2:], [str(owner[0]), str(module.APP_GID)])
+            self.assertIn("os.getuid()", command[-3])
+            self.assertIn("os.getgid()", command[-3])
+            self.assertIn("os.getgroups()", command[-3])
+            self.assertIn("mapping.save", command[-3])
+            self.assertIn("sas_alias.save", command[-3])
+            self.assertNotIn("--user", command)
+        for stdout in ("", "journal_read=ok\nprivate-data", "journal_read=failed"):
+            with patch.object(module, "_run", return_value=Mock(stdout=stdout)), self.assertRaisesRegex(RuntimeError, "journal read"):
+                module._verify_ui_journal_read(prefix, (0, 0))
+
+    def test_nonroot_lifecycle_prepares_before_writers_and_probes_after_cycles(self) -> None:
+        module = self.load_matrix_module()
+        variant = next(v for v in module.VARIANTS if v.name == "ui-nonroot")
+        events = []
+        owner = (module.APP_UID, module.APP_GID)
+        model = {"services": {"enclosure-ui": {"user": "10001:10001"}}}
+        with contextlib.ExitStack() as stack:
+            for name in ("_assert_compose_resources_removed", "_verify_runtime_contract", "_verify_ui", "_cleanup_variant"):
+                stack.enter_context(patch.object(module, name))
+            stack.enter_context(patch.object(module, "_prepare_variant_root", side_effect=lambda *a, **k: events.append("prepare")))
+            stack.enter_context(patch.object(module, "_verify_rendered_contract", return_value=model))
+            def run(command, **kwargs):
+                events.append("up" if "up" in command else "ps")
+                return Mock(stdout="enclosure-ui\n")
+            stack.enter_context(patch.object(module, "_run", side_effect=run))
+            pencil = stack.enter_context(patch.object(module, "_verify_pencil_cycle", side_effect=lambda *a, **k: events.append("alias")))
+            mapping = stack.enter_context(patch.object(module, "_verify_mapping_cycle", side_effect=lambda *a, **k: events.append("mapping")))
+            journal = stack.enter_context(patch.object(module, "_verify_ui_journal_read", side_effect=lambda *a: events.append("journal")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            module._run_variant(Path("/synthetic"), variant, compose_path=ROOT / "docker-compose.yml",
+                                config_fixture=ROOT / "config/config.example.yaml", image="sha256:" + "a" * 64,
+                                ports=module.Ports(19080, 19081, 19082), source_commit="b" * 40)
+        self.assertEqual(events, ["prepare", "up", "ps", "alias", "mapping", "journal"])
+        self.assertEqual(pencil.call_args.kwargs, {"expected_owner": owner})
+        self.assertEqual(mapping.call_args.kwargs, {"expected_owner": owner})
+        self.assertEqual(journal.call_args.args[-1], owner)
+
     def test_reserved_names_match_base_compose_and_exact_image_revision(self) -> None:
         module = self.load_matrix_module()
         self.assertEqual(
