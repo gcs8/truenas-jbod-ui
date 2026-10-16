@@ -19510,6 +19510,42 @@ ses1:
         self.assertFalse(result["confirmed"])
         self.assertEqual([path["identify_active"] for path in result["paths"]], [True, None])
 
+    async def test_core_readback_never_borrows_another_bay_by_slot_number(self) -> None:
+        # The readback map lists the target element under a description the
+        # parser cannot turn into a bay number, so it sits in unmapped_slots,
+        # while a different element describes itself as Slot07. The readback
+        # must follow the element id and report the target as still off.
+        slot = SlotView(
+            slot=7, slot_label="07", row_index=0, column_index=0, enclosure_id="shelf-a",
+            led_supported=True, led_backend="ssh",
+            ssh_ses_targets=[{"ses_device": "/dev/ses0", "ses_element_id": 7, "enclosure_id": "5000c50000000001"}],
+        )
+        readback = """
+ses0:
+  Enclosure Name: ExampleCo DualPathShelf
+  Enclosure ID: 5000c50000000001
+  Element 3, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x02 0x00)
+    Description: Slot07
+    Extra status:
+      - LED=locate
+  Element 7, Type: Array Device Slot
+    Status: Not Installed (0x05 0x00 0x00 0x00)
+    Description: Disk bay
+""".strip()
+        maps = iter([self.CORE_MAP_OFF, readback])
+        session = self.scripted_session({})
+        session.run_command_owned.side_effect = lambda command, **_kwargs: SSHCommandResult(
+            command=command, ok=True, exit_code=0,
+            stdout=next(maps) if command.endswith("sesutil map") else "",
+        )
+        service = self.ssh_led_service("core", slot, session)
+
+        result = await service.set_slot_led(7, LedAction.identify, "shelf-a", invalidate_snapshot=False)
+
+        self.assertFalse(result["confirmed"])
+        self.assertEqual([path["identify_active"] for path in result["paths"]], [False])
+
     async def test_sg_ses_locate_refuses_a_device_that_now_reports_another_shelf(self) -> None:
         session = self.scripted_session({
             "-p aes /dev/sg27": self.SG_AES_SHELF_A.replace("synthetic-shelf-a", "synthetic-shelf-b"),

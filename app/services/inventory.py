@@ -14881,13 +14881,17 @@ class InventoryService:
             observed = None
             # A path counts only while its device reports the target's shelf.
             if enclosure is not None and reported_shelves.get(device) == normalize_text(target.get("enclosure_id")):
+                # Match the element id only. enclosure.slots is keyed by the
+                # bay number parsed from each description, so indexing it by
+                # element id would read another bay's LED when the target
+                # element's description was not recognised.
                 mapped_slot = next(
                     (
                         candidate
-                        for candidate in enclosure.slots.values()
+                        for candidate in (*enclosure.slots.values(), *enclosure.unmapped_slots)
                         if candidate.element_id == element
                     ),
-                    enclosure.slots.get(element),
+                    None,
                 )
                 if mapped_slot is not None:
                     observed = bool(mapped_slot.identify_active)

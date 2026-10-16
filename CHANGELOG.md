@@ -36,6 +36,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The CORE locate readback followed the element id instead of borrowing
+  the bay numbered like it when the target element's description was not
+  recognised, so it no longer confirms another drive's light (#984).
 - CORE SSH stopped stacking separate backplanes and AHCI SGPIO ports into one
   shelf drawn as the 60-bay CSE-946, and read pool names without the API
   (#955).

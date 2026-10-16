@@ -1191,59 +1191,108 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertNotIn("/api/system/backup/import", paths)
 
     def test_admin_backup_export_returns_file_response_and_cleans_workspace(self) -> None:
-        workspace = Path(tempfile.mkdtemp(prefix="admin-export-response-"))
-        archive_path = workspace / "backup.zip"
-        archive_path.write_bytes(b"PK-file-backed")
-        artifact = FileBackupArtifact(
-            filename="backup.zip",
-            path=archive_path,
-            media_type="application/zip",
-            manifest={"packaging": "zip", "schema_version": 1},
-            cleanup_root=workspace,
-        )
-        maintenance = SimpleNamespace(
-            stopped_containers=[],
-            restarted_containers=[],
-            restart_failures={},
-        )
-        service = MagicMock()
-        service.export_bundle.return_value = (artifact, maintenance)
-        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+        def exercise(spec_version: str, outcome: str) -> None:
+            workspace = Path(tempfile.mkdtemp(prefix="admin-export-response-"))
+            archive_path = workspace / "backup.zip"
+            archive_path.write_bytes(b"PK-file-backed")
+            artifact = FileBackupArtifact(
+                filename="backup.zip",
+                path=archive_path,
+                media_type="application/zip",
+                manifest={"packaging": "zip", "schema_version": 1},
+                cleanup_root=workspace,
+            )
+            maintenance = SimpleNamespace(
+                stopped_containers=[],
+                restarted_containers=[],
+                restart_failures={},
+            )
+            service = MagicMock()
+            service.export_bundle.return_value = (artifact, maintenance)
+            route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
-        with patch("admin_service.routes.get_maintenance_service", return_value=service):
-            response = asyncio.run(
-                route.endpoint(
-                    SystemBackupExportRequest(
-                        packaging="zip",
-                        encrypt=True,
-                        passphrase="test-passphrase",
-                    ),
-                    stop_services=False,
-                    restart_services=True,
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
+                response = asyncio.run(
+                    route.endpoint(
+                        SystemBackupExportRequest(
+                            packaging="zip",
+                            encrypt=True,
+                            passphrase="test-passphrase",
+                        ),
+                        stop_services=False,
+                        restart_services=True,
+                    )
                 )
-            )
 
-        self.assertIsInstance(response, FileResponse)
-        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="backup.zip"')
-        self.assertTrue(archive_path.exists())
+            self.assertIsInstance(response, FileResponse)
+            self.assertEqual(response.headers["content-disposition"], 'attachment; filename="backup.zip"')
+            self.assertTrue(archive_path.exists())
 
-        async def disconnect_during_body() -> None:
-            async def receive() -> dict[str, object]:
-                return {"type": "http.disconnect"}
+            async def exercise_response() -> None:
+                body_started = asyncio.Event()
+                transfer_blocked = asyncio.Event()
+                receive_blocked = asyncio.Event()
+                sent: list[dict[str, Any]] = []
 
-            async def send(message: dict[str, object]) -> None:
-                if message.get("type") == "http.response.body":
-                    raise asyncio.CancelledError()
+                async def receive() -> dict[str, object]:
+                    # Keep the connection open until the response task is cancelled.
+                    # An immediate disconnect can stop an ASGI <2.4 transfer before
+                    # send() runs, and is not a request-task cancellation contract.
+                    await receive_blocked.wait()
+                    return {"type": "http.disconnect"}
 
-            await response(
-                {"type": "http", "method": "GET", "headers": []},
-                receive,
-                send,
-            )
+                async def send(message: dict[str, object]) -> None:
+                    sent.append(message)
+                    if message.get("type") == "http.response.body":
+                        body_started.set()
+                        if outcome == "cancelled":
+                            await transfer_blocked.wait()
+                        elif outcome == "send-error":
+                            raise OSError("synthetic closed connection")
 
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(disconnect_during_body())
-        self.assertFalse(workspace.exists())
+                response.chunk_size = 4
+                response_task = asyncio.create_task(
+                    response(
+                        {"type": "http", "method": "GET", "headers": [],
+                         "asgi": {"spec_version": spec_version}},
+                        receive,
+                        send,
+                    )
+                )
+                try:
+                    await asyncio.wait_for(body_started.wait(), timeout=5)
+                    self.assertEqual(sent[0]["type"], "http.response.start")
+                    self.assertEqual(sent[0]["status"], 200)
+                    self.assertEqual(sent[1]["body"], b"PK-f")
+                    self.assertTrue(sent[1]["more_body"])
+                    if outcome == "cancelled":
+                        self.assertTrue(archive_path.exists())
+                        response_task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await response_task
+                        self.assertTrue(response_task.cancelled())
+                    elif outcome == "send-error":
+                        with self.assertRaisesRegex(OSError, "synthetic closed connection"):
+                            await response_task
+                    else:
+                        await response_task
+                        body = [item for item in sent if item["type"] == "http.response.body"]
+                        self.assertEqual(b"".join(item["body"] for item in body), b"PK-file-backed")
+                        self.assertFalse(body[-1]["more_body"])
+                    self.assertFalse(workspace.exists())
+                    self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+                finally:
+                    if not response_task.done():
+                        response_task.cancel()
+                    await asyncio.gather(response_task, return_exceptions=True)
+
+            asyncio.run(exercise_response())
+            self.assertFalse(workspace.exists())
+
+        for spec_version in ("2.3", "2.4"):
+            for outcome in ("completed", "cancelled", "send-error"):
+                with self.subTest(spec_version=spec_version, outcome=outcome):
+                    exercise(spec_version, outcome)
 
     def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
         request, receive_probe = make_streaming_request([b"archive-", b"bytes"])
