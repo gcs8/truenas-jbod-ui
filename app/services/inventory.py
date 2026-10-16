@@ -475,6 +475,9 @@ LED_SSH_ADMISSION_WAIT_SECONDS = 5.0
 # option. Real systems have a handful; refuse a topology far past that rather
 # than let one unauthenticated request occupy the worker for every one of them.
 SYSTEM_RETENTION_MAX_ENCLOSURES = 32
+# Opening-order scoring is optional page enrichment, not page admission.
+OPENING_ORDER_MAX_WAITERS = 8
+OPENING_ORDER_TIMEOUT_SECONDS = 2.0
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 # Storage-view bays are numbered from here so they never collide with a real
 # enclosure slot number in the same snapshot.
@@ -1313,6 +1316,7 @@ class InventoryService:
         self._snapshot_discovery_lock = asyncio.Lock()
         self._system_retention_lock = asyncio.Lock()
         self._view_order_recompute_lock = asyncio.Lock()
+        self._view_order_waiters = 0
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
@@ -2540,9 +2544,9 @@ class InventoryService:
                     return list(cached)
             return None
 
-        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+        def fallback_order(reason: str) -> list[str]:
             warning = (
-                "Opening-view scoring was skipped because this system exceeds the enclosure limit; "
+                f"Opening-view scoring was skipped because {reason}; "
                 "saved order followed by discovery order is shown."
             )
             if warning not in active_snapshot.warnings:
@@ -2554,53 +2558,78 @@ class InventoryService:
                 view_counts=[(view_id, 0) for view_id, _count in view_counts],
                 saved_order=saved_order,
             )
+
+        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            return fallback_order("this system exceeds the enclosure limit")
         cached = cached_order()
         if cached is not None:
             return cached
 
-        # Opening a page is not a retention-check admission. Wait for bounded
-        # scoring work instead of returning busy to a concurrent browser tab.
-        async with self._view_order_recompute_lock:
-            cached = cached_order()
-            if cached is not None:
-                return cached
-            publication_generation = self._snapshot_publication_generation
-            enclosure_counts: list[tuple[str, int]] = []
-            for option in active_snapshot.enclosures:
-                snapshot = known_snapshots.get(option.id)
-                if snapshot is None:
-                    # The request already collected the source bundle. Building each
-                    # option from that bundle adds no appliance/API/SSH refresh.
-                    snapshot = await self._get_secondary_runtime_snapshot(
-                        option.id,
-                        force_refresh=force_refresh,
-                    )
-                    known_snapshots[option.id] = snapshot
-                enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+        # Ordinary browser collisions may wait, but a burst cannot retain an
+        # unbounded queue. Admission and lock acquisition have no intervening
+        # await, so the counter covers every queued contender on this event loop.
+        collided = self._view_order_recompute_lock.locked() or self._view_order_waiters > 0
+        queued = collided
+        if queued:
+            if self._view_order_waiters >= OPENING_ORDER_MAX_WAITERS:
+                return fallback_order("opening-order scoring is busy")
+            self._view_order_waiters += 1
+        try:
+            # Bound both queue time and optional secondary scoring. Cancellation
+            # unwinds the lock and counter; no detached scoring task survives.
+            async with asyncio.timeout(OPENING_ORDER_TIMEOUT_SECONDS):
+                async with self._view_order_recompute_lock:
+                    if queued:
+                        self._view_order_waiters -= 1
+                        queued = False
+                    cached = cached_order()
+                    if cached is not None:
+                        return cached
+                    if collided and force_refresh:
+                        # Secondary forced publications invalidate the order cache.
+                        # A waiting forced request must not repeat that work just
+                        # because its predecessor could not safely cache a result.
+                        return fallback_order("opening-order scoring is busy")
+                    publication_generation = self._snapshot_publication_generation
+                    enclosure_counts: list[tuple[str, int]] = []
+                    for option in active_snapshot.enclosures:
+                        snapshot = known_snapshots.get(option.id)
+                        if snapshot is None:
+                            # The request already collected the source bundle.
+                            # Secondary builds add no appliance/API/SSH refresh.
+                            snapshot = await self._get_secondary_runtime_snapshot(
+                                option.id,
+                                force_refresh=force_refresh,
+                            )
+                            known_snapshots[option.id] = snapshot
+                        enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
 
-            order = effective_main_view_order(
-                enclosure_counts=enclosure_counts,
-                view_counts=view_counts,
-                saved_order=saved_order,
-                ha_primary_view_id=ha_primary_view_id,
-                ha_owner_enclosure_id=ha_owner_enclosure_id,
-            )
-            # A stale-hit can publish a refreshed snapshot while another option
-            # is awaited. Return this request's coherent result, but only cache it
-            # when no snapshot publication raced the computation.
-            if publication_generation == self._snapshot_publication_generation:
-                if (self._view_order_source_bundle is not source_bundle
-                        or self._view_order_topology_generation != self._snapshot_topology_generation):
-                    self._view_order_cache.clear()
-                self._view_order_source_bundle = source_bundle
-                self._view_order_topology_generation = self._snapshot_topology_generation
-                self._view_order_cache[order_context] = list(order)
-                self._view_order_cache.move_to_end(order_context)
-                # Retain both saved/automatic contexts for each selected shelf,
-                # with a hard bound even when runtime counts keep changing.
-                while len(self._view_order_cache) > 2 * SYSTEM_RETENTION_MAX_ENCLOSURES:
-                    self._view_order_cache.popitem(last=False)
-            return order
+                    order = effective_main_view_order(
+                        enclosure_counts=enclosure_counts,
+                        view_counts=view_counts,
+                        saved_order=saved_order,
+                        ha_primary_view_id=ha_primary_view_id,
+                        ha_owner_enclosure_id=ha_owner_enclosure_id,
+                    )
+                    # A stale-hit can publish a refreshed snapshot while another
+                    # option is awaited. Only cache when no publication raced it.
+                    if publication_generation == self._snapshot_publication_generation:
+                        if (self._view_order_source_bundle is not source_bundle
+                                or self._view_order_topology_generation != self._snapshot_topology_generation):
+                            self._view_order_cache.clear()
+                        self._view_order_source_bundle = source_bundle
+                        self._view_order_topology_generation = self._snapshot_topology_generation
+                        self._view_order_cache[order_context] = list(order)
+                        self._view_order_cache.move_to_end(order_context)
+                        # Bound saved/automatic contexts for each selected shelf.
+                        while len(self._view_order_cache) > 2 * SYSTEM_RETENTION_MAX_ENCLOSURES:
+                            self._view_order_cache.popitem(last=False)
+                    return order
+        except TimeoutError:
+            return fallback_order("opening-order scoring timed out")
+        finally:
+            if queued:
+                self._view_order_waiters -= 1
 
     async def get_storage_view_runtime(
         self,

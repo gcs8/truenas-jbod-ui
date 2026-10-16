@@ -36,9 +36,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- Opening-view requests waited instead of failing on collisions, large systems
-  used saved then discovery order with a warning, and forced refreshes retried
-  correlation once after overlapping background source updates (#997).
+- Opening-view requests bounded scoring waits and used saved then discovery
+  order with a warning when busy, timed out, or over cap; forced refreshes
+  retried correlation once after overlapping background source updates (#997).
 - History shutdown interrupted a deferred index build without discarding completed
   indexes, and the next start resumed only the missing indexes (#994).
 - The CORE locate readback followed the element id instead of borrowing

@@ -259,6 +259,143 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(body)["view_order"], expected[index % 2])
         self.service._get_secondary_runtime_snapshot.assert_not_awaited()
 
+    async def test_forced_order_burst_bounds_waiters_and_falls_back_without_busy(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def secondary(enclosure_id, **kwargs):
+            entered.set()
+            await release.wait()
+            return self.snapshots[enclosure_id]
+
+        self.service._get_secondary_runtime_snapshot = AsyncMock(side_effect=secondary)
+        self.system.view_order = ["enclosure:enc-b", "view:primary-chassis"]
+        tasks = [asyncio.create_task(self.request(
+            "/api/storage-views", b"enclosure_id=enc-a&force=true",
+        ))]
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            tasks.extend(asyncio.create_task(self.request(
+                "/" if index % 2 else "/api/storage-views",
+                b"enclosure_id=enc-a&force=true",
+            )) for index in range(64))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertLessEqual(sum(not task.done() for task in tasks), 9)
+            self.assertLessEqual(len(self.service._view_order_recompute_lock._waiters or ()), 8)
+            overflow = [task.result() for task in tasks if task.done()]
+            self.assertGreaterEqual(len(overflow), 56)
+            for status, body in overflow:
+                self.assertEqual(status, 200, body)
+                if body.startswith(b'{'):
+                    self.assertEqual(json.loads(body)["view_order"], [
+                        "enclosure:enc-b", "view:primary-chassis", "enclosure:enc-a",
+                    ])
+                else:
+                    self.assertIn(b"<!doctype html>", body.lower())
+                    self.assertIn(b"Opening-view scoring was skipped", body)
+            release.set()
+            responses = await asyncio.wait_for(asyncio.gather(*tasks), 2)
+            self.assertTrue(all(status == 200 for status, _ in responses))
+            self.assertEqual(self.service._get_secondary_runtime_snapshot.await_count, 1)
+            self.assertFalse(self.service._view_order_recompute_lock.locked())
+        finally:
+            release.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_forced_order_waiters_do_not_repeat_invalidated_scoring(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def secondary(enclosure_id, **kwargs):
+            entered.set()
+            await release.wait()
+            # Real secondary publication advances this generation and prevents
+            # the opening-order result from being cached. Waiters must not each
+            # force another secondary build when that happens.
+            self.service._snapshot_publication_generation += 1
+            self.service._view_order_cache.clear()
+            return self.snapshots[enclosure_id]
+
+        self.service._get_secondary_runtime_snapshot = AsyncMock(side_effect=secondary)
+        tasks = [asyncio.create_task(self.request(
+            "/api/storage-views", b"enclosure_id=enc-a&force=true",
+        ))]
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            tasks.extend(asyncio.create_task(self.request(
+                "/api/storage-views", b"enclosure_id=enc-a&force=true",
+            )) for _ in range(4))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            release.set()
+            responses = await asyncio.wait_for(asyncio.gather(*tasks), 2)
+            self.assertTrue(all(status == 200 for status, _ in responses))
+            self.assertEqual(self.service._get_secondary_runtime_snapshot.await_count, 1)
+            self.assertEqual(len(self.service._view_order_cache), 0)
+        finally:
+            release.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_order_timeout_returns_page_fallback_and_releases_admission(self):
+        entered = asyncio.Event()
+
+        async def secondary(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        original = self.service._get_secondary_runtime_snapshot
+        self.service._get_secondary_runtime_snapshot = AsyncMock(side_effect=secondary)
+        with patch("app.services.inventory.OPENING_ORDER_TIMEOUT_SECONDS", 0.05, create=True):
+            tasks = [asyncio.create_task(self.request("/", b"enclosure_id=enc-a"))]
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                tasks.append(asyncio.create_task(self.request("/", b"enclosure_id=enc-b")))
+                responses = await asyncio.wait_for(asyncio.gather(*tasks), 0.5)
+                for status, body in responses:
+                    self.assertEqual(status, 200, body)
+                    self.assertIn(b"Opening-view scoring was skipped", body)
+                self.assertFalse(self.service._view_order_recompute_lock.locked())
+                self.assertEqual(self.service._view_order_waiters, 0)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        self.service._get_secondary_runtime_snapshot = original
+        status, _ = await self.request("/api/storage-views", b"enclosure_id=enc-a")
+        self.assertEqual(status, 200)
+        self.assertTrue(self.service._view_order_cache)
+
+    async def test_order_cancellation_releases_owner_and_waiter_admission(self):
+        entered = asyncio.Event()
+
+        async def secondary(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        original = self.service._get_secondary_runtime_snapshot
+        self.service._get_secondary_runtime_snapshot = AsyncMock(side_effect=secondary)
+        tasks = [asyncio.create_task(self.request("/api/storage-views", b"enclosure_id=enc-a"))]
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            tasks.append(asyncio.create_task(self.request("/api/storage-views", b"enclosure_id=enc-b")))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            tasks[1].cancel()
+            await asyncio.gather(tasks[1], return_exceptions=True)
+            tasks[0].cancel()
+            await asyncio.gather(tasks[0], return_exceptions=True)
+            self.assertFalse(self.service._view_order_recompute_lock.locked())
+            self.assertEqual(self.service._view_order_waiters, 0)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.service._get_secondary_runtime_snapshot = original
+        self.assertEqual((await self.request("/api/storage-views", b"enclosure_id=enc-b"))[0], 200)
+
     async def test_order_context_cache_stays_bounded_when_preferences_change(self):
         from app.services.inventory import SYSTEM_RETENTION_MAX_ENCLOSURES
 
