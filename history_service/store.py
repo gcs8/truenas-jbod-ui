@@ -525,6 +525,10 @@ SCHEMA = _BASE_SCHEMA + "".join(
 )
 
 
+class HistoryIndexBuildCancelled(RuntimeError):
+    """An owned deferred index build stopped; committed sibling indexes remain."""
+
+
 class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
@@ -1927,19 +1931,42 @@ class HistoryStore:
         with self._read_connection() as connection:
             return self._missing_chronological_indexes(connection)
 
-    def build_chronological_index(self, name: str) -> None:
+    def build_chronological_index(
+        self, name: str, *, should_continue: Callable[[], bool] | None = None
+    ) -> None:
         """Build one chronological index in its own write transaction.
 
         Holding only SQLite's write lock, not the history lifecycle lock, keeps
         reads and healthchecks answering while the index builds; other writers
         wait or retry exactly as they do for any long write.
+        A collector stop interrupts SQLite VM work, rolling back only this
+        atomic index. The caller retains its run lock until this connection
+        closes. SQLite lock waits retain the existing five-second timeout;
+        progress callbacks cannot bound a stalled filesystem operation.
         """
 
         statement = dict(CHRONOLOGICAL_INDEXES)[name]
         started = time.monotonic()
+        if should_continue is not None and not should_continue():
+            raise HistoryIndexBuildCancelled()
         with closing(self._connect()) as connection:
-            connection.execute(statement)
-            connection.commit()
+            try:
+                if should_continue is not None:
+                    if not should_continue():
+                        raise HistoryIndexBuildCancelled()
+                    connection.set_progress_handler(lambda: int(not should_continue()), 1000)
+                connection.execute(statement)
+                connection.commit()
+            except sqlite3.OperationalError as exc:
+                if (
+                    getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+                    and should_continue is not None
+                    and not should_continue()
+                ):
+                    raise HistoryIndexBuildCancelled() from exc
+                raise
+            finally:
+                connection.set_progress_handler(None, 0)
         logger.info("Built history index %s in %.1f seconds.", name, time.monotonic() - started)
 
     @staticmethod
