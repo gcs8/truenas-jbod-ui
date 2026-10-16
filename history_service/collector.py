@@ -44,7 +44,7 @@ from history_service.domain import (
 )
 from history_service.backup_scheduler.service import read_archive_status
 from history_service.scheduled_backup import read_scheduled_backup_status
-from history_service.store import HistoryStore, SlotStateUpdate, is_database_corruption_error
+from history_service.store import HistoryIndexBuildCancelled, HistoryStore, SlotStateUpdate, is_database_corruption_error
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
@@ -154,6 +154,8 @@ class HistoryCollector:
         self._paused_in_memory_at: datetime | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        # Native SQLite progress runs in the retained index worker thread.
+        self._index_build_stopping = threading.Event()
         self.started_at = isoformat_utc()
         self.last_inventory_at: str | None = None
         self.last_fast_metrics_at: str | None = None
@@ -225,12 +227,14 @@ class HistoryCollector:
         if self._task and not self._task.done():
             return
         self._stopping.clear()
+        self._index_build_stopping.clear()
         self._task = asyncio.create_task(self._run_loop(), name="history-collector")
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, True)
 
     async def stop(self) -> None:
         task = self._task
         self._stopping.set()
+        self._index_build_stopping.set()
         if task:
             try:
                 await task
@@ -841,6 +845,9 @@ class HistoryCollector:
                 await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
             except HistoryCollectionAlreadyRunning:
                 return False
+            except HistoryIndexBuildCancelled:
+                # An intentional stop is neither damage nor a retry failure.
+                return False
             except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
                 self._index_build_failures += 1
                 logger.warning(
@@ -852,6 +859,8 @@ class HistoryCollector:
                 if is_database_corruption_error(exc):
                     self._pause_for_damage(exc)
                 return False
+        if self._stopping.is_set():
+            return False
         self._chronological_indexes_identity = identity
         self._index_build_failures = 0
         return True
@@ -863,7 +872,9 @@ class HistoryCollector:
         self.current_collection_kind = "maintenance"
         self.current_collection_activity = f"building history index {position} of {total}"
         try:
-            self.store.build_chronological_index(name)
+            self.store.build_chronological_index(
+                name, should_continue=lambda: not self._index_build_stopping.is_set()
+            )
         finally:
             self.current_collection_started_at = None
             self.current_collection_kind = None

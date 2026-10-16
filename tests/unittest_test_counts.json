@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "modules": {
-    "test_account_bootstrap": 51,
+    "test_account_bootstrap": 53,
     "test_admin_auth": 28,
     "test_admin_command_state": 5,
     "test_admin_config": 6,
@@ -39,7 +39,7 @@
     "test_history_backup_coupling": 11,
     "test_history_bulk_bounds": 16,
     "test_history_config_contract": 14,
-    "test_history_deferred_indexes": 10,
+    "test_history_deferred_indexes": 15,
     "test_history_diagnostics": 13,
     "test_history_health_states": 26,
     "test_history_operation_bounds": 17,
