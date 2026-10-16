@@ -48,6 +48,7 @@ RETENTION_KEYS = (
     "unplaced_disk_count",
 )
 MAX_INVENTORY_BYTES = 64 * 1024 * 1024
+MAX_RETENTION_ERROR_BYTES = 4096
 # The UI runs one system-wide retention check per system at a time and answers
 # a concurrent one with 503 and Retry-After (#917). Wait for it, up to this long
 # in total, before treating the check as failed.
@@ -69,6 +70,19 @@ class InventoryBusy(DeploymentError):
     def __init__(self, retry_after_seconds: int) -> None:
         super().__init__("inventory retention check is busy")
         self.retry_after_seconds = retry_after_seconds
+
+
+class RetentionScopeTooLarge(DeploymentError):
+    """The system-wide disk check cannot verify this enclosure scope."""
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        minimum = payload.get("enclosure_count_minimum")
+        cap = payload.get("enclosure_cap")
+        detail = "inventory retention scope too large"
+        # Do not echo server prose or unbounded/untrusted count fields.
+        if type(minimum) is int and type(cap) is int and 0 < cap < minimum <= 2**31 - 1:
+            detail += f": at least {minimum} enclosure options exceeds cap {cap}"
+        super().__init__(detail)
 
 
 @dataclass(frozen=True)
@@ -313,9 +327,34 @@ def _default_fetch_json(url: str) -> object:
             data = response.read(MAX_INVENTORY_BYTES + 1)
     except urllib.error.HTTPError as exc:
         retry_after = (exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
-        exc.close()
-        if exc.code == 503 and retry_after.isdigit():
-            raise InventoryBusy(int(retry_after)) from None
+        try:
+            if exc.code == 503 and retry_after.isdigit():
+                raise InventoryBusy(int(retry_after)) from None
+            if exc.code == 503:
+                # Too-large is a terminal refusal, not a busy check. Read only
+                # a bounded error object, never an inventory-sized error body.
+                data = exc.read(MAX_RETENTION_ERROR_BYTES + 1)
+                if len(data) <= MAX_RETENTION_ERROR_BYTES:
+                    try:
+                        payload = json.loads(data)
+                    except (ValueError, RecursionError):
+                        payload = None
+                    if isinstance(payload, dict):
+                        if payload.get("error") == "retention_scope_too_large":
+                            raise RetentionScopeTooLarge(payload) from None
+                        # The baseline request reaches the predecessor, before
+                        # this update can activate the typed response (#986).
+                        # Recognize only its exact legacy object, never prose
+                        # substrings or counts absent from that contract.
+                        if payload.get("ok") is False and payload == {
+                            "ok": False,
+                            "detail": "This system has too many enclosures for a system-wide disk check.",
+                        }:
+                            raise RetentionScopeTooLarge({}) from None
+        except OSError:
+            pass
+        finally:
+            exc.close()
         raise DeploymentError("inventory retention check could not read the inventory") from exc
     except OSError as exc:
         raise DeploymentError("inventory retention check could not read the inventory") from exc
@@ -393,26 +432,25 @@ def _check_retention(before: dict[str, int] | None, after: dict[str, int]) -> No
         )
 
 
-_URL_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*)://([^\s/?#]*)[^\s]*")
-
-
-def _redact_url(match: re.Match[str]) -> str:
-    # Keep scheme, host and port so the operator sees which endpoint failed.
-    # Userinfo, path and query can carry tokens, so they never reach the output.
-    host = match.group(2).rpartition("@")[2]
-    return f"{match.group(1)}://{host}"
+# Consume the entire non-whitespace token: malformed userinfo can contain /
+# ? or #, so no parsed authority substring is safe to keep (#985). Include
+# percent-encoded separators and malformed HTTP URLs, without decoding prose.
+_URL_PATTERN = re.compile(
+    r"\b(?:[A-Za-z][A-Za-z0-9+.-]*(?::|%3a)(?:/|%2f){2}|https?(?::|%3a))\S*",
+    re.IGNORECASE,
+)
 
 
 def _failure_summary(error: BaseException) -> str:
     """One bounded line naming why activation or rollback failed (#910).
 
     Helper errors say what failed, but some quote a caller-supplied URL whose
-    path or query may hold a credential; those are cut to scheme://host:port.
+    path or query may hold a credential; the entire URL token is removed.
     Any other exception is reported by type only.
     """
 
     if isinstance(error, DeploymentError):
-        text = _URL_PATTERN.sub(_redact_url, " ".join(str(error).split()))
+        text = _URL_PATTERN.sub("[redacted-url]", " ".join(str(error).split()))
         return text[:300] if text else type(error).__name__
     return type(error).__name__
 

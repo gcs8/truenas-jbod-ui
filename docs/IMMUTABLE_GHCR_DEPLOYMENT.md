@@ -99,6 +99,17 @@ them. The receipt stores the counts under `retention`; it stores no disk
 identifiers. Collecting the inventory contacts the monitored systems, so the
 request may take up to two minutes.
 
+A scope above the system-wide check's enclosure-option cap returns
+`retention_scope_too_large`, with `enclosure_cap` and a lower bound named
+`enclosure_count_minimum`, not an exact count. The helper names this refusal
+rather than treating it as an unreadable or busy inventory. A refusal before
+activation stops the update; a refusal after activation still rolls back.
+Numeric `Retry-After` responses remain retryable within the existing wait
+budget. The helper never silently disables a requested retention check.
+`--inventory-url` remains optional, but omitting it explicitly forgoes disk
+retention verification for that update; there is no `--skip-retention-check`
+option.
+
 The receipt is JSON data, not shell code. The helper rejects symlinks, wrong owners or modes, duplicate or extra keys, missing or extra files, hash changes, and cardinality mismatches before verify or rollback touches Docker. An existing receipt blocks another update so a rerun cannot erase rollback evidence.
 
 Activation and rollback allow up to 120 seconds of Docker `starting` health,
