@@ -36,9 +36,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- Opening-view requests bounded scoring waits and used saved then discovery
-  order with a warning when busy, timed out, or over cap; forced refreshes
-  retried correlation once after overlapping background source updates (#997).
+- Opening-view requests bounded scoring waits, kept persistence and collection
+  out of optional scoring, and used saved then discovery order with a warning
+  when busy, timed out, or over cap; forced refreshes retried correlation once
+  after overlapping background source updates (#997).
 - The immutable upgrade helper removed complete URL tokens from failure
   summaries and named over-cap retention refusals with bounded count/cap
   evidence, while preserving refusal, rollback, and busy retries (#995).

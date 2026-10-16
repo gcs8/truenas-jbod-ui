@@ -1322,6 +1322,7 @@ class InventoryService:
         self._view_order_source_bundle: InventorySourceBundle | None = None
         self._view_order_topology_generation = -1
         self._view_order_cache: OrderedDict[tuple[Any, ...], list[str]] = OrderedDict()
+        self._view_order_read_inputs: tuple[Any, ...] | None = None
         self._canonical_options_request_sequence = 0
         # Sources behind the current canonical options; None when unknown.
         self._canonical_options_source_publication: SourcePublication | None = None
@@ -2505,6 +2506,44 @@ class InventoryService:
             )
         ).value
 
+    async def _get_opening_order_snapshot(
+        self,
+        enclosure_id: str,
+        *,
+        source_bundle: InventorySourceBundle,
+        active_snapshot: InventorySnapshot,
+    ) -> InventorySnapshot | None:
+        # Optional scoring cannot enter publication, persistence or collection.
+        # Those producers retain ownership while draining non-cancellable work.
+        inputs = self._view_order_read_inputs
+        if inputs is None or inputs[0] is not source_bundle or inputs[1] != self._snapshot_topology_generation:
+            return None
+        await asyncio.sleep(0)
+        if inputs[1] != self._snapshot_topology_generation:
+            return None
+        ssh_data = (
+            self._parsed_ssh_data_for_enclosure(source_bundle, enclosure_id)
+            if source_bundle.ssh_collected else ParsedSSHData()
+        )
+        if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
+            ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
+        token = _snapshot_read_inputs.set((self, inputs[2], inputs[3]))
+        try:
+            slots, *_rest = self._correlate(
+                source_bundle.raw_data, ssh_data, [],
+                selected_enclosure_id=enclosure_id,
+                quantastor_ses_data=source_bundle.quantastor_ses_data,
+                bmc_inventory=source_bundle.bmc_inventory,
+            )
+        finally:
+            _snapshot_read_inputs.reset(token)
+        # Observe cancellation after synchronous correlation as well. These
+        # request-local slots have no executor, persistence or identity owner.
+        await asyncio.sleep(0)
+        if inputs[1] != self._snapshot_topology_generation:
+            return None
+        return active_snapshot.model_copy(update={"slots": slots, "selected_enclosure_id": enclosure_id})
+
     async def _effective_runtime_view_order(
         self,
         *,
@@ -2595,12 +2634,13 @@ class InventoryService:
                     for option in active_snapshot.enclosures:
                         snapshot = known_snapshots.get(option.id)
                         if snapshot is None:
-                            # The request already collected the source bundle.
-                            # Secondary builds add no appliance/API/SSH refresh.
-                            snapshot = await self._get_secondary_runtime_snapshot(
+                            snapshot = await self._get_opening_order_snapshot(
                                 option.id,
-                                force_refresh=force_refresh,
+                                source_bundle=source_bundle,
+                                active_snapshot=active_snapshot,
                             )
+                            if snapshot is None:
+                                return fallback_order("current correlation inputs are unavailable")
                             known_snapshots[option.id] = snapshot
                         enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
 
@@ -7077,6 +7117,11 @@ class InventoryService:
 
         mappings, aliases = await _drain_inventory_worker(
             asyncio.get_running_loop().run_in_executor(None, copy_context().run, read_inputs)
+        )
+        # Reuse this admitted read for optional secondary counts. Do not reopen
+        # stores from the deadline-bounded scorer, even if source TTL expires.
+        self._view_order_read_inputs = (
+            source_bundle, self._snapshot_topology_generation, mappings, aliases,
         )
         token = _snapshot_read_inputs.set((self, mappings, aliases))
         try:
