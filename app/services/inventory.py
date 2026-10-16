@@ -1036,6 +1036,7 @@ _snapshot_detail_commits: ContextVar[list[Callable[[Callable[[], bool]], Awaitab
 _snapshot_build_source_publications: ContextVar[list[SourcePublication] | None] = ContextVar(
     "snapshot_build_source_publications", default=None,
 )
+_snapshot_background_refresh: ContextVar[bool] = ContextVar("snapshot_background_refresh", default=False)
 
 
 async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
@@ -1316,11 +1317,11 @@ class InventoryService:
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
         self._view_order_topology_generation = -1
-        self._view_order_context: tuple[Any, ...] | None = None
-        self._cached_effective_view_order: list[str] = []
+        self._view_order_cache: OrderedDict[tuple[Any, ...], list[str]] = OrderedDict()
         self._canonical_options_request_sequence = 0
         # Sources behind the current canonical options; None when unknown.
         self._canonical_options_source_publication: SourcePublication | None = None
+        self._canonical_options_background_refresh = False
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
@@ -1659,18 +1660,55 @@ class InventoryService:
                 )
                 build_started = time.perf_counter()
                 detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
-                source_publications.clear()
-                detail_token = _snapshot_detail_commits.set(detail_commits)
-                source_token = _snapshot_build_source_publications.set(source_publications)
-                try:
-                    with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
-                        snapshot = await self._build_snapshot(
-                            selected_enclosure_id=selected_enclosure_id,
-                            force_source_refresh=refresh_sources,
-                        )
-                finally:
-                    _snapshot_build_source_publications.reset(source_token)
-                    _snapshot_detail_commits.reset(detail_token)
+                retry_bundle: InventorySourceBundle | None = None
+                retry_generation = self._source_bundle_generation
+                for attempt in range(2):
+                    source_publications.clear()
+                    detail_commits.clear()
+                    detail_token = _snapshot_detail_commits.set(detail_commits)
+                    source_token = _snapshot_build_source_publications.set(source_publications)
+                    try:
+                        with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
+                            if retry_bundle is None:
+                                snapshot = await self._build_snapshot(
+                                    selected_enclosure_id=selected_enclosure_id,
+                                    force_source_refresh=refresh_sources,
+                                )
+                            else:
+                                snapshot = await self._build_snapshot(
+                                    selected_enclosure_id=selected_enclosure_id,
+                                    source_bundle=retry_bundle,
+                                )
+                    finally:
+                        _snapshot_build_source_publications.reset(source_token)
+                        _snapshot_detail_commits.reset(detail_token)
+                    if retry_bundle is not None and retry_generation != self._source_bundle_generation:
+                        raise SnapshotStateBusyError()
+                    # A background warm-up can collect S2 while this forced
+                    # request is correlating S1. Re-correlate once from the exact
+                    # published S2, never publish S1 or start another source flight.
+                    # Unrelated foreground supersession and topology changes keep
+                    # their fail-closed behavior.
+                    current_bundle = self._source_bundle
+                    if (
+                        attempt == 0 and force_refresh and refresh_sources
+                        and selected_enclosure_id is not None
+                        and snapshot.selected_enclosure_id == selected_enclosure_id
+                        and self._snapshot_has_trusted_topology(snapshot)
+                        and topology_generation == self._snapshot_topology_generation
+                        and cache_key not in self._snapshot_invalidated
+                        and request_sequence < self._canonical_options_request_sequence
+                        and self._canonical_options_background_refresh
+                        and current_bundle is not None and source_publications
+                        and current_bundle.publication == self._canonical_options_source_publication
+                        and current_bundle.publication.sequence > source_publications[-1].sequence
+                        and self._source_publication_meets(current_bundle.publication, required_source_publication)
+                        and {option.id for option in snapshot.enclosures} == set(self._canonical_enclosure_options or {})
+                    ):
+                        retry_bundle = current_bundle
+                        retry_generation = self._source_bundle_generation
+                        continue
+                    break
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and cache_key in self._snapshot_invalidated:
                     raise SnapshotStateBusyError()
@@ -1980,8 +2018,7 @@ class InventoryService:
         self._snapshot_publication_generation += 1
         self._view_order_source_bundle = None
         self._view_order_topology_generation = -1
-        self._view_order_context = None
-        self._cached_effective_view_order = []
+        self._view_order_cache.clear()
         self._touch_snapshot_key(cache_key)
         return snapshot, True
 
@@ -2119,6 +2156,7 @@ class InventoryService:
                     self._canonical_options_source_publication = (
                         source_publications[-1] if source_publications else None
                     )
+                    self._canonical_options_background_refresh = _snapshot_background_refresh.get()
                     if not trusted_topology:
                         discovered_snapshot = None
         if selected_enclosure_id is None:
@@ -2182,6 +2220,7 @@ class InventoryService:
             self._canonical_default_enclosure_id = next(iter(options), None)
         self._canonical_options_request_sequence = request_sequence
         self._canonical_options_source_publication = source_publications[-1] if source_publications else None
+        self._canonical_options_background_refresh = _snapshot_background_refresh.get()
         for key in removed_keys:
             self._remove_snapshot_state_key(key, cancel_task=True)
         self._forget_led_targets(removed_keys, request_sequence=request_sequence)
@@ -2494,20 +2533,33 @@ class InventoryService:
             if (
                 self._view_order_source_bundle is source_bundle
                 and self._view_order_topology_generation == self._snapshot_topology_generation
-                and self._view_order_context == order_context
-                and self._cached_effective_view_order
             ):
-                return list(self._cached_effective_view_order)
+                cached = self._view_order_cache.get(order_context)
+                if cached is not None:
+                    self._view_order_cache.move_to_end(order_context)
+                    return list(cached)
             return None
 
+        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            warning = (
+                "Opening-view scoring was skipped because this system exceeds the enclosure limit; "
+                "saved order followed by discovery order is shown."
+            )
+            if warning not in active_snapshot.warnings:
+                active_snapshot.warnings.append(warning)
+            # This bounds scoring, not rendering. Equal zero counts retain
+            # discovery order and saved preferences without building other shelves.
+            return effective_main_view_order(
+                enclosure_counts=[(option.id, 0) for option in active_snapshot.enclosures],
+                view_counts=[(view_id, 0) for view_id, _count in view_counts],
+                saved_order=saved_order,
+            )
         cached = cached_order()
         if cached is not None:
             return cached
-        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
-            raise SystemRetentionTooLargeError()
-        if self._view_order_recompute_lock.locked():
-            raise SystemRetentionBusyError()
 
+        # Opening a page is not a retention-check admission. Wait for bounded
+        # scoring work instead of returning busy to a concurrent browser tab.
         async with self._view_order_recompute_lock:
             cached = cached_order()
             if cached is not None:
@@ -2537,10 +2589,17 @@ class InventoryService:
             # is awaited. Return this request's coherent result, but only cache it
             # when no snapshot publication raced the computation.
             if publication_generation == self._snapshot_publication_generation:
+                if (self._view_order_source_bundle is not source_bundle
+                        or self._view_order_topology_generation != self._snapshot_topology_generation):
+                    self._view_order_cache.clear()
                 self._view_order_source_bundle = source_bundle
                 self._view_order_topology_generation = self._snapshot_topology_generation
-                self._view_order_context = order_context
-                self._cached_effective_view_order = list(order)
+                self._view_order_cache[order_context] = list(order)
+                self._view_order_cache.move_to_end(order_context)
+                # Retain both saved/automatic contexts for each selected shelf,
+                # with a hard bound even when runtime counts keep changing.
+                while len(self._view_order_cache) > 2 * SYSTEM_RETENTION_MAX_ENCLOSURES:
+                    self._view_order_cache.popitem(last=False)
             return order
 
     async def get_storage_view_runtime(
@@ -4666,6 +4725,7 @@ class InventoryService:
         task.add_done_callback(_cleanup)
 
     async def _background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
+        background_token = _snapshot_background_refresh.set(True)
         try:
             observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
             source_task = self._schedule_background_source_bundle_refresh()
@@ -4702,6 +4762,8 @@ class InventoryService:
             logger.debug("Background snapshot refresh for %s was superseded.", cache_key)
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
+        finally:
+            _snapshot_background_refresh.reset(background_token)
 
     @staticmethod
     def _snapshot_has_trusted_topology(snapshot: InventorySnapshot) -> bool:
@@ -6917,8 +6979,9 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         force_source_refresh: bool = False,
+        source_bundle: InventorySourceBundle | None = None,
     ) -> InventorySnapshot:
-        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
+        source_bundle = source_bundle or await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
         source_publications = _snapshot_build_source_publications.get()
         if source_publications is not None:
             source_publications.append(source_bundle.publication)

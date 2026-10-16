@@ -4318,7 +4318,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 before.view_order.index("enclosure:enc-b"),
                 before.view_order.index("enclosure:enc-a"),
             )
-            self.assertTrue(service._cached_effective_view_order)
+            self.assertTrue(service._view_order_cache)
 
             refreshed = self._view_order_snapshot(
                 "synthetic-system", "enc-a", "Enclosure A", 4, options,
@@ -4371,7 +4371,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             force_source_refresh=False,
         )
 
-    def test_runtime_view_order_refuses_oversized_enclosure_enumeration(self) -> None:
+    def test_runtime_view_order_falls_back_for_oversized_enclosure_enumeration(self) -> None:
         options = [
             EnclosureOption(id=f"enc-{index}", label=f"Enclosure {index}")
             for index in range(inventory_module.SYSTEM_RETENTION_MAX_ENCLOSURES + 1)
@@ -4392,8 +4392,12 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
 
-            with self.assertRaises(inventory_module.SystemRetentionTooLargeError):
-                asyncio.run(service.get_storage_view_runtime(selected_enclosure_id=options[0].id))
+            runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id=options[0].id))
+            self.assertEqual(runtime.view_order, [
+                *(f"enclosure:{option.id}" for option in options), "view:primary-chassis",
+            ])
+            self.assertTrue(any("Opening-view scoring was skipped" in warning
+                                for warning in snapshots[options[0].id].warnings))
 
         self.assertEqual(service.get_snapshot.await_count, 1)
 
@@ -4414,11 +4418,13 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         async def exercise(service: InventoryService) -> None:
             await service._view_order_recompute_lock.acquire()
+            task = asyncio.create_task(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
             try:
-                with self.assertRaises(inventory_module.SystemRetentionBusyError):
-                    await service.get_storage_view_runtime(selected_enclosure_id="enc-a")
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
             finally:
                 service._view_order_recompute_lock.release()
+            await asyncio.wait_for(task, 2)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(id="synthetic-system", label="Synthetic system")
@@ -4429,7 +4435,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
             asyncio.run(exercise(service))
 
-        self.assertEqual(service.get_snapshot.await_count, 1)
+        self.assertEqual(service.get_snapshot.await_count, 2)
 
     def test_filtered_storage_view_runtime_preserves_opening_order_metadata(self) -> None:
         runtime = StorageViewRuntimePayload(
