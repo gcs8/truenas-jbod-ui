@@ -20,7 +20,7 @@
     "test_backup_integration": 134,
     "test_bash_ci_contract": 6,
     "test_changelog_entry_gate": 23,
-    "test_ci_contract": 48,
+    "test_ci_contract": 50,
     "test_compose_runtime_matrix": 43,
     "test_config_example": 9,
     "test_container_contract": 64,
