@@ -36,6 +36,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Storage Fabric linked cascaded MPR expanders through unique, consistent
+  reported parents, retained verified ancestors in selected traces, and bounded
+  propagated bay memberships; missing, conflicting or over-limit ancestry stayed
+  unknown (#970).
 - History adoption kept its committed success when the optional follow-up scan
   failed, warned that the source list needed a refresh, and preserved the last
   known list instead of displaying an empty result (#999).
