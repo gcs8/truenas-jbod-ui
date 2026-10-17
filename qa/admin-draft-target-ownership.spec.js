@@ -36,7 +36,7 @@ print(env.get_template('index.html').render(admin_bootstrap_json=sys.stdin.read(
 `, path.join(root, "admin_service/templates")], { input: JSON.stringify(fixture), encoding: "utf8" });
 const html = renderFixture(bootstrap);
 
-async function openFixture(page, { platformBindings = false } = {}) {
+async function openFixture(page, { platformBindings = false, beforeCandidate = null } = {}) {
   const pending = { saves: [], candidates: [], edits: [], states: 0, lists: 0, restores: [], inspections: 0, heldStates: [], holdState: false, errors: [], unexpected: [], state: JSON.parse(JSON.stringify(bootstrap)) };
   if (platformBindings) {
     pending.state.storage_view_templates[0].default_binding = view("view-a", "node-a").binding;
@@ -65,6 +65,7 @@ async function openFixture(page, { platformBindings = false } = {}) {
       return;
     }
     if (url.pathname === "/api/admin/storage-views/candidates") {
+      if (beforeCandidate) await beforeCandidate(url);
       pending.candidates.push({ system: url.searchParams.get("system_id"), target: url.searchParams.get("target_system_id"), respond: json });
       return;
     }
@@ -945,6 +946,26 @@ for (const outcome of ['success','failure']) {
  });
 }
 
+async function newTargetCandidate(pending, before, system, target) {
+  const find = () => pending.candidates.slice(before).find((request) => request.system === system && request.target === target);
+  await expect.poll(() => Boolean(find())).toBe(true);
+  const request = find();
+  expect(request.system).toBe(system);
+  expect(request.target).toBe(target);
+  return request;
+}
+
+async function expectFreshTargetBinding(page, pending) {
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue('node-a');
+  const request = await save(page, pending);
+  expect(request.body.system_id).toBe('system-a');
+  const savedView = request.body.storage_views.find((storageView) => storageView.id === 'view-a');
+  expect(savedView.binding.target_system_id).toBe('node-a');
+  expect(savedView.binding.device_names).toEqual(['fresh-device']);
+  await acknowledge(request);
+  await finished(page);
+}
+
 test('rapid target A to B to A rejects old hints before paint',async ({page})=>{
  const p=await openFixture(page); await candidateResponse(p.candidates.at(-1));
  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
@@ -956,12 +977,63 @@ test('rapid target A to B to A rejects old hints before paint',async ({page})=>{
   document.querySelector('#setup-storage-view-candidates-add-all-button').dispatchEvent(new MouseEvent('click',{bubbles:true}));
  });
  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
- await expect.poll(()=>p.candidates.length).toBeGreaterThan(before);
- await candidateResponse(p.candidates.at(-1),'fresh-device');
+ const a=await newTargetCandidate(p,before,'system-a','node-a');
+ await expect(page.locator('#setup-storage-view-target-system')).toHaveValue(a.target);
+ await candidateResponse(a,'fresh-device');
  await page.locator('#setup-storage-view-candidates-add-all-button').click();
- await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');clean(p);
+ await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');
+ await expectFreshTargetBinding(page,p);clean(p);
 });
 
+
+test('rapid target A to B to A ignores intermediate B while exact final A is pending',async ({page})=>{
+ let holdFinalA=false, finalAHeld=false, releaseFinalA;
+ const finalAGate=new Promise(resolve=>{releaseFinalA=resolve;});
+ const p=await openFixture(page,{beforeCandidate:async url=>{
+  if(holdFinalA&&url.searchParams.get('system_id')==='system-a'&&url.searchParams.get('target_system_id')==='node-a') {
+   finalAHeld=true;await finalAGate;
+  }
+ }});
+ try {
+  await candidateResponse(p.candidates.at(-1));
+  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
+  const before=p.candidates.length;holdFinalA=true;
+  // Keep both changes and stale action attempts in one task, through shipping callbacks.
+  await page.evaluate(()=>{
+   const target=document.querySelector('#setup-storage-view-target-system');
+   for(const value of ['node-b','node-a']) {target.value=value;target.dispatchEvent(new Event('change',{bubbles:true}));}
+   document.querySelector('[data-storage-view-candidate-id="candidate-node-a"]')?.click();
+   document.querySelector('#setup-storage-view-candidates-add-all-button').dispatchEvent(new MouseEvent('click',{bubbles:true}));
+  });
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
+  await expect.poll(()=>p.candidates.length).toBeGreaterThan(before);
+  await expect.poll(()=>finalAHeld).toBe(true);
+  // The old count/array-tail selector would now choose B, not the final A owner.
+  expect(p.candidates.slice(before).map(request=>[request.system,request.target])).toEqual([['system-a','node-b']]);
+  const b=p.candidates[before];
+  releaseFinalA();
+  const a=await newTargetCandidate(p,before,'system-a','node-a');
+  expect(a).not.toBe(b);
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue(a.target);
+  const response=page.waitForResponse(r=>{
+   const url=new URL(r.url());
+   return url.pathname==='/api/admin/storage-views/candidates'&&url.searchParams.get('system_id')===b.system&&url.searchParams.get('target_system_id')===b.target;
+  });
+  await candidateResponse(b,'stale-b-device');
+  await (await response).finished();
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  await expect(page.locator('#setup-storage-view-candidates-list')).not.toContainText('stale-b-device');
+  await expect(page.locator('[data-storage-view-candidate-id]')).toHaveCount(0);
+  await expect(page.locator('#setup-storage-view-candidates-add-all-button')).toBeDisabled();
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue('node-a');
+  await candidateResponse(a,'fresh-device');
+  await expect(page.locator('#setup-storage-view-candidates-add-all-button')).toBeEnabled();
+  await page.locator('#setup-storage-view-candidates-add-all-button').click();
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');
+  await expectFreshTargetBinding(page,p);clean(p);
+ } finally {releaseFinalA();}
+});
 
 test('Reset to defaults button after save retains dirty protection', async ({page})=>{
  const p=await openFixture(page);
