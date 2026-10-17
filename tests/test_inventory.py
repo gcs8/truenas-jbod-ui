@@ -158,6 +158,55 @@ class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
         )
         return build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name, MagicMock())
 
+    def test_non_identify_state_matches_unmasked_producer_and_survives_caches(self):
+        service = self.service()
+        for expected, raw, mapping in (
+            ("unknown", {}, None),
+            ("unmapped", {}, ManualMapping(slot=0, serial="SANITIZED-MAPPED")),
+            ("empty", {"present": False, "status": "Critical"}, None),
+            ("fault", {"status": "Fault"}, None),
+            ("healthy", {"present": True, "bmc_slot_number": 0}, None),
+        ):
+            with self.subTest(expected=expected):
+                for active in (False, True, False):
+                    slot = service._build_slot_view(
+                        0, 0, 0, {"id": "shelf-a"}, {**raw, "identify_active": active},
+                        None, mapping, ParsedSSHData(), {}, set(),
+                    )
+                    self.assertEqual(slot.state.value, "identify" if active else expected)
+                    self.assertEqual(slot.non_identify_state, expected)
+                    payload = slot.model_dump(mode="json")
+                    self.assertEqual(SlotView.model_validate(payload).non_identify_state, expected)
+                    snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30,
+                                                 selected_enclosure_id="shelf-a")
+                    service._remember_led_snapshot("shelf-a", snapshot)
+                    self.assertEqual(service._led_slot_targets[("shelf-a", 0)].non_identify_state, expected)
+
+    def test_non_identify_state_storage_runtime_producer(self):
+        service = self.service()
+        view = StorageViewRuntimeView(id="synthetic-view", label="Synthetic view", kind="boot_devices", template_id="synthetic")
+        for occupied, health, expected in ((False, "FAULTED", "empty"),
+                                           (True, "FAULTED", "fault"),
+                                           (True, "ONLINE", "healthy")):
+            with self.subTest(occupied=occupied, health=health):
+                slot = service._build_slot_view_from_storage_view_runtime_slot(
+                    view, StorageViewRuntimeSlot(slot_index=0, slot_label="00", occupied=occupied,
+                                                 state="identify", health=health),
+                )
+                self.assertEqual(slot.non_identify_state, expected)
+
+    def test_non_identify_state_model_allowlist_and_legacy_default(self):
+        from pydantic import ValidationError
+
+        legacy = dict(slot=0, slot_label="00", row_index=0, column_index=0, state="identify")
+        self.assertIsNone(SlotView(**legacy).non_identify_state)
+        self.assertNotIn("non_identify_state", SlotView(**legacy).model_dump(mode="json"))
+        for value in ("healthy", "fault", "empty", "unknown", "unmapped"):
+            self.assertEqual(SlotView(**legacy, non_identify_state=value).non_identify_state, value)
+        for value in ("identify", "invalid", False, {}, []):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                SlotView(**legacy, non_identify_state=value)
+
     @staticmethod
     def overlay(host, enclosure_id, device, *, bay=0, sas="0x5eeeee01"):
         enclosure = SESMapEnclosure(

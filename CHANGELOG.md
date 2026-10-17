@@ -41,6 +41,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   generation, and used saved then discovery order with a warning when busy,
   timed out, or over cap; forced refreshes retried correlation once after
   overlapping background source updates (#997).
+- Locate light readback immediately updated bay tiles and restored their prior
+  state on clear, including cached views, and Connections Show all retained
+  keyboard focus on its heading (#998).
+- History adoption kept its committed success when the optional follow-up scan
+  failed, warned that the source list needed a refresh, and preserved the last
+  known list instead of displaying an empty result (#999).
 - The immutable upgrade helper removed complete URL tokens from failure
   summaries and named over-cap retention refusals with bounded count/cap
   evidence, while preserving refusal, rollback, and busy retries (#995).

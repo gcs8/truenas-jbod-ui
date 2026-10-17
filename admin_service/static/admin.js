@@ -7780,18 +7780,24 @@
           target_system_id: targetSystem.id,
         }),
       });
-      state.orphanedHistory = Array.isArray(payload.orphaned_systems) ? payload.orphaned_systems : [];
+      const refreshed = Array.isArray(payload.orphaned_systems);
+      if (refreshed) {
+        state.orphanedHistory = payload.orphaned_systems;
+      }
+      // Keep last-known rows visible but unavailable until an explicit scan.
+      state.orphanedHistoryError = !refreshed;
+      const warning = refreshed ? "" : (payload.warning || "Unable to refresh removed-system history. Refresh the history source list before another adoption.");
       state.selectedHistoryAdoptSourceId = state.orphanedHistory[0]?.system_id || "";
       state.selectedHistoryAdoptTargetId = targetSystem.id;
       renderHistoryMaintenance();
       if (elements.historyAdoptResult) {
-        elements.historyAdoptResult.textContent = payload.detail || "Removed-system history adopted.";
+        elements.historyAdoptResult.textContent = [payload.detail || "Removed-system history adopted.", warning].filter(Boolean).join(" ");
       }
       setBanner(
-        Number(payload.summary?.total_rows || 0) > 0
+        [Number(payload.summary?.total_rows || 0) > 0
           ? `Adopted saved history from ${sourceSystem.system_label || sourceSystem.system_id} into ${targetSystem.label || targetSystem.id}.`
-          : `No saved history rows matched ${sourceSystem.system_id}.`,
-        Number(payload.summary?.total_rows || 0) > 0 ? "success" : "info"
+          : `No saved history rows matched ${sourceSystem.system_id}.`, warning].filter(Boolean).join(" "),
+        !warning && Number(payload.summary?.total_rows || 0) > 0 ? "success" : "info"
       );
     } catch (error) {
       if (elements.historyAdoptResult) {

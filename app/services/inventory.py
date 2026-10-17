@@ -3235,10 +3235,12 @@ class InventoryService:
         return runtime_slot.slot_index, f"storage-view:{runtime_view.id}"
 
     @classmethod
-    def _storage_view_runtime_slot_state(cls, runtime_slot: StorageViewRuntimeSlot) -> SlotState:
+    def _storage_view_runtime_slot_state(
+        cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
+    ) -> SlotState:
         if not runtime_slot.occupied:
             return SlotState.empty
-        if runtime_slot.state == SlotState.identify.value:
+        if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
             return SlotState.fault
@@ -3275,6 +3277,7 @@ class InventoryService:
             enclosure_name=runtime_view.label,
             present=runtime_slot.occupied,
             state=self._storage_view_runtime_slot_state(runtime_slot),
+            non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
             smart_device_names=list(runtime_slot.smart_device_names),
             smart_device_type=runtime_slot.smart_device_type,
@@ -14613,18 +14616,17 @@ class InventoryService:
             or (not ses_says_empty_without_disk and status_says_populated)
         )
 
-        if identify_active:
-            state = SlotState.identify
-        elif faulty and not ses_says_empty_without_disk:
-            state = SlotState.fault
+        if faulty and not ses_says_empty_without_disk:
+            non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
-            state = SlotState.empty
+            non_identify_state = SlotState.empty
         elif disk or bmc_present:
-            state = SlotState.healthy
+            non_identify_state = SlotState.healthy
         elif mapping:
-            state = SlotState.unmapped
+            non_identify_state = SlotState.unmapped
         else:
-            state = SlotState.unknown
+            non_identify_state = SlotState.unknown
+        state = SlotState.identify if identify_active else non_identify_state
 
         identity_mapping = None if stale_manual_mapping else mapping
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
@@ -14841,6 +14843,7 @@ class InventoryService:
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
             state=state,
+            non_identify_state=non_identify_state.value,
             identify_active=identify_active,
             device_name=device_name,
             smart_device_names=list(disk.smart_devices) if disk else [],
