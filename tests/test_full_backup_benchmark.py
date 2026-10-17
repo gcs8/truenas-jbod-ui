@@ -538,9 +538,13 @@ raise SystemExit(b.main())
             old_tempdir = tempfile.tempdir
             tempfile.tempdir = str(self.root)
             self.addCleanup(setattr, tempfile, "tempdir", old_tempdir)
-            request = {"root": str(self.root), "passphrase": "ephemeral-test-only"}
+            request = {"root": str(self.root), "passphrase": "  ephemeral 雪 test-only   "}
             self.b.operation("create", request)
             for operation in ("inspect", "verify", "extract"):
+                result = self.b.operation(operation, request)
+                if operation == "extract":
+                    self.assertGreater(result["rows"]["slot_events"], 0)
+                self.assertFalse(any(p.name.startswith("truenas-jbod-ui-") for p in self.root.iterdir()))
                 with self.assertRaises(ValueError):
                     self.b.operation(operation, {**request, "passphrase": "wrong"})
                 self.assertFalse(any(p.name.startswith("truenas-jbod-ui-") for p in self.root.iterdir()))

@@ -2124,7 +2124,17 @@ class InventoryService:
         if selected_enclosure_id is None:
             return self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY, discovered_snapshot
         if selected_enclosure_id not in options:
-            raise UnknownEnclosureError()
+            # Explicit CORE stacks are opt-in views of discovered shelves, not
+            # new identities inferred from matching model names. Admit only
+            # distinct, exact component IDs already offered by discovery.
+            parts = selected_enclosure_id.split("+")
+            if not (
+                self.system.truenas.platform == "core"
+                and len(parts) > 1
+                and len(set(parts)) == len(parts)
+                and all(part in options and ":" not in part and options[part].slot_count for part in parts)
+            ):
+                raise UnknownEnclosureError()
         return selected_enclosure_id, (
             discovered_snapshot
             if discovered_snapshot is not None
@@ -3057,10 +3067,12 @@ class InventoryService:
         return runtime_slot.slot_index, f"storage-view:{runtime_view.id}"
 
     @classmethod
-    def _storage_view_runtime_slot_state(cls, runtime_slot: StorageViewRuntimeSlot) -> SlotState:
+    def _storage_view_runtime_slot_state(
+        cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
+    ) -> SlotState:
         if not runtime_slot.occupied:
             return SlotState.empty
-        if runtime_slot.state == SlotState.identify.value:
+        if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
             return SlotState.fault
@@ -3097,6 +3109,7 @@ class InventoryService:
             enclosure_name=runtime_view.label,
             present=runtime_slot.occupied,
             state=self._storage_view_runtime_slot_state(runtime_slot),
+            non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
             smart_device_names=list(runtime_slot.smart_device_names),
             smart_device_type=runtime_slot.smart_device_type,
@@ -12444,11 +12457,7 @@ class InventoryService:
                 seen_ids.add(selected_id)
                 options.append(
                     selected_option
-                    or EnclosureOption(
-                        id=selected_id,
-                        label=normalize_text(selected_meta.get("label")) or selected_id,
-                        name=normalize_text(selected_meta.get("name")),
-                    )
+                    or self._core_ssh_primary_option(ssh_data, selected_id, selected_ids, selected_meta)
                 )
             if primary_id and primary_id not in seen_ids:
                 seen_ids.add(primary_id)
@@ -12458,7 +12467,9 @@ class InventoryService:
             for enclosure in self._build_core_ssh_enclosure_options(
                 ssh_data,
                 filter_value=filter_value,
-                excluded_ids=primary_ids | selected_ids,
+                # Keep component shelves selectable after an explicit stack;
+                # the opt-in view must not replace their automatic identities.
+                excluded_ids=primary_ids,
                 finalize=False,
             ):
                 if enclosure.id in seen_ids:
@@ -14414,18 +14425,17 @@ class InventoryService:
             or (not ses_says_empty_without_disk and status_says_populated)
         )
 
-        if identify_active:
-            state = SlotState.identify
-        elif faulty and not ses_says_empty_without_disk:
-            state = SlotState.fault
+        if faulty and not ses_says_empty_without_disk:
+            non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
-            state = SlotState.empty
+            non_identify_state = SlotState.empty
         elif disk or bmc_present:
-            state = SlotState.healthy
+            non_identify_state = SlotState.healthy
         elif mapping:
-            state = SlotState.unmapped
+            non_identify_state = SlotState.unmapped
         else:
-            state = SlotState.unknown
+            non_identify_state = SlotState.unknown
+        state = SlotState.identify if identify_active else non_identify_state
 
         identity_mapping = None if stale_manual_mapping else mapping
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
@@ -14642,6 +14652,7 @@ class InventoryService:
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
             state=state,
+            non_identify_state=non_identify_state.value,
             identify_active=identify_active,
             device_name=device_name,
             smart_device_names=list(disk.smart_devices) if disk else [],

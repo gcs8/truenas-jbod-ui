@@ -358,9 +358,13 @@ class HistoryCollector:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
-        # HTTP success does not make a failed platform inventory authoritative.
-        untrusted_scopes = [scope for scope in scopes if not self._should_record_scope_snapshot(scope.snapshot)]
-        self._publish_skipped_scopes(scopes, root_only=bool(enumerate_kwargs.get("cached_root_only")))
+        # Resolve eligibility once, before any durable writes. Command warning
+        # tiers alone cannot prove that a degraded SSH bay map kept its disks.
+        skip_reasons = [self._scope_history_skip_reason(scope) for scope in scopes]
+        untrusted_scopes = [scope for scope, reason in zip(scopes, skip_reasons, strict=True) if reason is not None]
+        self._publish_skipped_scopes(
+            scopes, skip_reasons, root_only=bool(enumerate_kwargs.get("cached_root_only"))
+        )
         for scope in untrusted_scopes:
             self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
         if untrusted_scopes:
@@ -379,7 +383,7 @@ class HistoryCollector:
             not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
         )
         if enumeration_failed:
-            if not any(self._should_record_scope_snapshot(scope.snapshot) for scope in scopes):
+            if len(untrusted_scopes) == len(scopes):
                 self._scope_collection_degraded_reason = "No trusted history inventory scopes were available."
                 raise HistorySourceError.error_reply(self._scope_collection_degraded_reason)
             self._scope_collection_degraded_reason = (
@@ -391,7 +395,7 @@ class HistoryCollector:
             self._raise_if_stopping()
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
-            skip_reason = self._scope_skip_reason(scope.snapshot)
+            skip_reason = skip_reasons[scope_index - 1]
             if skip_reason is not None:
                 smart_scope_unavailable = True
                 logger.warning(
@@ -1762,9 +1766,9 @@ class HistoryCollector:
         platform = normalize_text(snapshot.get("selected_system_platform"))
         if platform in {"linux", "esxi"}:
             # These host inventories come from SSH, not the disabled API.
-            # SSH remains optional enrichment on API-backed platforms. A failed
-            # optional command (UNVR `lsscsi -g -t`) leaves the bay map whole;
-            # only the inventory's explicit required_ok says so (#927).
+            # SSH remains optional enrichment on API-backed platforms. The
+            # explicit required_ok permits optional-command recovery (#927);
+            # the durable identity comparison below also checks the map (#989).
             ssh_source = sources.get("ssh")
             if (
                 isinstance(ssh_source, dict)
@@ -1783,7 +1787,53 @@ class HistoryCollector:
                 return "topology_incomplete"
         return None
 
-    def _publish_skipped_scopes(self, scopes: list[ScopeSnapshot], *, root_only: bool) -> None:
+    def _scope_history_skip_reason(self, scope: ScopeSnapshot) -> str | None:
+        reason = self._scope_skip_reason(scope.snapshot)
+        if reason is not None:
+            return reason
+        if normalize_text(scope.snapshot.get("selected_system_platform")) not in {"linux", "esxi"}:
+            return None
+        sources = scope.snapshot.get("sources")
+        ssh = sources.get("ssh") if isinstance(sources, dict) else None
+        if not isinstance(ssh, dict) or not ssh.get("enabled") or ssh.get("ok"):
+            return None
+
+        # required_ok describes command criticality, not resolved bay identity
+        # (#989). A failed optional join can leave AES bays with no disks. Do
+        # not let even repeated failed scans replace the last durable map. A
+        # healthy source can establish a real removal/replacement immediately.
+        previous = self.store.get_slot_states(scope.system_id, scope.enclosure_id)
+        current_records = [
+            SlotStateRecord.from_snapshot_slot(scope.snapshot, slot)
+            for slot in scope.snapshot.get("slots", [])
+        ]
+        current = {record.slot: record for record in current_records}
+        for slot, old in previous.items():
+            new = current.get(slot)
+            if new is None:
+                if old.present:
+                    return "ssh_required_failed"
+                continue
+            if old.present != new.present:
+                return "ssh_required_failed"
+            if not old.present:
+                continue
+            # Additional identity detail is harmless. Losing or contradicting
+            # a known identifier is not evidence of a physical disk change.
+            identity_fields = ("serial", "model", "gptid", "logical_unit_id", "disk_identity_key")
+            if not any(getattr(old, name) for name in ("serial", "gptid", "logical_unit_id", "disk_identity_key")):
+                identity_fields += ("device_name", "sas_address")
+            if any(getattr(old, name) and getattr(old, name) != getattr(new, name) for name in identity_fields):
+                return "ssh_required_failed"
+        return None
+
+    def _publish_skipped_scopes(
+        self,
+        scopes: list[ScopeSnapshot],
+        skip_reasons: list[str | None],
+        *,
+        root_only: bool,
+    ) -> None:
         """Name the scopes this scan read but will not record (#927).
 
         A fleet scan replaces the list. A root-only scan looked at one scope,
@@ -1793,8 +1843,8 @@ class HistoryCollector:
         """
         skipped = [*self._unreadable_scopes] + [
             self._skipped_scope_entry(scope, reason)
-            for scope in scopes
-            if (reason := self._scope_skip_reason(scope.snapshot)) is not None
+            for scope, reason in zip(scopes, skip_reasons, strict=True)
+            if reason is not None
         ]
         if not root_only:
             self.last_skipped_scopes = skipped

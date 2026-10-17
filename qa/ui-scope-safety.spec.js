@@ -391,6 +391,97 @@ test("late LED completion cannot replace a newer shelf or its draft", async ({pa
  expect(errors).toEqual([]);
 });
 
+for (const underlying of ["healthy", "fault", "empty", "unknown", "unmapped"]) {
+ for (const phase of ["local-toggle", "initial-prelit", "refresh-prelit",
+   ...(underlying === "unknown" ? ["legacy-prelit", "invalid-prelit"] : [])]) {
+  test(`confirmed locate immediately renders on and clear over ${underlying}/${phase}, including cached navigation`, async ({page}) => {
+    await page.addInitScript(({underlying, phase}) => {
+      Object.defineProperty(window, "APP_BOOTSTRAP", {configurable: true, set(value) {
+        value.writePolicy = {enabled: true, mode: "network", reason: "Synthetic fixture write policy"};
+        Object.assign(value.snapshot.slots[0], {
+          led_supported: true, state: ["initial-prelit", "legacy-prelit", "invalid-prelit"].includes(phase) ? "identify" : underlying,
+          non_identify_state: phase === "legacy-prelit" ? undefined : phase === "invalid-prelit" ? "identify" : underlying,
+          identify_active: ["initial-prelit", "legacy-prelit", "invalid-prelit"].includes(phase), device_name: null,
+          present: underlying === "healthy", health: underlying === "fault" ? "FAULTED" : "ONLINE",
+        });
+        value.snapshot.enclosures.push({...value.snapshot.enclosures[0], id: "enc-b", label: "Second Shelf"});
+        Object.defineProperty(window, "APP_BOOTSTRAP", {value, writable: true, configurable: true});
+      }});
+    }, {underlying, phase});
+    const errors = await openFixture(page);
+    await page.locator("#auto-refresh-toggle").uncheck();
+    const original = await page.evaluate(() => structuredClone(window.APP_BOOTSTRAP.snapshot));
+    const inventoryRequests = [];
+    let pendingReturn;
+    await page.route("**/api/inventory?**", route => {
+      inventoryRequests.push(route.request().url());
+      const next = structuredClone(original);
+      next.selected_enclosure_id = new URL(route.request().url()).searchParams.get("enclosure_id") || "enc-a";
+      next.slots[0].enclosure_id = next.selected_enclosure_id;
+      if (next.selected_enclosure_id === "enc-a") {
+        pendingReturn = {route, next};
+        return;
+      }
+      return route.fulfill({contentType: "application/json", body: JSON.stringify(next)});
+    });
+    const writes = [];
+    await page.route("**/api/slots/0/led?**", route => {
+      const action = route.request().postDataJSON().action;
+      writes.push(action);
+      return route.fulfill({contentType: "application/json", body: JSON.stringify({
+        ok: true, slot: 0, requested_active: action === "IDENTIFY", identify_active: action === "IDENTIFY", confirmed: true,
+      })});
+    });
+    const tile = page.locator('#slot-grid [data-slot="0"]');
+    if (phase === "refresh-prelit") {
+      await page.route("**/api/inventory?**", route => route.fulfill({contentType: "application/json",
+        body: JSON.stringify({...original, slots: original.slots.map(slot => ({...slot, state: "identify", identify_active: true}))})}));
+      await page.locator("#refresh-button").click();
+      await expect(page.locator("#status-text")).toHaveText("Up to date.");
+      await page.unroute("**/api/inventory?**");
+      await page.route("**/api/inventory?**", route => {
+        inventoryRequests.push(route.request().url());
+        const next = structuredClone(original);
+        next.selected_enclosure_id = new URL(route.request().url()).searchParams.get("enclosure_id") || "enc-a";
+        next.slots[0].enclosure_id = next.selected_enclosure_id;
+        if (next.selected_enclosure_id === "enc-a") { pendingReturn = {route, next}; return; }
+        return route.fulfill({contentType: "application/json", body: JSON.stringify(next)});
+      });
+    }
+    const assertState = async state => {
+      await expect(tile).toHaveClass(new RegExp(`state-${state}(?: |$)`));
+      if (state === "identify") await expect(tile).toContainText("LOCATE");
+      else await expect(tile).not.toContainText("LOCATE");
+      await expect(page.locator("#detail-state-pill")).toHaveText(state[0].toUpperCase() + state.slice(1));
+      expect(await tile.locator(".slot-status-led").evaluate(node => getComputedStyle(node).animationName))
+        .toBe(state === "identify" ? "slot-led-locate" : "none");
+    };
+    const actions = phase === "local-toggle" ? [["IDENTIFY", "identify"], ["CLEAR", underlying]] : [["CLEAR", underlying]];
+    for (const [action, state] of actions) {
+      const before = inventoryRequests.length;
+      await page.locator(`[data-led-action="${action}"]`).click();
+      await expect(page.locator("#status-text")).toContainText("confirmed through");
+      await assertState(state);
+      expect(inventoryRequests).toHaveLength(before);
+      await page.locator("#enclosure-select").selectOption("enclosure:enc-b");
+      await expect(page.locator("#inventory-scope-note")).toBeHidden();
+      pendingReturn = null;
+      await page.locator("#enclosure-select").selectOption("enclosure:enc-a");
+      await expect.poll(() => Boolean(pendingReturn)).toBe(true);
+      await expect(page.locator("#inventory-scope-note")).toBeHidden();
+      await tile.click();
+      // The new inventory response is still pending: this is the cached copy.
+      await assertState(state);
+      Object.assign(pendingReturn.next.slots[0], {state, identify_active: state === "identify"});
+      await pendingReturn.route.fulfill({contentType: "application/json", body: JSON.stringify(pendingReturn.next)});
+      await expect(page.locator("#status-text")).toHaveText("Up to date.");
+    }
+    expect(writes).toEqual(actions.map(([action]) => action));
+    expect(errors).toEqual([]);
+  });
+ }
+}
+
 async function openAliasFixture(page) {
   await page.addInitScript(() => {
     Object.defineProperty(window, "APP_BOOTSTRAP", {configurable: true, set(value) {

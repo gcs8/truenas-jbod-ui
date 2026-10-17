@@ -1222,12 +1222,27 @@ def build_router(admin_settings: Any) -> APIRouter:
                 )
             finally:
                 history_changed()
-            remaining_orphaned_systems = without_system_ids(await scan_history_summaries(), valid_system_ids)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - surface maintenance failures directly in admin.
             logger.exception("Unable to adopt removed system history")
             raise HTTPException(status_code=500, detail="Unable to adopt removed system history; see admin logs.") from exc
+
+        # Adoption has committed. A failed optional refresh must not invite a
+        # retry of the write or claim that no orphaned history remains.
+        refresh_result: dict[str, Any]
+        try:
+            refresh_result = {
+                "orphaned_systems": without_system_ids(await scan_history_summaries(), valid_system_ids),
+            }
+        except Exception:  # noqa: BLE001 - preserve committed adoption and report only the refresh failure.
+            logger.exception("Unable to refresh orphaned history after adoption")
+            refresh_result = {
+                "warning": (
+                    "Unable to refresh removed-system history. "
+                    "Refresh the history source list before another adoption; see admin logs."
+                ),
+            }
 
         if summary["total_rows"]:
             detail = (
@@ -1250,7 +1265,7 @@ def build_router(admin_settings: Any) -> APIRouter:
                 "source": source_summary,
                 "target_system_id": target_system.id,
                 "target_system_label": target_system.label,
-                "orphaned_systems": remaining_orphaned_systems,
+                **refresh_result,
                 "valid_system_ids": valid_system_ids,
             }
         )

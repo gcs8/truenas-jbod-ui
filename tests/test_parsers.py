@@ -1158,6 +1158,7 @@ Enclosure status diagnostic page:
                     enclosures,
                     36,
                     None,
+                    selected_enclosure_id="front-id+rear-id",
                 )
                 self.assertEqual(selected["label"], "Front 24 Bay + Rear 12 Bay")
                 self.assertEqual(candidates[0]["enclosure_label"], "Front 24 Bay")
@@ -3978,6 +3979,15 @@ class CoreShelfStackingTests(unittest.TestCase):
             {candidate["enclosure_id"] for candidate in parsed.ses_slot_candidates.values()},
             {fx.HALF_FRONT_ID, fx.HALF_REAR_ID},
         )
+        for bay, enclosure_id, ses_device in (
+            (0, fx.HALF_FRONT_ID, "/dev/ses2"),
+            (30, fx.HALF_REAR_ID, "/dev/ses3"),
+        ):
+            self.assertEqual(
+                {(target["enclosure_id"], target["ses_device"], target["ses_element_id"])
+                 for target in parsed.ses_slot_candidates[bay]["ses_targets"]},
+                {(enclosure_id, ses_device, 1)},
+            )
 
     def test_small_generic_cages_do_not_displace_a_profiled_shelf(self) -> None:
         from tests import core_ses_fixtures as fx
@@ -3994,7 +4004,7 @@ class CoreShelfStackingTests(unittest.TestCase):
         self.assertEqual(parsed.ses_selected_meta["id"], fx.FRONT_24_ID)
         self.assertEqual(len(parsed.ses_slot_candidates), 24)
 
-    def test_unknown_shelves_without_any_layout_still_stack_as_before(self) -> None:
+    def test_unknown_shelves_with_different_logical_ids_stay_separate(self) -> None:
         from tests import core_ses_fixtures as fx
 
         output = fx.sesutil_map(
@@ -4005,9 +4015,161 @@ class CoreShelfStackingTests(unittest.TestCase):
 
         parsed = parse_ssh_outputs({"sesutil map": output}, 60, None)
 
-        self.assertEqual(parsed.ses_selected_meta["id"], "500cccc00000010+500cccc00000020")
-        self.assertEqual(len(parsed.ses_slot_candidates), 48)
+        self.assertEqual(parsed.ses_selected_meta["id"], "500cccc00000010")
+        self.assertEqual(len(parsed.ses_slot_candidates), 24)
+        self.assertEqual(
+            {candidate["enclosure_id"] for candidate in parsed.ses_slot_candidates.values()},
+            {"500cccc00000010"},
+        )
+        self.assertNotIn("da24", parsed.ses_slot_to_device.values())
         self.assertNotIn("ada0", parsed.ses_slot_to_device.values())
+
+    def test_same_model_shelf_selection_is_order_independent_and_targets_stay_local(self) -> None:
+        from itertools import permutations
+        from tests import core_ses_fixtures as fx
+
+        records = (
+            ("ses0", "ExampleCo Shelf 0100", "500cccc00000010", 24, {0: "da0"}),
+            ("ses1", "ExampleCo Shelf 0100", "500cccc00000020", 24, {0: "da24"}),
+        )
+        for order in permutations(records):
+            output = fx.sesutil_map(*order)
+            for selected_id, device, disk in (
+                (None, "/dev/ses0", "da0"),
+                (records[1][2], "/dev/ses1", "da24"),
+            ):
+                with self.subTest(order=[r[0] for r in order], selected=selected_id):
+                    parsed = parse_ssh_outputs({"sesutil map": output}, 60, None, selected_id)
+                    self.assertEqual(len(parsed.ses_enclosures), 2)
+                    self.assertEqual(len(parsed.ses_slot_candidates), 24)
+                    self.assertEqual(parsed.ses_slot_candidates[0]["device_names"], [disk])
+                    for candidate in parsed.ses_slot_candidates.values():
+                        self.assertEqual(candidate["ses_device"], device)
+                        self.assertEqual(
+                            {target["ses_device"] for target in candidate["ses_targets"]}, {device},
+                        )
+                        self.assertEqual(
+                            {target["enclosure_id"] for target in candidate["ses_targets"]},
+                            {selected_id or records[0][2]},
+                        )
+
+    def test_missing_logical_ids_do_not_merge_same_name_shelves(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        for ids in (("", ""), ("500cccc00000010", ""), ("", "500cccc00000020")):
+            with self.subTest(ids=ids):
+                output = fx.sesutil_map(
+                    ("ses0", "ExampleCo Shelf 0100", ids[0], 24, {0: "da0"}),
+                    ("ses1", "ExampleCo Shelf 0100", ids[1], 24, {0: "da24"}),
+                )
+                parsed = parse_ssh_outputs({"sesutil map": output}, 60, None)
+                self.assertEqual(len(parsed.ses_enclosures), 2)
+                self.assertEqual(len(parsed.ses_slot_candidates), 24)
+                self.assertEqual(parsed.ses_slot_candidates[0]["device_names"], ["da0"])
+
+    def test_matching_logical_ids_merge_redundant_paths_not_bay_ranges(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        output = fx.sesutil_map(
+            ("ses0", "ExampleCo Shelf 0100", "500cccc00000010", 24, {0: "da0"}),
+            ("ses1", "ExampleCo Shelf 0100", "500cccc00000010", 24, {0: "da0"}),
+        )
+        parsed = parse_ssh_outputs({"sesutil map": output}, 60, None)
+        self.assertEqual(len(parsed.ses_enclosures), 1)
+        self.assertEqual(len(parsed.ses_slot_candidates), 24)
+        self.assertEqual(
+            {target["ses_device"] for target in parsed.ses_slot_candidates[0]["ses_targets"]},
+            {"/dev/ses0", "/dev/ses1"},
+        )
+
+    def test_same_front_named_shelves_are_not_mistaken_for_front_rear_parts(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        output = fx.sesutil_map(
+            ("ses0", "ExampleCo Front Shelf", "500cccc00000010", 24, {0: "da0"}),
+            ("ses1", "ExampleCo Front Shelf", "500cccc00000020", 24, {0: "da24"}),
+        )
+        parsed = parse_ssh_outputs({"sesutil map": output}, 60, None)
+        self.assertEqual(len(parsed.ses_slot_candidates), 24)
+        self.assertEqual(parsed.ses_selected_meta["id"], "500cccc00000010")
+
+    def test_partial_pages_keep_layout_and_identity_without_a_name_join(self) -> None:
+        from itertools import permutations
+
+        for order in permutations((0, 1, 2)):
+            rows = [
+                SESMapEnclosure(
+                    ses_device="/dev/sg2", enclosure_name="ExampleCo Shelf",
+                    slots={0: SESMapSlot(slot_number=0, element_id=0, ses_device="/dev/sg2")},
+                ),
+                SESMapEnclosure(
+                    ses_device="/dev/sg2", enclosure_name="ExampleCo Shelf", enclosure_id="shelf-a",
+                    profile_id="synthetic-profile", layout_rows=1, layout_columns=1, slot_layout=[[0]],
+                    slots={0: SESMapSlot(slot_number=0, element_id=0, ses_device="/dev/sg2")},
+                ),
+                SESMapEnclosure(
+                    ses_device="/dev/sg3", enclosure_name="ExampleCo Shelf", enclosure_id="shelf-b",
+                    slots={0: SESMapSlot(slot_number=0, element_id=0, ses_device="/dev/sg3")},
+                ),
+            ]
+            merged = _merge_ses_enclosures([rows[index] for index in order])
+            with self.subTest(order=order):
+                self.assertEqual({item.enclosure_id for item in merged}, {"shelf-a", "shelf-b"})
+                first = next(item for item in merged if item.enclosure_id == "shelf-a")
+                self.assertEqual(first.profile_id, "synthetic-profile")
+                self.assertEqual((first.layout_rows, first.layout_columns, first.slot_layout), (1, 1, [[0]]))
+                candidates, meta = build_slot_candidates_from_ses_enclosures(merged, 60, None)
+                self.assertEqual(meta["id"], "shelf-a")
+                self.assertEqual(candidates[0]["ses_device"], "/dev/sg2")
+
+    def test_partial_front_rear_or_ambiguous_pairs_do_not_create_a_stack(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        for records in (
+            (("ses0", "Synthetic Front", "shelf-a", 22, {}),
+             ("ses1", "Synthetic Rear", "shelf-b", 22, {})),
+            (("ses0", "Synthetic Front", "", 30, {}),
+             ("ses1", "Synthetic Rear", "shelf-b", 30, {})),
+            (("ses0", "Synthetic Front", "shelf-a", 30, {}),
+             ("ses1", "Synthetic Rear", "shelf-b", 30, {}),
+             ("ses2", "Synthetic Rear", "shelf-c", 30, {})),
+        ):
+            with self.subTest(records=records):
+                parsed = parse_ssh_outputs({"sesutil map": fx.sesutil_map(*records)}, 60, None)
+                self.assertLessEqual(len(parsed.ses_slot_candidates), 30)
+                self.assertEqual(len({c["ses_device"] for c in parsed.ses_slot_candidates.values()}), 1)
+
+    def test_mixed_ses_pages_and_scsi_tuples_do_not_join_distinct_logical_ids(self) -> None:
+        from itertools import permutations
+        from tests import core_ses_fixtures as fx
+
+        outputs = {
+            "sesutil map": fx.sesutil_map(
+                ("ses0", "ExampleCo Shelf 0100", "500cccc00000010", 24, {0: "da0"}),
+                ("ses1", "ExampleCo Shelf 0100", "500cccc00000020", 24, {0: "da24"}),
+            ),
+            "sg_ses -p aes /dev/sg2": """
+  ExampleCo Shelf 0100
+  Primary enclosure logical identifier (hex): 500cccc00000010
+Additional element status diagnostic page:
+  Element type: Array device slot, subenclosure id: 0
+    Element index: 1
+      device slot number: 0
+      SAS device type: end device
+""",
+            "lsscsi -g": """
+[0:0:0:0] enclosu ExampleCo Shelf 0100 - /dev/sg2
+[0:0:1:0] enclosu ExampleCo Shelf 0100 - /dev/sg3
+""",
+        }
+        for order in permutations(outputs):
+            parsed = parse_ssh_outputs({key: outputs[key] for key in order}, 60, None)
+            with self.subTest(order=order):
+                self.assertEqual({item.enclosure_id for item in parsed.ses_enclosures},
+                                 {"500cccc00000010", "500cccc00000020"})
+                self.assertEqual(parsed.ses_selected_meta["id"], "500cccc00000010")
+                self.assertEqual(len(parsed.ses_slot_candidates), 24)
+                self.assertNotIn("da24", parsed.ses_slot_to_device.values())
 
     def test_a_host_with_only_ahci_sgpio_enclosures_keeps_a_view(self) -> None:
         from tests import core_ses_fixtures as fx

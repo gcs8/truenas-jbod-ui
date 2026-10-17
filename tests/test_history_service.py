@@ -12184,6 +12184,7 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
             "esx": {"enabled": True, "ok": False, "required_ok": False,
                     "message": "StorCLI commands unavailable."},
         }
+        self.slot_overrides: dict[str, list[dict[str, Any]]] = {}
         self.unreachable: set[tuple[str, str | None]] = set()
         self.extra_enclosures: dict[str, str] = {}
         self.no_enclosure: set[str] = set()
@@ -12200,12 +12201,13 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
             system_label, enclosure_label = self.LABELS[system]
             extra = self.extra_enclosures.get(system)
             bayless = system in self.no_enclosure
+            selected_enclosure = params.get("enclosure_id") or f"{system}-bay"
             return {
                 "systems": [{"id": "nvr"}, {"id": "esx"}],
                 "selected_system_id": system,
                 "selected_system_label": system_label,
                 "selected_system_platform": self.PLATFORMS[system],
-                "selected_enclosure_id": None if bayless else f"{system}-bay",
+                "selected_enclosure_id": None if bayless else selected_enclosure,
                 "selected_enclosure_label": None if bayless else enclosure_label,
                 "enclosures": [] if bayless else [{"id": f"{system}-bay"}, *([{"id": extra}] if extra else [])],
                 "sources": {
@@ -12213,7 +12215,9 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
                     "ssh": dict(self.ssh[system]),
                     "bmc": {"enabled": False, "ok": True},
                 },
-                "slots": [{"slot": 0, "present": True, "serial": f"TESTSER-{system}", "state": "healthy"}],
+                "slots": self.slot_overrides.get(selected_enclosure, self.slot_overrides.get(system, [
+                    {"slot": 0, "present": True, "serial": f"TESTSER-{system}", "state": "healthy"},
+                ])),
             }
         if path == "/api/storage-views":
             if params.get("system_id") in self.storage_views_fail:
@@ -12259,6 +12263,112 @@ class HistorySkippedScopeVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["last_skipped_scopes"], [])
         self.assertIsNone(self.collector.degraded_reason())
         self.assertIsNotNone(self._recorded("esx"))
+
+    async def test_failed_bay_map_never_persists_removal_and_recovers(self):
+        # AES can retain bays without device names when join/sysfs/lsscsi fails.
+        self.ssh["esx"].update(ok=True, required_ok=True)
+        await self._pass()
+        baseline = self._recorded("nvr")
+        self.slot_overrides["nvr"] = [{"slot": 0, "present": False, "state": "unknown"}]
+        self.slot_overrides["esx"] = [{
+            "slot": 0, "present": True, "serial": "TESTSER-esx", "state": "fault",
+        }]
+        for _ in range(3):
+            self.now += timedelta(minutes=5)
+            status = await self._pass(force_slow=False)
+            self.assertEqual(self._recorded("nvr"), baseline)
+            self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+            self.assertEqual(status["last_skipped_scopes"], [self._skipped("nvr")])
+            self.assertEqual(self._recorded("esx").state, "fault")
+            self.assertEqual(self.collector.degraded_reason(), self.PARTIAL)
+        self.assertEqual(len(self.store.list_slot_events("esx", "esx-bay", 0)), 1)
+        self.slot_overrides.pop("nvr")
+        self.ssh["nvr"]["ok"] = True
+        self.now += timedelta(minutes=5)
+        status = await self._pass(force_slow=False)
+        self.assertEqual(self._recorded("nvr"), baseline)
+        self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+        self.assertEqual(status["last_skipped_scopes"], [])
+        self.assertIsNone(self.collector.degraded_reason())
+
+    async def test_failed_bay_map_replacement_waits_for_healthy_source(self):
+        await self._pass(force_slow=False)
+        baseline = self._recorded("nvr")
+        self.slot_overrides["nvr"] = [{
+            "slot": 0, "present": True, "state": "healthy", "serial": "SANITIZED-REPLACEMENT",
+        }]
+        for _ in range(3):
+            self.now += timedelta(minutes=5)
+            with self.assertRaises(HistorySourceError):
+                await self._pass(force_slow=False)
+            self.assertEqual(self._recorded("nvr"), baseline)
+            self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+        self.ssh["nvr"]["ok"] = True
+        await self._pass(force_slow=False)
+        self.assertEqual(self._recorded("nvr").serial, "SANITIZED-REPLACEMENT")
+        events = self.store.list_slot_events("nvr", "nvr-bay", 0)
+        self.assertEqual([event["event_type"] for event in events], ["slot_identity_changed"])
+
+    async def test_healthy_bay_map_records_true_removal(self):
+        await self._pass(force_slow=False)
+        self.ssh["nvr"]["ok"] = True
+        self.slot_overrides["nvr"] = [{"slot": 0, "present": False, "state": "empty"}]
+        self.now += timedelta(minutes=5)
+        await self._pass(force_slow=False)
+        self.assertFalse(self._recorded("nvr").present)
+        events = self.store.list_slot_events("nvr", "nvr-bay", 0)
+        self.assertEqual([event["event_type"] for event in events], ["slot_state_changed"])
+        self.assertEqual(json.loads(events[0]["details_json"])["present"]["current"], False)
+
+    async def test_optional_failure_keeps_trustworthy_bayless_history_running(self):
+        self.no_enclosure.add("nvr")
+        await self._pass(force_slow=False)
+        self.slot_overrides["nvr"] = [{
+            "slot": 0, "present": True, "state": "fault", "serial": "TESTSER-nvr",
+        }]
+        self.now += timedelta(minutes=5)
+        await self._pass(force_slow=False)
+        self.assertEqual(self.store.get_slot_state("nvr", None, 0).state, "fault")
+        self.assertEqual(len(self.store.list_slot_events("nvr", None, 0)), 1)
+
+    async def test_failed_bay_map_missing_slot_retains_previous_identity(self):
+        await self._pass(force_slow=False)
+        baseline = self._recorded("nvr")
+        self.slot_overrides["nvr"] = []
+        with self.assertRaises(HistorySourceError):
+            await self._pass(force_slow=False)
+        self.assertEqual(self._recorded("nvr"), baseline)
+        self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+        self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("nvr"), self._skipped("esx")])
+
+    async def test_failed_bay_map_scope_isolation_and_identity_detail_recovery(self):
+        self.extra_enclosures["nvr"] = "nvr-rear"
+        await self._pass(force_slow=False)
+        baseline = self._recorded("nvr")
+        self.slot_overrides["nvr-bay"] = [{"slot": 0, "present": True, "state": "unknown"}]
+        self.slot_overrides["nvr-rear"] = [{
+            "slot": 0, "present": True, "state": "healthy", "serial": "TESTSER-nvr",
+            "gptid": "SANITIZED-PERSISTENT-ID", "persistent_id_label": "WWN",
+        }]
+        self.now += timedelta(minutes=5)
+        await self._pass(force_slow=False)
+        self.assertEqual(self._recorded("nvr"), baseline)
+        self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+        sibling = self.store.get_slot_state("nvr", "nvr-rear", 0)
+        assert sibling is not None
+        self.assertEqual(sibling.gptid, "SANITIZED-PERSISTENT-ID")
+        self.assertEqual(len(self.store.list_slot_events("nvr", "nvr-rear", 0)), 1)
+        self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("nvr"), self._skipped("esx")])
+
+    async def test_failed_root_only_bay_map_retains_identity_and_skip_visibility(self):
+        await self._pass(force_slow=False)
+        baseline = self._recorded("nvr")
+        self.slot_overrides["nvr"] = [{"slot": 0, "present": False, "state": "unknown"}]
+        with self.assertRaises(HistorySourceError):
+            await self._pass(force_slow=False, cached_root_only=True)
+        self.assertEqual(self._recorded("nvr"), baseline)
+        self.assertEqual(self.store.list_slot_events("nvr", "nvr-bay", 0), [])
+        self.assertEqual(self.collector.status()["last_skipped_scopes"], [self._skipped("esx"), self._skipped("nvr")])
 
     async def test_a_snapshot_without_the_signal_is_still_skipped(self):
         # An older main UI does not send required_ok; keep the 87ec6f6 gate.

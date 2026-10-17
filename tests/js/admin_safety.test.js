@@ -25,6 +25,54 @@ test("failed history source scan preserves last known rows and marks them unavai
   assert.equal(state.orphanedHistory.length, 1);
   assert.equal(state.orphanedHistoryError, true);
 });
+test("adoption with a failed optional rescan preserves stale rows and reports the committed result", async () => {
+  const rows = [{system_id: "removed-one", total_rows: 4}];
+  const current = {id: "current", label: "Current system"};
+  const state = {orphanedHistory: rows, systems: [current], selectedHistoryAdoptSourceId: "removed-one"};
+  const elements = {historyAdoptButton: {}, historyAdoptSourceSelect: {value: "removed-one"}, historyAdoptTargetSelect: {value: "current"}, historyAdoptResult: {}};
+  const banners = [];
+  let requests = 0;
+  const handlers = load(["adoptRemovedSystemHistory", "renderHistoryMaintenance", "loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan"], {
+    state, elements, window: {confirm: () => true},
+    getSystemById: () => current, escapeHtml: (text) => text,
+    fetchJson: async (url) => {
+      requests++;
+      return url.endsWith("/adopt-removed-system")
+        ? {ok: true, summary: {total_rows: 4}, detail: "History adopted.", warning: "Unable to refresh removed-system history. Refresh the history source list before another adoption."}
+        : {ok: true, orphaned_systems: []};
+    },
+    setBanner(text, kind) {banners.push({text, kind});},
+  });
+  await handlers.adoptRemovedSystemHistory();
+  assert.equal(requests, 1, "never retry the adoption or launch an unbounded rescan");
+  assert.equal(state.orphanedHistory, rows, "a missing summary is not an empty list");
+  assert.equal(state.orphanedHistoryError, true);
+  assert.equal(elements.historyAdoptButton.disabled, true);
+  assert.match(elements.historyAdoptResult.textContent, /History adopted/);
+  assert.match(elements.historyAdoptResult.textContent, /Refresh the history source list/);
+  assert.doesNotMatch(elements.historyAdoptResult.textContent, /adoption failed/i);
+  assert.match(banners[0].text, /Adopted saved history/);
+  assert.match(banners[0].text, /Refresh the history source list/);
+  assert.equal(banners[0].kind, "info");
+  await handlers.loadOrphanedHistory({fresh: true});
+  assert.equal(requests, 2, "an explicit refresh performs only a GET scan");
+  assert.equal(state.orphanedHistory.length, 0);
+  assert.equal(state.orphanedHistoryError, false);
+  assert.match(elements.historyAdoptResult.textContent, /No orphaned history rows/);
+});
+test("adoption with a successful empty rescan replaces stale rows and clears scan failure", async () => {
+  const state = {orphanedHistory: [{system_id: "removed-one", total_rows: 4}], orphanedHistoryError: true, selectedHistoryAdoptSourceId: "removed-one"};
+  const elements = {historyAdoptResult: {}};
+  await load(["adoptRemovedSystemHistory"], {
+    state, elements, window: {confirm: () => true},
+    getSystemById: () => ({id: "current", label: "Current system"}),
+    fetchJson: async () => ({ok: true, summary: {total_rows: 4}, orphaned_systems: []}),
+    renderHistoryMaintenance() {}, setBanner() {},
+  }).adoptRemovedSystemHistory();
+  assert.equal(state.orphanedHistory.length, 0);
+  assert.equal(state.orphanedHistoryError, false);
+  assert.equal(state.selectedHistoryAdoptSourceId, "");
+});
 test("empty purge preview disables deletion without asking for confirmation", async () => {
   const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};
   let confirms = 0;
