@@ -36,6 +36,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Opening-view requests bounded scoring waits, kept persistence and collection
+  out of optional scoring, retained each snapshot's exact source and mapping
+  generation, and used saved then discovery order with a warning when busy,
+  timed out, or over cap; forced refreshes retried correlation once after
+  overlapping background source updates (#997).
 - Locate light readback immediately updated bay tiles and restored their prior
   state on clear, including cached views, and Connections Show all retained
   keyboard focus on its heading (#998).
