@@ -399,6 +399,177 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
         self.service._get_opening_order_snapshot = original
         self.assertEqual((await self.request("/api/storage-views", b"enclosure_id=enc-b"))[0], 200)
 
+    def use_real_snapshot_producers(self):
+        from app.services.inventory import InventoryService
+
+        for name in ("get_snapshot", "_get_inventory_source_bundle", "_get_opening_order_snapshot"):
+            setattr(self.service, name, getattr(InventoryService, name).__get__(self.service))
+        bundles = []
+
+        async def collect():
+            # Every native collection returns a distinct bundle. Reusing one
+            # object here would conceal the forced S1/S2 runtime defect.
+            bundle = self.fixture._empty_source_bundle()
+            bundle.raw_data.enclosures = [
+                {"id": option.id, "name": option.label, "elements": [
+                    {"slot": slot, "dev": f"da{index * 4 + slot}", "status": "OK"}
+                    for slot in range(1, index + 2)
+                ]} for index, option in enumerate(self.options)
+            ]
+            bundles.append(bundle)
+            return bundle
+
+        self.service._collect_inventory_source_bundle = AsyncMock(side_effect=collect)
+        self.settings.app.source_bundle_cache_ttl_seconds = 60
+        return bundles
+
+    async def test_forced_runtime_scores_exact_active_source_without_recollection(self):
+        bundles = self.use_real_snapshot_producers()
+        status, body = await self.request("/api/storage-views", b"enclosure_id=enc-a&force=true")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["view_order"][0], "enclosure:enc-b")
+        self.assertEqual(len(bundles), 1)
+        self.assertFalse(any("scoring was skipped" in warning
+                             for warning in self.service._cache["enc-a"].warnings))
+        self.assertEqual(set(self.service._cache), {"enc-a"})
+        self.assertFalse(self.service._snapshot_refresh_tasks)
+
+    async def test_mapping_read_invalidation_cannot_be_readmitted_to_order_scoring(self):
+        import threading
+        from app.services.inventory import SnapshotStateBusyError
+
+        self.use_real_snapshot_producers()
+        active = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-b")
+        source = self.service._source_bundle
+        entered, release = threading.Event(), threading.Event()
+        native_read = self.service.mapping_store.load_read_snapshot
+
+        def read_then_wait():
+            value = native_read()
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("synthetic mapping-read safety bound exceeded")
+            return value
+
+        self.service.mapping_store.load_read_snapshot = read_then_wait
+        rejected = []
+        native_build = self.service._build_snapshot
+
+        async def build(*args, **kwargs):
+            candidate = await native_build(*args, **kwargs)
+            rejected.append(candidate)
+            return candidate
+
+        self.service._build_snapshot = build
+        task = asyncio.create_task(self.service._get_snapshot_result(
+            selected_enclosure_id="enc-a", force_source_refresh=False,
+        ))
+        try:
+            async with asyncio.timeout(2):
+                while not entered.is_set():
+                    await asyncio.sleep(0.001)
+            generation = self.service._snapshot_topology_generation
+            self.service.invalidate_snapshot_cache(
+                reason="synthetic.mapping-change", cache_keys=["enc-a"], invalidate_source_bundle=False,
+            )
+            self.assertGreater(self.service._snapshot_topology_generation, generation)
+            release.set()
+            with self.assertRaises(SnapshotStateBusyError):
+                await task
+            result = await self.service._get_opening_order_snapshot(
+                "enc-a", source_bundle=source, active_snapshot=active,
+            )
+            self.assertIsNone(result, "pre-invalidation mapping read was readmitted to optional scoring")
+            self.assertEqual(len(rejected), 1)
+            self.assertIsNone(self.service._opening_order_inputs_for(rejected[0]),
+                              "rejected mapping read retained a post-invalidation association")
+            self.assertIsNone(await self.service._get_opening_order_snapshot(
+                "enc-b", source_bundle=source, active_snapshot=rejected[0],
+            ))
+            self.assertNotIn("enc-a", self.service._cache)
+            self.assertFalse(self.service._view_order_cache)
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_runtime_source_associations_survive_other_snapshot_builds(self):
+        bundles = self.use_real_snapshot_producers()
+        self.settings.app.snapshot_cache_ttl_seconds = 60
+        active = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+        source = self.service._source_bundle
+        other = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-b")
+        self.assertIsNot(self.service._source_bundle, source)
+        self.assertIsNone(await self.service._get_opening_order_snapshot(
+            "enc-b", source_bundle=self.service._source_bundle, active_snapshot=active,
+        ))
+        before = len(bundles)
+        native_snapshot = self.service.get_snapshot
+        # Supplied snapshots do not rebuild, even on a forced runtime call.
+        self.service.get_snapshot = AsyncMock(side_effect=AssertionError("supplied snapshot rebuilt"))
+        for force in (False, True):
+            for tolerant in (False, True):
+                with self.subTest(force=force, tolerant=tolerant):
+                    runtime = await self.service.get_storage_view_runtime(
+                        snapshot=active, force_refresh=force, tolerate_hidden_view_targets=tolerant,
+                    )
+                    self.assertEqual(runtime.view_order[0], "enclosure:enc-b")
+                    self.assertIs(self.service._view_order_source_bundle, source)
+                    self.assertEqual(len(bundles), before)
+                    self.service._view_order_cache.clear()
+        self.service.get_snapshot = native_snapshot
+        runtime = await self.service.get_storage_view_runtime(selected_enclosure_id="enc-a")
+        self.assertEqual(runtime.view_order[0], "enclosure:enc-b")
+        self.assertIs(self.service._view_order_source_bundle, source)
+        self.assertIs(self.service._cache["enc-b"], other)
+        self.assertFalse(any("scoring was skipped" in warning for warning in active.warnings))
+        self.assertEqual(len(bundles), before)
+        # A model copy or deserialized legacy snapshot has no association. It
+        # cannot borrow the latest builder's read or the existing scored cache.
+        legacy = active.model_copy(deep=True)
+        runtime = await self.service.get_storage_view_runtime(snapshot=legacy)
+        self.assertEqual(runtime.view_order[0], "enclosure:enc-a")
+        self.assertTrue(any("current correlation inputs are unavailable" in warning for warning in legacy.warnings))
+        _, retention = await self.service.get_snapshot_with_system_retention(
+            selected_enclosure_id="enc-a",
+        )
+        self.assertIsNotNone(retention)
+
+    async def test_order_refuses_invalidation_or_source_advancement_while_awaiting(self):
+        self.use_real_snapshot_producers()
+        active = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+        original = self.service._get_opening_order_snapshot
+        for invalidate in (False, True):
+            with self.subTest(invalidate=invalidate):
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def held(*args, **kwargs):
+                    result = await original(*args, **kwargs)
+                    entered.set()
+                    await release.wait()
+                    return result
+
+                self.service._get_opening_order_snapshot = held
+                self.service._view_order_cache.clear()
+                task = asyncio.create_task(self.service.get_storage_view_runtime(snapshot=active))
+                try:
+                    await asyncio.wait_for(entered.wait(), 2)
+                    if invalidate:
+                        self.service.invalidate_snapshot_cache(
+                            reason="synthetic.order-invalidation", cache_keys=[], invalidate_source_bundle=True,
+                        )
+                    else:
+                        await self.service._get_inventory_source_bundle(force_refresh=True)
+                    release.set()
+                    runtime = await asyncio.wait_for(task, 2)
+                    self.assertEqual(runtime.view_order[0], "enclosure:enc-a")
+                    self.assertFalse(self.service._view_order_cache)
+                    self.assertFalse(self.service._view_order_recompute_lock.locked())
+                    self.assertEqual(self.service._view_order_waiters, 0)
+                finally:
+                    release.set()
+                    await asyncio.gather(task, return_exceptions=True)
+        self.service._get_opening_order_snapshot = original
+
     async def test_order_does_not_enter_retained_slot_detail_worker(self):
         await self.exercise_retained_order_boundary(store=True)
 
@@ -478,7 +649,7 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
                 status, body = task.result()
                 self.assertEqual(status, 200, body)
                 self.assertEqual(json.loads(body)["view_order"][0], "enclosure:enc-b")
-                self.assertEqual(self.service._get_inventory_source_bundle.await_count, 1)
+                self.assertEqual(self.service._get_inventory_source_bundle.await_count, 0)
                 self.assertFalse(release.is_set())
                 self.assertEqual(calls, [], "optional scoring entered a retained worker")
                 self.assertIs(self.service._cache["enc-b"], old_secondary)
@@ -494,19 +665,19 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
     async def test_order_missing_or_invalidated_read_inputs_falls_back_without_producers(self):
-        from app.services.inventory import InventoryService
-
-        self.service._get_opening_order_snapshot = InventoryService._get_opening_order_snapshot.__get__(self.service)
-        bundle = self.service._get_inventory_source_bundle.return_value
+        self.use_real_snapshot_producers()
+        active = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+        entry = self.service._view_order_read_inputs[id(active)]
         self.system.view_order = ["enclosure:enc-b"]
         self.service._get_secondary_runtime_snapshot = AsyncMock(side_effect=AssertionError("retained producer"))
         for inputs in (
             None,
-            (self.fixture._empty_source_bundle(), self.service._snapshot_topology_generation, {}, []),
-            (bundle, self.service._snapshot_topology_generation - 1, {}, []),
+            (entry[0], entry[1], self.service._snapshot_topology_generation - 1, *entry[3:]),
         ):
             with self.subTest(inputs_available=inputs is not None):
-                self.service._view_order_read_inputs = inputs
+                self.service._view_order_read_inputs.clear()
+                if inputs is not None:
+                    self.service._view_order_read_inputs[id(active)] = inputs
                 status, body = await self.request("/", b"enclosure_id=enc-a")
                 self.assertEqual(status, 200, body)
                 self.assertIn(b"current correlation inputs are unavailable", body)
