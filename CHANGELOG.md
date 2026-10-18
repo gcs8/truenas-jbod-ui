@@ -33,6 +33,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - On TrueNAS CORE hosts read over SSH only, separate backplanes and AHCI SGPIO
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
+- Same-model SES shelves that an earlier version joined into one enclosure
+  with a combined id such as `A+B` are now separate shelves. Outside CORE a
+  link or API call naming `A+B` answers 404 with the separate shelf ids, and
+  the page opens the first shelf. Bay assignments, history, the saved
+  main-page order and storage-view bindings filed under `A+B` stay there and
+  are named in the page warnings and the admin banner, with each bay's place
+  on the separate shelves. Save those assignments again on the shelf they
+  belong to (#1008).
 
 ### Fixed
 
