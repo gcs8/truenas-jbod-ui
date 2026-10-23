@@ -1,0 +1,26 @@
+{
+  "slot_mappings": {
+    "v2:[\"scale-ssh\",\"500cccc00000010+500cccc00000020\",0]": {
+      "device_name": "sdb", "enclosure_id": "500cccc00000010+500cccc00000020", "gptid": null,
+      "notes": "Synthetic front-left bay", "serial": "SYNTH-SN-0000", "slot": 0, "source": "manual",
+      "system_id": "scale-ssh", "updated_at": "2026-09-01T12:00:00Z"
+    },
+    "v2:[\"scale-ssh\",\"500cccc00000010+500cccc00000020\",23]": {
+      "device_name": null, "enclosure_id": "500cccc00000010+500cccc00000020", "gptid": null,
+      "notes": null, "serial": "SYNTH-SN-0023", "slot": 23, "source": "manual",
+      "system_id": "scale-ssh", "updated_at": "2026-09-01T12:00:00Z"
+    },
+    "v2:[\"scale-ssh\",\"500cccc00000010+500cccc00000020\",30]": {
+      "device_name": null, "enclosure_id": "500cccc00000010+500cccc00000020", "gptid": null,
+      "notes": "Synthetic second shelf bay 6", "serial": "SYNTH-SN-0030", "slot": 30, "source": "manual",
+      "system_id": "scale-ssh", "updated_at": "2026-09-01T12:00:00Z"
+    },
+    "v2:[\"scale-ssh\",\"500cccc00000010\",23]": {
+      "device_name": null, "enclosure_id": "500cccc00000010", "gptid": null,
+      "notes": "Saved after the split", "serial": "SYNTH-SN-0123", "slot": 23, "source": "manual",
+      "system_id": "scale-ssh", "updated_at": "2026-10-01T12:00:00Z"
+    }
+  },
+  "updated_at": "2026-09-01T12:00:00+00:00",
+  "version": 2
+}

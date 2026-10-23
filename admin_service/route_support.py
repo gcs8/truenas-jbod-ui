@@ -46,6 +46,7 @@ from app.script_json import register_script_json_filters
 from app.models.domain import (
     QuantastorNodeDiscoveryRequest,
 )
+from app.services.combined_shelf_ids import combined_history_scope_warnings
 from app.services.inventory import InventoryService
 from app.services.profile_builder import collect_profile_references
 from app.services.profile_registry import ProfileRegistry, build_profile_reference_warnings, profile_is_system_layout
@@ -504,6 +505,23 @@ def validate_admin_public_origin(admin_settings: AdminSettings) -> None:
         )
 
 
+def build_combined_shelf_history_warnings(history_settings: Any) -> list[dict[str, str]]:
+    """History scopes still filed under a split combined shelf id (#1006).
+
+    Optional context for the banner: a missing, segmented or unreadable
+    history database contributes nothing rather than failing the admin page.
+    """
+
+    if history_settings.segment_catalog_path or not Path(history_settings.sqlite_path).is_file():
+        return []
+    try:
+        scopes = get_history_store().list_scopes(include_activity_counts=False)
+    except Exception:  # noqa: BLE001 - an optional warning must not break the admin state.
+        logger.warning("Unable to check history for combined shelf scopes", exc_info=True)
+        return []
+    return combined_history_scope_warnings(scopes)
+
+
 async def build_admin_state_payload(request: Request) -> dict[str, Any]:
     settings = reload_app_settings()
     runtime_service = get_runtime_service()
@@ -535,6 +553,7 @@ async def build_admin_state_payload(request: Request) -> dict[str, Any]:
         "configuration_warnings": [
             *build_unknown_config_key_warnings(settings),
             *build_profile_reference_warnings(settings),
+            *await asyncio.to_thread(build_combined_shelf_history_warnings, history_settings),
         ],
         "storage_view_templates": serialize_storage_view_templates(),
         "setup_platform_defaults": serialize_platform_defaults(),
