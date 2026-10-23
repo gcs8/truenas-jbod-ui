@@ -33,6 +33,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - On TrueNAS CORE hosts read over SSH only, separate backplanes and AHCI SGPIO
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
+- Same-model SES shelves that an earlier version joined into one enclosure
+  with a combined id such as `A+B` are now separate shelves. Outside CORE a
+  link or API call naming `A+B` answers 404 with the separate shelf ids, and
+  the page opens the first shelf. Bay assignments, history, the saved
+  main-page order and storage-view bindings filed under `A+B` stay there and
+  are named in the page warnings and the admin banner, with each bay's place
+  on the separate shelves. Save those assignments again on the shelf they
+  belong to (#1008).
 
 ### Fixed
 
@@ -101,11 +109,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   system saved with one keeps it, the drive list heading matches its drives,
   and NVMe drives no longer start with "UNKNOWN" (#966).
 
+### Performance
+
+- History summary scans reused authenticated immutable segment counts on warm
+  reads, retaining existing segment admission checks and fresh hot-database
+  counts (#1012).
+
 ### Internal
 
 - Added an inactive source-qualified CORE expander-counter command policy
   draft with exact read-only request shapes; no grant, collector or host
   capability was enabled (#1017).
+- Added an inactive all-writer orchestration prototype with synthetic process
+  tests; the ownership helper's stop-every-writer precondition remained
+  unchanged, with no live backend or activation (#1014).
 
 ## v0.24.0-beta.3 - 2026-10-11
 

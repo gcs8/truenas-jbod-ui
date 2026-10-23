@@ -9,7 +9,7 @@ restart counts, image identity, version, revision, retained state and SQLite
 integrity, writes with the new release, and rolls back by pin with the same two
 commands.
 
-``--scenario`` picks one of four runs, each a separate CI step:
+``--scenario`` picks a run, each a separate CI step:
 
 * ``base``: the root-owned base Compose file, as above.
 * ``hardened``: the previous release's base file plus its
@@ -28,6 +28,12 @@ commands.
   then its exact generation, catalog bytes and referenced segment bytes must
   survive the image-only upgrade and rollback while both releases read the
   combined hot and segmented history.
+* ``readonly-state``: after seeding and stopping v0.22.2, mount its required
+  history directory literally read-only for candidate startup. Require the
+  existing local-storage refusal contract, live process, unchanged bytes and
+  no restarts over 20 seconds. Explicitly restore the writable mount and prove
+  the candidate can read the retained records. This is not a supported-storage
+  or release-promotion decision.
 
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
@@ -37,6 +43,7 @@ publishes the candidate to a local registry so ``pull`` works unchanged.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -56,8 +63,9 @@ HISTORY_PORT = 18181
 SERVICES = ("enclosure-ui", "enclosure-history")
 SMOKE_SYSTEM = "upgrade-smoke"
 SUCCESS_PREFIX = "image_upgrade_smoke=ok"
-SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog")
+SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state")
 HARDENED_FILES = ("docker-compose.yml", "docker-compose.nonroot.yml")
+READONLY_FILES = ("docker-compose.yml", "docker-compose.readonly.yml")
 APP_UID = 10001
 
 # The one-time ownership step for adopting docker-compose.nonroot.yml, exactly
@@ -400,13 +408,13 @@ def seed_script(template: str, slots: tuple[int, ...], metrics_per_slot: int = 0
     return template.replace("SLOTS", repr(slots)).replace("METRICS_PER_SLOT", str(metrics_per_slot))
 
 
-def get_json(url: str) -> tuple[int, dict]:
+def get_json(url: str, *, read_error_body: bool = False) -> tuple[int, dict]:
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as exc:
         with exc:
-            return exc.code, {}
+            return exc.code, json.load(exc) if read_error_body else {}
 
 
 def history_api_view(slots: tuple[int, ...]) -> dict[str, list]:
@@ -803,7 +811,158 @@ def interrupted_migration(args: argparse.Namespace) -> str:
     )
 
 
+# Stdlib-only probes do not import settings or initialize another store. Include
+# every directory/file, including sidecars and recovery markers, not just row
+# counts. Hash binary bytes, never the text-oriented host sha256 helper above.
+READ_HISTORY_TREE = """
+import hashlib
+import json
+from pathlib import Path
+root = Path("/app/history")
+entries = {}
+for path in sorted(root.rglob("*")):
+    if path.is_symlink() or not (path.is_file() or path.is_dir()):
+        raise RuntimeError("unexpected history entry type")
+    if path.is_file():
+        with path.open("rb") as stream:
+            entries[path.relative_to(root).as_posix()] = [path.stat().st_size, hashlib.file_digest(stream, "sha256").hexdigest()]
+    else:
+        entries[path.relative_to(root).as_posix()] = None
+print(json.dumps(entries, sort_keys=True))
+"""
+
+READONLY_WRITE_PROBE = """
+import errno
+import json
+import os
+from pathlib import Path
+path = Path("/app/history/.upgrade-smoke-readonly-probe")
+try:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except OSError as exc:
+    if exc.errno != errno.EROFS:
+        raise
+    print(json.dumps({"errno": exc.errno}))
+else:
+    os.close(descriptor)
+    path.unlink()
+    raise RuntimeError("required history mount is writable")
+"""
+
+
+def install_readonly_history_mount(deployment: Deployment) -> None:
+    # Compose merges volumes by container target. Only the history bind changes;
+    # retain the published command, restart policy, healthcheck and UI mounts.
+    (deployment.root / READONLY_FILES[-1]).write_text(json.dumps({
+        "services": {"enclosure-history": {"volumes": ["./history:/app/history:ro"]}},
+    }) + "\n", encoding="utf-8")
+    deployment.files = READONLY_FILES
+
+
+def wait_for_history_liveness(version: str, timeout: int = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            status, payload = get_json(f"http://127.0.0.1:{HISTORY_PORT}/livez")
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise SmokeError("read-only history startup did not become live within 60 seconds") from None
+            time.sleep(1)
+            continue
+        expect(status == 200 and payload.get("status") == "ok" and payload.get("version") == version,
+               "read-only history /livez does not identify the live candidate")
+        return
+
+
+def check_readonly_runtime(deployment: Deployment, args: argparse.Namespace) -> dict:
+    """Local startup refusal is 503/down, not remote-source 200/degraded (#429)."""
+    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", args.candidate_image]).strip()
+    revision = run(["docker", "image", "inspect", "--format",
+                    '{{index .Config.Labels "org.opencontainers.image.revision"}}', args.candidate_image]).strip()
+    expect(revision == args.candidate_revision, "read-only candidate revision does not match")
+    identity = {}
+    for service in SERVICES:
+        container = deployment.compose("ps", "-q", service).strip()
+        expect(bool(container) and "\n" not in container, f"{service} must resolve to exactly one container")
+        state = json.loads(run(["docker", "inspect", "--format", "{{json .}}", container]))
+        expect(state["State"]["Status"] == "running" and state["RestartCount"] == 0,
+               f"{service} exited or restarted during read-only refusal")
+        expect(state["Image"] == image_id, f"{service} does not run the read-only candidate")
+        identity[service] = [container, state["State"]["StartedAt"]]
+        if service == "enclosure-history":
+            mounts = [mount for mount in state["Mounts"] if mount["Destination"] == "/app/history"]
+            expect(len(mounts) == 1 and mounts[0]["Type"] == "bind" and mounts[0]["RW"] is False
+                   and mounts[0]["Source"] == str(deployment.root / "history"),
+                   "required history mount is not the seeded read-only bind")
+    for port in (UI_PORT, HISTORY_PORT):
+        status, live = get_json(f"http://127.0.0.1:{port}/livez")
+        expect(status == 200 and live.get("status") == "ok" and live.get("version") == args.candidate_version,
+               f"/livez on {port} does not identify the live candidate")
+    status, ui = get_json(f"http://127.0.0.1:{UI_PORT}/healthz")
+    expect(status == 200 and ui.get("status") in {"ok", "degraded"}, "safe UI access is unavailable")
+    status, health = get_json(f"http://127.0.0.1:{HISTORY_PORT}/healthz", read_error_body=True)
+    unavailable = "History storage is unavailable; see the service logs."
+    expect(status == 503 and health.get("status") == "down" and health.get("detail") == unavailable
+           and str(health.get("reason", "")).startswith("Cannot write to /app/history "),
+           "read-only history must visibly refuse unavailable local storage, not report healthy recovery")
+    status, overview = get_json(f"http://127.0.0.1:{HISTORY_PORT}/api/history/overview", read_error_body=True)
+    expect(status == 503 and overview == {"detail": unavailable},
+           "read-only history API must refuse rather than serve fresh active history")
+    return identity
+
+
+def readonly_state(args: argparse.Namespace) -> str:
+    """Exercise one literal read-only required-state mount on synthetic released state."""
+    root = args.root.resolve()
+    prepare_root(root, args.compose_fixture, args.config_fixture)
+    deployment = Deployment(root)
+    config_digest = sha256(root / "config/config.yaml")
+    before_ui, before_history, seeded = seed_previous_release(deployment, args)
+    deployment.compose("stop", *SERVICES)
+    # Snapshot after the released writer closes and checkpoints. Inject no
+    # permission repair, fault hook, database edit or alternate storage path.
+    install_readonly_history_mount(deployment)
+    deployment.set_image(args.candidate_image)
+    deployment.compose("pull")
+    before_bytes = deployment.run_python("enclosure-history", READ_HISTORY_TREE)
+    expect("history.db" in before_bytes and before_bytes["history.db"][0] > 0, "seeded history bytes are missing")
+    # --wait would demand healthy storage and hide the intentional 503 behind a
+    # Compose timeout. Keep the ordinary up -d and bound the probe separately.
+    deployment.compose("up", "-d")
+    wait_for_history_liveness(args.candidate_version)
+    expect(deployment.exec_python("enclosure-history", READONLY_WRITE_PROBE) == {"errno": errno.EROFS},
+           "required history mount did not reject writes with EROFS")
+    identity = check_readonly_runtime(deployment, args)
+    for _ in range(10):
+        time.sleep(2)
+        expect(check_readonly_runtime(deployment, args) == identity, "container identity changed during refusal")
+    expect(deployment.exec_python("enclosure-history", READ_HISTORY_TREE) == before_bytes,
+           "history bytes or entries changed during read-only refusal")
+    expect(sha256(root / "config/config.yaml") == config_digest, "config changed during read-only refusal")
+    expect(deployment.exec_python("enclosure-ui", READ_UI)["mappings"] == before_ui["mappings"],
+           "mappings changed during read-only refusal")
+
+    # Operator removes the injected fault, not an automatic repair. The same
+    # candidate must then open the same seeded store through normal startup.
+    deployment.compose("stop", *SERVICES)
+    deployment.files = ()
+    deployment.pull_and_up()
+    check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+    after = deployment.exec_python("enclosure-history", READ_HISTORY)
+    expect(after["integrity"] == "ok" and after["counts"] == before_history["counts"],
+           "writable recovery lost predecessor history")
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "writable candidate cannot read retained predecessor history")
+    return (f"{SUCCESS_PREFIX} scenario=readonly-state previous={args.previous_version} "
+            f"candidate={args.candidate_version} revision={args.candidate_revision} "
+            "mount=ro write_errno=EROFS livez=ok history_health=down history_http=503 "
+            "history_api=refused restarts=0 observation_seconds=20 history_bytes=unchanged "
+            "writable_recovery=ok")
+
+
 def smoke(args: argparse.Namespace) -> str:
+    if args.scenario == "readonly-state":
+        return readonly_state(args)
     if args.scenario == "interrupted-migration":
         return interrupted_migration(args)
     if args.scenario == "segmented-catalog":
@@ -812,6 +971,8 @@ def smoke(args: argparse.Namespace) -> str:
 
 
 def compose_chain(root: Path) -> list[str]:
+    if (root / READONLY_FILES[-1]).exists():
+        return [arg for name in READONLY_FILES for arg in ("-f", name)]
     if (root / "docker-compose.nonroot.yml").exists():
         return [arg for name in HARDENED_FILES for arg in ("-f", name)]
     return []
