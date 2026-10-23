@@ -2184,6 +2184,146 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
             self.assertEqual(verified_digest_count, 1)
             self.assertEqual(sha256.call_count, verified_digest_count)
 
+    def test_catalog_summary_reuses_authenticated_segment_counts_but_refreshes_hot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot, segment, catalog = (
+                root / name for name in ("hot.sqlite3", "segment-0001.sqlite3", "catalog.json")
+            )
+            self._create_database(hot, [(1, "2025-01-01T00:00:00+00:00")])
+            self._create_database(segment, [
+                (i, "2025-01-01T00:00:00+00:00") for i in range(1, 20_001)
+            ], [(1, "2025-01-01T00:00:00+00:00", 30)])
+            self._insert_rollup(segment, bucket_start="2025-01-01T00:00:00+00:00", value_sum=60)
+            with closing(sqlite3.connect(segment)) as connection, connection:
+                connection.execute("""INSERT INTO slot_state_current (
+                    system_id, enclosure_key, slot, slot_label, present,
+                    identify_active, last_seen_at
+                ) VALUES ('system-1', 'enclosure-1', 1, 'slot-1', 1, 0,
+                          '2025-01-01T00:00:00+00:00')""")
+            self._write_catalog(catalog, segment)
+            store = HistoryStore(
+                str(hot), initialize=False, recover_unreadable_database=False,
+                segment_catalog_path=catalog,
+            )
+            first = store.list_history_system_summaries()
+            self.assertEqual(first[0]["event_count"], 20_001)
+            # Returned dictionaries and per-request exclusions must not mutate
+            # the authenticated, unfiltered segment result.
+            first[0]["event_count"] = -1
+            self.assertEqual(store.list_history_system_summaries(["system-1"]), [])
+            with closing(sqlite3.connect(hot)) as connection, connection:
+                connection.execute("UPDATE slot_events SET system_label='Current label'")
+                connection.execute("""INSERT INTO slot_events (
+                    observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                ) VALUES ('2025-01-01T00:00:00+00:00', 'system-1', 'enclosure-1',
+                          1, 'slot-1', 'state', '{}')""")
+            reader = store._segment_reader_cache
+            assert reader is not None
+            original = reader._query_connection
+            work = []
+
+            @contextmanager
+            def counted(path, hot_connection=None):
+                with original(path, hot_connection) as connection:
+                    instructions = 0
+
+                    def progress():
+                        nonlocal instructions
+                        instructions += 100
+                        return 0
+
+                    connection.set_progress_handler(progress, 100)
+                    try:
+                        yield connection
+                    finally:
+                        connection.set_progress_handler(None, 0)
+                        work.append(instructions)
+
+            with patch.object(reader, "_query_connection", side_effect=counted):
+                result = store.list_history_system_summaries()
+            self.assertEqual(result[0]["event_count"], 20_002)
+            self.assertEqual(result[0]["tracked_slots"], 1)
+            self.assertEqual(result[0]["metric_sample_count"], 1)
+            self.assertEqual(result[0]["metric_rollup_count"], 1)
+            self.assertEqual(result[0]["system_label"], "Current label")
+            self.assertLess(sum(work), 2_000, f"Warm summary SQLite VM work: {work}")
+
+    def test_catalog_summary_cache_retains_payload_and_sidecar_guards(self) -> None:
+        for damage in ("payload", "sidecar", "activation"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                hot, segment, catalog = (
+                    root / name for name in ("hot.sqlite3", "segment-0001.sqlite3", "catalog.json")
+                )
+                self._create_database(hot, [])
+                self._create_database(segment, [(1, "2025-01-01T00:00:00+00:00")])
+                self._write_catalog(catalog, segment)
+                reader = SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+                self.assertEqual(reader.list_history_system_summaries()[0]["event_count"], 1)
+                if damage == "payload":
+                    metadata = segment.stat()
+                    # Same size and restored mtime do not authenticate new bytes.
+                    with closing(sqlite3.connect(segment)) as connection, connection:
+                        connection.execute("UPDATE slot_events SET event_type='other_change'")
+                    self.assertEqual(segment.stat().st_size, metadata.st_size)
+                    os.utime(segment, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                elif damage == "sidecar":
+                    Path(f"{segment}-wal").write_bytes(b"")
+                else:
+                    assert reader.activation_marker_path is not None
+                    reader.activation_marker_path.write_text("pending", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    reader.list_history_system_summaries()
+
+    def test_catalog_summary_cache_reauthenticates_replacement_and_resets_with_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot, segment, catalog, replacement = (
+                root / name for name in (
+                    "hot.sqlite3", "segment-0001.sqlite3", "catalog.json", "replacement.sqlite3"
+                )
+            )
+            self._create_database(hot, [])
+            self._create_database(segment, [(1, "2025-01-01T00:00:00+00:00")])
+            self._write_catalog(catalog, segment)
+            store = HistoryStore(
+                str(hot), initialize=False, recover_unreadable_database=False,
+                segment_catalog_path=catalog,
+            )
+            self.assertEqual(store.list_history_system_summaries()[0]["event_count"], 1)
+            first_reader = store._segment_reader_cache
+            replacement.write_bytes(segment.read_bytes())
+            replacement.replace(segment)
+            original_sha256 = hashlib.sha256
+            with patch.object(segment_reader.hashlib, "sha256", wraps=original_sha256) as sha256:
+                self.assertEqual(store.list_history_system_summaries()[0]["event_count"], 1)
+                self.assertEqual(sha256.call_count, 1)
+            # A new catalog authenticates new contents; the old reader's counts
+            # must not survive the generation transition in HistoryStore.
+            with closing(sqlite3.connect(segment)) as connection, connection:
+                connection.execute("""INSERT INTO slot_events (
+                    observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                ) SELECT observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+                  FROM slot_events""")
+            successor = root / "successor.json"
+            self._write_catalog(successor, segment, generation_id="generation-0002")
+            successor.replace(catalog)
+            self.assertEqual(store.list_history_system_summaries()[0]["event_count"], 2)
+            self.assertIsNot(store._segment_reader_cache, first_reader)
+
+    def test_uncatalogued_summary_sources_are_always_counted_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot, segment = root / "hot.sqlite3", root / "segment-0001.sqlite3"
+            self._create_database(hot, [])
+            self._create_database(segment, [(1, "2025-01-01T00:00:00+00:00")])
+            reader = SegmentedHistoryReader(hot_path=hot, segment_paths=[segment])
+            self.assertEqual(reader.list_history_system_summaries()[0]["event_count"], 1)
+            with closing(sqlite3.connect(segment)) as connection, connection:
+                connection.execute("DELETE FROM slot_events")
+            self.assertEqual(reader.list_history_system_summaries(), [])
+
     def test_catalog_digest_cache_reauthenticates_an_atomically_replaced_segment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -49,6 +49,7 @@ from app.services.inventory import (
     SYSTEM_RETENTION_MAX_ENCLOSURES,
     SnapshotStateBusyError,
     SystemRetentionBusyError,
+    SplitEnclosureError,
     SystemRetentionTooLargeError,
     UnknownEnclosureError,
 )
@@ -127,6 +128,9 @@ ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL = "Unable to resolve selected enclosure layo
 EXCEPTION_RESPONSES: dict[type[Exception], ErrorResponseSpec] = {
     SystemNotConfiguredError: ErrorResponseSpec(status_code=404),
     UnknownEnclosureError: ErrorResponseSpec(status_code=404, detail=UNKNOWN_ENCLOSURE_DETAIL),
+    # A pre-#1000 combined shelf id: still 404, but the detail names the
+    # separate shelves instead of calling the id unknown (#1006).
+    SplitEnclosureError: ErrorResponseSpec(status_code=404),
     SnapshotStateBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=1),
     SnapshotExportBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
     SystemRetentionBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
@@ -164,6 +168,12 @@ async def mapped_exception_handler(
             error="retention_scope_too_large",
             enclosure_count_minimum=SYSTEM_RETENTION_MAX_ENCLOSURES + 1,
             enclosure_cap=SYSTEM_RETENTION_MAX_ENCLOSURES,
+        )
+    if isinstance(exc, SplitEnclosureError):
+        payload.update(
+            error="enclosure_split",
+            enclosure_id=exc.enclosure_id,
+            member_enclosure_ids=list(exc.member_ids),
         )
     return JSONResponse(
         payload,

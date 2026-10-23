@@ -173,6 +173,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_app_history_bounds",
             "tests.test_backup_archive_journal",
             "tests.test_backup_integration",
+            "tests.test_combined_shelf_upgrade",
             "tests.test_history_bulk_bounds",
             "tests.test_history_refresh_bounds",
             "tests.test_history_backup_coupling",

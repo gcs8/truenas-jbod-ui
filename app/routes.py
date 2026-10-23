@@ -95,7 +95,7 @@ from app.services.history_backend import (
     HistoryBackendPolicyError,
 )
 from app.services.history_status import project_public_collector_status
-from app.services.inventory import DiskInventorySyncBusy, LedSessionBusyError
+from app.services.inventory import DiskInventorySyncBusy, LedSessionBusyError, SplitEnclosureError
 from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
@@ -176,6 +176,14 @@ def _unknown_system_notice(system_id: str, settings: Any) -> str:
         settings.default_system_id or "the default system",
     )
     return f'System "{system_id}" is not configured. Showing {default_label} instead.'
+
+
+def _split_enclosure_notice(exc: SplitEnclosureError) -> str:
+    return (
+        f"Enclosure {exc.enclosure_id} combined {len(exc.member_ids)} shelves that are now shown "
+        f"separately ({', '.join(exc.member_ids)}). Showing {exc.member_ids[0]} instead; "
+        "update saved links to name one shelf."
+    )
 
 
 SMART_BATCH_TRANSPORT_EXCEPTIONS = (
@@ -328,13 +336,28 @@ def build_router() -> APIRouter:
             else _unknown_system_notice(system_id, current_settings)
         )
         service = route_service(selected_system_id, enclosure_id=enclosure_id)
-        admin_launch, snapshot = await asyncio.gather(
-            asyncio.to_thread(resolve_admin_launch_url, request, current_settings),
-            service.get_snapshot(
-                selected_enclosure_id=enclosure_id,
-                allow_stale_cache=True,
-            ),
-        )
+
+        async def load_page_sources(page_enclosure_id: str | None) -> tuple[Any, Any]:
+            return await asyncio.gather(
+                asyncio.to_thread(resolve_admin_launch_url, request, current_settings),
+                service.get_snapshot(
+                    selected_enclosure_id=page_enclosure_id,
+                    allow_stale_cache=True,
+                ),
+            )
+
+        try:
+            admin_launch, snapshot = await load_page_sources(enclosure_id)
+        except SplitEnclosureError as exc:
+            # A saved link to a pre-#1000 combined shelf (#1006). The page is
+            # read-only, so open the first separate shelf and say why, as an
+            # unknown system id does. API routes keep the 404 that names the
+            # shelves: a write or LED action must never land on another shelf.
+            enclosure_id = exc.member_ids[0]
+            system_notice = " ".join(
+                filter(None, [system_notice, _split_enclosure_notice(exc)])
+            )
+            admin_launch, snapshot = await load_page_sources(enclosure_id)
         storage_view_runtime = await service.get_storage_view_runtime(
             selected_enclosure_id=enclosure_id,
             snapshot=snapshot,
