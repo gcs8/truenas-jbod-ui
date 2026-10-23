@@ -93,7 +93,7 @@
     "test_segment_rotation": 52,
     "test_segment_sealer": 16,
     "test_segmented_history": 13,
-    "test_segmented_history_reader": 56,
+    "test_segmented_history_reader": 60,
     "test_segmented_restore_recovery": 18,
     "test_settings_reload": 54,
     "test_slot_bounds_routes": 36,
