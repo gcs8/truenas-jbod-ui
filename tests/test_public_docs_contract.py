@@ -658,6 +658,171 @@ class OperatorRecipeTests(unittest.TestCase):
                             self.assertEqual(leaked, set())
 
 
+@unittest.skipUnless(os.name == "posix", "disposable staging runner requires POSIX metadata")
+class LiteralStagingQualificationTests(unittest.TestCase):
+    def test_runtime_extracts_the_unmodified_documented_python(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        self.assertEqual(qualification.staging_code(ROOT), rotation_staging_code())
+        compile(qualification.staging_code(ROOT), "<literal documented staging>", "exec")
+
+    def test_runtime_refuses_local_execution_before_any_subprocess(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(subprocess, "run", side_effect=AssertionError("local execution")):
+            with self.assertRaisesRegex(ValueError, "GitHub-hosted"):
+                qualification.require_hosted_runner()
+
+    def test_runtime_leaf_symlink_and_foreign_parent_are_refused(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            parent.chmod(0o700)
+            leaf = parent / "runtime"
+            qualification.require_runtime_path(leaf, parent, os.getuid(), existing=False)
+            leaf.symlink_to(parent, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                qualification.require_runtime_path(leaf, parent, os.getuid(), existing=False)
+            with self.assertRaises(ValueError):
+                qualification.require_runtime_path(parent / "other/runtime", parent, os.getuid(), existing=False)
+
+    def test_runtime_container_argv_has_only_scoped_readonly_mounts(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        argv = qualification.probe_arguments(Path("/fixture"), "sha256:" + "a" * 64,
+                                             "tjui-staging-fixture", "fixture", (10001, 10001),
+                                             "fresh", wrong_owner=False)
+        for option in ("--read-only", "--cap-drop", "--security-opt", "--network", "--user"):
+            self.assertIn(option, argv)
+        self.assertEqual(argv[argv.index("--network") + 1], "none")
+        self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+        self.assertEqual(argv[argv.index("--user") + 1], "10001:10001")
+        self.assertEqual(argv[argv.index("--security-opt") + 1], "no-new-privileges:true")
+        mounts = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
+        self.assertEqual(len(mounts), 3)
+        self.assertTrue(all(value.startswith("type=bind,src=/fixture/") and value.endswith(",readonly")
+                            for value in mounts))
+        self.assertNotIn("--privileged", argv)
+        self.assertNotIn("--publish", argv)
+        self.assertIn("_require_source_owner", qualification.CONTAINER_PROBE)
+        self.assertIn("_validate_backup_evidence", qualification.CONTAINER_PROBE)
+
+    def test_runtime_probe_fakes_verify_owned_id_cleanup_and_query_failures(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        for failure in (None, "create_timeout", "foreign_label", "final_query"):
+            with self.subTest(failure=failure):
+                state = {"record": None, "removed": False, "queries": 0}
+                calls = []
+
+                def fake_docker(scratch, *argv, **kwargs):
+                    calls.append(argv)
+                    if argv[0] == "ps":
+                        state["queries"] += 1
+                        if failure == "final_query" and state["removed"]:
+                            raise subprocess.TimeoutExpired(argv, 1)
+                        output = "c" * 64 if state["record"] else ""
+                    elif argv[0] == "create":
+                        name = argv[argv.index("--name") + 1]
+                        state["record"] = {"Id": "c" * 64, "Name": "/" + name,
+                                           "Image": "sha256:" + "a" * 64,
+                                           "Config": {"Labels": {qualification.LABEL:
+                                                                 "foreign" if failure == "foreign_label" else "fixture"}},
+                                           "HostConfig": {"ReadonlyRootfs": True, "NetworkMode": "none",
+                                                          "CapDrop": ["ALL"], "Privileged": False,
+                                                          "SecurityOpt": ["no-new-privileges:true"]},
+                                           "Mounts": [{"Type": "bind", "RW": False}],
+                                           "State": {"Running": False, "ExitCode": 0}}
+                        if failure == "create_timeout":
+                            raise subprocess.TimeoutExpired(argv, 1)
+                        output = "c" * 64
+                    elif argv[0] == "inspect":
+                        output = json.dumps([state["record"]])
+                    elif argv[0] == "start":
+                        output = json.dumps({"probe": "fresh", "uid": 10001, "gid": 10001, "pass": True})
+                    elif argv[0] == "rm":
+                        self.assertEqual(argv, ("rm", "--force", "c" * 64))
+                        state["removed"] = True
+                        state["record"] = None
+                        output = ""
+                    else:
+                        self.fail(f"unexpected fake Docker operation {argv}")
+                    return subprocess.CompletedProcess(argv, 0, output, "")
+
+                with patch.object(qualification, "docker", side_effect=fake_docker):
+                    if failure is None:
+                        qualification.container_probe(Path("/scratch"), Path("/fixture"),
+                                                      "sha256:" + "a" * 64, "fixture", (10001, 10001), "fresh")
+                    else:
+                        expected = ValueError if failure == "foreign_label" else subprocess.TimeoutExpired
+                        with self.assertRaises(expected):
+                            qualification.container_probe(Path("/scratch"), Path("/fixture"),
+                                                          "sha256:" + "a" * 64, "fixture", (10001, 10001), "fresh")
+                self.assertEqual(state["removed"], failure != "foreign_label")
+                self.assertFalse(any("prune" in call for call in calls))
+
+    def test_branch_workflow_separates_frozen_controls_from_application(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        workflow = yaml.safe_load((ROOT / ".github/workflows/disposable-runtime-qualification.yml").read_text())
+        trigger = workflow.get("on", workflow.get(True))
+        self.assertEqual(trigger, {"push": {"branches": [qualification.BRANCH]}})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        job = workflow["jobs"]["staging"]
+        self.assertEqual(job["timeout-minutes"], 35)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        first, second = job["steps"][:2]
+        self.assertEqual(first["with"]["path"], "controls")
+        self.assertEqual(first["with"]["ref"], "${{ github.sha }}")
+        self.assertEqual(second["with"]["path"], "source")
+        self.assertEqual(second["with"]["ref"], qualification.SOURCE_SHA)
+        self.assertFalse(first["with"]["persist-credentials"])
+        self.assertFalse(second["with"]["persist-credentials"])
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertLess(commands.index('git rev-parse HEAD'), commands.index('docker --host'))
+        self.assertIn("../controls/scripts/run_literal_staging_qualification.py", commands)
+        self.assertIn('--source "$GITHUB_WORKSPACE/source"', commands)
+        self.assertNotIn("run_compose_runtime_matrix.py", commands)
+        self.assertNotIn("docker push", commands)
+        self.assertNotIn("prune", commands.replace("Never prune", "Never remove broadly"))
+        self.assertIn("QUALIFICATION_SOURCE_VERIFIED", job["steps"][-1]["if"])
+
+    def test_runtime_fixture_shapes_use_only_task_paths_with_fake_chown(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        for history, backup in (((0, 0), (0, 0)), ((10001, 10001), (1000, 1000))):
+            for fault in qualification.FAULTS:
+                with self.subTest(history=history, fault=fault), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "case"
+                    with patch.object(qualification.os, "chown") as fake_chown:
+                        qualification.make_case(root, history, backup, fault)
+                    self.assertEqual(fake_chown.call_count, 6)
+                    self.assertTrue(all(call.args[0].is_relative_to(root) for call in fake_chown.call_args_list))
+                    self.assertTrue(set(qualification.snapshot(root)) <= qualification.ALLOWED_PATHS)
+                    qualification.cleanup_case(root)
+                    self.assertFalse(root.exists())
+
+    def test_runtime_snapshot_and_cleanup_preserve_unknown_evidence(self) -> None:
+        from scripts import run_literal_staging_qualification as qualification
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "history"
+            history.mkdir()
+            hot = history / "history.db"
+            hot.write_bytes(b"synthetic fixture")
+            before = qualification.snapshot(root)
+            hot.write_bytes(b"different fixture")
+            self.assertNotEqual(qualification.snapshot(root), before)
+            unknown = root / "foreign"
+            unknown.write_bytes(b"retain")
+            with self.assertRaisesRegex(ValueError, "unexpected"):
+                qualification.cleanup_case(root)
+            self.assertEqual(unknown.read_bytes(), b"retain")
+
+
 class OperatorRecipePortabilityTests(unittest.TestCase):
     PORTABLE_METHODS = (
         "test_core_standing_yaml_runs_two_read_only_probe_batches",

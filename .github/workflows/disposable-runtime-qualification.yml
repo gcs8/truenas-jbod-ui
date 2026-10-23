@@ -4,40 +4,64 @@ name: Disposable runtime qualification
 on:
   push:
     branches:
-      - test/jbod-disposable-runtime-qualification-20261023
+      - test/jbod-staging-qualification-20261023
 
 permissions:
   contents: read
 
 concurrency:
-  group: jbod-disposable-runtime-qualification
+  group: jbod-disposable-staging-qualification
   cancel-in-progress: false
 
 jobs:
-  matrix:
+  staging:
     if: github.repository == 'gcs8/truenas-jbod-ui' && github.actor == 'gcs8' && github.triggering_actor == 'gcs8'
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: source
     env:
       SOURCE_SHA: e85b8d5b56962bf6bb55d2b1fc1e425c5407dd3b
+      CONTROL_SHA: ${{ github.sha }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Check out exact accepted source without credentials
+      - name: Check out frozen qualification controls without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: controls
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check out exact accepted application source without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: e85b8d5b56962bf6bb55d2b1fc1e425c5407dd3b
+          path: source
           persist-credentials: false
           fetch-depth: 1
+      - name: Require exact source and controls before any runtime commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git -C ../controls rev-parse HEAD)" = "$CONTROL_SHA"
+          test -z "$(git -C ../controls status --porcelain --untracked-files=all)"
+          printf 'QUALIFICATION_SOURCE_VERIFIED=true\n' >> "$GITHUB_ENV"
       - name: Require a fresh job-local Linux Docker host
         shell: bash
         run: |
           set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain)"
           unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
           export DOCKER_HOST=unix:///var/run/docker.sock
           test "$(docker --host "$DOCKER_HOST" info --format '{{.Swarm.LocalNodeState}}')" = inactive
           test -z "$(docker --host "$DOCKER_HOST" ps --all --quiet)"
+          test -z "$(docker --host "$DOCKER_HOST" volume ls --quiet)"
           docker --host "$DOCKER_HOST" compose version
           root="$(mktemp -d "$RUNNER_TEMP/tjui-runtime-XXXXXXXX")"
           chmod 700 "$root"
@@ -52,30 +76,29 @@ jobs:
           set -euo pipefail
           unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          docker --host "$DOCKER_HOST" build --build-arg "SOURCE_COMMIT=$SOURCE_SHA" \
+          DOCKER_BUILDKIT=0 docker --host "$DOCKER_HOST" build --build-arg "SOURCE_COMMIT=$SOURCE_SHA" \
             --iidfile "$QUALIFICATION_ROOT/image-id" .
           image="$(<"$QUALIFICATION_ROOT/image-id")"
           [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$(docker --host "$DOCKER_HOST" image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
           printf 'QUALIFICATION_IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
-          printf 'qualification_source=%s image=%s\n' "$SOURCE_SHA" "$image"
-      - name: Run all maintained synthetic Compose runtime variants
+          printf 'qualification_controls=%s source=%s image=%s\n' "$CONTROL_SHA" "$SOURCE_SHA" "$image"
+      - name: Qualify literal staging with genuine owners and container UIDs
         shell: bash
         run: |
           set -euo pipefail
           unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
-          timeout --kill-after=30s 1500s python3 scripts/run_compose_runtime_matrix.py \
-            --compose docker-compose.yml \
-            --config-fixture tests/fixtures/ci-smoke-config.yaml \
-            --image "$QUALIFICATION_IMAGE" --source-commit "$SOURCE_SHA" \
+          timeout --kill-after=30s 1500s python3 ../controls/scripts/run_literal_staging_qualification.py \
+            --source "$GITHUB_WORKSPACE/source" --source-commit "$SOURCE_SHA" \
+            --image "$QUALIFICATION_IMAGE" \
             --runtime-root "$QUALIFICATION_ROOT/runtime" --scratch-root "$QUALIFICATION_ROOT" \
-            --ui-port 19080 --history-port 19081 --admin-port 19082 \
-            --ack I_APPROVE_DISPOSABLE_COMPOSE_QA \
-            2>&1 | tee "$QUALIFICATION_ROOT/matrix.log"
+            --ack I_APPROVE_DISPOSABLE_STAGING_QA \
+            2>&1 | tee "$QUALIFICATION_ROOT/staging.log"
           test ! -e "$QUALIFICATION_ROOT/runtime"
           test -z "$(git status --porcelain)"
+          test -z "$(git -C ../controls status --porcelain)"
       - name: Independently read back cleanup, without broad deletion
-        if: always()
+        if: always() && env.QUALIFICATION_SOURCE_VERIFIED == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -88,17 +111,15 @@ jobs:
           export QUALIFICATION_CONTAINERS="$containers" QUALIFICATION_NETWORKS="$networks" QUALIFICATION_VOLUMES="$volumes"
           python3 - <<'PY'
           import os
-          reserved = {'truenas-jbod-ui', 'truenas-jbod-history', 'truenas-jbod-admin'}
-          containers = set(os.environ['QUALIFICATION_CONTAINERS'].splitlines())
-          assert not containers & reserved, 'reserved QA containers remain'
-          for name in ('QUALIFICATION_CONTAINERS', 'QUALIFICATION_NETWORKS', 'QUALIFICATION_VOLUMES'):
-              assert not any(value.startswith('tjui-matrix-') for value in os.environ[name].splitlines()), name
+          assert not os.environ['QUALIFICATION_CONTAINERS'].splitlines(), 'containers remain'
+          assert not os.environ['QUALIFICATION_VOLUMES'].splitlines(), 'volumes remain'
+          assert set(os.environ['QUALIFICATION_NETWORKS'].splitlines()) == {'bridge', 'host', 'none'}, 'non-default networks remain'
           print('qualification_cleanup=pass task_containers=0 task_networks=0 task_volumes=0')
           PY
-          # A failed run retains its synthetic scratch in the job log context.
-          # The hosted VM is discarded; never prune a daemon or delete by name.
+          # Failed runs retain synthetic scratch. Never prune or delete by name.
           if [ "${{ job.status }}" = success ]; then
             test -n "${QUALIFICATION_ROOT:-}"
             test ! -e "$QUALIFICATION_ROOT/runtime"
+            test ! -L "$QUALIFICATION_ROOT/runtime"
             printf 'qualification_runtime_root=absent\n'
           fi
