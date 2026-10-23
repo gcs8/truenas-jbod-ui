@@ -479,6 +479,7 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         phases = [inspect.getsource(function) for function in (
             smoke.seed_previous_release, smoke.upgrade_and_rollback, smoke.segmented_catalog_upgrade,
             smoke.interrupted_migration, smoke.kill_during_startup, smoke.check_runtime,
+            smoke.readonly_state, smoke.install_readonly_history_mount,
             *(value for value in vars(smoke.Deployment).values() if inspect.isfunction(value)))]
         for forbidden in ("chown", "prepare_nonroot_bind_mounts", "migrate_segmented_history", '"down"',
                           "HARDENED_OWNERSHIP_PREP"):
@@ -734,6 +735,278 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn("chronological indexes", scripts_guide)
         # Any section: #637 moves from Unreleased into its release and stays there.
         self.assertRegex(changelog, r"\(#637(?:, #\d+)*\)")
+
+
+class ReadOnlyStateScenarioTests(unittest.TestCase):
+    """#463: maintained driver regressions, not real-container evidence."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def test_readonly_state_is_dispatched_and_invoked_in_the_existing_report_only_job(self):
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        self.assertIn("readonly-state", smoke.SCENARIOS)
+        with mock.patch.object(smoke, "readonly_state", return_value="qualified") as scenario:
+            args = SimpleNamespace(scenario="readonly-state")
+            self.assertEqual(smoke.smoke(args), "qualified")
+            scenario.assert_called_once_with(args)
+        workflow = yaml.safe_load((self.ROOT / ".github/workflows/ci.yml").read_text())
+        job = workflow["jobs"]["image-upgrade-scenarios"]
+        runs = [step["run"] for step in job["steps"] if "--scenario readonly-state" in step.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        for argument in (
+            '--root "$RUNNER_TEMP/image-upgrade-readonly"',
+            '--compose-fixture tests/fixtures/compose/v0.22.2.yml',
+            '--config-fixture tests/fixtures/ci-smoke-config.yaml',
+            '--previous-image "$PREVIOUS_IMAGE"',
+            '--previous-version "$PREVIOUS_VERSION"',
+            '--candidate-image "$CANDIDATE_IMAGE"',
+            '--candidate-revision "$GITHUB_SHA"',
+        ):
+            self.assertIn(argument, runs[0])
+        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertNotIn("--scenario readonly-state", str(workflow["jobs"]["image-upgrade-smoke"]))
+
+    def scenario_args(self, root):
+        from types import SimpleNamespace
+        return SimpleNamespace(root=root, compose_fixture=Path("compose-fixture"),
+                               config_fixture=Path("config-fixture"), previous_image="previous",
+                               previous_version="1", candidate_image="candidate", candidate_version="2",
+                               candidate_revision="revision", scenario="readonly-state")
+
+    def test_readonly_lifecycle_preserves_bytes_and_recovers_only_after_explicit_remount(self):
+        self.exercise_lifecycle()
+
+    def test_readonly_lifecycle_refuses_lost_replaced_or_fresh_history(self):
+        for changed in ({}, {"history.db": [0, "fresh"]}, {"history.db.broken-1": [20, "original"]}):
+            with self.subTest(changed=changed):
+                self.exercise_lifecycle(changed=changed)
+
+    def test_readonly_lifecycle_refuses_a_replaced_container_even_without_a_restart_count(self):
+        self.exercise_lifecycle(replaced=True)
+
+    def exercise_lifecycle(self, *, changed=None, replaced=False):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.scenario_args(root)
+            deployment = mock.Mock(spec=smoke.Deployment)
+            deployment.files = ()
+            deployment.root = root
+            before = {"history.db": [20, "original"]}
+            ui = {"mappings": [["shelf-a", 1, "SYNTH-0001", "synthetic"]]}
+            history = {"counts": {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12},
+                       "integrity": "ok"}
+            deployment.run_python.return_value = before
+
+            def read(service, script):
+                if script == smoke.READ_HISTORY_TREE:
+                    return before if changed is None else changed
+                if script == smoke.READONLY_WRITE_PROBE:
+                    return {"errno": 30}
+                return ui if service == "enclosure-ui" else history
+
+            deployment.exec_python.side_effect = read
+            with (
+                mock.patch.object(smoke, "Deployment", return_value=deployment),
+                mock.patch.object(smoke, "prepare_root"),
+                mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "sha256", return_value="config"),
+                mock.patch.object(smoke, "wait_for_history_liveness"),
+                mock.patch.object(smoke, "check_readonly_runtime", return_value={"started": "unchanged"},
+                                  side_effect=[{"started": "unchanged"}, {"started": "replacement"}]
+                                  if replaced else None) as check,
+                mock.patch.object(smoke, "check_runtime") as healthy,
+                mock.patch.object(smoke, "history_api_view", return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke.time, "sleep") as sleep,
+            ):
+                if changed is not None or replaced:
+                    reason = "container identity changed" if replaced else "history bytes or entries changed"
+                    with self.assertRaisesRegex(smoke.SmokeError, reason):
+                        smoke.readonly_state(args)
+                    healthy.assert_not_called()
+                    deployment.pull_and_up.assert_not_called()
+                else:
+                    result = smoke.readonly_state(args)
+                    self.assertIn("scenario=readonly-state", result)
+                    self.assertIn("history_health=down", result)
+                    self.assertIn("history_bytes=unchanged", result)
+                    self.assertIn("writable_recovery=ok", result)
+                    self.assertEqual(check.call_count, 11)
+                    self.assertEqual(sleep.call_args_list, [mock.call(2)] * 10)
+                    healthy.assert_called_once_with(deployment, "candidate", "2", "revision")
+                    deployment.pull_and_up.assert_called_once_with()
+                    self.assertEqual(deployment.files, ())
+                deployment.set_image.assert_called_once_with("candidate")
+                calls = deployment.compose.call_args_list
+                self.assertEqual(calls[:3], [mock.call("stop", *smoke.SERVICES), mock.call("pull"),
+                                             mock.call("up", "-d")])
+                if changed is None and not replaced:
+                    self.assertEqual(calls[3:], [mock.call("stop", *smoke.SERVICES)])
+
+    def test_readonly_runtime_distinguishes_local_refusal_from_liveness_or_remote_degradation(self):
+        import copy
+        import json
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deployment = smoke.Deployment(root)
+            args = self.scenario_args(root)
+            baseline = {"State": {"Status": "running", "StartedAt": "start"}, "Image": "image-id",
+                        "RestartCount": 0, "Mounts": [{"Destination": "/app/history", "Source": str(root / "history"),
+                                                       "Type": "bind", "RW": False}]}
+            for fault in (None, "restart", "remounted", "wrong-source", "other-image", "exited",
+                          "healthy-history", "remote-degraded", "wrong-reason", "active-api", "wrong-version"):
+                with self.subTest(fault=fault):
+                    state = copy.deepcopy(baseline)
+                    responses = {
+                        f"http://127.0.0.1:{smoke.UI_PORT}/livez": (200, {"status": "ok", "version": "2"}),
+                        f"http://127.0.0.1:{smoke.UI_PORT}/healthz": (200, {"status": "ok"}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/livez": (200, {"status": "ok", "version": "2"}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz": (503, {
+                            "status": "down", "detail": "History storage is unavailable; see the service logs.",
+                            "reason": "Cannot write to /app/history (owned by uid 0, running as uid 0)."}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/api/history/overview": (503, {
+                            "detail": "History storage is unavailable; see the service logs."}),
+                    }
+                    if fault == "restart":
+                        state["RestartCount"] = 1
+                    elif fault == "remounted":
+                        state["Mounts"][0]["RW"] = True
+                    elif fault == "wrong-source":
+                        state["Mounts"][0]["Source"] = str(root / "fresh-history")
+                    elif fault == "other-image":
+                        state["Image"] = "other"
+                    elif fault == "exited":
+                        state["State"]["Status"] = "exited"
+                    elif fault in {"healthy-history", "remote-degraded"}:
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"] = (
+                            200, {"status": "ok" if fault == "healthy-history" else "degraded"})
+                    elif fault == "wrong-reason":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] = "other failure"
+                    elif fault == "active-api":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/api/history/overview"] = (200, {})
+                    elif fault == "wrong-version":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/livez"][1]["version"] = "1"
+
+                    def run(command, **kwargs):
+                        if command[:3] == ["docker", "image", "inspect"]:
+                            return "revision" if "Labels" in command[4] else "image-id"
+                        return json.dumps(state)
+
+                    with (mock.patch.object(smoke, "run", side_effect=run),
+                          mock.patch.object(deployment, "compose", return_value="container"),
+                          mock.patch.object(smoke, "get_json", side_effect=lambda url, **kwargs: responses[url])):
+                        if fault is None:
+                            self.assertEqual(set(smoke.check_readonly_runtime(deployment, args)), set(smoke.SERVICES))
+                        else:
+                            with self.assertRaises(smoke.SmokeError):
+                                smoke.check_readonly_runtime(deployment, args)
+
+    def test_readonly_probes_hash_binary_bytes_and_require_erofs_not_permissions(self):
+        import contextlib
+        import errno
+        import io
+        import json
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "history.db").write_bytes(b"\xff\x00synthetic")
+
+            def execute(template):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    exec(compile(template.replace("/app/history", str(root)), "probe", "exec"), {})
+                return json.loads(output.getvalue())
+
+            before = execute(smoke.READ_HISTORY_TREE)
+            self.assertIn("history.db", before)
+            self.assertEqual(execute(smoke.READ_HISTORY_TREE), before)
+            (root / "history.db").write_bytes(b"\xfe\x00synthetic")
+            self.assertNotEqual(execute(smoke.READ_HISTORY_TREE), before)
+            with mock.patch("os.open", side_effect=OSError(errno.EROFS, "read-only filesystem")):
+                self.assertEqual(execute(smoke.READONLY_WRITE_PROBE), {"errno": errno.EROFS})
+            for number in (errno.EACCES, errno.ENOSPC):
+                with mock.patch("os.open", side_effect=OSError(number, "other fault")):
+                    with self.assertRaises(OSError):
+                        execute(smoke.READONLY_WRITE_PROBE)
+            with self.assertRaisesRegex(RuntimeError, "required history mount is writable"):
+                execute(smoke.READONLY_WRITE_PROBE)
+            self.assertEqual(set(root.iterdir()), {root / "history.db"})
+
+    def test_error_bodies_are_opt_in_and_preserve_the_actual_http_refusal(self):
+        import io
+        import urllib.error
+        from email.message import Message
+
+        smoke = self.load_smoke()
+        for read_body in (False, True):
+            error = urllib.error.HTTPError("http://127.0.0.1/healthz", 503, "unavailable", Message(),
+                                           io.BytesIO(b'{"status":"down","reason":"Cannot write to /app/history"}'))
+            with mock.patch.object(smoke.urllib.request, "urlopen", side_effect=error):
+                status, payload = smoke.get_json("http://127.0.0.1/healthz", read_error_body=read_body)
+            self.assertEqual(status, 503)
+            self.assertEqual(payload, {"status": "down", "reason": "Cannot write to /app/history"} if read_body else {})
+
+    def test_readonly_startup_wait_is_bounded_and_does_not_accept_another_release(self):
+        smoke = self.load_smoke()
+        with (mock.patch.object(smoke, "get_json", side_effect=OSError("not listening")),
+              mock.patch.object(smoke.time, "monotonic", side_effect=[0, 1, 60]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            with self.assertRaisesRegex(smoke.SmokeError, "within 60 seconds"):
+                smoke.wait_for_history_liveness("2")
+            sleep.assert_called_once_with(1)
+        with mock.patch.object(smoke, "get_json", return_value=(200, {"status": "ok", "version": "1"})):
+            with self.assertRaisesRegex(smoke.SmokeError, "live candidate"):
+                smoke.wait_for_history_liveness("2")
+        with mock.patch.object(smoke, "get_json", return_value=(200, {"status": "ok", "version": "2"})):
+            smoke.wait_for_history_liveness("2")
+
+    def test_readonly_cli_cleans_up_on_both_success_and_qualification_failure(self):
+        smoke = self.load_smoke()
+        for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "docker-compose.yml").write_text("services: {}")
+                smoke.install_readonly_history_mount(smoke.Deployment(root))
+                argv = ["--scenario", "readonly-state", "--root", str(root),
+                        "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
+                        "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
+                        "--candidate-version", "2", "--candidate-revision", "revision"]
+                with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
+                      mock.patch.object(smoke.subprocess, "run") as run,
+                      mock.patch("sys.stdout"), mock.patch("sys.stderr")):
+                    self.assertEqual(smoke.main(argv), 1 if failure else 0)
+                commands = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(commands[-2:], [
+                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.readonly.yml",
+                     "down", "--volumes", "--remove-orphans"], ["sudo", "rm", "-rf", str(root)],
+                ])
+
+    def test_readonly_mount_is_the_only_fault_and_cleanup_uses_its_compose_chain(self):
+        smoke = self.load_smoke()
+        self.assertTrue(callable(getattr(smoke, "readonly_state", None)),
+                        "the runtime scenario must exist, not only a static validator")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docker-compose.yml").write_text("services: {}")
+            smoke.install_readonly_history_mount(smoke.Deployment(root))
+            overlay = yaml.safe_load((root / "docker-compose.readonly.yml").read_text())
+            self.assertEqual(overlay, {"services": {"enclosure-history": {
+                "volumes": ["./history:/app/history:ro"],
+            }}})
+            with mock.patch.object(smoke.subprocess, "run") as run:
+                smoke.cleanup(root)
+            self.assertEqual(run.call_args_list[0].args[0], [
+                "docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.readonly.yml",
+                "down", "--volumes", "--remove-orphans",
+            ])
+            self.assertEqual(run.call_args_list[1].args[0], ["sudo", "rm", "-rf", str(root)])
 
 
 class UpgradeScenarioContractTests(unittest.TestCase):
