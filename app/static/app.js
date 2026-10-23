@@ -2413,10 +2413,13 @@
       sasFabricRefreshButton.disabled = state.snapshotMode || state.sasFabric.loading;
     }
     if (sasFabricShowAllButton) {
-      sasFabricShowAllButton.classList.toggle(
-        "hidden",
-        !selectedSasFabricTrace() && !selectedSasFabricNode(),
-      );
+      const hideShowAll = !selectedSasFabricTrace() && !selectedSasFabricNode();
+      // The heading survives map rerenders. Move focus before hiding the
+      // activated control, including when a selected bay is cleared.
+      if (hideShowAll && state.sasFabric.open && document.activeElement === sasFabricShowAllButton) {
+        document.getElementById("sas-fabric-heading")?.focus({ preventScroll: true });
+      }
+      sasFabricShowAllButton.classList.toggle("hidden", hideShowAll);
     }
     if (!state.sasFabric.open) {
       return;
@@ -10759,7 +10762,37 @@
           return snapshot;
         }
         const matchingSlot = snapshot.slots.find((item) => Number(item.slot) === Number(payload.slot));
-        if (matchingSlot) matchingSlot.identify_active = payload.identify_active;
+        if (matchingSlot) {
+          // Authoritative inventory wins over a locally retained legacy state,
+          // including after a refresh while locate is on. Never retain identify.
+          const baseStates = ["healthy", "fault", "empty", "unknown", "unmapped"];
+          const authoritative = baseStates.includes(matchingSlot.non_identify_state)
+            ? matchingSlot.non_identify_state : null;
+          if (baseStates.includes(matchingSlot.state)) {
+            matchingSlot.state_before_identify = matchingSlot.state;
+          }
+          matchingSlot.identify_active = payload.identify_active;
+          if (payload.identify_active) {
+            matchingSlot.state = "identify";
+          } else if (matchingSlot.state === "identify") {
+            // Legacy pre-lit snapshots can lack both base states. Presence is
+            // not enough to distinguish unknown/unmapped/healthy/empty bays.
+            const raw = matchingSlot.raw_status || {};
+            const health = [matchingSlot.health, raw.status, raw.value]
+              .filter(Boolean).join(" ").toLowerCase().replaceAll("noncritical", "non-crit-code");
+            // Match the server's allowlisted status fields, never arbitrary
+            // descriptions or identifiers that happen to contain "fault".
+            const status = [raw.status, raw.value, raw.value_raw, raw.state, raw.sas_device_type]
+              .filter(value => value != null && typeof value !== "object").join(" ").toLowerCase();
+            const faulty = raw.ses_fault_sensed || raw.ses_fault_requested
+              || /fault|degrad|fail|unavail|offline|removed|critical/.test(health)
+              || /(?:^|[^a-z0-9])fault/.test(status);
+            const retained = baseStates.includes(matchingSlot.state_before_identify)
+              ? matchingSlot.state_before_identify : null;
+            matchingSlot.state = authoritative || retained
+              || (raw.present === false ? "empty" : faulty ? "fault" : "unknown");
+          }
+        }
         return snapshot;
       };
       const currentSnapshotMatchesOrigin = mutation.scope === currentUiScopeKey()

@@ -152,8 +152,17 @@ test("path, node and bay selections can return to the full map without clearing 
   await expectFullMap(page);
 
   await failedPath.click();
-  await showAll.click();
+  await showAll.focus();
+  await expect(showAll).toBeFocused();
+  await page.keyboard.press("Enter");
   await expectFullMap(page);
+  // Inspect automatic focus before sending Tab or focusing any other control.
+  expect(await page.evaluate(() => ({
+    id: document.activeElement.id,
+    visible: document.activeElement.getClientRects().length > 0,
+  }))).toEqual({id: "sas-fabric-heading", visible: true});
+  await page.keyboard.press("Tab");
+  await expect(page.locator("#sas-fabric-refresh-button")).toBeFocused();
 
   await controller.click();
   await controller.focus();

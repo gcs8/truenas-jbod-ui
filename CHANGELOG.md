@@ -36,6 +36,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Admin storage-view edits survived queued repaints without restoring old input
+  values or losing pending candidate and platform bindings, while view and system
+  switches retained their own editor state (#1003).
+- Identical unprofiled SES shelves with different logical IDs stayed separate,
+  without joining their bays or locate targets. Verified Front/Rear shelf
+  parts still stacked, and explicitly selected combined shelves kept their
+  summed bay geometry and shelf-local locate targets (#1000).
+- History retained trusted disk identities when degraded SSH mapping lost or
+  contradicted bay assignments, while healthy observations still recorded real
+  changes (#1002).
+- Encrypted portable 7z backups waited for password-terminal readiness before
+  sending the passphrase, avoiding an echoed or discarded password line (#1001).
+- Locate light readback immediately updated bay tiles and restored their prior
+  state on clear, including cached views, and Connections Show all retained
+  keyboard focus on its heading (#998).
+- History adoption kept its committed success when the optional follow-up scan
+  failed, warned that the source list needed a refresh, and preserved the last
+  known list instead of displaying an empty result (#999).
+- The immutable upgrade helper removed complete URL tokens from failure
+  summaries and named over-cap retention refusals with bounded count/cap
+  evidence, while preserving refusal, rollback, and busy retries (#995).
+- History shutdown interrupted a deferred index build without discarding completed
+  indexes, and the next start resumed only the missing indexes (#994).
+- The CORE locate readback followed the element id instead of borrowing
+  the bay numbered like it when the target element's description was not
+  recognised, so it no longer confirms another drive's light (#984).
 - CORE SSH stopped stacking separate backplanes and AHCI SGPIO ports into one
   shelf drawn as the 60-bay CSE-946, and read pool names without the API
   (#955).
@@ -51,6 +77,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   exist yet. It now creates the account through `midclt call user.create` when
   the new Home directory field names a folder on a pool, and the unused
   bootstrap sudo-password field was removed (#960).
+- The TrueNAS CORE one-time bootstrap ignored an invalid Home directory field
+  for an existing account, while still refusing it before any host change when
+  account creation was needed (#993).
 - On TrueNAS CORE with SSH, the page no longer asked to turn on SSH when SSH
   had mapped the bays, named the real source of enclosures and bay positions,
   said "Empty" for an empty NVMe slot, did not offer locate lights on a view

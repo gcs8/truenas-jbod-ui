@@ -44,7 +44,7 @@ from history_service.domain import (
 )
 from history_service.backup_scheduler.service import read_archive_status
 from history_service.scheduled_backup import read_scheduled_backup_status
-from history_service.store import HistoryStore, SlotStateUpdate, is_database_corruption_error
+from history_service.store import HistoryIndexBuildCancelled, HistoryStore, SlotStateUpdate, is_database_corruption_error
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
@@ -154,6 +154,8 @@ class HistoryCollector:
         self._paused_in_memory_at: datetime | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        # Native SQLite progress runs in the retained index worker thread.
+        self._index_build_stopping = threading.Event()
         self.started_at = isoformat_utc()
         self.last_inventory_at: str | None = None
         self.last_fast_metrics_at: str | None = None
@@ -225,12 +227,14 @@ class HistoryCollector:
         if self._task and not self._task.done():
             return
         self._stopping.clear()
+        self._index_build_stopping.clear()
         self._task = asyncio.create_task(self._run_loop(), name="history-collector")
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, True)
 
     async def stop(self) -> None:
         task = self._task
         self._stopping.set()
+        self._index_build_stopping.set()
         if task:
             try:
                 await task
@@ -354,9 +358,13 @@ class HistoryCollector:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
-        # HTTP success does not make a failed platform inventory authoritative.
-        untrusted_scopes = [scope for scope in scopes if not self._should_record_scope_snapshot(scope.snapshot)]
-        self._publish_skipped_scopes(scopes, root_only=bool(enumerate_kwargs.get("cached_root_only")))
+        # Resolve eligibility once, before any durable writes. Command warning
+        # tiers alone cannot prove that a degraded SSH bay map kept its disks.
+        skip_reasons = [self._scope_history_skip_reason(scope) for scope in scopes]
+        untrusted_scopes = [scope for scope, reason in zip(scopes, skip_reasons, strict=True) if reason is not None]
+        self._publish_skipped_scopes(
+            scopes, skip_reasons, root_only=bool(enumerate_kwargs.get("cached_root_only"))
+        )
         for scope in untrusted_scopes:
             self._clear_pending_topology_changes_for_scope(scope.system_id, scope.enclosure_id)
         if untrusted_scopes:
@@ -375,7 +383,7 @@ class HistoryCollector:
             not self._scope_enumeration_complete and not enumerate_kwargs.get("cached_root_only")
         )
         if enumeration_failed:
-            if not any(self._should_record_scope_snapshot(scope.snapshot) for scope in scopes):
+            if len(untrusted_scopes) == len(scopes):
                 self._scope_collection_degraded_reason = "No trusted history inventory scopes were available."
                 raise HistorySourceError.error_reply(self._scope_collection_degraded_reason)
             self._scope_collection_degraded_reason = (
@@ -387,7 +395,7 @@ class HistoryCollector:
             self._raise_if_stopping()
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
-            skip_reason = self._scope_skip_reason(scope.snapshot)
+            skip_reason = skip_reasons[scope_index - 1]
             if skip_reason is not None:
                 smart_scope_unavailable = True
                 logger.warning(
@@ -841,6 +849,9 @@ class HistoryCollector:
                 await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
             except HistoryCollectionAlreadyRunning:
                 return False
+            except HistoryIndexBuildCancelled:
+                # An intentional stop is neither damage nor a retry failure.
+                return False
             except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
                 self._index_build_failures += 1
                 logger.warning(
@@ -852,6 +863,8 @@ class HistoryCollector:
                 if is_database_corruption_error(exc):
                     self._pause_for_damage(exc)
                 return False
+        if self._stopping.is_set():
+            return False
         self._chronological_indexes_identity = identity
         self._index_build_failures = 0
         return True
@@ -863,7 +876,9 @@ class HistoryCollector:
         self.current_collection_kind = "maintenance"
         self.current_collection_activity = f"building history index {position} of {total}"
         try:
-            self.store.build_chronological_index(name)
+            self.store.build_chronological_index(
+                name, should_continue=lambda: not self._index_build_stopping.is_set()
+            )
         finally:
             self.current_collection_started_at = None
             self.current_collection_kind = None
@@ -1751,9 +1766,9 @@ class HistoryCollector:
         platform = normalize_text(snapshot.get("selected_system_platform"))
         if platform in {"linux", "esxi"}:
             # These host inventories come from SSH, not the disabled API.
-            # SSH remains optional enrichment on API-backed platforms. A failed
-            # optional command (UNVR `lsscsi -g -t`) leaves the bay map whole;
-            # only the inventory's explicit required_ok says so (#927).
+            # SSH remains optional enrichment on API-backed platforms. The
+            # explicit required_ok permits optional-command recovery (#927);
+            # the durable identity comparison below also checks the map (#989).
             ssh_source = sources.get("ssh")
             if (
                 isinstance(ssh_source, dict)
@@ -1772,7 +1787,53 @@ class HistoryCollector:
                 return "topology_incomplete"
         return None
 
-    def _publish_skipped_scopes(self, scopes: list[ScopeSnapshot], *, root_only: bool) -> None:
+    def _scope_history_skip_reason(self, scope: ScopeSnapshot) -> str | None:
+        reason = self._scope_skip_reason(scope.snapshot)
+        if reason is not None:
+            return reason
+        if normalize_text(scope.snapshot.get("selected_system_platform")) not in {"linux", "esxi"}:
+            return None
+        sources = scope.snapshot.get("sources")
+        ssh = sources.get("ssh") if isinstance(sources, dict) else None
+        if not isinstance(ssh, dict) or not ssh.get("enabled") or ssh.get("ok"):
+            return None
+
+        # required_ok describes command criticality, not resolved bay identity
+        # (#989). A failed optional join can leave AES bays with no disks. Do
+        # not let even repeated failed scans replace the last durable map. A
+        # healthy source can establish a real removal/replacement immediately.
+        previous = self.store.get_slot_states(scope.system_id, scope.enclosure_id)
+        current_records = [
+            SlotStateRecord.from_snapshot_slot(scope.snapshot, slot)
+            for slot in scope.snapshot.get("slots", [])
+        ]
+        current = {record.slot: record for record in current_records}
+        for slot, old in previous.items():
+            new = current.get(slot)
+            if new is None:
+                if old.present:
+                    return "ssh_required_failed"
+                continue
+            if old.present != new.present:
+                return "ssh_required_failed"
+            if not old.present:
+                continue
+            # Additional identity detail is harmless. Losing or contradicting
+            # a known identifier is not evidence of a physical disk change.
+            identity_fields = ("serial", "model", "gptid", "logical_unit_id", "disk_identity_key")
+            if not any(getattr(old, name) for name in ("serial", "gptid", "logical_unit_id", "disk_identity_key")):
+                identity_fields += ("device_name", "sas_address")
+            if any(getattr(old, name) and getattr(old, name) != getattr(new, name) for name in identity_fields):
+                return "ssh_required_failed"
+        return None
+
+    def _publish_skipped_scopes(
+        self,
+        scopes: list[ScopeSnapshot],
+        skip_reasons: list[str | None],
+        *,
+        root_only: bool,
+    ) -> None:
         """Name the scopes this scan read but will not record (#927).
 
         A fleet scan replaces the list. A root-only scan looked at one scope,
@@ -1782,8 +1843,8 @@ class HistoryCollector:
         """
         skipped = [*self._unreadable_scopes] + [
             self._skipped_scope_entry(scope, reason)
-            for scope in scopes
-            if (reason := self._scope_skip_reason(scope.snapshot)) is not None
+            for scope, reason in zip(scopes, skip_reasons, strict=True)
+            if reason is not None
         ]
         if not root_only:
             self.last_skipped_scopes = skipped

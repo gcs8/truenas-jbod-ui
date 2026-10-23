@@ -493,7 +493,9 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         `grep` reports the key as present, as the middleware writes it when it
         creates the account.
         """
-        root = Path(self.temp.name)
+        run_temp = tempfile.TemporaryDirectory(dir=self.temp.name)
+        self.addCleanup(run_temp.cleanup)
+        root = Path(run_temp.name)
         stubs = root / "bin"
         stubs.mkdir()
         calls = root / "calls.log"
@@ -519,8 +521,9 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         for stub in stubs.iterdir():
             stub.chmod(0o755)
         payload = self.payload("core", "root", **updates)
-        command = self.service._build_bootstrap_command(payload)
-        script = self.service._build_remote_script(payload, SYNTHETIC_PUBLIC_KEY)
+        self.service.bootstrap_service_account(payload)
+        command = FakeProbe.last_command
+        script = FakeProbe.last_stdin
         csh = shutil.which("csh") or shutil.which("tcsh")
         argv = [csh, "-f", "-c", command] if csh else ["/bin/sh", "-c", command]
         completed = subprocess.run(
@@ -599,7 +602,7 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIs(payload["smb"], False)
         self.assertIs(payload["password_disabled"], True)
 
-    def test_core_service_home_outside_a_pool_folder_fails_before_connecting(self) -> None:
+    def test_core_missing_user_with_home_outside_a_pool_folder_fails_before_any_change(self) -> None:
         for bad_home in (
             "/home/x",
             "/mnt",
@@ -619,16 +622,12 @@ class BootstrapRemoteExecTests(unittest.TestCase):
             "/mnt/tank/home/'jbodmap'",
         ):
             with self.subTest(bad_home=bad_home):
-                FakeProbe.last_config = None
-                FakeProbe.last_command = None
-                with self.assertRaises(ValueError) as raised:
-                    self.service.bootstrap_service_account(self.payload("core", service_home=bad_home))
-                message = str(raised.exception)
-                self.assertIn("Home directory", message)
-                self.assertIn("/mnt/tank/home/jbodmap", message)
-                self.assertNotIn("validation error", message)
-                self.assertIsNone(FakeProbe.last_config)
-                self.assertIsNone(FakeProbe.last_command)
+                completed, logged, received = self.run_core_script("[]", service_home=bad_home)
+                self.assert_only_the_account_lookup_ran(completed, logged, received)
+                self.assertIsNone(self.created_payload)
+                self.assertIn("Home directory", completed.stderr)
+                self.assertIn("/mnt/tank/home/jbodmap", completed.stderr)
+                self.assertNotIn("validation error", completed.stderr)
 
     def test_core_service_home_accepts_folders_on_a_pool(self) -> None:
         for home, expected in (
@@ -694,6 +693,30 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIn("BOOTSTRAP_ACCOUNT_CREATED=0\n", completed.stdout)
         self.assertEqual(received, "")
 
+    def test_core_existing_service_user_ignores_an_invalid_home_field(self) -> None:
+        for install_sudo_rules in (True, False):
+            for home in ("/home/jbodmap", "/mnt/tank/../jbodmap", "/mnt/tank/$(id)"):
+                with self.subTest(home=home, install_sudo_rules=install_sudo_rules):
+                    completed, logged, received = self.run_core_script(
+                        '[{"id": 54, "username": "jbodmap", "home": "/mnt/tank/svc/jbodmap"}]',
+                        service_home=home,
+                        install_sudo_rules=install_sudo_rules,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertIsNone(self.created_payload)
+                    self.assertNotIn(home, "\n".join(logged))
+                    self.assertNotIn("create_payload=", str(FakeProbe.last_stdin))
+                    self.assertFalse(any("user.create" in line for line in logged), logged)
+                    self.assertIn("BOOTSTRAP_SERVICE_HOME=/mnt/tank/svc/jbodmap\n", completed.stdout)
+                    self.assertIn("BOOTSTRAP_ACCOUNT_CREATED=0\n", completed.stdout)
+                    for change in ("mkdir ", "touch ", "chmod ", "chown "):
+                        self.assertTrue(any(line.startswith(change) for line in logged), logged)
+                    updates = [line for line in logged if line.startswith("midclt call user.update ")]
+                    self.assertEqual(len(updates), int(install_sudo_rules))
+                    if updates:
+                        self.assertTrue(updates[0].startswith("midclt call user.update 54 "), updates)
+                    self.assertEqual(received, "")
+
     def test_core_existing_service_user_outside_mnt_is_never_moved(self) -> None:
         completed, logged, received = self.run_core_script(
             '[{"id": 54, "username": "jbodmap", "home": "/nonexistent"}]',
@@ -701,6 +724,15 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         )
         self.assert_only_the_account_lookup_ran(completed, logged, received)
         self.assertIsNone(self.created_payload)
+
+    def test_core_invalid_home_field_does_not_bypass_existing_account_home_guard(self) -> None:
+        completed, logged, received = self.run_core_script(
+            '[{"id": 54, "username": "jbodmap", "home": "/nonexistent"}]',
+            service_home="/home/jbodmap",
+        )
+        self.assert_only_the_account_lookup_ran(completed, logged, received)
+        self.assertIsNone(self.created_payload)
+        self.assertIn("/nonexistent", completed.stderr)
 
     def test_core_refused_user_create_stops_before_the_key_and_grants(self) -> None:
         completed, logged, received = self.run_core_script(

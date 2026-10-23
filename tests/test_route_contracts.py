@@ -293,15 +293,31 @@ class RouteContractTests(unittest.TestCase):
                 self.assertEqual(json.loads(response.body), {"ok": False, "detail": detail})
 
     def test_system_retention_refusals_map_to_bounded_503s(self) -> None:
-        from app.services.inventory import SystemRetentionBusyError, SystemRetentionTooLargeError
+        from app.services.inventory import SystemRetentionBusyError
 
-        for error, retry_after in ((SystemRetentionBusyError(), "5"), (SystemRetentionTooLargeError(), None)):
+        for error, retry_after in ((SystemRetentionBusyError(), "5"),):
             with self.subTest(error=type(error).__name__):
                 self.assertIs(app_main.app.exception_handlers[type(error)], app_main.mapped_exception_handler)
                 response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), error))
                 self.assertEqual(response.status_code, 503)
                 self.assertEqual(response.headers.get("retry-after"), retry_after)
                 self.assertEqual(json.loads(response.body), {"ok": False, "detail": str(error)})
+
+    def test_retention_scope_too_large_has_typed_bounded_count_contract(self) -> None:
+        from app.services.inventory import SYSTEM_RETENTION_MAX_ENCLOSURES, SystemRetentionTooLargeError
+
+        self.assertIs(app_main.app.exception_handlers[SystemRetentionTooLargeError], app_main.mapped_exception_handler)
+        response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), SystemRetentionTooLargeError()))
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("retry-after", response.headers)
+        self.assertEqual(json.loads(response.body), {
+            "ok": False,
+            "error": "retention_scope_too_large",
+            "detail": "This system has too many enclosures for a system-wide disk check.",
+            # The exception does not carry the exact size, only proof it exceeds the cap.
+            "enclosure_count_minimum": SYSTEM_RETENTION_MAX_ENCLOSURES + 1,
+            "enclosure_cap": SYSTEM_RETENTION_MAX_ENCLOSURES,
+        })
 
     def test_unknown_enclosure_maps_to_404_without_a_retry_hint(self) -> None:
         response = asyncio.run(app_main.mapped_exception_handler(MagicMock(), UnknownEnclosureError()))

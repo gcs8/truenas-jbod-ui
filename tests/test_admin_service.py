@@ -1191,59 +1191,108 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertNotIn("/api/system/backup/import", paths)
 
     def test_admin_backup_export_returns_file_response_and_cleans_workspace(self) -> None:
-        workspace = Path(tempfile.mkdtemp(prefix="admin-export-response-"))
-        archive_path = workspace / "backup.zip"
-        archive_path.write_bytes(b"PK-file-backed")
-        artifact = FileBackupArtifact(
-            filename="backup.zip",
-            path=archive_path,
-            media_type="application/zip",
-            manifest={"packaging": "zip", "schema_version": 1},
-            cleanup_root=workspace,
-        )
-        maintenance = SimpleNamespace(
-            stopped_containers=[],
-            restarted_containers=[],
-            restart_failures={},
-        )
-        service = MagicMock()
-        service.export_bundle.return_value = (artifact, maintenance)
-        route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
+        def exercise(spec_version: str, outcome: str) -> None:
+            workspace = Path(tempfile.mkdtemp(prefix="admin-export-response-"))
+            archive_path = workspace / "backup.zip"
+            archive_path.write_bytes(b"PK-file-backed")
+            artifact = FileBackupArtifact(
+                filename="backup.zip",
+                path=archive_path,
+                media_type="application/zip",
+                manifest={"packaging": "zip", "schema_version": 1},
+                cleanup_root=workspace,
+            )
+            maintenance = SimpleNamespace(
+                stopped_containers=[],
+                restarted_containers=[],
+                restart_failures={},
+            )
+            service = MagicMock()
+            service.export_bundle.return_value = (artifact, maintenance)
+            route = next(route for route in admin_app.routes if route.path == "/api/admin/backup/export")
 
-        with patch("admin_service.routes.get_maintenance_service", return_value=service):
-            response = asyncio.run(
-                route.endpoint(
-                    SystemBackupExportRequest(
-                        packaging="zip",
-                        encrypt=True,
-                        passphrase="test-passphrase",
-                    ),
-                    stop_services=False,
-                    restart_services=True,
+            with patch("admin_service.routes.get_maintenance_service", return_value=service):
+                response = asyncio.run(
+                    route.endpoint(
+                        SystemBackupExportRequest(
+                            packaging="zip",
+                            encrypt=True,
+                            passphrase="test-passphrase",
+                        ),
+                        stop_services=False,
+                        restart_services=True,
+                    )
                 )
-            )
 
-        self.assertIsInstance(response, FileResponse)
-        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="backup.zip"')
-        self.assertTrue(archive_path.exists())
+            self.assertIsInstance(response, FileResponse)
+            self.assertEqual(response.headers["content-disposition"], 'attachment; filename="backup.zip"')
+            self.assertTrue(archive_path.exists())
 
-        async def disconnect_during_body() -> None:
-            async def receive() -> dict[str, object]:
-                return {"type": "http.disconnect"}
+            async def exercise_response() -> None:
+                body_started = asyncio.Event()
+                transfer_blocked = asyncio.Event()
+                receive_blocked = asyncio.Event()
+                sent: list[dict[str, Any]] = []
 
-            async def send(message: dict[str, object]) -> None:
-                if message.get("type") == "http.response.body":
-                    raise asyncio.CancelledError()
+                async def receive() -> dict[str, object]:
+                    # Keep the connection open until the response task is cancelled.
+                    # An immediate disconnect can stop an ASGI <2.4 transfer before
+                    # send() runs, and is not a request-task cancellation contract.
+                    await receive_blocked.wait()
+                    return {"type": "http.disconnect"}
 
-            await response(
-                {"type": "http", "method": "GET", "headers": []},
-                receive,
-                send,
-            )
+                async def send(message: dict[str, object]) -> None:
+                    sent.append(message)
+                    if message.get("type") == "http.response.body":
+                        body_started.set()
+                        if outcome == "cancelled":
+                            await transfer_blocked.wait()
+                        elif outcome == "send-error":
+                            raise OSError("synthetic closed connection")
 
-        with self.assertRaises(asyncio.CancelledError):
-            asyncio.run(disconnect_during_body())
-        self.assertFalse(workspace.exists())
+                response.chunk_size = 4
+                response_task = asyncio.create_task(
+                    response(
+                        {"type": "http", "method": "GET", "headers": [],
+                         "asgi": {"spec_version": spec_version}},
+                        receive,
+                        send,
+                    )
+                )
+                try:
+                    await asyncio.wait_for(body_started.wait(), timeout=5)
+                    self.assertEqual(sent[0]["type"], "http.response.start")
+                    self.assertEqual(sent[0]["status"], 200)
+                    self.assertEqual(sent[1]["body"], b"PK-f")
+                    self.assertTrue(sent[1]["more_body"])
+                    if outcome == "cancelled":
+                        self.assertTrue(archive_path.exists())
+                        response_task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await response_task
+                        self.assertTrue(response_task.cancelled())
+                    elif outcome == "send-error":
+                        with self.assertRaisesRegex(OSError, "synthetic closed connection"):
+                            await response_task
+                    else:
+                        await response_task
+                        body = [item for item in sent if item["type"] == "http.response.body"]
+                        self.assertEqual(b"".join(item["body"] for item in body), b"PK-file-backed")
+                        self.assertFalse(body[-1]["more_body"])
+                    self.assertFalse(workspace.exists())
+                    self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+                finally:
+                    if not response_task.done():
+                        response_task.cancel()
+                    await asyncio.gather(response_task, return_exceptions=True)
+
+            asyncio.run(exercise_response())
+            self.assertFalse(workspace.exists())
+
+        for spec_version in ("2.3", "2.4"):
+            for outcome in ("completed", "cancelled", "send-error"):
+                with self.subTest(spec_version=spec_version, outcome=outcome):
+                    exercise(spec_version, outcome)
 
     def test_admin_backup_import_streams_file_and_cleans_workspace(self) -> None:
         request, receive_probe = make_streaming_request([b"archive-", b"bytes"])
@@ -4218,6 +4267,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail, "Unable to inspect orphaned history; see admin logs.")
         self.assertNotIn("Traceback", str(raised.exception.detail))
         self.assertNotIn("history-secret", str(raised.exception.detail))
+        history_store.adopt_system_history.assert_not_called()
 
     def test_adopt_removed_system_history_route_rehomes_orphaned_history(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
@@ -4274,6 +4324,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
+        self.assertNotIn("warning", payload)
         self.assertEqual(payload["summary"]["total_rows"], 9)
         self.assertEqual(payload["target_system_id"], "example-qs-ha")
         self.assertEqual(payload["orphaned_systems"], [])
@@ -4282,6 +4333,73 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "example-qs-ha",
             target_system_label="ExampleQS HA",
         )
+
+    def test_adoption_rejects_invalid_sources_and_targets_without_mutation(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        settings = Settings(systems=[SystemConfig(
+            id="current-system", label="Current system",
+            truenas=TrueNASConfig(host="https://host.example.test", platform="quantastor"),
+        )])
+        for source_id, target_id in (
+            (" ", "current-system"), ("removed-system", " "),
+            ("current-system", "current-system"), ("removed-system", "unknown-system"),
+            ("not-orphaned", "current-system"),
+        ):
+            with self.subTest(source=source_id, target=target_id):
+                history_store = MagicMock()
+                history_store.list_history_system_summaries.return_value = []
+                with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+                    "admin_service.routes.get_history_store", return_value=history_store,
+                ), self.assertRaises(HTTPException) as raised:
+                    asyncio.run(route.endpoint(payload=HistoryAdoptRequest(
+                        source_system_id=source_id, target_system_id=target_id,
+                    )))
+                self.assertEqual(raised.exception.status_code, 400)
+                history_store.adopt_system_history.assert_not_called()
+
+    def test_adoption_success_survives_optional_rescan_failure(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        orphaned_route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
+        settings = Settings(systems=[SystemConfig(
+            id="current-system", label="Current system",
+            truenas=TrueNASConfig(host="https://host.example.test", platform="quantastor"),
+        )])
+        source = {"system_id": "removed-system", "total_rows": 4}
+        committed = {"total_rows": 4, "target_system_id": "current-system"}
+        remaining = [{"system_id": "other-removed-system", "total_rows": 2}]
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                history_store = MagicMock()
+                history_store.list_history_system_summaries.side_effect = [
+                    [source], error_type("synthetic private rescan detail"), remaining,
+                ]
+                history_store.adopt_system_history.return_value = committed
+
+                async def scenario():
+                    response = await route.endpoint(payload=HistoryAdoptRequest(
+                        source_system_id="removed-system", target_system_id="current-system",
+                    ))
+                    refresh = await orphaned_route.endpoint()
+                    return response, refresh
+
+                with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+                    "admin_service.routes.get_history_store", return_value=history_store,
+                ):
+                    response, refresh = asyncio.run(scenario())
+                payload = json.loads(response.body)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["summary"], committed)
+                self.assertEqual(payload["source"], source)
+                self.assertEqual(payload["target_system_id"], "current-system")
+                self.assertNotIn("orphaned_systems", payload)
+                self.assertIn("Refresh", payload["warning"])
+                self.assertNotIn("synthetic private", json.dumps(payload))
+                self.assertEqual(json.loads(refresh.body)["orphaned_systems"], remaining)
+                self.assertEqual(history_store.list_history_system_summaries.call_count, 3)
+                history_store.adopt_system_history.assert_called_once_with(
+                    "removed-system", "current-system", target_system_label="Current system",
+                )
 
     def test_adopt_removed_system_history_route_redacts_adoption_failure_detail(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
