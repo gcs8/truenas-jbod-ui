@@ -17,10 +17,33 @@ import tempfile
 import threading
 
 
+def _handle_tls_connection(connection, context, *, allow_invalid_leaf, handshakes, failures):
+    started = completed = False
+    try:
+        with connection:
+            connection.settimeout(2)
+            started = True
+            with context.wrap_socket(connection, server_side=True):
+                completed = True
+    except ssl.SSLError as error:
+        expected_alerts = {
+            'SSLV3_ALERT_CERTIFICATE_EXPIRED', 'SSLV3_ALERT_BAD_CERTIFICATE',
+            'SSLV3_ALERT_CERTIFICATE_UNKNOWN',
+        }
+        if not (started and not completed and allow_invalid_leaf
+                and getattr(error, 'reason', None) in expected_alerts):
+            failures.append(type(error).__name__)
+    except Exception as error:
+        failures.append(type(error).__name__)
+    else:
+        handshakes.append(True)
+
+
 @contextmanager
-def tls_endpoint(certificate: Path, key: Path):
+def tls_endpoint(certificate: Path, key: Path, *, allow_invalid_leaf: bool = False):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.num_tickets = 0
     context.load_cert_chain(certificate, key)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(('127.0.0.1', 0))
@@ -45,19 +68,10 @@ def tls_endpoint(certificate: Path, key: Path):
                 connection.close()
                 failures.append('non_loopback_peer')
                 continue
-            with connection:
-                connection.settimeout(2)
-                try:
-                    with context.wrap_socket(connection, server_side=True) as stream:
-                        handshakes.append(True)
-                        stream.recv(1)
-                except ssl.SSLError:
-                    # The client's genuine invalid-leaf verification can abort.
-                    continue
-                except (ConnectionError, socket.timeout):
-                    continue
-                except Exception as error:
-                    failures.append(type(error).__name__)
+            _handle_tls_connection(
+                connection, context, allow_invalid_leaf=allow_invalid_leaf,
+                handshakes=handshakes, failures=failures,
+            )
 
     thread = threading.Thread(target=serve, name='synthetic-loopback-tls')
     thread.start()
@@ -147,7 +161,7 @@ def main() -> int:
             config.write_text('systems: []\n', encoding='utf-8')
             cert, key = make_certificate(case, window)
             service = service_module.TLSTrustStoreService(str(config))
-            with tls_endpoint(cert, key) as (url, handshakes):
+            with tls_endpoint(cert, key, allow_invalid_leaf=window != 'valid') as (url, handshakes):
                 inspection = service.inspect_remote_certificate(
                     url, timeout_seconds=3, tls_server_name='localhost',
                 )

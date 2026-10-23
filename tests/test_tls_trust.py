@@ -590,3 +590,66 @@ class TLSContextTests(unittest.TestCase):
         self.assertIs(returned, urlopen_mock.return_value)
         urlopen_mock.assert_called_once_with(request, timeout=5, context=context)
         build_opener_mock.assert_not_called()
+
+
+class LoopbackQualificationServerTests(unittest.TestCase):
+    """Control-only faults, without opening a socket or generating a certificate."""
+
+    def _run_connection(self, *, allowed=False, handshake_error=None, close_error=None):
+        from scripts.run_tls_loopback_qualification import _handle_tls_connection
+
+        connection = MagicMock()
+        context = MagicMock()
+        stream = context.wrap_socket.return_value
+        stream.__enter__.return_value = stream
+        stream.__exit__.return_value = False
+        if handshake_error is not None:
+            context.wrap_socket.side_effect = handshake_error
+        if close_error is not None:
+            stream.__exit__.side_effect = close_error
+        handshakes, failures = [], []
+        _handle_tls_connection(connection, context, allow_invalid_leaf=allowed,
+                               handshakes=handshakes, failures=failures)
+        return handshakes, failures, stream
+
+    @staticmethod
+    def _ssl_error(reason):
+        error = ssl.SSLError(1, 'synthetic server fault')
+        error.reason = reason
+        return error
+
+    def test_valid_control_needs_no_application_receive(self):
+        handshakes, failures, stream = self._run_connection()
+        self.assertEqual(handshakes, [True])
+        self.assertEqual(failures, [])
+        stream.recv.assert_not_called()
+
+    def test_expected_invalid_leaf_alert_is_tolerated_only_in_negative_cases(self):
+        for reason in ('SSLV3_ALERT_CERTIFICATE_EXPIRED', 'SSLV3_ALERT_BAD_CERTIFICATE',
+                       'SSLV3_ALERT_CERTIFICATE_UNKNOWN'):
+            with self.subTest(reason=reason):
+                handshakes, failures, _ = self._run_connection(
+                    allowed=True, handshake_error=self._ssl_error(reason))
+                self.assertEqual(handshakes, [])
+                self.assertEqual(failures, [])
+                _, failures, _ = self._run_connection(
+                    allowed=False, handshake_error=self._ssl_error(reason))
+                self.assertTrue(failures)
+
+    def test_unexpected_handshake_ssl_connection_and_timeout_fail(self):
+        for error in (self._ssl_error('INTERNAL_ERROR'), ConnectionResetError('synthetic'),
+                      TimeoutError('synthetic')):
+            with self.subTest(error=type(error).__name__):
+                handshakes, failures, _ = self._run_connection(
+                    allowed=True, handshake_error=error)
+                self.assertEqual(handshakes, [])
+                self.assertTrue(failures)
+
+    def test_post_handshake_close_fault_never_receives_invalid_leaf_exemption(self):
+        for allowed in (False, True):
+            with self.subTest(allowed=allowed):
+                handshakes, failures, _ = self._run_connection(
+                    allowed=allowed,
+                    close_error=self._ssl_error('SSLV3_ALERT_CERTIFICATE_EXPIRED'))
+                self.assertEqual(handshakes, [])
+                self.assertTrue(failures)
