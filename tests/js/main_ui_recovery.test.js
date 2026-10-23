@@ -75,6 +75,18 @@ function loadFunctions(names, context = {}) {
   return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
 }
 
+// Negative HTML assertions for test payloads. These are test checks, not a
+// shipping sanitizer: a plain case-folded substring search covers every case
+// variant of a tag name, where a case-sensitive regex would not.
+function assertNoRawTags(html, ...tagNames) {
+  const lowered = String(html).toLowerCase();
+  for (const tagName of tagNames) {
+    for (const opener of [`<${tagName}`, `</${tagName}`]) {
+      assert.equal(lowered.includes(opener), false, `raw ${opener} must not appear in rendered HTML`);
+    }
+  }
+}
+
 test("SAS disk port rows distinguish zero, missing and saturated counters", () => {
   const { renderSasPortCounters } = loadFunctions([
     "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
@@ -122,9 +134,13 @@ test("SAS counters reject malformed values and escape reported metadata", () => 
   }
   const html = renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports: [
     { port: 1, phy: 0, attached_reason: "<img src=x>", attached_type: "<script>" },
+    { port: 2, phy: 0, attached_reason: "<IMG SRC=x>", attached_type: "<SCRIPT>", negotiated_link_rate: "</ScRiPt >" },
   ] } });
-  assert.doesNotMatch(html, /<img|<script>/);
-  assert.match(html, /&lt;img/);
+  assertNoRawTags(html, "img", "script");
+  assert.ok(html.includes("&lt;img src=x&gt;"), "lowercase payload is escaped");
+  assert.ok(html.includes("&lt;IMG SRC=x&gt;"), "uppercase payload is escaped");
+  assert.ok(html.includes("&lt;SCRIPT&gt;"), "uppercase tag is escaped");
+  assert.ok(html.includes("&lt;/ScRiPt &gt;"), "mixed-case closing tag is escaped");
 });
 
 test("both live and saved disk details render SAS port counters", () => {
@@ -181,10 +197,15 @@ test("SATA PHY rows escape metadata and reject invalid numeric representations",
   assert.equal(formatSataPhyCounter({ size: 3, value: "0" }), "not reported");
   const html = renderSataPhyEvents({ data: { transport_protocol: "ATA", sata_phy_events: [
     { id: 2, size: 2, value: "3", name: "<img src=x>" },
+    { id: 3, size: 2, value: "5", name: "<IMG SRC=x><SCRIPT>" },
     { id: "<script>", size: 2, value: "4", name: "bad identity" },
+    { id: "<SCRIPT>", size: 2, value: "4", name: "BAD IDENTITY" },
   ] } });
-  assert.match(html, /&lt;img/);
-  assert.doesNotMatch(html, /<img|<script>|bad identity/);
+  assert.ok(html.includes("&lt;img src=x&gt;"), "lowercase payload is escaped");
+  assert.ok(html.includes("&lt;IMG SRC=x&gt;&lt;SCRIPT&gt;"), "uppercase payload is escaped");
+  assertNoRawTags(html, "img", "script");
+  assert.equal(html.includes("bad identity"), false, "a row without integer identity is not rendered");
+  assert.equal(html.includes("BAD IDENTITY"), false, "a row without integer identity is not rendered");
 });
 
 test("both live and saved disk details render SATA event equivalents", () => {

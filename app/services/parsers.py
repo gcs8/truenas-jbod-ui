@@ -3469,91 +3469,185 @@ def _extract_smartctl_sas_phy(
     )
 
 
+# Retention caps for the optional per-disk counter collections. SMART output
+# is already bounded at 4 MiB per command, but that still admits tens of
+# thousands of rows per disk, retained for every disk in the SMART cache. The
+# caps are internal and provisional:
+# - SAS: a disk target port is narrow (one PHY) and disks expose at most two
+#   ports, so 32 distinct (port, PHY) identities is well above any real disk
+#   port log while keeping 128 disks' retained rows small.
+# - SATA: GP log 0x11 is one 512-byte page and smartctl reads one page; each
+#   counter needs at least 4 bytes after the 4-byte header, so a device can
+#   report at most 126 distinct identifiers. 128 covers the whole page.
+# Exceeding a cap refuses that optional collection (None) rather than showing
+# a prefix that looks complete; health/temperature/identity are unaffected.
+SMART_SAS_PORT_ROW_CAP = 32
+SMART_SATA_PHY_EVENT_CAP = 128
+
+_SMART_ROW_CONFLICT = object()
+_SMART_ROW_MISSING = object()
+
+
+class _BoundedIdentityRows:
+    """Retain at most ``cap`` distinct identities in first-reported order.
+
+    Admission happens before any row list exists, so repeated input never
+    allocates one retained row per repeat. An identical repeat of an identity
+    collapses to one row. A repeat with different content makes that identity
+    unreported, because the log cannot say which value is true. More than
+    ``cap`` distinct identities refuses the whole collection.
+    """
+
+    __slots__ = ("_cap", "_rows", "_overflowed")
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._rows: dict[Any, Any] = {}
+        self._overflowed = False
+
+    def admit(self, identity: Any, row: dict[str, Any]) -> bool:
+        """Record one reported row; False once the identity cap is exceeded."""
+        if self._overflowed:
+            return False
+        existing = self._rows.get(identity, _SMART_ROW_MISSING)
+        if existing is _SMART_ROW_MISSING:
+            if len(self._rows) >= self._cap:
+                self._overflowed = True
+                return False
+            self._rows[identity] = row
+        elif existing is not _SMART_ROW_CONFLICT and existing != row:
+            self._rows[identity] = _SMART_ROW_CONFLICT
+        return True
+
+    def rows(self) -> list[dict[str, Any]] | None:
+        if self._overflowed:
+            return None
+        retained = [row for row in self._rows.values() if row is not _SMART_ROW_CONFLICT]
+        return retained or None
+
+
+def _sas_port_row(port: int, phy_id: int, phy: dict[str, Any]) -> dict[str, Any]:
+    # Optional metadata is reported text, never coerced from malformed JSON
+    # values. Keep this admission local to the port-row readers.
+    row = {
+        "port": port,
+        "phy": phy_id,
+        "attached_type": normalize_text(phy.get("attached_device_type")) if isinstance(phy.get("attached_device_type"), str) else None,
+        "attached_reason": normalize_text(phy.get("attached_reason")) if isinstance(phy.get("attached_reason"), str) else None,
+        "sas_address": format_hex_identifier(phy.get("sas_address")) if isinstance(phy.get("sas_address"), str) else None,
+        "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")) if isinstance(phy.get("attached_sas_address"), str) else None,
+        "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")) if isinstance(phy.get("negotiated_logical_link_rate"), str) else None,
+    }
+    for counter in (
+        "invalid_dword_count", "running_disparity_error_count",
+        "loss_of_dword_synchronization_count", "phy_reset_problem_count",
+    ):
+        count = phy.get(counter)
+        # Missing/invalid values are not measured zeros. FFFFFFFF is a valid
+        # saturated total; never wrap, sum, reset or infer it.
+        row[counter] = count if type(count) is int and 0 <= count <= 0xFFFFFFFF else None
+    return row
+
+
 def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Retain per-disk PHY totals only from already-collected port-log JSON."""
-    rows: list[dict[str, Any]] = []
+    """Retain per-disk PHY totals only from already-collected port-log JSON.
+
+    smartctl numbers ``scsi_sas_port_N`` and ``phy_N`` by output position. The
+    reported identity is the embedded ``relative_target_port_id`` (16-bit) and
+    ``phy_identifier`` (8-bit); a block whose identity is missing, a bool, out
+    of range or otherwise malformed is unknown and is not admitted.
+    """
+    rows = _BoundedIdentityRows(SMART_SAS_PORT_ROW_CAP)
     for key, value in payload.items():
-        port_match = re.fullmatch(r"scsi_sas_port_([0-9]{1,5})", key)
-        if port_match is None or not isinstance(value, dict):
+        if not isinstance(key, str) or re.fullmatch(r"scsi_sas_port_[0-9]+", key) is None or not isinstance(value, dict):
             continue
-        port = int(port_match.group(1))
-        if port > 65535:
+        port = value.get("relative_target_port_id")
+        if type(port) is not int or not 0 <= port <= 65535:
             continue
         for subkey, phy in value.items():
-            phy_match = re.fullmatch(r"phy_([0-9]{1,3})", subkey)
-            if phy_match is None or not isinstance(phy, dict):
+            if not isinstance(subkey, str) or re.fullmatch(r"phy_[0-9]+", subkey) is None or not isinstance(phy, dict):
                 continue
-            phy_id = int(phy_match.group(1))
-            if phy_id > 255:
+            phy_id = phy.get("phy_identifier")
+            if type(phy_id) is not int or not 0 <= phy_id <= 255:
                 continue
-            # Optional metadata is reported text, never coerced from malformed
-            # JSON values. Keep this admission local to the new port reader.
-            row = {
-                "port": port,
-                "phy": phy_id,
-                "attached_type": normalize_text(phy.get("attached_device_type")) if isinstance(phy.get("attached_device_type"), str) else None,
-                "attached_reason": normalize_text(phy.get("attached_reason")) if isinstance(phy.get("attached_reason"), str) else None,
-                "sas_address": format_hex_identifier(phy.get("sas_address")) if isinstance(phy.get("sas_address"), str) else None,
-                "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")) if isinstance(phy.get("attached_sas_address"), str) else None,
-                "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")) if isinstance(phy.get("negotiated_logical_link_rate"), str) else None,
-            }
-            for counter in (
-                "invalid_dword_count", "running_disparity_error_count",
-                "loss_of_dword_synchronization_count", "phy_reset_problem_count",
-            ):
-                count = phy.get(counter)
-                # Missing/invalid values are not measured zeros. FFFFFFFF is
-                # a valid saturated total; never wrap, sum, reset or infer it.
-                row[counter] = count if type(count) is int and 0 <= count <= 0xFFFFFFFF else None
-            rows.append(row)
-    return rows or None
+            if not rows.admit((port, phy_id), _sas_port_row(port, phy_id, phy)):
+                return None
+    return rows.rows()
+
+
+# smartmontools scsiprint.cpp show_sas_port_param labels. RELEASE_7_3 added a
+# "count" suffix to two counter labels; both exact generations are accepted.
+_SAS_PORT_TEXT_LABELS = {
+    "attached device type:": "attached_device_type",
+    "attached reason:": "attached_reason",
+    "negotiated logical link rate:": "negotiated_logical_link_rate",
+    "SAS address =": "sas_address",
+    "attached SAS address =": "attached_sas_address",
+    "Invalid DWORD count =": "invalid_dword_count",
+    "Running disparity error count =": "running_disparity_error_count",
+    "Loss of DWORD synchronization count =": "loss_of_dword_synchronization_count",
+    "Phy reset problem count =": "phy_reset_problem_count",
+    "Loss of DWORD synchronization =": "loss_of_dword_synchronization_count",
+    "Phy reset problem =": "phy_reset_problem_count",
+}
 
 
 def _extract_smartctl_sas_ports_text(output: str) -> list[dict[str, Any]] | None:
-    """smartmontools RELEASE_7_2 scsiprint.cpp show_sas_port_param labels."""
-    payload: dict[str, Any] = {}
+    """Parse the SAS SSP port log text with the same identity and bounds as JSON.
+
+    Identity comes from the ``relative target port id`` and ``phy identifier``
+    lines. Each PHY block is admitted when the next header or the section end
+    arrives, so the scan never holds more than one in-progress PHY.
+    """
+    rows = _BoundedIdentityRows(SMART_SAS_PORT_ROW_CAP)
     active = False
-    port_block: dict[str, Any] | None = None
-    phy: dict[str, Any] | None = None
-    labels = {
-        "attached device type:": "attached_device_type",
-        "attached reason:": "attached_reason",
-        "negotiated logical link rate:": "negotiated_logical_link_rate",
-        "SAS address =": "sas_address",
-        "attached SAS address =": "attached_sas_address",
-        "Invalid DWORD count =": "invalid_dword_count",
-        "Running disparity error count =": "running_disparity_error_count",
-        "Loss of DWORD synchronization =": "loss_of_dword_synchronization_count",
-        "Phy reset problem =": "phy_reset_problem_count",
-    }
+    port: int | None = None
+    phy_id: int | None = None
+    fields: dict[str, Any] = {}
+
+    def flush() -> bool:
+        nonlocal phy_id, fields
+        admitted = True
+        if port is not None and phy_id is not None:
+            admitted = rows.admit((port, phy_id), _sas_port_row(port, phy_id, fields))
+        phy_id, fields = None, {}
+        return admitted
+
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if line == "Protocol Specific port log page for SAS SSP":
-            active, port_block, phy = True, None, None
+            if not flush():
+                return None
+            active, port = True, None
             continue
         if not active:
             continue
         if line.startswith("relative target port id ="):
+            if not flush():
+                return None
             match = re.fullmatch(r"relative target port id =\s*([0-9]{1,5})", line)
-            port_block = phy = None
-            if match and int(match.group(1)) <= 65535:
-                port_block = payload.setdefault(f"scsi_sas_port_{int(match.group(1))}", {})
+            port = int(match.group(1)) if match and int(match.group(1)) <= 65535 else None
         elif line.startswith("phy identifier ="):
+            if not flush():
+                return None
             match = re.fullmatch(r"phy identifier =\s*([0-9]{1,3})", line)
-            phy = None
-            if match and int(match.group(1)) <= 255 and port_block is not None:
-                phy = port_block.setdefault(f"phy_{int(match.group(1))}", {})
-        elif (label := next((key for key in labels if line.startswith(key)), None)) is not None:
-            if phy is not None:
-                field = labels[label]
+            if match and int(match.group(1)) <= 255 and port is not None:
+                phy_id = int(match.group(1))
+        elif (label := next((key for key in _SAS_PORT_TEXT_LABELS if line.startswith(key)), None)) is not None:
+            if phy_id is not None:
+                field = _SAS_PORT_TEXT_LABELS[label]
                 value = line[len(label):].strip()
-                phy[field] = (
+                fields[field] = (
                     int(value) if re.fullmatch(r"[0-9]{1,10}", value) else None
                 ) if field.endswith("_count") else value
         elif not line or not raw_line[:1].isspace():
             # Do not let another log's labels leak into the last disk PHY.
-            active, port_block, phy = False, None, None
-    return _extract_smartctl_sas_ports(payload)
+            if not flush():
+                return None
+            active, port = False, None
+    if not flush():
+        return None
+    return rows.rows()
 
 
 def _sata_phy_event_row(entry: Any) -> dict[str, Any] | None:
@@ -3577,14 +3671,19 @@ def _extract_smartctl_sata_phy_events(payload: dict[str, Any]) -> list[dict[str,
     table = block.get("table") if isinstance(block, dict) else None
     if not isinstance(table, list):
         return None
-    return [row for entry in table if (row := _sata_phy_event_row(entry)) is not None] or None
+    rows = _BoundedIdentityRows(SMART_SATA_PHY_EVENT_CAP)
+    for entry in table:
+        row = _sata_phy_event_row(entry)
+        if row is not None and not rows.admit(row["id"], row):
+            return None
+    return rows.rows()
 
 
 def _extract_smartctl_sata_phy_text(output: str) -> list[dict[str, Any]] | None:
     """Parse only the documented GP log 0x11 table, never other ATA tables."""
     active = False
     table_started = False
-    rows: list[dict[str, Any]] = []
+    rows = _BoundedIdentityRows(SMART_SATA_PHY_EVENT_CAP)
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if line == "SATA Phy Event Counters (GP Log 0x11)":
@@ -3609,9 +3708,9 @@ def _extract_smartctl_sata_phy_text(output: str) -> list[dict[str, Any]] | None:
         row = _sata_phy_event_row({
             "id": int(match.group(1), 16), "size": size, "value": value, "name": match.group(4),
         })
-        if row is not None:
-            rows.append(row)
-    return rows or None
+        if row is not None and not rows.admit(row["id"], row):
+            return None
+    return rows.rows()
 
 
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
