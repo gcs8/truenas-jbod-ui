@@ -216,6 +216,75 @@ class RouteContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"caller-controlled-value", body)
 
+    def test_partial_locate_http_result_uses_real_aggregation_and_refreshes_once(self) -> None:
+        for action in ("IDENTIFY", "CLEAR"):
+            for same_host, failure in ((True, "action"), (False, "action"), (False, "preflight")):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, failure=failure, reverse=reverse):
+                        status, payload, service = self.locate_http_result(
+                            action=action, same_host=same_host, failure=failure, reverse=reverse,
+                        )
+                        self.assertEqual(status, 200, payload)
+                        self.assertTrue(payload["ok"])
+                        self.assertTrue(payload["partial"])
+                        self.assertFalse(payload["confirmed"])
+                        self.assertIs(payload["identify_active"], True if action == "IDENTIFY" else None)
+                        self.assertEqual(len(payload["paths"]), 2)
+                        self.assertEqual(len(payload["failures"]), 1)
+                        self.assertLessEqual(len(payload["failures"][0]), 240)
+                        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+                        service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+
+    def test_moved_locate_http_result_preserves_refusal_and_exceptional_refresh(self) -> None:
+        status, payload, service = self.locate_http_result(failure="moved")
+        self.assertEqual(status, 400)
+        self.assertIn("switched through one enclosure path", payload["detail"])
+        self.assertNotIn(("shelf-a", 0), service._led_slot_targets)
+        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+
+    def test_total_locate_http_failure_remains_a_refusal(self) -> None:
+        for action in ("IDENTIFY", "CLEAR"):
+            for failure in ("preflight", "all_actions"):
+                with self.subTest(action=action, failure=failure):
+                    status, _payload, service = self.locate_http_result(action=action, same_host=True, failure=failure)
+                    self.assertEqual(status, 400)
+                    service.schedule_led_snapshot_refresh.assert_not_called()
+
+    def locate_http_result(self, *, action="IDENTIFY", **fixture_options):
+        from tests.test_inventory import partial_locate_fixture
+
+        service, _sent = partial_locate_fixture(self, observed=action == "IDENTIFY", **fixture_options)
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        application = app_main.create_app()
+        application.state.operator_auth_settings = SimpleNamespace(auth_mode="network", allowed_host_names=frozenset())
+        application.state.read_ui_public_origin = "http://127.0.0.1"
+        messages = []
+
+        async def invoke():
+            async def receive():
+                return {"type": "http.request", "body": json.dumps({"action": action}).encode(), "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            await application(
+                {
+                    "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                    "method": "POST", "scheme": "http", "path": "/api/slots/0/led",
+                    "raw_path": b"/api/slots/0/led",
+                    "query_string": b"system_id=synthetic-led-test&enclosure_id=shelf-a",
+                    "headers": [(b"content-type", b"application/json"), (b"host", b"127.0.0.1"), (b"origin", b"http://127.0.0.1")],
+                    "client": ("127.0.0.1", 1), "server": ("test", 80), "root_path": "",
+                }, receive, send,
+            )
+
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+            asyncio.run(invoke())
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+        return start["status"], json.loads(body), service
+
     def test_inventory_retention_scope_system_reports_system_wide_totals(self) -> None:
         from app.models.domain import InventorySnapshot, InventorySummary
         from app.services.inventory_accounting import DiskRetentionAccounting
