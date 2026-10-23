@@ -186,6 +186,17 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
             return self.snapshots[enclosure_id]
         self.service._get_opening_order_snapshot = AsyncMock(side_effect=opening_snapshot)
         self.service._get_inventory_source_bundle = AsyncMock(return_value=self.fixture._empty_source_bundle())
+        # These coordination tests supply snapshots instead of running their
+        # producer. Model the producer's exact per-snapshot source/read binding;
+        # unassociated-snapshot regressions below deliberately omit this entry.
+        import weakref
+        source = self.service._get_inventory_source_bundle.return_value
+        mappings = self.service.mapping_store.load_read_snapshot()
+        for supplied in self.snapshots.values():
+            self.service._view_order_read_inputs[id(supplied)] = (
+                weakref.ref(supplied), source, self.service._snapshot_topology_generation,
+                mappings, [], self.service._source_bundle_generation, object(),
+            )
         registry = MagicMock()
         registry.get_service.return_value = self.service
         for target, value in (
@@ -533,6 +544,51 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
             selected_enclosure_id="enc-a",
         )
         self.assertIsNotNone(retention)
+
+    async def test_single_enclosure_unassociated_snapshot_cannot_score_or_cache(self):
+        await self.exercise_missing_order_association(single_enclosure=True)
+
+    async def test_all_known_unassociated_snapshot_cannot_score_or_cache(self):
+        await self.exercise_missing_order_association(single_enclosure=False)
+
+    async def exercise_missing_order_association(self, *, single_enclosure):
+        from app.models.domain import StorageViewRuntimeView
+
+        self.use_real_snapshot_producers()
+        active = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id="enc-a")
+        source = self.service._opening_order_inputs_for(active)[0]
+        if single_enclosure:
+            active.enclosures = active.enclosures[:1]
+        view = StorageViewRuntimeView(
+            id="visible", label="Synthetic visible view", kind="manual",
+            template_id="manual", matched_count=100,
+        )
+        arguments = dict(
+            source_bundle=source, runtime_views=[view],
+            ha_primary_view_id=None, ha_owner_enclosure_id=None, force_refresh=False,
+        )
+        known = {option.id: active for option in active.enclosures}
+        # Positive control: an associated snapshot really scores the high-count
+        # view first, so fallback must not merely happen to equal scored order.
+        scored = await self.service._effective_runtime_view_order(
+            active_snapshot=active, known_snapshots=known, **arguments,
+        )
+        self.assertEqual(scored[0], "view:visible")
+        self.assertTrue(self.service._view_order_cache)
+        self.service._view_order_cache.clear()
+        legacy = active.model_copy(deep=True)
+        self.assertIsNone(self.service._opening_order_inputs_for(legacy))
+        secondary = AsyncMock(side_effect=AssertionError("unassociated snapshot entered secondary scoring"))
+        with patch.object(self.service, "_get_opening_order_snapshot", secondary):
+            fallback = await self.service._effective_runtime_view_order(
+                active_snapshot=legacy,
+                known_snapshots={option.id: legacy for option in legacy.enclosures},
+                **arguments,
+            )
+        self.assertEqual(fallback[0], "enclosure:enc-a")
+        self.assertTrue(any("current correlation inputs are unavailable" in warning for warning in legacy.warnings))
+        self.assertFalse(self.service._view_order_cache)
+        secondary.assert_not_awaited()
 
     async def test_order_refuses_invalidation_or_source_advancement_while_awaiting(self):
         self.use_real_snapshot_producers()

@@ -2582,10 +2582,10 @@ class InventoryService:
             return (topology_generation == self._snapshot_topology_generation
                     and source_generation == self._source_bundle_generation
                     and source_publication == self._source_bundle_published_sequence
-                    and (active_inputs is None or (
-                        active_inputs[0] is source_bundle
-                        and active_inputs[1] == topology_generation
-                        and active_inputs[4] == source_generation)))
+                    and active_inputs is not None
+                    and active_inputs[0] is source_bundle
+                    and active_inputs[1] == topology_generation
+                    and active_inputs[4] == source_generation)
 
         saved_order = () if ignore_saved_order else tuple(self.system.view_order)
         view_counts = [
