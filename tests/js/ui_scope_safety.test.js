@@ -360,6 +360,57 @@ test("a locate result in the same scope keeps its plain message", async () => {
   assert.equal(statuses.at(-1)[0], "Locate light on for slot 00, confirmed through synthetic enclosure.");
 });
 
+for (const action of ["IDENTIFY", "CLEAR"]) {
+  for (const changeScope of [false, true]) {
+    test(`partial ${action} locate warns without claiming every path (${changeScope ? "late" : "current"})`, async () => {
+      const pending = deferred();
+      const statuses = [];
+      const requested = action === "IDENTIFY";
+      const originSlot = {slot:0, slot_label:"00", led_supported:true, identify_active:!requested};
+      const state = {
+        snapshotMode:false,
+        snapshot:{selected_system_id:"a", selected_enclosure_id:"one", slots:[originSlot]},
+        selectedSystemId:"a", selectedEnclosureId:"one", selectedSlot:0,
+        latestRefreshToken:1, selectionEpoch:0, mappingDraftRevision:0,
+        snapshotReuseCache:{}, mutationsInFlight:{}, mutationResults:{},
+      };
+      const context = {
+        state, URLSearchParams, writeBlockedByPolicy:()=>false, getSlotById:()=>originSlot,
+        setStatus(message, tone){ statuses.push([message, tone || "info"]); },
+        sendScopedRequest:async()=>pending.promise,
+        applySnapshot(){}, renderAll(){}, locateLightSourceLabel:()=>"synthetic enclosure", handleWriteRejection(){},
+      };
+      const c = load(["cloneJsonValue", "snapshotReuseCacheKey", ...guardNames, "sendLedAction"], context);
+      const run = c.sendLedAction(action);
+      await new Promise(resolve=>setImmediate(resolve));
+      if (changeScope) {
+        state.selectedSystemId = "b";
+        state.selectedEnclosureId = "two";
+        state.selectionEpoch++;
+        state.snapshot = {selected_system_id:"b", selected_enclosure_id:"two", slots:[{slot:0, identify_active:false}]};
+      }
+      pending.resolve({
+        ok:true, system_id:"a", enclosure_id:"one", slot:0, requested_active:requested,
+        identify_active:requested ? true : null, confirmed:false, partial:true,
+        failures:["synthetic failure ".repeat(1000)],
+      });
+      await run;
+      const [message, tone] = statuses.at(-1);
+      assert.equal(tone, "warning");
+      assert.match(message, /another path failed/);
+      assert.match(message, /Not all paths are confirmed/);
+      assert.doesNotMatch(message, /synthetic failure|confirmed through synthetic enclosure/);
+      assert.ok(message.length < 250);
+      if (changeScope) {
+        assert.match(message, /^a \/ one: /);
+        assert.equal(state.snapshot.slots[0].identify_active, false, "another shelf must not be patched");
+      } else {
+        assert.equal(state.snapshot.slots[0].identify_active, true, "an unknown clear must not patch off");
+      }
+    });
+  }
+}
+
 test("locate completion patches the newest snapshot after a same-scope refresh", async () => {
   const pending = deferred();
   const originSlot = {slot:0, slot_label:"00", led_supported:true, identify_active:false};

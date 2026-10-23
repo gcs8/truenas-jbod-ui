@@ -479,6 +479,34 @@ class CIWorkflowContractTests(unittest.TestCase):
             upload["with"]["path"], "${{ env.CANDIDATE_DIR }}"
         )
 
+    def test_screenshot_capture_doc_matches_the_complete_workflow_image_pin(self) -> None:
+        workflow = yaml.safe_load(self.read(CAPTURE_SCREENSHOTS_WORKFLOW))
+        job = workflow["jobs"]["capture"]
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+
+        def assert_pin(text: str) -> None:
+            match = re.search(r"^\| Container image \| `([^`]+)` \|$", text, re.MULTILINE)
+            self.assertIsNotNone(match)
+            self.assertEqual(match.group(1), job["container"]["image"])
+            self.assertIn(
+                f'https://mcr.microsoft.com/v2/playwright/manifests/'
+                f'v{job["env"]["PLAYWRIGHT_VERSION"]}-jammy', text,
+            )
+
+        assert_pin(docs)
+        image = job["container"]["image"]
+        tag = job["env"]["CONTAINER_TAG"]
+        for wrong_image in (tag, f'{tag}@sha256:{"0" * 64}'):
+            with self.subTest(image=wrong_image), self.assertRaises(AssertionError):
+                assert_pin(docs.replace(image, wrong_image))
+
+    def test_screenshot_capture_doc_preserves_stable_only_and_pending_qualification(self) -> None:
+        docs = self.read(ROOT / "docs" / "SCREENSHOT_CAPTURE.md")
+        self.assertIn("Ordinary pull requests and prereleases do not regenerate", docs)
+        self.assertIn("only for an approved stable release", docs)
+        self.assertIn("has not yet been runtime-qualified", docs)
+        self.assertIn("does not qualify this image", docs)
+
     def test_release_checklist_uses_and_reviews_the_dispatch_capture_artifact(self) -> None:
         checklist = self.read(RELEASE_CHECKLIST)
         screenshot_section = checklist.split("## Screenshots", 1)[1].split("\n## ", 1)[0]
