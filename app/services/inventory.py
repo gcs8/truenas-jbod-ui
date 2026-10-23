@@ -15956,7 +15956,31 @@ class InventoryService:
             member = ssh_data.zpool_device_members.get(key)
             if member:
                 return replace(member, raw_name="", raw_path=None)
-        return None
+        if disk is not None or self.system.truenas.platform != "core":
+            return None
+
+        # An SSH-only SES consumer may have its GPT label on the owning geom.
+        # Require that exact consumer's unique owner, never a camcontrol peer.
+        consumer = normalize_device_name(device_name)
+        info = self._index_multipath_consumers(ssh_data).get((consumer or "").lower())
+        if info is None:
+            return None
+        provider = normalize_device_name(info.device_name)
+        derived_keys = normalize_lookup_keys(info.device_name)
+        derived_keys.update(normalize_lookup_keys(ssh_data.glabel.device_to_gptid.get((provider or "").lower())))
+        inferred_member = None
+        for key in sorted(derived_keys):
+            for members in (ssh_data.zpool_members, api_topology_members, ssh_data.zpool_device_members):
+                member = members.get(key)
+                if member is None:
+                    continue
+                # Provider/GPTID aliases must agree on all membership metadata.
+                # Neither inferred raw path is a persistent disk identity.
+                member = replace(member, raw_name="", raw_path=None)
+                if inferred_member is not None and member != inferred_member:
+                    return None
+                inferred_member = member
+        return inferred_member
 
     def _disk_sas_alias_tiers(self, disk: DiskRecord) -> tuple[set[str], set[str]]:
         sources: list[str | None] = [disk.lunid]
