@@ -393,6 +393,33 @@ sys.argv = sys.argv[:3]
         image = "sha256:" + "a" * 64
         ports = module.Ports(19080, 19081, 19082)
 
+        self.assertEqual(
+            {variant.name for variant in module.VARIANTS if variant.journal_read},
+            {"ui-only", "ui-nonroot"},
+        )
+        for variant in (*module.VARIANTS, None):
+            name = variant.name if variant else "default"
+            with self.subTest(variant=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                module._write_environment(root, image, ports, variant=variant)
+                lines = (root / ".env").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    [line for line in lines if line.startswith((
+                        "SCHEDULED_BACKUP_ENABLED=", "BACKUP_FULL_ENABLED=", "BACKUP_TARGETS_JSON=",
+                    ))],
+                    ["SCHEDULED_BACKUP_ENABLED=false", "BACKUP_FULL_ENABLED=false", "BACKUP_TARGETS_JSON=[]"],
+                )
+                if variant is not None and name in {"ui-only", "ui-nonroot"}:
+                    self.assertFalse(variant.scheduler_enabled)
+                    self.assertFalse(variant.scheduler_policy_enabled)
+                    self.assertEqual(variant.services, ("enclosure-ui",))
+                    self.assertFalse(any(line.startswith("BACKUP_ARCHIVE_PASSPHRASE_FILE=") for line in lines))
+                expected = "true" if name in {"scheduler-enabled", "ui-only", "ui-nonroot"} else "false"
+                self.assertEqual(
+                    [line for line in lines if line.startswith("BACKUP_CONFIG_ENABLED=")],
+                    [f"BACKUP_CONFIG_ENABLED={expected}"],
+                )
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             module._write_environment(

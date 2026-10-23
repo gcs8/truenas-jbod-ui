@@ -378,6 +378,7 @@ def _write_environment(
     variant: Variant | None = None,
 ) -> None:
     scheduler_policy_enabled = bool(variant and variant.scheduler_policy_enabled)
+    config_backups_enabled = scheduler_policy_enabled or bool(variant and variant.journal_read)
     values = [
         f"JBOD_UI_IMAGE={image}",
         f"APP_UID={APP_UID}",
@@ -402,7 +403,7 @@ def _write_environment(
         f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
         "METRICS_ENABLED=true",
         "SCHEDULED_BACKUP_ENABLED=false",
-        f"BACKUP_CONFIG_ENABLED={'true' if scheduler_policy_enabled else 'false'}",
+        f"BACKUP_CONFIG_ENABLED={'true' if config_backups_enabled else 'false'}",
         "BACKUP_FULL_ENABLED=false",
         # Replace any backups.targets from the config fixture: the matrix must
         # never ship to, or run retention against, real remote storage.
