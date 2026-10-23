@@ -101,6 +101,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   system saved with one keeps it, the drive list heading matches its drives,
   and NVMe drives no longer start with "UNKNOWN" (#966).
 
+### Internal
+
+- Added an inactive all-writer orchestration prototype with synthetic process
+  tests; the ownership helper's stop-every-writer precondition remained
+  unchanged, with no live backend or activation (#1014).
+
 ## v0.24.0-beta.3 - 2026-10-11
 
 This prerelease adds the fixes merged after `v0.24.0-beta.2`. GHCR gets the
