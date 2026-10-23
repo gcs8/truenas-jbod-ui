@@ -92,6 +92,28 @@ def _index(rows: list[dict[str, Any]], kind: str) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _validate_expander_raw(raw: dict[str, Any]) -> None:
+    # The domain intentionally leaves raw extensible. Validate only fields this
+    # composer interprets, before using them in hashing or PHY comparisons.
+    for field in ("controller_id", "sas_address", "dev_handle"):
+        if raw.get(field) is not None and not isinstance(raw[field], str):
+            raise ValueError("malformed expander identity evidence")
+    phys = raw.get("phys")
+    if phys is None:
+        return
+    if not isinstance(phys, list):
+        raise ValueError("malformed expander PHY evidence")
+    for phy in phys:
+        if not isinstance(phy, dict):
+            raise ValueError("malformed expander PHY row")
+        for field in ("dev_handle", "device"):
+            if phy.get(field) is not None and not isinstance(phy[field], str):
+                raise ValueError("malformed expander PHY text")
+        for field in ("phy", "remote_phy"):
+            if phy.get(field) is not None and type(phy[field]) not in (str, int):
+                raise ValueError("malformed expander PHY number")
+
+
 def _prepare(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     prepared = []
     scopes = set()
@@ -114,6 +136,8 @@ def _prepare(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
         links = _index(payload.get("links", []), "link")
         traces = _index(payload.get("traces", []), "trace")
         for node in nodes.values():
+            if node["kind"] == "expander":
+                _validate_expander_raw(node.get("raw", {}))
             controller = node.get("controller_id")
             if controller is not None and (controller not in nodes or nodes[controller]["kind"] != "controller"):
                 raise ValueError("dangling controller reference")
@@ -281,7 +305,9 @@ def _compose_system(system: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             entry["observations"].append({"enclosure_id": enclosure, "payload": node})
         for original, link in sorted(row["links"].items()):
             source, target = node_map[link["source"]], node_map[link["target"]]
-            key = _id("link", system, source, target, link["kind"])
+            # Endpoint equality does not prove that two distinct supplied
+            # edges/ports are one edge. Share only the same supplied link ID.
+            key = _id("link", system, source, target, link["kind"], original)
             link_map[original] = key
             entry = links.setdefault(key, {"id": key, "source": source, "target": target, "kind": link["kind"], "observations": []})
             entry["observations"].append({"enclosure_id": enclosure, "payload": link})

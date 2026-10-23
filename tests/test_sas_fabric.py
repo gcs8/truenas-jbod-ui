@@ -4127,6 +4127,53 @@ class SystemSasFabricDraftTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(self.compose(list(reversed(payloads))), result)
 
+    def test_distinct_supplied_parallel_edges_and_trace_membership_are_preserved(self):
+        from app.models.domain import SasFabricLink, SasFabricNode, SasFabricSnapshot, SasFabricTrace
+
+        payload = SasFabricSnapshot(
+            system_id="synthetic-system", selected_enclosure_id="synthetic-head",
+            nodes=[SasFabricNode(id="h", kind="host", label="Synthetic"),
+                   SasFabricNode(id="c", kind="controller", label="Synthetic controller")],
+            links=[SasFabricLink(id=f"l{slot}", source="h", target="c", kind="host-controller", related_slots=[slot])
+                   for slot in (0, 1)],
+            traces=[SasFabricTrace(id=f"t{slot}", kind="path", label="Synthetic path", link_ids=[f"l{slot}"], slots=[slot])
+                    for slot in (0, 1)],
+        ).model_dump(mode="json")
+        graph = self.compose([payload])["systems"][0]
+        self.assertEqual(len(graph["links"]), 2)
+        traces = graph["enclosures"][0]["traces"]
+        self.assertNotEqual(traces[0]["link_ids"], traces[1]["link_ids"])
+        by_id = {link["id"]: link for link in graph["links"]}
+        for trace in traces:
+            link = by_id[trace["link_ids"][0]]
+            self.assertEqual(link["observations"][0]["payload"]["related_slots"], trace["observation"]["slots"])
+
+    def test_malformed_interpreted_raw_fields_refuse_with_value_error(self):
+        import os
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        command = [sys.executable, str(root / "scripts" / "preview_system_sas_fabric.py"),
+                   "--max-input-bytes", str(4 * 1024 * 1024), "--max-depth", "40"]
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        for field, value in (("dev_handle", []), ("dev_handle", {}), ("controller_id", []),
+                             ("sas_address", {}), ("phys", {}), ("device", []), ("device", {})):
+            payload = self.cascade_payload()
+            peer = [n for n in payload["nodes"] if n["kind"] == "expander"][1]
+            if field == "device":
+                peer["raw"]["phys"][0][field] = value
+            else:
+                peer["raw"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    self.compose([payload])
+                child = subprocess.run(command, input=json.dumps([payload]), text=True, capture_output=True,
+                                       cwd=root, env=environment, timeout=10)
+                self.assertEqual(child.returncode, 2)
+                self.assertEqual(child.stdout, "")
+                self.assertNotIn("Traceback", child.stderr)
+
     def test_preview_cli_reads_stdin_and_file_and_refuses_bad_input(self):
         import os
         import subprocess
