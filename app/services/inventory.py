@@ -14663,7 +14663,10 @@ class InventoryService:
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
-            if zpool := self._lookup_zpool_member(None, peer, peer_gptid, ssh_data, api_topology_members):
+            # A bay peer may supply direct membership, not SSH-only geom inference.
+            if zpool := self._lookup_zpool_member(
+                None, peer, peer_gptid, ssh_data, api_topology_members, allow_geom_inference=False,
+            ):
                 gptid = gptid or peer_gptid
                 break
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
@@ -15918,6 +15921,8 @@ class InventoryService:
         gptid: str | None,
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
+        *,
+        allow_geom_inference: bool = True,
     ):
         seen: set[str] = set()
         candidate_keys: list[str] = []
@@ -15956,7 +15961,7 @@ class InventoryService:
             member = ssh_data.zpool_device_members.get(key)
             if member:
                 return replace(member, raw_name="", raw_path=None)
-        if disk is not None or self.system.truenas.platform != "core":
+        if not allow_geom_inference or disk is not None or self.system.truenas.platform != "core":
             return None
 
         # An SSH-only SES consumer may have its GPT label on the owning geom.

@@ -24844,6 +24844,71 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
         )[0]
         self.assertIsNone(service._lookup_zpool_member(record, "da0", None, parsed, {}))
 
+    async def test_core_record_bay_peer_cannot_enable_geom_pool_inference(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        service = self._bare_service("core")
+        disk = service._build_disk_records([{"name": "da9"}], ParsedSSHData(), {}, {})[0]
+        self.assertEqual((disk.device_name, disk.smart_devices, disk.lookup_keys), ("da9", ["da9"], {"da9"}))
+        self.assertIsNone(disk.pool_name)
+        raw = {"device_names": ["da9", "da0"], "status": "OK"}
+        peers = inventory_module._bay_peer_devices(raw, disk, {"da9": disk})
+        self.assertEqual(peers, ["da0"])
+        for source in (None, "zpool_members", "api", "zpool_device_members"):
+            with self.subTest(source=source):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                self.assertIsNone(service._lookup_zpool_member(disk, "da9", None, parsed, {}))
+                inferred = service._lookup_zpool_member(None, "da0", None, parsed, {})
+                self.assertEqual((inferred.pool_name, inferred.vdev_name, inferred.vdev_class),
+                                 ("synthpool", "mirror-0", "data"))
+                api = {}
+                if source:
+                    direct = copy.deepcopy(inferred)
+                    direct.pool_name = "directpool"
+                    target = api if source == "api" else getattr(parsed, source)
+                    target["da0"] = direct
+                kwargs = dict(
+                    slot=0, row_index=0, column_index=0, enclosure_meta={"id": fx.FRONT_24_ID},
+                    raw_slot_status=raw, disk=disk, mapping=None, ssh_data=parsed,
+                    api_topology_members=api, api_enclosure_ids=set(),
+                )
+                baseline = service._build_slot_view(**kwargs)
+                slot = service._build_slot_view(**kwargs, bay_peer_devices=peers)
+                self.assertEqual(
+                    (slot.device_name, slot.smart_device_names, slot.serial, slot.gptid,
+                     slot.persistent_id_label, slot.multipath),
+                    (baseline.device_name, baseline.smart_device_names, baseline.serial, baseline.gptid,
+                     baseline.persistent_id_label, baseline.multipath),
+                )
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_name, slot.vdev_class),
+                    ("directpool", "mirror-0", "data") if source else (None, None, None),
+                )
+                if source is None:
+                    self.assertEqual(slot.model_dump(), baseline.model_dump())
+
+        # Also exercise the real peer selection and slot builder through a snapshot.
+        outputs = self._core_ssh_only_gptid_multipath_outputs()
+        outputs["sesutil map"] = fx.sesutil_map(
+            ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {0: "da9,da0"}),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_data = TrueNASRawData(
+                enclosures=[], disks=[{"name": "da9"}], pools=[],
+                disk_temperatures={}, smart_test_results=[],
+            )
+            service = self._core_service(temp_dir, raw_data)
+            bundle = service._get_inventory_source_bundle.return_value
+            bundle.ssh_outputs = outputs
+            bundle.ssh_collected = True
+            snapshot = await service.get_snapshot(force_refresh=True)
+        self.assertEqual(snapshot.summary.source_disk_count, 1)
+        slot = next(slot for slot in snapshot.slots if slot.device_name == "da9")
+        self.assertEqual(set(slot.raw_status["device_names"]), {"da9", "da0"})
+        self.assertEqual((slot.device_name, slot.smart_device_names), ("da9", ["da9"]))
+        self.assertEqual((slot.serial, slot.gptid, slot.persistent_id_label, slot.multipath), (None, None, None, None))
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), (None, None, None))
+
     async def test_core_page_with_the_old_combined_id_in_view_order_still_renders(self) -> None:
         from tests import core_ses_fixtures as fx
 
