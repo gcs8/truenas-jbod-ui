@@ -46,6 +46,7 @@ from app.perf import add_perf_metadata, perf_stage
 from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory import (
+    SYSTEM_RETENTION_MAX_ENCLOSURES,
     SnapshotStateBusyError,
     SystemRetentionBusyError,
     SystemRetentionTooLargeError,
@@ -155,8 +156,17 @@ async def mapped_exception_handler(
     exc: Exception,
 ) -> JSONResponse:
     spec = error_response_spec(exc)
+    payload: dict[str, object] = {"ok": False, "detail": spec.detail_for(exc)}
+    if isinstance(exc, SystemRetentionTooLargeError):
+        # This exception proves only that the cap was exceeded, not the exact
+        # option count. Publish a bounded lower bound rather than invent one.
+        payload.update(
+            error="retention_scope_too_large",
+            enclosure_count_minimum=SYSTEM_RETENTION_MAX_ENCLOSURES + 1,
+            enclosure_cap=SYSTEM_RETENTION_MAX_ENCLOSURES,
+        )
     return JSONResponse(
-        {"ok": False, "detail": spec.detail_for(exc)},
+        payload,
         status_code=spec.status_code,
         headers=spec.headers(),
     )

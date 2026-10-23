@@ -706,6 +706,23 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("oversized", EXPORT_ZIP_CACHE)
         self.assertEqual(exporter._cache_total_size_bytes(), 2)
 
+    async def test_non_identify_state_survives_plain_and_redacted_offline_export(self) -> None:
+        for base in ("unknown", "unmapped", "empty", "fault", "healthy"):
+            for redact in (False, True):
+                with self.subTest(base=base, redact=redact):
+                    snapshot = build_snapshot()
+                    snapshot.slots[0].state = SlotState.identify
+                    snapshot.slots[0].identify_active = True
+                    snapshot.slots[0].non_identify_state = base
+                    exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+                    rendered = await exporter.build_enclosure_snapshot_html(
+                        request=build_request(), snapshot=snapshot, smart_summary_cache={},
+                        selected_slot=0, history_window_hours=24, io_chart_mode="total",
+                        redact_sensitive=redact,
+                    )
+                    self.assertIn(f'"non_identify_state": "{base}"', rendered.html)
+                    self.assertEqual(snapshot.slots[0].non_identify_state, base)
+
     async def test_service_builds_self_contained_html_snapshot(self) -> None:
         snapshot = build_snapshot()
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)

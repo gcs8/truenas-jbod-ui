@@ -397,7 +397,7 @@
         "sha256:cb345dd95355b12b3628a9305b73277c0689a0b7dc4920453b607fc8ac81cda6": 2
       },
       "private_posix_host_path": {
-        "sha256:7e04fc1997830f69e825d8cb2ecf5a1101935884d78a269b5ad25e373a3582b8": 25
+        "sha256:a23444ac1bb7fc30086a4193cc20322e3b5edcd2b80ba9da04d29b472bf21046": 31
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -490,7 +490,7 @@
         "sha256:1863c834b4ee013a4376220cdf2e1057444270458b9a697fe56ad5c48d4facb8": 117
       },
       "sas_wwn_identifier": {
-        "sha256:4a0ac86ac9a07a86bb88093d9cf8a46b3969f579dfcc362d4a31a414d03bab95": 221
+        "sha256:592bf798cf1d494aceb478251706cb8fc5657b050d807d41dfc97ad7f6fcb541": 223
       }
     },
     "reason": "Synthetic or adversarial test literals; exact values and counts are pinned. Issue 926 adds six literal occurrences of one invented enclosure identifier for dual-path locate-light confirmation; no captured device identity is added."

@@ -234,6 +234,11 @@ class SlotView(BaseModel):
     enclosure_name: str | None = None
     present: bool = False
     state: SlotState = SlotState.unknown
+    # Live producers record the same state predicate before the locate mask.
+    # Older saved snapshots omit it; never treat identify itself as a base state.
+    non_identify_state: Literal["healthy", "fault", "empty", "unknown", "unmapped"] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     # "unknown" marks an occupied bay whose live observation carries none of the
     # strong disk identifiers (serial, logical_unit_id, gptid). The bay-scoped
     # sas_address and the reusable device alias cannot tell one occupant from

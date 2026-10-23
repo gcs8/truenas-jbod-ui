@@ -238,8 +238,6 @@ class ServiceAccountBootstrapService:
         if requires_sudo and payload.bootstrap_sudo_password:
             # The script travels on stdin, which a piped sudo password would share.
             raise ValueError(BOOTSTRAP_SUDO_PASSWORD_UNSUPPORTED_DETAIL)
-        # Refuse a bad CORE home before anything connects to the host.
-        self._core_service_home(payload)
         public_key, key_source = self._resolve_public_key(payload)
         ssh_config = SSHConfig(
             enabled=True,
@@ -391,7 +389,14 @@ class ServiceAccountBootstrapService:
             else ""
         )
         if payload.platform == "core":
-            service_home = self._core_service_home(payload)
+            home_error = None
+            try:
+                service_home = self._core_service_home(payload)
+            except ValueError:
+                # Existence is only known after the remote read-only lookup.
+                # Never send an invalid home; reject it only if creation is needed.
+                service_home = None
+                home_error = CORE_SERVICE_HOME_INVALID_DETAIL
             account_lines = self._core_account_lookup_script(
                 self._build_core_midclt_user_create_payload(
                     service_user, service_shell, service_home, public_key
@@ -399,6 +404,7 @@ class ServiceAccountBootstrapService:
                 if service_home
                 else None,
                 service_home,
+                home_error=home_error,
             )
         else:
             account_lines = [
@@ -498,6 +504,8 @@ class ServiceAccountBootstrapService:
         cls,
         create_payload: str | None = None,
         service_home: str | None = None,
+        *,
+        home_error: str | None = None,
     ) -> list[str]:
         """Resolve the CORE middleware account before anything on the host changes.
 
@@ -508,7 +516,12 @@ class ServiceAccountBootstrapService:
         bootstrap stops and asks for one. An existing account keeps its home.
         """
         nothing_changed = "Nothing was changed on the host."
-        if create_payload and service_home:
+        if home_error:
+            missing_lines = [
+                f"  printf '%s\\n' {shlex.quote(f'{home_error} {nothing_changed}')} >&2",
+                "  exit 1",
+            ]
+        elif create_payload and service_home:
             missing_lines = [
                 f"  create_payload={shlex.quote(create_payload)}",
                 "  if ! create_output=$(midclt call user.create \"$create_payload\" 2>&1); then",

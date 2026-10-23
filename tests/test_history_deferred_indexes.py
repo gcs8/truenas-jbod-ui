@@ -87,12 +87,12 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             activities: list[str | None] = []
             original = store.build_chronological_index
 
-            def build(name: str) -> None:
+            def build(name: str, **kwargs) -> None:
                 status = collector.status()
                 self.assertTrue(status["collection_running"])
                 self.assertEqual(status["collection_kind"], "maintenance")
                 activities.append(status["collection_activity"])
-                original(name)
+                original(name, **kwargs)
 
             with patch.object(store, "build_chronological_index", side_effect=build):
                 asyncio.run(collector._build_pending_indexes())
@@ -138,12 +138,12 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             degraded: list[str | None] = []
             original = store.build_chronological_index
 
-            def build(name: str) -> None:
+            def build(name: str, **kwargs) -> None:
                 if "failed" not in events:
                     events.append("failed")
                     raise sqlite3.OperationalError("database is locked")
                 events.append("built")
-                original(name)
+                original(name, **kwargs)
 
             def collect(**_kwargs) -> None:
                 events.append("collect")
@@ -180,13 +180,13 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
             original = store.build_chronological_index
             original_wait_for = asyncio.wait_for
 
-            def build(name: str) -> None:
+            def build(name: str, **kwargs) -> None:
                 if events.count("failed") < failures_before_success:
                     events.append("failed")
                     reasons.append(None)
                     raise sqlite3.OperationalError("disk I/O")
                 events.append("built")
-                original(name)
+                original(name, **kwargs)
 
             def collect(**_kwargs) -> None:
                 events.append("collect")
@@ -282,6 +282,206 @@ class DeferredChronologicalIndexTests(unittest.TestCase):
                 self.assertTrue(asyncio.run(collector._build_pending_indexes()))
 
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+
+    def test_stop_interrupts_native_index_and_restart_keeps_completed_indexes(self) -> None:
+        self._exercise_index_shutdown(cancel_task=False)
+
+    def test_stop_drains_index_worker_after_outer_task_cancellation(self) -> None:
+        self._exercise_index_shutdown(cancel_task=True)
+
+    def _exercise_index_shutdown(self, *, cancel_task: bool) -> None:
+        import threading
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=4_000)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            closed = threading.Event()
+            target = CHRONOLOGICAL_INDEXES[1][0]
+            native_connect = sqlite3.connect
+
+            class GatedConnection(sqlite3.Connection):
+                cancellation_check = None
+
+                def set_progress_handler(self, progress_handler, n):
+                    self.cancellation_check = progress_handler
+                    return super().set_progress_handler(progress_handler, n)
+
+                def execute(self, sql, *args, **kwargs):
+                    if sql == dict(CHRONOLOGICAL_INDEXES)[target]:
+                        self.target_build = True
+                        def progress():
+                            if not entered.is_set():
+                                entered.set()
+                                if not release.wait(5):
+                                    raise AssertionError("test did not release native progress callback")
+                            return self.cancellation_check() if self.cancellation_check else 0
+
+                        super().set_progress_handler(progress, 1)
+                    return super().execute(sql, *args, **kwargs)
+
+                def close(self):
+                    super().close()
+                    if getattr(self, "target_build", False):
+                        closed.set()
+
+            def connect(*args, **kwargs):
+                return native_connect(*args, **kwargs, factory=GatedConnection)
+
+            async def exercise():
+                await collector.start()
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                    self.assertTrue(collector.collection_running)
+                    if cancel_task:
+                        assert collector._task is not None
+                        collector._task.cancel()
+                        await asyncio.sleep(0)
+                    stopping = asyncio.create_task(collector.stop())
+                    await asyncio.sleep(0)
+                    self.assertFalse(stopping.done())
+                    release.set()
+                    await asyncio.wait_for(stopping, 2)
+                    # Assert owned-resource settlement before fixture cleanup.
+                    self.assertTrue(closed.is_set())
+                    self.assertFalse(collector.collection_running)
+                    self.assertIsNone(collector._task)
+                    self.assertIsNone(collector.current_collection_activity)
+                finally:
+                    release.set()
+                    await collector.stop()
+
+            with (
+                patch.object(store_module.sqlite3, "connect", side_effect=connect),
+                patch.object(collector, "run_once") as collect,
+            ):
+                asyncio.run(exercise())
+                collect.assert_not_called()
+
+            self.assertEqual(_indexes(path), {CHRONOLOGICAL_INDEXES[0][0]})
+            self.assertEqual(collector._index_build_failures, 0)
+            self.assertIsNone(collector._chronological_indexes_identity)
+            self.assertIsNone(collector.degraded_reason())
+            with closing(native_connect(path)) as connection:
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(connection.execute("SELECT count(*) FROM metric_samples").fetchone()[0], 4_000)
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+
+            # A fresh store/collector sees the completed first index, then builds
+            # only the missing ones before admitting its first collection.
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                reopened = HistoryStore(str(path), recover_unreadable_database=False)
+            restarted = HistoryCollector(collector.settings, reopened)
+            built = []
+            original_build = reopened.build_chronological_index
+
+            def build(name, **kwargs):
+                built.append(name)
+                original_build(name, **kwargs)
+
+            async def collect_after_restart(**_kwargs):
+                self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+                restarted._stopping.set()
+
+            async def restart():
+                await restarted.start()
+                assert restarted._task is not None
+                await asyncio.wait_for(restarted._task, 5)
+                await restarted.stop()
+
+            with (
+                patch.object(reopened, "build_chronological_index", side_effect=build),
+                patch.object(restarted, "run_once", side_effect=collect_after_restart) as collected,
+            ):
+                asyncio.run(restart())
+                collected.assert_awaited_once()
+            self.assertEqual(built, [name for name, _ in CHRONOLOGICAL_INDEXES[1:]])
+
+    def test_store_cancellation_uses_native_progress_and_rolls_back_only_current_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=4_000)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            first, target = [name for name, _ in CHRONOLOGICAL_INDEXES[:2]]
+            store.build_chronological_index(first)
+            calls = 0
+
+            def should_continue():
+                nonlocal calls
+                calls += 1
+                return calls < 4
+
+            with self.assertRaises(store_module.HistoryIndexBuildCancelled):
+                store.build_chronological_index(target, should_continue=should_continue)
+            self.assertGreaterEqual(calls, 4)
+            self.assertEqual(_indexes(path), {first})
+            store.build_chronological_index(target)
+            self.assertEqual(_indexes(path), {first, target})
+
+    def test_stop_before_connection_or_execution_admits_no_index(self) -> None:
+        for cutoff in (1, 2):
+            with self.subTest(cutoff=cutoff), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "history.sqlite3"
+                _legacy_database(path, samples=40)
+                with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                    store = HistoryStore(str(path), recover_unreadable_database=False)
+                calls = 0
+
+                def should_continue():
+                    nonlocal calls
+                    calls += 1
+                    return calls < cutoff
+
+                with (
+                    patch.object(store, "_connect", wraps=store._connect) as connect,
+                    self.assertRaises(store_module.HistoryIndexBuildCancelled),
+                ):
+                    store.build_chronological_index(
+                        CHRONOLOGICAL_INDEXES[0][0], should_continue=should_continue
+                    )
+                self.assertEqual(connect.call_count, cutoff - 1)
+                self.assertEqual(_indexes(path), set())
+
+    def test_stop_after_final_index_does_not_collect_or_cache_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            original = collector._build_index_blocking
+
+            async def exercise():
+                # Invoke stop at the return boundary of the final actual build,
+                # before _build_pending_indexes publishes completion.
+                def build(name, position, total):
+                    original(name, position, total)
+                    if position == total:
+                        collector._stopping.set()
+
+                with (
+                    patch.object(collector, "_build_index_blocking", side_effect=build),
+                    patch.object(collector, "run_once") as collect,
+                ):
+                    await collector.start()
+                    assert collector._task is not None
+                    await asyncio.wait_for(collector._task, 5)
+                    await collector.stop()
+                    collect.assert_not_called()
+
+            asyncio.run(exercise())
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+            self.assertIsNone(collector._chronological_indexes_identity)
 
     def test_reads_answer_while_an_index_builds(self) -> None:
         import threading

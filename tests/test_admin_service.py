@@ -4267,6 +4267,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail, "Unable to inspect orphaned history; see admin logs.")
         self.assertNotIn("Traceback", str(raised.exception.detail))
         self.assertNotIn("history-secret", str(raised.exception.detail))
+        history_store.adopt_system_history.assert_not_called()
 
     def test_adopt_removed_system_history_route_rehomes_orphaned_history(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
@@ -4323,6 +4324,7 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["ok"])
+        self.assertNotIn("warning", payload)
         self.assertEqual(payload["summary"]["total_rows"], 9)
         self.assertEqual(payload["target_system_id"], "example-qs-ha")
         self.assertEqual(payload["orphaned_systems"], [])
@@ -4331,6 +4333,73 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
             "example-qs-ha",
             target_system_label="ExampleQS HA",
         )
+
+    def test_adoption_rejects_invalid_sources_and_targets_without_mutation(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        settings = Settings(systems=[SystemConfig(
+            id="current-system", label="Current system",
+            truenas=TrueNASConfig(host="https://host.example.test", platform="quantastor"),
+        )])
+        for source_id, target_id in (
+            (" ", "current-system"), ("removed-system", " "),
+            ("current-system", "current-system"), ("removed-system", "unknown-system"),
+            ("not-orphaned", "current-system"),
+        ):
+            with self.subTest(source=source_id, target=target_id):
+                history_store = MagicMock()
+                history_store.list_history_system_summaries.return_value = []
+                with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+                    "admin_service.routes.get_history_store", return_value=history_store,
+                ), self.assertRaises(HTTPException) as raised:
+                    asyncio.run(route.endpoint(payload=HistoryAdoptRequest(
+                        source_system_id=source_id, target_system_id=target_id,
+                    )))
+                self.assertEqual(raised.exception.status_code, 400)
+                history_store.adopt_system_history.assert_not_called()
+
+    def test_adoption_success_survives_optional_rescan_failure(self) -> None:
+        route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")
+        orphaned_route = next(route for route in admin_app.routes if route.path == "/api/admin/history/orphaned")
+        settings = Settings(systems=[SystemConfig(
+            id="current-system", label="Current system",
+            truenas=TrueNASConfig(host="https://host.example.test", platform="quantastor"),
+        )])
+        source = {"system_id": "removed-system", "total_rows": 4}
+        committed = {"total_rows": 4, "target_system_id": "current-system"}
+        remaining = [{"system_id": "other-removed-system", "total_rows": 2}]
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                history_store = MagicMock()
+                history_store.list_history_system_summaries.side_effect = [
+                    [source], error_type("synthetic private rescan detail"), remaining,
+                ]
+                history_store.adopt_system_history.return_value = committed
+
+                async def scenario():
+                    response = await route.endpoint(payload=HistoryAdoptRequest(
+                        source_system_id="removed-system", target_system_id="current-system",
+                    ))
+                    refresh = await orphaned_route.endpoint()
+                    return response, refresh
+
+                with patch("admin_service.routes.reload_app_settings", return_value=settings), patch(
+                    "admin_service.routes.get_history_store", return_value=history_store,
+                ):
+                    response, refresh = asyncio.run(scenario())
+                payload = json.loads(response.body)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["summary"], committed)
+                self.assertEqual(payload["source"], source)
+                self.assertEqual(payload["target_system_id"], "current-system")
+                self.assertNotIn("orphaned_systems", payload)
+                self.assertIn("Refresh", payload["warning"])
+                self.assertNotIn("synthetic private", json.dumps(payload))
+                self.assertEqual(json.loads(refresh.body)["orphaned_systems"], remaining)
+                self.assertEqual(history_store.list_history_system_summaries.call_count, 3)
+                history_store.adopt_system_history.assert_called_once_with(
+                    "removed-system", "current-system", target_system_label="Current system",
+                )
 
     def test_adopt_removed_system_history_route_redacts_adoption_failure_detail(self) -> None:
         route = next(route for route in admin_app.routes if route.path == "/api/admin/history/adopt-removed-system")

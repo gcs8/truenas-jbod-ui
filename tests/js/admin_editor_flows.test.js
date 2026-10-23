@@ -611,6 +611,7 @@ test("renaming a storage view rewrites its saved view-order key in place", () =>
     {
       elements,
       flushStorageViewRender: () => {},
+      storageViewEditorValues: () => new Map(),
       getStorageViewTemplate: () => ({ kind: "manual" }),
       nextStorageViewOrder: () => 20,
       parseSlotLabelsText: () => ({}),

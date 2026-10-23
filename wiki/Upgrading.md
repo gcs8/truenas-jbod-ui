@@ -125,7 +125,16 @@ definitions and rows, unchanged logical schema version, and idempotent restart.
 On a hot database with more than 250,000 history rows, startup defers the
 missing indexes so the service answers its healthcheck first; the collector
 then builds them one at a time before it collects, and history reads use the
-older, slower path until they finish (#910). A 2-million-row synthetic
+older, slower path until they finish (#910). On shutdown the collector asks
+SQLite to interrupt an in-flight deferred index build, waits for its connection
+to close, and does not start another index or collection pass. The interrupted
+index rolls back atomically; completed indexes remain and the next start builds
+only the missing ones (#988). Cancellation is checked before execution and
+every 1,000 SQLite VM instructions. SQLite writer-lock waits keep their existing
+five-second timeout. This does not impose a wall-clock bound on stalled storage
+I/O or rollback, and production-scale Docker shutdown timing remains unqualified.
+Compose stop-grace settings are unchanged.
+A 2-million-row synthetic
 database took 14.6 seconds to start without the deferral; production's
 4-million-row database took 58.7 seconds, past the healthcheck.
 Executing the schema SQL alone does not qualify startup. Existing immutable
