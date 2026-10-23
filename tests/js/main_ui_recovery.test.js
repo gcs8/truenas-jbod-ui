@@ -132,6 +132,66 @@ test("both live and saved disk details render SAS port counters", () => {
   assert.match(functionSource("renderDetail"), /renderSasPortCounters\(storageViewDetailSlot, smartEntry\)/);
 });
 
+test("SATA PHY events show exact totals and size-dependent saturation", () => {
+  const { renderSataPhyEvents } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "kvRow", "escapeHtml",
+  ]);
+  const html = renderSataPhyEvents({ data: { transport_protocol: "ATA", sata_phy_events: [
+    { id: 2, size: 2, name: "R_ERR response for data FIS", value: "0" },
+    { id: 11, size: 2, name: "CRC errors within host-to-device FIS", value: "65535" },
+    { id: 32769, size: 8, name: "Vendor specific", value: "18446744073709551615" },
+    { id: 3, size: 2, name: "Missing total", value: null },
+  ] } });
+  assert.match(html, /R_ERR response for data FIS: 0/);
+  assert.match(html, /CRC errors within host-to-device FIS: 65535 \(saturated\)/);
+  assert.match(html, /18446744073709551615 \(saturated\)/);
+  assert.match(html, /Missing total: not reported/);
+  assert.match(html, /0x000b/);
+  assert.match(html, /Cumulative.*disk-side.*No timestamps/i);
+});
+
+test("SATA behind an expander shows SATA events, never a SAS unavailable row", () => {
+  const { renderSataPhyEvents, renderSasPortCounters } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "renderSasPortCounters",
+    "shouldShowSasTransportFields", "formatSasPortCounter", "kvRow", "escapeHtml",
+  ]);
+  for (const transport_protocol of ["ATA", "SATA"]) {
+    for (const sata_phy_events of [null, undefined, []]) {
+      const entry = { data: { transport_protocol, sata_phy_events } };
+      assert.match(renderSataPhyEvents(entry), /SATA PHY events.*not reported/s);
+      assert.equal(renderSasPortCounters({ sas_address: "synthetic-expander-path" }, entry), "");
+    }
+  }
+  const entry = { data: { sata_phy_events: [{ id: 2, size: 2, name: "Event", value: "0" }] } };
+  assert.match(renderSataPhyEvents(entry), /Event: 0/);
+  assert.equal(renderSasPortCounters({ sas_address: "synthetic-expander-path" }, entry), "");
+  for (const transport_protocol of ["SAS", "NVMe"]) {
+    assert.equal(renderSataPhyEvents({ data: { ...entry.data, transport_protocol } }), "");
+  }
+  assert.match(renderSataPhyEvents({ loading: true, data: { transport_protocol: "SATA" } }), /Loading/);
+});
+
+test("SATA PHY rows escape metadata and reject invalid numeric representations", () => {
+  const { renderSataPhyEvents, formatSataPhyCounter } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "kvRow", "escapeHtml",
+  ]);
+  for (const value of [null, undefined, true, false, 0, "-1", "1.5", "01", "65536", "18446744073709551616"]) {
+    assert.equal(formatSataPhyCounter({ size: 2, value }), "not reported");
+  }
+  assert.equal(formatSataPhyCounter({ size: 3, value: "0" }), "not reported");
+  const html = renderSataPhyEvents({ data: { transport_protocol: "ATA", sata_phy_events: [
+    { id: 2, size: 2, value: "3", name: "<img src=x>" },
+    { id: "<script>", size: 2, value: "4", name: "bad identity" },
+  ] } });
+  assert.match(html, /&lt;img/);
+  assert.doesNotMatch(html, /<img|<script>|bad identity/);
+});
+
+test("both live and saved disk details render SATA event equivalents", () => {
+  assert.match(functionSource("renderLiveSlotDetail"), /renderSataPhyEvents\(smartEntry\)/);
+  assert.match(functionSource("renderDetail"), /renderSataPhyEvents\(smartEntry\)/);
+});
+
 function classList(initial = []) {
   const values = new Set(initial);
   return {

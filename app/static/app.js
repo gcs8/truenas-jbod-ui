@@ -4579,6 +4579,10 @@
     if (transport.includes("nvme") || transport.includes("ata") || transport.includes("sata")) {
       return false;
     }
+    // An observed SATA disk log beats a bay's SAS expander path address.
+    if (smartEntry?.data?.sata_phy_events?.length) {
+      return false;
+    }
 
     return Boolean(
       smartEntry?.data?.logical_unit_id ||
@@ -4620,6 +4624,33 @@
       `PHY reset problem: ${formatSasPortCounter(row.phy_reset_problem_count)}`,
     ].join("; "))).join("") + kvRow("SAS counter scope",
       "Cumulative totals from smartctl disk port log. Disk-to-expander link only, not upstream cables. No timestamps or change rate.");
+  }
+
+  function formatSataPhyCounter(row) {
+    if (![2, 4, 6, 8].includes(row.size) || typeof row.value !== "string"
+      || !/^(0|[1-9][0-9]{0,19})$/.test(row.value)) {
+      return "not reported";
+    }
+    const value = BigInt(row.value);
+    const maximum = (1n << BigInt(8 * row.size)) - 1n;
+    if (value > maximum) return "not reported";
+    return value === maximum ? `${row.value} (saturated)` : row.value;
+  }
+
+  function renderSataPhyEvents(smartEntry) {
+    const transport = String(smartEntry?.data?.transport_protocol || "").toLowerCase();
+    if (transport.includes("sas") || transport.includes("nvme")) return "";
+    const events = Array.isArray(smartEntry?.data?.sata_phy_events)
+      ? smartEntry.data.sata_phy_events.filter((row) => row && Number.isInteger(row.id)
+        && row.id > 0 && row.id <= 0x8fff && !(row.id & ~0x8fff) && [2, 4, 6, 8].includes(row.size))
+      : [];
+    if (!transport.includes("ata") && !events.length) return "";
+    if (!events.length) {
+      return kvRow("SATA PHY events", smartEntry?.loading ? "Loading..." : "not reported");
+    }
+    return events.map((row) => kvRow(`SATA PHY event 0x${row.id.toString(16).padStart(4, "0")}`,
+      `${row.name || "Event name not reported"}: ${formatSataPhyCounter(row)}`)).join("")
+      + kvRow("SATA counter scope", "Cumulative totals from smartctl disk-side SATA PHY event log. Not expander counters. No timestamps or change rate.");
   }
 
   function formatNamespaceIdentifierValue(value, smartEntry) {
@@ -9055,6 +9086,7 @@
           showSasTransportFields ? kvRowIfMeaningful("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
           showLinkRate ? kvRowIfMeaningful("Link Rate", formatLinkRateValue(smartEntry)) : "",
           renderSasPortCounters(slot, smartEntry),
+          renderSataPhyEvents(smartEntry),
           kvRowIfMeaningful("SES Flags", formatSesStateValue(slot), false, slot?.raw_status?.ses_swapped ? SES_SWAP_TITLE : ""),
         ]),
       ].filter(Boolean).join("");
@@ -9203,6 +9235,7 @@
         showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
         showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
         renderSasPortCounters(storageViewDetailSlot, smartEntry),
+        renderSataPhyEvents(smartEntry),
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),

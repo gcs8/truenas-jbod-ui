@@ -152,6 +152,24 @@ class SasPortView(BaseModel):
     phy_reset_problem_count: int | None = Field(default=None, ge=0, le=0xFFFFFFFF, strict=True)
 
 
+class SataPhyEventView(BaseModel):
+    """Disk-side SATA GP log 0x11 event, not a SAS/expander PHY counter."""
+
+    id: int = Field(ge=1, le=0x8FFF, strict=True)
+    size: Literal[2, 4, 6, 8]
+    name: str | None = None
+    # Decimal wire strings preserve 64-bit totals through browser JSON parsing.
+    value: str | None = Field(default=None, strict=True, pattern=r"^(0|[1-9][0-9]{0,19})$")
+
+    @model_validator(mode="after")
+    def validate_counter_bounds(self) -> SataPhyEventView:
+        if self.id & ~0x8FFF:
+            raise ValueError("Unsupported SATA PHY event identifier")
+        if self.value is not None and int(self.value) >= 1 << (8 * self.size):
+            raise ValueError("SATA PHY event value exceeds its reported size")
+        return self
+
+
 class SmartSummaryView(BaseModel):
     available: bool = False
     layout_bounds: Literal["verified", "unavailable"] | None = None
@@ -205,8 +223,9 @@ class SmartSummaryView(BaseModel):
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
-    # None means no JSON port log was reported, including smartctl 7.2 paths.
+    # None means no supported port log was reported, not an empty measurement.
     sas_ports: list[SasPortView] | None = None
+    sata_phy_events: list[SataPhyEventView] | None = None
     message: str | None = None
 
 

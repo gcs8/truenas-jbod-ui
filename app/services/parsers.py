@@ -3507,6 +3507,111 @@ def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]]
     return rows or None
 
 
+def _extract_smartctl_sas_ports_text(output: str) -> list[dict[str, Any]] | None:
+    """smartmontools RELEASE_7_2 scsiprint.cpp show_sas_port_param labels."""
+    payload: dict[str, Any] = {}
+    active = False
+    port_block: dict[str, Any] | None = None
+    phy: dict[str, Any] | None = None
+    labels = {
+        "attached device type:": "attached_device_type",
+        "attached reason:": "attached_reason",
+        "negotiated logical link rate:": "negotiated_logical_link_rate",
+        "SAS address =": "sas_address",
+        "attached SAS address =": "attached_sas_address",
+        "Invalid DWORD count =": "invalid_dword_count",
+        "Running disparity error count =": "running_disparity_error_count",
+        "Loss of DWORD synchronization =": "loss_of_dword_synchronization_count",
+        "Phy reset problem =": "phy_reset_problem_count",
+    }
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "Protocol Specific port log page for SAS SSP":
+            active, port_block, phy = True, None, None
+            continue
+        if not active:
+            continue
+        if line.startswith("relative target port id ="):
+            match = re.fullmatch(r"relative target port id =\s*([0-9]{1,5})", line)
+            port_block = phy = None
+            if match and int(match.group(1)) <= 65535:
+                port_block = payload.setdefault(f"scsi_sas_port_{int(match.group(1))}", {})
+        elif line.startswith("phy identifier ="):
+            match = re.fullmatch(r"phy identifier =\s*([0-9]{1,3})", line)
+            phy = None
+            if match and int(match.group(1)) <= 255 and port_block is not None:
+                phy = port_block.setdefault(f"phy_{int(match.group(1))}", {})
+        elif (label := next((key for key in labels if line.startswith(key)), None)) is not None:
+            if phy is not None:
+                field = labels[label]
+                value = line[len(label):].strip()
+                phy[field] = (
+                    int(value) if re.fullmatch(r"[0-9]{1,10}", value) else None
+                ) if field.endswith("_count") else value
+        elif not line or not raw_line[:1].isspace():
+            # Do not let another log's labels leak into the last disk PHY.
+            active, port_block, phy = False, None, None
+    return _extract_smartctl_sas_ports(payload)
+
+
+def _sata_phy_event_row(entry: Any) -> dict[str, Any] | None:
+    """RELEASE_7_4 ataprint.cpp PrintSataPhyEventCounters JSON contract."""
+    if not isinstance(entry, dict):
+        return None
+    event_id, size, value = entry.get("id"), entry.get("size"), entry.get("value")
+    if (type(event_id) is not int or not 1 <= event_id <= 0x8FFF or event_id & ~0x8FFF
+            or type(size) is not int or size not in (2, 4, 6, 8)):
+        return None
+    return {
+        "id": event_id, "size": size,
+        "name": normalize_text(entry.get("name")) if isinstance(entry.get("name"), str) else None,
+        # A decimal string avoids rounding uint64 totals in browser JSON.parse.
+        "value": str(value) if type(value) is int and 0 <= value < 1 << (8 * size) else None,
+    }
+
+
+def _extract_smartctl_sata_phy_events(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    block = payload.get("sata_phy_event_counters")
+    table = block.get("table") if isinstance(block, dict) else None
+    if not isinstance(table, list):
+        return None
+    return [row for entry in table if (row := _sata_phy_event_row(entry)) is not None] or None
+
+
+def _extract_smartctl_sata_phy_text(output: str) -> list[dict[str, Any]] | None:
+    """Parse only the documented GP log 0x11 table, never other ATA tables."""
+    active = False
+    table_started = False
+    rows: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "SATA Phy Event Counters (GP Log 0x11)":
+            active, table_started = True, False
+            continue
+        if not active:
+            continue
+        if re.fullmatch(r"ID\s+Size\s+Value\s+Description", line):
+            table_started = True
+            continue
+        if not table_started and line.startswith("[Reserved:"):
+            continue
+        match = re.fullmatch(r"0x([0-9a-fA-F]{4})\s+([2468])\s+(\S+)\s+(.+)", line) if table_started else None
+        if match is None:
+            active = False
+            continue
+        size, token = int(match.group(2)), match.group(3)
+        count = re.fullmatch(r"([0-9]{1,20})(\+?)", token)
+        value = int(count.group(1)) if count else None
+        if count and count.group(2) and value != (1 << (8 * size)) - 1:
+            value = None
+        row = _sata_phy_event_row({
+            "id": int(match.group(1), 16), "size": size, "value": value, "name": match.group(4),
+        })
+        if row is not None:
+            rows.append(row)
+    return rows or None
+
+
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
     try:
         payload = json.loads(output)
@@ -3692,6 +3797,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "attached_sas_address": attached_sas_address,
             "negotiated_link_rate": negotiated_link_rate,
             "sas_ports": _extract_smartctl_sas_ports(payload),
+            "sata_phy_events": _extract_smartctl_sata_phy_events(payload),
         },
         "No SMART summary fields were returned for this disk.",
     )
@@ -3817,6 +3923,8 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
     trim_supported: bool | None = None
+    sas_ports = _extract_smartctl_sas_ports_text(output)
+    sata_phy_events = _extract_smartctl_sata_phy_text(output)
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -3881,6 +3989,8 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
                 attached_sas_address,
                 negotiated_link_rate,
                 trim_supported,
+                sas_ports,
+                sata_phy_events,
             )
         ),
         "read_cache_enabled": read_cache_enabled,
@@ -3893,6 +4003,8 @@ def parse_smartctl_text_enrichment(output: str) -> dict[str, Any]:
         "attached_sas_address": attached_sas_address,
         "negotiated_link_rate": negotiated_link_rate,
         "trim_supported": trim_supported,
+        "sas_ports": sas_ports,
+        "sata_phy_events": sata_phy_events,
     }
 
 
