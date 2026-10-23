@@ -1,104 +1,100 @@
-name: Disposable runtime qualification
+name: Disposable beta4 TLS qualification
 
-# Qualification branch only. No default-branch integration or release action.
+# Branch-only evidence. No product activation, appliance access or publication.
 on:
   push:
     branches:
-      - test/jbod-disposable-runtime-qualification-20261023
-
+      - test/jbod-tls-loopback-qualification-20261023
 permissions:
   contents: read
-
 concurrency:
-  group: jbod-disposable-runtime-qualification
+  group: jbod-tls-loopback-qualification
   cancel-in-progress: false
-
 jobs:
-  matrix:
+  tls-loopback:
     if: github.repository == 'gcs8/truenas-jbod-ui' && github.actor == 'gcs8' && github.triggering_actor == 'gcs8'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
-      SOURCE_SHA: e85b8d5b56962bf6bb55d2b1fc1e425c5407dd3b
+      SOURCE_SHA: 9478b115ab95d8eddb18ccd3a930a71ed16b5b16
+      CONTROL_SHA: ${{ github.sha }}
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Check out exact accepted source without credentials
+      - name: Check out exact qualification controls without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: e85b8d5b56962bf6bb55d2b1fc1e425c5407dd3b
+          ref: ${{ github.sha }}
+          path: controls
           persist-credentials: false
           fetch-depth: 1
-      - name: Require a fresh job-local Linux Docker host
+      - name: Check out frozen beta4 source separately without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 9478b115ab95d8eddb18ccd3a930a71ed16b5b16
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Admit fresh job-local daemon and exact source/control identities
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test -z "$(git status --porcelain)"
+          test "$(git -C controls rev-parse HEAD)" = "$CONTROL_SHA"
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git -C controls status --porcelain)"
+          test -z "$(git -C source status --porcelain)"
           unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
           export DOCKER_HOST=unix:///var/run/docker.sock
           test "$(docker --host "$DOCKER_HOST" info --format '{{.Swarm.LocalNodeState}}')" = inactive
           test -z "$(docker --host "$DOCKER_HOST" ps --all --quiet)"
-          docker --host "$DOCKER_HOST" compose version
-          root="$(mktemp -d "$RUNNER_TEMP/tjui-runtime-XXXXXXXX")"
+          root="$(mktemp -d "$RUNNER_TEMP/tjui-tls-XXXXXXXX")"
           chmod 700 "$root"
+          mkdir -m 700 "$root/docker-config"
           printf 'QUALIFICATION_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
           printf 'DOCKER_HOST=unix:///var/run/docker.sock\n' >> "$GITHUB_ENV"
-          printf 'TMPDIR=%s\n' "$root" >> "$GITHUB_ENV"
           printf 'DOCKER_CONFIG=%s/docker-config\n' "$root" >> "$GITHUB_ENV"
-          mkdir -m 700 "$root/docker-config"
-      - name: Build an exact local candidate, never publish it
+          hash="$(sha256sum source/admin_service/services/tls_trust.py)"
+          printf 'TLS_SOURCE_SHA256=%s\n' "${hash%% *}" >> "$GITHUB_ENV"
+      - name: Build exact frozen beta4 image locally without registry publication
         shell: bash
         run: |
           set -euo pipefail
           unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           docker --host "$DOCKER_HOST" build --build-arg "SOURCE_COMMIT=$SOURCE_SHA" \
-            --iidfile "$QUALIFICATION_ROOT/image-id" .
+            --iidfile "$QUALIFICATION_ROOT/image-id" source
           image="$(<"$QUALIFICATION_ROOT/image-id")"
           [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$(docker --host "$DOCKER_HOST" image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
           printf 'QUALIFICATION_IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
-          printf 'qualification_source=%s image=%s\n' "$SOURCE_SHA" "$image"
-      - name: Run all maintained synthetic Compose runtime variants
+          printf 'tls_qualification_source=%s control=%s image=%s\n' "$SOURCE_SHA" "$CONTROL_SHA" "$image"
+      - name: Run genuine loopback TLS negative and positive controls without egress
         shell: bash
         run: |
           set -euo pipefail
           unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
-          timeout --kill-after=30s 1500s python3 scripts/run_compose_runtime_matrix.py \
-            --compose docker-compose.yml \
-            --config-fixture tests/fixtures/ci-smoke-config.yaml \
-            --image "$QUALIFICATION_IMAGE" --source-commit "$SOURCE_SHA" \
-            --runtime-root "$QUALIFICATION_ROOT/runtime" --scratch-root "$QUALIFICATION_ROOT" \
-            --ui-port 19080 --history-port 19081 --admin-port 19082 \
-            --ack I_APPROVE_DISPOSABLE_COMPOSE_QA \
-            2>&1 | tee "$QUALIFICATION_ROOT/matrix.log"
-          test ! -e "$QUALIFICATION_ROOT/runtime"
-          test -z "$(git status --porcelain)"
-      - name: Independently read back cleanup, without broad deletion
+          token="tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          name="tjui-$token"
+          test -z "$(docker --host "$DOCKER_HOST" ps --all --filter "name=^/$name$" --quiet)"
+          timeout --kill-after=15s 180s docker --host "$DOCKER_HOST" run --rm \
+            --name "$name" --label "io.gcs8.qa-owner=$token" \
+            --user 10001:10001 --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --memory 256m --pids-limit 64 --cpus 1 \
+            --tmpfs /scratch:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001 \
+            --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/app --env TMPDIR=/scratch \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/controls/scripts/run_tls_loopback_qualification.py,dst=/qa/run_tls_loopback_qualification.py,readonly" \
+            --entrypoint python "$QUALIFICATION_IMAGE" \
+            /qa/run_tls_loopback_qualification.py --scratch /scratch \
+            --source-sha "$SOURCE_SHA" --tls-source-sha256 "$TLS_SOURCE_SHA256" \
+            --ack I_APPROVE_SYNTHETIC_TLS_LOOPBACK
+          test -z "$(git -C controls status --porcelain)"
+          test -z "$(git -C source status --porcelain)"
+      - name: Independently verify owned TLS container absence
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           unset DOCKER_CONTEXT DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH BUILDX_BUILDER
           export DOCKER_HOST=unix:///var/run/docker.sock
-          # A query error fails the step. It never counts as resource absence.
-          containers="$(timeout 30s docker --host "$DOCKER_HOST" ps --all --format '{{.Names}}')"
-          networks="$(timeout 30s docker --host "$DOCKER_HOST" network ls --format '{{.Name}}')"
-          volumes="$(timeout 30s docker --host "$DOCKER_HOST" volume ls --format '{{.Name}}')"
-          export QUALIFICATION_CONTAINERS="$containers" QUALIFICATION_NETWORKS="$networks" QUALIFICATION_VOLUMES="$volumes"
-          python3 - <<'PY'
-          import os
-          reserved = {'truenas-jbod-ui', 'truenas-jbod-history', 'truenas-jbod-admin'}
-          containers = set(os.environ['QUALIFICATION_CONTAINERS'].splitlines())
-          assert not containers & reserved, 'reserved QA containers remain'
-          for name in ('QUALIFICATION_CONTAINERS', 'QUALIFICATION_NETWORKS', 'QUALIFICATION_VOLUMES'):
-              assert not any(value.startswith('tjui-matrix-') for value in os.environ[name].splitlines()), name
-          print('qualification_cleanup=pass task_containers=0 task_networks=0 task_volumes=0')
-          PY
-          # A failed run retains its synthetic scratch in the job log context.
-          # The hosted VM is discarded; never prune a daemon or delete by name.
-          if [ "${{ job.status }}" = success ]; then
-            test -n "${QUALIFICATION_ROOT:-}"
-            test ! -e "$QUALIFICATION_ROOT/runtime"
-            printf 'qualification_runtime_root=absent\n'
-          fi
+          token="tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ids="$(timeout 30s docker --host "$DOCKER_HOST" ps --all --filter "label=io.gcs8.qa-owner=$token" --quiet)"
+          test -z "$ids"
+          printf 'tls_qualification_cleanup=pass owned_containers=0\n'
