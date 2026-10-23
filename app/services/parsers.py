@@ -3486,14 +3486,16 @@ def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]]
             phy_id = int(phy_match.group(1))
             if phy_id > 255:
                 continue
+            # Optional metadata is reported text, never coerced from malformed
+            # JSON values. Keep this admission local to the new port reader.
             row = {
                 "port": port,
                 "phy": phy_id,
-                "attached_type": normalize_text(phy.get("attached_device_type")),
-                "attached_reason": normalize_text(phy.get("attached_reason")),
-                "sas_address": format_hex_identifier(phy.get("sas_address")),
-                "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")),
-                "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")),
+                "attached_type": normalize_text(phy.get("attached_device_type")) if isinstance(phy.get("attached_device_type"), str) else None,
+                "attached_reason": normalize_text(phy.get("attached_reason")) if isinstance(phy.get("attached_reason"), str) else None,
+                "sas_address": format_hex_identifier(phy.get("sas_address")) if isinstance(phy.get("sas_address"), str) else None,
+                "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")) if isinstance(phy.get("attached_sas_address"), str) else None,
+                "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")) if isinstance(phy.get("negotiated_logical_link_rate"), str) else None,
             }
             for counter in (
                 "invalid_dword_count", "running_disparity_error_count",

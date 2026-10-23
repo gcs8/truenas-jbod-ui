@@ -3585,6 +3585,78 @@ class ParserConsolidationTests(unittest.TestCase):
         self.assertEqual(rows[2]["invalid_dword_count"], 9)
         self.assertEqual(parsed["sas_address"], disk_address)
 
+    def test_sas_malformed_attached_reason_preserves_typed_smart_summary(self) -> None:
+        from app.services.inventory import InventoryService
+
+        for value in (5, True, {}, [], False, 0, 1.5, {"bad": "reason"}, ["bad"], None, " "):
+            with self.subTest(value=value):
+                payload = json.dumps({
+                    "temperature": {"current": 30}, "smart_status": {"passed": True},
+                    "scsi_sas_port_1": {"phy_0": {
+                        "attached_device_type": "expander device", "attached_reason": value,
+                        "negotiated_logical_link_rate": "12 Gbps",
+                        "invalid_dword_count": 0, "phy_reset_problem_count": 4294967295,
+                    }},
+                })
+                summary = InventoryService._parse_smart_payload_for_slot(None, payload)
+                self.assertTrue(summary.available)
+                self.assertEqual(summary.temperature_c, 30)
+                self.assertEqual(summary.smart_health_status, "PASSED")
+                row = summary.model_dump()["sas_ports"][0]
+                self.assertIsNone(row["attached_reason"])
+                self.assertEqual(row["attached_type"], "expander device")
+                self.assertEqual(row["negotiated_link_rate"], "12 Gbps")
+                self.assertEqual(row["invalid_dword_count"], 0)
+                self.assertEqual(row["phy_reset_problem_count"], 4294967295)
+                self.assertIsNone(row["running_disparity_error_count"])
+                self.assertIsNone(row["loss_of_dword_synchronization_count"])
+
+    def test_sas_unselected_phy_malformed_metadata_preserves_typed_smart_summary(self) -> None:
+        from app.services.inventory import InventoryService
+
+        # Legacy global SAS extraction reads only the first attached PHY.
+        # Newly retained rows must not turn malformed optional siblings into
+        # whole-summary failures, even when legacy extraction never read them.
+        fields = {
+            "attached_device_type": "attached_type", "sas_address": "sas_address",
+            "attached_sas_address": "attached_sas_address",
+            "negotiated_logical_link_rate": "negotiated_link_rate",
+        }
+        for source, target in fields.items():
+            for value in (5, True, {}, [], False, 0, 1.5, {"bad": "metadata"}, ["bad"]):
+                with self.subTest(field=source, value=value):
+                    payload = json.dumps({
+                        "temperature": {"current": 30}, "smart_status": {"passed": True},
+                        "scsi_sas_port_1": {
+                            "phy_0": {"attached_device_type": "expander device"},
+                            "phy_1": {source: value, "invalid_dword_count": 0},
+                        },
+                    })
+                    summary = InventoryService._parse_smart_payload_for_slot(None, payload)
+                    self.assertTrue(summary.available)
+                    self.assertEqual(summary.temperature_c, 30)
+                    self.assertEqual(summary.smart_health_status, "PASSED")
+                    rows = summary.model_dump()["sas_ports"]
+                    self.assertEqual([(row["port"], row["phy"]) for row in rows], [(1, 0), (1, 1)])
+                    self.assertIsNone(rows[1][target])
+                    self.assertEqual(rows[1]["invalid_dword_count"], 0)
+
+    def test_sas_port_metadata_reader_rejects_nonstrings_without_coercion(self) -> None:
+        fields = {
+            "attached_device_type": "attached_type", "attached_reason": "attached_reason",
+            "sas_address": "sas_address", "attached_sas_address": "attached_sas_address",
+            "negotiated_logical_link_rate": "negotiated_link_rate",
+        }
+        for source, target in fields.items():
+            for value in (5, True, {}, [], False, 0, 1.5, {"bad": "metadata"}, ["bad"], None, " "):
+                with self.subTest(field=source, value=value):
+                    rows = parsers._extract_smartctl_sas_ports({
+                        "scsi_sas_port_1": {"phy_0": {source: value, "invalid_dword_count": 0}},
+                    })
+                    assert rows is not None
+                    self.assertIsNone(rows[0][target])
+                    self.assertEqual(rows[0]["invalid_dword_count"], 0)
+
     def test_sas_port_counters_missing_logs_stay_unreported(self) -> None:
         for payload in ({}, {"scsi_transport_protocol": {"name": "SAS"}},
                         {"smartctl": {"version": [7, 2]}, "device": {"protocol": "SCSI"}}):
