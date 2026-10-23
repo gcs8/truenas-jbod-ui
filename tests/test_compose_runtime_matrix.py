@@ -104,8 +104,175 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     "scheduler": True,
                     "scheduler_policy": True,
                 },
+                "ui-nonroot": {
+                    "profiles": (),
+                    "services": ("enclosure-ui",),
+                    "ui": True,
+                    "admin_setup": False,
+                    "scheduler": False,
+                    "scheduler_policy": False,
+                },
             },
         )
+
+    def test_nonroot_variant_uses_the_inherited_overlay_and_prepares_ownership(self) -> None:
+        module = self.load_matrix_module()
+        variant = next(v for v in module.VARIANTS if v.name == "ui-nonroot")
+        self.assertTrue(variant.ui_enabled)
+        self.assertTrue(variant.nonroot)
+        self.assertTrue(variant.journal_read)
+        self.assertEqual(variant.services, ("enclosure-ui",))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / variant.name
+            with patch.object(module, "_run") as run:
+                module._prepare_variant_root(
+                    root, variant=variant, compose_path=ROOT / "docker-compose.yml",
+                    config_fixture=ROOT / "config/config.example.yaml",
+                    image="sha256:" + "a" * 64, ports=module.Ports(19080, 19081, 19082),
+                )
+            self.assertEqual((root / "nonroot.yaml").read_bytes(), (ROOT / "docker-compose.nonroot.yml").read_bytes())
+            self.assertEqual(stat.S_IMODE((root / "nonroot.yaml").stat().st_mode), 0o600)
+            command = list(run.call_args_list[-1].args[0])
+            self.assertEqual(command, [
+                "sudo", "-n", "--", module.sys.executable,
+                str(ROOT / "scripts/prepare_nonroot_bind_mounts.py"), str(root),
+                "--uid", str(module.APP_UID), "--gid", str(module.APP_GID), "--apply",
+            ])
+            prefix = module._compose_prefix(root, variant)
+            files = [prefix[i + 1] for i, arg in enumerate(prefix) if arg == "-f"]
+            self.assertEqual(files, [str(root / "compose.yaml"), str(root / "nonroot.yaml")])
+            self.assertIn("backup-scheduler", prefix)
+
+    def test_ui_owners_are_bound_to_base_overlay_and_rendered_user(self) -> None:
+        import yaml
+
+        module = self.load_matrix_module()
+        base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+        overlay = yaml.safe_load((ROOT / "docker-compose.nonroot.yml").read_text())
+        self.assertEqual(base["services"]["enclosure-ui"]["user"], "0:0")
+        self.assertEqual(overlay["services"]["enclosure-ui"]["user"], "${APP_UID:-10001}:${APP_GID:-10001}")
+        for name, user, expected in (("ui-only", "0:0", (0, 0)), ("ui-nonroot", "10001:10001", (module.APP_UID, module.APP_GID))):
+            variant = next(v for v in module.VARIANTS if v.name == name)
+            model = {"services": {"enclosure-ui": {"user": user}}}
+            self.assertEqual(module._ui_writer_owner(model, variant), expected)
+            for wrong in ("", "root", "0", "10001:0", "0:10001", None):
+                with self.subTest(name=name, user=wrong), self.assertRaisesRegex(RuntimeError, "writer identity"):
+                    module._ui_writer_owner({"services": {"enclosure-ui": {"user": wrong}}}, variant)
+            module._require_ui_written_file(*expected, 0o100660, "alias", expected_owner=expected)
+            with self.assertRaisesRegex(RuntimeError, "ownership failed"):
+                module._require_ui_written_file(9999, expected[1], 0o100660, "mapping", expected_owner=expected)
+
+    def test_scheduler_journal_probe_checks_effective_identity_and_actual_ui_entries(self) -> None:
+        module = self.load_matrix_module()
+        prefix = ("docker", "compose", "--project-name", "synthetic")
+        for owner in ((0, 0), (module.APP_UID, module.APP_GID)):
+            with patch.object(module, "_run", return_value=Mock(stdout="journal_read=ok\n")) as run:
+                module._verify_ui_journal_read(prefix, owner)
+            command = list(run.call_args.args[0])
+            self.assertEqual(command[:len(prefix)], list(prefix))
+            self.assertEqual(command[len(prefix):-3], ["run", "--rm", "--no-deps", "--pull", "never", "-T", "--entrypoint", "python", "enclosure-backup-scheduler", "-c"])
+            self.assertEqual(command[-2:], [str(owner[0]), str(module.APP_GID)])
+            self.assertIn("os.getuid()", command[-3])
+            self.assertIn("os.getgid()", command[-3])
+            self.assertIn("os.getgroups()", command[-3])
+            self.assertIn("mapping.save", command[-3])
+            self.assertIn("sas_alias.save", command[-3])
+            self.assertNotIn("--user", command)
+        for stdout in ("", "journal_read=ok\nprivate-data", "journal_read=failed"):
+            with patch.object(module, "_run", return_value=Mock(stdout=stdout)), self.assertRaisesRegex(RuntimeError, "journal read"):
+                module._verify_ui_journal_read(prefix, (0, 0))
+
+    def test_nonroot_lifecycle_prepares_before_writers_and_probes_after_cycles(self) -> None:
+        module = self.load_matrix_module()
+        variant = next(v for v in module.VARIANTS if v.name == "ui-nonroot")
+        events = []
+        owner = (module.APP_UID, module.APP_GID)
+        model = {"services": {"enclosure-ui": {"user": "10001:10001", "read_only": True,
+                 "cap_drop": ["ALL"], "tmpfs": ["/tmp"], "security_opt": ["no-new-privileges:true"]}}}
+        with contextlib.ExitStack() as stack:
+            for name in ("_assert_compose_resources_removed", "_verify_runtime_contract", "_verify_ui", "_cleanup_variant"):
+                stack.enter_context(patch.object(module, name))
+            stack.enter_context(patch.object(module, "_prepare_variant_root", side_effect=lambda *a, **k: events.append("prepare")))
+            stack.enter_context(patch.object(module, "_verify_rendered_contract", return_value=model))
+            def run(command, **kwargs):
+                events.append("up" if "up" in command else "ps")
+                return Mock(stdout="enclosure-ui\n")
+            stack.enter_context(patch.object(module, "_run", side_effect=run))
+            pencil = stack.enter_context(patch.object(module, "_verify_pencil_cycle", side_effect=lambda *a, **k: events.append("alias")))
+            mapping = stack.enter_context(patch.object(module, "_verify_mapping_cycle", side_effect=lambda *a, **k: events.append("mapping")))
+            journal = stack.enter_context(patch.object(module, "_verify_ui_journal_read", side_effect=lambda *a: events.append("journal")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            module._run_variant(Path("/synthetic"), variant, compose_path=ROOT / "docker-compose.yml",
+                                config_fixture=ROOT / "config/config.example.yaml", image="sha256:" + "a" * 64,
+                                ports=module.Ports(19080, 19081, 19082), source_commit="b" * 40)
+        self.assertEqual(events, ["prepare", "up", "ps", "alias", "mapping", "journal"])
+        self.assertEqual(pencil.call_args.kwargs, {"expected_owner": owner})
+        self.assertEqual(mapping.call_args.kwargs, {"expected_owner": owner})
+        self.assertEqual(journal.call_args.args[-1], owner)
+
+    def test_journal_probe_executes_with_synthetic_metadata_and_rejects_drift(self) -> None:
+        import subprocess
+
+        module = self.load_matrix_module()
+        actions = ("sas_alias.save", "sas_alias.clear", "mapping.save", "mapping.clear")
+        valid = "".join(json.dumps({"type": "change", "action": action}) + "\n" for action in actions)
+        # Replace identity/metadata only, never impersonate users or change owners.
+        # The production probe still opens and parses real synthetic file bytes.
+        prelude = """import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+uid, gid, groups, owner, mode, fixture = sys.argv[3:]
+os.getuid = lambda: int(uid)
+os.getgid = lambda: int(gid)
+os.getgroups = lambda: [int(groups)]
+Path.stat = lambda self, **kw: SimpleNamespace(st_mode=0o042770, st_uid=1000, st_gid=10001)
+original_open = os.open
+os.open = lambda path, flags: original_open(fixture, flags)
+os.fstat = lambda fd: SimpleNamespace(st_mode=0o100000 | int(mode), st_uid=int(owner), st_gid=10001)
+sys.argv = sys.argv[:3]
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Path(temp) / "synthetic-journal.jsonl"
+            cases = [(owner, "1000", "1000", "10001", owner, str(0o660), valid, True) for owner in ("0", "10001")]
+            cases += [
+                ("10001", "0", "1000", "10001", "10001", str(0o660), valid, False),
+                ("10001", "1000", "0", "10001", "10001", str(0o660), valid, False),
+                ("10001", "1000", "1000", "1000", "10001", str(0o660), valid, False),
+                ("10001", "1000", "1000", "10001", "0", str(0o660), valid, False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o600), valid, False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o660), "", False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o660), "{}\n", False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o660), valid.rstrip(), False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o660), "not-json\n", False),
+                ("10001", "1000", "1000", "10001", "10001", str(0o660), "x" * (1024 * 1024 + 1), False),
+            ]
+            for expected, uid, gid, groups, actual, mode, content, passes in cases:
+                with self.subTest(expected=expected, uid=uid, gid=gid, groups=groups, actual=actual, mode=mode, size=len(content)):
+                    fixture.write_text(content)
+                    result = subprocess.run([module.sys.executable, "-c", prelude + module.UI_JOURNAL_READ_PROBE,
+                                             expected, "10001", uid, gid, groups, actual, mode, str(fixture)],
+                                            capture_output=True, text=True, timeout=10, env={"PATH": os.defpath})
+                    self.assertEqual(result.returncode == 0, passes, result.stderr)
+                    self.assertEqual(result.stdout, "journal_read=ok\n" if passes else "")
+
+    def test_failed_nonroot_preparation_never_starts_a_writer(self) -> None:
+        module = self.load_matrix_module()
+        variant = next(v for v in module.VARIANTS if v.name == "ui-nonroot")
+        commands = []
+        def run(command, **kwargs):
+            commands.append(list(command))
+            if "--apply" in command:
+                raise RuntimeError("synthetic helper refusal")
+            return Mock(stdout="")
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Path(temp)
+            with patch.object(module, "_run", side_effect=run), patch.object(module, "_assert_compose_resources_removed"), self.assertRaisesRegex(RuntimeError, "helper refusal"):
+                module._run_variant(runtime, variant, compose_path=ROOT / "docker-compose.yml",
+                                    config_fixture=ROOT / "config/config.example.yaml", image="sha256:" + "a" * 64,
+                                    ports=module.Ports(19080, 19081, 19082), source_commit="b" * 40)
+            self.assertTrue((runtime / variant.name / "nonroot.yaml").is_file())
+            self.assertTrue((runtime / variant.name / "compose.yaml").is_file())
+            self.assertFalse(any("up" in command or "run" in command for command in commands))
 
     def test_reserved_names_match_base_compose_and_exact_image_revision(self) -> None:
         module = self.load_matrix_module()
@@ -210,11 +377,12 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         self.assertIn("admin-only initial setup readback failed", source)
         self.assertEqual(
             module.SUCCESS_MARKER,
-            "compose_runtime_matrix=ok variants=7 ui_alias_cycles=4 "
-            "ui_mapping_cycles=4 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
-            "scheduler_backup_cycles=1",
+            "compose_runtime_matrix=ok variants=8 ui_alias_cycles=5 "
+            "ui_mapping_cycles=5 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
+            "scheduler_backup_cycles=1 ui_journal_read_cycles=2",
         )
-        self.assertEqual(sum(variant.ui_enabled for variant in module.VARIANTS), 4)
+        self.assertEqual(sum(variant.ui_enabled for variant in module.VARIANTS), 5)
+        self.assertEqual(sum(variant.journal_read for variant in module.VARIANTS), 2)
         self.assertEqual(sum(variant.admin_initial_setup for variant in module.VARIANTS), 1)
         self.assertEqual(sum(variant.scheduler_enabled for variant in module.VARIANTS), 2)
         self.assertEqual(sum(variant.scheduler_policy_enabled for variant in module.VARIANTS), 1)
@@ -224,6 +392,33 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         variants = {variant.name: variant for variant in module.VARIANTS}
         image = "sha256:" + "a" * 64
         ports = module.Ports(19080, 19081, 19082)
+
+        self.assertEqual(
+            {variant.name for variant in module.VARIANTS if variant.journal_read},
+            {"ui-only", "ui-nonroot"},
+        )
+        for variant in (*module.VARIANTS, None):
+            name = variant.name if variant else "default"
+            with self.subTest(variant=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                module._write_environment(root, image, ports, variant=variant)
+                lines = (root / ".env").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(
+                    [line for line in lines if line.startswith((
+                        "SCHEDULED_BACKUP_ENABLED=", "BACKUP_FULL_ENABLED=", "BACKUP_TARGETS_JSON=",
+                    ))],
+                    ["SCHEDULED_BACKUP_ENABLED=false", "BACKUP_FULL_ENABLED=false", "BACKUP_TARGETS_JSON=[]"],
+                )
+                if variant is not None and name in {"ui-only", "ui-nonroot"}:
+                    self.assertFalse(variant.scheduler_enabled)
+                    self.assertFalse(variant.scheduler_policy_enabled)
+                    self.assertEqual(variant.services, ("enclosure-ui",))
+                    self.assertFalse(any(line.startswith("BACKUP_ARCHIVE_PASSPHRASE_FILE=") for line in lines))
+                expected = "true" if name in {"scheduler-enabled", "ui-only", "ui-nonroot"} else "false"
+                self.assertEqual(
+                    [line for line in lines if line.startswith("BACKUP_CONFIG_ENABLED=")],
+                    [f"BACKUP_CONFIG_ENABLED={expected}"],
+                )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -554,6 +749,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 compose = Path(temp_dir) / "compose.yaml"
                 compose.write_text("services: {}\n", encoding="utf-8")
                 fixture = Path(temp_dir) / "config.yaml"
+                (Path(temp_dir) / "docker-compose.nonroot.yml").write_text("services: {}\n", encoding="utf-8")
                 with patch.object(module, "_run") as run:
                     module._prepare_variant_root(
                         root,
@@ -1190,6 +1386,12 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                                READ_UI_AUTH_USERNAME=module.AUTH_USERNAME, READ_UI_AUTH_PASSWORD=module.AUTH_PASSWORD)
                 services[service] = {
                     "image": image, "environment": env,
+                    "user": "1000:1000" if service == "enclosure-backup-scheduler" else "10001:10001" if variant.nonroot else "0:0",
+                    "read_only": variant.nonroot,
+                    "cap_drop": ["ALL"] if variant.nonroot else [],
+                    "tmpfs": ["/tmp"] if variant.nonroot else [],
+                    "security_opt": ["no-new-privileges:true"] if variant.nonroot else [],
+                    "group_add": ["10001"] if service == "enclosure-backup-scheduler" else [],
                     "volumes": [{"type": "bind", "source": str(runtime / variant.name / "data"), "target": "/app/data"}],
                     "ports": [{"host_ip": "127.0.0.1", "published": str(port_map[service][0]),
                                "target": port_map[service][1], "protocol": "tcp"}] if service in port_map else [],
@@ -1210,10 +1412,16 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 services[variant.services[0]]["environment"]["BACKUP_TARGETS_JSON"] = '[{"type":"sftp"}]'
             if failure == "render-auth":
                 services[variant.services[0]]["environment"]["ADMIN_AUTH_MODE"] = "network"
+            if failure == "render-user":
+                services[variant.services[0]]["user"] = "9999:9999"
+            if failure == "render-hardening":
+                services[variant.services[0]]["read_only"] = False
 
             def prepare(root, **kwargs):
                 root.mkdir()
                 (root / "compose.yaml").write_text("synthetic recovery configuration")
+                if variant.nonroot:
+                    (root / "nonroot.yaml").write_text("synthetic overlay recovery configuration")
                 module._write_environment(root, image, kwargs["ports"], variant=variant)
 
             def transport(command, **kwargs):
@@ -1258,14 +1466,17 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                             continue
                         ports = {f"{p['target']}/tcp": [{"HostIp": p["host_ip"], "HostPort": p["published"]}] for p in spec["ports"]}
                         record = {"Image": image, "State": {"Running": True},
-                                  "Config": {"Labels": {"com.docker.compose.project": project,
+                                  "Config": {"User": spec["user"], "Labels": {"com.docker.compose.project": project,
                                              "com.docker.compose.service": service,
                                              "org.opencontainers.image.revision": revision},
                                              "Env": [f"{k}={v}" for k, v in spec["environment"].items()]},
                                   "Mounts": [{"Type": m["type"], "Source": m["source"],
                                               "Name": volumes[m["source"]]["name"] if m["type"] == "volume" else None,
                                               "Destination": m["target"], "RW": True} for m in spec["volumes"]],
-                                  "HostConfig": {"PortBindings": ports or None, "NetworkMode": project + "_default"},
+                                  "HostConfig": {"PortBindings": ports or None, "NetworkMode": project + "_default",
+                                                 "ReadonlyRootfs": spec["read_only"], "CapDrop": spec["cap_drop"],
+                                                 "GroupAdd": spec["group_add"], "SecurityOpt": spec["security_opt"],
+                                                 "Tmpfs": {key: "" for key in spec["tmpfs"]}},
                                   "NetworkSettings": {"Ports": ports}}
                         if failure == "runtime-image":
                             record["Image"] = "sha256:" + "c" * 64
@@ -1277,6 +1488,16 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                             record["Mounts"][0]["Source"] = str(scratch / "outside")
                         if failure == "runtime-target":
                             record["Config"]["Env"].append('BACKUP_TARGETS_JSON=[{"type":"sftp"}]')
+                        if failure == "runtime-user":
+                            record["Config"]["User"] = "9999:9999"
+                        if failure == "runtime-hardening":
+                            record["HostConfig"]["ReadonlyRootfs"] = not spec["read_only"]
+                        if failure == "runtime-groups":
+                            record["HostConfig"]["GroupAdd"] = ["9999"]
+                        if failure == "runtime-security":
+                            record["HostConfig"]["SecurityOpt"] = []
+                        if failure == "runtime-tmpfs":
+                            record["HostConfig"]["Tmpfs"] = {}
                         records.append(record)
                     return Mock(returncode=0, stdout=json.dumps(records))
                 if command[:2] == ["docker", "container"]:
@@ -1307,7 +1528,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 stack.enter_context(patch.object(module, "_read_app_owned_text", return_value="demo-builder-lab demo-builder-lab-chassis"))
                 for name in ("validate_ports_available", "validate_available_memory", "validate_free_disk",
                              "_verify_ui", "_verify_history", "_verify_admin", "_verify_pencil_cycle",
-                             "_verify_mapping_cycle", "_verify_scheduler_disabled", "_verify_scheduler_enabled"):
+                             "_verify_mapping_cycle", "_verify_ui_journal_read", "_verify_scheduler_disabled", "_verify_scheduler_enabled"):
                     stack.enter_context(patch.object(module, name))
                 stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 stderr = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
@@ -1316,6 +1537,8 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 except BaseException as exc:
                     error = exc
             retained = (runtime / variant.name / "compose.yaml").exists()
+            if retained and variant.nonroot:
+                self.assertTrue((runtime / variant.name / "nonroot.yaml").is_file())
             environment = (runtime / variant.name / ".env").read_text() if retained else ""
             return error, original, events, children, retained, environment, stderr.getvalue()
 
@@ -1336,7 +1559,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                     self.assertLess(events.index("readback"), events.index("remove"))
 
     def test_main_constrains_all_children_and_verifies_actual_runtime(self) -> None:
-        for variant_index in range(7):
+        for variant_index in range(8):
             with self.subTest(variant=variant_index):
                 error, _, events, children, retained, _, _ = self._synthetic_controller(variant_index=variant_index)
                 self.assertIsNone(error)
@@ -1362,6 +1585,7 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
         self.assertNotIn("down", events)
 
     def test_main_refuses_rendered_and_runtime_contract_drift(self) -> None:
+        # Identity is validated against both the rendered model and runtime.
         for failure in ("render-image", "render-port", "render-mount", "render-target", "render-auth",
                         "runtime-image", "runtime-revision", "runtime-port", "runtime-mount", "runtime-target", "render-volume-driver"):
             with self.subTest(failure=failure):
@@ -1373,6 +1597,25 @@ class ComposeRuntimeMatrixContractTests(unittest.TestCase):
                 else:
                     self.assertIn("inspect", events)
                 self.assertFalse(retained)
+
+    def test_nonroot_identity_and_hardening_drift_fail_closed(self) -> None:
+        for failure in ("render-user", "render-hardening", "runtime-user", "runtime-hardening", "runtime-groups", "runtime-security", "runtime-tmpfs"):
+            with self.subTest(failure=failure):
+                error, _, events, _, retained, _, _ = self._synthetic_controller(failure=failure, variant_index=7)
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn("contract", str(error))
+                self.assertFalse(retained)
+                if failure.startswith("render-"):
+                    self.assertNotIn("up", events)
+                else:
+                    self.assertIn("inspect", events)
+
+    def test_nonroot_cleanup_failure_retains_overlay_and_base_configuration(self) -> None:
+        error, original, _, _, retained, environment, stderr = self._synthetic_controller(failure="cleanup-down", variant_index=7)
+        self.assertIs(error, original)
+        self.assertTrue(retained)
+        self.assertIn("APP_UID=10001", environment)
+        self.assertIn("retained", stderr)
 
     def test_cleanup_failure_raises_when_it_is_the_first_failure(self) -> None:
         module = self.load_matrix_module()

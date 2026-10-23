@@ -75,6 +75,144 @@ function loadFunctions(names, context = {}) {
   return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
 }
 
+// Negative HTML assertions for test payloads. These are test checks, not a
+// shipping sanitizer: a plain case-folded substring search covers every case
+// variant of a tag name, where a case-sensitive regex would not.
+function assertNoRawTags(html, ...tagNames) {
+  const lowered = String(html).toLowerCase();
+  for (const tagName of tagNames) {
+    for (const opener of [`<${tagName}`, `</${tagName}`]) {
+      assert.equal(lowered.includes(opener), false, `raw ${opener} must not appear in rendered HTML`);
+    }
+  }
+}
+
+test("SAS disk port rows distinguish zero, missing and saturated counters", () => {
+  const { renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  const html = renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports: [
+    { port: 1, phy: 0, attached_type: "expander device", attached_reason: "power on",
+      negotiated_link_rate: "12 Gbps", invalid_dword_count: 0, running_disparity_error_count: 7,
+      phy_reset_problem_count: 4294967295 },
+    { port: 2, phy: 0, invalid_dword_count: 9 },
+  ] } });
+  assert.match(html, /SAS port 1 PHY 0/);
+  assert.match(html, /SAS port 2 PHY 0/);
+  assert.match(html, /Invalid DWORD: 0/);
+  assert.match(html, /Invalid DWORD: 9/);
+  assert.match(html, /Running disparity: 7/);
+  assert.match(html, /Loss of DWORD sync: not reported/);
+  assert.match(html, /PHY reset problem: 4294967295 \(saturated\)/);
+  assert.match(html, /expander device/);
+  assert.match(html, /power on/);
+  assert.match(html, /12 Gbps/);
+  assert.match(html, /disk-to-expander link only/i);
+  assert.match(html, /cumulative/i);
+});
+
+test("missing SAS logs are not reported while SATA and NVMe remain unchanged", () => {
+  const { renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  for (const sas_ports of [undefined, null, []]) {
+    assert.match(renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports } }), /not reported/);
+  }
+  for (const transport_protocol of ["SATA", "ATA", "NVMe"]) {
+    assert.equal(renderSasPortCounters({ sas_address: "synthetic" }, {
+      data: { transport_protocol, sas_ports: [{ port: 1, phy: 0, invalid_dword_count: 1 }] },
+    }), "");
+  }
+});
+
+test("SAS counters reject malformed values and escape reported metadata", () => {
+  const { formatSasPortCounter, renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  for (const value of [undefined, null, false, true, -1, 4294967296, 1.5, "0", "FFFFFFFF"]) {
+    assert.equal(formatSasPortCounter(value), "not reported");
+  }
+  const html = renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports: [
+    { port: 1, phy: 0, attached_reason: "<img src=x>", attached_type: "<script>" },
+    { port: 2, phy: 0, attached_reason: "<IMG SRC=x>", attached_type: "<SCRIPT>", negotiated_link_rate: "</ScRiPt >" },
+  ] } });
+  assertNoRawTags(html, "img", "script");
+  assert.ok(html.includes("&lt;img src=x&gt;"), "lowercase payload is escaped");
+  assert.ok(html.includes("&lt;IMG SRC=x&gt;"), "uppercase payload is escaped");
+  assert.ok(html.includes("&lt;SCRIPT&gt;"), "uppercase tag is escaped");
+  assert.ok(html.includes("&lt;/ScRiPt &gt;"), "mixed-case closing tag is escaped");
+});
+
+test("both live and saved disk details render SAS port counters", () => {
+  assert.match(functionSource("renderLiveSlotDetail"), /renderSasPortCounters\(slot, smartEntry\)/);
+  assert.match(functionSource("renderDetail"), /renderSasPortCounters\(storageViewDetailSlot, smartEntry\)/);
+});
+
+test("SATA PHY events show exact totals and size-dependent saturation", () => {
+  const { renderSataPhyEvents } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "kvRow", "escapeHtml",
+  ]);
+  const html = renderSataPhyEvents({ data: { transport_protocol: "ATA", sata_phy_events: [
+    { id: 2, size: 2, name: "R_ERR response for data FIS", value: "0" },
+    { id: 11, size: 2, name: "CRC errors within host-to-device FIS", value: "65535" },
+    { id: 32769, size: 8, name: "Vendor specific", value: "18446744073709551615" },
+    { id: 3, size: 2, name: "Missing total", value: null },
+  ] } });
+  assert.match(html, /R_ERR response for data FIS: 0/);
+  assert.match(html, /CRC errors within host-to-device FIS: 65535 \(saturated\)/);
+  assert.match(html, /18446744073709551615 \(saturated\)/);
+  assert.match(html, /Missing total: not reported/);
+  assert.match(html, /0x000b/);
+  assert.match(html, /Cumulative.*disk-side.*No timestamps/i);
+});
+
+test("SATA behind an expander shows SATA events, never a SAS unavailable row", () => {
+  const { renderSataPhyEvents, renderSasPortCounters } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "renderSasPortCounters",
+    "shouldShowSasTransportFields", "formatSasPortCounter", "kvRow", "escapeHtml",
+  ]);
+  for (const transport_protocol of ["ATA", "SATA"]) {
+    for (const sata_phy_events of [null, undefined, []]) {
+      const entry = { data: { transport_protocol, sata_phy_events } };
+      assert.match(renderSataPhyEvents(entry), /SATA PHY events.*not reported/s);
+      assert.equal(renderSasPortCounters({ sas_address: "synthetic-expander-path" }, entry), "");
+    }
+  }
+  const entry = { data: { sata_phy_events: [{ id: 2, size: 2, name: "Event", value: "0" }] } };
+  assert.match(renderSataPhyEvents(entry), /Event: 0/);
+  assert.equal(renderSasPortCounters({ sas_address: "synthetic-expander-path" }, entry), "");
+  for (const transport_protocol of ["SAS", "NVMe"]) {
+    assert.equal(renderSataPhyEvents({ data: { ...entry.data, transport_protocol } }), "");
+  }
+  assert.match(renderSataPhyEvents({ loading: true, data: { transport_protocol: "SATA" } }), /Loading/);
+});
+
+test("SATA PHY rows escape metadata and reject invalid numeric representations", () => {
+  const { renderSataPhyEvents, formatSataPhyCounter } = loadFunctions([
+    "renderSataPhyEvents", "formatSataPhyCounter", "kvRow", "escapeHtml",
+  ]);
+  for (const value of [null, undefined, true, false, 0, "-1", "1.5", "01", "65536", "18446744073709551616"]) {
+    assert.equal(formatSataPhyCounter({ size: 2, value }), "not reported");
+  }
+  assert.equal(formatSataPhyCounter({ size: 3, value: "0" }), "not reported");
+  const html = renderSataPhyEvents({ data: { transport_protocol: "ATA", sata_phy_events: [
+    { id: 2, size: 2, value: "3", name: "<img src=x>" },
+    { id: 3, size: 2, value: "5", name: "<IMG SRC=x><SCRIPT>" },
+    { id: "<script>", size: 2, value: "4", name: "bad identity" },
+    { id: "<SCRIPT>", size: 2, value: "4", name: "BAD IDENTITY" },
+  ] } });
+  assert.ok(html.includes("&lt;img src=x&gt;"), "lowercase payload is escaped");
+  assert.ok(html.includes("&lt;IMG SRC=x&gt;&lt;SCRIPT&gt;"), "uppercase payload is escaped");
+  assertNoRawTags(html, "img", "script");
+  assert.equal(html.includes("bad identity"), false, "a row without integer identity is not rendered");
+  assert.equal(html.includes("BAD IDENTITY"), false, "a row without integer identity is not rendered");
+});
+
+test("both live and saved disk details render SATA event equivalents", () => {
+  assert.match(functionSource("renderLiveSlotDetail"), /renderSataPhyEvents\(smartEntry\)/);
+  assert.match(functionSource("renderDetail"), /renderSataPhyEvents\(smartEntry\)/);
+});
+
 function classList(initial = []) {
   const values = new Set(initial);
   return {

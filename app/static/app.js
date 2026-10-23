@@ -4579,6 +4579,10 @@
     if (transport.includes("nvme") || transport.includes("ata") || transport.includes("sata")) {
       return false;
     }
+    // An observed SATA disk log beats a bay's SAS expander path address.
+    if (smartEntry?.data?.sata_phy_events?.length) {
+      return false;
+    }
 
     return Boolean(
       smartEntry?.data?.logical_unit_id ||
@@ -4590,6 +4594,63 @@
       slot?.raw_status?.attached_sas_address ||
       slot?.multipath?.lunid
     );
+  }
+
+  function formatSasPortCounter(value) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      return "not reported";
+    }
+    return value === 0xffffffff ? `${value} (saturated)` : String(value);
+  }
+
+  function renderSasPortCounters(slot, smartEntry) {
+    if (!shouldShowSasTransportFields(slot, smartEntry)) {
+      return "";
+    }
+    const ports = Array.isArray(smartEntry?.data?.sas_ports)
+      ? smartEntry.data.sas_ports.filter((row) => row && Number.isInteger(row.port) && row.port >= 0 && row.port <= 65535
+        && Number.isInteger(row.phy) && row.phy >= 0 && row.phy <= 255)
+      : [];
+    if (!ports.length) {
+      return kvRow("SAS port counters", smartEntry?.loading ? "Loading..." : "not reported");
+    }
+    return ports.map((row) => kvRow(`SAS port ${row.port} PHY ${row.phy}`, [
+      `Attached type: ${row.attached_type || "not reported"}`,
+      `Attached reason: ${row.attached_reason || "not reported"}`,
+      `Rate: ${row.negotiated_link_rate || "not reported"}`,
+      `Invalid DWORD: ${formatSasPortCounter(row.invalid_dword_count)}`,
+      `Running disparity: ${formatSasPortCounter(row.running_disparity_error_count)}`,
+      `Loss of DWORD sync: ${formatSasPortCounter(row.loss_of_dword_synchronization_count)}`,
+      `PHY reset problem: ${formatSasPortCounter(row.phy_reset_problem_count)}`,
+    ].join("; "))).join("") + kvRow("SAS counter scope",
+      "Cumulative totals from smartctl disk port log. Disk-to-expander link only, not upstream cables. No timestamps or change rate.");
+  }
+
+  function formatSataPhyCounter(row) {
+    if (![2, 4, 6, 8].includes(row.size) || typeof row.value !== "string"
+      || !/^(0|[1-9][0-9]{0,19})$/.test(row.value)) {
+      return "not reported";
+    }
+    const value = BigInt(row.value);
+    const maximum = (1n << BigInt(8 * row.size)) - 1n;
+    if (value > maximum) return "not reported";
+    return value === maximum ? `${row.value} (saturated)` : row.value;
+  }
+
+  function renderSataPhyEvents(smartEntry) {
+    const transport = String(smartEntry?.data?.transport_protocol || "").toLowerCase();
+    if (transport.includes("sas") || transport.includes("nvme")) return "";
+    const events = Array.isArray(smartEntry?.data?.sata_phy_events)
+      ? smartEntry.data.sata_phy_events.filter((row) => row && Number.isInteger(row.id)
+        && row.id > 0 && row.id <= 0x8fff && !(row.id & ~0x8fff) && [2, 4, 6, 8].includes(row.size))
+      : [];
+    if (!transport.includes("ata") && !events.length) return "";
+    if (!events.length) {
+      return kvRow("SATA PHY events", smartEntry?.loading ? "Loading..." : "not reported");
+    }
+    return events.map((row) => kvRow(`SATA PHY event 0x${row.id.toString(16).padStart(4, "0")}`,
+      `${row.name || "Event name not reported"}: ${formatSataPhyCounter(row)}`)).join("")
+      + kvRow("SATA counter scope", "Cumulative totals from smartctl disk-side SATA PHY event log. Not expander counters. No timestamps or change rate.");
   }
 
   function formatNamespaceIdentifierValue(value, smartEntry) {
@@ -9024,6 +9085,8 @@
           showSasTransportFields ? kvRowIfMeaningful("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
           showSasTransportFields ? kvRowIfMeaningful("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
           showLinkRate ? kvRowIfMeaningful("Link Rate", formatLinkRateValue(smartEntry)) : "",
+          renderSasPortCounters(slot, smartEntry),
+          renderSataPhyEvents(smartEntry),
           kvRowIfMeaningful("SES Flags", formatSesStateValue(slot), false, slot?.raw_status?.ses_swapped ? SES_SWAP_TITLE : ""),
         ]),
       ].filter(Boolean).join("");
@@ -9171,6 +9234,8 @@
         showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
         showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
         showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
+        renderSasPortCounters(storageViewDetailSlot, smartEntry),
+        renderSataPhyEvents(smartEntry),
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),
@@ -10814,7 +10879,9 @@
       }
 
       const requestedState = payload.requested_active === false ? "off" : "on";
-      if (payload.confirmed === true) {
+      if (payload.partial === true) {
+        reportLocate(`Locate light ${requestedState} was read back through one enclosure path for slot ${slot.slot_label}, but another path failed. Not all paths are confirmed.`, "warning");
+      } else if (payload.confirmed === true) {
         reportLocate(`Locate light ${requestedState} for slot ${slot.slot_label}, confirmed through ${locateLightSourceLabel(slot)}.`);
       } else if (payload.confirmed === false) {
         reportLocate(`The enclosure did not confirm the locate light is ${requestedState} for slot ${slot.slot_label}.`, "warning");

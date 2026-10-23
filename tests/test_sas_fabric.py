@@ -3876,6 +3876,373 @@ class FabricPathRegressionTests(unittest.TestCase):
                     self.assertEqual({nodes[c["id"]].status for c in fabric.controllers}, {"online"})
 
 
+class SystemSasFabricDraftTests(unittest.TestCase):
+    """Inactive composition contract, not a replacement for cascade admission."""
+
+    @staticmethod
+    def payload(enclosure="synthetic-head", system="synthetic-system", unit=0):
+        address = f"{1:016x}"
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id=system, truenas=TrueNASConfig(platform="core")),
+            snapshot=InventorySnapshot(
+                slots=[FabricPathRegressionTests.slot(0)], refresh_interval_seconds=30,
+                selected_enclosure_id=address,
+            ),
+            ssh_outputs={
+                "mprutil show adapters": f"/dev/mpr{unit} SAS3516 Synthetic 1.0",
+                f"mprutil -u {unit} show expanders": f"36 {address} 0009 0001 0002 1",
+            },
+        )
+        payload = fabric.model_dump(mode="json")
+        payload.update(selected_enclosure_id=enclosure, generated_at="2026-01-01T00:00:00Z")
+        return payload
+
+    @staticmethod
+    def compose(payloads, **overrides):
+        from app.services.system_sas_fabric import compose_system_sas_fabrics
+
+        return compose_system_sas_fabrics(
+            payloads, **{"max_input_bytes": 4 * 1024 * 1024, "max_depth": 40, **overrides},
+        )
+
+    @classmethod
+    def cascade_payload(cls, enclosure="synthetic-head"):
+        from app.models.domain import SasFabricLink, SasFabricNode
+
+        payload = cls.payload(enclosure)
+        # Supplied graph edge only. This fixture does not implement/adopt #970.
+        rows = parse_mpr_expanders(
+            f"36 {1:016x} 0009 0001 0002 1\n"
+            "  4 8 0019 12.0 1.5 12.0 Expander\n"
+            "  5 9 0019 12.0 1.5 12.0 Expander\n"
+            f"36 {2:016x} 0019 0009 0012 2\n"
+            "  8 4 0009 12.0 1.5 12.0 Expander\n"
+            "  9 5 0009 12.0 1.5 12.0 Expander"
+        )
+        payload["nodes"] = [n for n in payload["nodes"] if n["kind"] != "expander"]
+        for row in rows:
+            payload["nodes"].append(SasFabricNode(
+                id=f"expander:controller:mpr0:{row['sas_address']}", kind="expander",
+                label="Synthetic expander", raw_id=row["sas_address"], controller_id="controller:mpr0",
+                related_slots=[0], evidence=["mprutil -u 0 show expanders"], raw=row,
+            ).model_dump(mode="json"))
+        source, target = [n["id"] for n in payload["nodes"] if n["kind"] == "expander"]
+        payload["links"] = [link for link in payload["links"] if link["kind"] != "controller-expander"]
+        payload["links"].append(SasFabricLink(
+            id="synthetic-cascade", source=source, target=target, kind="expander-expander",
+            evidence=["synthetic supplied edge"], related_slots=[0],
+        ).model_dump(mode="json"))
+        payload["traces"] = []
+        return payload
+
+    def test_same_system_deduplicates_shared_hba_and_expander_without_losing_bays(self):
+        first, second = self.payload(), self.payload("synthetic-jbod")
+        before = json.dumps([first, second], sort_keys=True)
+        graph = self.compose([first, second])["systems"][0]
+        self.assertEqual(len([n for n in graph["nodes"] if n["kind"] == "controller"]), 1)
+        self.assertEqual(len([n for n in graph["nodes"] if n["kind"] == "expander"]), 1)
+        bays = [n for n in graph["nodes"] if n["kind"] == "bay"]
+        self.assertEqual(len(bays), 2)
+        self.assertEqual({n["observations"][0]["enclosure_id"] for n in bays}, {"synthetic-head", "synthetic-jbod"})
+        self.assertTrue(all(n["observations"][0]["payload"]["related_slots"] == [0] for n in bays))
+        self.assertEqual(json.dumps([first, second], sort_keys=True), before)
+
+    def test_system_and_controller_identity_never_collide(self):
+        result = self.compose([self.payload(), self.payload(system="synthetic-other"), self.payload("synthetic-jbod", unit=1)])
+        self.assertEqual(len(result["systems"]), 2)
+        ids = [n["id"] for graph in result["systems"] for n in graph["nodes"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        own = next(g for g in result["systems"] if g["system_id"] == "synthetic-system")
+        self.assertEqual(len([n for n in own["nodes"] if n["kind"] == "expander"]), 2)
+
+    def test_missing_authoritative_scope_and_duplicate_enclosure_are_refused(self):
+        for field in ("system_id", "selected_enclosure_id"):
+            payload = self.payload()
+            payload[field] = None
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "scope"):
+                self.compose([payload])
+        with self.assertRaisesRegex(ValueError, "duplicate enclosure"):
+            self.compose([self.payload(), self.payload()])
+
+    def test_conflicting_controller_identity_is_not_shared(self):
+        first, second = self.payload(), self.payload("synthetic-jbod")
+        for payload, address in ((first, "0000:01:00.0"), (second, "0000:02:00.0")):
+            next(n for n in payload["nodes"] if n["kind"] == "controller")["metrics"]["pci_address"] = address
+        graph = self.compose([first, second])["systems"][0]
+        controllers = [n for n in graph["nodes"] if n["kind"] == "controller"]
+        self.assertEqual(len(controllers), 2)
+        self.assertTrue(all(n["identity_state"] == "conflicting" for n in controllers))
+        self.assertEqual(len([n for n in graph["nodes"] if n["kind"] == "expander"]), 2)
+
+    def test_handle_only_expander_identity_stays_enclosure_local(self):
+        payloads = [self.payload(), self.payload("synthetic-jbod")]
+        for payload in payloads:
+            next(n for n in payload["nodes"] if n["kind"] == "expander")["raw"].pop("sas_address")
+        graph = self.compose(payloads)["systems"][0]
+        self.assertEqual(len([n for n in graph["nodes"] if n["kind"] == "expander"]), 2)
+
+    def test_supplied_cascade_and_reported_reciprocal_lanes_are_preserved(self):
+        graph = self.compose([self.cascade_payload()])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"], {
+            "state": "observed", "lane_count": 2, "source_phys": [4, 5], "target_phys": [8, 9],
+            "phy_pairs": [[4, 8], [5, 9]], "basis": "reciprocal_reported_phy_rows",
+        })
+        self.assertEqual(link["observations"][0]["payload"]["evidence"], ["synthetic supplied edge"])
+        self.assertFalse(any(link["kind"] == "controller-expander" for link in graph["links"]))
+
+    def test_case_alias_endpoint_handles_never_admit_reciprocal_lanes(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "A00B"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"]
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertIsNone(link["wide_port"]["lane_count"])
+
+    def test_distinct_hex_handles_match_phy_rows_without_changing_raw_evidence(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "c00d"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"].upper()
+        before = json.dumps(payload, sort_keys=True)
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "observed")
+        self.assertEqual(link["wide_port"]["lane_count"], 2)
+        self.assertEqual(json.dumps(payload, sort_keys=True), before)
+        observations = [observation["payload"] for node in graph["nodes"]
+                        if node["kind"] == "expander" for observation in node["observations"]]
+        self.assertEqual({node["raw"]["dev_handle"] for node in observations}, {"a00b", "c00d"})
+
+    def test_case_alias_duplicate_handle_is_ambiguous_within_controller(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "c00d"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"]
+        duplicate = json.loads(json.dumps(left))
+        duplicate.update(id="synthetic-duplicate-expander", raw_id=f"{3:016x}")
+        duplicate["raw"].update(sas_address=f"{3:016x}", dev_handle="A00B", phys=[])
+        payload["nodes"].append(duplicate)
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertEqual(link["wide_port"]["reason"], "ambiguous_endpoint_handle")
+
+    def test_shared_lanes_are_not_summed_and_permutations_are_deterministic(self):
+        first, second = self.cascade_payload(), self.cascade_payload("synthetic-jbod")
+        expected = self.compose([first, second])
+        for payload in (first, second):
+            payload["nodes"].reverse()
+            payload["links"].reverse()
+            for node in payload["nodes"]:
+                if "phys" in node["raw"]:
+                    node["raw"]["phys"].reverse()
+        self.assertEqual(self.compose([second, first]), expected)
+        link = next(link for link in expected["systems"][0]["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["lane_count"], 2)
+        self.assertEqual(len(link["observations"]), 2)
+
+    def test_missing_phy_evidence_never_becomes_zero_or_linked_phy_count(self):
+        payload = self.payload()
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "controller-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertIsNone(link["wide_port"]["lane_count"])
+        self.assertIsNone(link["wide_port"]["source_phys"])
+        self.assertIsNone(link["wide_port"]["target_phys"])
+
+    def test_contradictory_or_partial_or_duplicate_phy_evidence_stays_unknown(self):
+        for change in ("remote", "duplicate", "missing", "handle", "type"):
+            payload = self.cascade_payload()
+            peer = [n for n in payload["nodes"] if n["kind"] == "expander"][1]
+            if change == "remote":
+                peer["raw"]["phys"][0]["remote_phy"] = "7"
+            elif change == "duplicate":
+                peer["raw"]["phys"].append(dict(peer["raw"]["phys"][0]))
+            elif change == "missing":
+                peer["raw"]["phys"].pop()
+            elif change == "handle":
+                peer["raw"]["dev_handle"] = None
+            else:
+                peer["raw"]["phys"][0]["device"] = "No Device"
+            with self.subTest(change=change):
+                graph = self.compose([payload])["systems"][0]
+                link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+                self.assertEqual(link["wide_port"]["state"], "unknown")
+                self.assertIsNone(link["wide_port"]["lane_count"])
+
+    def test_conflicting_reports_do_not_promote_one_shelfs_lanes(self):
+        first, second = self.cascade_payload(), self.cascade_payload("synthetic-jbod")
+        next(n for n in second["nodes"] if n["kind"] == "expander")["raw"]["phys"] = []
+        graph = self.compose([first, second])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertEqual(len(link["observations"]), 2)
+
+    def test_sources_warnings_unknowns_and_local_trace_references_survive(self):
+        payloads = [self.payload(), self.payload("synthetic-jbod")]
+        payloads[0]["warnings"] = ["Synthetic missing evidence"]
+        payloads[0]["raw"]["future_evidence"] = {"unknown": None}
+        result = self.compose(payloads)["systems"][0]
+        enclosure = next(e for e in result["enclosures"] if e["enclosure_id"] == "synthetic-head")
+        self.assertEqual(enclosure["snapshot"]["warnings"], payloads[0]["warnings"])
+        self.assertEqual(enclosure["snapshot"]["raw"], payloads[0]["raw"])
+        all_nodes, all_links = {n["id"] for n in result["nodes"]}, {link["id"] for link in result["links"]}
+        for enclosure in result["enclosures"]:
+            for trace in enclosure["traces"]:
+                self.assertLessEqual(set(trace["node_ids"]), all_nodes)
+                self.assertLessEqual(set(trace["link_ids"]), all_links)
+                self.assertEqual(trace["observation"]["slots"], [0])
+
+    def test_malformed_graph_structure_is_explicitly_refused(self):
+        for change in ("duplicate_node", "dangling_link", "dangling_controller", "dangling_trace", "bad_node"):
+            payload = self.payload()
+            if change == "duplicate_node":
+                payload["nodes"].append(dict(payload["nodes"][0]))
+            elif change == "dangling_link":
+                payload["links"][0]["target"] = "absent"
+            elif change == "dangling_controller":
+                next(n for n in payload["nodes"] if n["kind"] == "expander")["controller_id"] = "absent"
+            elif change == "dangling_trace":
+                payload["traces"][0]["node_ids"].append("absent")
+            else:
+                payload["nodes"][0]["kind"] = 7
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.compose([payload])
+
+    def test_explicit_caller_budgets_refuse_size_depth_cycles_and_non_json(self):
+        with self.assertRaisesRegex(ValueError, "byte budget"):
+            self.compose([self.payload()], max_input_bytes=100)
+        with self.assertRaisesRegex(ValueError, "depth budget"):
+            self.compose([self.payload()], max_depth=2)
+        payload = self.payload()
+        payload["raw"]["cycle"] = payload
+        with self.assertRaises(ValueError):
+            self.compose([payload])
+        for value in (float("nan"), object()):
+            payload = self.payload()
+            payload["raw"]["invalid"] = value
+            with self.assertRaises(ValueError):
+                self.compose([payload])
+        for limits in ({"max_input_bytes": 0}, {"max_depth": True}):
+            with self.assertRaises(ValueError):
+                self.compose([], **limits)
+
+    def test_ambiguous_handles_or_reused_local_phys_are_not_lane_evidence(self):
+        for change in ("handle_collision", "reused_phy", "raw_controller_conflict"):
+            payload = self.cascade_payload()
+            source, target = [n for n in payload["nodes"] if n["kind"] == "expander"]
+            if change == "handle_collision":
+                duplicate = json.loads(json.dumps(target))
+                duplicate.update(id="synthetic-ambiguous-peer", raw_id=f"{3:016x}")
+                duplicate["raw"]["sas_address"] = f"{3:016x}"
+                payload["nodes"].append(duplicate)
+            elif change == "reused_phy":
+                source["raw"]["phys"].append({**source["raw"]["phys"][0], "dev_handle": "0029"})
+            else:
+                source["raw"]["controller_id"] = "controller:mpr1"
+            with self.subTest(change=change):
+                graph = self.compose([payload])["systems"][0]
+                link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+                self.assertEqual(link["wide_port"]["state"], "unknown")
+                self.assertIsNone(link["wide_port"]["lane_count"])
+
+    def test_duplicate_sas_identity_in_one_enclosure_is_refused(self):
+        payload = self.cascade_payload()
+        duplicate = json.loads(json.dumps(next(n for n in payload["nodes"] if n["kind"] == "expander")))
+        duplicate["id"] = "synthetic-duplicate-identity"
+        payload["nodes"].append(duplicate)
+        with self.assertRaisesRegex(ValueError, "ambiguous shared node identity"):
+            self.compose([payload])
+
+    def test_scope_tuple_encoding_preserves_case_and_delimiters(self):
+        payloads = [self.payload("c", "synthetic:a:b"), self.payload("b:c", "synthetic:a"),
+                    self.payload("c", "Synthetic:a:b")]
+        result = self.compose(payloads)
+        ids = [n["id"] for graph in result["systems"] for n in graph["nodes"]]
+        self.assertEqual(len(result["systems"]), 3)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(self.compose(list(reversed(payloads))), result)
+
+    def test_distinct_supplied_parallel_edges_and_trace_membership_are_preserved(self):
+        from app.models.domain import SasFabricLink, SasFabricNode, SasFabricSnapshot, SasFabricTrace
+
+        payload = SasFabricSnapshot(
+            system_id="synthetic-system", selected_enclosure_id="synthetic-head",
+            nodes=[SasFabricNode(id="h", kind="host", label="Synthetic"),
+                   SasFabricNode(id="c", kind="controller", label="Synthetic controller")],
+            links=[SasFabricLink(id=f"l{slot}", source="h", target="c", kind="host-controller", related_slots=[slot])
+                   for slot in (0, 1)],
+            traces=[SasFabricTrace(id=f"t{slot}", kind="path", label="Synthetic path", link_ids=[f"l{slot}"], slots=[slot])
+                    for slot in (0, 1)],
+        ).model_dump(mode="json")
+        graph = self.compose([payload])["systems"][0]
+        self.assertEqual(len(graph["links"]), 2)
+        traces = graph["enclosures"][0]["traces"]
+        self.assertNotEqual(traces[0]["link_ids"], traces[1]["link_ids"])
+        by_id = {link["id"]: link for link in graph["links"]}
+        for trace in traces:
+            link = by_id[trace["link_ids"][0]]
+            self.assertEqual(link["observations"][0]["payload"]["related_slots"], trace["observation"]["slots"])
+
+    def test_malformed_interpreted_raw_fields_refuse_with_value_error(self):
+        import os
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        command = [sys.executable, str(root / "scripts" / "preview_system_sas_fabric.py"),
+                   "--max-input-bytes", str(4 * 1024 * 1024), "--max-depth", "40"]
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        for field, value in (("dev_handle", []), ("dev_handle", {}), ("controller_id", []),
+                             ("sas_address", {}), ("phys", {}), ("device", []), ("device", {})):
+            payload = self.cascade_payload()
+            peer = [n for n in payload["nodes"] if n["kind"] == "expander"][1]
+            if field == "device":
+                peer["raw"]["phys"][0][field] = value
+            else:
+                peer["raw"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    self.compose([payload])
+                child = subprocess.run(command, input=json.dumps([payload]), text=True, capture_output=True,
+                                       cwd=root, env=environment, timeout=10)
+                self.assertEqual(child.returncode, 2)
+                self.assertEqual(child.stdout, "")
+                self.assertNotIn("Traceback", child.stderr)
+
+    def test_preview_cli_reads_stdin_and_file_and_refuses_bad_input(self):
+        import os
+        import subprocess
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        command = [sys.executable, str(root / "scripts" / "preview_system_sas_fabric.py"),
+                   "--max-input-bytes", str(4 * 1024 * 1024), "--max-depth", "40"]
+        payload = json.dumps([self.payload()])
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "synthetic.json"
+            source.write_text(payload)
+            stdin = subprocess.run(command, input=payload, text=True, capture_output=True, cwd=directory, env=environment, timeout=10)
+            file = subprocess.run([*command, str(source)], text=True, capture_output=True, cwd=directory, env=environment, timeout=10)
+            refusals = [subprocess.run(command, input=data, text=True, capture_output=True, cwd=directory, env=environment, timeout=10)
+                        for data in ("[{}]", "{\"duplicate\":1,\"duplicate\":2}", "[NaN]", "[" * 10000, "[" + " " * (4 * 1024 * 1024))]
+        self.assertEqual(stdin.returncode, 0, stdin.stderr)
+        self.assertEqual(file.returncode, 0, file.stderr)
+        self.assertEqual(stdin.stdout, file.stdout)
+        self.assertEqual(json.loads(stdin.stdout), self.compose(json.loads(payload)))
+        self.assertTrue(all(bad.returncode == 2 and bad.stdout == "" for bad in refusals))
+
+
 class SasFabricInventoryProbeTests(unittest.TestCase):
     @staticmethod
     def _service(platform: str = "core") -> InventoryService:

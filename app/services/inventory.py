@@ -13,7 +13,7 @@ import threading
 import weakref
 from contextlib import contextmanager, nullcontext
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -63,6 +63,11 @@ from app.services.credential_authority import (
     ssh_credential_authorities,
 )
 from app.services.inventory_accounting import DiskRetentionAccounting, build_disk_retention_accounting
+from app.services.combined_shelf_ids import (
+    combined_enclosure_parts,
+    combined_mapping_warnings,
+    combined_reference_warnings,
+)
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -976,6 +981,23 @@ class UnknownEnclosureError(Exception):
 
     def __init__(self) -> None:
         super().__init__("Requested enclosure is not available for this system.")
+
+
+class SplitEnclosureError(UnknownEnclosureError):
+    """A combined shelf id from before #1000 whose shelves are now separate (#1006).
+
+    It stays an UnknownEnclosureError, so every caller that tolerates an
+    unknown id keeps doing so; the route answer names the separate shelves.
+    """
+
+    def __init__(self, enclosure_id: str, member_ids: Sequence[str]) -> None:
+        self.enclosure_id = enclosure_id
+        self.member_ids = tuple(member_ids)
+        Exception.__init__(
+            self,
+            f"Enclosure {enclosure_id} combined {len(self.member_ids)} shelves that are now shown "
+            f"separately: {', '.join(self.member_ids)}. Choose one of them instead.",
+        )
 
 
 class SnapshotStateBusyError(Exception):
@@ -2180,6 +2202,16 @@ class InventoryService:
                 and len(set(parts)) == len(parts)
                 and all(part in options and ":" not in part and options[part].slot_count for part in parts)
             ):
+                # Elsewhere a combined id is a pre-#1000 default view whose
+                # shelves are now separate. Say so instead of "unknown" when
+                # every shelf it joined is still offered (#1006).
+                members = combined_enclosure_parts(selected_enclosure_id)
+                if (
+                    self.system.truenas.platform != "core"
+                    and members is not None
+                    and all(member in options for member in members)
+                ):
+                    raise SplitEnclosureError(selected_enclosure_id, members)
                 raise UnknownEnclosureError()
         return selected_enclosure_id, (
             discovered_snapshot
@@ -7198,6 +7230,9 @@ class InventoryService:
                 )
         finally:
             _snapshot_read_inputs.reset(token)
+        for warning in self._combined_shelf_scope_warnings(available_enclosures, mappings):
+            if warning not in warnings:
+                warnings.append(warning)
         enclosure_source = self._enclosure_source(raw_data, available_enclosures)
         if (
             core_no_bays_warning
@@ -12838,6 +12873,65 @@ class InventoryService:
         )
         return finalize_enclosure_option_labels(options, aliases)
 
+    def _combined_shelf_scope_warnings(
+        self,
+        available_enclosures: list[EnclosureOption],
+        loaded_mappings: Mapping[str, ManualMapping],
+    ) -> list[str]:
+        """Name saved state still filed under a split combined shelf id (#1006).
+
+        Read only: the warning says where each saved bay belongs when that is
+        unambiguous and leaves the save to the operator, who can check the
+        disk first.
+        """
+        offered = {option.id: option for option in available_enclosures if option.kind == "physical"}
+        system_ids = {self.system.id, None}
+        combined_scopes: dict[str, list[int]] = {}
+        assigned: dict[tuple[str, int], bool] = {}
+        for key in loaded_mappings:
+            mapping = loaded_mappings[key]
+            if mapping.system_id not in system_ids or not mapping.enclosure_id:
+                continue
+            assigned[(mapping.enclosure_id, mapping.slot)] = True
+            if combined_enclosure_parts(mapping.enclosure_id) is not None:
+                combined_scopes.setdefault(mapping.enclosure_id, []).append(mapping.slot)
+        # A shelf that is merely offline is not a split; say nothing until at
+        # least one shelf the id joined is reported again.
+        combined_scopes = {
+            enclosure_id: slots
+            for enclosure_id, slots in combined_scopes.items()
+            if any(part in offered for part in combined_enclosure_parts(enclosure_id) or ())
+        }
+        reopenable = {
+            enclosure_id
+            for enclosure_id in combined_scopes
+            if self.system.truenas.platform == "core"
+            and all(
+                part in offered and offered[part].slot_count
+                for part in combined_enclosure_parts(enclosure_id) or ()
+            )
+        }
+        warnings = combined_mapping_warnings(
+            combined_scopes,
+            offered_ids=offered,
+            bay_counts={enclosure_id: option.slot_count for enclosure_id, option in offered.items()},
+            has_assignment=assigned,
+            reopenable_ids=reopenable,
+        )
+        if offered:
+            # With no shelf reported there is nothing to compare against.
+            warnings.extend(
+                combined_reference_warnings(
+                    offered_ids=offered,
+                    view_order=self.system.view_order,
+                    storage_view_bindings=[
+                        (storage_view.id, storage_view.binding.enclosure_ids)
+                        for storage_view in self.system.storage_views
+                    ],
+                )
+            )
+        return warnings
+
     def _warn_unapplied_legacy_mappings(
         self,
         warnings: list[str],
@@ -15136,6 +15230,17 @@ class InventoryService:
         sg_action = "--set=ident" if requested_active else "--clear=ident"
         acted_on_another_path = False
         for target_host, host_targets in by_host.items():
+            # Keep every required path, including failed/unread paths. Omitting
+            # one could turn a single off readback into a false global off.
+            host_paths = [
+                {
+                    "ses_device": normalize_text(target.get("ses_device")),
+                    "ses_element_id": target["ses_element_id"],
+                    "identify_active": None,
+                }
+                for target in host_targets
+            ]
+            paths.extend(host_paths)
             # Discovery only maps a device whose AES page it read, so the same
             # page, read first in this session, says which shelf it is now.
             preflight_commands = [
@@ -15192,6 +15297,13 @@ class InventoryService:
                         f"{exc} The other enclosure path also failed: " + "; ".join(failures)
                     ) from exc
                 raise
+            except LedSessionBusyError:
+                raise
+            except TrueNASAPIError as exc:
+                # An ordinary preflight failure leaves this host untouched,
+                # but must not discard a confirmed action on another host.
+                failures.append(str(exc))
+                continue
             results = results[len(preflight_commands):]
             # Only a successful locate command counts as switching this bay.
             acted_on_another_path = acted_on_another_path or any(
@@ -15240,16 +15352,15 @@ class InventoryService:
                         )
                         if mapped_slot is not None:
                             observed = bool(mapped_slot.identify_active)
-                paths.append(
-                    {
-                        "ses_device": target_device,
-                        "ses_element_id": target_element,
-                        "identify_active": observed,
-                    }
-                )
+                host_paths[index]["identify_active"] = observed
+        result = self._led_readback_result(requested_active, paths)
         if failures:
-            raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
-        return self._led_readback_result(requested_active, paths)
+            # A successful command alone is not partial success: at least one
+            # successful path must actually read back the requested state.
+            if not any(path["identify_active"] is requested_active for path in paths):
+                raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+            result.update(partial=True, failures=[failure[:240] for failure in failures[:8]])
+        return result
 
     @staticmethod
     def _led_readback_result(

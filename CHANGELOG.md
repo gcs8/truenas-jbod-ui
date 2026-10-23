@@ -33,6 +33,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - On TrueNAS CORE hosts read over SSH only, separate backplanes and AHCI SGPIO
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
+- Same-model SES shelves that an earlier version joined into one enclosure
+  with a combined id such as `A+B` are now separate shelves. Outside CORE a
+  link or API call naming `A+B` answers 404 with the separate shelf ids, and
+  the page opens the first shelf. Bay assignments, history, the saved
+  main-page order and storage-view bindings filed under `A+B` stay there and
+  are named in the page warnings and the admin banner, with each bay's place
+  on the separate shelves. Save those assignments again on the shelf they
+  belong to (#1008).
+
+### Added
+
+- Disk details showed already-collected SAS JSON/text port counters and SATA
+  PHY events, preserving reported identities, missing values, exact totals and
+  saturation. Duplicate rows and retained metadata were bounded, without new
+  collection commands or counter resets (#1018).
 
 ### Fixed
 
@@ -41,6 +56,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   generation, and used saved then discovery order with a warning when busy,
   timed out, over cap, or missing a snapshot association; forced refreshes retried
   correlation once after overlapping background source updates (#997).
+- Locate actions retained a verified partial path result when another enclosure
+  path failed, warned about the incomplete readback and refreshed once, without
+  treating an unread path as confirmed off. Mapping saves also warned when an
+  automatic locator clear was only partially confirmed (#1013).
 - Admin storage-view edits survived queued repaints without restoring old input
   values or losing pending candidate and platform bindings, while view and system
   switches retained their own editor state (#1003).
@@ -105,6 +124,24 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and the system Chassis layout list offered them; each is now listed once, a
   system saved with one keeps it, the drive list heading matches its drives,
   and NVMe drives no longer start with "UNKNOWN" (#966).
+
+### Performance
+
+- History summary scans reused authenticated immutable segment counts on warm
+  reads, retaining existing segment admission checks and fresh hot-database
+  counts (#1012).
+
+### Internal
+
+- Added an inactive per-system SAS graph preview that preserved supplied
+  topology and enclosure-local evidence, with reciprocal reported PHY metadata
+  only where available; no collection or application activation changed (#1015).
+- Added an inactive source-qualified CORE expander-counter command policy
+  draft with exact read-only request shapes; no grant, collector or host
+  capability was enabled (#1017).
+- Added an inactive all-writer orchestration prototype with synthetic process
+  tests; the ownership helper's stop-every-writer precondition remained
+  unchanged, with no live backend or activation (#1014).
 
 ## v0.24.0-beta.3 - 2026-10-11
 
