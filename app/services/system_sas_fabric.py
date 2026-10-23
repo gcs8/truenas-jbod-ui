@@ -220,11 +220,18 @@ def _phy_number(value: Any) -> int | None:
     return None
 
 
+def _handle_identity(value: Any) -> str | None:
+    # Canonicalize only interpreted identity; keep supplied observations intact.
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{4}", value):
+        return value.lower()
+    return None
+
+
 def _reported_pairs(source: dict[str, Any], target: dict[str, Any]) -> list[tuple[int, int]] | None:
     raw, peer = source.get("raw", {}), target.get("raw", {})
-    handle = peer.get("dev_handle")
-    own_handle = raw.get("dev_handle")
-    if not isinstance(handle, str) or not re.fullmatch(r"[0-9a-fA-F]{4}", handle) or handle == own_handle:
+    handle = _handle_identity(peer.get("dev_handle"))
+    own_handle = _handle_identity(raw.get("dev_handle"))
+    if handle is None or own_handle is None or handle == own_handle:
         return None
     phys = raw.get("phys")
     if not isinstance(phys, list):
@@ -238,7 +245,7 @@ def _reported_pairs(source: dict[str, Any], target: dict[str, Any]) -> list[tupl
         if local is None or local in seen_phys:
             return None
         seen_phys.add(local)
-        if phy.get("dev_handle") != handle:
+        if _handle_identity(phy.get("dev_handle")) != handle:
             continue
         remote = _phy_number(phy.get("remote_phy"))
         if local is None or remote is None or phy.get("device") not in {"Expander", "Edge Expander", "Fanout Expander", "SMP Target"}:
@@ -265,7 +272,7 @@ def _wide_port(link: dict[str, Any], nodes: dict[str, dict[str, Any]], ambiguous
         return _unknown("endpoint_reports_not_coincident")
     for enclosure in sorted(left):
         for node in (left[enclosure], right[enclosure]):
-            if (enclosure, node.get("controller_id"), node.get("raw", {}).get("dev_handle")) in ambiguous_handles:
+            if (enclosure, node.get("controller_id"), _handle_identity(node.get("raw", {}).get("dev_handle"))) in ambiguous_handles:
                 return _unknown("ambiguous_endpoint_handle")
         forward, reverse = _reported_pairs(left[enclosure], right[enclosure]), _reported_pairs(right[enclosure], left[enclosure])
         if forward is None or reverse is None or forward != sorted((b, a) for a, b in reverse):
@@ -287,8 +294,8 @@ def _compose_system(system: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     handle_counts: dict[tuple[str, str, str], int] = defaultdict(int)
     for row in rows:
         for node in row["nodes"].values():
-            handle = node.get("raw", {}).get("dev_handle")
-            if node["kind"] == "expander" and isinstance(handle, str) and node.get("controller_id"):
+            handle = _handle_identity(node.get("raw", {}).get("dev_handle"))
+            if node["kind"] == "expander" and handle is not None and node.get("controller_id"):
                 handle_counts[row["enclosure"], node["controller_id"], handle] += 1
     ambiguous_handles = {key for key, count in handle_counts.items() if count > 1}
     for row in rows:

@@ -3991,6 +3991,51 @@ class SystemSasFabricDraftTests(unittest.TestCase):
         self.assertEqual(link["observations"][0]["payload"]["evidence"], ["synthetic supplied edge"])
         self.assertFalse(any(link["kind"] == "controller-expander" for link in graph["links"]))
 
+    def test_case_alias_endpoint_handles_never_admit_reciprocal_lanes(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "A00B"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"]
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertIsNone(link["wide_port"]["lane_count"])
+
+    def test_distinct_hex_handles_match_phy_rows_without_changing_raw_evidence(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "c00d"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"].upper()
+        before = json.dumps(payload, sort_keys=True)
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "observed")
+        self.assertEqual(link["wide_port"]["lane_count"], 2)
+        self.assertEqual(json.dumps(payload, sort_keys=True), before)
+        observations = [observation["payload"] for node in graph["nodes"]
+                        if node["kind"] == "expander" for observation in node["observations"]]
+        self.assertEqual({node["raw"]["dev_handle"] for node in observations}, {"a00b", "c00d"})
+
+    def test_case_alias_duplicate_handle_is_ambiguous_within_controller(self):
+        payload = self.cascade_payload()
+        left, right = [node for node in payload["nodes"] if node["kind"] == "expander"]
+        left["raw"]["dev_handle"], right["raw"]["dev_handle"] = "a00b", "c00d"
+        for own, peer in ((left, right), (right, left)):
+            for phy in own["raw"]["phys"]:
+                phy["dev_handle"] = peer["raw"]["dev_handle"]
+        duplicate = json.loads(json.dumps(left))
+        duplicate.update(id="synthetic-duplicate-expander", raw_id=f"{3:016x}")
+        duplicate["raw"].update(sas_address=f"{3:016x}", dev_handle="A00B", phys=[])
+        payload["nodes"].append(duplicate)
+        graph = self.compose([payload])["systems"][0]
+        link = next(link for link in graph["links"] if link["kind"] == "expander-expander")
+        self.assertEqual(link["wide_port"]["state"], "unknown")
+        self.assertEqual(link["wide_port"]["reason"], "ambiguous_endpoint_handle")
+
     def test_shared_lanes_are_not_summed_and_permutations_are_deterministic(self):
         first, second = self.cascade_payload(), self.cascade_payload("synthetic-jbod")
         expected = self.compose([first, second])
