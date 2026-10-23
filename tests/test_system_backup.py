@@ -3579,6 +3579,262 @@ class SystemBackupServiceTests(unittest.TestCase):
         self.assertIn("-mmt=1", command)
         self.assertNotIn("-mx=9", command)
 
+    def test_7z_prompt_waits_for_delayed_flushing_terminal_transition(self) -> None:
+        import pty
+        import select
+        import termios
+
+        # The child cannot flush until the poll AFTER the parent consumed the
+        # prompt. The old wrapper deterministically writes into that flush.
+        control_read, control_write = os.pipe()
+        master_fds: list[int] = []
+        processes: list[subprocess.Popen] = []
+        writes: list[tuple[bytes, bool]] = []
+        prompt_read = False
+        released = False
+        original_read, original_write = os.read, os.write
+        original_popen, original_openpty = subprocess.Popen, pty.openpty
+        original_poll = select.poll
+        secret = "  synthetic Unicode 雪 secret   "
+        program = """
+import os, select, sys, termios
+control = int(sys.argv[1])
+os.write(1, b'Enter password (will not be echoed):')
+os.read(control, 1)
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSAFLUSH, attributes)
+line = bytearray()
+while not line.endswith(b'\\n'):
+    line.extend(os.read(0, 1))
+# Return only a digest, never the passphrase or raw input.
+import hashlib
+os.write(1, b'\\n' + hashlib.sha256(line).hexdigest().encode() + b'\\n')
+"""
+
+        def openpty():
+            master, slave = original_openpty()
+            master_fds.append(master)
+            return master, slave
+
+        def popen(*args, **kwargs):
+            kwargs["pass_fds"] = (control_read,)
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def read(fd, count):
+            nonlocal prompt_read
+            chunk = original_read(fd, count)
+            if fd in master_fds and b"Enter password" in chunk:
+                prompt_read = True
+            return chunk
+
+        def write(fd, content):
+            if fd in master_fds:
+                writes.append((content, bool(termios.tcgetattr(fd)[3] & termios.ECHO)))
+            return original_write(fd, content)
+
+        class Poll:
+            def __init__(self):
+                self.poller = original_poll()
+
+            def register(self, *args):
+                self.poller.register(*args)
+
+            def poll(self, timeout):
+                nonlocal released
+                if prompt_read and not released:
+                    original_write(control_write, b"r")
+                    released = True
+                return self.poller.poll(timeout)
+
+        try:
+            with (
+                patch("pty.openpty", side_effect=openpty),
+                patch("history_service.system_backup.subprocess.Popen", side_effect=popen),
+                patch("history_service.system_backup.os.read", side_effect=read),
+                patch("history_service.system_backup.os.write", side_effect=write),
+                patch("history_service.system_backup.select.poll", Poll),
+                patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 2),
+            ):
+                result = self.backup_service._run_7z_prompt_command(
+                    [sys.executable, "-c", program, str(control_read)],
+                    cwd=None,
+                    passphrase=secret,
+                )
+            self.assertEqual(result.returncode, 0)
+            self.assertIn(hashlib.sha256(secret.encode() + b"\n").hexdigest(), result.stdout)
+            self.assertNotIn(secret, result.stdout)
+            self.assertEqual(writes, [(secret.encode() + b"\n", False)])
+        finally:
+            os.close(control_read)
+            os.close(control_write)
+            self.assertTrue(processes)
+            self.assertTrue(all(process.returncode is not None for process in processes))
+            for fd in master_fds:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
+    def _run_observed_7z_prompt_helper(self, program: str, *, initial_echo=True):
+        import pty
+        import termios
+
+        original_openpty, original_popen = pty.openpty, subprocess.Popen
+        original_write = os.write
+        descriptors = []
+        processes = []
+        writes = []
+
+        def openpty():
+            master, slave = original_openpty()
+            descriptors.extend((master, slave))
+            if not initial_echo:
+                attributes = termios.tcgetattr(slave)
+                attributes[3] &= ~termios.ECHO
+                termios.tcsetattr(slave, termios.TCSANOW, attributes)
+            return master, slave
+
+        def popen(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def write(fd, content):
+            if fd == descriptors[0]:
+                writes.append((content, bool(termios.tcgetattr(fd)[3] & termios.ECHO)))
+            return original_write(fd, content)
+
+        try:
+            with (
+                patch("pty.openpty", side_effect=openpty),
+                patch("history_service.system_backup.subprocess.Popen", side_effect=popen),
+                patch("history_service.system_backup.os.write", side_effect=write),
+                patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 0.5),
+            ):
+                result = self.backup_service._run_7z_prompt_command(
+                    [sys.executable, "-c", program], cwd=None, passphrase="synthetic-only",
+                )
+            return result, writes
+        finally:
+            self.assertTrue(all(process.returncode is not None for process in processes))
+            for fd in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+            self.assertTrue(all(not echo for _, echo in writes), "password written with echo on")
+
+    def test_7z_prompt_fragmentation_and_single_delivery(self) -> None:
+        result, writes = self._run_observed_7z_prompt_helper("""
+import os, termios, time
+attributes = termios.tcgetattr(0)
+attributes[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSAFLUSH, attributes)
+os.write(1, b'Enter pass')
+time.sleep(0.03)
+os.write(1, b'word (will not be echoed):')
+line = os.read(0, 1024)
+raise SystemExit(0 if line == b'synthetic-only\\n' else 4)
+""")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(writes, [(b"synthetic-only\n", False)])
+        self.assertNotIn("synthetic-only", result.stdout)
+
+    def test_7z_prompt_never_ready_times_out_and_reaps_without_delivery(self) -> None:
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self._run_observed_7z_prompt_helper("""
+import os, time
+os.write(1, b'Enter password (will not be echoed):')
+time.sleep(30)
+""")
+
+    def test_7z_prompt_early_exit_does_not_deliver_password(self) -> None:
+        for program in (
+            "raise SystemExit(2)",
+            "import os; os.write(1, b'Enter password:'); raise SystemExit(2)",
+        ):
+            with self.subTest(program=program):
+                result, writes = self._run_observed_7z_prompt_helper(program)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(writes, [])
+        with self.assertRaisesRegex(ValueError, "readiness was not established"):
+            self._run_observed_7z_prompt_helper("import os; os.write(1, b'Enter password:')")
+
+    def test_7z_prompt_rejects_unknown_initial_terminal_state(self) -> None:
+        with self.assertRaisesRegex(ValueError, "readiness is unsupported"):
+            self._run_observed_7z_prompt_helper("raise SystemExit(0)", initial_echo=False)
+
+    def test_7z_prompt_output_cap_reaps_without_delivery(self) -> None:
+        with patch("history_service.system_backup.MAX_7Z_COMMAND_OUTPUT_BYTES", 64):
+            with self.assertRaisesRegex(ValueError, "command output exceeded"):
+                self._run_observed_7z_prompt_helper("""
+import os, time
+os.write(1, b'Enter password:' + b'x' * 100)
+time.sleep(30)
+""")
+
+    @unittest.skipUnless(shutil.which("7z"), "real 7z executable unavailable")
+    def test_7z_native_password_readiness_create_list_test_extract(self) -> None:
+        import pty
+        import termios
+
+        # Runs the installed codec, including the version supplied by CI and
+        # the image's Debian 7zip package. No fake codec or binary substitution.
+        original_openpty, original_popen, original_write = pty.openpty, subprocess.Popen, os.write
+        descriptors = []
+        processes = []
+        deliveries = []
+        secret = "  synthetic native 雪 secret   "
+        archive = self.temp_dir / "native-readiness.7z"
+        source = self.temp_dir / "synthetic.txt"
+        source.write_bytes(b"synthetic public payload\n")
+        extracted = self.temp_dir / "native-extracted"
+
+        def openpty():
+            master, slave = original_openpty()
+            self.assertTrue(termios.tcgetattr(slave)[3] & termios.ECHO)
+            descriptors.extend((master, slave))
+            return master, slave
+
+        def popen(argv, **kwargs):
+            self.assertNotIn(secret, json.dumps(argv))
+            self.assertNotIn(secret, json.dumps(kwargs.get("env", {})))
+            process = original_popen(argv, **kwargs)
+            processes.append(process)
+            return process
+
+        def write(fd, content):
+            deliveries.append((content, bool(termios.tcgetattr(fd)[3] & termios.ECHO)))
+            return original_write(fd, content)
+
+        commands = (
+            ["a", "-t7z", "-p", "-mhe=on", "-y", "-bd", "-mmt=1", str(archive), source.name],
+            ["l", "-slt", str(archive)],
+            ["t", "-bd", str(archive)],
+            ["x", "-y", "-bd", str(archive), f"-o{extracted}"],
+        )
+        try:
+            with (
+                patch("pty.openpty", side_effect=openpty),
+                patch("history_service.system_backup.subprocess.Popen", side_effect=popen),
+                patch("history_service.system_backup.os.write", side_effect=write),
+                patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 10),
+            ):
+                for command in commands:
+                    result = self.backup_service._run_7z_command(
+                        command, cwd=self.temp_dir, passphrase=secret,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertNotIn(secret, result.stdout)
+                    self.assertNotIn(secret, result.stderr)
+            self.assertEqual(deliveries, [(secret.encode() + b"\n", False)] * 4)
+            self.assertEqual((extracted / source.name).read_bytes(), source.read_bytes())
+        finally:
+            self.assertEqual(len(processes), 4)
+            self.assertTrue(all(process.returncode is not None for process in processes))
+            for fd in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
     def test_7z_prompt_channel_keeps_passphrase_out_of_process_argv(self) -> None:
         fake_7z = self.temp_dir / "fake-7z-prompt.py"
         fake_7z.write_text(

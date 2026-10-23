@@ -2170,7 +2170,17 @@ class InventoryService:
         if selected_enclosure_id is None:
             return self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY, discovered_snapshot
         if selected_enclosure_id not in options:
-            raise UnknownEnclosureError()
+            # Explicit CORE stacks are opt-in views of discovered shelves, not
+            # new identities inferred from matching model names. Admit only
+            # distinct, exact component IDs already offered by discovery.
+            parts = selected_enclosure_id.split("+")
+            if not (
+                self.system.truenas.platform == "core"
+                and len(parts) > 1
+                and len(set(parts)) == len(parts)
+                and all(part in options and ":" not in part and options[part].slot_count for part in parts)
+            ):
+                raise UnknownEnclosureError()
         return selected_enclosure_id, (
             discovered_snapshot
             if discovered_snapshot is not None
@@ -12646,11 +12656,7 @@ class InventoryService:
                 seen_ids.add(selected_id)
                 options.append(
                     selected_option
-                    or EnclosureOption(
-                        id=selected_id,
-                        label=normalize_text(selected_meta.get("label")) or selected_id,
-                        name=normalize_text(selected_meta.get("name")),
-                    )
+                    or self._core_ssh_primary_option(ssh_data, selected_id, selected_ids, selected_meta)
                 )
             if primary_id and primary_id not in seen_ids:
                 seen_ids.add(primary_id)
@@ -12660,7 +12666,9 @@ class InventoryService:
             for enclosure in self._build_core_ssh_enclosure_options(
                 ssh_data,
                 filter_value=filter_value,
-                excluded_ids=primary_ids | selected_ids,
+                # Keep component shelves selectable after an explicit stack;
+                # the opt-in view must not replace their automatic identities.
+                excluded_ids=primary_ids,
                 finalize=False,
             ):
                 if enclosure.id in seen_ids:

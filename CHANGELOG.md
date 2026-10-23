@@ -41,6 +41,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   generation, and used saved then discovery order with a warning when busy,
   timed out, over cap, or missing a snapshot association; forced refreshes retried
   correlation once after overlapping background source updates (#997).
+- Admin storage-view edits survived queued repaints without restoring old input
+  values or losing pending candidate and platform bindings, while view and system
+  switches retained their own editor state (#1003).
+- Identical unprofiled SES shelves with different logical IDs stayed separate,
+  without joining their bays or locate targets. Verified Front/Rear shelf
+  parts still stacked, and explicitly selected combined shelves kept their
+  summed bay geometry and shelf-local locate targets (#1000).
+- History retained trusted disk identities when degraded SSH mapping lost or
+  contradicted bay assignments, while healthy observations still recorded real
+  changes (#1002).
+- Encrypted portable 7z backups waited for password-terminal readiness before
+  sending the passphrase, avoiding an echoed or discarded password line (#1001).
 - Locate light readback immediately updated bay tiles and restored their prior
   state on clear, including cached views, and Connections Show all retained
   keyboard focus on its heading (#998).

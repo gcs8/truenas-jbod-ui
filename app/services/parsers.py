@@ -2171,7 +2171,6 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
     slot_evidence: dict[str, list[tuple[SESMapSlot, str | None]]] = {}
     enclosure_ids: dict[str, str] = {}
     ses_device_keys: dict[tuple[str | None, str], str] = {}
-    unkeyed_names: dict[tuple[str | None, str], str] = {}
 
     for enclosure in enclosures:
         key = enclosure_ids.get(enclosure.enclosure_id) if enclosure.enclosure_id else None
@@ -2182,8 +2181,6 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
                 and enclosure.enclosure_id != merged[key].enclosure_id
             ):
                 key = None
-        if key is None and enclosure.enclosure_name and not enclosure.enclosure_id:
-            key = unkeyed_names.get((enclosure.ssh_host, enclosure.enclosure_name))
         if key is None and enclosure.ssh_host:
             key = next((candidate_key for candidate_key, candidate in identity_enclosures.items()
                         if not (enclosure.enclosure_id and merged[candidate_key].enclosure_id
@@ -2231,8 +2228,6 @@ def _merge_ses_enclosures(enclosures: list[SESMapEnclosure]) -> list[SESMapEnclo
             enclosure_ids.setdefault(target.enclosure_id, key)
         if enclosure.ses_device:
             ses_device_keys.setdefault((enclosure.ssh_host, enclosure.ses_device), key)
-        if enclosure.enclosure_name and not target.enclosure_id:
-            unkeyed_names.setdefault((enclosure.ssh_host, enclosure.enclosure_name), key)
         slot_evidence[key].extend((slot, enclosure.ssh_host) for slot in enclosure.slots.values())
 
         for slot in enclosure.unmapped_slots:
@@ -2476,18 +2471,20 @@ def _pick_preferred_enclosures(
         return _stack_enclosures(enclosures, slot_count)
     parts = [item for item in shelves if not item.profile_id]
     halves = [item for item in parts if _reads_front_or_rear(item)]
-    if len(halves) > 1:
+    # Retain the established two-30-bay front/rear contract. Two front
+    # shelves, missing IDs, or multiple possible pairs do not prove a stack.
+    if (
+        len(halves) == 2
+        and all(item.enclosure_id and _infer_ses_slot_count(item) == 30 for item in halves)
+        and {_enclosure_sort_key(item)[0] for item in halves} == {0, 1}
+    ):
         stacked = _stack_enclosures(halves, slot_count)
         if len(stacked) > 1:
             return stacked
 
-    # Otherwise the default view is one shelf, or one set of same-model SES
-    # groups with no layout of their own: front first, then the most bays.
+    # A model name is not physical identity (#990). Matching logical IDs
+    # already merge redundant paths above; otherwise choose one shelf.
     views = [[item] for item in shelves]
-    for group in _same_name_groups(parts):
-        stacked = _stack_enclosures(group, slot_count)
-        if len(stacked) > 1:
-            views.append(stacked)
     return min(
         views,
         key=lambda view: (
@@ -2501,15 +2498,6 @@ def _pick_preferred_enclosures(
 def _reads_front_or_rear(enclosure: SESMapEnclosure) -> bool:
     text = " ".join(filter(None, [enclosure.enclosure_name, enclosure.enclosure_label])).lower()
     return "front" in text or "rear" in text
-
-
-def _same_name_groups(enclosures: list[SESMapEnclosure]) -> list[list[SESMapEnclosure]]:
-    groups: dict[str, list[SESMapEnclosure]] = {}
-    for item in enclosures:
-        name = (item.enclosure_name or "").strip().casefold()
-        if name:
-            groups.setdefault(name, []).append(item)
-    return [group for group in groups.values() if len(group) > 1]
 
 
 def _merge_control_targets(
@@ -2735,11 +2723,11 @@ def build_slot_candidates_from_ses_enclosures(
     """
     Convert parsed SES maps into the app's 0-based slot view.
 
-    Many systems expose two 30-slot SES groups for a 60-bay shelf. When that pattern
-    is detected, we stack the groups into one 60-slot view in name order, preferring
-    "Front" before "Rear". An enclosure with its own inferred layout and the AHCI
-    SGPIO pseudo-enclosure are never stacked. Duplicate paths to the same
-    enclosure ID are merged.
+    The established two-30-slot Front/Rear pattern stacks into one 60-slot
+    shelf view. Otherwise a shared model name is not physical identity:
+    distinct or missing logical IDs stay separate by default. Duplicate paths
+    to the same enclosure ID merge bays, not bay ranges. Explicitly selected
+    combined IDs retain their existing stacking behavior.
     """
     merged_enclosures = enclosures if enclosures_are_merged else _merge_ses_enclosures(enclosures)
     selected_ids = {

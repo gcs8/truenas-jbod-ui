@@ -3598,11 +3598,20 @@
     });
   }
 
+  function storageViewEditorValues() {
+    return new Map(Array.from(
+      elements.setupStorageViewEditor?.querySelectorAll("input, select, textarea") || [],
+      (field) => [field, field.type === "checkbox" ? field.checked : field.value]
+    ));
+  }
+
   function syncStorageViewEditorFromState() {
     const storageView = ensureStorageViewSelection();
     if (!elements.setupStorageViewEditor || !elements.setupStorageViewEmpty || !elements.setupStorageViewTemplateBadge) {
       return;
     }
+    state.storageViewEditorId = state.selectedStorageViewId;
+    state.storageViewEditorGeneration = state.setupEditorGeneration;
     if (!storageView) {
       elements.setupStorageViewEditor.classList.add("hidden");
       elements.setupStorageViewEmpty.classList.remove("hidden");
@@ -3704,6 +3713,7 @@
     if (elements.setupStorageViewMoveDownButton) {
       elements.setupStorageViewMoveDownButton.disabled = state.storageViews[state.storageViews.length - 1]?.id === storageView.id;
     }
+    state.storageViewEditorValues = storageViewEditorValues();
   }
 
   function renderStorageViewPreview() {
@@ -3864,8 +3874,20 @@
   }
 
   function saveStorageViewEditorToState() {
-    // Make sure the editor shows the selected view before reading it back.
+    // Preserve only fresh DOM edits, not stale fields awaiting a model paint
+    // (candidate additions and platform bindings can update this same owner).
+    // A genuine view/system switch still replaces all of the old owner's DOM.
+    const sameEditor = state.storageViewEditorId === state.selectedStorageViewId
+      && state.storageViewEditorGeneration === state.setupEditorGeneration;
+    const edits = sameEditor ? Array.from(storageViewEditorValues()).filter(
+      ([field, value]) => state.storageViewEditorValues?.has(field)
+        && state.storageViewEditorValues.get(field) !== value
+    ) : [];
     flushStorageViewRender();
+    edits.forEach(([field, value]) => {
+      if (field.type === "checkbox") field.checked = value;
+      else field.value = value;
+    });
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
@@ -3905,6 +3927,13 @@
           : null;
       return storageView.id;
     });
+    // Renaming updates selection before its deferred paint. Further changes in
+    // this task still belong to the editor that performed the rename.
+    state.storageViewEditorId = state.selectedStorageViewId;
+    state.storageViewEditorGeneration = state.setupEditorGeneration;
+    // Consumed changes are no longer new input if another model update follows
+    // before the next paint; rename ownership above advances at the same time.
+    state.storageViewEditorValues = storageViewEditorValues();
   }
 
   function currentStorageViewSystemId() {
