@@ -75,6 +75,63 @@ function loadFunctions(names, context = {}) {
   return Object.fromEntries(names.map((name) => [name, sandbox[`__${name}`]]));
 }
 
+test("SAS disk port rows distinguish zero, missing and saturated counters", () => {
+  const { renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  const html = renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports: [
+    { port: 1, phy: 0, attached_type: "expander device", attached_reason: "power on",
+      negotiated_link_rate: "12 Gbps", invalid_dword_count: 0, running_disparity_error_count: 7,
+      phy_reset_problem_count: 4294967295 },
+    { port: 2, phy: 0, invalid_dword_count: 9 },
+  ] } });
+  assert.match(html, /SAS port 1 PHY 0/);
+  assert.match(html, /SAS port 2 PHY 0/);
+  assert.match(html, /Invalid DWORD: 0/);
+  assert.match(html, /Invalid DWORD: 9/);
+  assert.match(html, /Running disparity: 7/);
+  assert.match(html, /Loss of DWORD sync: not reported/);
+  assert.match(html, /PHY reset problem: 4294967295 \(saturated\)/);
+  assert.match(html, /expander device/);
+  assert.match(html, /power on/);
+  assert.match(html, /12 Gbps/);
+  assert.match(html, /disk-to-expander link only/i);
+  assert.match(html, /cumulative/i);
+});
+
+test("missing SAS logs are not reported while SATA and NVMe remain unchanged", () => {
+  const { renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  for (const sas_ports of [undefined, null, []]) {
+    assert.match(renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports } }), /not reported/);
+  }
+  for (const transport_protocol of ["SATA", "ATA", "NVMe"]) {
+    assert.equal(renderSasPortCounters({ sas_address: "synthetic" }, {
+      data: { transport_protocol, sas_ports: [{ port: 1, phy: 0, invalid_dword_count: 1 }] },
+    }), "");
+  }
+});
+
+test("SAS counters reject malformed values and escape reported metadata", () => {
+  const { formatSasPortCounter, renderSasPortCounters } = loadFunctions([
+    "shouldShowSasTransportFields", "formatSasPortCounter", "renderSasPortCounters", "kvRow", "escapeHtml",
+  ]);
+  for (const value of [undefined, null, false, true, -1, 4294967296, 1.5, "0", "FFFFFFFF"]) {
+    assert.equal(formatSasPortCounter(value), "not reported");
+  }
+  const html = renderSasPortCounters({}, { data: { transport_protocol: "SAS", sas_ports: [
+    { port: 1, phy: 0, attached_reason: "<img src=x>", attached_type: "<script>" },
+  ] } });
+  assert.doesNotMatch(html, /<img|<script>/);
+  assert.match(html, /&lt;img/);
+});
+
+test("both live and saved disk details render SAS port counters", () => {
+  assert.match(functionSource("renderLiveSlotDetail"), /renderSasPortCounters\(slot, smartEntry\)/);
+  assert.match(functionSource("renderDetail"), /renderSasPortCounters\(storageViewDetailSlot, smartEntry\)/);
+});
+
 function classList(initial = []) {
   const values = new Set(initial);
   return {

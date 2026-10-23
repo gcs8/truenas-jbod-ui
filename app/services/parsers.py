@@ -3469,6 +3469,44 @@ def _extract_smartctl_sas_phy(
     )
 
 
+def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Retain per-disk PHY totals only from already-collected port-log JSON."""
+    rows: list[dict[str, Any]] = []
+    for key, value in payload.items():
+        port_match = re.fullmatch(r"scsi_sas_port_([0-9]{1,5})", key)
+        if port_match is None or not isinstance(value, dict):
+            continue
+        port = int(port_match.group(1))
+        if port > 65535:
+            continue
+        for subkey, phy in value.items():
+            phy_match = re.fullmatch(r"phy_([0-9]{1,3})", subkey)
+            if phy_match is None or not isinstance(phy, dict):
+                continue
+            phy_id = int(phy_match.group(1))
+            if phy_id > 255:
+                continue
+            row = {
+                "port": port,
+                "phy": phy_id,
+                "attached_type": normalize_text(phy.get("attached_device_type")),
+                "attached_reason": normalize_text(phy.get("attached_reason")),
+                "sas_address": format_hex_identifier(phy.get("sas_address")),
+                "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")),
+                "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")),
+            }
+            for counter in (
+                "invalid_dword_count", "running_disparity_error_count",
+                "loss_of_dword_synchronization_count", "phy_reset_problem_count",
+            ):
+                count = phy.get(counter)
+                # Missing/invalid values are not measured zeros. FFFFFFFF is
+                # a valid saturated total; never wrap, sum, reset or infer it.
+                row[counter] = count if type(count) is int and 0 <= count <= 0xFFFFFFFF else None
+            rows.append(row)
+    return rows or None
+
+
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
     try:
         payload = json.loads(output)
@@ -3653,6 +3691,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "sas_address": sas_address,
             "attached_sas_address": attached_sas_address,
             "negotiated_link_rate": negotiated_link_rate,
+            "sas_ports": _extract_smartctl_sas_ports(payload),
         },
         "No SMART summary fields were returned for this disk.",
     )

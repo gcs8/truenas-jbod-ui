@@ -4592,6 +4592,36 @@
     );
   }
 
+  function formatSasPortCounter(value) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      return "not reported";
+    }
+    return value === 0xffffffff ? `${value} (saturated)` : String(value);
+  }
+
+  function renderSasPortCounters(slot, smartEntry) {
+    if (!shouldShowSasTransportFields(slot, smartEntry)) {
+      return "";
+    }
+    const ports = Array.isArray(smartEntry?.data?.sas_ports)
+      ? smartEntry.data.sas_ports.filter((row) => row && Number.isInteger(row.port) && row.port >= 0 && row.port <= 65535
+        && Number.isInteger(row.phy) && row.phy >= 0 && row.phy <= 255)
+      : [];
+    if (!ports.length) {
+      return kvRow("SAS port counters", smartEntry?.loading ? "Loading..." : "not reported");
+    }
+    return ports.map((row) => kvRow(`SAS port ${row.port} PHY ${row.phy}`, [
+      `Attached type: ${row.attached_type || "not reported"}`,
+      `Attached reason: ${row.attached_reason || "not reported"}`,
+      `Rate: ${row.negotiated_link_rate || "not reported"}`,
+      `Invalid DWORD: ${formatSasPortCounter(row.invalid_dword_count)}`,
+      `Running disparity: ${formatSasPortCounter(row.running_disparity_error_count)}`,
+      `Loss of DWORD sync: ${formatSasPortCounter(row.loss_of_dword_synchronization_count)}`,
+      `PHY reset problem: ${formatSasPortCounter(row.phy_reset_problem_count)}`,
+    ].join("; "))).join("") + kvRow("SAS counter scope",
+      "Cumulative totals from smartctl disk port log. Disk-to-expander link only, not upstream cables. No timestamps or change rate.");
+  }
+
   function formatNamespaceIdentifierValue(value, smartEntry) {
     if (value) {
       return value;
@@ -9024,6 +9054,7 @@
           showSasTransportFields ? kvRowIfMeaningful("SAS Address", formatSasAddressValue(slot, smartEntry)) : "",
           showSasTransportFields ? kvRowIfMeaningful("Attached SAS", formatAttachedSasAddressValue(slot, smartEntry)) : "",
           showLinkRate ? kvRowIfMeaningful("Link Rate", formatLinkRateValue(smartEntry)) : "",
+          renderSasPortCounters(slot, smartEntry),
           kvRowIfMeaningful("SES Flags", formatSesStateValue(slot), false, slot?.raw_status?.ses_swapped ? SES_SWAP_TITLE : ""),
         ]),
       ].filter(Boolean).join("");
@@ -9171,6 +9202,7 @@
         showSasTransportFields ? kvRow("SAS Address", formatSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
         showSasTransportFields ? kvRow("Attached SAS", formatAttachedSasAddressValue(storageViewDetailSlot, smartEntry)) : "",
         showLinkRate ? kvRow("Link Rate", formatLinkRateValue(smartEntry)) : "",
+        renderSasPortCounters(storageViewDetailSlot, smartEntry),
         kvRowIfMeaningful("Transport Address", storageViewSlot.transport_address),
         kvRowIfMeaningful("Placement", storageViewSlot.placement_key),
         kvRowIfMeaningful("Matched By", Array.isArray(storageViewSlot.match_reasons) ? storageViewSlot.match_reasons.join(", ") : null),

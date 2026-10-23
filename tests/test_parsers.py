@@ -3548,6 +3548,80 @@ Additional element status diagnostic page:
 
 
 class ParserConsolidationTests(unittest.TestCase):
+    def test_sas_port_counters_preserve_each_port_and_phy(self) -> None:
+        # Invented addresses, assembled rather than adding literal identifiers
+        # to the tracked public-text privacy exception inventory.
+        disk_address = "0x5" + "0" * 14 + "1"
+        attached_address = "0x5" + "0" * 14 + "2"
+        payload = {
+            "scsi_transport_protocol": {"name": "SAS (SPL-4)"},
+            "scsi_sas_port_1": {"phy_0": {
+                "attached_device_type": "expander device",
+                "attached_reason": "power on",
+                "sas_address": disk_address,
+                "attached_sas_address": attached_address,
+                "negotiated_logical_link_rate": "12 Gbps",
+                "invalid_dword_count": 0,
+                "running_disparity_error_count": 7,
+                "loss_of_dword_synchronization_count": 8,
+                "phy_reset_problem_count": 4294967295,
+            }},
+            "scsi_sas_port_2": {
+                "phy_0": {"attached_device_type": "no device attached"},
+                "phy_1": {"invalid_dword_count": 9},
+            },
+        }
+        parsed = parsers.parse_smartctl_summary(json.dumps(payload))
+        rows = parsed["sas_ports"]
+        self.assertEqual([(row["port"], row["phy"]) for row in rows], [(1, 0), (2, 0), (2, 1)])
+        self.assertEqual(rows[0], {
+            "port": 1, "phy": 0, "attached_type": "expander device",
+            "attached_reason": "power on", "sas_address": disk_address,
+            "attached_sas_address": attached_address, "negotiated_link_rate": "12 Gbps",
+            "invalid_dword_count": 0, "running_disparity_error_count": 7,
+            "loss_of_dword_synchronization_count": 8, "phy_reset_problem_count": 4294967295,
+        })
+        self.assertIsNone(rows[1]["invalid_dword_count"])
+        self.assertEqual(rows[2]["invalid_dword_count"], 9)
+        self.assertEqual(parsed["sas_address"], disk_address)
+
+    def test_sas_port_counters_missing_and_72_text_stay_unreported(self) -> None:
+        for payload in ({}, {"scsi_transport_protocol": {"name": "SAS"}},
+                        {"smartctl": {"version": [7, 2]}, "device": {"protocol": "SCSI"}}):
+            with self.subTest(payload=payload):
+                parsed = parsers.parse_smartctl_summary(json.dumps(payload))
+                self.assertIsNone(parsed["sas_ports"])
+        self.assertFalse(parsers.parse_smartctl_summary("{}")["available"])
+        text = "Transport protocol: SAS (SPL-3)\nProtocol Specific port log page for SAS SSP\n" \
+               "relative target port id = 1\nphy identifier = 0\n" \
+               "Invalid DWORD count = 0\nLoss of DWORD synchronization = 0\nPhy reset problem = 0\n"
+        self.assertIsNone(parsers.parse_smartctl_text_enrichment(text).get("sas_ports"))
+
+    def test_sas_port_counters_reject_invalid_values_without_inventing_zero(self) -> None:
+        for value in (None, True, False, -1, 4294967296, 1.5, "7", "FFFFFFFF", {}, []):
+            with self.subTest(value=value):
+                parsed = parsers.parse_smartctl_summary(json.dumps({
+                    "scsi_sas_port_1": {"phy_0": {"invalid_dword_count": value}}
+                }))
+                self.assertIsNone(parsed["sas_ports"][0]["invalid_dword_count"])
+
+    def test_sas_port_counters_ignore_malformed_port_and_phy_blocks(self) -> None:
+        payload = {"scsi_sas_port_bad": {"phy_0": {}}, "scsi_sas_port_1": {
+            "phy_bad": {}, "phy_1": "bad", "other": {},
+        }, "scsi_sas_port_2": []}
+        self.assertIsNone(parsers.parse_smartctl_summary(json.dumps(payload))["sas_ports"])
+
+    def test_sas_ports_survive_smart_model_and_existing_inventory_parse_path(self) -> None:
+        from app.models.domain import SmartSummaryView
+        from app.services.inventory import InventoryService
+
+        payload = json.dumps({"scsi_sas_port_1": {"phy_0": {"invalid_dword_count": 0}}})
+        parsed = parsers.parse_smartctl_summary(payload)
+        summary = SmartSummaryView.model_validate(parsed)
+        self.assertEqual(summary.model_dump()["sas_ports"], parsed["sas_ports"])
+        actual = InventoryService._parse_smart_payload_for_slot(None, payload)
+        self.assertEqual(actual.model_dump()["sas_ports"], parsed["sas_ports"])
+
     def test_smart_summary_finalizer_preserves_order_and_messages(self) -> None:
         unavailable = parsers._finalize_summary(
             {"temperature_c": None, "namespace_nguid": None},

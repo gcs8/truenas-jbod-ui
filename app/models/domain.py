@@ -136,6 +136,22 @@ class MultipathView(BaseModel):
     members: list[MultipathMember] = Field(default_factory=list)
 
 
+class SasPortView(BaseModel):
+    """One reported disk PHY from smartctl's SAS port log, not an expander log."""
+
+    port: int = Field(ge=0, le=65535, strict=True)
+    phy: int = Field(ge=0, le=255, strict=True)
+    attached_type: str | None = None
+    attached_reason: str | None = None
+    sas_address: str | None = None
+    attached_sas_address: str | None = None
+    negotiated_link_rate: str | None = None
+    invalid_dword_count: int | None = Field(default=None, ge=0, le=0xFFFFFFFF, strict=True)
+    running_disparity_error_count: int | None = Field(default=None, ge=0, le=0xFFFFFFFF, strict=True)
+    loss_of_dword_synchronization_count: int | None = Field(default=None, ge=0, le=0xFFFFFFFF, strict=True)
+    phy_reset_problem_count: int | None = Field(default=None, ge=0, le=0xFFFFFFFF, strict=True)
+
+
 class SmartSummaryView(BaseModel):
     available: bool = False
     layout_bounds: Literal["verified", "unavailable"] | None = None
@@ -189,6 +205,8 @@ class SmartSummaryView(BaseModel):
     sas_address: str | None = None
     attached_sas_address: str | None = None
     negotiated_link_rate: str | None = None
+    # None means no JSON port log was reported, including smartctl 7.2 paths.
+    sas_ports: list[SasPortView] | None = None
     message: str | None = None
 
 
