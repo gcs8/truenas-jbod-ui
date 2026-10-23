@@ -128,6 +128,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- Added an inactive per-system SAS graph preview that preserved supplied
+  topology and enclosure-local evidence, with reciprocal reported PHY metadata
+  only where available; no collection or application activation changed (#1015).
 - Added an inactive source-qualified CORE expander-counter command policy
   draft with exact read-only request shapes; no grant, collector or host
   capability was enabled (#1017).
