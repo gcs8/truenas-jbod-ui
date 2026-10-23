@@ -546,7 +546,7 @@ class MappingImportRouteTests(unittest.TestCase):
                 serial="SANITIZED",
             )
         )
-        service.set_slot_led = AsyncMock()
+        service.set_slot_led = AsyncMock(return_value={"identify_active": False, "confirmed": True})
         service.get_snapshot = AsyncMock(
             return_value=InventorySnapshot(slots=[], refresh_interval_seconds=30)
         )
