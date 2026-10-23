@@ -84,9 +84,8 @@ def combined_mapping_warnings(
     ``scopes`` maps a combined id to its saved bay indexes. ``bay_counts``
     holds the bay count of every shelf offered now. ``has_assignment`` marks
     (shelf id, bay) pairs that already hold a saved assignment, so the text
-    can say a placement would replace something instead of implying it is
-    free. ``reopenable_ids`` are combined ids the platform still opens when
-    selected explicitly (CORE).
+    can flag its presence without comparing contents. ``reopenable_ids`` are
+    combined ids the platform still opens when selected explicitly (CORE).
     """
 
     offered = set(offered_ids)
@@ -120,7 +119,7 @@ def combined_mapping_warnings(
                 member_id, local_slot = located
                 text = f"{_bay(slot)} -> {member_id} {_bay(local_slot)}"
                 if has_assignment.get((member_id, local_slot)):
-                    text += " (that bay already has a different assignment)"
+                    text += " (that bay already has a saved assignment)"
                 placements.append(text)
         if not placeable:
             missing = [part for part, bay_count in members if not (isinstance(bay_count, int) and bay_count > 0)]
@@ -153,7 +152,7 @@ def combined_reference_warnings(
     view_order: Iterable[str],
     storage_view_bindings: Iterable[tuple[str, Iterable[str]]],
 ) -> list[str]:
-    """Saved main-page order entries and storage-view bindings naming an old combined id."""
+    """Name unused combined references only when at least one member is offered."""
 
     offered = set(offered_ids)
     warnings: list[str] = []
@@ -163,7 +162,8 @@ def combined_reference_warnings(
         if isinstance(entry, str)
         and entry.startswith("enclosure:")
         and entry.removeprefix("enclosure:") not in offered
-        and combined_enclosure_parts(entry.removeprefix("enclosure:")) is not None
+        and (parts := combined_enclosure_parts(entry.removeprefix("enclosure:"))) is not None
+        and any(part in offered for part in parts)
     })
     if order_ids:
         shown = order_ids[:MAX_REPORTED_SCOPES]
@@ -176,7 +176,8 @@ def combined_reference_warnings(
         stale = sorted({
             value
             for value in enclosure_ids
-            if value not in offered and combined_enclosure_parts(value) is not None
+            if value not in offered and (parts := combined_enclosure_parts(value)) is not None
+            and any(part in offered for part in parts)
         })
         if stale:
             shown = stale[:MAX_REPORTED_SCOPES]

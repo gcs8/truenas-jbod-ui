@@ -33,6 +33,7 @@ from app.services import inventory as inventory_module
 from app.services.combined_shelf_ids import (
     combined_enclosure_parts,
     combined_history_scope_warnings,
+    combined_reference_warnings,
     locate_member_slot,
 )
 from app.services.mapping_store import MappingStore
@@ -118,6 +119,28 @@ class CombinedShelfIdHelperTests(unittest.TestCase):
         self.assertEqual(locate_member_slot(3, [(FIRST, 24), (SECOND, None)]), (FIRST, 3))
         self.assertIsNone(locate_member_slot(30, [(FIRST, 24), (SECOND, None)]))
         self.assertIsNone(locate_member_slot(30, [(FIRST, None), (SECOND, 24)]))
+
+    def test_reference_warnings_need_at_least_one_offered_member(self) -> None:
+        for offered in ([], ["500dddd00000001"], [FIRST], [SECOND], [FIRST, SECOND], [COMBINED]):
+            with self.subTest(offered=offered):
+                expected = int(FIRST in offered or SECOND in offered)
+                order = combined_reference_warnings(
+                    offered_ids=offered, view_order=[f"enclosure:{COMBINED}"], storage_view_bindings=[],
+                )
+                bindings = combined_reference_warnings(
+                    offered_ids=offered, view_order=[], storage_view_bindings=[("pinned-shelf", [COMBINED])],
+                )
+                self.assertEqual(len(order), expected, order)
+                self.assertEqual(len(bindings), expected, bindings)
+
+    def test_reference_warnings_ignore_noncombined_and_malformed_ids(self) -> None:
+        for value in (FIRST, f"{FIRST}+", f"+{FIRST}", f"{FIRST}++{SECOND}", f"{FIRST}+{FIRST}",
+                      f"{FIRST}+ {SECOND}", f"{FIRST}::profile+{SECOND}"):
+            with self.subTest(value=value):
+                self.assertEqual(combined_reference_warnings(
+                    offered_ids=[FIRST, SECOND], view_order=[f"enclosure:{value}"],
+                    storage_view_bindings=[("pinned-shelf", [value])],
+                ), [])
 
 
 class NonCoreCombinedSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -273,12 +296,36 @@ class Pre1000MappingFixtureTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("Nothing was moved", warning)
                 self.assertIn(f"bay 00 -> {FIRST} bay 00", warning)
                 self.assertIn(f"bay 30 -> {SECOND} bay 06", warning)
-                # The fixture saved a different disk in bay 23 after the split.
-                self.assertIn(f"bay 23 -> {FIRST} bay 23 (that bay already has a different assignment)", warning)
+                # Presence is known; the warning does not compare disk contents.
+                self.assertIn(f"bay 23 -> {FIRST} bay 23 (that bay already has a saved assignment)", warning)
         # The combined rows are not applied to either separate shelf.
         first_bay = next(slot for slot in snapshot.slots if slot.slot == 0)
         self.assertNotEqual(first_bay.serial, "SYNTH-SN-0000")
         self.assertNotEqual(first_bay.notes, "Synthetic front-left bay")
+
+    async def test_copied_mapping_warns_of_saved_assignment_without_claiming_a_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = _service(temp_dir)
+            mapping_path = Path(temp_dir) / "slot_mappings.json"
+            payload = json.loads(mapping_path.read_text())
+            combined_key = MappingStore._encode_v2_key("scale-ssh", COMBINED, 0)
+            member_key = MappingStore._encode_v2_key("scale-ssh", FIRST, 0)
+            original = payload["slot_mappings"][combined_key]
+            copied = {**original, "enclosure_id": FIRST}
+            payload["slot_mappings"][member_key] = copied
+            mapping_path.write_text(json.dumps(payload))
+            before = mapping_path.read_bytes()
+            for field in ("serial", "device_name", "notes", "gptid", "source"):
+                self.assertEqual(copied[field], original[field])
+            snapshot = await service.get_snapshot(force_refresh=True)
+            self.assertEqual(mapping_path.read_bytes(), before)
+
+        warning = _combined_warnings(snapshot)[0]
+        self.assertIn(f"bay 00 -> {FIRST} bay 00 (that bay already has a saved assignment)", warning)
+        self.assertNotIn("different assignment", warning)
+        first_bay = next(slot for slot in snapshot.slots if slot.slot == 0)
+        self.assertEqual(first_bay.serial, original["serial"])
+        self.assertEqual(first_bay.notes, original["notes"])
 
     async def test_combined_mapping_scope_with_an_unknown_shelf_count_does_not_guess(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -301,6 +348,37 @@ class Pre1000MappingFixtureTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await service.get_snapshot(force_refresh=True)
 
         self.assertEqual(_combined_warnings(snapshot), [])
+
+    async def test_saved_order_does_not_report_offline_members_as_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = _service(temp_dir, view_order=[f"enclosure:{COMBINED}"])
+            bundle = await service._get_inventory_source_bundle()
+            bundle.ssh_outputs = {"sesutil map": fx.sesutil_map(
+                ("ses0", "ExampleCo Shelf 0200", "500dddd00000001", 12, {}),
+            )}
+            before = (Path(temp_dir) / "slot_mappings.json").read_bytes()
+            snapshot = await service.get_snapshot(force_refresh=True)
+            self.assertEqual((Path(temp_dir) / "slot_mappings.json").read_bytes(), before)
+
+        self.assertEqual(_combined_warnings(snapshot), [])
+        self.assertEqual(service.system.view_order, [f"enclosure:{COMBINED}"])
+
+    async def test_storage_binding_does_not_report_offline_members_as_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = _service(temp_dir, storage_views=[StorageViewConfig(
+                id="pinned-shelf", label="Pinned shelf", kind="ses_enclosure", template_id="ses-auto",
+                binding=StorageViewBindingConfig(enclosure_ids=[COMBINED]),
+            )])
+            bundle = await service._get_inventory_source_bundle()
+            bundle.ssh_outputs = {"sesutil map": fx.sesutil_map(
+                ("ses0", "ExampleCo Shelf 0200", "500dddd00000001", 12, {}),
+            )}
+            before = (Path(temp_dir) / "slot_mappings.json").read_bytes()
+            snapshot = await service.get_snapshot(force_refresh=True)
+            self.assertEqual((Path(temp_dir) / "slot_mappings.json").read_bytes(), before)
+
+        self.assertEqual(_combined_warnings(snapshot), [])
+        self.assertEqual(service.system.storage_views[0].binding.enclosure_ids, [COMBINED])
 
     async def test_core_names_the_combined_view_that_still_opens(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
