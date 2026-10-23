@@ -44,6 +44,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Locate actions retained a verified partial path result when another enclosure
+  path failed, warned about the incomplete readback and refreshed once, without
+  treating an unread path as confirmed off. Mapping saves also warned when an
+  automatic locator clear was only partially confirmed (#1013).
 - Admin storage-view edits survived queued repaints without restoring old input
   values or losing pending candidate and platform bindings, while view and system
   switches retained their own editor state (#1003).

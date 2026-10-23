@@ -216,6 +216,262 @@ class RouteContractTests(unittest.TestCase):
         )
         self.assertNotIn(b"caller-controlled-value", body)
 
+    def test_partial_locate_http_result_uses_real_aggregation_and_refreshes_once(self) -> None:
+        for action in ("IDENTIFY", "CLEAR"):
+            for same_host, failure in ((True, "action"), (False, "action"), (False, "preflight")):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, failure=failure, reverse=reverse):
+                        status, payload, service = self.locate_http_result(
+                            action=action, same_host=same_host, failure=failure, reverse=reverse,
+                        )
+                        self.assertEqual(status, 200, payload)
+                        self.assertTrue(payload["ok"])
+                        self.assertTrue(payload["partial"])
+                        self.assertFalse(payload["confirmed"])
+                        self.assertIs(payload["identify_active"], True if action == "IDENTIFY" else None)
+                        self.assertEqual(len(payload["paths"]), 2)
+                        self.assertEqual(len(payload["failures"]), 1)
+                        self.assertLessEqual(len(payload["failures"][0]), 240)
+                        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+                        service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+
+    def test_moved_locate_http_result_preserves_refusal_and_exceptional_refresh(self) -> None:
+        status, payload, service = self.locate_http_result(failure="moved")
+        self.assertEqual(status, 400)
+        self.assertIn("switched through one enclosure path", payload["detail"])
+        self.assertNotIn(("shelf-a", 0), service._led_slot_targets)
+        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+
+    def test_total_locate_http_failure_remains_a_refusal(self) -> None:
+        for action in ("IDENTIFY", "CLEAR"):
+            for failure in ("preflight", "all_actions"):
+                with self.subTest(action=action, failure=failure):
+                    status, _payload, service = self.locate_http_result(action=action, same_host=True, failure=failure)
+                    self.assertEqual(status, 400)
+                    service.schedule_led_snapshot_refresh.assert_not_called()
+
+    def test_mapping_save_partial_clear_warns_and_persists_with_real_led_aggregation(self) -> None:
+        from app.models.domain import LedAction
+
+        for same_host, failure in ((True, "action"), (False, "action"), (False, "preflight")):
+            for reverse in (False, True):
+                with self.subTest(same_host=same_host, failure=failure, reverse=reverse):
+                    status, payload, service, sent, results = self.mapping_save_http_result(
+                        same_host=same_host, failure=failure, reverse=reverse,
+                    )
+                    self.assertEqual(status, 200, payload)
+                    self.assertTrue(payload["ok"])
+                    self.assert_mapping_save_persisted(payload, service)
+                    self.assertEqual(len(results), 1)
+                    result = results[0]
+                    self.assertTrue(result["partial"])
+                    self.assertFalse(result["confirmed"])
+                    self.assertIsNone(result["identify_active"])
+                    self.assertEqual(
+                        {path["ses_device"]: path["identify_active"] for path in result["paths"]},
+                        {"/dev/sg27": False, "/dev/sg9": None},
+                    )
+                    self.assertEqual(
+                        payload["warning"],
+                        "Saved mapping, but the identify LED clear was only partially confirmed; "
+                        "another path failed and may still be lit.",
+                    )
+                    self.assertNotIn("synthetic failure", json.dumps(payload))
+                    self.assertLessEqual(len(payload["warning"]), 240)
+                    service.set_slot_led.assert_awaited_once_with(
+                        0, LedAction.clear, selected_enclosure_id="shelf-a", invalidate_snapshot=False,
+                    )
+                    self.assert_mapping_refresh_owner(service, led_changed=True)
+                    service.schedule_led_snapshot_refresh.assert_not_called()
+                    actions = [command for _host, command in sent if "--dev-slot-num" in command]
+                    self.assertEqual(len(actions), 2 if failure == "action" else 1)
+                    self.assertTrue(all("--clear=ident" in command for command in actions))
+
+    def test_mapping_save_complete_clear_retains_no_warning(self) -> None:
+        for same_host in (False, True):
+            with self.subTest(same_host=same_host):
+                status, payload, service, _sent, results = self.mapping_save_http_result(
+                    same_host=same_host, failure="none",
+                )
+                self.assertEqual(status, 200, payload)
+                self.assertIsNone(payload["warning"])
+                self.assert_mapping_save_persisted(payload, service)
+                self.assertEqual(len(results), 1)
+                self.assertTrue(results[0]["confirmed"])
+                self.assertIs(results[0]["identify_active"], False)
+                self.assertNotIn("partial", results[0])
+                self.assert_mapping_refresh_owner(service, led_changed=True)
+                service.schedule_led_snapshot_refresh.assert_not_called()
+
+    def test_mapping_save_total_clear_failure_and_moved_target_keep_existing_warning(self) -> None:
+        for failure, same_host in (("all_actions", True), ("preflight", True), ("moved", False)):
+            for reverse in (False, True):
+                with self.subTest(failure=failure, reverse=reverse):
+                    status, payload, service, sent, results = self.mapping_save_http_result(
+                        same_host=same_host, failure=failure, reverse=reverse,
+                    )
+                    self.assertEqual(status, 200, payload)
+                    self.assert_mapping_save_persisted(payload, service)
+                    self.assertEqual(results, [])
+                    self.assertEqual(
+                        payload["warning"],
+                        "Saved mapping, but failed to clear the identify LED; see application logs.",
+                    )
+                    self.assertNotIn("synthetic failure", json.dumps(payload))
+                    service.set_slot_led.assert_awaited_once()
+                    self.assert_mapping_refresh_owner(service, led_changed=False)
+                    if failure == "moved":
+                        self.assertNotIn(("shelf-a", 0), service._led_slot_targets)
+                        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+                        self.assertFalse(any(
+                            "--dev-slot-num" in command and command.endswith("/dev/sg9")
+                            for _host, command in sent
+                        ))
+                    else:
+                        service.schedule_led_snapshot_refresh.assert_not_called()
+                    if failure == "preflight":
+                        self.assertFalse(any("--dev-slot-num" in command for _host, command in sent))
+
+    def test_mapping_save_clear_opt_out_sends_no_led_action(self) -> None:
+        status, payload, service, sent, results = self.mapping_save_http_result(
+            clear_identify_after_save=False,
+        )
+        self.assertEqual(status, 200, payload)
+        self.assert_mapping_save_persisted(payload, service)
+        self.assertIsNone(payload["warning"])
+        self.assertEqual(results, [])
+        self.assertEqual(sent, [])
+        service.set_slot_led.assert_not_awaited()
+        service.schedule_led_snapshot_refresh.assert_not_called()
+        self.assert_mapping_refresh_owner(service, led_changed=False)
+
+    def test_mapping_save_auth_and_revision_gates_precede_auto_clear(self) -> None:
+        for options, expected_status in (
+            ({"expected_revision": "f" * 64}, 409),
+            ({"expected_revision": None}, 422),
+            ({"origin": "http://other.example.test"}, 403),
+        ):
+            with self.subTest(options=options):
+                status, _payload, service, sent, results = self.mapping_save_http_result(**options)
+                self.assertEqual(status, expected_status)
+                self.assertEqual(service.mapping_store.load_all(), {})
+                self.assertEqual(sent, [])
+                self.assertEqual(results, [])
+                service.set_slot_led.assert_not_awaited()
+                service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+                service.schedule_led_snapshot_refresh.assert_not_called()
+                self.assertFalse(any(call.kwargs.get("force_refresh") for call in service.get_snapshot.await_args_list))
+
+    def assert_mapping_save_persisted(self, payload, service):
+        from app.services.mapping_store import MappingStore
+
+        persisted = MappingStore(service.mapping_store.file_path).get_mapping(service.system.id, "shelf-a", 0)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(persisted.model_dump(mode="json"), payload["mapping"])
+        self.assertEqual(persisted.serial, "SANITIZED-MAPPING-978")
+        self.assertEqual(payload["snapshot"]["selected_system_id"], service.system.id)
+        self.assertEqual(payload["snapshot"]["selected_enclosure_id"], "shelf-a")
+
+    def assert_mapping_refresh_owner(self, service, *, led_changed):
+        service.invalidate_physical_enclosure_snapshot_cache.assert_called_once_with(
+            reason="route.save_mapping", enclosure_id="shelf-a", invalidate_source_bundle=led_changed,
+        )
+        self.assertEqual(
+            [call.kwargs for call in service.get_snapshot.await_args_list if call.kwargs.get("force_refresh")],
+            [{"force_refresh": True, "selected_enclosure_id": "shelf-a"}],
+        )
+
+    def mapping_save_http_result(self, *, origin="http://127.0.0.1", **options):
+        from tests.test_inventory import partial_locate_fixture
+
+        body = {"serial": "SANITIZED-MAPPING-978"}
+        for key in ("clear_identify_after_save", "expected_revision"):
+            if key in options:
+                body[key] = options.pop(key)
+        service, sent = partial_locate_fixture(self, observed=False, **options)
+        # Keep snapshot collection synthetic; mapping persistence, bounds, LED
+        # aggregation, session sequencing and target preflight remain real.
+        service.get_snapshot = AsyncMock(return_value=service._cache["shelf-a"])
+        revision = service.mapping_store.save_revision(service.system.id, "shelf-a", 0)
+        body.setdefault("expected_revision", revision)
+        if body["expected_revision"] is None:
+            del body["expected_revision"]
+        led_results = []
+        real_set_slot_led = service.set_slot_led
+
+        async def capture_led_result(*args, **kwargs):
+            result = await real_set_slot_led(*args, **kwargs)
+            led_results.append(result)
+            return result
+
+        service.set_slot_led = AsyncMock(side_effect=capture_led_result)
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        application = app_main.create_app()
+        application.state.operator_auth_settings = SimpleNamespace(auth_mode="network", allowed_host_names=frozenset())
+        application.state.read_ui_public_origin = "http://127.0.0.1"
+        messages = []
+
+        async def invoke():
+            async def receive():
+                return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            await application(
+                {
+                    "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                    "method": "POST", "scheme": "http", "path": "/api/slots/0/mapping",
+                    "raw_path": b"/api/slots/0/mapping",
+                    "query_string": b"system_id=synthetic-led-test&enclosure_id=shelf-a",
+                    "headers": [(b"content-type", b"application/json"), (b"host", b"127.0.0.1"), (b"origin", origin.encode())],
+                    "client": ("127.0.0.1", 1), "server": ("test", 80), "root_path": "",
+                }, receive, send,
+            )
+
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+            asyncio.run(invoke())
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        response_body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+        return start["status"], json.loads(response_body), service, sent, led_results
+
+    def locate_http_result(self, *, action="IDENTIFY", **fixture_options):
+        from tests.test_inventory import partial_locate_fixture
+
+        service, _sent = partial_locate_fixture(self, observed=action == "IDENTIFY", **fixture_options)
+        registry = MagicMock()
+        registry.get_service.return_value = service
+        application = app_main.create_app()
+        application.state.operator_auth_settings = SimpleNamespace(auth_mode="network", allowed_host_names=frozenset())
+        application.state.read_ui_public_origin = "http://127.0.0.1"
+        messages = []
+
+        async def invoke():
+            async def receive():
+                return {"type": "http.request", "body": json.dumps({"action": action}).encode(), "more_body": False}
+
+            async def send(message):
+                messages.append(message)
+
+            await application(
+                {
+                    "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                    "method": "POST", "scheme": "http", "path": "/api/slots/0/led",
+                    "raw_path": b"/api/slots/0/led",
+                    "query_string": b"system_id=synthetic-led-test&enclosure_id=shelf-a",
+                    "headers": [(b"content-type", b"application/json"), (b"host", b"127.0.0.1"), (b"origin", b"http://127.0.0.1")],
+                    "client": ("127.0.0.1", 1), "server": ("test", 80), "root_path": "",
+                }, receive, send,
+            )
+
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+            asyncio.run(invoke())
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+        return start["status"], json.loads(body), service
+
     def test_inventory_retention_scope_system_reports_system_wide_totals(self) -> None:
         from app.models.domain import InventorySnapshot, InventorySummary
         from app.services.inventory_accounting import DiskRetentionAccounting

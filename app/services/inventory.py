@@ -15031,6 +15031,17 @@ class InventoryService:
         sg_action = "--set=ident" if requested_active else "--clear=ident"
         acted_on_another_path = False
         for target_host, host_targets in by_host.items():
+            # Keep every required path, including failed/unread paths. Omitting
+            # one could turn a single off readback into a false global off.
+            host_paths = [
+                {
+                    "ses_device": normalize_text(target.get("ses_device")),
+                    "ses_element_id": target["ses_element_id"],
+                    "identify_active": None,
+                }
+                for target in host_targets
+            ]
+            paths.extend(host_paths)
             # Discovery only maps a device whose AES page it read, so the same
             # page, read first in this session, says which shelf it is now.
             preflight_commands = [
@@ -15087,6 +15098,13 @@ class InventoryService:
                         f"{exc} The other enclosure path also failed: " + "; ".join(failures)
                     ) from exc
                 raise
+            except LedSessionBusyError:
+                raise
+            except TrueNASAPIError as exc:
+                # An ordinary preflight failure leaves this host untouched,
+                # but must not discard a confirmed action on another host.
+                failures.append(str(exc))
+                continue
             results = results[len(preflight_commands):]
             # Only a successful locate command counts as switching this bay.
             acted_on_another_path = acted_on_another_path or any(
@@ -15135,16 +15153,15 @@ class InventoryService:
                         )
                         if mapped_slot is not None:
                             observed = bool(mapped_slot.identify_active)
-                paths.append(
-                    {
-                        "ses_device": target_device,
-                        "ses_element_id": target_element,
-                        "identify_active": observed,
-                    }
-                )
+                host_paths[index]["identify_active"] = observed
+        result = self._led_readback_result(requested_active, paths)
         if failures:
-            raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
-        return self._led_readback_result(requested_active, paths)
+            # A successful command alone is not partial success: at least one
+            # successful path must actually read back the requested state.
+            if not any(path["identify_active"] is requested_active for path in paths):
+                raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+            result.update(partial=True, failures=[failure[:240] for failure in failures[:8]])
+        return result
 
     @staticmethod
     def _led_readback_result(

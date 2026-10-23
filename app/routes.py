@@ -742,13 +742,18 @@ def build_router() -> APIRouter:
         led_changed = False
         if payload.clear_identify_after_save:
             try:
-                await service.set_slot_led(
+                led_result = await service.set_slot_led(
                     slot,
                     LedAction.clear,
                     selected_enclosure_id=enclosure_id,
                     invalidate_snapshot=False,
                 )
                 led_changed = True
+                if led_result.get("partial"):
+                    led_warning = (
+                        "Saved mapping, but the identify LED clear was only partially confirmed; "
+                        "another path failed and may still be lit."
+                    )
             except Exception as exc:  # noqa: BLE001 - surface as non-fatal warning.
                 logger.warning("Failed to clear identify LED after saving slot %s mapping: %s", slot, exc)
                 led_warning = "Saved mapping, but failed to clear the identify LED; see application logs."

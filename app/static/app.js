@@ -10814,7 +10814,9 @@
       }
 
       const requestedState = payload.requested_active === false ? "off" : "on";
-      if (payload.confirmed === true) {
+      if (payload.partial === true) {
+        reportLocate(`Locate light ${requestedState} was read back through one enclosure path for slot ${slot.slot_label}, but another path failed. Not all paths are confirmed.`, "warning");
+      } else if (payload.confirmed === true) {
         reportLocate(`Locate light ${requestedState} for slot ${slot.slot_label}, confirmed through ${locateLightSourceLabel(slot)}.`);
       } else if (payload.confirmed === false) {
         reportLocate(`The enclosure did not confirm the locate light is ${requestedState} for slot ${slot.slot_label}.`, "warning");
