@@ -1403,5 +1403,139 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class CoreExpanderCounterDraftTests(unittest.TestCase):
+    """Source-only policy: no CORE binary, sudo or device is exercised."""
+
+    def policy(self, argv, **updates):
+        from scripts.core_expander_counter_draft import draft_readonly_policy
+
+        evidence = {
+            "freebsd_release": "13.2",
+            "tool_path": "/sbin/camcontrol",
+            "sudo_version": "1.9.10",
+            "opt_in": True,
+        }
+        evidence.update(updates)
+        return draft_readonly_policy(argv, **evidence)
+
+    def test_default_is_disabled_without_commands_or_grants(self):
+        from scripts.core_expander_counter_draft import draft_readonly_policy
+
+        result = draft_readonly_policy(("/sbin/camcontrol", "smpphylist", "pass3"))
+        self.assertEqual(result["state"], "disabled")
+        self.assertIs(result["enabled"], False)
+        self.assertEqual(result["argv"], ())
+        self.assertIsNone(result["candidate_grant"])
+        self.assertIs(result["host_validated"], False)
+
+    def test_topology_is_not_mislabeled_as_error_counters(self):
+        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
+        result = self.policy(argv)
+        self.assertEqual(result["capability"], "phy_topology_only")
+        self.assertEqual(result["state"], "inactive_draft")
+        self.assertIs(result["enabled"], False)
+        self.assertEqual(result["argv"], argv)
+        self.assertEqual(result["candidate_grant"], "/sbin/camcontrol ^smpphylist pass3$")
+
+    def test_counter_request_has_only_the_exact_report_phy_error_log_bytes(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        for phy in (0, 3, 127, 254):
+            with self.subTest(phy=phy):
+                argv = phy_error_log_argv("pass3", phy)
+                request = bytes.fromhex(" ".join(argv[5].split("{}")))
+                self.assertEqual(request, bytes((0x40, 0x11, 6, 2, 0, 0, 0, 0, 0, phy, 0, 0)))
+                self.assertEqual(argv[:5], ("/sbin/camcontrol", "smpcmd", "pass3", "-r", "12"))
+                self.assertEqual(argv[6:], ("-R", "28", "-"))
+                result = self.policy(argv)
+                self.assertEqual(result["capability"], "expander_phy_error_log")
+                self.assertEqual(result["argv"], argv)
+                self.assertIs(result["host_validated"], False)
+                self.assertIs(result["enabled"], False)
+                grant = result["candidate_grant"]
+                self.assertTrue(core_stored_grant_matches(grant, shlex.join(argv)))
+                self.assertNotIn("*", grant)
+                self.assertNotIn("\\", grant)
+                self.assertNotIn(",", grant)
+                self.assertNotIn(":", grant)
+                self.assertFalse(core_stored_grant_matches(
+                    grant, shlex.join(phy_error_log_argv("pass4", phy))))
+                self.assertFalse(core_stored_grant_matches(
+                    grant, shlex.join(phy_error_log_argv("pass3", (phy + 1) % 255))))
+
+    def test_missing_or_unqualified_version_and_tool_evidence_is_refused(self):
+        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
+        for updates in (
+            {"freebsd_release": None}, {"freebsd_release": "13.0"},
+            {"freebsd_release": "14.0"}, {"freebsd_release": "TrueNAS-13"},
+            {"tool_path": None}, {"tool_path": "/usr/local/sbin/smp_rep_phy_err_log"},
+            {"tool_path": "/sbin/../sbin/camcontrol"},
+            {"sudo_version": None}, {"sudo_version": "1.9.9"},
+            {"sudo_version": "1.9.10 garbage"}, {"sudo_version": "1.8.31"},
+            {"opt_in": "yes"},
+        ):
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                self.policy(argv, **updates)
+        for version in ("1.9.10p1", "1.9.17"):
+            self.assertEqual(self.policy(argv, sudo_version=version)["state"], "inactive_draft")
+
+    def test_mutations_options_paths_and_unsupported_tools_are_refused(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        good = phy_error_log_argv("pass3", 3)
+        refused = [
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "reset"),
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "disable"),
+            ("/sbin/camcontrol", "reset", "pass3"),
+            ("/usr/local/sbin/smp_rep_phy_err_log", "--phy=3", "/dev/ses3"),
+            ("/usr/local/sbin/smartctl", "-l", "sasphy,reset", "/dev/da3"),
+            ("/usr/bin/sg_logs", "--select", "/dev/sg3"),
+            ("/sbin/camcontrol", "smpphylist", "pass3", "-l"),
+            ("/sbin/camcontrol", "smpphylist", "/dev/pass3"),
+            ("/sbin/camcontrol", "smpphylist", "pass3/../../etc/master.passwd"),
+            ("/sbin/camcontrol", "smpphylist", "pass3\nreset"),
+            ("/sbin/camcontrol", "smpphylist", "pass３"),
+            ("/sbin/../sbin/camcontrol", *good[1:]),
+            (*good, "-r", "12", "-"),  # stdin-controlled replacement request
+            (*good[:5], "-", *good[6:]),
+            (*good[:5], good[5].replace("11", "91", 1), *good[6:]),
+            (*good[:4], "16", *good[5:]),
+            (*good[:7], "32", "-"),
+            (*good[:5], "40 11 06 02 00 00 00 00 00 03 00 00", *good[6:]),
+            (*good, ";", "reset"),
+            " ".join(good),
+        ]
+        grants = (self.policy(good)["candidate_grant"],
+                  self.policy(("/sbin/camcontrol", "smpphylist", "pass3"))["candidate_grant"])
+        for argv in refused:
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                self.policy(argv)
+            if not isinstance(argv, str):
+                self.assertFalse(any(core_stored_grant_matches(grant, shlex.join(argv)) for grant in grants))
+
+    def test_builder_rejects_bad_phy_and_device_instead_of_normalizing(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        for phy in (-1, 255, True, "3", None, 3.0):
+            with self.subTest(phy=phy), self.assertRaises(ValueError):
+                phy_error_log_argv("pass3", phy)
+        for device in ("pass3 -v", "../pass3", "/dev/pass3", "pass3\x00", "pass３", "ses3"):
+            with self.subTest(device=device), self.assertRaises(ValueError):
+                phy_error_log_argv(device, 3)
+
+    def test_draft_does_not_touch_live_policy_or_io(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        before = core_grant_sources()
+        with patch("builtins.open", side_effect=AssertionError("file IO")), \
+                patch("subprocess.run", side_effect=AssertionError("exec")), \
+                patch("socket.create_connection", side_effect=AssertionError("network")):
+            result = self.policy(phy_error_log_argv("pass3", 3))
+        self.assertEqual(result["state"], "inactive_draft")
+        self.assertEqual(core_grant_sources(), before)
+        for grants in before.values():
+            self.assertFalse(any("smpcmd" in grant or "smpphylist" in grant for grant in grants))
+
+
 if __name__ == "__main__":
     unittest.main()
