@@ -37,8 +37,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Added
 
 - Disk details showed already-collected SAS JSON/text port counters and SATA
-  PHY events, preserving missing values, exact totals and saturation without
-  new collection commands or counter resets (#1018).
+  PHY events, preserving reported identities, missing values, exact totals and
+  saturation. Duplicate rows and retained metadata were bounded, without new
+  collection commands or counter resets (#1018).
 
 ### Fixed
 

@@ -3473,9 +3473,9 @@ def _extract_smartctl_sas_phy(
 # is already bounded at 4 MiB per command, but that still admits tens of
 # thousands of rows per disk, retained for every disk in the SMART cache. The
 # caps are internal and provisional:
-# - SAS: a disk target port is narrow (one PHY) and disks expose at most two
-#   ports, so 32 distinct (port, PHY) identities is well above any real disk
-#   port log while keeping 128 disks' retained rows small.
+# - SAS: 32 distinct (port, PHY) identities is a provisional retention budget,
+#   not a claim about a universal hardware limit. Overflow makes this optional
+#   collection unavailable instead of presenting an apparently complete prefix.
 # - SATA: GP log 0x11 is one 512-byte page and smartctl reads one page; each
 #   counter needs at least 4 bytes after the 4-byte header, so a device can
 #   report at most 126 distinct identifiers. 128 covers the whole page.
@@ -3526,17 +3526,30 @@ class _BoundedIdentityRows:
         return retained or None
 
 
+SMART_COUNTER_METADATA_MAX_CHARS = 256
+
+
+def _smart_counter_metadata(value: Any) -> str | None:
+    # Bound newly retained reported text before normalization/copying. Preserve
+    # measured counters if descriptions are oversized or not valid Unicode.
+    if not isinstance(value, str) or len(value) > SMART_COUNTER_METADATA_MAX_CHARS:
+        return None
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        return None
+    return normalize_text(value)
+
+
 def _sas_port_row(port: int, phy_id: int, phy: dict[str, Any]) -> dict[str, Any]:
     # Optional metadata is reported text, never coerced from malformed JSON
     # values. Keep this admission local to the port-row readers.
     row = {
         "port": port,
         "phy": phy_id,
-        "attached_type": normalize_text(phy.get("attached_device_type")) if isinstance(phy.get("attached_device_type"), str) else None,
-        "attached_reason": normalize_text(phy.get("attached_reason")) if isinstance(phy.get("attached_reason"), str) else None,
-        "sas_address": format_hex_identifier(phy.get("sas_address")) if isinstance(phy.get("sas_address"), str) else None,
-        "attached_sas_address": format_hex_identifier(phy.get("attached_sas_address")) if isinstance(phy.get("attached_sas_address"), str) else None,
-        "negotiated_link_rate": normalize_text(phy.get("negotiated_logical_link_rate")) if isinstance(phy.get("negotiated_logical_link_rate"), str) else None,
+        "attached_type": _smart_counter_metadata(phy.get("attached_device_type")),
+        "attached_reason": _smart_counter_metadata(phy.get("attached_reason")),
+        "sas_address": format_hex_identifier(_smart_counter_metadata(phy.get("sas_address"))),
+        "attached_sas_address": format_hex_identifier(_smart_counter_metadata(phy.get("attached_sas_address"))),
+        "negotiated_link_rate": _smart_counter_metadata(phy.get("negotiated_logical_link_rate")),
     }
     for counter in (
         "invalid_dword_count", "running_disparity_error_count",
@@ -3554,7 +3567,7 @@ def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]]
 
     smartctl numbers ``scsi_sas_port_N`` and ``phy_N`` by output position. The
     reported identity is the embedded ``relative_target_port_id`` (16-bit) and
-    ``phy_identifier`` (8-bit); a block whose identity is missing, a bool, out
+    ``identifier`` (8-bit); a block whose identity is missing, a bool, out
     of range or otherwise malformed is unknown and is not admitted.
     """
     rows = _BoundedIdentityRows(SMART_SAS_PORT_ROW_CAP)
@@ -3567,7 +3580,7 @@ def _extract_smartctl_sas_ports(payload: dict[str, Any]) -> list[dict[str, Any]]
         for subkey, phy in value.items():
             if not isinstance(subkey, str) or re.fullmatch(r"phy_[0-9]+", subkey) is None or not isinstance(phy, dict):
                 continue
-            phy_id = phy.get("phy_identifier")
+            phy_id = phy.get("identifier")
             if type(phy_id) is not int or not 0 <= phy_id <= 255:
                 continue
             if not rows.admit((port, phy_id), _sas_port_row(port, phy_id, phy)):
@@ -3660,7 +3673,7 @@ def _sata_phy_event_row(entry: Any) -> dict[str, Any] | None:
         return None
     return {
         "id": event_id, "size": size,
-        "name": normalize_text(entry.get("name")) if isinstance(entry.get("name"), str) else None,
+        "name": _smart_counter_metadata(entry.get("name")),
         # A decimal string avoids rounding uint64 totals in browser JSON.parse.
         "value": str(value) if type(value) is int and 0 <= value < 1 << (8 * size) else None,
     }

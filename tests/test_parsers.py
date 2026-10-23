@@ -3559,7 +3559,7 @@ class ParserConsolidationTests(unittest.TestCase):
         payload = {
             "scsi_transport_protocol": {"name": "SAS (SPL-4)"},
             "scsi_sas_port_0": {"relative_target_port_id": 1, "generation_code": 3, "number_of_phys": 1, "phy_0": {
-                "phy_identifier": 0,
+                "identifier": 0,
                 "attached_device_type": "expander device",
                 "attached_reason": "power on",
                 "sas_address": disk_address,
@@ -3572,8 +3572,8 @@ class ParserConsolidationTests(unittest.TestCase):
             }},
             "scsi_sas_port_1": {
                 "relative_target_port_id": 2, "generation_code": 3, "number_of_phys": 2,
-                "phy_0": {"phy_identifier": 0, "attached_device_type": "no device attached"},
-                "phy_1": {"phy_identifier": 1, "invalid_dword_count": 9},
+                "phy_0": {"identifier": 0, "attached_device_type": "no device attached"},
+                "phy_1": {"identifier": 1, "invalid_dword_count": 9},
             },
         }
         parsed = parsers.parse_smartctl_summary(json.dumps(payload))
@@ -3598,7 +3598,7 @@ class ParserConsolidationTests(unittest.TestCase):
                 payload = json.dumps({
                     "temperature": {"current": 30}, "smart_status": {"passed": True},
                     "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {
-                        "phy_identifier": 0,
+                        "identifier": 0,
                         "attached_device_type": "expander device", "attached_reason": value,
                         "negotiated_logical_link_rate": "12 Gbps",
                         "invalid_dword_count": 0, "phy_reset_problem_count": 4294967295,
@@ -3635,8 +3635,8 @@ class ParserConsolidationTests(unittest.TestCase):
                         "temperature": {"current": 30}, "smart_status": {"passed": True},
                         "scsi_sas_port_0": {
                             "relative_target_port_id": 1,
-                            "phy_0": {"phy_identifier": 0, "attached_device_type": "expander device"},
-                            "phy_1": {"phy_identifier": 1, source: value, "invalid_dword_count": 0},
+                            "phy_0": {"identifier": 0, "attached_device_type": "expander device"},
+                            "phy_1": {"identifier": 1, source: value, "invalid_dword_count": 0},
                         },
                     })
                     summary = InventoryService._parse_smart_payload_for_slot(None, payload)
@@ -3659,7 +3659,7 @@ class ParserConsolidationTests(unittest.TestCase):
                 with self.subTest(field=source, value=value):
                     rows = parsers._extract_smartctl_sas_ports({
                         "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {
-                            "phy_identifier": 0, source: value, "invalid_dword_count": 0,
+                            "identifier": 0, source: value, "invalid_dword_count": 0,
                         }},
                     })
                     assert rows is not None
@@ -3763,7 +3763,7 @@ ID      Size     Value  Description
         filled = InventoryService._merge_missing_smart_fields(SmartSummaryView(), text)
         self.assertEqual(filled.sas_ports, text.sas_ports)
         original = InventoryService._parse_smart_payload_for_slot(None, json.dumps({
-            "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 42}},
+            "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"identifier": 0, "invalid_dword_count": 42}},
             "temperature": {"current": 30},
         }))
         before = original.model_dump()["sas_ports"]
@@ -3869,20 +3869,48 @@ ID      Size     Value  Description
         for value in (None, True, False, -1, 4294967296, 1.5, "7", "FFFFFFFF", {}, []):
             with self.subTest(value=value):
                 parsed = parsers.parse_smartctl_summary(json.dumps({
-                    "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": 0, "invalid_dword_count": value}}
+                    "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"identifier": 0, "invalid_dword_count": value}}
                 }))
                 self.assertIsNone(parsed["sas_ports"][0]["invalid_dword_count"])
 
     def test_sas_port_counters_ignore_malformed_port_and_phy_blocks(self) -> None:
         payload = {
-            "scsi_sas_port_bad": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": 0}},
+            "scsi_sas_port_bad": {"relative_target_port_id": 1, "phy_0": {"identifier": 0}},
             "scsi_sas_port_0": {
                 "relative_target_port_id": 1,
-                "phy_bad": {"phy_identifier": 0}, "phy_1": "bad", "other": {"phy_identifier": 0},
+                "phy_bad": {"identifier": 0}, "phy_1": "bad", "other": {"identifier": 0},
             },
             "scsi_sas_port_1": [], "scsi_sas_port_2": "bad", "scsi_sas_port_3": None,
         }
         self.assertIsNone(parsers.parse_smartctl_summary(json.dumps(payload))["sas_ports"])
+
+    def test_smart_counter_metadata_is_bounded_without_dropping_measurements(self) -> None:
+        for metadata in ("x" * 257, "x" * 100000, "bad\udfffmetadata"):
+            with self.subTest(length=len(metadata)):
+                sas = [parsers._sas_port_row(7, 3, {
+                    "attached_reason": metadata, "invalid_dword_count": 0,
+                })]
+                self.assertIsNone(sas[0]["attached_reason"])
+                self.assertEqual(sas[0]["invalid_dword_count"], 0)
+                sata = parsers._extract_smartctl_sata_phy_events({
+                    "sata_phy_event_counters": {"table": [
+                        {"id": 2, "size": 2, "value": 0, "name": metadata},
+                    ]},
+                })
+                assert sata is not None
+                self.assertIsNone(sata[0]["name"])
+                self.assertEqual(sata[0]["value"], "0")
+                text = ("Protocol Specific port log page for SAS SSP\n"
+                        "relative target port id = 7\n  phy identifier = 3\n"
+                        f"    attached reason: {metadata}\n    Invalid DWORD count = 0\n")
+                rows = parsers._extract_smartctl_sas_ports_text(text)
+                assert rows is not None
+                self.assertIsNone(rows[0]["attached_reason"])
+                self.assertEqual(rows[0]["invalid_dword_count"], 0)
+        valid = "x" * 256
+        row = parsers._sata_phy_event_row({"id": 2, "size": 2, "value": 0, "name": valid})
+        assert row is not None
+        self.assertEqual(row["name"], valid)
 
     def test_sas_port_json_identity_is_embedded_not_the_ordinal_suffix(self) -> None:
         # Real smartctl shape: the first reported port (ordinal 0) carries
@@ -3890,12 +3918,12 @@ ID      Size     Value  Description
         parsed = parsers.parse_smartctl_summary(json.dumps({
             "temperature": {"current": 30}, "smart_status": {"passed": True},
             "scsi_sas_port_0": {"relative_target_port_id": 7, "number_of_phys": 1,
-                                "phy_0": {"phy_identifier": 3, "invalid_dword_count": 5}},
+                                "phy_0": {"identifier": 3, "invalid_dword_count": 5}},
         }))
         self.assertEqual([(r["port"], r["phy"], r["invalid_dword_count"]) for r in parsed["sas_ports"]], [(7, 3, 5)])
         # The ordinal suffix is never validated or credited as identity.
         parsed = parsers.parse_smartctl_summary(json.dumps({
-            "scsi_sas_port_70000": {"relative_target_port_id": 1, "phy_999": {"phy_identifier": 0, "invalid_dword_count": 1}},
+            "scsi_sas_port_70000": {"relative_target_port_id": 1, "phy_999": {"identifier": 0, "invalid_dword_count": 1}},
         }))
         self.assertEqual([(r["port"], r["phy"]) for r in parsed["sas_ports"]], [(1, 0)])
         # Ordinal-only blocks are unknown, not port 0 PHY 0.
@@ -3909,8 +3937,8 @@ ID      Size     Value  Description
             with self.subTest(relative_target_port_id=port_id):
                 parsed = parsers.parse_smartctl_summary(json.dumps({
                     "temperature": {"current": 30}, "smart_status": {"passed": True},
-                    "scsi_sas_port_0": {"relative_target_port_id": port_id, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 5}},
-                    "scsi_sas_port_1": {"relative_target_port_id": 2, "phy_0": {"phy_identifier": 1, "invalid_dword_count": 6}},
+                    "scsi_sas_port_0": {"relative_target_port_id": port_id, "phy_0": {"identifier": 0, "invalid_dword_count": 5}},
+                    "scsi_sas_port_1": {"relative_target_port_id": 2, "phy_0": {"identifier": 1, "invalid_dword_count": 6}},
                 }))
                 self.assertEqual([(r["port"], r["phy"], r["invalid_dword_count"]) for r in parsed["sas_ports"]], [(2, 1, 6)])
                 self.assertEqual(parsed["temperature_c"], 30)
@@ -3918,12 +3946,12 @@ ID      Size     Value  Description
         for phy_id in (True, False, -1, 256, 65536, "3", "0", 1.5, None, {}, [], {"id": 1}):
             with self.subTest(phy_identifier=phy_id):
                 parsed = parsers.parse_smartctl_summary(json.dumps({
-                    "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": phy_id, "invalid_dword_count": 5},
-                                        "phy_1": {"phy_identifier": 1, "invalid_dword_count": 6}},
+                    "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"identifier": phy_id, "invalid_dword_count": 5},
+                                        "phy_1": {"identifier": 1, "invalid_dword_count": 6}},
                 }))
                 self.assertEqual([(r["port"], r["phy"], r["invalid_dword_count"]) for r in parsed["sas_ports"]], [(1, 1, 6)])
         for payload in (
-            {"scsi_sas_port_0": {"phy_0": {"phy_identifier": 0, "invalid_dword_count": 5}}},
+            {"scsi_sas_port_0": {"phy_0": {"identifier": 0, "invalid_dword_count": 5}}},
             {"scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"invalid_dword_count": 5}}},
             {"scsi_sas_port_0": {"relative_target_port_id": 1}},
         ):
@@ -3991,24 +4019,24 @@ Background scan results log
                 self.assertIsNone(row["loss_of_dword_synchronization_count"])
 
     def test_sas_port_rows_collapse_identical_repeats_and_omit_conflicting_identities(self) -> None:
-        shared = {"phy_identifier": 0, "attached_device_type": "expander device", "invalid_dword_count": 5}
+        shared = {"identifier": 0, "attached_device_type": "expander device", "invalid_dword_count": 5}
         parsed = parsers.parse_smartctl_summary(json.dumps({
             "temperature": {"current": 30}, "smart_status": {"passed": True},
             "scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": dict(shared)},
             "scsi_sas_port_1": {"relative_target_port_id": 1, "phy_0": dict(shared)},
-            "scsi_sas_port_2": {"relative_target_port_id": 2, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 1}},
-            "scsi_sas_port_3": {"relative_target_port_id": 2, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 2}},
-            "scsi_sas_port_4": {"relative_target_port_id": 3, "phy_0": {"phy_identifier": 4, "invalid_dword_count": 1},
-                                "phy_1": {"phy_identifier": 4, "attached_reason": "power on", "invalid_dword_count": 1}},
-            "scsi_sas_port_5": {"relative_target_port_id": 4, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 3}},
+            "scsi_sas_port_2": {"relative_target_port_id": 2, "phy_0": {"identifier": 0, "invalid_dword_count": 1}},
+            "scsi_sas_port_3": {"relative_target_port_id": 2, "phy_0": {"identifier": 0, "invalid_dword_count": 2}},
+            "scsi_sas_port_4": {"relative_target_port_id": 3, "phy_0": {"identifier": 4, "invalid_dword_count": 1},
+                                "phy_1": {"identifier": 4, "attached_reason": "power on", "invalid_dword_count": 1}},
+            "scsi_sas_port_5": {"relative_target_port_id": 4, "phy_0": {"identifier": 0, "invalid_dword_count": 3}},
         }))
         self.assertEqual([(r["port"], r["phy"], r["invalid_dword_count"]) for r in parsed["sas_ports"]], [(1, 0, 5), (4, 0, 3)])
         self.assertEqual(parsed["temperature_c"], 30)
         self.assertEqual(parsed["sas_address"], None)
         only_conflicts = parsers.parse_smartctl_summary(json.dumps({
             "temperature": {"current": 30},
-            "scsi_sas_port_0": {"relative_target_port_id": 2, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 1}},
-            "scsi_sas_port_1": {"relative_target_port_id": 2, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 2}},
+            "scsi_sas_port_0": {"relative_target_port_id": 2, "phy_0": {"identifier": 0, "invalid_dword_count": 1}},
+            "scsi_sas_port_1": {"relative_target_port_id": 2, "phy_0": {"identifier": 0, "invalid_dword_count": 2}},
         }))
         self.assertIsNone(only_conflicts["sas_ports"])
         self.assertEqual(only_conflicts["temperature_c"], 30)
@@ -4029,7 +4057,7 @@ Background scan results log
         def payload(count: int) -> dict:
             return {
                 "temperature": {"current": 30}, "smart_status": {"passed": True},
-                **{f"scsi_sas_port_{i}": {"relative_target_port_id": i, "phy_0": {"phy_identifier": 0, "invalid_dword_count": i}}
+                **{f"scsi_sas_port_{i}": {"relative_target_port_id": i, "phy_0": {"identifier": 0, "invalid_dword_count": i}}
                    for i in range(count)},
             }
 
@@ -4042,7 +4070,7 @@ Background scan results log
         self.assertTrue(over["available"])
         # Repeats of one identity never count against the cap and never
         # allocate a row each.
-        repeated = {f"scsi_sas_port_{i}": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 0}}
+        repeated = {f"scsi_sas_port_{i}": {"relative_target_port_id": 1, "phy_0": {"identifier": 0, "invalid_dword_count": 0}}
                     for i in range(5000)}
         self.assertEqual([(r["port"], r["phy"]) for r in parsers.parse_smartctl_summary(json.dumps(repeated))["sas_ports"]], [(1, 0)])
         self.assertEqual(len(parsers._extract_smartctl_sas_ports(payload(cap - 1))), cap - 1)
@@ -4122,7 +4150,7 @@ Background scan results log
         from app.models.domain import SmartSummaryView
         from app.services.inventory import InventoryService
 
-        payload = json.dumps({"scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"phy_identifier": 0, "invalid_dword_count": 0}}})
+        payload = json.dumps({"scsi_sas_port_0": {"relative_target_port_id": 1, "phy_0": {"identifier": 0, "invalid_dword_count": 0}}})
         parsed = parsers.parse_smartctl_summary(payload)
         summary = SmartSummaryView.model_validate(parsed)
         self.assertEqual(summary.model_dump()["sas_ports"], parsed["sas_ports"])
