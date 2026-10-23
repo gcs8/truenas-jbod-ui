@@ -25,8 +25,8 @@ APP_UID = 10001
 APP_GID = 10001
 BACKUP_UID = 1000
 # The default docker-compose.yml runs enclosure-ui as root ("0:0") since #399;
-# the non-root identity lives in docker-compose.nonroot.yml, which this matrix
-# does not apply. Files the UI writes are therefore owned by root.
+# the optional overlay changes the UI writer to APP_UID:APP_GID. Keep the base
+# expectation separate and bind each cycle to the validated rendered user.
 UI_WRITER_UID = 0
 UI_WRITER_GID = 0
 BACKUP_GID = 1000
@@ -44,9 +44,9 @@ MATRIX_CONTAINER_NAMES = {
 SYNTHETIC_BACKUP_PASSPHRASE = "synthetic-compose-matrix-backup-passphrase"
 SCHEDULER_WAIT_SECONDS = 90
 SUCCESS_MARKER = (
-    "compose_runtime_matrix=ok variants=7 ui_alias_cycles=4 "
-    "ui_mapping_cycles=4 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
-    "scheduler_backup_cycles=1"
+    "compose_runtime_matrix=ok variants=8 ui_alias_cycles=5 "
+    "ui_mapping_cycles=5 admin_setup_cycles=1 scheduler_disabled_cycles=1 "
+    "scheduler_backup_cycles=1 ui_journal_read_cycles=2"
 )
 
 
@@ -60,6 +60,8 @@ class Variant(NamedTuple):
     admin_initial_setup: bool = False
     scheduler_enabled: bool = False
     scheduler_policy_enabled: bool = False
+    nonroot: bool = False
+    journal_read: bool = False
 
 
 class Ports(NamedTuple):
@@ -69,7 +71,7 @@ class Ports(NamedTuple):
 
 
 VARIANTS = (
-    Variant("ui-only", (), ("enclosure-ui",), True, False, False),
+    Variant("ui-only", (), ("enclosure-ui",), True, False, False, journal_read=True),
     Variant(
         "ui-history",
         ("history",),
@@ -122,6 +124,8 @@ VARIANTS = (
         scheduler_enabled=True,
         scheduler_policy_enabled=True,
     ),
+    Variant("ui-nonroot", (), ("enclosure-ui",), True, False, False,
+            nonroot=True, journal_read=True),
 )
 
 
@@ -355,11 +359,14 @@ def _compose_prefix(root: Path, variant: Variant) -> list[str]:
         str(root),
         "-f",
         str(root / "compose.yaml"),
-        "--env-file",
-        str(root / ".env"),
     ]
+    if variant.nonroot:
+        command.extend(("-f", str(root / "nonroot.yaml")))
+    command.extend(("--env-file", str(root / ".env")))
     for profile in variant.profiles:
         command.extend(("--profile", profile))
+    if variant.journal_read and "backup-scheduler" not in variant.profiles:
+        command.extend(("--profile", "backup-scheduler"))
     return command
 
 
@@ -371,6 +378,7 @@ def _write_environment(
     variant: Variant | None = None,
 ) -> None:
     scheduler_policy_enabled = bool(variant and variant.scheduler_policy_enabled)
+    config_backups_enabled = scheduler_policy_enabled or bool(variant and variant.journal_read)
     values = [
         f"JBOD_UI_IMAGE={image}",
         f"APP_UID={APP_UID}",
@@ -395,7 +403,7 @@ def _write_environment(
         f"ADMIN_PUBLIC_ORIGIN=http://127.0.0.1:{ports.admin}",
         "METRICS_ENABLED=true",
         "SCHEDULED_BACKUP_ENABLED=false",
-        f"BACKUP_CONFIG_ENABLED={'true' if scheduler_policy_enabled else 'false'}",
+        f"BACKUP_CONFIG_ENABLED={'true' if config_backups_enabled else 'false'}",
         "BACKUP_FULL_ENABLED=false",
         # Replace any backups.targets from the config fixture: the matrix must
         # never ship to, or run retention against, real remote storage.
@@ -446,6 +454,10 @@ def _prepare_variant_root(
     root.mkdir(mode=0o700)
     shutil.copyfile(compose_path, root / "compose.yaml")
     (root / "compose.yaml").chmod(0o600)
+    if variant.nonroot:
+        overlay = _require_regular_file(compose_path.with_name("docker-compose.nonroot.yml"), "Nonroot overlay")
+        shutil.copyfile(overlay, root / "nonroot.yaml")
+        (root / "nonroot.yaml").chmod(0o600)
     _write_environment(root, image, ports, variant=variant)
     _run(
         (
@@ -547,6 +559,12 @@ def _prepare_variant_root(
             )
         finally:
             source.unlink(missing_ok=True)
+    if variant.nonroot:
+        # Only this fresh, absence-checked fixture is migrated. No writer has
+        # started, and none may start until the inherited helper completes.
+        _run(("sudo", "-n", "--", sys.executable,
+              str(Path(__file__).with_name("prepare_nonroot_bind_mounts.py")), str(root),
+              "--uid", str(APP_UID), "--gid", str(APP_GID), "--apply"))
 
 
 def _authorization_header() -> str:
@@ -820,8 +838,22 @@ def _restart_ui(prefix: Sequence[str], ports: Ports) -> None:
     _verify_ui(ports)
 
 
-def _require_ui_written_file(owner_uid: int, owner_gid: int, file_mode: int, kind: str) -> None:
-    expected = (UI_WRITER_UID, UI_WRITER_GID)
+def _ui_writer_owner(model: dict[str, object], variant: Variant) -> tuple[int, int]:
+    expected = (APP_UID, APP_GID) if variant.nonroot else (UI_WRITER_UID, UI_WRITER_GID)
+    services = model.get("services")
+    ui = services.get("enclosure-ui") if isinstance(services, dict) else None
+    user = ui.get("user") if isinstance(ui, dict) else None
+    if not isinstance(user, str) or user != f"{expected[0]}:{expected[1]}":
+        raise RuntimeError("Compose UI writer identity contract mismatch.")
+    uid, gid = user.split(":")
+    return int(uid), int(gid)
+
+
+def _require_ui_written_file(
+    owner_uid: int, owner_gid: int, file_mode: int, kind: str,
+    *, expected_owner: tuple[int, int] | None = None,
+) -> None:
+    expected = expected_owner if expected_owner is not None else (UI_WRITER_UID, UI_WRITER_GID)
     if (owner_uid, owner_gid) != expected or not stat.S_ISREG(file_mode):
         raise RuntimeError(
             f"{kind} persistence ownership failed: owner={owner_uid}:{owner_gid} "
@@ -834,6 +866,7 @@ def _verify_pencil_cycle(
     variant: Variant,
     ports: Ports,
     prefix: Sequence[str],
+    *, expected_owner: tuple[int, int] | None = None,
 ) -> None:
     url = f"http://127.0.0.1:{ports.ui}/api/sas-fabric/aliases"
     same_origin = f"http://127.0.0.1:{ports.ui}"
@@ -877,7 +910,7 @@ def _verify_pencil_cycle(
     if saved_alias.get("object_id") != object_id or saved_alias.get("label") != save_payload["label"]:
         raise RuntimeError("alias persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(alias_path)
-    _require_ui_written_file(owner_uid, owner_gid, file_mode, "alias")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "alias", expected_owner=expected_owner)
 
     _restart_ui(prefix, ports)
     aliases = _read_app_owned_json(alias_path).get("sas_fabric_aliases")
@@ -911,6 +944,7 @@ def _verify_mapping_cycle(
     variant: Variant,
     ports: Ports,
     prefix: Sequence[str],
+    *, expected_owner: tuple[int, int] | None = None,
 ) -> None:
     base = f"http://127.0.0.1:{ports.ui}"
     same_origin = base
@@ -998,7 +1032,7 @@ def _verify_mapping_cycle(
     if saved_mapping.get("slot") != 0 or saved_mapping.get("notes") != payload["notes"]:
         raise RuntimeError("mapping persistence readback failed")
     owner_uid, owner_gid, file_mode, _size = _read_app_owned_metadata(mapping_path)
-    _require_ui_written_file(owner_uid, owner_gid, file_mode, "mapping")
+    _require_ui_written_file(owner_uid, owner_gid, file_mode, "mapping", expected_owner=expected_owner)
 
     _restart_ui(prefix, ports)
     mappings = _read_app_owned_json(mapping_path).get("slot_mappings")
@@ -1023,6 +1057,44 @@ def _verify_mapping_cycle(
     mappings = _read_app_owned_json(mapping_path).get("slot_mappings")
     if mappings != {}:
         raise RuntimeError("mapping clear readback failed")
+
+
+# Run only as the scheduler's inherited user/groups. No daemon, journal lock
+# acquisition, credential read, backup job, or remote destination is invoked.
+UI_JOURNAL_READ_PROBE = """import json, os, stat, sys
+from pathlib import Path
+owner_uid, app_gid = map(int, sys.argv[1:])
+if (os.getuid(), os.getgid()) != (1000, 1000) or app_gid not in os.getgroups():
+    raise RuntimeError('scheduler effective identity mismatch')
+directory = Path('/app/backup-journal')
+metadata = directory.stat(follow_symlinks=False)
+if (not stat.S_ISDIR(metadata.st_mode) or (metadata.st_uid, metadata.st_gid) != (1000, app_gid)
+        or stat.S_IMODE(metadata.st_mode) != 0o2770):
+    raise RuntimeError('journal directory contract mismatch')
+path = directory / 'config-changes.jsonl'
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+with os.fdopen(fd, 'rb') as stream:
+    metadata = os.fstat(stream.fileno())
+    if (not stat.S_ISREG(metadata.st_mode) or (metadata.st_uid, metadata.st_gid) != (owner_uid, app_gid)
+            or stat.S_IMODE(metadata.st_mode) != 0o660):
+        raise RuntimeError('UI journal ownership/mode mismatch')
+    raw = stream.read(1024 * 1024 + 1)
+if not raw or len(raw) > 1024 * 1024 or not raw.endswith(b'\\n'):
+    raise RuntimeError('UI journal size/framing mismatch')
+actions = {record.get('action') for line in raw.splitlines()
+           if isinstance(record := json.loads(line), dict) and record.get('type') == 'change'}
+if not {'sas_alias.save', 'sas_alias.clear', 'mapping.save', 'mapping.clear'} <= actions:
+    raise RuntimeError('UI journal mutation entries missing')
+print('journal_read=ok')
+"""
+
+
+def _verify_ui_journal_read(prefix: Sequence[str], owner: tuple[int, int]) -> None:
+    result = _run((*prefix, "run", "--rm", "--no-deps", "--pull", "never", "-T",
+                   "--entrypoint", "python", "enclosure-backup-scheduler", "-c",
+                   UI_JOURNAL_READ_PROBE, str(owner[0]), str(APP_GID)), capture_output=True)
+    if result.stdout.strip() != "journal_read=ok":
+        raise RuntimeError("Compose scheduler UI journal read contract mismatch.")
 
 
 def _verify_ui(ports: Ports) -> None:
@@ -1194,6 +1266,10 @@ def _verify_rendered_contract(
         if any(service.get(key) for key in ("build", "privileged", "devices", "volumes_from",
                                             "network_mode", "pid", "ipc", "env_file", "extends")):
             raise RuntimeError("Compose rendered isolation contract mismatch.")
+        if name == "enclosure-backup-scheduler":
+            if (service.get("user") != f"{BACKUP_UID}:{BACKUP_GID}"
+                    or set(map(str, service.get("group_add") or [])) != {str(APP_GID)}):
+                raise RuntimeError("Compose rendered scheduler identity/group contract mismatch.")
         expected_port = port_map[name]
         bindings = service.get("ports", [])
         if expected_port is None:
@@ -1270,6 +1346,19 @@ def _verify_runtime_contract(
         expected = model["services"][name]
         if record.get("Image") != expected["image"]:
             raise RuntimeError("Compose runtime image contract mismatch.")
+        if record.get("Config", {}).get("User") != expected.get("user"):
+            raise RuntimeError("Compose runtime user contract mismatch.")
+        host = record.get("HostConfig", {})
+        if bool(host.get("ReadonlyRootfs")) != bool(expected.get("read_only")):
+            raise RuntimeError("Compose runtime read-only contract mismatch.")
+        for rendered, runtime in (("cap_drop", "CapDrop"), ("group_add", "GroupAdd")):
+            if set(map(str, host.get(runtime) or [])) != set(map(str, expected.get(rendered) or [])):
+                raise RuntimeError("Compose runtime hardening/group contract mismatch.")
+        if "no-new-privileges:true" in expected.get("security_opt", []):
+            if "no-new-privileges:true" not in (host.get("SecurityOpt") or []):
+                raise RuntimeError("Compose runtime no-new-privileges contract mismatch.")
+        if "/tmp" in expected.get("tmpfs", []) and "/tmp" not in (host.get("Tmpfs") or {}):
+            raise RuntimeError("Compose runtime tmpfs contract mismatch.")
         expected_ports = {
             f"{port['target']}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port["published"])}]
             for port in expected.get("ports", [])
@@ -1332,6 +1421,13 @@ def _run_variant(
     )
     try:
         model = _verify_rendered_contract(prefix, root, image, ports)
+        owner = _ui_writer_owner(model, variant) if variant.ui_enabled else None
+        if variant.nonroot:
+            ui = model["services"]["enclosure-ui"]
+            if (ui.get("read_only") is not True or ui.get("cap_drop") != ["ALL"]
+                    or "/tmp" not in ui.get("tmpfs", [])
+                    or "no-new-privileges:true" not in ui.get("security_opt", [])):
+                raise RuntimeError("Compose nonroot hardening contract mismatch.")
         up = [*prefix, "up", "-d", "--wait", "--wait-timeout", "90"]
         if variant.admin_initial_setup:
             up.append("--no-deps")
@@ -1345,9 +1441,13 @@ def _run_variant(
             raise RuntimeError(f"{variant.name} started an unexpected service set")
         _verify_runtime_contract(prefix, model, variant.services, source_commit)
         if variant.ui_enabled:
+            if owner is None:
+                raise RuntimeError("Compose UI writer identity contract is missing.")
             _verify_ui(ports)
-            _verify_pencil_cycle(root, variant, ports, prefix)
-            _verify_mapping_cycle(root, variant, ports, prefix)
+            _verify_pencil_cycle(root, variant, ports, prefix, expected_owner=owner)
+            _verify_mapping_cycle(root, variant, ports, prefix, expected_owner=owner)
+            if variant.journal_read:
+                _verify_ui_journal_read(prefix, owner)
         if variant.history_enabled:
             _verify_history(ports)
         if variant.admin_enabled:
@@ -1367,6 +1467,9 @@ def _run_variant(
                     "admin_initial_setup": variant.admin_initial_setup,
                     "alias_cycle": variant.ui_enabled,
                     "mapping_cycle": variant.ui_enabled,
+                    "nonroot": variant.nonroot,
+                    "ui_writer": list(owner) if owner is not None else None,
+                    "ui_journal_read": variant.journal_read,
                     "scheduler": variant.scheduler_enabled,
                     "scheduler_backup": variant.scheduler_policy_enabled,
                     "services": list(variant.services),
