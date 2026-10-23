@@ -1,10 +1,11 @@
 # Recapturing the public demo screenshots
 
 `docs/images/screenshots/manifest.json` binds the two public-demo PNGs to the
-checked-in demo artifact byte for byte. Any pull request that changes a declared
-demo input eventually needs a fresh capture, and the fresh bytes have to come
-from one pinned environment. This page is the only supported way to produce
-them.
+checked-in demo artifact byte for byte. Ordinary pull requests and prereleases do not regenerate
+the public demo, screenshots, manifest, or pixel-review record. Regenerate them
+only for an approved stable release, from its frozen release source. The fresh
+bytes must come from one pinned environment. This page is the only supported way
+to produce them.
 
 ## Why the capture is Linux only
 
@@ -25,7 +26,7 @@ never on a workstation.
 
 | Thing | Pin |
 |---|---|
-| Container image | `mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615` |
+| Container image | `mcr.microsoft.com/playwright:v1.64.0-jammy@sha256:c064e7f355d2dda32f669801a1b09e86a1e9252395c844d2cfbbe5c44acb9b79` |
 | Playwright package | `package-lock.json`, installed with `npm ci --ignore-scripts` |
 | Browser build | the Chromium inside that image |
 | Fonts | the font packages inside that image, listed in the run log |
@@ -41,7 +42,7 @@ log, and `tests/test_ci_contract.py` fails if the `container.image` pin loses it
 
 ```bash
 curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
-  https://mcr.microsoft.com/v2/playwright/manifests/v1.62.1-jammy |
+  https://mcr.microsoft.com/v2/playwright/manifests/v1.64.0-jammy |
   grep -i docker-content-digest
 ```
 
@@ -51,8 +52,19 @@ The container tag and the locked Playwright version must match. The job reads
 the version out of `package-lock.json` and fails if the tag has drifted, because
 `npm ci --ignore-scripts` does not download browsers and relies on the ones
 already in the image. When Dependabot raises `@playwright/test`, raise the tag in
-`.github/workflows/capture-public-demo-screenshots.yml` in the same pull
-request.
+`.github/workflows/capture-public-demo-screenshots.yml` and this guide's complete
+image pin in the same pull request. Resolve and verify the new digest from the
+official registry; changing the tag alone is insufficient.
+
+The 1.64.0 pin was resolved from [Microsoft's registry](https://mcr.microsoft.com/v2/playwright/manifests/v1.64.0-jammy)
+on 2026-10-13. Its OCI index response hash matches the registry's
+`Docker-Content-Digest` header. The package version is the upstream
+[`v1.64.0` release](https://github.com/microsoft/playwright/releases/tag/v1.64.0).
+This is source compatibility only:
+the new image has not yet been runtime-qualified. Image execution, browser
+availability, rendered fonts, and two-capture repeatability remain required
+before using it for stable-release artifacts. No existing public artifact or
+historical pixel-review attestation is refreshed by this dependency update.
 
 The job prints the fallback family that `fc-match` resolves for `sans-serif` and
 `monospace`, plus every installed font package and its version. That output is
@@ -76,8 +88,9 @@ Chromium used no longer matches:
 | `EXPECTED_SANS_FALLBACK` | `Liberation Sans` |
 | `EXPECTED_MONO_FALLBACK` | `WenQuanYi Zen Hei Mono` |
 
-Qualification run `34734456858` recorded both under the container digest pinned
-above; #516 moved them into the workflow. Do not edit either value to make a red
+Qualification run `34734456858` recorded both under an earlier container digest;
+#516 moved them into the workflow. That historical run does not qualify this image.
+Do not edit either value to make a red
 capture green: a mismatch means the image, its fonts, or the Chromium build
 changed, so the pixels changed too. Re-qualify instead - dispatch a
 `qualification_only` run against the new pin, read the dominant families out of
@@ -154,8 +167,9 @@ producing images to commit, is the workflow run with `qualification_only` set to
 
 ## How a maintainer produces a candidate
 
-1. Push the branch that changed the demo input and its rebuilt
-   `public-demo/index.html`.
+1. During approved stable-release preparation, push the frozen release source
+   and its rebuilt `public-demo/index.html`. Do not rebuild it for an ordinary
+   pull request or prerelease.
 2. Run the **Capture Public Demo Screenshots** workflow with
    `workflow_dispatch`, set `ref` to the full commit SHA of that branch head, and
    set `qualification_only` to `false`.
