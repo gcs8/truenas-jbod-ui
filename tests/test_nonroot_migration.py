@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, call, patch
 
+import yaml
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts/prepare_nonroot_bind_mounts.py"
 SPEC = importlib.util.spec_from_file_location("prepare_nonroot_bind_mounts", SCRIPT_PATH)
@@ -647,7 +649,7 @@ class NonRootWriterFenceDraftTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.writers = tuple(
             self.fence.Writer(role, role, "synthetic-owner")
-            for role in ("ui", "history", "admin", "backup-scheduler", "host-job")
+            for role in ("ui", "history", "admin", "backup", "backup-scheduler", "host-job")
         )
         self.deployment = self.fence.Deployment(
             "synthetic-deployment", "synthetic-owner", self.root, self.writers, ("host-job",),
@@ -660,6 +662,102 @@ class NonRootWriterFenceDraftTests(unittest.TestCase):
             deployment if deployment is not None else self.deployment,
             backend if backend is not None else self.backend,
         )
+
+    def test_draft_core_roles_cover_supported_compose_writers(self):
+        # Source-contract coverage only, not independent runtime discovery.
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            with self.subTest(compose=compose_name):
+                services = yaml.safe_load(
+                    (SCRIPT_PATH.parent.parent / compose_name).read_text(encoding="utf-8")
+                )["services"]
+                writer_roles = set()
+                for name, service in services.items():
+                    for binding in service.get("volumes", []):
+                        # Fail visibly if Compose changes to an unmodeled syntax.
+                        self.assertIsInstance(binding, str)
+                        fields = binding.split(":")
+                        self.assertIn(len(fields), (2, 3))
+                        modes = fields[2].split(",") if len(fields) == 3 else []
+                        if fields[0].startswith("./") and "ro" not in modes:
+                            self.assertTrue(name.startswith("enclosure-"))
+                            writer_roles.add(name.removeprefix("enclosure-"))
+                self.assertIn("backup", writer_roles)
+                self.assertEqual(self.fence.CORE_ROLES, writer_roles)
+                self.assertEqual(
+                    {writer.role for writer in self.writers if writer.role != "host-job"},
+                    writer_roles,
+                )
+
+    def test_draft_omitted_backup_is_refused_before_acquisition_or_callbacks(self):
+        declaration = replace(
+            self.deployment,
+            writers=tuple(writer for writer in self.writers if writer.role != "backup"),
+        )
+        # Match the incomplete declaration so backend mismatch cannot mask admission.
+        authority = _DisposableWriterAuthority(self.fence, declaration)
+        self.addCleanup(authority.cleanup)
+        coordinator = self.coordinator(declaration, authority)
+        inventory, mutate = Mock(), Mock()
+        with self.assertRaisesRegex(self.fence.FenceRefused, "all core writer roles"):
+            coordinator.run(inventory, mutate)
+        inventory.assert_not_called()
+        mutate.assert_not_called()
+        self.assertEqual(authority.events, [])
+        self.assertFalse(authority.held)
+        self.assertEqual(coordinator.phase, self.fence.Phase.FAILED)
+
+    def test_draft_running_backup_is_stopped_and_verified_before_callbacks(self):
+        backup = next(writer for writer in self.writers if writer.role == "backup")
+        child = self.backend.launch(backup)
+        self.assertIsNone(child.poll())
+        coordinator = self.coordinator()
+
+        def inventory(root, check):
+            self.assertEqual(root, self.root)
+            self.assertIsNotNone(child.poll())
+            self.assertEqual(
+                self.backend.events,
+                [("acquire", self.deployment.key), ("inspect", None)]
+                + [("stop", writer.name) for writer in self.writers]
+                + [("inspect", None)],
+            )
+            self.backend.events.append(("inventory", backup.name))
+            check()
+            return "synthetic-backup-plan"
+
+        def mutate(plan, check):
+            self.assertEqual(plan, "synthetic-backup-plan")
+            self.assertIsNotNone(child.poll())
+            self.assertIn(("inventory", backup.name), self.backend.events)
+            check()
+            self.backend.events.append(("mutate", backup.name))
+
+        refusal = None
+        try:
+            coordinator.run(inventory, mutate)
+        except self.fence.FenceRefused as exc:
+            refusal = exc
+        self.assertIsNone(refusal, "supported one-shot backup must be admitted and stopped")
+        self.assertIn(("mutate", backup.name), self.backend.events)
+        self.assertEqual(coordinator.phase, self.fence.Phase.COMPLETE_HELD)
+        self.assertTrue(self.backend.held)
+
+    def test_draft_unstopped_backup_is_refused_before_inventory_or_mutation(self):
+        backup = next(writer for writer in self.writers if writer.role == "backup")
+        child = self.backend.launch(backup)
+        self.assertIsNone(child.poll())
+        self.backend.ignore_stop.add(backup.name)
+        coordinator = self.coordinator()
+        inventory, mutate = Mock(), Mock()
+        with self.assertRaisesRegex(self.fence.FenceRefused, "writer termination not verified"):
+            coordinator.run(inventory, mutate)
+        inventory.assert_not_called()
+        mutate.assert_not_called()
+        self.assertIn(("stop", backup.name), self.backend.events)
+        self.assertEqual(self.backend.events[-1], ("inspect", None))
+        self.assertIsNone(child.poll())
+        self.assertEqual(coordinator.phase, self.fence.Phase.FAILED)
+        self.assertTrue(self.backend.held)
 
     def test_draft_concurrent_declared_launches_are_denied_through_both_windows(self):
         coordinator = self.coordinator()

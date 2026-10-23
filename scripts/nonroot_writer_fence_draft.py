@@ -41,7 +41,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol, TypeVar
 
-CORE_ROLES = frozenset({"ui", "history", "admin", "backup-scheduler"})
+CORE_ROLES = frozenset({"ui", "history", "admin", "backup", "backup-scheduler"})
 ROLES = CORE_ROLES | {"host-job"}
 Plan = TypeVar("Plan")
 
