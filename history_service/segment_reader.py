@@ -147,6 +147,9 @@ class SegmentedHistoryReader:
         self._catalog_generation_id: str | None = None
         self._verified_segment_digests: dict[tuple[str, Path], _VerifiedSegmentDigest] = {}
         self._verified_segment_digests_lock = threading.Lock()
+        self._segment_system_summaries: dict[
+            Path, tuple[_VerifiedSegmentDigest, tuple[tuple[str, sqlite3.Row], ...]]
+        ] = {}
 
     @classmethod
     def from_catalog(
@@ -698,37 +701,57 @@ class SegmentedHistoryReader:
         summaries: dict[str, dict[str, Any]] = {}
         for path in (self.hot_path, *self._selected_segment_paths(since=None)):
             with self._query_connection(path) as connection:
-                for table_name, key in (
-                    ("slot_state_current", "tracked_slots"),
-                    ("slot_events", "event_count"),
-                    ("metric_samples", "metric_sample_count"),
-                    ("metric_rollups", "metric_rollup_count"),
-                ):
-                    for row in connection.execute(
-                        f"""
-                        SELECT system_id, MAX(system_label) AS system_label,
-                               COUNT(*) AS row_count
-                        FROM {table_name}
-                        GROUP BY system_id
-                        """
-                    ).fetchall():
-                        system_id = str(row["system_id"])
-                        if system_id in excludes:
-                            continue
-                        summary = summaries.setdefault(
-                            system_id,
-                            {
-                                "system_id": system_id,
-                                "system_label": row["system_label"],
-                                "tracked_slots": 0,
-                                "event_count": 0,
-                                "metric_sample_count": 0,
-                                "metric_rollup_count": 0,
-                            },
+                # Always enter the guarded connection first: cached counts do
+                # not authenticate a segment, bypass sidecars/activation, or
+                # replace the digest check after file-identity changes. Only a
+                # catalog-authenticated immutable source can reuse its rows;
+                # the hot database and uncatalogued sources are counted fresh.
+                verified = (
+                    self._verified_segment_digests.get((self._catalog_generation_id, path))
+                    if self._catalog_generation_id is not None and path != self.hot_path
+                    else None
+                )
+                cached = self._segment_system_summaries.get(path)
+                if verified is not None and cached is not None and cached[0] == verified:
+                    table_rows = cached[1]
+                else:
+                    table_rows = tuple(
+                        (key, row)
+                        for table_name, key in (
+                            ("slot_state_current", "tracked_slots"),
+                            ("slot_events", "event_count"),
+                            ("metric_samples", "metric_sample_count"),
+                            ("metric_rollups", "metric_rollup_count"),
                         )
-                        if row["system_label"]:
-                            summary["system_label"] = row["system_label"]
-                        summary[key] += int(row["row_count"])
+                        for row in connection.execute(
+                            f"""
+                            SELECT system_id, MAX(system_label) AS system_label,
+                                   COUNT(*) AS row_count
+                            FROM {table_name}
+                            GROUP BY system_id
+                            """
+                        ).fetchall()
+                    )
+                    if verified is not None:
+                        self._segment_system_summaries[path] = (verified, table_rows)
+                for key, row in table_rows:
+                    system_id = str(row["system_id"])
+                    if system_id in excludes:
+                        continue
+                    summary = summaries.setdefault(
+                        system_id,
+                        {
+                            "system_id": system_id,
+                            "system_label": row["system_label"],
+                            "tracked_slots": 0,
+                            "event_count": 0,
+                            "metric_sample_count": 0,
+                            "metric_rollup_count": 0,
+                        },
+                    )
+                    if row["system_label"]:
+                        summary["system_label"] = row["system_label"]
+                    summary[key] += int(row["row_count"])
         return sorted(
             summaries.values(),
             key=lambda summary: (

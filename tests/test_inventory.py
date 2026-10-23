@@ -19289,7 +19289,129 @@ Consumers:
         self.assertEqual(inventory_module._bay_peer_devices({"device_names": ["da0", "da1"]}, None, {}), [])
 
 
+def partial_locate_fixture(test_case, *, same_host=False, reverse=False, failure="action", observed=True):
+    """Real LED aggregation/session sequencing, with synthetic command transport only."""
+    directory = tempfile.TemporaryDirectory()
+    test_case.addCleanup(directory.cleanup)
+    targets = [
+        {"ses_device": device, "ses_element_id": 0, "ses_slot_number": 0,
+         "enclosure_id": "synthetic-shelf-a", "ssh_host": host}
+        for device, host in (
+            ("/dev/sg27", "node-a.example.test"),
+            ("/dev/sg9", "node-a.example.test" if same_host else "node-b.example.test"),
+        )
+    ]
+    slot = SlotView(
+        slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+        led_supported=True, led_backend="quantastor_sg_ses",
+        ssh_ses_targets=list(reversed(targets)) if reverse else targets,
+    )
+    system = SystemConfig(
+        id="synthetic-led-test", truenas=TrueNASConfig(platform="quantastor"),
+        ssh=SSHConfig(enabled=True, host="node-a.example.test"),
+    )
+    service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name)
+    service._cache["shelf-a"] = InventorySnapshot(
+        slots=[slot], selected_system_id=system.id, selected_enclosure_id="shelf-a",
+        refresh_interval_seconds=30,
+    )
+    sent = []
+
+    def run(host, command):
+        sent.append((host, command))
+        bad_path = command.endswith("/dev/sg9")
+        preflight = " -p aes " in command
+        readback = " -p ec " in command
+        failed_action = failure == "all_actions" or bad_path and failure == "action"
+        failed = (bad_path and failure == "preflight" and preflight) or (failed_action and not preflight and not readback)
+        if failed:
+            return SSHCommandResult(command=command, ok=False, stderr="synthetic failure " * 200, exit_code=1)
+        shelf = "synthetic-shelf-b" if bad_path and failure == "moved" else "synthetic-shelf-a"
+        stdout = sg_aes_header(shelf) if preflight else ""
+        if readback and observed is not None:
+            stdout = sg_aes_header("synthetic-shelf-b" if observed == "moved" else shelf)
+            stdout += InventoryServiceLedTests.SG_EC_ON.replace("Ident=1", f"Ident={int(observed is True)}")
+        return SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0)
+
+    probes = {}
+    for host in {target["ssh_host"] for target in targets}:
+        session = Mock()
+        session.run_command_owned = AsyncMock(side_effect=lambda command, host=host: run(host, command))
+        session.close_owned = AsyncMock()
+        probe = Mock(spec=SSHProbe)
+        probe.open_session.return_value = session
+        probes[host] = probe
+    service._ssh_probe_for_host = lambda host: probes[host]
+    service._ssh_destination_authority_approved = lambda host=None: True
+    service.schedule_led_snapshot_refresh = Mock()
+    service.invalidate_physical_enclosure_snapshot_cache = Mock()
+    return service, sent
+
+
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dual_path_locate_returns_partial_only_with_matching_readback(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            requested = action == LedAction.identify
+            for same_host, failure in ((True, "action"), (False, "action"), (False, "preflight")):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, failure=failure, reverse=reverse):
+                        service, sent = partial_locate_fixture(
+                            self, same_host=same_host, reverse=reverse, failure=failure, observed=requested,
+                        )
+                        result = await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                        self.assertTrue(result["partial"])
+                        self.assertFalse(result["confirmed"])
+                        self.assertIs(result["identify_active"], True if requested else None)
+                        self.assertEqual(len(result["paths"]), 2)
+                        states = {path["ses_device"]: path["identify_active"] for path in result["paths"]}
+                        self.assertEqual(states, {"/dev/sg27": requested, "/dev/sg9": None})
+                        self.assertEqual(len(result["failures"]), 1)
+                        self.assertLessEqual(len(result["failures"][0]), 240)
+                        self.assertIn("synthetic failure", result["failures"][0])
+                        if failure == "preflight":
+                            self.assertFalse(any("--dev-slot-num" in command for _, command in sent if command.endswith("/dev/sg9")))
+                        service.schedule_led_snapshot_refresh.assert_not_called()
+                        service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+
+    async def test_dual_path_failed_action_without_matching_readback_still_raises(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            for observed in (None, action != LedAction.identify, "moved"):
+                with self.subTest(action=action, observed=observed):
+                    service, _sent = partial_locate_fixture(self, observed=observed)
+                    with self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+
+    async def test_dual_path_total_failure_still_raises_in_both_orders(self) -> None:
+        for reverse in (False, True):
+            for action in (LedAction.identify, LedAction.clear):
+                for failure in ("preflight", "all_actions"):
+                    service, sent = partial_locate_fixture(self, same_host=True, reverse=reverse, failure=failure)
+                    with self.subTest(reverse=reverse, action=action, failure=failure), self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                    if failure == "preflight":
+                        self.assertFalse(any("--dev-slot-num" in command for _, command in sent))
+
+    async def test_dual_path_complete_readback_can_confirm_off(self) -> None:
+        for same_host in (True, False):
+            service, _sent = partial_locate_fixture(self, same_host=same_host, failure="none", observed=False)
+            result = await service.set_slot_led(0, LedAction.clear, "shelf-a", invalidate_snapshot=False)
+            self.assertIs(result["identify_active"], False)
+            self.assertTrue(result["confirmed"])
+            self.assertNotIn("partial", result)
+            self.assertEqual([path["identify_active"] for path in result["paths"]], [False, False])
+
+    async def test_dual_path_moved_target_keeps_exceptional_refresh_in_both_orders(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            for same_host in (True, False):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, reverse=reverse):
+                        service, sent = partial_locate_fixture(self, same_host=same_host, reverse=reverse, failure="moved")
+                        with self.assertRaises(inventory_module.LedTargetMovedError):
+                            await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                        self.assertFalse(any("--dev-slot-num" in command for _, command in sent if command.endswith("/dev/sg9")))
+                        self.assertNotIn(("shelf-a", 0), service._led_slot_targets)
+                        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+
     CORE_MAP_ON = """
 ses0:
   Enclosure Name: ExampleCo DualPathShelf

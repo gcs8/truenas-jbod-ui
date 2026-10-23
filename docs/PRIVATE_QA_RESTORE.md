@@ -44,13 +44,41 @@ History-only is not a supported combination because the history service depends
 on the UI. Admin-only is supported specifically for initial configuration and
 recovery.
 
-The matrix runs against `docker-compose.yml`. Repository tests also parse and
-merge-check `docker-compose.dev.yml`, `docker-compose.secrets.yml`, and
-`docker-compose.nonroot.yml`. The secrets overlay gets a separate synthetic
-secret-file runtime check when that overlay changes. The non-root overlay must
-remain equivalent to the hardened base identity contract. Do not multiply every
-service combination by every overlay when the overlay does not change that
-service. Record the exact Compose file sequence in the receipt.
+The matrix retains the seven base `docker-compose.yml` cases and adds a UI-only
+case using `-f docker-compose.yml -f docker-compose.nonroot.yml`. It copies the
+base file and its sibling overlay into a fresh isolated fixture, keeps both in
+that case's startup/restart/cleanup chain, and applies the existing
+`scripts/prepare_nonroot_bind_mounts.py` with explicit `APP_UID:APP_GID` before
+starting any writer. A helper failure prevents startup. This does not relax the
+helper's stopped-writers policy or authorize migration of a running deployment.
+
+Both UI-only cases run alias and mapping save/readback/restart/readback/clear
+cycles. Base UI files must be owned by `0:0`; nonroot UI files must be owned by
+`APP_UID:APP_GID`, currently `10001:10001`. The expected owner must agree with the
+rendered UI `user`. Runtime inspection checks user, image/revision, mounts, ports
+and applicable hardening before accepting write evidence.
+
+After those cycles, a temporary scheduler Python reader inherits `1000:1000`
+plus supplementary group `10001`, without a `--user` override. It requires the
+`backup-journal` directory's `1000:10001` ownership and `2770` mode, a regular
+UI-owned `0660` journal with group `10001`, and bounded JSONL containing all four
+alias/mapping mutation actions. `compose run --rm --no-deps --pull never` runs
+only the reader, not the scheduler daemon or a backup job. It returns a fixed
+marker, not journal entries. Cleanup must verify resource absence before deleting
+the fixture; failure retains both Compose files and the owned environment.
+
+The receipt describes eight variants, five alias cycles, five mapping cycles and
+two scheduler journal-read cycles. Source tests use synthetic transport and
+identity/metadata, so they do not prove real container permissions. Issue #659
+remains open until a separately approved exact-host/image disposable run executes
+the full matrix under both UI identities and verifies cleanup. The existing
+acknowledgement, image/revision and isolation preflights remain required.
+
+Repository tests also parse and merge-check `docker-compose.dev.yml` and
+`docker-compose.secrets.yml`. The secrets overlay gets a separate synthetic
+secret-file runtime check when it changes. Do not multiply every service
+combination by every overlay when the overlay does not change that service.
+Record the exact Compose file sequence in the receipt.
 
 ## Write touchpoints
 

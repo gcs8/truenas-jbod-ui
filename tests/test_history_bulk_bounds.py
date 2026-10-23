@@ -551,6 +551,7 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
             await asyncio.to_thread(entered.wait)
+            operation, = history_main.bulk_history_read_operations
             task.cancel()
             event_loop_turn = asyncio.Event()
             asyncio.get_running_loop().call_soon(event_loop_turn.set)
@@ -564,14 +565,14 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(finished.wait)
             self.assertFalse(acquired_while_thread_running)
 
-            for _ in range(100):
-                acquired_after_finish = admission.try_acquire()
-                if acquired_after_finish:
-                    admission.release()
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("Admission was not released after the SQLite worker finished")
+            # The store's threading.Event precedes the coroutine's finally and
+            # done callbacks. Join that exact operation, not a yield budget.
+            await asyncio.wait((operation,))
+            self.assertNotIn(operation, history_main.bulk_history_read_operations)
+            acquired_after_finish = admission.try_acquire()
+            if acquired_after_finish:
+                admission.release()
+            self.assertTrue(acquired_after_finish)
 
         with (
             patch.object(history_main, "bulk_history_read_admission", admission),
@@ -604,6 +605,7 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
             await asyncio.to_thread(entered.wait)
+            operation, = history_main.bulk_history_read_operations
             try:
                 task.cancel()
                 await asyncio.sleep(0)
@@ -619,14 +621,14 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await asyncio.to_thread(finished.wait)
 
-            for _ in range(100):
-                acquired_after_finish = admission.try_acquire()
-                if acquired_after_finish:
-                    admission.release()
-                    break
-                await asyncio.sleep(0)
-            else:
-                self.fail("Admission was not released after the SQLite worker finished")
+            # The store's threading.Event precedes the coroutine's finally and
+            # done callbacks. Join that exact operation, not a yield budget.
+            await asyncio.wait((operation,))
+            self.assertNotIn(operation, history_main.bulk_history_read_operations)
+            acquired_after_finish = admission.try_acquire()
+            if acquired_after_finish:
+                admission.release()
+            self.assertTrue(acquired_after_finish)
 
 
     async def test_canceled_caller_consumes_late_worker_exception(self) -> None:
@@ -689,18 +691,17 @@ class HistoryReadAdmissionTests(unittest.IsolatedAsyncioTestCase):
             ):
                 task = asyncio.create_task(history_main._execute_admitted_history_plan(plan))
                 await asyncio.to_thread(entered.wait)
+                operation, = history_main.bulk_history_read_operations
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
                 release.set()
                 await asyncio.to_thread(finished.wait)
-                for _ in range(100):
-                    if not history_main.bulk_history_read_operations:
-                        break
-                    await asyncio.sleep(0)
-                else:
-                    self.fail("Failed bulk-history operation remained retained")
-                await asyncio.sleep(0)
+                # Await the real task and its already-registered cleanup callback.
+                # The worker's event alone does not mean the operation is done.
+                await asyncio.wait((operation,))
+                self.assertTrue(operation.done())
+                self.assertNotIn(operation, history_main.bulk_history_read_operations)
         finally:
             release.set()
             loop.set_exception_handler(previous_handler)

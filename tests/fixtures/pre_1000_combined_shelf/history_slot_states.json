@@ -1,0 +1,11 @@
+{
+  "_comment": "Synthetic pre-#1000 history: current-slot rows recorded under a combined shelf id. Every id and serial is made up.",
+  "rows": [
+    {"system_id": "scale-ssh", "system_label": "Synthetic SCALE", "enclosure_id": "500cccc00000010+500cccc00000020",
+     "enclosure_label": "ExampleCo Shelf 0100 + ExampleCo Shelf 0100", "slot": 0, "serial": "SYNTH-SN-0000", "observed_at": "2026-09-01T12:00:00+00:00"},
+    {"system_id": "scale-ssh", "system_label": "Synthetic SCALE", "enclosure_id": "500cccc00000010+500cccc00000020",
+     "enclosure_label": "ExampleCo Shelf 0100 + ExampleCo Shelf 0100", "slot": 30, "serial": "SYNTH-SN-0030", "observed_at": "2026-09-01T12:00:00+00:00"},
+    {"system_id": "scale-ssh", "system_label": "Synthetic SCALE", "enclosure_id": "500bbbb00000001+500bbbb00000002",
+     "enclosure_label": "Front + Rear", "slot": 1, "serial": "SYNTH-SN-0201", "observed_at": "2026-09-01T12:00:00+00:00"}
+  ]
+}
