@@ -34,6 +34,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
 
+### Added
+
+- Disk details showed already-collected SAS JSON/text port counters and SATA
+  PHY events, preserving missing values, exact totals and saturation without
+  new collection commands or counter resets (#1018).
+
 ### Fixed
 
 - Admin storage-view edits survived queued repaints without restoring old input
