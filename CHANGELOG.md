@@ -3,7 +3,7 @@
 <!--
 Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - One line per merged pull request, past tense, ending with the pull request
-  number as `(#N)`. Several numbers may share a line as `(#12, #13, and #14)`,
+  number as `(#1028)`. Several numbers may share a line as `(#12, #13, and #14)`,
   and the reference may sit on a wrapped continuation line. Wrap at about 80
   columns.
 - Entries live under the top `Unreleased` section in one of these subsections,
@@ -13,7 +13,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   at release time, not per pull request.
 - A pull request labelled `breaking` must also add a bullet under Breaking
   changes or Upgrade notes that names the variable, file, or action an
-  operator must handle, ending with `(#N)`.
+  operator must handle, ending with `(#1028)`.
 - A pull request labelled `no-changelog` needs no entry (tests-only, CI-only,
   or otherwise invisible to operators). A `dependencies` (Dependabot) pull
   request needs no entry either; it reaches the release body through its
@@ -148,7 +148,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the scheduler's own refusal names the target and failure class, the local
   archive keeps the artifact with no restarts, and the operator restoring the
   target is proven by byte readback; the published matrix documents the
-  bounded slice (#N).
+  bounded slice (#1028).
 
 ### Internal
 
