@@ -51,6 +51,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Explained unplaced source observations whose only identity evidence was a bare
+  device-mapper minor, without changing disk identity or retention totals (#1026).
 - CORE bootstrap supplied a validated next UID before creating a missing service
   account, avoiding the CORE13 home-permission UID failure while preserving
   existing accounts and refusing malformed allocation results (#1025).
