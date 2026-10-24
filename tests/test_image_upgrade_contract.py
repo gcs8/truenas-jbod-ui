@@ -1564,7 +1564,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                                       order.append("seed") or (ui, history, {1: 4, 2: 4, 3: 4})),
                 mock.patch.object(smoke, "sha256", side_effect=sha_digest),
                 mock.patch.object(smoke, "wait_for_backup_target_status", side_effect=wait) as wait_mock,
-                mock.patch.object(smoke, "make_backup_target_unavailable") as fault,
+                mock.patch.object(smoke, "make_backup_target_unavailable", return_value=1000.0) as fault,
                 mock.patch.object(smoke, "make_backup_target_available") as restore,
                 mock.patch.object(smoke, "check_backup_target_readback", return_value={"config/after.7z": "d"}) as readback,
                 mock.patch.object(smoke, "check_runtime") as healthy,
@@ -1632,7 +1632,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         restore.assert_called_once_with(root)
                         readback.assert_called_once_with(
                             root,
-                            window_start="2026-01-01T00:01:00+00:00",
+                            window_start=1000.0,
                             window_end="2026-01-01T00:02:00+00:00",
                         )
                         self.assertEqual(healthy.call_count, 2)
@@ -1859,8 +1859,13 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                   mock.patch.object(smoke, "sha256", side_effect=digests_of)):
                 # Two refusal-window artifacts missing remotely is exactly the
                 # contract: the target is the local archive minus the window.
+                # The window starts at the raw host injection instant — the
+                # refused build (12:00:00) predates its own refusal record
+                # (12:00:01) because the artifact-name stamp is the archive
+                # build time, so the refused record's `at` must never bound it.
+                injection_ts = base.timestamp() + 3599.5
                 shipped = smoke.check_backup_target_readback(
-                    root, window_start=refused_one_at.isoformat(), window_end=recovery_at.isoformat())
+                    root, window_start=injection_ts, window_end=recovery_at.isoformat())
             self.assertEqual(set(shipped), {artifact(baseline_at), artifact(recovery_at)})
             with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
                   mock.patch.object(smoke, "sha256", side_effect=digests_of),
@@ -1936,7 +1941,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
 
             with readback_mocks():
                 shipped = smoke.check_backup_target_readback(
-                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+                    root, window_start=refusal_at.timestamp() - 0.5, window_end=recovery_at.isoformat())
             self.assertEqual(set(shipped), {"config/" + artifact(base), "config/" + artifact(recovery_at)})
             (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x04drifted")
             with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):

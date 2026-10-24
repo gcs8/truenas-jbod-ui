@@ -1263,14 +1263,17 @@ def install_backup_scheduler_with_target(deployment: Deployment) -> None:
     deployment.files = UNAVAILABLE_BACKUP_FILES
 
 
-def make_backup_target_unavailable(root: Path) -> None:
+def make_backup_target_unavailable(root: Path) -> float:
     """The one injected condition: the target root is not a directory.
 
     Host-side rename plus file swap inside the existing bind, so the scheduler
     sees the same condition an operator's storage failure leaves behind.
+    Returns the host injection timestamp: the readback window starts there,
+    because the refused archive's build predates its own refusal record.
     """
     run(["sudo", "mv", str(root / "backup-targets" / "remote"), str(root / "backup-targets" / "remote.held")])
     run(["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", "/dev/null", str(root / "backup-targets" / "remote")])
+    return time.time()
 
 
 def make_backup_target_available(root: Path) -> None:
@@ -1360,20 +1363,27 @@ def check_backup_target_recovery(status: dict, *, target_id: str = BACKUP_TARGET
     return record
 
 
-def check_backup_target_readback(root: Path, *, window_start: str, window_end: str) -> dict:
+def _window_bound(bound: float | str) -> datetime:
+    """A window bound is the host injection epoch or an ISO status instant."""
+    if isinstance(bound, (int, float)):
+        return datetime.fromtimestamp(bound, tz=timezone.utc)
+    return datetime.fromisoformat(str(bound)).astimezone(timezone.utc)
+
+
+def check_backup_target_readback(root: Path, *, window_start: float | str, window_end: float | str) -> dict:
     """The target holds exactly the local archive minus the refusal-window artifacts.
 
     The runner keeps its own bookkeeping (``.scheduled-backup.lock``) beside the
     artifacts, so both sides are filtered to the released artifact-name shape
-    first. Artifacts carry their attempt timestamp in the name at second
-    resolution, so the window bounds are floored to whole seconds; the floor can
-    only widen the window, and a wider window can never misattribute a shipped
-    artifact because its shipped copy is present on the target.
+    first. The window starts at the raw host injection instant (the refused
+    archive's build predates its own refusal record) and ends at the observed
+    recovery record; artifact name stamps are whole-second truncations of the
+    same host kernel clock.
     """
     remote_root = root / "backup-targets" / "remote"
     local_root = root / "backups" / "archive"
-    start = datetime.fromisoformat(window_start).astimezone(timezone.utc).replace(microsecond=0)
-    end = datetime.fromisoformat(window_end).astimezone(timezone.utc).replace(microsecond=0)
+    start = _window_bound(window_start)
+    end = _window_bound(window_end)
 
     def artifact_stamp(relative_name: str) -> datetime | None:
         match = ARCHIVE_ARTIFACT_NAME.search(Path(relative_name).name)
@@ -1448,7 +1458,7 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
     expect("history.db" in before_bytes and before_bytes["history.db"][0] > 0, "seeded history bytes are missing")
 
     # The condition: the target root is not a directory for the next backup.
-    make_backup_target_unavailable(root)
+    fault_injected_at = make_backup_target_unavailable(root)
     record_backup_phase_change(deployment, "upgrade-smoke-backup-during")
     refused = wait_for_backup_target_status(root, want_ok=False, after=shipped_record["at"])
     check_backup_target_refusal(refused)
@@ -1473,7 +1483,7 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
     recovered = wait_for_backup_target_status(root, want_ok=True, after=refused_record["at"])
     check_backup_target_recovery(recovered)
     check_backup_target_readback(root,
-                                 window_start=refused_record["at"],
+                                 window_start=fault_injected_at,
                                  window_end=recovered["targets"][BACKUP_TARGET_ID]["at"])
 
     check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
