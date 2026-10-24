@@ -1474,17 +1474,38 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
     def test_backup_target_status_wait_requires_a_coherent_refusal_snapshot(self):
         smoke = self.load_smoke()
 
-        def snapshot(target_at, target_ok, class_at, class_detail):
-            return {"schema_version": 1,
-                    "classes": {"config": {"at": class_at, "ok": True, "detail": class_detail,
-                                           "artifact_id": "a"}},
-                    "targets": {"smoke-nas": {"at": target_at, "ok": target_ok, "detail": "x",
-                                              "artifact_id": "artifact"}}}
+        # Records exactly as the released writer persists them. Target failure
+        # record: RunRecord.as_dict plus the writer's label merge (the shape
+        # fork CI dumped). Class records: RunRecord.as_dict
+        # (history_service/backup_scheduler/service.py:145-146) with
+        # at = _iso(started) from _run_class entry (:808) - the archive BUILD
+        # time, strictly BEFORE the target record's at, which _ship takes
+        # inside its per-target loop (:1132) after the build.
+        def target_failure_record(at):
+            return {"artifact_id": None, "at": at,
+                    "detail": ("ConfigurationError: Configuration error: Filesystem archive target "
+                               "'smoke-nas': Filesystem archive target root must resolve through "
+                               "directories only."),
+                    "label": "smoke-nas", "ok": False}
 
-        incoherent = snapshot("2026-01-01T00:09:00+00:00", False,
-                              "2026-01-01T00:00:00+00:00", None)
-        coherent = snapshot("2026-01-01T00:09:00+00:00", False,
-                            "2026-01-01T00:09:01+00:00", "1 remote copy failure(s)")
+        def class_record(at, detail):
+            return {"at": at, "ok": True, "detail": detail, "artifact_id": "artifact-" + at[:19]}
+
+        def snapshot(target_at, failure_record, class_at, class_detail):
+            return {"schema_version": 1,
+                    "classes": {"config": class_record(class_at, class_detail)},
+                    "targets": {"smoke-nas": failure_record}}
+
+        ship_at = "2026-10-24T22:43:01.541158+00:00"
+        baseline_build_at = "2026-10-24T22:42:40.112000+00:00"
+        refused_build_at = "2026-10-24T22:43:00.900000+00:00"
+        # Intermediate write: _ship persisted the fresh target failure beside
+        # the previous (baseline) class record, _record_class has not run.
+        incoherent = snapshot(ship_at, target_failure_record(ship_at), baseline_build_at, None)
+        # The coherent pair the scheduler ends with: the class record is the
+        # refused run's OWN record, so its at predates the target record's at.
+        coherent = snapshot(ship_at, target_failure_record(ship_at), refused_build_at,
+                            "1 remote copy failure(s)")
         with (mock.patch.object(smoke, "read_backup_archive_status", return_value=incoherent),
               mock.patch.object(smoke.time, "monotonic", side_effect=[0, 30, 90]),
               mock.patch.object(smoke.time, "sleep") as sleep):
@@ -1497,6 +1518,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
               mock.patch.object(smoke.time, "sleep") as sleep):
             self.assertEqual(smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False), coherent)
             self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        with mock.patch.object(smoke, "read_backup_archive_status", return_value=coherent):
+            # The first poll may already see the resolved pair: the refused
+            # class record's detail shape is what makes it coherent, never an
+            # at comparison against the target record it predates.
+            self.assertEqual(smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False), coherent)
 
     def test_unavailable_backup_storage_is_dispatched_and_invoked_in_the_existing_report_only_job(self):
         from types import SimpleNamespace

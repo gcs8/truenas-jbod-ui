@@ -1302,18 +1302,21 @@ def read_backup_archive_status(root: Path) -> dict:
 REMOTE_COPY_FAILURE_DETAIL = re.compile(r"[0-9]+ remote copy failure\(s\)")
 
 
-def _coherent_refusal_status(status: dict, record: dict) -> bool:
+def _coherent_refusal_status(status: dict, previous_class_at: str) -> bool:
     """Whether `_run_class`'s class record for this failure has landed.
 
     Between `_ship`'s status write (fresh target failure, stale class record)
     and `_record_class`'s write, the file names the refusal without the
     local-success/remote-failure isolation; a verdict read there would reject
-    the scheduler's own bookkeeping. The class record must be at least as new
-    as the target record and carry the isolation shape.
+    the scheduler's own bookkeeping. The coherent class record is the refused
+    run's own record, so its `at` is the archive BUILD time and predates the
+    target record's ship-time `at` — never compare the two. Coherence is the
+    isolation detail shape plus a class record that does not regress behind
+    what earlier polls of this wait already saw.
     """
     class_record = (status.get("classes") or {}).get("config") or {}
     return (class_record.get("ok") is True
-            and str(class_record.get("at") or "") >= str(record.get("at") or "")
+            and str(class_record.get("at") or "") >= previous_class_at
             and REMOTE_COPY_FAILURE_DETAIL.fullmatch(str(class_record.get("detail") or "")) is not None)
 
 
@@ -1324,6 +1327,7 @@ def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "",
     snapshot); otherwise the poll keeps going, still deadline-bounded.
     """
     deadline = time.monotonic() + timeout
+    previous_class_at = ""
     while True:
         try:
             status = read_backup_archive_status(root)
@@ -1334,8 +1338,10 @@ def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "",
         record = status.get("targets", {}).get(BACKUP_TARGET_ID) or {}
         at = str(record.get("at") or "")
         if at > after and bool(record.get("ok")) is want_ok:
-            if want_ok or _coherent_refusal_status(status, record):
+            if want_ok or _coherent_refusal_status(status, previous_class_at):
                 return status
+        previous_class_at = (str((status.get("classes") or {}).get("config", {}).get("at") or "")
+                             or previous_class_at)
         if time.monotonic() >= deadline:
             raise SmokeError(
                 f"backup target {BACKUP_TARGET_ID!r} never reported "
