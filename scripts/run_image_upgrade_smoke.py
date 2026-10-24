@@ -1184,7 +1184,7 @@ def clean_host_absent(project: str, env: dict[str, str]) -> None:
 def clean_host_down(deployment: Deployment, project: str, env: dict[str, str]) -> None:
     failed = False
     try:
-        deployment.compose("--profile", "admin", "down", "--volumes")
+        deployment.compose("--profile", "history", "--profile", "admin", "down", "--volumes")
     except (SmokeError, OSError, subprocess.SubprocessError):
         failed = True
     clean_host_absent(project, env)  # independent readback even after failed down

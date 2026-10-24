@@ -1700,7 +1700,20 @@ class UpgradeScenarioContractTests(unittest.TestCase):
                 with self.assertRaises(smoke.SmokeError):
                     smoke.clean_host_down(deployment, "owned", {})
             self.assertTrue((root / "key-input").is_file())
-            deployment.compose.assert_called_once_with("--profile", "admin", "down", "--volumes")
+            deployment.compose.assert_called_once()
+            command = deployment.compose.call_args.args
+            deployment.set_image("synthetic-image")
+            self.assertIn("COMPOSE_PROFILES=history", (root / ".env").read_text())
+            # Explicit --profile flags replace the .env profile selection.
+            # Check both supplied Compose documents, without claiming a Docker run.
+            profiles = {command[index + 1] for index, value in enumerate(command[:-1])
+                        if value == "--profile"}
+            for fixture in ("tests/fixtures/compose/v0.22.2.yml", "docker-compose.yml"):
+                services = yaml.safe_load((self.ROOT / fixture).read_text())["services"]
+                selected = {name for name, service in services.items()
+                            if not service.get("profiles") or profiles.intersection(service["profiles"])}
+                self.assertTrue({"enclosure-ui", "enclosure-history", "enclosure-admin"} <= selected)
+            self.assertEqual(command[-2:], ("down", "--volumes"))
 
     def test_clean_host_http_restore_uses_encrypted_inspection_receipt(self):
         smoke = self.load_smoke()
