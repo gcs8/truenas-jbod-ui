@@ -1512,6 +1512,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             tree_reads = []
             ui_reads = []
             sha_calls = []
+            order = []
 
             def sha_digest(path):
                 sha_calls.append(path)
@@ -1556,8 +1557,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             with (
                 mock.patch.object(smoke, "Deployment", return_value=deployment),
                 mock.patch.object(smoke, "prepare_root"),
+                mock.patch.object(smoke, "install_backup_secrets") as bootstrap,
                 mock.patch.object(smoke, "install_backup_scheduler_with_target") as install,
-                mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "seed_previous_release",
+                                  side_effect=lambda *args, **kwargs:
+                                      order.append("seed") or (ui, history, {1: 4, 2: 4, 3: 4})),
                 mock.patch.object(smoke, "sha256", side_effect=sha_digest),
                 mock.patch.object(smoke, "wait_for_backup_target_status", side_effect=wait) as wait_mock,
                 mock.patch.object(smoke, "make_backup_target_unavailable") as fault,
@@ -1568,6 +1572,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                                   return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})),
                 mock.patch.object(smoke.time, "sleep") as sleep,
             ):
+                bootstrap.side_effect = lambda *args, **kwargs: order.append("bootstrap") or mock.DEFAULT
                 if replaced:
                     # The probe runs once for the identity and once per bounded
                     # observation step; every later reading is the replacement,
@@ -1630,6 +1635,14 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         for call in healthy.call_args_list:
                             self.assertEqual(call.args, (deployment, "candidate", "2", "revision"))
                         deployment.pull_and_up.assert_called_once_with()
+                # The sudo bootstrap is CI-proven only: mocked here (as the
+                # enospc mount is), called once with the deployment root, and
+                # strictly before seeding, so the pre-seed ordering stays
+                # pinned executably in the harness as well as by source text.
+                bootstrap.assert_called_once_with(root)
+                self.assertEqual(order, ["bootstrap", "seed"])
+                self.assertFalse((root / "config" / "backup-secrets").exists(),
+                                 "the harness must not run the real sudo bootstrap inside the temporary root")
                 waits = [(call.kwargs["want_ok"], call.kwargs.get("after", ""))
                          for call in wait_mock.call_args_list]
                 self.assertEqual(waits, [(True, ""), (False, "2026-01-01T00:00:00+00:00"),
