@@ -1669,6 +1669,40 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=True)
             self.assertEqual(sleep.call_args_list, [mock.call(2)] * 2)
 
+    def test_backup_target_status_wait_survives_malformed_reads_until_the_deadline(self):
+        import itertools
+        import json
+
+        smoke = self.load_smoke()
+        torn = json.JSONDecodeError("Expecting value", "backup-archive.json", 0)
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=torn),
+              mock.patch.object(smoke.time, "monotonic", side_effect=itertools.count(0, 30)),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            # A malformed or torn read is "no fresh status yet", never a failed
+            # qualification: the poll keeps going until the bounded deadline,
+            # whose message names the last record seen.
+            with self.assertRaisesRegex(smoke.SmokeError, "never reported"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=True)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)] * 2)
+
+    def test_backup_archive_status_reader_refuses_malformed_payloads(self):
+        import json
+
+        smoke = self.load_smoke()
+        good = {"schema_version": 1, "classes": {}, "targets": {}}
+        for payload in ({}, [], "not an object",
+                        {"schema_version": 2, "classes": {}, "targets": {}},
+                        {"schema_version": 1, "classes": {}},
+                        {"schema_version": 1, "targets": {}},
+                        {"schema_version": 1, "classes": [], "targets": {}},
+                        {"schema_version": 1, "classes": {}, "targets": "smoke-nas"}):
+            with self.subTest(payload=payload):
+                with mock.patch.object(smoke, "run", return_value=json.dumps(payload)):
+                    with self.assertRaisesRegex(smoke.SmokeError, "unexpected shape"):
+                        smoke.read_backup_archive_status(Path("/nonexistent"))
+        with mock.patch.object(smoke, "run", return_value=json.dumps(good)):
+            self.assertEqual(smoke.read_backup_archive_status(Path("/nonexistent")), good)
+
     def test_backup_target_refusal_pins_the_scheduler_diagnosis_and_rejects_sibling_faults(self):
         smoke = self.load_smoke()
         detail = ("ConfigurationError: Configuration error: Filesystem archive target 'smoke-nas': "

@@ -1267,7 +1267,9 @@ def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "",
     while True:
         try:
             status = read_backup_archive_status(root)
-        except SmokeError:
+        except (SmokeError, ValueError):
+            # A torn or malformed status file is no fresh status yet (JSON
+            # decode errors are ValueErrors), never a failed qualification.
             status = {}
         record = status.get("targets", {}).get(BACKUP_TARGET_ID) or {}
         at = str(record.get("at") or "")
