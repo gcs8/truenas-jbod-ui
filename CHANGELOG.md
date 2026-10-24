@@ -3,7 +3,7 @@
 <!--
 Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - One line per merged pull request, past tense, ending with the pull request
-  number as `(#1028)`. Several numbers may share a line as `(#12, #13, and #14)`,
+  number as `(#N)`. Several numbers may share a line as `(#12, #13, and #14)`,
   and the reference may sit on a wrapped continuation line. Wrap at about 80
   columns.
 - Entries live under the top `Unreleased` section in one of these subsections,
@@ -13,7 +13,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   at release time, not per pull request.
 - A pull request labelled `breaking` must also add a bullet under Breaking
   changes or Upgrade notes that names the variable, file, or action an
-  operator must handle, ending with `(#1028)`.
+  operator must handle, ending with `(#N)`.
 - A pull request labelled `no-changelog` needs no entry (tests-only, CI-only,
   or otherwise invisible to operators). A `dependencies` (Dependabot) pull
   request needs no entry either; it reaches the release body through its
