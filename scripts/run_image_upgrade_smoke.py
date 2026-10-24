@@ -40,6 +40,15 @@ commands.
   no restarts over 20 seconds. Explicitly restore the writable mount and prove
   the candidate can read the retained records. This is not a supported-storage
   or release-promotion decision.
+* ``unavailable-backup-storage``: after seeding and stopping v0.22.2, run the
+  candidate's backup scheduler with one filesystem backup target. Prove the
+  shipped copy once, make the target root not a directory (one injected
+  storage condition), and require the scheduler's own visible refusal for the
+  next backup — the status file names the target and the failure class, the
+  local archive keeps the artifact, and the scheduler never restarts over 20
+  seconds. Explicitly restore the target root and prove the next backup ships
+  byte-identically by readback. This is not a supported-storage or
+  release-promotion decision.
 
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
@@ -62,6 +71,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 UI_PORT = 18180
@@ -69,10 +79,12 @@ HISTORY_PORT = 18181
 SERVICES = ("enclosure-ui", "enclosure-history")
 SMOKE_SYSTEM = "upgrade-smoke"
 SUCCESS_PREFIX = "image_upgrade_smoke=ok"
-SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state", "enospc-state")
+SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state", "enospc-state", "unavailable-backup-storage")
 HARDENED_FILES = ("docker-compose.yml", "docker-compose.nonroot.yml")
 READONLY_FILES = ("docker-compose.yml", "docker-compose.readonly.yml")
 ENOSPC_FILES = ("docker-compose.yml", "docker-compose.enospc.yml")
+UNAVAILABLE_BACKUP_FILES = ("docker-compose.yml", "docker-compose.unavailable-backup.yml")
+BACKUP_TARGET_ID = "smoke-nas"
 APP_UID = 10001
 
 # The one-time ownership step for adopting docker-compose.nonroot.yml, exactly
@@ -1109,11 +1121,319 @@ def enospc_state(args: argparse.Namespace) -> str:
             "writable_recovery=ok")
 
 
+# Synthetic config change the released MappingStore writer journals for the
+# scheduler; each qualification phase changes the notes so the canonical config
+# hash differs and the coalescer takes a real backup instead of a noop.
+CONFIG_CHANGE_PROBE = f"""
+import json
+from app.config import get_settings
+from app.models.domain import ManualMapping
+from app.services.mapping_store import MappingStore
+store = MappingStore(get_settings().paths.mapping_file)
+store.save_mapping(ManualMapping(system_id="{SMOKE_SYSTEM}", enclosure_id="shelf-a", slot=4,
+                                 serial="SYNTH-0004", notes=NOTES))
+print(json.dumps({{"ok": True}}))
+"""
+
+# Appends one pending change through the released journal writer, inside the
+# scheduler container (the only container bound to ./backup-journal).
+BACKUP_JOURNAL_APPEND = """
+import json
+from pathlib import Path
+from history_service.backup_archive.journal import ChangeJournal
+journal = ChangeJournal(Path("/app/backup-journal/config-changes.jsonl"), file_mode=0o660)
+entry = journal.append("mapping.save", SUBJECT)
+print(json.dumps({"change_id": entry.change_id}))
+"""
+
+
+def config_change_script(notes: str) -> str:
+    return CONFIG_CHANGE_PROBE.replace("NOTES", repr(notes))
+
+
+def journal_append_script(notes: str) -> str:
+    return BACKUP_JOURNAL_APPEND.replace("SUBJECT", repr(notes))
+
+
+# The candidate scheduler service as the overlay defines it. The scheduler is
+# absent from v0.22.2, so this is the whole service definition: the published
+# shape (read-only rootfs, dropped capabilities, socket API healthcheck) with a
+# bounded config-backup policy and one root-owned filesystem target whose root
+# the scenario can make unavailable through the existing bind mount.
+BACKUP_SCHEDULER_OVERLAY = {
+    "services": {
+        "enclosure-backup-scheduler": {
+            "image": "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}",
+            "command": ["python", "-m", "history_service.backup_scheduler.main"],
+            "user": "0:0",
+            "read_only": True,
+            "tmpfs": ["/tmp"],
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "group_add": ["10001"],
+            "environment": {
+                "TMPDIR": "/app/backups",
+                "APP_LOG_LEVEL": "INFO",
+                "APP_GID": "10001",
+                "LOG_FORMAT": "text",
+                "HISTORY_SQLITE_PATH": "/app/history/history.db",
+                "BACKUP_ARCHIVE_DIR": "/app/backups/archive",
+                "BACKUP_ARCHIVE_STATE_DIR": "/app/backups/archive-state",
+                "BACKUP_JOURNAL_PATH": "/app/backup-journal/config-changes.jsonl",
+                "BACKUP_ARCHIVE_STATUS_FILE": "/app/backup-status/backup-archive.json",
+                "BACKUP_SCHEDULER_SOCKET": "/app/backup-api/scheduler.sock",
+                "BACKUP_CONFIG_ENABLED": "true",
+                "BACKUP_CONFIG_DEBOUNCE_SECONDS": "2",
+                "BACKUP_CONFIG_MAX_DELAY_SECONDS": "10",
+                "SCHEDULED_BACKUP_PASSPHRASE_FILE": "/app/config/backup-secrets/backup-passphrase",
+                "BACKUP_TARGETS_JSON": '[{"target_id":"smoke-nas","provider":"filesystem","root":"/app/backups/targets/remote"}]',
+            },
+            "volumes": [
+                "./config:/app/config:ro",
+                "./data:/app/data:ro",
+                "./history:/app/history",
+                "./backups:/app/backups",
+                "./backup-status:/app/backup-status",
+                "./backup-journal:/app/backup-journal",
+                "./backup-api:/app/backup-api",
+                "./backup-targets:/app/backups/targets",
+                "./config/ssh:/run/ssh:ro",
+            ],
+            "restart": "unless-stopped",
+            "mem_limit": "1g",
+            "healthcheck": {
+                "test": ["CMD", "python", "-c",
+                         "import os, stat, sys; sys.exit(0 if stat.S_ISSOCK(os.stat('/app/backup-api/scheduler.sock').st_mode) else 1)"],
+                "interval": "30s",
+                "timeout": "5s",
+                "retries": 3,
+                "start_period": "30s",
+            },
+        },
+    },
+}
+
+
+def install_backup_scheduler_with_target(deployment: Deployment) -> None:
+    """Add the candidate's backup scheduler service with one available target."""
+    root = deployment.root
+    (root / UNAVAILABLE_BACKUP_FILES[-1]).write_text(json.dumps(BACKUP_SCHEDULER_OVERLAY) + "\n", encoding="utf-8")
+    # write_shared_status demands root:APP_GID mode 2750 (chown first: chown
+    # clears the setgid bit); _prepare_socket demands no access for others.
+    run(["sudo", "chown", "0:10001", str(root / "backup-status")])
+    run(["sudo", "chmod", "2750", str(root / "backup-status")])
+    for name, mode in (("backups", "0755"), ("backup-journal", "0755"),
+                       ("backup-api", "2750"), ("backup-targets", "0755")):
+        run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", mode, str(root / name)])
+    run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets" / "remote")])
+    # A private synthetic passphrase file; the value exists only at run time.
+    secrets = root / "config" / "backup-secrets"
+    secrets.mkdir(parents=True, exist_ok=True, mode=0o700)
+    passphrase = secrets / "backup-passphrase"
+    passphrase.write_text(uuid.uuid4().hex + "\n", encoding="ascii")
+    passphrase.chmod(0o600)
+    deployment.files = UNAVAILABLE_BACKUP_FILES
+
+
+def make_backup_target_unavailable(root: Path) -> None:
+    """The one injected condition: the target root is not a directory.
+
+    Host-side rename plus file swap inside the existing bind, so the scheduler
+    sees the same condition an operator's storage failure leaves behind.
+    """
+    run(["sudo", "mv", str(root / "backup-targets" / "remote"), str(root / "backup-targets" / "remote.held")])
+    run(["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", "/dev/null", str(root / "backup-targets" / "remote")])
+
+
+def make_backup_target_available(root: Path) -> None:
+    """The operator's explicit fix: the real target root directory back."""
+    run(["sudo", "rm", str(root / "backup-targets" / "remote")])
+    run(["sudo", "mv", str(root / "backup-targets" / "remote.held"), str(root / "backup-targets" / "remote")])
+
+
+def read_backup_archive_status(root: Path) -> dict:
+    """Read the scheduler's secret-free status file the way /healthz reads it."""
+    text = run(["sudo", "cat", str(root / "backup-status" / "backup-archive.json")])
+    status = json.loads(text)
+    expect(isinstance(status, dict) and status.get("schema_version") == 1
+           and isinstance(status.get("classes"), dict) and isinstance(status.get("targets"), dict),
+           f"backup archive status has an unexpected shape: {status!r}")
+    return status
+
+
+def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "", timeout: int = 90) -> dict:
+    """Poll for a target record newer than `after` whose `ok` equals `want_ok`."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            status = read_backup_archive_status(root)
+        except SmokeError:
+            status = {}
+        record = status.get("targets", {}).get(BACKUP_TARGET_ID) or {}
+        at = str(record.get("at") or "")
+        if at > after and bool(record.get("ok")) is want_ok:
+            return status
+        if time.monotonic() >= deadline:
+            raise SmokeError(
+                f"backup target {BACKUP_TARGET_ID!r} never reported "
+                f"{'a shipped copy' if want_ok else 'a refusal'} within {timeout} seconds: {record}"
+            )
+        time.sleep(2)
+
+
+def check_backup_scheduler_runtime(deployment: Deployment) -> dict:
+    """The scheduler stays up through a refused target: running, never restarted."""
+    container = deployment.compose("ps", "-q", "enclosure-backup-scheduler").strip()
+    expect(bool(container) and "\n" not in container, "scheduler must resolve to exactly one container")
+    state = json.loads(run(["docker", "inspect", "--format", "{{json .}}", container]))
+    expect(state["State"]["Status"] == "running", "the backup scheduler container is not running")
+    expect(state["RestartCount"] == 0,
+           f"the backup scheduler restarted {state['RestartCount']} times during the refusal")
+    return {"enclosure-backup-scheduler": [container, state["State"]["StartedAt"]]}
+
+
+def check_backup_target_refusal(status: dict, *, target_id: str = BACKUP_TARGET_ID) -> None:
+    """Pin the scheduler's own failure classification for an unusable target root.
+
+    The per-target record must name the target and carry the archives module's
+    own diagnosis, never a sibling fault class, while the class record proves
+    the local archive copy succeeded and only the remote copy failed.
+    """
+    record = (status.get("targets") or {}).get(target_id) or {}
+    expect(record.get("ok") is False, f"backup target {target_id!r} must be refused, not reported ok: {record}")
+    detail = str(record.get("detail") or "")
+    expect(detail.startswith("ConfigurationError: "),
+           f"the refusal detail must name the failing check type, got: {detail!r}")
+    expect(f"Filesystem archive target {target_id!r}: " in detail,
+           f"the refusal detail must attribute the failure to the target, got: {detail!r}")
+    expect("must resolve through directories only" in detail,
+           "the refusal detail must carry the scheduler's own diagnosis for a target root "
+           f"that is not a directory, got: {detail!r}")
+    expect("filesystem is full" not in detail and "Cannot write to /app/history" not in detail,
+           f"the refusal must not borrow a sibling fault class: {detail!r}")
+    class_record = (status.get("classes") or {}).get("config") or {}
+    expect(class_record.get("ok") is True and bool(class_record.get("artifact_id")),
+           f"the local config backup must still succeed with a refused target: {class_record}")
+    expect(class_record.get("detail") == "1 remote copy failure(s)",
+           f"the class record must isolate exactly the remote copy failure: {class_record}")
+
+
+def check_backup_target_recovery(status: dict, *, target_id: str = BACKUP_TARGET_ID) -> dict:
+    """The success surface after the explicit fix: shipped, verified, attributed."""
+    record = (status.get("targets") or {}).get(target_id) or {}
+    expect(record.get("ok") is True, f"backup target {target_id!r} must ship after the fix, got: {record}")
+    expect(bool(record.get("artifact_id")), f"the recovered copy must name its artifact: {record}")
+    expect(not record.get("detail"), f"the recovered copy must carry no failure detail: {record}")
+    return record
+
+
+def check_backup_target_readback(root: Path) -> dict:
+    """Every shipped target object must byte-match its local archive twin."""
+    remote_root = root / "backup-targets" / "remote"
+    local_root = root / "backups" / "archive"
+
+    def digest_tree(base: Path) -> dict[str, str]:
+        listing = run(["sudo", "find", str(base), "-type", "f", "-printf", "%P\n"])
+        return {name: sha256(base / name) for name in listing.splitlines() if name}
+
+    remote = digest_tree(remote_root)
+    expect(bool(remote), "the recovered target holds no shipped backup bytes")
+    local = digest_tree(local_root)
+    for name, digest in remote.items():
+        expect(name in local and local[name] == digest,
+               f"target copy {name!r} does not byte-match the local archive copy")
+    expect(len(local) == len(remote) + 1,
+           f"exactly the refusal-window artifact must be missing from the target: "
+           f"{len(local)} local vs {len(remote)} remote")
+    return remote
+
+
+def record_backup_phase_change(deployment: Deployment, notes: str) -> None:
+    """One real config change plus its journal entry, through the released writers."""
+    deployment.exec_python("enclosure-ui", config_change_script(notes))
+    deployment.exec_python("enclosure-backup-scheduler", journal_append_script(notes))
+
+
+def unavailable_backup_storage(args: argparse.Namespace) -> str:
+    """Exercise one unavailable filesystem backup target on synthetic released state."""
+    root = args.root.resolve()
+    prepare_root(root, args.compose_fixture, args.config_fixture)
+    deployment = Deployment(root)
+    config_digest = sha256(root / "config/config.yaml")
+    before_ui, before_history, seeded = seed_previous_release(deployment, args)
+    deployment.compose("stop", *SERVICES)
+
+    # The scheduler joins only through the overlay; v0.22.2 has no such service.
+    install_backup_scheduler_with_target(deployment)
+    deployment.set_image(args.candidate_image)
+    deployment.compose("pull")
+    # Nothing is faulted yet, so the literal update procedure converges every
+    # service, including the scheduler's socket healthcheck.
+    deployment.pull_and_up()
+    upgraded = check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+
+    # Success surface before the condition: one config backup ships to the target.
+    record_backup_phase_change(deployment, "upgrade-smoke-backup-before")
+    shipped = wait_for_backup_target_status(root, want_ok=True)
+    check_backup_target_recovery(shipped)
+    shipped_record = shipped["targets"][BACKUP_TARGET_ID]
+
+    # Snapshot after the released writers close and the candidate's startup
+    # writes settle; inject no history edit and no alternate storage path.
+    before_bytes = deployment.run_python("enclosure-history", READ_HISTORY_TREE)
+    expect("history.db" in before_bytes and before_bytes["history.db"][0] > 0, "seeded history bytes are missing")
+
+    # The condition: the target root is not a directory for the next backup.
+    make_backup_target_unavailable(root)
+    record_backup_phase_change(deployment, "upgrade-smoke-backup-during")
+    refused = wait_for_backup_target_status(root, want_ok=False, after=shipped_record["at"])
+    check_backup_target_refusal(refused)
+    refused_record = refused["targets"][BACKUP_TARGET_ID]
+
+    identity = check_backup_scheduler_runtime(deployment)
+    for _ in range(10):
+        time.sleep(2)
+        expect(check_backup_scheduler_runtime(deployment) == identity, "scheduler identity changed during the refusal")
+
+    expect(deployment.run_python("enclosure-history", READ_HISTORY_TREE) == before_bytes,
+           "history bytes or entries changed during the backup-target refusal")
+    expect(sha256(root / "config/config.yaml") == config_digest, "config changed during the backup-target refusal")
+    during_ui = deployment.exec_python("enclosure-ui", READ_UI)
+    expect(during_ui["mappings"] == before_ui["mappings"] + [["shelf-a", 4, "SYNTH-0004", "upgrade-smoke-backup-during"]],
+           "mappings changed beyond the qualification's own phase change during the refusal")
+
+    # The operator's explicit fix, not an automatic repair. The same candidate
+    # must then ship to the restored target and read back what it wrote.
+    make_backup_target_available(root)
+    record_backup_phase_change(deployment, "upgrade-smoke-backup-after")
+    recovered = wait_for_backup_target_status(root, want_ok=True, after=refused_record["at"])
+    check_backup_target_recovery(recovered)
+    readback = check_backup_target_readback(root)
+
+    check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+    after = deployment.exec_python("enclosure-history", READ_HISTORY)
+    expect(after["integrity"] == "ok" and after["counts"] == before_history["counts"],
+           "the candidate lost predecessor history across the backup-target qualification")
+    expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+           "the candidate cannot read retained predecessor history after the qualification")
+    after_ui = deployment.exec_python("enclosure-ui", READ_UI)
+    expect(after_ui["mappings"] == before_ui["mappings"] + [["shelf-a", 4, "SYNTH-0004", "upgrade-smoke-backup-after"]],
+           "mappings after recovery are not the seeded three plus the phase change")
+
+    return (f"{SUCCESS_PREFIX} scenario=unavailable-backup-storage previous={args.previous_version} "
+            f"candidate={args.candidate_version} revision={args.candidate_revision} "
+            f"services={','.join(sorted(upgraded))} restarts=0 "
+            "target_refusals=1 target_refusal=ConfigurationError target_recovery=ok "
+            "backup_local_kept=ok target_readback=ok history_bytes=unchanged config_bytes=unchanged")
+
+
 def smoke(args: argparse.Namespace) -> str:
     if args.scenario == "enospc-state":
         return enospc_state(args)
     if args.scenario == "readonly-state":
         return readonly_state(args)
+    if args.scenario == "unavailable-backup-storage":
+        return unavailable_backup_storage(args)
     if args.scenario == "interrupted-migration":
         return interrupted_migration(args)
     if args.scenario == "segmented-catalog":
@@ -1124,6 +1444,8 @@ def smoke(args: argparse.Namespace) -> str:
 def compose_chain(root: Path) -> list[str]:
     if (root / ENOSPC_FILES[-1]).exists():
         return [arg for name in ENOSPC_FILES for arg in ("-f", name)]
+    if (root / UNAVAILABLE_BACKUP_FILES[-1]).exists():
+        return [arg for name in UNAVAILABLE_BACKUP_FILES for arg in ("-f", name)]
     if (root / READONLY_FILES[-1]).exists():
         return [arg for name in READONLY_FILES for arg in ("-f", name)]
     if (root / "docker-compose.nonroot.yml").exists():
