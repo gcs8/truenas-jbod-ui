@@ -51,6 +51,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- CORE bootstrap supplied a validated next UID before creating a missing service
+  account, avoiding the CORE13 home-permission UID failure while preserving
+  existing accounts and refusing malformed allocation results (#1025).
 - Mapping and SAS-alias saves and writability probes reported capacity failures
   without permission advice or private response details; SQLite open failures
   on read-only filesystems retained the read-only diagnosis (#1024).
