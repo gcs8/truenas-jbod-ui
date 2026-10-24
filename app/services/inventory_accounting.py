@@ -180,6 +180,8 @@ class DiskRetentionAccounting:
     rendered_unique_disk_count: int = 0
     duplicate_disk_view_count: int = 0
     unplaced_disk_count: int = 0
+    # Diagnostic subset of unplaced observations, not another identity class.
+    bare_device_mapper_unplaced_count: int = 0
 
 
 class _Classes:
@@ -344,13 +346,30 @@ def build_disk_retention_accounting(
         rendered_classes.add(identity)
 
     unplaced = 0
-    for identity in source_identities:
+    bare_device_mapper_unplaced = 0
+    for disk, tokens, identity in zip(source_disks, source_tokens, source_identities):
         if identity is None or identity not in rendered_classes:
             unplaced += 1
+            # Empty tokens alone do not establish this reason. Require an
+            # actual rejected minor name, and no usable identity or path token.
+            if not tokens and any(
+                _BARE_DEVICE_MAPPER_NAME.match(value)
+                for raw in (
+                    getattr(disk, "identifier", None),
+                    getattr(disk, "device_name", None),
+                    getattr(disk, "path_device_name", None),
+                    getattr(disk, "multipath_name", None),
+                    getattr(disk, "multipath_member", None),
+                    *(getattr(disk, "smart_devices", None) or ()),
+                )
+                if (value := _clean(raw))
+            ):
+                bare_device_mapper_unplaced += 1
 
     return DiskRetentionAccounting(
         source_disk_count=len(source_tokens),
         rendered_unique_disk_count=len(rendered_classes),
         duplicate_disk_view_count=rendered_view_count - len(rendered_classes),
         unplaced_disk_count=unplaced,
+        bare_device_mapper_unplaced_count=bare_device_mapper_unplaced,
     )
