@@ -516,8 +516,19 @@ def owner_uid(path: Path) -> int:
     return int(run(["sudo", "stat", "-c", "%u", str(path)]).strip())
 
 
+def run_bytes(command: list[str], *, timeout: int = 600) -> bytes:
+    """run() for binary output: identical failure discipline, no text decode."""
+    result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        raise SmokeError(
+            f"command failed ({result.returncode}): {' '.join(command)}\n"
+            f"{result.stdout[-4000:]!r}\n{result.stderr[-4000:]!r}"
+        )
+    return result.stdout
+
+
 def sha256(path: Path) -> str:
-    return hashlib.sha256(run(["sudo", "cat", str(path)]).encode("utf-8")).hexdigest()
+    return hashlib.sha256(run_bytes(["sudo", "cat", str(path)])).hexdigest()
 
 
 def expect(condition: bool, message: str) -> None:

@@ -1796,7 +1796,23 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                             with self.assertRaises(smoke.SmokeError):
                                 smoke.check_backup_scheduler_runtime(deployment)
 
+    def test_readback_sha256_is_binary_safe_and_hashes_exact_bytes(self):
+        import hashlib
+
+        smoke = self.load_smoke()
+        payload = bytes(range(256))
+        with (mock.patch.object(smoke, "run", return_value=payload),
+              mock.patch.object(smoke, "run_bytes", return_value=payload, create=True)):
+            try:
+                digest = smoke.sha256(Path("/nonexistent"))
+            except (UnicodeDecodeError, AttributeError) as error:
+                # The pre-fix seam decoded or re-encoded the bytes as text;
+                # either failure mode is the same binary-safety defect.
+                self.fail(f"sha256 is not binary-safe: {error!r}")
+            self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+
     def test_backup_target_readback_requires_byte_identical_local_twins(self):
+        import contextlib
         import subprocess
 
         smoke = self.load_smoke()
@@ -1815,34 +1831,40 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                     result = subprocess.run(["find", command[2], "-type", "f", "-printf", "%P\n"],
                                             capture_output=True, text=True, check=True)
                     return result.stdout
-                if command[:2] == ["sudo", "cat"]:
-                    result = subprocess.run(["cat", command[2]], capture_output=True, check=True)
-                    return result.stdout.decode()
                 raise AssertionError(command)
 
-            with mock.patch.object(smoke, "run", side_effect=run_without_sudo):
+            def run_bytes_without_sudo(command, **kwargs):
+                if command[:2] == ["sudo", "cat"]:
+                    result = subprocess.run(["cat", command[2]], capture_output=True, check=True)
+                    return result.stdout
+                raise AssertionError(command)
+
+            def readback_mocks():
+                stack = contextlib.ExitStack()
+                stack.enter_context(mock.patch.object(smoke, "run", side_effect=run_without_sudo))
+                stack.enter_context(mock.patch.object(smoke, "run_bytes", side_effect=run_bytes_without_sudo,
+                                                      create=True))
+                return stack
+
+            with readback_mocks():
                 shipped = smoke.check_backup_target_readback(root)
             self.assertEqual(set(shipped), {"config/before.7z", "config/after.7z"})
             (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x04drifted")
-            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
-                  self.assertRaisesRegex(smoke.SmokeError, "does not byte-match")):
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
                 smoke.check_backup_target_readback(root)
             (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x03synthetic")
             (root / "backup-targets" / "remote" / "config" / "orphan.7z").write_bytes(b"\x05synthetic")
-            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
-                  self.assertRaisesRegex(smoke.SmokeError, "does not byte-match")):
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
                 smoke.check_backup_target_readback(root)
             (root / "backup-targets" / "remote" / "config" / "orphan.7z").unlink()
             (root / "backup-targets" / "remote" / "config" / "before.7z").unlink()
             (root / "backup-targets" / "remote" / "config" / "after.7z").unlink()
-            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
-                  self.assertRaisesRegex(smoke.SmokeError, "no shipped backup bytes")):
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "no shipped backup bytes"):
                 smoke.check_backup_target_readback(root)
             (root / "backup-targets" / "remote" / "config" / "before.7z").write_bytes(b"\x01synthetic")
             (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x03synthetic")
             (root / "backups" / "archive" / "config" / "second.7z").write_bytes(b"\x06synthetic")
-            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
-                  self.assertRaisesRegex(smoke.SmokeError, "exactly the refusal-window artifact")):
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "exactly the refusal-window artifact"):
                 smoke.check_backup_target_readback(root)
 
     def test_backup_target_fixture_is_bounded_and_cleanup_uses_its_compose_chain(self):
