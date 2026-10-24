@@ -1,0 +1,225 @@
+name: Clean-host encrypted restore qualification
+
+# Disposable synthetic qualification only. Parent reviews W before pushing.
+on:
+  push:
+    branches:
+      - test/jbod-clean-host-qualification-20261024
+permissions:
+  contents: read
+concurrency:
+  group: jbod-clean-host-qualification
+  cancel-in-progress: false
+jobs:
+  restore:
+    if: >-
+      github.repository == 'gcs8/truenas-jbod-ui' && github.actor == 'gcs8' &&
+      github.triggering_actor == 'gcs8' && github.event_name == 'push' &&
+      github.ref == 'refs/heads/test/jbod-clean-host-qualification-20261024'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      SOURCE_SHA: ccad955334b714cf8aa7e7223c71fdefce6cbf5f
+      CONTROL_SHA: ${{ github.sha }}
+      PREVIOUS_IMAGE: ghcr.io/gcs8/truenas-jbod-ui@sha256:4bfa37a4c40a058055aef384194f98248722eca25f7fb429d6a5a34446d647a7
+      REGISTRY_IMAGE: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+      CANDIDATE_IMAGE: localhost:5000/truenas-jbod-ui:clean-host
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out reviewed source S, not workflow controls W
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ccad955334b714cf8aa7e7223c71fdefce6cbf5f
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Admit exclusive job-local Docker and reserve task namespace
+        id: admit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          test -S /var/run/docker.sock
+          root="$(mktemp -d /tmp/jq.XXXXXXXX)"
+          chmod 700 "$root"
+          mkdir -m 700 "$root/bin" "$root/docker-config"
+          real_docker="$(command -v docker)"
+          test "${real_docker:0:1}" = /
+          printf '#!/bin/bash\nREAL_DOCKER=%q\n' "$real_docker" > "$root/bin/docker"
+          cat >> "$root/bin/docker" <<'WRAPPER'
+          unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+          unset BUILDKIT_HOST BUILDKIT_TLS_SERVER_NAME BUILDKIT_TLS_CACERT BUILDKIT_TLS_CERT BUILDKIT_TLS_KEY
+          unset BUILDX_CONFIG BUILDX_BAKE_FILE BUILDX_BAKE_FILE_SEPARATOR DOCKER_CUSTOM_HEADERS
+          export DOCKER_HOST=unix:///var/run/docker.sock BUILDX_BUILDER=default DOCKER_BUILDKIT=1
+          exec "$REAL_DOCKER" --host unix:///var/run/docker.sock "$@"
+          WRAPPER
+          chmod 700 "$root/bin/docker"
+          export PATH="$root/bin:$PATH" DOCKER_CONFIG="$root/docker-config"
+          export QUALIFICATION_ROOT="$root" RESTORE_ROOT="$root/jbod-clean-host-run"
+          export REGISTRY_NAME="jbod-clean-host-registry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export OWNER_TOKEN="$CONTROL_SHA:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"
+          # Persist controls before the first daemon query, including failure paths.
+          for key in QUALIFICATION_ROOT RESTORE_ROOT DOCKER_CONFIG REGISTRY_NAME OWNER_TOKEN; do
+            printf '%s=%s\n' "$key" "${!key}" >> "$GITHUB_ENV"
+          done
+          printf '%s\n' "$root/bin" >> "$GITHUB_PATH"
+          test ! -e "$RESTORE_ROOT"
+          test -z "$(ls -A "$DOCKER_CONFIG")"
+          test "$(timeout -k 5s 30s docker info --format '{{.Swarm.LocalNodeState}}')" = inactive
+          test -z "$(timeout -k 5s 30s docker container ls --all --quiet)"
+          test -z "$(timeout -k 5s 30s docker volume ls --quiet)"
+          timeout -k 5s 30s docker network ls --no-trunc --format '{{.ID}} {{.Name}}' > "$root/networks-before"
+          python3 - <<'PY'
+          import os, pathlib, socket
+          root = pathlib.Path(os.environ['QUALIFICATION_ROOT'])
+          rows = [line.split() for line in (root / 'networks-before').read_text().splitlines()]
+          assert len(rows) == 3 and {r[1] for r in rows} == {'bridge', 'host', 'none'}
+          # These fixed ports are the reviewed driver's actual constants. Refuse collisions.
+          sockets = []
+          try:
+              for port in (5000, 18180, 18181, 18182):
+                  s = socket.socket()
+                  sockets.append(s)
+                  s.bind(('0.0.0.0', port))
+          finally:
+              for s in sockets:
+                  s.close()
+          PY
+          timeout -k 5s 30s docker compose version >/dev/null
+          printf 'qualification_source=%s controls=%s admission=pass\n' "$SOURCE_SHA" "$CONTROL_SHA"
+      - name: Build S and serve only inside this job
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build and pull output stays private in disposable job scratch.
+          timeout -k 10s 600s docker pull --platform linux/amd64 "$PREVIOUS_IMAGE" > "$QUALIFICATION_ROOT/pull.log" 2>&1
+          timeout -k 5s 30s docker image inspect "$PREVIOUS_IMAGE" > "$QUALIFICATION_ROOT/previous.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          state = json.loads((pathlib.Path(os.environ['QUALIFICATION_ROOT']) / 'previous.json').read_text())[0]
+          labels = state['Config'].get('Labels') or {}
+          assert state['Id'] == 'sha256:ea26586fc454dd279b800aadf3381adc384f3df0e48c41302b24274e37bbe9c1'
+          assert labels.get('org.opencontainers.image.revision') == '6473d05f46d8344146cbbd7d0cdbf44487613a3c'
+          assert labels.get('org.opencontainers.image.version') == '0.22.2'
+          assert labels.get('org.opencontainers.image.source') == 'https://github.com/gcs8/truenas-jbod-ui'
+          print('predecessor_image=' + state['Id'] + ' revision=' + labels['org.opencontainers.image.revision']
+                + ' version=' + labels['org.opencontainers.image.version']
+                + ' source=' + labels['org.opencontainers.image.source'])
+          PY
+          timeout -k 10s 600s docker build --builder default --platform linux/amd64 \
+            --build-arg "SOURCE_COMMIT=$SOURCE_SHA" --iidfile "$QUALIFICATION_ROOT/image-id" \
+            -t "$CANDIDATE_IMAGE" . > "$QUALIFICATION_ROOT/build.log" 2>&1
+          image="$(<"$QUALIFICATION_ROOT/image-id")"
+          [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(timeout -k 5s 30s docker image inspect "$CANDIDATE_IMAGE" --format '{{.Id}}')" = "$image"
+          test "$(timeout -k 5s 30s docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          timeout -k 10s 120s docker pull "$REGISTRY_IMAGE" > "$QUALIFICATION_ROOT/registry-pull.log" 2>&1
+          timeout -k 5s 30s docker image inspect "$REGISTRY_IMAGE" --format '{{.Id}}' > "$QUALIFICATION_ROOT/registry-image"
+          # Record intent first. Ambiguous create failures require ownership readback.
+          touch "$QUALIFICATION_ROOT/registry-attempted"
+          timeout -k 5s 30s docker run -d --name "$REGISTRY_NAME" --label "qualification.owner=$OWNER_TOKEN" \
+            --cidfile "$QUALIFICATION_ROOT/registry-id" --publish 127.0.0.1:5000:5000 \
+            --mount type=tmpfs,destination=/var/lib/registry "$REGISTRY_IMAGE" > "$QUALIFICATION_ROOT/registry-run.log" 2>&1
+          timeout -k 5s 30s bash -c 'until curl --noproxy "*" -fsS http://127.0.0.1:5000/v2/ >/dev/null 2>&1; do sleep 1; done'
+          # Mandatory driver pulls use this loopback registry, never an external push.
+          timeout -k 10s 120s docker push "$CANDIDATE_IMAGE" > "$QUALIFICATION_ROOT/push.log" 2>&1
+          printf 'candidate_image=%s revision=%s registry=job-loopback-only\n' "$image" "$SOURCE_SHA"
+      - name: Run the reviewed encrypted clean-host restore scenario
+        id: scenario
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TMPDIR="$QUALIFICATION_ROOT"
+          test "$(stat -c %a "$TMPDIR")" = 700
+          test ! -e "$RESTORE_ROOT"
+          version="$(python3 -c 'import app; print(app.__version__)')"
+          # No raw errors, key inputs, archive contents or container logs reach Actions.
+          if timeout -k 30s 1500s python3 scripts/run_image_upgrade_smoke.py \
+            --scenario clean-host-restore --disposable-clean-host-restore \
+            --root "$RESTORE_ROOT" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" --previous-version 0.22.2 \
+            --candidate-image "$CANDIDATE_IMAGE" --candidate-version "$version" \
+            --candidate-revision "$SOURCE_SHA" > "$QUALIFICATION_ROOT/scenario.log" 2>&1; then
+            grep -Fx "image_upgrade_smoke=ok scenario=clean-host-restore previous=0.22.2 candidate=$version revision=$SOURCE_SHA archive=7z encrypted=true original_installation=removed mappings=3 history_rows=18 state_identity=ok integrity=ok history_api=ok restart=ok cleanup=verified human_acceptance=unverified" "$QUALIFICATION_ROOT/scenario.log"
+          else
+            rc=$?
+            printf 'qualification_script=fail exit=%s recovery=retained-if-present\n' "$rc"
+            exit "$rc"
+          fi
+          test ! -e "$RESTORE_ROOT"
+          image="$(<"$QUALIFICATION_ROOT/image-id")"
+          test "$(timeout -k 5s 30s docker image inspect "$CANDIDATE_IMAGE" --format '{{.Id}}')" = "$image"
+          test -z "$(git status --porcelain)"
+          printf 'qualification_script=pass source_clean=true\n'
+      - name: Independently verify cleanup, deleting only the owned registry ID
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess, tempfile
+          # Never use ambient context, even when admission failed before wrapper setup.
+          env = {k: v for k, v in os.environ.items() if not k.startswith(('DOCKER_', 'BUILDX_', 'BUILDKIT_'))}
+          admitted = bool(os.environ.get('QUALIFICATION_ROOT'))
+          root = pathlib.Path(os.environ['QUALIFICATION_ROOT']) if admitted else pathlib.Path(tempfile.mkdtemp(prefix='jq-cleanup-'))
+          if not admitted:
+              (root / 'docker-config').mkdir(mode=0o700)
+          env['DOCKER_CONFIG'] = str(root / 'docker-config')
+          failed = not admitted
+          def query(*args):
+              global failed
+              try:
+                  result = subprocess.run(['docker', '--host', 'unix:///var/run/docker.sock', *args],
+                      env=env, capture_output=True, text=True, timeout=30, check=False)
+                  if result.returncode != 0:
+                      raise ValueError('query failed')
+                  return result.stdout.strip()
+              except (OSError, ValueError, subprocess.SubprocessError):
+                  failed = True
+                  return None
+          containers = query('container', 'ls', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}')
+          registry = os.environ.get('REGISTRY_NAME', '')
+          if containers is not None:
+              rows = [line.split() for line in containers.splitlines()]
+              for row in rows:
+                  if len(row) != 2 or row[1] != registry or not re.fullmatch('[0-9a-f]{64}', row[0]):
+                      failed = True
+                      continue
+                  cid = row[0]
+                  owned = False
+                  record = query('container', 'inspect', cid)
+                  try:
+                      state = json.loads(record)[0]
+                      expected_id = (root / 'registry-id').read_text().strip() if (root / 'registry-id').exists() else cid
+                      owned = ((root / 'registry-attempted').is_file() and expected_id == cid
+                          and state['Id'] == cid and state['Name'] == '/' + registry
+                          and state['Image'] == (root / 'registry-image').read_text().strip()
+                          and state['Config']['Labels'].get('qualification.owner') == os.environ['OWNER_TOKEN'])
+                  except (OSError, ValueError, TypeError, KeyError, IndexError):
+                      pass
+                  if owned:
+                      query('container', 'rm', '--force', cid)
+                  else:
+                      failed = True
+          # Independently enumerate all actual resources. Query failure is not absence.
+          containers = query('container', 'ls', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}')
+          networks = query('network', 'ls', '--no-trunc', '--format', '{{.ID}} {{.Name}}')
+          volumes = query('volume', 'ls', '--format', '{{.Name}}')
+          failed |= containers is None or bool(containers) or volumes is None or bool(volumes)
+          if networks is None:
+              failed = True
+          else:
+              baseline = root / 'networks-before'
+              expected = set(baseline.read_text().splitlines()) if baseline.is_file() else set()
+              failed |= not expected or set(networks.splitlines()) != expected
+          recovery = pathlib.Path(os.environ.get('RESTORE_ROOT', str(root / 'unknown-recovery')))
+          recovery_present = recovery.exists() or recovery.is_symlink()
+          failed |= recovery_present
+          print('qualification_external_cleanup=' + ('fail' if failed else 'pass')
+                + ' recovery_root=' + ('retained' if recovery_present else 'absent'))
+          # Never erase recovery files or remove task/foreign containers to force green.
+          if failed:
+              raise SystemExit(1)
+          PY

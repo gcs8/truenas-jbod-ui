@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -233,7 +234,7 @@ class CIWorkflowContractTests(unittest.TestCase):
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup.
-        self.assertEqual(action_count, 44)
+        self.assertEqual(action_count, 45)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -1054,6 +1055,141 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "Outside contributors cannot apply labels, so the gate runs in advisory mode",
             contributing,
         )
+
+
+class CleanHostQualificationWorkflowTests(unittest.TestCase):
+    """Offline controls only, never Docker or restore acceptance evidence."""
+
+    def workflow(self):
+        return yaml.safe_load((WORKFLOW_DIR / "clean-host-restore-qualification.yml").read_text())
+
+    def test_branch_admission_and_separate_source_identity(self):
+        workflow = self.workflow()
+        self.assertEqual(workflow.get("on", workflow.get(True)), {
+            "push": {"branches": ["test/jbod-clean-host-qualification-20261024"]}})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        job = workflow["jobs"]["restore"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        for condition in ("github.repository == 'gcs8/truenas-jbod-ui'",
+                          "github.actor == 'gcs8'", "github.triggering_actor == 'gcs8'",
+                          "github.event_name == 'push'", "github.ref == 'refs/heads/test/jbod-clean-host-qualification-20261024'"):
+            self.assertIn(condition, job["if"])
+        self.assertEqual(job["env"]["SOURCE_SHA"], "ccad955334b714cf8aa7e7223c71fdefce6cbf5f")
+        self.assertEqual(job["env"]["CONTROL_SHA"], "${{ github.sha }}")
+        checkout = job["steps"][0]
+        self.assertEqual(checkout["uses"], "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        self.assertEqual(checkout["with"]["ref"], job["env"]["SOURCE_SHA"])
+        self.assertFalse(checkout["with"]["persist-credentials"])
+        self.assertFalse(workflow["concurrency"]["cancel-in-progress"])
+        self.assertFalse(any("upload" in step.get("uses", "") or "cache" in step.get("uses", "")
+                             for step in job["steps"]))
+
+    def test_maintained_scenario_flags_and_no_broad_cleanup(self):
+        steps = self.workflow()["jobs"]["restore"]["steps"]
+        run = next(step["run"] for step in steps if step.get("id") == "scenario")
+        for fragment in ("scripts/run_image_upgrade_smoke.py", "--scenario clean-host-restore",
+                         "--disposable-clean-host-restore", '--candidate-revision "$SOURCE_SHA"',
+                         '--root "$RESTORE_ROOT"', "tests/fixtures/compose/v0.22.2.yml",
+                         "tests/fixtures/ci-smoke-config.yaml", "import app; print(app.__version__)"):
+            self.assertIn(fragment, run)
+        text = "\n".join(step.get("run", "") for step in steps)
+        for forbidden in ("--remove-orphans", " prune", "upload-artifact", "docker context use"):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("build --builder default", text)
+        self.assertIn("127.0.0.1:5000:5000", text)
+        self.assertEqual(steps[-1]["if"], "always()")
+
+    def cleanup_program(self):
+        step = self.workflow()["jobs"]["restore"]["steps"][-1]
+        return step["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    def test_cleanup_reads_all_kinds_and_preserves_unknown_or_recovery_state(self):
+        import contextlib
+        import io
+        from types import SimpleNamespace
+        program = self.cleanup_program()
+        registry_id = "a" * 64
+        image_id = "sha256:" + "b" * 64
+        for fault in (None, "foreign", "query", "network", "volume", "root", "ownership", "remove"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "networks-before").write_text("1 bridge\n2 host\n3 none\n")
+                (root / "registry-attempted").touch()
+                (root / "registry-image").write_text(image_id)
+                (root / "registry-id").write_text(registry_id)
+                if fault == "root":
+                    (root / "jbod-clean-host-run").mkdir()
+                calls = []
+                removed = False
+
+                def docker(command, **kwargs):
+                    nonlocal removed
+                    self.assertEqual(kwargs["timeout"], 30)
+                    self.assertEqual(command[:3], ["docker", "--host", "unix:///var/run/docker.sock"])
+                    args = command[3:]
+                    calls.append(args)
+                    output = ""
+                    code = 0
+                    if args[:2] == ["container", "ls"]:
+                        output = "" if removed else registry_id + " registry"
+                        if fault == "foreign":
+                            output += "\n" + "c" * 64 + " foreign"
+                        if fault == "query":
+                            code = 1
+                    elif args[:2] == ["container", "inspect"]:
+                        output = json.dumps([{"Id": registry_id, "Name": "/registry", "Image": image_id,
+                                              "Config": {"Labels": {"qualification.owner": "owner" if fault != "ownership" else "foreign"}}}])
+                    elif args[:2] == ["container", "rm"]:
+                        self.assertEqual(args, ["container", "rm", "--force", registry_id])
+                        if fault == "remove":
+                            raise subprocess.TimeoutExpired(command, 30)
+                        removed = True
+                    elif args[:2] == ["network", "ls"]:
+                        output = "1 bridge\n2 host\n3 none" + ("\n4 task" if fault == "network" else "")
+                    elif args[:2] == ["volume", "ls"]:
+                        output = "task" if fault == "volume" else ""
+                    return SimpleNamespace(returncode=code, stdout=output, stderr="")
+
+                env = {"QUALIFICATION_ROOT": str(root), "RESTORE_ROOT": str(root / "jbod-clean-host-run"),
+                       "REGISTRY_NAME": "registry", "OWNER_TOKEN": "owner", "DOCKER_CONFIG": str(root)}
+                with mock.patch.dict(os.environ, env), mock.patch("subprocess.run", side_effect=docker), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if fault is None:
+                        exec(compile(program, "workflow-cleanup", "exec"), {})
+                    else:
+                        with self.assertRaises(SystemExit):
+                            exec(compile(program, "workflow-cleanup", "exec"), {})
+                self.assertTrue(any(c[:2] == ["network", "ls"] for c in calls))
+                self.assertTrue(any(c[:2] == ["volume", "ls"] for c in calls))
+                if fault in ("query", "ownership"):
+                    self.assertFalse(removed)
+                if fault == "root":
+                    self.assertTrue((root / "jbod-clean-host-run").exists())
+
+    def test_socket_wrapper_neutralizes_inherited_selectors_for_indirect_calls(self):
+        import shlex
+        import sys
+        setup = next(s["run"] for s in self.workflow()["jobs"]["restore"]["steps"] if s.get("id") == "admit")
+        wrapper = setup.split("<<'WRAPPER'\n", 1)[1].split("\nWRAPPER", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "real-docker"
+            fake.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
+                            " -c 'import os,sys,json; print(json.dumps([sys.argv[1:],dict(os.environ)]))' \"$@\"\n")
+            fake.chmod(0o700)
+            script = root / "docker"
+            script.write_text('#!/bin/bash\n' + wrapper.replace('"$REAL_DOCKER"', shlex.quote(str(fake))))
+            script.chmod(0o700)
+            env = {**os.environ, "DOCKER_CONTEXT": "foreign", "DOCKER_HOST": "tcp://192.0.2.1:2376",
+                   "DOCKER_TLS_VERIFY": "1", "DOCKER_CERT_PATH": "foreign", "BUILDX_BUILDER": "foreign",
+                   "BUILDKIT_HOST": "tcp://192.0.2.1:1234", "DOCKER_CONFIG": str(root)}
+            result = subprocess.run([str(script), "compose", "config"], env=env,
+                                    capture_output=True, text=True, timeout=10, check=True)
+            argv, actual = json.loads(result.stdout)
+            self.assertEqual(argv, ["--host", "unix:///var/run/docker.sock", "compose", "config"])
+            for selector in ("DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "BUILDKIT_HOST"):
+                self.assertNotIn(selector, actual)
+            self.assertEqual(actual["BUILDX_BUILDER"], "default")
 
 
 if __name__ == "__main__":
