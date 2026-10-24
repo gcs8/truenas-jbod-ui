@@ -40,6 +40,11 @@ commands.
   no restarts over 20 seconds. Explicitly restore the writable mount and prove
   the candidate can read the retained records. This is not a supported-storage
   or release-promotion decision.
+* ``clean-host-restore``: explicitly admitted, exclusive disposable host only.
+  Export encrypted 7z through the predecessor Admin API, stop and remove its
+  entire installation, then inspect/import into an independent current target
+  through the receipt-bound Admin API. Verify bytes, logical identity, health,
+  history reads, restart and resource absence. Not run by the existing CI jobs.
 
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
@@ -49,6 +54,7 @@ publishes the candidate to a local registry so ``pull`` works unchanged.
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import hashlib
 import json
@@ -57,6 +63,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -69,7 +76,8 @@ HISTORY_PORT = 18181
 SERVICES = ("enclosure-ui", "enclosure-history")
 SMOKE_SYSTEM = "upgrade-smoke"
 SUCCESS_PREFIX = "image_upgrade_smoke=ok"
-SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state", "enospc-state")
+SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state", "enospc-state",
+             "clean-host-restore")
 HARDENED_FILES = ("docker-compose.yml", "docker-compose.nonroot.yml")
 READONLY_FILES = ("docker-compose.yml", "docker-compose.readonly.yml")
 ENOSPC_FILES = ("docker-compose.yml", "docker-compose.enospc.yml")
@@ -111,7 +119,8 @@ class SmokeError(RuntimeError):
     """A failed upgrade or rollback expectation."""
 
 
-def run(command: list[str], *, cwd: Path | None = None, input_text: str | None = None, timeout: int = 600) -> str:
+def run(command: list[str], *, cwd: Path | None = None, input_text: str | None = None, timeout: int = 600,
+        env: dict[str, str] | None = None) -> str:
     result = subprocess.run(
         command,
         cwd=cwd,
@@ -120,6 +129,7 @@ def run(command: list[str], *, cwd: Path | None = None, input_text: str | None =
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         raise SmokeError(
@@ -135,12 +145,14 @@ class Deployment:
         self.files = files
         self.image: str | None = None
         self.runtime_environment: dict[str, str] = {}
+        self.environment: dict[str, str] | None = None
 
     def file_args(self) -> list[str]:
         return [arg for name in self.files for arg in ("-f", name)]
 
     def compose(self, *args: str, timeout: int = 600) -> str:
-        return run(["docker", "compose", *self.file_args(), *args], cwd=self.root, timeout=timeout)
+        return run(["docker", "compose", *self.file_args(), *args], cwd=self.root, timeout=timeout,
+                   env=self.environment)
 
     def _write_environment(self) -> None:
         if self.image is None:
@@ -181,6 +193,7 @@ class Deployment:
             cwd=self.root,
             input_text=textwrap.dedent(script),
             timeout=180,
+            env=self.environment,
         )
         return json.loads(output.strip().splitlines()[-1])
 
@@ -191,6 +204,7 @@ class Deployment:
             cwd=self.root,
             input_text=textwrap.dedent(script),
             timeout=180,
+            env=self.environment,
         )
         return json.loads(output.strip().splitlines()[-1])
 
@@ -461,13 +475,13 @@ def expected_history_view(seeded: dict[int, int]) -> dict[str, list]:
 
 
 def check_runtime(deployment: Deployment, image: str, version: str, revision: str | None) -> dict:
-    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", image]).strip()
+    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], env=deployment.environment).strip()
     rows = {}
     for service in SERVICES:
         container = deployment.compose("ps", "-q", service).strip()
         if not container or "\n" in container:
             raise SmokeError(f"{service} must resolve to exactly one container")
-        state = json.loads(run(["docker", "inspect", "--format", "{{json .}}", container]))
+        state = json.loads(run(["docker", "inspect", "--format", "{{json .}}", container], env=deployment.environment))
         health = (state["State"].get("Health") or {}).get("Status", "")
         if state["State"]["Status"] != "running" or health != "healthy":
             raise SmokeError(f"{service} is {state['State']['Status']}/{health or 'no health'}")
@@ -492,7 +506,7 @@ def check_runtime(deployment: Deployment, image: str, version: str, revision: st
     if revision is not None:
         label = run(
             ["docker", "image", "inspect", "--format",
-             '{{index .Config.Labels "org.opencontainers.image.revision"}}', image]
+             '{{index .Config.Labels "org.opencontainers.image.revision"}}', image], env=deployment.environment
         ).strip()
         if label != revision:
             raise SmokeError(f"image revision label is {label!r}, expected {revision}")
@@ -1109,6 +1123,210 @@ def enospc_state(args: argparse.Namespace) -> str:
             "writable_recovery=ok")
 
 
+CLEAN_HOST_GROUPS = ("config_file", "mapping_file", "history_db")
+CLEAN_HOST_ADMIN_PORT = 18182
+CLEAN_HOST_AUTH = "Basic " + base64.b64encode(b"operator:synthetic-clean-host-auth").decode("ascii")
+
+# Read-only probes. History identity is logical, not a promise that SQLite file
+# bytes survive supported snapshot/restore/startup. Config and mappings are exact.
+READ_CLEAN_FILES = """
+import hashlib, json
+from pathlib import Path
+print(json.dumps({name: hashlib.sha256(Path(path).read_bytes()).hexdigest() for name, path in
+    (("config_sha256", "/app/config/config.yaml"), ("mapping_sha256", "/app/data/slot_mappings.json"))}))
+"""
+READ_CLEAN_HISTORY = f"""
+import hashlib, json, sqlite3
+connection = sqlite3.connect("file:/app/history/history.db?mode=ro", uri=True)
+try:
+    rows = {{}}
+    for table, columns in (("slot_state_current", "system_id,enclosure_key,slot,serial,device_name"),
+                           ("slot_events", "system_id,enclosure_key,slot,serial,event_type,current_value,observed_at"),
+                           ("metric_samples", "system_id,enclosure_key,slot,serial,metric_name,value_integer,observed_at")):
+        values = sorted(connection.execute(f"SELECT {{columns}} FROM {{table}} WHERE system_id=?",
+                                           ("{SMOKE_SYSTEM}",)).fetchall())
+        rows[table] = [len(values), hashlib.sha256(json.dumps(values).encode()).hexdigest()]
+    print(json.dumps({{"history_rows": rows}}))
+finally:
+    connection.close()
+"""
+
+
+def admit_clean_host_root(root: Path, *, consent: bool) -> None:
+    expect(consent, "clean-host restore needs --disposable-clean-host-restore on an exclusive disposable host")
+    expect(root.is_absolute() and root == root.resolve() and root.name.startswith("jbod-clean-host-")
+           and root.parent.is_dir() and root.is_relative_to(Path(tempfile.gettempdir()).resolve()),
+           "clean-host root must be an absent nonsymlink jbod-clean-host-* directory below TMPDIR")
+    expect(not root.exists(), "clean-host root already exists; refusing to replace recovery files")
+    root.mkdir(mode=0o700)
+
+
+def clean_host_absent(project: str, env: dict[str, str]) -> None:
+    commands = [
+        ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+        ["docker", "container", "ls", "--all", "--filter", f"label=com.docker.compose.project={project}",
+         "--format", "{{.Names}}"],
+        *(["docker", kind, "ls", "--filter", f"label=com.docker.compose.project={project}",
+           "--format", "{{.Name}}"] for kind in ("network", "volume")),
+    ]
+    unsafe = False
+    for index, command in enumerate(commands):
+        try:
+            output = run(command, env=env, timeout=30).splitlines()
+        except (SmokeError, OSError, subprocess.SubprocessError):
+            unsafe = True
+            continue
+        unsafe |= any(name in {"truenas-jbod-ui", "truenas-jbod-history", "truenas-jbod-admin"}
+                      for name in output) if index == 0 else bool(output)
+    expect(not unsafe, "clean-host resources remain or census is unknown; retain recovery files")
+
+
+def clean_host_down(deployment: Deployment, project: str, env: dict[str, str]) -> None:
+    failed = False
+    try:
+        deployment.compose("--profile", "history", "--profile", "admin", "down", "--volumes")
+    except (SmokeError, OSError, subprocess.SubprocessError):
+        failed = True
+    clean_host_absent(project, env)  # independent readback even after failed down
+    expect(not failed, "clean-host teardown failed; retain recovery files")
+
+
+def clean_host_post(path: str, body: bytes, headers: dict[str, str]) -> dict:
+    request = urllib.request.Request(f"http://127.0.0.1:{CLEAN_HOST_ADMIN_PORT}" + path, data=body,
+                                     headers={"Authorization": CLEAN_HOST_AUTH, **headers}, method="POST")
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=180) as response:
+            return json.load(response)
+    except (OSError, ValueError) as exc:
+        raise SmokeError("clean-host admin request failed") from exc
+
+
+def clean_host_import(archive: Path, passphrase: str) -> None:
+    expect(0 < archive.stat().st_size <= 16 * 1024 * 1024, "clean-host archive exceeds its 16 MiB bound")
+    body = archive.read_bytes()  # bounded synthetic fixture only, never production scale
+    headers = {"Content-Type": "application/octet-stream",
+               "X-Backup-Passphrase-Base64": base64.b64encode(passphrase.encode()).decode("ascii")}
+    inspection = clean_host_post("/api/admin/backup/inspect", body, headers)
+    expect(inspection.get("ok") is True and inspection.get("encrypted") is True
+           and inspection.get("encryption_mode") == "encrypted" and bool(inspection.get("inspection_receipt"))
+           and set(inspection.get("selected_groups", [])) == set(CLEAN_HOST_GROUPS)
+           and set(inspection.get("present_groups", [])) == set(CLEAN_HOST_GROUPS)
+           and inspection.get("absent_groups") == [], "clean-host encrypted inspection is incomplete")
+    result = clean_host_post("/api/admin/backup/import?stop_services=true&restart_services=false", body, {
+        **headers, "X-Backup-Expected-Encryption": "encrypted",
+        "X-Backup-Inspection-Receipt": inspection["inspection_receipt"],
+    })
+    expect(result.get("ok") is True and set(result.get("included_groups", [])) == set(CLEAN_HOST_GROUPS),
+           "clean-host import did not restore all required groups")
+
+
+def check_clean_host_identity(before: dict, after: dict) -> None:
+    expect(before == after, "clean-host restore changed config/mapping bytes or history counts/identity")
+
+
+class CleanHostDeployment(Deployment):
+    def __init__(self, root: Path, project: str, env: dict[str, str]) -> None:
+        super().__init__(root)
+        self.project = project
+        self.environment = env
+
+    def file_args(self) -> list[str]:
+        return ["--project-name", self.project, "-f", "docker-compose.yml"]
+
+
+def clean_host_restore(args: argparse.Namespace) -> str:
+    """One archive-only synthetic recovery cell, not support or human acceptance."""
+    repository = Path(__file__).resolve().parents[1]
+    for supplied, expected in ((args.compose_fixture, repository / "tests/fixtures/compose/v0.22.2.yml"),
+                               (args.config_fixture, repository / "tests/fixtures/ci-smoke-config.yaml")):
+        expect(supplied.read_bytes() == expected.read_bytes(), "clean-host requires the maintained synthetic fixtures")
+    root = args.root.absolute()
+    admit_clean_host_root(root, consent=args.disposable_clean_host_restore)
+    client = root / "docker-client"
+    client.mkdir(mode=0o700)
+    env = {"PATH": os.environ.get("PATH", os.defpath), "DOCKER_HOST": "unix:///var/run/docker.sock",
+           "DOCKER_CONFIG": str(client), "APP_BIND_ADDRESS": "127.0.0.1"}
+    project = root.name
+    clean_host_absent(project, env)  # before daemon mutation or teardown ownership
+    recovery = root / "recovery"
+    recovery.mkdir(mode=0o700)
+    passphrase = os.urandom(32).hex()  # synthetic key input, never a real credential
+    key = recovery / "operator-key-input"
+    key.write_text(passphrase, encoding="utf-8")
+    key.chmod(0o600)
+    archive = recovery / "backup.7z"
+    deployment = CleanHostDeployment(root / "source", project, env)
+    completed = False
+    try:
+        prepare_root(deployment.root, args.compose_fixture, args.config_fixture)
+        deployment.image = args.previous_image
+        deployment.runtime_environment.update({"ADMIN_PORT": str(CLEAN_HOST_ADMIN_PORT),
+            "ADMIN_BIND_ADDRESS": "127.0.0.1", "ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": "operator",
+            "ADMIN_AUTH_PASSWORD": "synthetic-clean-host-auth"})
+        seed_previous_release(deployment, args)
+        deployment.compose("stop", *SERVICES)
+        before = {**deployment.run_python("enclosure-ui", READ_CLEAN_FILES),
+                  **deployment.run_python("enclosure-history", READ_CLEAN_HISTORY)}
+        deployment.compose("--profile", "admin", "up", "-d", "--wait", "enclosure-admin")
+        payload = json.dumps({"encrypt": True, "passphrase": passphrase, "packaging": "7z",
+                              "included_paths": list(CLEAN_HOST_GROUPS)}).encode()
+        request = urllib.request.Request(f"http://127.0.0.1:{CLEAN_HOST_ADMIN_PORT}/api/admin/backup/export"
+                                         "?stop_services=true&restart_services=false", data=payload,
+                                         headers={"Authorization": CLEAN_HOST_AUTH, "Content-Type": "application/json"})
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=180) as response:
+            content = response.read(16 * 1024 * 1024 + 1)
+        expect(content.startswith(b"7z\xbc\xaf\x27\x1c") and len(content) <= 16 * 1024 * 1024,
+               "predecessor did not export the bounded supported 7z archive")
+        archive.write_bytes(content)
+        archive.chmod(0o600)
+        del payload, content, request
+        clean_host_down(deployment, project, env)
+        run(["sudo", "rm", "-rf", "--", str(deployment.root)], env=env)
+        expect(not deployment.root.exists(), "original installation was not removed")
+        # New current Compose and bootstrap fixture, never copied source state.
+        deployment = CleanHostDeployment(root / "target", project, env)
+        bootstrap = root / "fresh-bootstrap.yaml"
+        bootstrap.write_bytes(args.config_fixture.read_bytes().replace(b"WARNING", b"ERROR"))
+        expect(bootstrap.read_bytes() != args.config_fixture.read_bytes(), "fresh bootstrap must differ from source config")
+        prepare_root(deployment.root, repository / "docker-compose.yml", bootstrap)
+        bootstrap.unlink()
+        deployment.image = args.candidate_image
+        deployment.runtime_environment.update({"ADMIN_PORT": str(CLEAN_HOST_ADMIN_PORT),
+            "ADMIN_BIND_ADDRESS": "127.0.0.1", "ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": "operator",
+            "ADMIN_AUTH_PASSWORD": "synthetic-clean-host-auth"})
+        deployment.set_image(args.candidate_image)
+        deployment.compose("--profile", "admin", "pull", "enclosure-admin")
+        deployment.compose("--profile", "admin", "up", "-d", "--wait", "enclosure-admin")
+        clean_host_import(archive, key.read_text(encoding="utf-8"))
+        after = {**deployment.run_python("enclosure-ui", READ_CLEAN_FILES),
+                 **deployment.run_python("enclosure-history", READ_CLEAN_HISTORY)}
+        check_clean_host_identity(before, after)
+        deployment.pull_and_up()
+        check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+        expect(history_api_view((1, 2, 3)) == expected_history_view({1: 4, 2: 4, 3: 4}),
+               "clean-host history API lost predecessor identity")
+        after_history = deployment.exec_python("enclosure-history", READ_HISTORY)
+        expect(after_history["integrity"] == "ok" and after_history["counts"] == {
+            "slot_state_current": 3, "slot_events": 3, "metric_samples": 12}, "clean-host counts/integrity failed")
+        deployment.compose("restart", *SERVICES)
+        deployment.compose("up", "-d", "--wait", "--wait-timeout", "300")
+        check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+        check_clean_host_identity(before, {**deployment.exec_python("enclosure-ui", READ_CLEAN_FILES),
+                                          **deployment.exec_python("enclosure-history", READ_CLEAN_HISTORY)})
+        completed = True
+    finally:
+        # Partial startup owns resources too. Never erase recovery material after
+        # failure, failed teardown, failed list queries, or residual resources.
+        clean_host_down(deployment, project, env)
+        if completed:
+            run(["sudo", "rm", "-rf", "--", str(root)], env=env)
+            expect(not root.exists(), "clean-host fixture cleanup failed")
+    return (f"{SUCCESS_PREFIX} scenario=clean-host-restore previous={args.previous_version} "
+            f"candidate={args.candidate_version} revision={args.candidate_revision} "
+            "archive=7z encrypted=true original_installation=removed mappings=3 history_rows=18 "
+            "state_identity=ok integrity=ok history_api=ok restart=ok cleanup=verified human_acceptance=unverified")
+
+
 def smoke(args: argparse.Namespace) -> str:
     if args.scenario == "enospc-state":
         return enospc_state(args)
@@ -1152,6 +1370,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-version", required=True)
     parser.add_argument("--candidate-revision", required=True)
     parser.add_argument("--scenario", choices=SCENARIOS, default="base")
+    parser.add_argument("--disposable-clean-host-restore", action="store_true",
+                        help="Admit fixture destruction on an exclusive disposable local Docker host.")
     parser.add_argument("--nonroot-fixture", type=Path,
                         help="The previous release's docker-compose.nonroot.yml (hardened scenario).")
     return parser
@@ -1166,6 +1386,13 @@ def main(argv: list[str] | None = None) -> int:
         print("run_image_upgrade_smoke.py needs a disposable Linux Docker host.", file=sys.stderr)
         return 2
     started = time.monotonic()
+    if args.scenario == "clean-host-restore":
+        try:
+            print(clean_host_restore(args))
+            return 0
+        except (SmokeError, OSError, subprocess.SubprocessError) as exc:
+            print(f"clean-host restore failed; recovery files retained: {type(exc).__name__}", file=sys.stderr)
+            return 1
     try:
         print(smoke(args) + f" seconds={int(time.monotonic() - started)}")
     except SmokeError as exc:
