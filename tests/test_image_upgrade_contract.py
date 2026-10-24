@@ -1476,7 +1476,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
         self.exercise_lifecycle(replaced=True)
 
     def test_unavailable_backup_storage_refuses_an_unisolated_target_failure(self):
-        for refusal_detail in (None, "2 remote copy failure(s)"):
+        for refusal_detail in (None, "unrelated failure"):
             with self.subTest(refusal_detail=refusal_detail):
                 self.exercise_lifecycle(refusal_detail=refusal_detail)
 
@@ -1598,7 +1598,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         self.assertEqual(wait_mock.call_count, 2)
                         self.assertEqual(healthy.call_count, 1)
                     elif refusal_detail != "1 remote copy failure(s)":
-                        with self.assertRaisesRegex(smoke.SmokeError, "isolate exactly the remote copy failure"):
+                        with self.assertRaisesRegex(smoke.SmokeError, "isolate the remote copy failures"):
                             smoke.unavailable_backup_storage(args)
                         self.assertEqual(fault.call_count, 1)
                         restore.assert_not_called()
@@ -1630,7 +1630,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         install.assert_called_once_with(deployment)
                         fault.assert_called_once_with(root)
                         restore.assert_called_once_with(root)
-                        readback.assert_called_once_with(root)
+                        readback.assert_called_once_with(
+                            root,
+                            window_start="2026-01-01T00:01:00+00:00",
+                            window_end="2026-01-01T00:02:00+00:00",
+                        )
                         self.assertEqual(healthy.call_count, 2)
                         for call in healthy.call_args_list:
                             self.assertEqual(call.args, (deployment, "candidate", "2", "revision"))
@@ -1728,6 +1732,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                     "targets": {"smoke-nas": target_record}}
 
         smoke.check_backup_target_refusal(status_for({"at": "t", "ok": False, "detail": detail}))
+        # The per-run count is the scheduler's own bookkeeping; any count and
+        # the multi-failure plural form must both pass the shape pin.
+        smoke.check_backup_target_refusal(status_for(
+            {"at": "t", "ok": False, "detail": detail},
+            class_record={"at": "t", "ok": True, "detail": "2 remote copy failure(s)", "artifact_id": "a"}))
         sibling_contamination = detail.replace(
             "must resolve through directories only",
             "must resolve through directories only; the filesystem is full")
@@ -1741,11 +1750,15 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 "must resolve through directories only", "something else happened")}),
             status_for({"at": "t", "ok": False, "detail": sibling_contamination}),
             status_for({"at": "t", "ok": False, "detail": detail}, class_record={
-                "at": "t", "ok": False, "detail": "ConfigurationError: ...", "artifact_id": "a"}),
+                "at": "t", "ok": False, "detail": "1 remote copy failure(s)", "artifact_id": "a"}),
             status_for({"at": "t", "ok": False, "detail": detail}, class_record={
                 "at": "t", "ok": True, "detail": None, "artifact_id": None}),
             status_for({"at": "t", "ok": False, "detail": detail}, class_record={
-                "at": "t", "ok": True, "detail": "2 remote copy failure(s)", "artifact_id": "a"}),
+                "at": "t", "ok": True, "detail": "1 remote copy failures", "artifact_id": "a"}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": "unrelated failure", "artifact_id": "a"}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": "remote copy failure(s)", "artifact_id": "a"}),
         )
         for mutant in mutants:
             with self.subTest(mutant=repr(mutant["targets"]["smoke-nas"])[:100]):
@@ -1811,20 +1824,95 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 self.fail(f"sha256 is not binary-safe: {error!r}")
             self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
 
-    def test_backup_target_readback_requires_byte_identical_local_twins(self):
-        import contextlib
-        import subprocess
+    def test_backup_target_readback_attribute_missing_artifacts_to_the_refusal_window(self):
+        from datetime import datetime, timedelta, timezone
 
         smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        baseline_at = base
+        refused_one_at = base + timedelta(hours=1)
+        refused_two_at = base + timedelta(minutes=65)
+        recovery_at = base + timedelta(minutes=70)
+
+        def artifact(at):
+            return "config/jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
+        local_names = [artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at),
+                       artifact(recovery_at), "config/.scheduled-backup.lock"]
+        remote_names = [artifact(baseline_at), artifact(recovery_at)]
+        digests = {name: "d" + name[-13] for name in local_names + remote_names}
+
+        def find_listing(sub_root):
+            return "\n".join(remote_names if "backup-targets" in sub_root else local_names) + "\n"
+
+        def run_without_sudo(command, **kwargs):
+            if command[:2] == ["sudo", "find"]:
+                return find_listing(command[2])
+            raise AssertionError(command)
+
+        def digests_of(path):
+            return digests["config/" + Path(path).name]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # Two refusal-window artifacts missing remotely is exactly the
+                # contract: the target is the local archive minus the window.
+                shipped = smoke.check_backup_target_readback(
+                    root, window_start=refused_one_at.isoformat(), window_end=recovery_at.isoformat())
+            self.assertEqual(set(shipped), {artifact(baseline_at), artifact(recovery_at)})
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window")):
+                # A window that starts after the first refusal must refuse its
+                # artifact: the attribution is by timestamp, not by "any gap".
+                smoke.check_backup_target_readback(
+                    root, window_start=refused_two_at.isoformat(), window_end=recovery_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window")):
+                # The recovered artifact's own instant ends the window.
+                smoke.check_backup_target_readback(
+                    root, window_start=baseline_at.isoformat(), window_end=refused_two_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs:
+                                        find_listing(command[2]) if "backup-targets" in command[2]
+                                        else "\n".join(remote_names) + "\n"),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "produced no unshipped artifact")):
+                # Nothing missing at all: the target already holds every local artifact.
+                smoke.check_backup_target_readback(
+                    root, window_start=refused_one_at.isoformat(), window_end=recovery_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs:
+                                        "config/.scheduled-backup.lock\n"),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "must hold only shipped archive artifacts")):
+                smoke.check_backup_target_readback(
+                    root, window_start=baseline_at.isoformat(), window_end=recovery_at.isoformat())
+
+    def test_backup_target_readback_requires_byte_identical_local_twins_on_disk(self):
+        import contextlib
+        import subprocess
+        from datetime import datetime, timedelta, timezone
+
+        smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        refusal_at = base + timedelta(minutes=1)
+        recovery_at = base + timedelta(minutes=2)
+
+        def artifact(at):
+            return "jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "backup-targets" / "remote" / "config").mkdir(parents=True)
             (root / "backups" / "archive" / "config").mkdir(parents=True)
-            (root / "backup-targets" / "remote" / "config" / "before.7z").write_bytes(b"\x01synthetic")
-            (root / "backups" / "archive" / "config" / "before.7z").write_bytes(b"\x01synthetic")
-            (root / "backups" / "archive" / "config" / "during.7z").write_bytes(b"\x02synthetic")
-            (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x03synthetic")
-            (root / "backups" / "archive" / "config" / "after.7z").write_bytes(b"\x03synthetic")
+            (root / "backups" / "archive" / "config" / ".scheduled-backup.lock").write_bytes(b"bookkeeping")
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backups" / "archive" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).write_bytes(b"\x02synthetic")
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            (root / "backups" / "archive" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
 
             def run_without_sudo(command, **kwargs):
                 if command[:2] == ["sudo", "find"]:
@@ -1847,25 +1935,36 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 return stack
 
             with readback_mocks():
-                shipped = smoke.check_backup_target_readback(root)
-            self.assertEqual(set(shipped), {"config/before.7z", "config/after.7z"})
-            (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x04drifted")
+                shipped = smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            self.assertEqual(set(shipped), {"config/" + artifact(base), "config/" + artifact(recovery_at)})
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x04drifted")
             with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
-                smoke.check_backup_target_readback(root)
-            (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x03synthetic")
-            (root / "backup-targets" / "remote" / "config" / "orphan.7z").write_bytes(b"\x05synthetic")
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            orphan = "jbod-scheduled-backup-" + (base + timedelta(minutes=3)).strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+            (root / "backup-targets" / "remote" / "config" / orphan).write_bytes(b"\x05synthetic")
             with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
-                smoke.check_backup_target_readback(root)
-            (root / "backup-targets" / "remote" / "config" / "orphan.7z").unlink()
-            (root / "backup-targets" / "remote" / "config" / "before.7z").unlink()
-            (root / "backup-targets" / "remote" / "config" / "after.7z").unlink()
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backup-targets" / "remote" / "config" / orphan).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).unlink()
             with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "no shipped backup bytes"):
-                smoke.check_backup_target_readback(root)
-            (root / "backup-targets" / "remote" / "config" / "before.7z").write_bytes(b"\x01synthetic")
-            (root / "backup-targets" / "remote" / "config" / "after.7z").write_bytes(b"\x03synthetic")
-            (root / "backups" / "archive" / "config" / "second.7z").write_bytes(b"\x06synthetic")
-            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "exactly the refusal-window artifact"):
-                smoke.check_backup_target_readback(root)
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "produced no unshipped artifact"):
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).write_bytes(b"\x02synthetic")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window"):
+                smoke.check_backup_target_readback(
+                    root, window_start=(refusal_at + timedelta(seconds=1)).isoformat(),
+                    window_end=recovery_at.isoformat())
 
     def test_backup_target_fixture_is_bounded_and_cleanup_uses_its_compose_chain(self):
         smoke = self.load_smoke()
