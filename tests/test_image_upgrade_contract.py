@@ -1421,6 +1421,83 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
     ROOT = Path(__file__).resolve().parents[1]
     load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
 
+    def test_backup_target_readback_requires_the_recovered_copy_shipped_after_the_restore(self):
+        from datetime import datetime, timedelta, timezone
+
+        smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        baseline_at = base
+        refused_one_at = base + timedelta(hours=1)
+        refused_two_at = base + timedelta(minutes=65)
+        recovery_at = base + timedelta(minutes=70)
+        # The scenario's host-side instants: the fault goes in before the
+        # refused builds and is restored before the recovery build.
+        injection_ts = base.timestamp() + 3599.5
+        restore_ts = refused_two_at.timestamp() + 30.5
+
+        def artifact(at):
+            return "config/jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
+        digests = {name: "d" + str(index) for index, name in enumerate([
+            artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at), artifact(recovery_at)])}
+        digests["config/.scheduled-backup.lock"] = "bookkeeping"
+
+        def digests_of(path):
+            return digests["config/" + Path(path).name]
+
+        def fixture(local_names, remote_names):
+            def run_without_sudo(command, **kwargs):
+                if command[:2] == ["sudo", "find"]:
+                    names = remote_names if "backup-targets" in command[2] else local_names
+                    return "\n".join(names) + "\n"
+                raise AssertionError(command)
+            return mock.patch.object(smoke, "run", side_effect=run_without_sudo)
+
+        lock = "config/.scheduled-backup.lock"
+        all_local = [artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at),
+                     artifact(recovery_at), lock]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (fixture(all_local, [artifact(baseline_at)]),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # The recovery artifact missing remotely is refused: everything
+                # built at/after the restore instant must ship byte-identically.
+                with self.assertRaisesRegex(smoke.SmokeError, "must be shipped byte-identically"):
+                    smoke.check_backup_target_readback(root, window_start=injection_ts, window_end=restore_ts)
+            with (fixture(all_local, [artifact(baseline_at), artifact(recovery_at)]),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # The documented shape holds: the target is the local archive
+                # minus the refusal-window artifacts, plus the recovered copy.
+                shipped = smoke.check_backup_target_readback(root, window_start=injection_ts, window_end=restore_ts)
+            self.assertEqual(set(shipped), {artifact(baseline_at), artifact(recovery_at)})
+
+    def test_backup_target_status_wait_requires_a_coherent_refusal_snapshot(self):
+        smoke = self.load_smoke()
+
+        def snapshot(target_at, target_ok, class_at, class_detail):
+            return {"schema_version": 1,
+                    "classes": {"config": {"at": class_at, "ok": True, "detail": class_detail,
+                                           "artifact_id": "a"}},
+                    "targets": {"smoke-nas": {"at": target_at, "ok": target_ok, "detail": "x",
+                                              "artifact_id": "artifact"}}}
+
+        incoherent = snapshot("2026-01-01T00:09:00+00:00", False,
+                              "2026-01-01T00:00:00+00:00", None)
+        coherent = snapshot("2026-01-01T00:09:00+00:00", False,
+                            "2026-01-01T00:09:01+00:00", "1 remote copy failure(s)")
+        with (mock.patch.object(smoke, "read_backup_archive_status", return_value=incoherent),
+              mock.patch.object(smoke.time, "monotonic", side_effect=[0, 30, 90]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            # A fresh target failure beside a stale class record is the
+            # intermediate write between _ship and _record_class: keep polling.
+            with self.assertRaisesRegex(smoke.SmokeError, "never reported"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=[incoherent, coherent]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            self.assertEqual(smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False), coherent)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)])
+
     def test_unavailable_backup_storage_is_dispatched_and_invoked_in_the_existing_report_only_job(self):
         from types import SimpleNamespace
 
@@ -1565,7 +1642,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 mock.patch.object(smoke, "sha256", side_effect=sha_digest),
                 mock.patch.object(smoke, "wait_for_backup_target_status", side_effect=wait) as wait_mock,
                 mock.patch.object(smoke, "make_backup_target_unavailable", return_value=1000.0) as fault,
-                mock.patch.object(smoke, "make_backup_target_available") as restore,
+                mock.patch.object(smoke, "make_backup_target_available", return_value=2000.0) as restore,
                 mock.patch.object(smoke, "check_backup_target_readback", return_value={"config/after.7z": "d"}) as readback,
                 mock.patch.object(smoke, "check_runtime") as healthy,
                 mock.patch.object(smoke, "history_api_view",
@@ -1633,7 +1710,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         readback.assert_called_once_with(
                             root,
                             window_start=1000.0,
-                            window_end="2026-01-01T00:02:00+00:00",
+                            window_end=2000.0,
                         )
                         self.assertEqual(healthy.call_count, 2)
                         for call in healthy.call_args_list:
@@ -1876,8 +1953,9 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                     root, window_start=refused_two_at.isoformat(), window_end=recovery_at.isoformat())
             with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
                   mock.patch.object(smoke, "sha256", side_effect=digests_of),
-                  self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window")):
-                # The recovered artifact's own instant ends the window.
+                  self.assertRaisesRegex(smoke.SmokeError, "must be shipped byte-identically")):
+                # An artifact at/after the window end is post-restore: missing
+                # remotely it is the unshipped recovery, never an allowed gap.
                 smoke.check_backup_target_readback(
                     root, window_start=baseline_at.isoformat(), window_end=refused_two_at.isoformat())
             with (mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs:
@@ -1966,7 +2044,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 smoke.check_backup_target_readback(
                     root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
             (root / "backups" / "archive" / "config" / artifact(refusal_at)).write_bytes(b"\x02synthetic")
+            later_refusal = base + timedelta(seconds=90)
+            (root / "backups" / "archive" / "config" / artifact(later_refusal)).write_bytes(b"\x07synthetic")
             with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window"):
+                # With a second in-window artifact, the early one's stamp before
+                # the window start is what the attribution pin rejects.
                 smoke.check_backup_target_readback(
                     root, window_start=(refusal_at + timedelta(seconds=1)).isoformat(),
                     window_end=recovery_at.isoformat())

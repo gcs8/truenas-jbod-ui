@@ -1276,10 +1276,15 @@ def make_backup_target_unavailable(root: Path) -> float:
     return time.time()
 
 
-def make_backup_target_available(root: Path) -> None:
-    """The operator's explicit fix: the real target root directory back."""
+def make_backup_target_available(root: Path) -> float:
+    """The operator's explicit fix: the real target root directory back.
+
+    Returns the host restore timestamp: the readback window ends there, and
+    every archive built at/after it must ship (the recovery proof).
+    """
     run(["sudo", "rm", str(root / "backup-targets" / "remote")])
     run(["sudo", "mv", str(root / "backup-targets" / "remote.held"), str(root / "backup-targets" / "remote")])
+    return time.time()
 
 
 def read_backup_archive_status(root: Path) -> dict:
@@ -1292,8 +1297,32 @@ def read_backup_archive_status(root: Path) -> dict:
     return status
 
 
+# The class-record detail shape `_run_class` writes after `_ship` isolates the
+# remote failures; shared by the refusal validator and the wait's coherence pin.
+REMOTE_COPY_FAILURE_DETAIL = re.compile(r"[0-9]+ remote copy failure\(s\)")
+
+
+def _coherent_refusal_status(status: dict, record: dict) -> bool:
+    """Whether `_run_class`'s class record for this failure has landed.
+
+    Between `_ship`'s status write (fresh target failure, stale class record)
+    and `_record_class`'s write, the file names the refusal without the
+    local-success/remote-failure isolation; a verdict read there would reject
+    the scheduler's own bookkeeping. The class record must be at least as new
+    as the target record and carry the isolation shape.
+    """
+    class_record = (status.get("classes") or {}).get("config") or {}
+    return (class_record.get("ok") is True
+            and str(class_record.get("at") or "") >= str(record.get("at") or "")
+            and REMOTE_COPY_FAILURE_DETAIL.fullmatch(str(class_record.get("detail") or "")) is not None)
+
+
 def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "", timeout: int = 90) -> dict:
-    """Poll for a target record newer than `after` whose `ok` equals `want_ok`."""
+    """Poll for a target record newer than `after` whose `ok` equals `want_ok`.
+
+    A refusal is returned only with its matching class record (coherent
+    snapshot); otherwise the poll keeps going, still deadline-bounded.
+    """
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -1305,7 +1334,8 @@ def wait_for_backup_target_status(root: Path, *, want_ok: bool, after: str = "",
         record = status.get("targets", {}).get(BACKUP_TARGET_ID) or {}
         at = str(record.get("at") or "")
         if at > after and bool(record.get("ok")) is want_ok:
-            return status
+            if want_ok or _coherent_refusal_status(status, record):
+                return status
         if time.monotonic() >= deadline:
             raise SmokeError(
                 f"backup target {BACKUP_TARGET_ID!r} never reported "
@@ -1350,7 +1380,7 @@ def check_backup_target_refusal(status: dict, *, target_id: str = BACKUP_TARGET_
     # The count of refused ship attempts inside one run is the scheduler's own
     # bookkeeping; the operator contract is the shape: a local archive kept and
     # the remote failure isolated into the per-class detail.
-    expect(re.fullmatch(r"[0-9]+ remote copy failure\(s\)", str(class_record.get("detail"))),
+    expect(REMOTE_COPY_FAILURE_DETAIL.fullmatch(str(class_record.get("detail"))),
            f"the class record must isolate the remote copy failures: {class_record}")
 
 
@@ -1407,12 +1437,21 @@ def check_backup_target_readback(root: Path, *, window_start: float | str, windo
     local_artifacts = {name: artifact_stamp(name) for name in local_files}
     local_artifacts = {name: stamp for name, stamp in local_artifacts.items() if stamp is not None}
     missing = set(local_artifacts) - set(remote_artifacts)
-    expect(bool(missing), "the refusal window produced no unshipped artifact")
+    allowed_missing = {name for name in missing
+                       if local_artifacts[name] is not None and start <= local_artifacts[name] < end}
+    expect(bool(allowed_missing), "the refusal window produced no unshipped artifact")
     for name in sorted(missing):
         stamp = local_artifacts[name]
-        expect(stamp is not None and start <= stamp < end,
+        expect(stamp is not None and stamp >= start,
                f"missing artifact {name!r} is not attributable to the refusal window: "
                f"{stamp} not within [{start}, {end})")
+    # The recovery proof: everything built at/after the restore instant must be
+    # on the target (the recovery build runs at least a debounce interval after
+    # the restore, so its second-resolution stamp cannot predate the restore).
+    for name, stamp in sorted(local_artifacts.items()):
+        if stamp is not None and stamp >= end:
+            expect(name in remote_files,
+                   f"the post-restore artifact {name!r} must be shipped byte-identically")
     for name, digest in remote_files.items():
         expect(name in local_files and local_files[name] == digest,
                f"target copy {name!r} does not byte-match the local archive copy")
@@ -1478,13 +1517,13 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
 
     # The operator's explicit fix, not an automatic repair. The same candidate
     # must then ship to the restored target and read back what it wrote.
-    make_backup_target_available(root)
+    restored_at = make_backup_target_available(root)
     record_backup_phase_change(deployment, "upgrade-smoke-backup-after")
     recovered = wait_for_backup_target_status(root, want_ok=True, after=refused_record["at"])
     check_backup_target_recovery(recovered)
     check_backup_target_readback(root,
                                  window_start=fault_injected_at,
-                                 window_end=recovered["targets"][BACKUP_TARGET_ID]["at"])
+                                 window_end=restored_at)
 
     check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
     after = deployment.exec_python("enclosure-history", READ_HISTORY)
