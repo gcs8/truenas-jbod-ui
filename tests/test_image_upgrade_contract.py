@@ -1883,9 +1883,8 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets")],
                 ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets" / "remote")],
             ])
-            self.assertTrue((root / "config" / "backup-secrets" / "backup-passphrase").exists())
-            passphrase_mode = (root / "config" / "backup-secrets" / "backup-passphrase").stat().st_mode & 0o777
-            self.assertEqual(passphrase_mode, 0o600)
+            self.assertFalse((root / "config" / "backup-secrets").exists(),
+                             "the post-seed helper must not touch the hardened config dir")
             with mock.patch.object(smoke, "run") as run:
                 smoke.make_backup_target_unavailable(root)
                 smoke.make_backup_target_available(root)
@@ -1917,6 +1916,38 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[0].args[0][:6],
                              ["docker", "compose", "-f", "docker-compose.yml",
                               "-f", "docker-compose.unavailable-backup.yml"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(smoke, "run") as run:
+                smoke.install_backup_secrets(root)
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0700",
+                 str(root / "config" / "backup-secrets")],
+                ["sudo", "install", "-m", "0600", "-o", "0", "-g", "0",
+                 str(root / "backup-passphrase.tmp"), str(root / "config" / "backup-secrets" / "backup-passphrase")],
+            ])
+            self.assertFalse((root / "backup-passphrase.tmp").exists(),
+                             "the staging copy must not survive the install")
+
+    def test_backup_secrets_bootstrap_precedes_seeding_and_the_overlay_joins_after(self):
+        import inspect
+
+        smoke = self.load_smoke()
+        source = inspect.getsource(smoke.unavailable_backup_storage)
+        # The secrets bootstrap must run while the deployment tree is still the
+        # invoking user's (before the released writers harden ./config), the
+        # seed phase must not see the scheduler, and the overlay must join the
+        # compose chain only after seeding (v0.22.2 has no scheduler module).
+        self.assertIn("install_backup_secrets(root)", source)
+        self.assertLess(source.index("install_backup_secrets(root)"),
+                        source.index("seed_previous_release(deployment, args)"))
+        self.assertLess(source.index("seed_previous_release(deployment, args)"),
+                        source.index('deployment.compose("stop", *SERVICES)'))
+        self.assertLess(source.index('deployment.compose("stop", *SERVICES)'),
+                        source.index("install_backup_scheduler_with_target(deployment)"))
+        self.assertNotIn("install_backup_scheduler_with_target", source[:source.index("seed_previous_release")])
+        self.assertNotIn("UNAVAILABLE_BACKUP_FILES", inspect.getsource(smoke.install_backup_secrets))
+        self.assertNotIn("backup-secrets", inspect.getsource(smoke.install_backup_scheduler_with_target))
 
     def test_unavailable_backup_cli_cleans_up_on_both_success_and_qualification_failure(self):
         smoke = self.load_smoke()

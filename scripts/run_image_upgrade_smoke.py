@@ -1214,6 +1214,23 @@ BACKUP_SCHEDULER_OVERLAY = {
 }
 
 
+def install_backup_secrets(root: Path) -> None:
+    """Create the scheduler's private passphrase before the released writers run.
+
+    prepare_root leaves ./config root-owned, and the seeded v0.22.2 containers
+    harden it further while they run, so this must happen before seeding, as
+    root. The value is synthetic and exists only at run time.
+    """
+    secrets = root / "config" / "backup-secrets"
+    run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0700", str(secrets)])
+    temporary = root / "backup-passphrase.tmp"
+    temporary.write_text(uuid.uuid4().hex + "\n", encoding="ascii")
+    temporary.chmod(0o600)
+    run(["sudo", "install", "-m", "0600", "-o", "0", "-g", "0",
+         str(temporary), str(secrets / "backup-passphrase")])
+    temporary.unlink()
+
+
 def install_backup_scheduler_with_target(deployment: Deployment) -> None:
     """Add the candidate's backup scheduler service with one available target."""
     root = deployment.root
@@ -1226,12 +1243,6 @@ def install_backup_scheduler_with_target(deployment: Deployment) -> None:
                        ("backup-api", "2750"), ("backup-targets", "0755")):
         run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", mode, str(root / name)])
     run(["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets" / "remote")])
-    # A private synthetic passphrase file; the value exists only at run time.
-    secrets = root / "config" / "backup-secrets"
-    secrets.mkdir(parents=True, exist_ok=True, mode=0o700)
-    passphrase = secrets / "backup-passphrase"
-    passphrase.write_text(uuid.uuid4().hex + "\n", encoding="ascii")
-    passphrase.chmod(0o600)
     deployment.files = UNAVAILABLE_BACKUP_FILES
 
 
@@ -1362,6 +1373,9 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
+    # The scheduler's config-side state exists before the released writers
+    # harden ./config; the seed phase runs without the scheduler overlay.
+    install_backup_secrets(root)
     before_ui, before_history, seeded = seed_previous_release(deployment, args)
     deployment.compose("stop", *SERVICES)
 
