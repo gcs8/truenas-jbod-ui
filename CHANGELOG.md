@@ -54,6 +54,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Mapping and SAS-alias saves and writability probes reported capacity failures
   without permission advice or private response details; SQLite open failures
   on read-only filesystems retained the read-only diagnosis (#1024).
+- Restored pool and vdev labels for SSH-only TrueNAS CORE bays through explicit
+  multipath consumer ownership and provider GPTIDs, while leaving ambiguous or
+  conflicting attribution unknown and preserving disk identity (#1022).
 - History startup diagnosed full volumes and exhausted inodes with a space or
   inode recovery remedy, while retaining ownership remedies for permissions (#1020).
 - Opening-view requests bounded scoring waits, kept persistence and collection

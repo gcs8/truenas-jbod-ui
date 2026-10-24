@@ -24612,6 +24612,303 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
                 # A device node is not a stable identity; it is not shown as one.
                 self.assertNotEqual(slot.gptid, f"/dev/{slot.device_name}p2")
 
+    @staticmethod
+    def _core_ssh_only_gptid_multipath_outputs(ses_consumer: str = "da0") -> dict[str, str]:
+        from tests import core_ses_fixtures as fx
+
+        # Invented CORE evidence: SES names a consumer, but only the geom's
+        # partition has a GPT label. Even -LP retains that GPTID path.
+        geoms = []
+        for name, active, passive in (("disk73", "da0", "da1"), ("disk74", "da2", "da3")):
+            geoms.append(
+                f"Geom name: {name}\n"
+                "Type: AUTOMATIC\nMode: Active/Passive\nState: OPTIMAL\n"
+                f"Providers:\n1. Name: multipath/{name}\n   State: OPTIMAL\n"
+                f"Consumers:\n1. Name: {active}\n   State: ACTIVE\n"
+                f"2. Name: {passive}\n   State: PASSIVE\n"
+            )
+        return {
+            "sesutil map": fx.sesutil_map(
+                ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {0: ses_consumer, 1: "da9"}),
+            ),
+            "gmultipath list": "\n".join(geoms),
+            "glabel status": (
+                "Name  Status  Components\n"
+                "gptid/aaaa0073-0000-4000-8000-000000000073  N/A  multipath/disk73p2\n"
+                "gptid/aaaa0074-0000-4000-8000-000000000074  N/A  multipath/disk74p2\n"
+            ),
+            "zpool status -gP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  33330000000000000001     ONLINE       0     0     0\n"
+                "\t    33330000000000000073   ONLINE       0     0     0\n"
+                "\t    33330000000000000074   ONLINE       0     0     0\n\n"
+                "errors: No known data errors\n"
+            ),
+            "zpool status -LP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  mirror-0                 ONLINE       0     0     0\n"
+                "\t    /dev/gptid/aaaa0073-0000-4000-8000-000000000073  ONLINE  0  0  0\n"
+                "\t    /dev/gptid/aaaa0074-0000-4000-8000-000000000074  ONLINE  0  0  0\n\n"
+                "errors: No known data errors\n"
+            ),
+        }
+
+    async def test_core_ssh_only_consumer_joins_pool_vdev_through_geom_gptid(self) -> None:
+        for consumer in ("da0", "da1"):
+            with self.subTest(consumer=consumer), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs(consumer)
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                gptid = "gptid/aaaa0073-0000-4000-8000-000000000073"
+                self.assertEqual(parsed.glabel.device_to_gptid["multipath/disk73"], gptid)
+                self.assertNotIn(consumer, parsed.glabel.device_to_gptid)
+                self.assertNotIn(consumer, parsed.zpool_members)
+                self.assertNotIn(gptid, parsed.zpool_members)
+                self.assertNotIn(consumer, parsed.zpool_device_members)
+                self.assertEqual(parsed.zpool_device_members[gptid].vdev_name, "mirror-0")
+
+                service = self._core_ssh_only_service(temp_dir, outputs)
+                snapshot = await service.get_snapshot(force_refresh=True)
+                self.assertFalse(snapshot.sources["api"].ok)
+                self.assertTrue(snapshot.sources["ssh"].ok)
+                self.assertEqual(snapshot.summary.source_disk_count, 0)
+                by_device = {slot.device_name: slot for slot in snapshot.slots if slot.device_name}
+                self.assertEqual(set(by_device), {consumer, "da9"})
+                self.assertIsNone(by_device["da9"].pool_name)
+                self.assertIsNone(by_device["da9"].vdev_name)
+                self.assertIsNone(by_device["da9"].vdev_class)
+                slot = by_device[consumer]
+                self.assertEqual(slot.mapping_source, "device-name")
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_name, slot.vdev_class),
+                    ("synthpool", "mirror-0", "data"),
+                )
+
+    async def test_core_ssh_only_ambiguous_geom_consumer_keeps_pool_unknown(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs()
+                first, second = outputs["gmultipath list"].split("\nGeom name: disk74", 1)
+                second = "Geom name: disk74" + second + "3. Name: da0\n   State: PASSIVE\n"
+                outputs["gmultipath list"] = "\n".join((second, first) if reverse else (first, second))
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                self.assertEqual(
+                    {info.name for info in parsed.multipath_info.values()
+                     if any(consumer.device_name == "da0" for consumer in info.consumers)},
+                    {"disk73", "disk74"},
+                )
+                service = self._core_ssh_only_service(temp_dir, outputs)
+                snapshot = await service.get_snapshot(force_refresh=True)
+                self.assertFalse(snapshot.sources["api"].ok)
+                self.assertEqual(snapshot.summary.source_disk_count, 0)
+                by_device = {slot.device_name: slot for slot in snapshot.slots if slot.device_name}
+                self.assertEqual(set(by_device), {"da0", "da9"})
+                for slot in by_device.values():
+                    self.assertIsNone(slot.pool_name)
+                    self.assertIsNone(slot.vdev_name)
+                    self.assertIsNone(slot.vdev_class)
+                    self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_unclaimed_consumer_cannot_borrow_a_camcontrol_peer_pool(self) -> None:
+        outputs = self._core_ssh_only_gptid_multipath_outputs("da73")
+        outputs["camcontrol devlist"] = (
+            "<SYNTHETIC DISK 1.0> at scbus0 target 0 lun 0 (da73,da0)\n"
+        )
+        parsed = parse_ssh_outputs(outputs, 24, None)
+        self.assertIn("da0", parsed.camcontrol_peer_devices["da73"])
+        self.assertNotIn("da73", InventoryService._index_multipath_consumers(parsed))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+        placed = [slot for slot in snapshot.slots if slot.device_name]
+        self.assertEqual({slot.device_name for slot in placed}, {"da73", "da9"})
+        for slot in placed:
+            self.assertIsNone(slot.pool_name)
+            self.assertIsNone(slot.vdev_name)
+            self.assertIsNone(slot.vdev_class)
+            self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_conflicting_provider_and_gptid_pools_stay_unknown(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs()
+                provider_pool = (
+                    "  pool: otherpool\n state: ONLINE\nconfig:\n\n"
+                    "\tNAME                       STATE     READ WRITE CKSUM\n"
+                    "\totherpool                  ONLINE       0     0     0\n"
+                    "\t  mirror-1                 ONLINE       0     0     0\n"
+                    "\t    /dev/multipath/disk73p2 ONLINE       0     0     0\n\n"
+                    "errors: No known data errors\n"
+                )
+                parts = (provider_pool, outputs["zpool status -LP"])
+                outputs["zpool status -LP"] = "\n".join(parts if reverse else reversed(parts))
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                self.assertEqual(parsed.zpool_device_members["multipath/disk73"].pool_name, "otherpool")
+                gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                self.assertEqual(parsed.zpool_device_members[gptid].pool_name, "synthpool")
+                snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+                for slot in snapshot.slots:
+                    self.assertIsNone(slot.pool_name)
+                    self.assertIsNone(slot.vdev_name)
+                    self.assertIsNone(slot.vdev_class)
+                    self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_direct_device_pool_precedes_geom_inference(self) -> None:
+        outputs = self._core_ssh_only_gptid_multipath_outputs()
+        outputs["zpool status -LP"] += (
+            "\n  pool: directpool\n state: ONLINE\nconfig:\n\n"
+            "\tNAME                       STATE     READ WRITE CKSUM\n"
+            "\tdirectpool                 ONLINE       0     0     0\n"
+            "\t  mirror-9                 ONLINE       0     0     0\n"
+            "\t    /dev/da0p2             ONLINE       0     0     0\n\n"
+            "errors: No known data errors\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+        slot = next(slot for slot in snapshot.slots if slot.device_name == "da0")
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), ("directpool", "mirror-9", "data"))
+        self.assertIsNone(slot.gptid)
+
+    def test_core_no_record_geom_pool_inference_is_core_only_and_never_walks_peers(self) -> None:
+        for platform in ("scale", "linux", "quantastor", "esxi"):
+            with self.subTest(platform=platform):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                service = self._bare_service(platform)
+                self.assertIsNone(service._lookup_zpool_member(None, "da0", None, parsed, {}))
+        service = self._bare_service("core")
+        parsed.camcontrol_peer_devices = {"da73": ["da0"]}
+        self.assertIsNone(service._lookup_zpool_member(None, "da73", None, parsed, {}))
+        # Even an ambiguous direct claim cannot be recovered through a unique peer.
+        parsed.multipath_info["multipath/disk74"].consumers.append(
+            copy.deepcopy(parsed.multipath_info["multipath/disk73"].consumers[0])
+        )
+        parsed.camcontrol_peer_devices = {"da0": ["da1"]}
+        self.assertIsNone(InventoryService._index_multipath_consumers(parsed)["da0"])
+        self.assertIsNone(service._lookup_zpool_member(None, "da0", None, parsed, {}))
+
+    def test_core_no_record_geom_pool_inference_normalizes_and_discards_raw_identity(self) -> None:
+        parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+        service = self._bare_service("core")
+        gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+        original = parsed.zpool_device_members[gptid]
+        provider_member = copy.deepcopy(original)
+        provider_member.raw_name = "multipath/disk73p2"
+        provider_member.raw_path = "/dev/multipath/disk73p2"
+        parsed.zpool_members["multipath/disk73"] = provider_member
+        member = service._lookup_zpool_member(None, "/dev/da1p2", None, parsed, {})
+        self.assertIsNotNone(member)
+        self.assertEqual((member.pool_name, member.vdev_name, member.vdev_class), ("synthpool", "mirror-0", "data"))
+        self.assertEqual((member.raw_name, member.raw_path), ("", None))
+        self.assertEqual(original.raw_path, f"/dev/{gptid}")
+        self.assertEqual(provider_member.raw_path, "/dev/multipath/disk73p2")
+
+    def test_core_no_record_geom_pool_inference_refuses_conflicting_membership_authorities(self) -> None:
+        # Contradictory aliases across normalized maps need a narrow unit control.
+        for source in ("zpool_members", "api", "zpool_device_members"):
+            for field, value in (
+                ("pool_name", "otherpool"), ("vdev_name", "mirror-9"),
+                ("vdev_class", "special"), ("health", "FAULTED"),
+                ("topology_label", "otherpool > mirror-9"),
+            ):
+                with self.subTest(source=source, field=field):
+                    parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                    gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                    conflicting = copy.deepcopy(parsed.zpool_device_members[gptid])
+                    setattr(conflicting, field, value)
+                    api = {}
+                    target = api if source == "api" else getattr(parsed, source)
+                    target["multipath/disk73"] = conflicting
+                    self.assertIsNone(self._bare_service("core")._lookup_zpool_member(None, "da0", None, parsed, api))
+
+    def test_core_no_record_geom_pool_inference_preserves_direct_api_and_record_boundaries(self) -> None:
+        service = self._bare_service("core")
+        for source in ("zpool_members", "api", "zpool_device_members"):
+            with self.subTest(source=source):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                direct = copy.deepcopy(parsed.zpool_device_members[gptid])
+                direct.pool_name = "directpool"
+                api = {}
+                target = api if source == "api" else getattr(parsed, source)
+                target["da0"] = direct
+                member = service._lookup_zpool_member(None, "da0", None, parsed, api)
+                self.assertEqual(member.pool_name, "directpool")
+                if source != "zpool_device_members":
+                    self.assertIs(member, direct)
+        parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+        record = service._build_disk_records(
+            [{"name": "da0", "devname": "da0", "serial": "SANITIZED-POOL-BOUNDARY"}],
+            ParsedSSHData(), {}, {},
+        )[0]
+        self.assertIsNone(service._lookup_zpool_member(record, "da0", None, parsed, {}))
+
+    async def test_core_record_bay_peer_cannot_enable_geom_pool_inference(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        service = self._bare_service("core")
+        disk = service._build_disk_records([{"name": "da9"}], ParsedSSHData(), {}, {})[0]
+        self.assertEqual((disk.device_name, disk.smart_devices, disk.lookup_keys), ("da9", ["da9"], {"da9"}))
+        self.assertIsNone(disk.pool_name)
+        raw = {"device_names": ["da9", "da0"], "status": "OK"}
+        peers = inventory_module._bay_peer_devices(raw, disk, {"da9": disk})
+        self.assertEqual(peers, ["da0"])
+        for source in (None, "zpool_members", "api", "zpool_device_members"):
+            with self.subTest(source=source):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                self.assertIsNone(service._lookup_zpool_member(disk, "da9", None, parsed, {}))
+                inferred = service._lookup_zpool_member(None, "da0", None, parsed, {})
+                self.assertEqual((inferred.pool_name, inferred.vdev_name, inferred.vdev_class),
+                                 ("synthpool", "mirror-0", "data"))
+                api = {}
+                if source:
+                    direct = copy.deepcopy(inferred)
+                    direct.pool_name = "directpool"
+                    target = api if source == "api" else getattr(parsed, source)
+                    target["da0"] = direct
+                kwargs = dict(
+                    slot=0, row_index=0, column_index=0, enclosure_meta={"id": fx.FRONT_24_ID},
+                    raw_slot_status=raw, disk=disk, mapping=None, ssh_data=parsed,
+                    api_topology_members=api, api_enclosure_ids=set(),
+                )
+                baseline = service._build_slot_view(**kwargs)
+                slot = service._build_slot_view(**kwargs, bay_peer_devices=peers)
+                self.assertEqual(
+                    (slot.device_name, slot.smart_device_names, slot.serial, slot.gptid,
+                     slot.persistent_id_label, slot.multipath),
+                    (baseline.device_name, baseline.smart_device_names, baseline.serial, baseline.gptid,
+                     baseline.persistent_id_label, baseline.multipath),
+                )
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_name, slot.vdev_class),
+                    ("directpool", "mirror-0", "data") if source else (None, None, None),
+                )
+                if source is None:
+                    self.assertEqual(slot.model_dump(), baseline.model_dump())
+
+        # Also exercise the real peer selection and slot builder through a snapshot.
+        outputs = self._core_ssh_only_gptid_multipath_outputs()
+        outputs["sesutil map"] = fx.sesutil_map(
+            ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {0: "da9,da0"}),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_data = TrueNASRawData(
+                enclosures=[], disks=[{"name": "da9"}], pools=[],
+                disk_temperatures={}, smart_test_results=[],
+            )
+            service = self._core_service(temp_dir, raw_data)
+            bundle = service._get_inventory_source_bundle.return_value
+            bundle.ssh_outputs = outputs
+            bundle.ssh_collected = True
+            snapshot = await service.get_snapshot(force_refresh=True)
+        self.assertEqual(snapshot.summary.source_disk_count, 1)
+        slot = next(slot for slot in snapshot.slots if slot.device_name == "da9")
+        self.assertEqual(set(slot.raw_status["device_names"]), {"da9", "da0"})
+        self.assertEqual((slot.device_name, slot.smart_device_names), ("da9", ["da9"]))
+        self.assertEqual((slot.serial, slot.gptid, slot.persistent_id_label, slot.multipath), (None, None, None, None))
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), (None, None, None))
+
     async def test_core_page_with_the_old_combined_id_in_view_order_still_renders(self) -> None:
         from tests import core_ses_fixtures as fx
 
