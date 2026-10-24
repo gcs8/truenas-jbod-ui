@@ -1408,7 +1408,7 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
     record_backup_phase_change(deployment, "upgrade-smoke-backup-after")
     recovered = wait_for_backup_target_status(root, want_ok=True, after=refused_record["at"])
     check_backup_target_recovery(recovered)
-    readback = check_backup_target_readback(root)
+    check_backup_target_readback(root)
 
     check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
     after = deployment.exec_python("enclosure-history", READ_HISTORY)
