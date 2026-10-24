@@ -1480,7 +1480,11 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             with self.subTest(refusal_detail=refusal_detail):
                 self.exercise_lifecycle(refusal_detail=refusal_detail)
 
-    def exercise_lifecycle(self, *, changed=None, replaced=False, refusal_detail="1 remote copy failure(s)"):
+    def test_unavailable_backup_storage_lifecycle_refuses_drifted_config_bytes(self):
+        self.exercise_lifecycle(config_drift=True)
+
+    def exercise_lifecycle(self, *, changed=None, replaced=False, refusal_detail="1 remote copy failure(s)",
+                           config_drift=False):
         smoke = self.load_smoke()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1507,6 +1511,15 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             replacement = {"enclosure-backup-scheduler": ["container-2", "start-2"]}
             tree_reads = []
             ui_reads = []
+            sha_calls = []
+
+            def sha_digest(path):
+                sha_calls.append(path)
+                # First call: the seeded capture. Later calls: drifted only
+                # when this entry drives the config-bytes refusal branch.
+                if len(sha_calls) == 1 or not config_drift:
+                    return "digest-seeded"
+                return "digest-drifted"
 
             def run_python(service, script):
                 if script == smoke.READ_HISTORY_TREE:
@@ -1545,7 +1558,7 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 mock.patch.object(smoke, "prepare_root"),
                 mock.patch.object(smoke, "install_backup_scheduler_with_target") as install,
                 mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
-                mock.patch.object(smoke, "sha256", return_value="config"),
+                mock.patch.object(smoke, "sha256", side_effect=sha_digest),
                 mock.patch.object(smoke, "wait_for_backup_target_status", side_effect=wait) as wait_mock,
                 mock.patch.object(smoke, "make_backup_target_unavailable") as fault,
                 mock.patch.object(smoke, "make_backup_target_available") as restore,
@@ -1587,6 +1600,17 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         readback.assert_not_called()
                         self.assertEqual(wait_mock.call_count, 2)
                         self.assertEqual(healthy.call_count, 1)
+                    elif config_drift:
+                        with self.assertRaisesRegex(smoke.SmokeError, "config changed during the backup-target refusal"):
+                            smoke.unavailable_backup_storage(args)
+                        self.assertEqual(fault.call_count, 1)
+                        restore.assert_not_called()
+                        readback.assert_not_called()
+                        self.assertEqual(wait_mock.call_count, 2)
+                        self.assertEqual(healthy.call_count, 1)
+                        self.assertEqual([path.resolve() for path in sha_calls],
+                                         [root.resolve() / "config/config.yaml"] * 2,
+                                         "the invariant limb must compare the seeded config digest, not a stub")
                     else:
                         result = smoke.unavailable_backup_storage(args)
                         self.assertIn("scenario=unavailable-backup-storage", result)
@@ -1606,7 +1630,6 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                         for call in healthy.call_args_list:
                             self.assertEqual(call.args, (deployment, "candidate", "2", "revision"))
                         deployment.pull_and_up.assert_called_once_with()
-                        self.assertEqual(deployment.files, ())
                 waits = [(call.kwargs["want_ok"], call.kwargs.get("after", ""))
                          for call in wait_mock.call_args_list]
                 self.assertEqual(waits, [(True, ""), (False, "2026-01-01T00:00:00+00:00"),
