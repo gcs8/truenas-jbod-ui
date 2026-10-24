@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.services.storage_writability import (
@@ -167,6 +168,74 @@ class SqliteUnwritableClassificationTests(unittest.TestCase):
                 self.assertFalse(is_unwritable_error(error))
 
 
+class HistoryCapacityFailureTests(unittest.TestCase):
+    def test_capacity_failures_name_the_volume_and_space_or_inode_recovery(self) -> None:
+        from history_service.startup import recorded_startup_failure
+
+        for error, space in (
+            (OSError(errno.ENOSPC, "No space left on device"), None),
+            (sqlite3.OperationalError("database or disk is full"), None),
+            (sqlite3.OperationalError("unable to open database file"),
+             SimpleNamespace(f_bavail=1024, f_files=256, f_favail=0)),
+            (sqlite3.OperationalError("unable to open database file"),
+             SimpleNamespace(f_bavail=0, f_files=256, f_favail=128)),
+        ):
+            with self.subTest(error=str(error), space=space):
+                def factory() -> object:
+                    raise error
+
+                with patch("app.services.storage_writability.os.statvfs", return_value=space, create=True):
+                    with self.assertRaises((HistoryStartupError, OSError, sqlite3.OperationalError)) as raised:
+                        open_history_store_with_retries(factory, directory="/app/history", attempts=1)
+                self.assertIsInstance(raised.exception, HistoryStartupError)
+                reason = raised.exception.reason
+                self.assertIn("filesystem is full", reason)
+                self.assertIn("free space or inodes", reason)
+                self.assertIn("volume containing ./history", reason)
+                self.assertNotIn("chown", reason)
+                self.assertIs(raised.exception.__cause__, error)
+                self.assertEqual(recorded_startup_failure(), reason)
+
+    def test_explicit_permission_errors_keep_the_exact_ownership_remedy(self) -> None:
+        for error in (
+            PermissionError(errno.EACCES, "denied"),
+            PermissionError(errno.EPERM, "denied"),
+            OSError(errno.EROFS, "read-only filesystem"),
+            sqlite3.OperationalError("attempt to write a readonly database"),
+        ):
+            with self.subTest(error=str(error)):
+                def factory() -> object:
+                    raise error
+
+                with (
+                    patch("app.services.storage_writability.os.statvfs", create=True) as statvfs,
+                    patch("app.services.storage_writability._running_identity", return_value=(10001, 10001)),
+                    patch("app.services.storage_writability.Path.stat", return_value=SimpleNamespace(st_uid=0)),
+                ):
+                    with self.assertRaises(HistoryStartupError) as raised:
+                        open_history_store_with_retries(factory, directory="/app/history", attempts=1)
+                self.assertEqual(raised.exception.reason,
+                                 "Cannot write to /app/history (owned by uid 0, running as uid 10001). "
+                                 "On the Docker host run: sudo chown -R 10001:10001 ./history")
+                statvfs.assert_not_called()
+
+    def test_sqlite_open_failure_needs_capacity_evidence_before_replacing_ownership(self) -> None:
+        def factory() -> object:
+            raise sqlite3.OperationalError("unable to open database file")
+
+        for probe in (
+            {"return_value": SimpleNamespace(f_bavail=1024, f_files=256, f_favail=128)},
+            {"return_value": SimpleNamespace(f_bavail=1024, f_files=0, f_favail=0)},
+            {"side_effect": OSError(errno.EACCES, "cannot inspect volume")},
+            {"new": None},
+        ):
+            with self.subTest(probe=probe):
+                with patch("app.services.storage_writability.os.statvfs", create=True, **probe):
+                    with self.assertRaises(HistoryStartupError) as raised:
+                        open_history_store_with_retries(factory, directory="/app/history", attempts=1)
+                self.assertEqual(raised.exception.reason, describe_unwritable_directory("/app/history"))
+
+
 class HostRepairInstructionTests(unittest.TestCase):
     """The operator runs the repair on the host, so it must name a host path."""
 
@@ -232,6 +301,31 @@ class HistoryRuntimeStartupTests(unittest.TestCase):
         assert reason is not None
         self.assertIn("Cannot write to", reason)
         self.assertIsNotNone(settings, "a default settings object keeps the app importable")
+
+    def test_capacity_failure_stays_up_and_reaches_health_with_its_recovery_remedy(self) -> None:
+        import asyncio
+        import json
+        from history_service import main as history_main
+
+        with patch.object(history_main, "get_history_settings", side_effect=OSError(errno.ENOSPC, "full")):
+            with self.assertLogs("history_service.startup", level="WARNING"):
+                settings, store, reason = history_main.load_history_runtime(
+                    attempts=1, initial_backoff_seconds=0.0)
+        self.assertIsNone(store)
+        self.assertIsNotNone(settings)
+        self.assertIn("filesystem is full", reason)
+        self.assertIn("free space or inodes", reason)
+        self.assertNotIn("chown", reason)
+        with (
+            patch.object(history_main, "startup_failure_reason", reason),
+            patch.object(history_main, "collector", None),
+            patch.object(history_main, "store", None),
+        ):
+            response = asyncio.run(history_main.healthz())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.body), {
+            "status": "down", "detail": history_main.HISTORY_UNAVAILABLE_DETAIL, "reason": reason,
+        })
 
 
 class MappingStoreUnwritableTests(unittest.TestCase):

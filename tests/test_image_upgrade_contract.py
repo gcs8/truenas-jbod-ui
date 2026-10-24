@@ -489,7 +489,8 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         # The only ownership change is the documented one-time step that adopts
         # the overlay, and it runs in prepare_root, before the first start.
         prep = source.split("HARDENED_OWNERSHIP_PREP = (", 1)[1].split("\n)\n", 1)[0]
-        self.assertEqual(source.count("chown"), prep.count("chown"))
+        # A diagnostic may reject chown without executing an ownership repair.
+        self.assertEqual(source.count("sudo chown "), prep.count("sudo chown "))
         self.assertIn("HARDENED_OWNERSHIP_PREP", inspect.getsource(smoke.prepare_root))
         calls = []
         deployment = smoke.Deployment(Path("/nonexistent"))
@@ -1009,6 +1010,411 @@ class ReadOnlyStateScenarioTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[1].args[0], ["sudo", "rm", "-rf", str(root)])
 
 
+class EnospcStateScenarioTests(unittest.TestCase):
+    """#463: maintained driver regressions, not real-container evidence."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def test_enospc_state_is_dispatched_and_invoked_in_the_existing_report_only_job(self):
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        self.assertIn("enospc-state", smoke.SCENARIOS)
+        with mock.patch.object(smoke, "enospc_state", return_value="qualified") as scenario:
+            args = SimpleNamespace(scenario="enospc-state")
+            self.assertEqual(smoke.smoke(args), "qualified")
+            scenario.assert_called_once_with(args)
+        workflow = yaml.safe_load((self.ROOT / ".github/workflows/ci.yml").read_text())
+        job = workflow["jobs"]["image-upgrade-scenarios"]
+        runs = [step["run"] for step in job["steps"] if "--scenario enospc-state" in step.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        for argument in (
+            '--root "$RUNNER_TEMP/image-upgrade-enospc"',
+            '--compose-fixture tests/fixtures/compose/v0.22.2.yml',
+            '--config-fixture tests/fixtures/ci-smoke-config.yaml',
+            '--previous-image "$PREVIOUS_IMAGE"',
+            '--previous-version "$PREVIOUS_VERSION"',
+            '--candidate-image "$CANDIDATE_IMAGE"',
+            '--candidate-revision "$GITHUB_SHA"',
+        ):
+            self.assertIn(argument, runs[0])
+        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertNotIn("--scenario enospc-state", str(workflow["jobs"]["image-upgrade-smoke"]))
+
+    def scenario_args(self, root):
+        from types import SimpleNamespace
+        return SimpleNamespace(root=root, compose_fixture=Path("compose-fixture"),
+                               config_fixture=Path("config-fixture"), previous_image="previous",
+                               previous_version="1", candidate_image="candidate", candidate_version="2",
+                               candidate_revision="revision", scenario="enospc-state")
+
+    def test_enospc_lifecycle_preserves_bytes_and_recovers_only_after_explicit_freeing(self):
+        self.exercise_lifecycle()
+
+    def test_enospc_lifecycle_refuses_lost_replaced_or_fresh_history(self):
+        for changed in ({}, {"history.db": [0, "fresh"]}, {"history.db.broken-1": [20, "original"]}):
+            with self.subTest(changed=changed):
+                self.exercise_lifecycle(changed=changed)
+
+    def test_enospc_lifecycle_refuses_a_replaced_container_even_without_a_restart_count(self):
+        self.exercise_lifecycle(replaced=True)
+
+    def test_enospc_recovery_rejects_invalid_integrity_or_lost_counts(self):
+        for recovered in ({"integrity": "corrupt", "counts": {
+                "slot_state_current": 3, "slot_events": 3, "metric_samples": 12}},
+                {"integrity": "ok", "counts": {}}):
+            with self.subTest(recovered=recovered):
+                self.exercise_lifecycle(recovered=recovered)
+
+    def test_enospc_startup_wait_has_fault_specific_bounded_diagnostics(self):
+        smoke = self.load_smoke()
+        with (mock.patch.object(smoke, "get_json", side_effect=OSError("not listening")),
+              mock.patch.object(smoke.time, "monotonic", side_effect=[0, 1, 60]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            with self.assertRaisesRegex(smoke.SmokeError, "ENOSPC history startup.*within 60 seconds"):
+                smoke.wait_for_history_liveness("2", fault="ENOSPC")
+            sleep.assert_called_once_with(1)
+        with mock.patch.object(smoke, "get_json", return_value=(200, {"status": "ok", "version": "1"})):
+            with self.assertRaisesRegex(smoke.SmokeError, "ENOSPC history /livez.*live candidate"):
+                smoke.wait_for_history_liveness("2", fault="ENOSPC")
+        with mock.patch.object(smoke, "get_json", return_value=(200, {"status": "ok", "version": "2"})):
+            smoke.wait_for_history_liveness("2", fault="ENOSPC")
+
+    def exercise_lifecycle(self, *, changed=None, replaced=False, recovered=None):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.scenario_args(root)
+            deployment = mock.Mock(spec=smoke.Deployment)
+            deployment.files = ()
+            deployment.root = root
+            sequence = mock.Mock()
+            sequence.attach_mock(deployment.run_python, "run_python")
+            sequence.attach_mock(deployment.pull_and_up, "pull_and_up")
+            before = {"history.db": [20, "original"]}
+            ui = {"mappings": [["shelf-a", 1, "SYNTH-0001", "synthetic"]]}
+            history = {"counts": {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12},
+                       "integrity": "ok"}
+            deployment.run_python.side_effect = lambda service, script: {
+                smoke.READ_HISTORY_TREE: before,
+                smoke.FILL_ENOSPC_HISTORY: {"errno": 28},
+                smoke.CLEAR_ENOSPC_HISTORY: {"ok": True},
+            }[script]
+            written = False
+            recovered_history = history if recovered is None else recovered
+
+            def read(service, script):
+                nonlocal written
+                if script == smoke.READ_HISTORY_TREE:
+                    return before if changed is None else changed
+                if script == smoke.ENOSPC_WRITE_PROBE:
+                    return {"errno": 28}
+                if script == smoke.seed_script(smoke.SEED_HISTORY, (4,), metrics_per_slot=1):
+                    written = True
+                    return {"ok": True}
+                if script == smoke.READ_HISTORY:
+                    return ({"integrity": "ok", "counts": {
+                        "slot_state_current": 4, "slot_events": 4, "metric_samples": 13,
+                    }} if written else recovered_history)
+                self.assertEqual((service, script), ("enclosure-ui", smoke.READ_UI))
+                return ui
+
+            deployment.exec_python.side_effect = read
+            with (
+                mock.patch.object(smoke, "Deployment", return_value=deployment),
+                mock.patch.object(smoke, "prepare_root"),
+                mock.patch.object(smoke, "install_enospc_history_mount") as install,
+                mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "sha256", return_value="config"),
+                mock.patch.object(smoke, "wait_for_history_liveness") as wait,
+                mock.patch.object(smoke, "check_enospc_runtime", return_value={"started": "unchanged"},
+                                  side_effect=[{"started": "unchanged"}, {"started": "replacement"}] + [{"started": "unchanged"}] * 9
+                                  if replaced else None) as check,
+                mock.patch.object(smoke, "check_runtime") as healthy,
+                mock.patch.object(smoke, "history_api_view", side_effect=[
+                    smoke.expected_history_view({1: 4, 2: 4, 3: 4}),
+                    smoke.expected_history_view({1: 4, 2: 4, 3: 4, 4: 1})]),
+                mock.patch.object(smoke.time, "sleep") as sleep,
+            ):
+                if changed is not None or replaced:
+                    reason = "container identity changed" if replaced else "history bytes or entries changed"
+                    with self.assertRaisesRegex(smoke.SmokeError, reason):
+                        smoke.enospc_state(args)
+                    healthy.assert_not_called()
+                    deployment.pull_and_up.assert_not_called()
+                elif recovered is not None:
+                    with self.assertRaisesRegex(smoke.SmokeError, "writable recovery lost predecessor history"):
+                        smoke.enospc_state(args)
+                else:
+                    result = smoke.enospc_state(args)
+                    self.assertIn("scenario=enospc-state", result)
+                    self.assertIn("history_health=down", result)
+                    self.assertIn("history_bytes=unchanged", result)
+                    self.assertIn("writable_recovery=ok", result)
+                    self.assertEqual(check.call_count, 11)
+                    self.assertEqual(sleep.call_args_list, [mock.call(2)] * 10)
+                    install.assert_called_once_with(deployment)
+                    wait.assert_called_once_with("2", fault="ENOSPC")
+                    healthy.assert_called_once_with(deployment, "candidate", "2", "revision")
+                    deployment.pull_and_up.assert_called_once_with()
+                    self.assertEqual(deployment.files, ())
+                    self.assertLess(sequence.mock_calls.index(mock.call.run_python(
+                        "enclosure-history", smoke.CLEAR_ENOSPC_HISTORY)),
+                        sequence.mock_calls.index(mock.call.pull_and_up()))
+                deployment.set_image.assert_called_once_with("candidate")
+                calls = deployment.compose.call_args_list
+                self.assertEqual(calls[:3], [mock.call("stop", *smoke.SERVICES), mock.call("pull"),
+                                             mock.call("up", "-d")])
+                if changed is None and not replaced and recovered is None:
+                    self.assertEqual(calls[3:], [mock.call("stop", *smoke.SERVICES),
+                                                mock.call("rm", "-f", *smoke.SERVICES)])
+                    self.assertEqual(deployment.run_python.call_args_list, [
+                        mock.call("enclosure-history", smoke.FILL_ENOSPC_HISTORY),
+                        mock.call("enclosure-history", smoke.READ_HISTORY_TREE),
+                        mock.call("enclosure-history", smoke.CLEAR_ENOSPC_HISTORY),
+                    ])
+                    deployment.exec_python.assert_any_call("enclosure-history",
+                        smoke.seed_script(smoke.SEED_HISTORY, (4,), metrics_per_slot=1))
+                    self.assertEqual(deployment.exec_python.call_args_list[-1],
+                                     mock.call("enclosure-history", smoke.READ_HISTORY))
+
+    def test_enospc_runtime_distinguishes_local_refusal_from_liveness_or_remote_degradation(self):
+        import copy
+        import json
+        import sqlite3
+        from types import SimpleNamespace
+
+        from history_service.startup import HistoryStartupError, open_history_store_with_retries
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deployment = smoke.Deployment(root)
+            args = self.scenario_args(root)
+            baseline = {"State": {"Status": "running", "StartedAt": "start"}, "Image": "image-id",
+                        "RestartCount": 0, "Mounts": [{"Destination": "/app/history", "Source": str(root / "history"),
+                                                       "Type": "bind", "RW": True}]}
+            for fault in (None, "restart", "remounted", "wrong-source", "other-image", "exited",
+                          "healthy-history", "remote-degraded", "wrong-reason", "active-api", "wrong-version",
+                          "ownership-only", "missing-remedy", "chown-remedy", "missing-capacity-diagnosis",
+                          "wrong-remedy-volume", "missing-inode-remedy", "product-inode-full"):
+                with self.subTest(fault=fault):
+                    state = copy.deepcopy(baseline)
+                    responses = {
+                        f"http://127.0.0.1:{smoke.UI_PORT}/livez": (200, {"status": "ok", "version": "2"}),
+                        f"http://127.0.0.1:{smoke.UI_PORT}/healthz": (200, {"status": "ok"}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/livez": (200, {"status": "ok", "version": "2"}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz": (503, {
+                            "status": "down", "detail": "History storage is unavailable; see the service logs.",
+                            "reason": "Cannot write to /app/history because the filesystem is full. "
+                                      "On the Docker host, free space or inodes on the volume containing ./history, "
+                                      "then restart the history service."}),
+                        f"http://127.0.0.1:{smoke.HISTORY_PORT}/api/history/overview": (503, {
+                            "detail": "History storage is unavailable; see the service logs."}),
+                    }
+                    if fault == "restart":
+                        state["RestartCount"] = 1
+                    elif fault == "remounted":
+                        state["Mounts"][0]["RW"] = False
+                    elif fault == "wrong-source":
+                        state["Mounts"][0]["Source"] = str(root / "fresh-history")
+                    elif fault == "other-image":
+                        state["Image"] = "other"
+                    elif fault == "exited":
+                        state["State"]["Status"] = "exited"
+                    elif fault in {"healthy-history", "remote-degraded"}:
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"] = (
+                            200, {"status": "ok" if fault == "healthy-history" else "degraded"})
+                    elif fault == "wrong-reason":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] = "other failure"
+                    elif fault == "ownership-only":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] = (
+                            "Cannot write to /app/history (owned by uid 0, running as uid 10001). "
+                            "On the Docker host run: sudo chown -R 10001:10001 ./history")
+                    elif fault == "missing-remedy":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] = (
+                            "Cannot write to /app/history because the filesystem is full.")
+                    elif fault == "chown-remedy":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] += (
+                            " Run sudo chown -R 10001:10001 ./history.")
+                    elif fault in {"missing-capacity-diagnosis", "wrong-remedy-volume", "missing-inode-remedy"}:
+                        old, new = {
+                            "missing-capacity-diagnosis": ("filesystem is full", "storage is unavailable"),
+                            "wrong-remedy-volume": ("./history", "./data"),
+                            "missing-inode-remedy": ("free space or inodes", "free space"),
+                        }[fault]
+                        payload = responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]
+                        payload["reason"] = payload["reason"].replace(old, new)
+                    elif fault == "product-inode-full":
+                        error = sqlite3.OperationalError("unable to open database file")
+                        space = SimpleNamespace(f_bavail=1024, f_files=256, f_favail=0)
+                        with mock.patch("app.services.storage_writability.os.statvfs", return_value=space, create=True):
+                            with self.assertRaises(HistoryStartupError) as raised:
+                                open_history_store_with_retries(
+                                    mock.Mock(side_effect=error), directory="/app/history", attempts=1)
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/healthz"][1]["reason"] = raised.exception.reason
+                    elif fault == "active-api":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/api/history/overview"] = (200, {})
+                    elif fault == "wrong-version":
+                        responses[f"http://127.0.0.1:{smoke.HISTORY_PORT}/livez"][1]["version"] = "1"
+
+                    def run(command, **kwargs):
+                        if command[:3] == ["docker", "image", "inspect"]:
+                            return "revision" if "Labels" in command[4] else "image-id"
+                        return json.dumps(state)
+
+                    with (mock.patch.object(smoke, "run", side_effect=run),
+                          mock.patch.object(deployment, "compose", return_value="container"),
+                          mock.patch.object(smoke, "get_json", side_effect=lambda url, **kwargs: responses[url])):
+                        if fault in (None, "product-inode-full"):
+                            self.assertEqual(set(smoke.check_enospc_runtime(deployment, args)), set(smoke.SERVICES))
+                        else:
+                            with self.assertRaises(smoke.SmokeError):
+                                smoke.check_enospc_runtime(deployment, args)
+
+    def test_enospc_probes_hash_binary_bytes_and_require_enospc_not_permissions_or_erofs(self):
+        import contextlib
+        import errno
+        import io
+        import json
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "history.db").write_bytes(b"\xff\x00synthetic")
+
+            def execute(template):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    exec(compile(template.replace("/app/history", str(root)), "probe", "exec"), {})
+                return json.loads(output.getvalue())
+
+            before = execute(smoke.READ_HISTORY_TREE)
+            self.assertIn("history.db", before)
+            self.assertEqual(execute(smoke.READ_HISTORY_TREE), before)
+            (root / "history.db").write_bytes(b"\xfe\x00synthetic")
+            self.assertNotEqual(execute(smoke.READ_HISTORY_TREE), before)
+            with mock.patch("os.open", side_effect=OSError(errno.ENOSPC, "full filesystem")):
+                self.assertEqual(execute(smoke.ENOSPC_WRITE_PROBE), {"errno": errno.ENOSPC})
+            for number in (errno.EACCES, errno.EROFS):
+                with mock.patch("os.open", side_effect=OSError(number, "other fault")):
+                    with self.assertRaises(OSError):
+                        execute(smoke.ENOSPC_WRITE_PROBE)
+            with self.assertRaisesRegex(RuntimeError, "required history mount has free space"):
+                execute(smoke.ENOSPC_WRITE_PROBE)
+            self.assertEqual(set(root.iterdir()), {root / "history.db"})
+
+    def test_enospc_cli_cleans_up_on_both_success_and_qualification_failure(self):
+        smoke = self.load_smoke()
+        for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "docker-compose.yml").write_text("services: {}")
+                with mock.patch.object(smoke, "run"):
+                    smoke.install_enospc_history_mount(smoke.Deployment(root))
+                argv = ["--scenario", "enospc-state", "--root", str(root),
+                        "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
+                        "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
+                        "--candidate-version", "2", "--candidate-revision", "revision"]
+                with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
+                      mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                      mock.patch.object(smoke.os.path, "ismount", return_value=True),
+                      mock.patch("sys.stdout"), mock.patch("sys.stderr")):
+                    self.assertEqual(smoke.main(argv), 1 if failure else 0)
+                commands = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(commands[-3:], [
+                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.enospc.yml",
+                     "down", "--volumes", "--remove-orphans"],
+                    ["sudo", "umount", str(root / "history")], ["sudo", "rm", "-rf", str(root)],
+                ])
+
+    def test_enospc_fixture_is_bounded_and_cleanup_unmounts_before_removing_it(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docker-compose.yml").write_text("services: {}")
+            deployment = smoke.Deployment(root)
+            with mock.patch.object(smoke, "run") as run:
+                smoke.install_enospc_history_mount(deployment)
+            self.assertEqual(run.call_args_list, [mock.call([
+                "sudo", "mount", "-t", "tmpfs", "-o", "size=8m,nr_inodes=256", "tmpfs", str(root / "history")])])
+            self.assertEqual(deployment.files, ("docker-compose.yml", "docker-compose.enospc.yml"))
+            overlay = yaml.safe_load((root / "docker-compose.enospc.yml").read_text())
+            self.assertEqual(overlay, {"services": {"enclosure-history": {
+                "volumes": ["./history:/app/history:rw"],
+            }}})
+            with (mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                  mock.patch.object(smoke.os.path, "ismount", return_value=True)):
+                smoke.cleanup(root)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands, [
+                ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.enospc.yml",
+                 "down", "--volumes", "--remove-orphans"],
+                ["sudo", "umount", str(root / "history")], ["sudo", "rm", "-rf", str(root)],
+            ])
+            # A failed unmount must leave the root intact instead of traversing a live mount.
+            with (mock.patch.object(smoke.subprocess, "run", side_effect=[
+                    mock.Mock(returncode=0), mock.Mock(returncode=1), mock.Mock(returncode=0)]) as run,
+                  mock.patch.object(smoke.os.path, "ismount", return_value=True)):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.cleanup(root)
+                self.assertEqual(run.call_count, 2)
+
+    def test_enospc_fill_requires_a_small_filesystem_and_restores_only_its_filler(self):
+        import contextlib
+        import errno
+        import io
+        import json
+        import os
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retained = root / "history.db"
+            retained.write_bytes(b"\xff\x00synthetic")
+            open_file = os.open
+
+            def execute(script):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    exec(compile(script.replace("/app/history", str(root)), "probe", "exec"), {})
+                return json.loads(output.getvalue())
+
+            small = SimpleNamespace(f_frsize=4096, f_blocks=2048, f_files=256)
+            for oversized in (SimpleNamespace(f_frsize=4096, f_blocks=2049, f_files=256),
+                              SimpleNamespace(f_frsize=4096, f_blocks=2048, f_files=257)):
+                with mock.patch("os.statvfs", return_value=oversized):
+                    with self.assertRaisesRegex(RuntimeError, "bounded fixture"):
+                        execute(smoke.FILL_ENOSPC_HISTORY)
+                self.assertEqual(list(root.iterdir()), [retained])
+
+            def limited_open(path, *args, **kwargs):
+                if len(list(root.rglob("*"))) >= 5:
+                    raise OSError(errno.ENOSPC, "synthetic inode quota")
+                return open_file(path, *args, **kwargs)
+
+            with (mock.patch("os.statvfs", return_value=small),
+                  mock.patch("os.open", side_effect=limited_open)):
+                self.assertEqual(execute(smoke.FILL_ENOSPC_HISTORY), {"errno": errno.ENOSPC})
+            self.assertGreater(len(list(root.rglob("*"))), 1)
+            self.assertEqual(execute(smoke.CLEAR_ENOSPC_HISTORY), {"ok": True})
+            self.assertEqual(list(root.iterdir()), [retained])
+            self.assertEqual(retained.read_bytes(), b"\xff\x00synthetic")
+            for number in (errno.EROFS, errno.EACCES):
+                with (mock.patch("os.statvfs", return_value=small),
+                      mock.patch("os.open", side_effect=OSError(number, "other fault"))):
+                    with self.assertRaises(OSError):
+                        execute(smoke.FILL_ENOSPC_HISTORY)
+                execute(smoke.CLEAR_ENOSPC_HISTORY)
+            with mock.patch("os.statvfs", return_value=small):
+                with self.assertRaisesRegex(RuntimeError, "did not exhaust"):
+                    execute(smoke.FILL_ENOSPC_HISTORY)
+                execute(smoke.CLEAR_ENOSPC_HISTORY)
+
+
 class UpgradeScenarioContractTests(unittest.TestCase):
     """#399/#463: hardened, interrupted-migration and segmented-catalog upgrades."""
 
@@ -1032,8 +1438,10 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertEqual(len(hardened), 1)
         self.assertEqual(len(interrupted), 1)
         self.assertEqual(len(segmented), 1)
+        enospc = [command for command in runs if "--scenario enospc-state" in command]
+        self.assertEqual(len(enospc), 1)
         self.assertIn("--nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml", hardened[0])
-        for command in hardened + interrupted + segmented:
+        for command in hardened + interrupted + segmented + enospc:
             self.assertIn("--compose-fixture tests/fixtures/compose/v0.22.2.yml", command)
             self.assertIn('--candidate-revision "$GITHUB_SHA"', command)
         # The required job stays the fast base scenario.

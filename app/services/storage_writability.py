@@ -25,8 +25,8 @@ SAVE_DETAIL = "Could not save: the data folder is not writable by the app. See T
 
 # SQLite reports a read-only directory as a message with no errno, so the
 # errno test alone misses exactly the startup failure this module explains.
-# Only these two messages are permission failures; "database is locked" and a
-# malformed image keep their own error.
+# These messages may be permission failures; startup checks capacity for the
+# ambiguous open failure. Locked and malformed databases keep their own error.
 SQLITE_UNWRITABLE_MESSAGES = (
     "attempt to write a readonly database",
     "unable to open database file",
@@ -86,6 +86,31 @@ def describe_unwritable_directory(directory: Path | str) -> str:
     """Return the one line that tells an operator what to do about `directory`."""
     path = Path(directory)
     return f"Cannot write to {path} {_ownership_and_remedy(path, access='write', recursive=True)}"
+
+
+def describe_capacity_failure(exc: BaseException, directory: Path | str) -> str | None:
+    """Explain a full volume, including SQLite open failures on exhausted inodes."""
+    full = isinstance(exc, OSError) and exc.errno == errno.ENOSPC
+    if type(exc) is sqlite3.OperationalError:
+        message = str(exc).strip().lower()
+        full = message == "database or disk is full"
+        if message == "unable to open database file":
+            statvfs = getattr(os, "statvfs", None)
+            if statvfs is None:
+                return None
+            try:
+                space = statvfs(directory)
+            except OSError:
+                return None
+            # Some filesystems do not report inode counts (f_files == 0).
+            full = space.f_bavail == 0 or (space.f_files > 0 and space.f_favail == 0)
+    if not full:
+        return None
+    return (
+        f"Cannot write to {directory} because the filesystem is full. "
+        "On the Docker host, free space or inodes on the volume containing "
+        f"{host_repair_path(directory)}, then restart the history service."
+    )
 
 
 class StorageDirectoryUnwritable(RuntimeError):

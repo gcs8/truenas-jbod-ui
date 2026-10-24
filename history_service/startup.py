@@ -1,10 +1,10 @@
-"""Open the history database without crash-looping on an unwritable directory.
+"""Open the history database without crash-looping on an unwritable or full directory.
 
 A bind mount Docker created as root:root makes `HistoryStore.__init__` raise
 PermissionError at import, and `restart: unless-stopped` then loops the
 container with a bare traceback. This module retries a bounded number of times
 (an operator fixing ownership while the container comes up is the common case)
-and then fails once with the path, the owner and the command to run, recording
+and then fails once with the path and the appropriate recovery action, recording
 the same reason for `/healthz` and for anything else that wants to report it.
 
 The caller decides what a terminal failure means. `history_service.main` keeps
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 from app.services.storage_writability import (
+    describe_capacity_failure,
     describe_unwritable_directory,
     is_unwritable_error,
 )
@@ -78,9 +79,9 @@ def open_history_store_with_retries(
     initial_backoff_seconds: float = DEFAULT_INITIAL_BACKOFF_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
 ) -> T:
-    """Call `factory`, retrying only permission failures, then fail with a reason.
+    """Call `factory`, retrying permission or capacity failures, then fail with a reason.
 
-    Anything that is not a permission failure is raised unchanged on the first
+    Anything else is raised unchanged on the first
     attempt: a pending lifecycle marker or a corrupt database is not something a
     retry can fix.
     """
@@ -97,10 +98,13 @@ def open_history_store_with_retries(
             logger.error("%s", exc.reason)
             raise
         except Exception as exc:
-            if not is_unwritable_error(exc):
-                _record(None)
-                raise
-            reason = describe_unwritable_directory(_resolve_directory(directory))
+            resolved_directory = _resolve_directory(directory)
+            reason = describe_capacity_failure(exc, resolved_directory)
+            if reason is None:
+                if not is_unwritable_error(exc):
+                    _record(None)
+                    raise
+                reason = describe_unwritable_directory(resolved_directory)
             if attempt >= attempts:
                 _record(reason)
                 logger.error("%s", reason)
