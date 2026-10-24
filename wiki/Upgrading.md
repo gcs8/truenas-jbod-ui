@@ -101,7 +101,7 @@ treat it as unverified, not as broken.
 | --- | --- | --- |
 | Docker host | Linux, Docker Engine with Compose v2, `linux/amd64` image | Docker Desktop, other architectures, rootless Docker |
 | Local state | Bind mounts on a local POSIX filesystem, owned by root; or, with the hardening overlay, handed to uid 10001 by the one-time ownership step in [[Troubleshooting]] | Network filesystems, read-only or full disks |
-| Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml` | Admin and backup services during an upgrade |
+| Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml`; the backup scheduler sidecar with one filesystem backup target, added through the scenario's own overlay | Admin service during an upgrade; NFS, SMB, S3, SFTP and FTP backup targets |
 | Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d`, with the same `-f` files each time | Releases before v0.22.2, skipping several releases |
 | After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity and schema compatibility checks pass; the report says `schema_transition=none` because the table layout and logical schema-version marker remain unchanged, while startup adds chronological indexes to the hot database; a v0.22.2 segmented catalog keeps the exact generation, catalog bytes and referenced segment bytes; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures, production-scale index construction time and headroom |
 | Rollback | Pin back to v0.22.2 with the same two commands, on base, hardened and segmented-history deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
@@ -109,9 +109,16 @@ treat it as unverified, not as broken.
 
 The checks are `scripts/run_image_upgrade_smoke.py`: the base upgrade runs in
 the `Image-only upgrade smoke` CI job, and `--scenario hardened`,
-`--scenario interrupted-migration` and `--scenario segmented-catalog` run as
-separate steps of the `Hardened, interrupted and segmented upgrade smoke` job.
-The segmented run uses v0.22.2's own migration module and reader, captures the
+`--scenario interrupted-migration`, `--scenario segmented-catalog`,
+`--scenario readonly-state`, `--scenario enospc-state` and
+`--scenario unavailable-backup-storage` run as separate steps of the
+`Hardened, interrupted and segmented upgrade smoke` job. The
+unavailable-backup-storage run proves the shipped copy once, makes the target
+root not a directory through the existing bind mount, and requires the
+scheduler's own visible refusal — the status file names the target and the
+failure class, the local archive keeps the artifact and the scheduler never
+restarts over 20 seconds — then the operator restores the root and the next
+backup ships byte-identically by readback. The segmented run uses v0.22.2's own migration module and reader, captures the
 catalog generation plus exact catalog and segment digests, and requires the
 same identity and combined history view after upgrade and rollback. v0.22.2
 already has the current table layout and logical schema-version marker, so

@@ -142,6 +142,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reads, retaining existing segment admission checks and fresh hot-database
   counts (#1012).
 
+### Docs
+
+- Added an upgrade qualification for an unavailable filesystem backup target:
+  the scheduler's own refusal names the target and failure class, the local
+  archive keeps the artifact with no restarts, and the operator restoring the
+  target is proven by byte readback; the published matrix documents the
+  bounded slice (#N).
+
 ### Internal
 
 - Added an inactive per-system SAS graph preview that preserved supplied
