@@ -13,6 +13,7 @@ from unittest.mock import patch
 from app.services.storage_writability import (
     CONTAINER_BIND_SOURCES,
     StorageDirectoryUnwritable,
+    describe_capacity_failure,
     describe_unwritable_directory,
     host_repair_path,
     is_unwritable_error,
@@ -236,6 +237,89 @@ class HistoryCapacityFailureTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, describe_unwritable_directory("/app/history"))
 
 
+class CapacityDiagnosisRegressionTests(unittest.TestCase):
+    def test_missing_quota_errno_preserves_capacity_and_unrelated_errors(self) -> None:
+        # errno constants are platform-dependent; quota support is optional.
+        with patch.dict(vars(errno)):
+            if hasattr(errno, "EDQUOT"):
+                delattr(errno, "EDQUOT")
+            for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "io"), OSError("unknown")):
+                with self.subTest(error=type(error).__name__):
+                    self.assertIsNone(describe_capacity_failure(error, "/app/data"))
+            reason = describe_capacity_failure(OSError(errno.ENOSPC, "full"), "/app/data")
+            self.assertIsNotNone(reason)
+            assert reason is not None
+            self.assertIn("filesystem is full", reason)
+
+    def test_read_only_statvfs_never_proves_ambiguous_sqlite_capacity(self) -> None:
+        error = sqlite3.OperationalError("unable to open database file")
+        for blocks, inodes in ((0, 128), (1024, 0), (0, 0)):
+            with self.subTest(blocks=blocks, inodes=inodes), patch(
+                "app.services.storage_writability.os.statvfs", create=True,
+                return_value=SimpleNamespace(
+                    f_flag=getattr(os, "ST_RDONLY", 1), f_bavail=blocks,
+                    f_files=256, f_favail=inodes,
+                ),
+            ):
+                self.assertIsNone(describe_capacity_failure(error, "/app/history"))
+                with self.assertRaises(HistoryStartupError) as raised:
+                    open_history_store_with_retries(
+                        lambda: (_ for _ in ()).throw(error),
+                        directory="/app/history", attempts=1,
+                    )
+                self.assertEqual(raised.exception.reason, describe_unwritable_directory("/app/history"))
+
+    def test_explicit_capacity_needs_no_statvfs_and_ui_remedy_has_no_history_restart(self) -> None:
+        for number in (errno.ENOSPC, errno.EDQUOT):
+            with self.subTest(errno=number), patch(
+                "app.services.storage_writability.os.statvfs", create=True,
+                side_effect=AssertionError("explicit errno needs no filesystem inference"),
+            ):
+                reason = describe_capacity_failure(OSError(number, "private failure"), "/app/data")
+                self.assertIsNotNone(reason)
+                assert reason is not None
+                self.assertIn("free space or inodes", reason)
+                self.assertIn("./data", reason)
+                self.assertNotIn("chown", reason)
+                self.assertNotIn("restart the history", reason)
+                self.assertNotIn("private failure", reason)
+
+    def test_real_history_store_open_failure_uses_capacity_or_read_only_fallback(self) -> None:
+        from history_service.store import HistoryStore
+
+        # Redirect the real store's SQLite open to a synthetic missing parent;
+        # SQLite itself supplies the ambiguous open error, not a canned exception.
+        real_connect = sqlite3.connect
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "history.sqlite"
+            database.touch()
+            before = database.read_bytes()
+            missing = Path(raw) / "missing" / "history.sqlite"
+            for readonly in (False, True):
+                with self.subTest(readonly=readonly), patch(
+                    "app.services.storage_writability.os.statvfs", create=True,
+                    return_value=SimpleNamespace(
+                        f_flag=getattr(os, "ST_RDONLY", 1) if readonly else 0,
+                        f_bavail=0, f_files=256, f_favail=0,
+                    ),
+                ), patch(
+                    "history_service.store.sqlite3.connect",
+                    side_effect=lambda *args, **kwargs: real_connect(str(missing)),
+                ) as connect:
+                    with self.assertRaises(HistoryStartupError) as raised:
+                        open_history_store_with_retries(
+                            lambda: HistoryStore(str(database)), directory=database.parent, attempts=1,
+                        )
+                    self.assertTrue(connect.called)
+                    self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+                    if readonly:
+                        self.assertEqual(raised.exception.reason, describe_unwritable_directory(database.parent))
+                    else:
+                        self.assertIn("free space or inodes", raised.exception.reason)
+                        self.assertIn("restart the history service", raised.exception.reason)
+                    self.assertEqual(database.read_bytes(), before)
+
+
 class HostRepairInstructionTests(unittest.TestCase):
     """The operator runs the repair on the host, so it must name a host path."""
 
@@ -356,7 +440,7 @@ class MappingStoreUnwritableTests(unittest.TestCase):
             with patch.object(
                 MappingStore,
                 "_create_temp_file",
-                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+                side_effect=OSError(errno.EIO, "I/O error"),
             ):
                 with self.assertRaises(OSError) as raised:
                     store._commit_v2({})

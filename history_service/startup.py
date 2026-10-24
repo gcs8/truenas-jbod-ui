@@ -100,6 +100,8 @@ def open_history_store_with_retries(
         except Exception as exc:
             resolved_directory = _resolve_directory(directory)
             reason = describe_capacity_failure(exc, resolved_directory)
+            if reason is not None:
+                reason = reason.removesuffix(".") + ", then restart the history service."
             if reason is None:
                 if not is_unwritable_error(exc):
                     _record(None)

@@ -125,7 +125,7 @@ _routes_logger = logging.getLogger(__name__)
 
 
 def _storage_unwritable_response(exc: StorageDirectoryUnwritable) -> JSONResponse:
-    """Answer a save that failed on directory permissions in words a user can act on."""
+    """Answer a directory permission or capacity refusal without exposing paths."""
     _routes_logger.error("%s", exc.operator_message)
     return JSONResponse(
         {

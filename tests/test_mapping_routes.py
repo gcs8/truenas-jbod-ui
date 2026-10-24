@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import tempfile
 import unittest
@@ -911,6 +912,84 @@ class UnwritableDataDirectoryRouteTests(unittest.TestCase):
                 )
                 self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode("utf-8"))
                 service.get_snapshot.assert_not_awaited()
+
+    def test_real_store_capacity_failures_reach_both_save_routes_with_private_safe_503(self) -> None:
+        from app.models.domain import SasFabricAlias
+        from app.services.sas_fabric_alias_store import SasFabricAliasStore
+
+        for kind in ("mapping", "alias"):
+            stages = ("_create_temp_file", "_write_temp_file", "_replace_temp_file") if kind == "mapping" else ("open", "replace")
+            for stage in stages:
+                for number in (errno.ENOSPC, errno.EDQUOT):
+                    with self.subTest(kind=kind, stage=stage, errno=number), tempfile.TemporaryDirectory() as raw:
+                        path = Path(raw) / f"{kind}.json"
+                        error = OSError(number, PRIVATE_EXCEPTION_DETAIL)
+                        if kind == "mapping":
+                            store = MappingStore(path)
+                            store._commit_v2({})
+                            fault = patch.object(store, stage, side_effect=error)
+
+                            async def save(*args, **kwargs):
+                                store._commit_v2({})
+                        else:
+                            store = SasFabricAliasStore(path)
+                            store._write({})
+                            original = getattr(Path, stage)
+
+                            def fail_temp(target, *args, **kwargs):
+                                if target == path.with_suffix(".tmp"):
+                                    raise error
+                                return original(target, *args, **kwargs)
+
+                            fault = patch.object(Path, stage, fail_temp)
+
+                            async def save(*args, **kwargs):
+                                store.save_alias(SasFabricAlias(
+                                    object_id="enclosure-1", object_kind="enclosure", label="Shelf A",
+                                ))
+                        before = path.read_bytes()
+                        service = Mock()
+                        service.system.id = "system-a"
+                        service.system.truenas.platform = "core"
+                        service.save_mapping = AsyncMock(side_effect=save)
+                        service.save_sas_fabric_alias_async = AsyncMock(side_effect=save)
+                        registry = Mock()
+                        registry.get_service.return_value = service
+                        registry.has_system.return_value = True
+                        route_path = "/api/slots/{slot}/mapping" if kind == "mapping" else "/api/sas-fabric/aliases"
+                        route = next(r for r in app_main.app.routes
+                                     if getattr(r, "path", "") == route_path
+                                     and "POST" in (getattr(r, "methods", None) or set()))
+                        arguments = {"slot": 2, "payload": MappingRequest(
+                            expected_revision="a" * 64, serial="SANITIZED", clear_identify_after_save=False,
+                        )} if kind == "mapping" else {"payload": SasFabricAliasRequest(
+                            object_id="enclosure-1", object_kind="enclosure", label="Shelf A",
+                        )}
+                        with (
+                            fault,
+                            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+                            patch.object(app_routes, "ensure_slot_bounds"),
+                            patch.object(app_routes, "add_perf_metadata"),
+                            self.assertLogs("app.routes", level="ERROR") as logs,
+                        ):
+                            response = asyncio.run(route.endpoint(
+                                **arguments, system_id="system-a", enclosure_id="enc-a",
+                            ))
+                        self.assertEqual(response.status_code, 503)
+                        self.assertEqual(json.loads(response.body), {
+                            "ok": False, "error": "data_directory_capacity_exhausted",
+                            "detail": "Could not save: the data folder has insufficient capacity. See Troubleshooting.",
+                        })
+                        self.assertNotIn(raw, response.body.decode())
+                        self.assertNotIn(PRIVATE_EXCEPTION_DETAIL, response.body.decode())
+                        self.assertIn(raw, logs.output[0])
+                        self.assertIn("free space or inodes", logs.output[0])
+                        self.assertNotIn("chown", logs.output[0])
+                        self.assertNotIn("restart the history", logs.output[0])
+                        self.assertEqual(path.read_bytes(), before)
+                        if kind == "mapping":
+                            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+                        service.get_snapshot.assert_not_called()
 
     def test_the_alias_save_route_answers_503_too(self) -> None:
         route = next(
