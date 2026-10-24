@@ -115,10 +115,10 @@ the `Image-only upgrade smoke` CI job, and `--scenario hardened`,
 `Hardened, interrupted and segmented upgrade smoke` job. The
 unavailable-backup-storage run proves the shipped copy once, makes the target
 root not a directory through the existing bind mount, and requires the
-scheduler's own visible refusal — the status file names the target and the
-failure class, the local archive keeps the artifact and the scheduler never
-restarts over 20 seconds — then the operator restores the root and the next
-backup ships byte-identically by readback. The segmented run uses v0.22.2's own migration module and reader, captures the
+scheduler's own visible refusal: the status file names the target and the
+failure class, the local archive keeps the artifact, and the scheduler never
+restarts over 20 seconds. After that observation the operator restores the
+root, and the next backup ships byte-identically by readback. The segmented run uses v0.22.2's own migration module and reader, captures the
 catalog generation plus exact catalog and segment digests, and requires the
 same identity and combined history view after upgrade and rollback. v0.22.2
 already has the current table layout and logical schema-version marker, so
