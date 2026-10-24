@@ -511,7 +511,7 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
         self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
         self.assertIn(workflow["jobs"]["image-upgrade-scenarios"]["name"], " ".join(matrix.split()))
-        for scenario in ("hardened", "interrupted-migration", "segmented-catalog"):
+        for scenario in ("hardened", "interrupted-migration", "segmented-catalog", "unavailable-backup-storage"):
             self.assertIn(f"--scenario {scenario}", " ".join(matrix.split()))
         self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
@@ -1440,8 +1440,10 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertEqual(len(segmented), 1)
         enospc = [command for command in runs if "--scenario enospc-state" in command]
         self.assertEqual(len(enospc), 1)
+        backup = [command for command in runs if "--scenario unavailable-backup-storage" in command]
+        self.assertEqual(len(backup), 1)
         self.assertIn("--nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml", hardened[0])
-        for command in hardened + interrupted + segmented + enospc:
+        for command in hardened + interrupted + segmented + enospc + backup:
             self.assertIn("--compose-fixture tests/fixtures/compose/v0.22.2.yml", command)
             self.assertIn('--candidate-revision "$GITHUB_SHA"', command)
         # The required job stays the fast base scenario.
