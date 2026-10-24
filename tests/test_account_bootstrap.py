@@ -8,6 +8,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -481,6 +482,9 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         *,
         created_output: str = "[]",
         create_fails: bool = False,
+        create_error: str = "[EINVAL] user_create.home: synthetic refusal",
+        uid_output: str = "3001",
+        uid_fails: bool = False,
         **updates: object,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
         """Run the real CORE exec string and script against recording stubs.
@@ -490,24 +494,48 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         does for root on TrueNAS CORE. `user.query` answers with
         ``query_output`` until `user.create` runs, then with ``created_output``.
         The `user.create` JSON argument is saved to ``self.created_payload``.
+        Its synthetic CORE13 model reads uid for home permissions before the
+        later automatic-allocation step, matching the installed ordering defect.
+        This models that contract only, not complete middleware user creation.
         `grep` reports the key as present, as the middleware writes it when it
         creates the account.
         """
-        root = Path(self.temp.name)
+        run_temp = tempfile.TemporaryDirectory(dir=self.temp.name)
+        self.addCleanup(run_temp.cleanup)
+        root = Path(run_temp.name)
         stubs = root / "bin"
         stubs.mkdir()
         calls = root / "calls.log"
         midclt_input = root / "midclt.stdin"
         created_marker = root / "created"
         create_argument = root / "user-create.json"
+        core13_create = root / "core13_create.py"
+        core13_create.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "data = json.loads(sys.argv[1])\n"
+            "with open(os.environ['CALL_LOG'], 'a') as log:\n"
+            "    log.write('core13 group.create_internal\\n')\n"
+            "    # CORE13 reads this before its later get_next_uid fallback.\n"
+            "    uid = data['uid']\n"
+            "    log.write(f'core13 filesystem.setperm uid={uid}\\n')\n"
+            "if not data.get('uid'):\n"
+            "    raise AssertionError('late UID allocation reached')\n"
+            "Path(os.environ['CREATED_MARKER']).touch()\n"
+            "print(61)\n"
+        )
         (stubs / "midclt").write_text(
             "#!/bin/sh\n"
             'printf "midclt %s\\n" "$*" >> "$CALL_LOG"\n'
             'cat >> "$MIDCLT_INPUT"\n'
             'if [ "$2" = user.create ]; then\n'
             '  printf "%s" "$3" > "$CREATE_ARGUMENT"\n'
-            '  if [ -n "$CREATE_FAILS" ]; then echo "[EINVAL] user_create.home: synthetic refusal" >&2; exit 1; fi\n'
-            '  : > "$CREATED_MARKER"; echo 61\n'
+            '  if [ -n "$CREATE_FAILS" ]; then printf "%s\\n" "$CREATE_ERROR" >&2; exit 1; fi\n'
+            f'  exec {shlex.quote(sys.executable)} "$CORE13_CREATE" "$3"\n'
+            "fi\n"
+            'if [ "$2" = user.get_next_uid ]; then\n'
+            '  if [ -n "$UID_FAILS" ]; then echo "synthetic UID lookup failure" >&2; exit 1; fi\n'
+            '  printf "%s\\n" "$UID_OUTPUT"\n'
             "fi\n"
             'if [ "$2" = user.query ]; then\n'
             '  if [ -e "$CREATED_MARKER" ]; then printf "%s\\n" "$CREATED_OUTPUT"; '
@@ -540,6 +568,10 @@ class BootstrapRemoteExecTests(unittest.TestCase):
                 "CREATED_MARKER": str(created_marker),
                 "CREATE_ARGUMENT": str(create_argument),
                 "CREATE_FAILS": "1" if create_fails else "",
+                "CREATE_ERROR": create_error,
+                "CORE13_CREATE": str(core13_create),
+                "UID_OUTPUT": uid_output,
+                "UID_FAILS": "1" if uid_fails else "",
             },
         )
         logged = calls.read_text().splitlines() if calls.exists() else []
@@ -661,9 +693,10 @@ class BootstrapRemoteExecTests(unittest.TestCase):
             service_home=SYNTHETIC_CORE_HOME,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(self.created_payload, self.expected_user_create())
+        self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": 3001})
         midclt_calls = [line.split(" ", 3)[2] for line in logged if line.startswith("midclt ")]
-        self.assertEqual(midclt_calls, ["user.query", "user.create", "user.query", "user.update"])
+        self.assertEqual(midclt_calls, ["user.query", "user.get_next_uid", "user.create", "user.query", "user.update"])
+        self.assertIn("core13 filesystem.setperm uid=3001", logged)
         self.assertTrue(any(line.startswith("midclt call user.update 61 ") for line in logged), logged)
         create_index = next(i for i, line in enumerate(logged) if line.startswith("midclt call user.create "))
         for change in ("mkdir ", "chmod ", "chown ", "touch "):
@@ -674,12 +707,73 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIn("BOOTSTRAP_PERMISSION_TARGET=midclt:user.update:61\n", completed.stdout)
         self.assertEqual(received, "")
 
+    def test_core_uid_allocation_precedes_create_and_home_permissions(self) -> None:
+        for uid in (1000, 4017, 2147483647):
+            for install_sudo_rules in (True, False):
+                with self.subTest(uid=uid, install_sudo_rules=install_sudo_rules):
+                    completed, logged, received = self.run_core_script(
+                        "[]", uid_output=str(uid), service_home=SYNTHETIC_CORE_HOME,
+                        created_output=f'[{json.dumps({"id": 61, "home": SYNTHETIC_CORE_HOME})}]',
+                        install_sudo_rules=install_sudo_rules,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": uid})
+                    self.assertEqual(logged[1], "midclt call user.get_next_uid")
+                    self.assertTrue(logged[2].startswith("midclt call user.create "), logged)
+                    self.assertEqual(logged[3:5], [
+                        "core13 group.create_internal", f"core13 filesystem.setperm uid={uid}",
+                    ])
+                    self.assertEqual(received, "")
+
+    def test_core_malformed_uid_fails_before_create_or_host_changes(self) -> None:
+        for malformed in (
+            "", "null", "true", "false", "[]", "{}", '"3001"', '{"uid":3001}',
+            "0", "1", "999", "65534", "-1", "2147483648", "4294967295",
+            "999999999999999999999999999999", "03001", "+3001", "3001.0", "3e3",
+            " 3001", "3001 ", "\n".join(("3001", "3002")), "３００１",
+            '3001,"sudo":true', "$(id)", "3001; id", "3001`id`",
+        ):
+            with self.subTest(malformed=malformed):
+                completed, logged, received = self.run_core_script(
+                    "[]", uid_output=malformed, service_home=SYNTHETIC_CORE_HOME,
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertIn("UID", completed.stderr)
+                self.assertIn("Nothing was changed on the host.", completed.stderr)
+                self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid"])
+                self.assertIsNone(self.created_payload)
+                self.assertNotIn("BOOTSTRAP_", completed.stdout)
+                self.assertEqual(received, "")
+
+    def test_core_failed_uid_lookup_fails_before_create_or_host_changes(self) -> None:
+        completed, logged, received = self.run_core_script(
+            "[]", uid_fails=True, service_home=SYNTHETIC_CORE_HOME,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("UID", completed.stderr)
+        self.assertIn("Nothing was changed on the host.", completed.stderr)
+        self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid"])
+        self.assertIsNone(self.created_payload)
+        self.assertEqual(received, "")
+
     def test_core_missing_service_user_without_a_home_points_at_the_home_field(self) -> None:
         completed, logged, received = self.run_core_script("[]")
         self.assert_only_the_account_lookup_ran(completed, logged, received)
         self.assertIsNone(self.created_payload)
         self.assertIn("Home directory", completed.stderr)
         self.assertIn("Accounts > Users", completed.stderr)
+
+    def test_core_uid_collision_is_reported_without_reallocation_or_retry(self) -> None:
+        completed, logged, received = self.run_core_script(
+            "[]", create_fails=True, create_error="[EEXIST] user_create.uid: synthetic collision",
+            service_home=SYNTHETIC_CORE_HOME,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("synthetic collision", completed.stderr)
+        self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid", "user.create"])
+        self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": 3001})
+        self.assertNotIn("BOOTSTRAP_", completed.stdout)
+        self.assertEqual(received, "")
 
     def test_core_existing_service_user_ignores_the_home_field(self) -> None:
         completed, logged, received = self.run_core_script(
@@ -689,6 +783,7 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIsNone(self.created_payload)
         self.assertFalse(any("user.create" in line for line in logged), logged)
+        self.assertFalse(any("user.get_next_uid" in line for line in logged), logged)
         self.assertTrue(any(line.startswith("midclt call user.update 54 ") for line in logged), logged)
         self.assertIn("BOOTSTRAP_SERVICE_HOME=/mnt/tank/svc/jbodmap\n", completed.stdout)
         self.assertIn("BOOTSTRAP_ACCOUNT_CREATED=0\n", completed.stdout)
@@ -713,7 +808,7 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertNotIn("BOOTSTRAP_", completed.stdout)
         self.assertEqual(
             [line.split(" ", 3)[2] for line in logged],
-            ["user.query", "user.create"],
+            ["user.query", "user.get_next_uid", "user.create"],
         )
         self.assertEqual(received, "")
 
@@ -725,8 +820,8 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIn("jbodmap", completed.stderr)
         self.assertNotIn("BOOTSTRAP_", completed.stdout)
         self.assertEqual(
-            [line.split(" ", 3)[2] for line in logged],
-            ["user.query", "user.create", "user.query"],
+            [line.split(" ", 3)[2] for line in logged if line.startswith("midclt ")],
+            ["user.query", "user.get_next_uid", "user.create", "user.query"],
         )
 
     def test_bootstrap_result_reports_a_created_account(self) -> None:
