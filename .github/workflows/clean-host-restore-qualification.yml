@@ -65,9 +65,12 @@ jobs:
           printf '%s\n' "$root/bin" >> "$GITHUB_PATH"
           test ! -e "$RESTORE_ROOT"
           test -z "$(ls -A "$DOCKER_CONFIG")"
-          test "$(timeout -k 5s 30s docker info --format '{{.Swarm.LocalNodeState}}')" = inactive
-          test -z "$(timeout -k 5s 30s docker container ls --all --quiet)"
-          test -z "$(timeout -k 5s 30s docker volume ls --quiet)"
+          swarm="$(timeout -k 5s 30s docker info --format '{{.Swarm.LocalNodeState}}')"
+          test "$swarm" = inactive
+          containers="$(timeout -k 5s 30s docker container ls --all --quiet)"
+          test -z "$containers"
+          volumes="$(timeout -k 5s 30s docker volume ls --quiet)"
+          test -z "$volumes"
           timeout -k 5s 30s docker network ls --no-trunc --format '{{.ID}} {{.Name}}' > "$root/networks-before"
           python3 - <<'PY'
           import os, pathlib, socket

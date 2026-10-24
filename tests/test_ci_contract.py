@@ -1063,6 +1063,40 @@ class CleanHostQualificationWorkflowTests(unittest.TestCase):
     def workflow(self):
         return yaml.safe_load((WORKFLOW_DIR / "clean-host-restore-qualification.yml").read_text())
 
+    def test_admission_census_failure_stops_before_mutation(self):
+        import shlex
+
+        setup = next(step["run"] for step in self.workflow()["jobs"]["restore"]["steps"]
+                     if step.get("id") == "admit")
+        lines = setup.splitlines()
+        start = next(i for i, line in enumerate(lines) if "docker info --format" in line)
+        end = next(i for i in range(start, len(lines)) if lines[i].startswith("python3 -"))
+        census = "\n".join(lines[start:end])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "docker"
+            fake.write_text("#!/bin/sh\n"
+                            'case "$1 $2" in\n'
+                            '  "info --format") printf "inactive\\n"; '
+                            '[ "$CENSUS_FAULT" != info ];;\n'
+                            '  "container ls") [ "$CENSUS_FAULT" != container ];;\n'
+                            '  "volume ls") [ "$CENSUS_FAULT" != volume ];;\n'
+                            '  "network ls") printf "1 bridge\\n2 host\\n3 none\\n"; '
+                            '[ "$CENSUS_FAULT" != network ];;\n'
+                            '  *) exit 99;;\nesac\n')
+            fake.chmod(0o700)
+            marker = root / "mutation-reached"
+            command = "set -euo pipefail\n" + census + "\nprintf mutation > " + shlex.quote(str(marker))
+            for fault in ("none", "info", "container", "volume", "network"):
+                with self.subTest(fault=fault):
+                    marker.unlink(missing_ok=True)
+                    env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                           "CENSUS_FAULT": fault, "QUALIFICATION_ROOT": str(root), "root": str(root)}
+                    result = subprocess.run(["bash", "-c", command], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode == 0, fault == "none")
+                    self.assertEqual(marker.exists(), fault == "none")
+
     def test_branch_admission_and_separate_source_identity(self):
         workflow = self.workflow()
         self.assertEqual(workflow.get("on", workflow.get(True)), {
