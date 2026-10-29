@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock, patch
 
 from cryptography.hazmat.primitives import serialization
@@ -1628,6 +1628,198 @@ class CoreExpanderCounterDraftTests(unittest.TestCase):
         self.assertEqual(core_grant_sources(), before)
         for grants in before.values():
             self.assertFalse(any("smpcmd" in grant or "smpphylist" in grant for grant in grants))
+
+
+class BootstrapPolicyAdmissionTests(unittest.TestCase):
+    """Policy admission uses only inline synthetic inputs and a recording probe."""
+
+    platforms = ("core", "scale", "linux", "quantastor")
+    custom_commands = ["sudo -n /usr/bin/id", "sudo /usr/bin/id"]
+
+    def setUp(self) -> None:
+        FakeProbe.last_config = None
+        FakeProbe.last_command = None
+        FakeProbe.last_stdin = None
+        self.probe_calls = []
+
+        def recording_factory(config):
+            self.probe_calls.append(config)
+            return cast(SSHProbe, FakeProbe(config))
+
+        self.service = ServiceAccountBootstrapService(
+            "synthetic-config.yaml", probe_factory=recording_factory
+        )
+
+    @staticmethod
+    def payload(platform, *, commands=(), install=True):
+        return SystemSetupBootstrapRequest(
+            platform=platform,
+            host="host.example.test",
+            bootstrap_user="root",
+            bootstrap_key_path="unused-bootstrap-key",
+            service_public_key="ssh-ed25519 placeholder",
+            sudo_commands=list(commands),
+            install_sudo_rules=install,
+        )
+
+    def assert_bootstrap_refused(self, payload, message):
+        self.probe_calls.clear()
+        with patch.object(
+            self.service, "_resolve_public_key", wraps=self.service._resolve_public_key
+        ) as key_lookup:
+            error = None
+            try:
+                self.service.bootstrap_service_account(payload)
+            except ValueError as exc:
+                error = str(exc)
+            self.assertEqual(self.probe_calls, [], "Rejected policy must not create a probe")
+            key_lookup.assert_not_called()
+            self.assertIsNotNone(error, "Rejected policy must raise ValueError")
+            assert isinstance(error, str)
+            self.assertRegex(error, message)
+
+    def test_ipmi_bootstrap_refuses_before_key_lookup_or_probe(self):
+        for install in (True, False):
+            for commands in ([], [" ", "sudo -n"], self.custom_commands):
+                with self.subTest(install=install, commands=commands):
+                    self.assert_bootstrap_refused(
+                        self.payload("ipmi", commands=commands, install=install),
+                        "BMC/IPMI.*bootstrap",
+                    )
+
+    def test_ipmi_preview_is_disabled_even_with_custom_commands(self):
+        for install in (True, False):
+            for commands in ([], self.custom_commands):
+                with self.subTest(install=install, commands=commands):
+                    preview = self.service.build_sudoers_preview(
+                        "jbodmap", "ipmi", install_sudo_rules=install,
+                        requested_commands=commands,
+                    )
+                    self.assertFalse(preview["enabled"])
+                    assert isinstance(preview["detail"], str)
+                    assert isinstance(preview["content"], str)
+                    self.assertRegex(preview["detail"], "BMC/IPMI.*bootstrap")
+                    self.assertNotIn("NOPASSWD:", preview["content"])
+                    self.assertEqual(self.probe_calls, [])
+
+    def test_unsupported_platform_cannot_render_a_policy(self):
+        for platform in ("ipmi", "unsupported"):
+            for commands in (None, [], self.custom_commands):
+                with self.subTest(platform=platform, commands=commands):
+                    with self.assertRaises(ValueError):
+                        self.service._build_sudoers_content("jbodmap", platform, commands)
+
+    def test_empty_effective_policy_refuses_execution_and_preview(self):
+        for platform in self.platforms:
+            for defaults in ((), ("", " ")):
+                for commands in ([], [" ", "sudo -n", "/usr/bin/id"]):
+                    with self.subTest(platform=platform, defaults=defaults, commands=commands):
+                        with patch.dict(SUDO_COMMANDS_BY_PLATFORM, {platform: defaults}):
+                            self.assert_bootstrap_refused(
+                                self.payload(platform, commands=commands),
+                                "No command-limited sudo policy",
+                            )
+                            with self.assertRaisesRegex(ValueError, "No command-limited sudo policy"):
+                                self.service.build_sudoers_preview(
+                                    "jbodmap", platform, requested_commands=commands
+                                )
+
+    def test_core_empty_policy_cannot_reach_the_middleware_payload(self):
+        with patch.dict(SUDO_COMMANDS_BY_PLATFORM, {"core": ()}):
+            with self.assertRaisesRegex(ValueError, "No command-limited sudo policy"):
+                self.service._build_core_midclt_user_update_payload([])
+
+    def assert_preview_matches_recorded_script(self, platform, commands):
+        preview = self.service.build_sudoers_preview(
+            "jbodmap", platform, requested_commands=commands
+        )
+        self.assertTrue(preview["enabled"])
+        assert isinstance(preview["content"], str)
+        self.assertNotIn("NOPASSWD: ALL", preview["content"])
+        result = self.service.bootstrap_service_account(self.payload(platform, commands=commands))
+        self.assertTrue(result["ok"])
+        self.assertEqual(FakeProbe.last_command, "/bin/sh -s")
+        assert isinstance(FakeProbe.last_stdin, str)
+        if platform == "core":
+            policy = shlex.split(preview["content"])[-1]
+            self.assertIn("midclt_payload=" + shlex.quote(policy), FakeProbe.last_stdin)
+            decoded = json.loads(policy)
+            self.assertTrue(decoded["sudo"])
+            self.assertTrue(decoded["sudo_nopasswd"])
+            self.assertEqual(
+                decoded["sudo_commands"],
+                list(self.service._resolve_sudo_commands(platform, commands)),
+            )
+        else:
+            self.assertIn(preview["content"], FakeProbe.last_stdin)
+            self.assertIn("Cmnd_Alias JBODMAP_" + platform.upper() + "_CMDS", preview["content"])
+
+    def test_supported_defaults_match_preview_and_recorded_execution(self):
+        for platform in self.platforms:
+            for commands in ([], [" ", "sudo -n", "/usr/bin/id"]):
+                with self.subTest(platform=platform, commands=commands):
+                    self.assertEqual(
+                        self.service._resolve_sudo_commands(platform, commands),
+                        SUDO_COMMANDS_BY_PLATFORM[platform],
+                    )
+                    self.assert_preview_matches_recorded_script(platform, commands)
+
+    def test_custom_commands_keep_normalization_supplements_and_preview_parity(self):
+        for platform in self.platforms:
+            with self.subTest(platform=platform):
+                self.assertEqual(
+                    self.service._resolve_sudo_commands(platform, self.custom_commands),
+                    ("/usr/bin/id", *SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM[platform]),
+                )
+                self.assert_preview_matches_recorded_script(platform, self.custom_commands)
+                # A nonempty custom policy does not require platform defaults.
+                with patch.dict(SUDO_COMMANDS_BY_PLATFORM, {platform: ()}):
+                    self.assert_preview_matches_recorded_script(platform, self.custom_commands)
+
+    def test_disabled_supported_policy_does_not_require_commands(self):
+        for platform in self.platforms:
+            with self.subTest(platform=platform):
+                with patch.dict(SUDO_COMMANDS_BY_PLATFORM, {platform: ()}):
+                    preview = self.service.build_sudoers_preview(
+                        "jbodmap", platform, install_sudo_rules=False
+                    )
+                    result = self.service.bootstrap_service_account(self.payload(platform, install=False))
+                self.assertFalse(preview["enabled"])
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["sudo_rules_installed"])
+                assert isinstance(FakeProbe.last_stdin, str)
+                self.assertIn("install_sudo=0", FakeProbe.last_stdin)
+                self.assertNotIn("NOPASSWD:", FakeProbe.last_stdin)
+                if platform == "core":
+                    self.assertIn("midclt_payload=''", FakeProbe.last_stdin)
+                    self.assertNotIn('"sudo_commands":', FakeProbe.last_stdin)
+
+    def test_esxi_still_refuses_bootstrap_and_disables_preview(self):
+        for install in (True, False):
+            with self.subTest(install=install):
+                self.assert_bootstrap_refused(
+                    self.payload("esxi", install=install), "VMware ESXi"
+                )
+                preview = self.service.build_sudoers_preview(
+                    "jbodmap", "esxi", install_sudo_rules=install
+                )
+                self.assertFalse(preview["enabled"])
+                assert isinstance(preview["detail"], str)
+                self.assertIn("VMware ESXi", preview["detail"])
+
+    def test_linux_policy_retains_syntax_and_active_include_checks(self):
+        self.service.bootstrap_service_account(self.payload("linux"))
+        script = FakeProbe.last_stdin
+        assert isinstance(script, str)
+        for required in (
+            "unsupported include syntax or continued policy lines.",
+            "no supported active includedir was found.",
+            "timeout 10 visudo -c >",
+            'timeout 10 visudo -cf "$temp_sudoers_path"',
+            'grep -Fxq "$sudoers_path: parsed OK"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, script)
 
 
 if __name__ == "__main__":
