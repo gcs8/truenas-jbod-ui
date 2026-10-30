@@ -51,6 +51,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The immutable update helper's new opt-in `--history-health-url` reported a
+  history store that needs recovery or has paused collection as a distinct
+  non-pass (exit 3) instead of a pass, without rolling back. The upgrade
+  matrix listed read-only and full history state as tested, and the sudo
+  examples used anchored arguments instead of trailing globs (#1051).
 - Admin kept late-rendered buttons locked after it stopped, rejected fractional
   profile builder sizes with a message, showed a failed drive discovery as a
   failure, and let Move Up/Down reorder views that share an order (#1050).
