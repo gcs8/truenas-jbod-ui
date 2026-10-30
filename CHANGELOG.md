@@ -51,6 +51,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Quantastor and Supermicro BMC requests no longer follow redirects to another
+  host, port or plain HTTP with credentials, a competing first SSH connection
+  can no longer replace a pinned host key, BMC discovery caps reported
+  controller and drive counts, and TLS bundle saves stage in their own file
+  (#1052).
 - Admin kept late-rendered buttons locked after it stopped, rejected fractional
   profile builder sizes with a message, showed a failed drive discovery as a
   failure, and let Move Up/Down reorder views that share an order (#1050).
