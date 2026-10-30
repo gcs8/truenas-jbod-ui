@@ -251,6 +251,8 @@ class OperatorRecipeTests(unittest.TestCase):
                         client.save_host_keys.assert_not_called()
                     else:
                         self.assertIsInstance(policy, AutoPinHostKeyPolicy)
+                        # The reloaded known_hosts file has no pin for this host yet.
+                        client.get_host_keys.return_value.lookup.return_value = None
                         policy.missing_host_key(client, "core.example.test", key)
                         client.save_host_keys.assert_called_once_with(path)
 

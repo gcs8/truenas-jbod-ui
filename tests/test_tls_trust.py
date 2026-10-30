@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import ssl
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request
 from unittest.mock import MagicMock, patch
 
@@ -14,8 +17,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from admin_service.services.tls_trust import TLSTrustStoreService
-from app.config import TrueNASConfig
-from app.services.tls_context import build_tls_client_context, resolve_tls_server_name, urlopen_with_tls_config
+from app.config import BMCConfig, TrueNASConfig
+from app.services.quantastor_api import QuantastorRESTClient
+from app.services.supermicro_bmc import SupermicroBMCService
+from app.services.tls_context import (
+    build_tls_client_context,
+    redirect_keeps_origin,
+    resolve_tls_server_name,
+    urlopen_with_tls_config,
+)
+from app.services.truenas_ws import TrueNASAPIError
 
 
 def build_self_signed_pem(
@@ -567,7 +578,7 @@ class TLSContextTests(unittest.TestCase):
 
     @patch("app.services.tls_context.urllib.request.build_opener")
     @patch("app.services.tls_context.urllib.request.urlopen")
-    def test_urlopen_with_tls_config_uses_plain_urlopen_when_verification_is_disabled(
+    def test_urlopen_with_tls_config_skips_hostname_override_when_verification_is_disabled(
         self,
         urlopen_mock: MagicMock,
         build_opener_mock: MagicMock,
@@ -587,6 +598,182 @@ class TLSContextTests(unittest.TestCase):
             server_hostname="TrueNAS.gcs8.io",
         )
 
-        self.assertIs(returned, urlopen_mock.return_value)
-        urlopen_mock.assert_called_once_with(request, timeout=5, context=context)
-        build_opener_mock.assert_not_called()
+        # #737: the opener still carries the same-origin redirect handler,
+        # but no server-name override when hostname checks are off.
+        self.assertIs(returned, build_opener_mock.return_value.open.return_value)
+        urlopen_mock.assert_not_called()
+        build_opener_mock.return_value.open.assert_called_once_with(request, timeout=5)
+        handlers = build_opener_mock.call_args.args
+        self.assertEqual(
+            [type(handler).__name__ for handler in handlers],
+            ["HTTPSHandler", "SameOriginRedirectHandler"],
+        )
+
+
+class _RedirectProbeServer:
+    """Loopback HTTP server that records each request and may redirect it."""
+
+    def __init__(self, location: str | None = None) -> None:
+        self.location = location
+        self.requests: list[tuple[str, str | None]] = []
+        probe = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+                probe.requests.append((self.path, self.headers.get("Authorization")))
+                if probe.location and self.path != "/final":
+                    self.send_response(302)
+                    self.send_header("Location", probe.location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = b"[]"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+class CredentialRedirectTests(unittest.TestCase):
+    """#737: credentials must not follow a redirect to another origin."""
+
+    def start_server(self, location: str | None = None) -> _RedirectProbeServer:
+        server = _RedirectProbeServer(location)
+        self.addCleanup(server.close)
+        return server
+
+    def test_redirect_origin_rules(self) -> None:
+        cases = {
+            ("https://nas.example.test/qstorapi/x", "https://nas.example.test/other"): True,
+            ("https://nas.example.test/x", "https://NAS.example.test:443/y"): True,
+            ("http://nas.example.test/x", "https://nas.example.test/y"): True,
+            ("https://nas.example.test/x", "http://nas.example.test/y"): False,
+            ("https://nas.example.test/x", "https://other.example.test/y"): False,
+            ("https://nas.example.test/x", "https://nas.example.test:8443/y"): False,
+            ("http://nas.example.test:8080/x", "https://nas.example.test:8443/y"): False,
+            ("https://nas.example.test/x", "ftp://nas.example.test/y"): False,
+            ("https://nas.example.test/x", "https://nas.example.test:bad/y"): False,
+        }
+        for (source, target), expected in cases.items():
+            with self.subTest(source=source, target=target):
+                self.assertEqual(redirect_keeps_origin(source, target), expected)
+
+    def test_cross_origin_redirect_does_not_forward_authorization(self) -> None:
+        other = self.start_server()
+        origin = self.start_server(location=f"{other.base_url}/final")
+        request = Request(f"{origin.base_url}/qstorapi/storageSystemEnum", headers={"Authorization": "Basic c3ludGhldGlj"})
+
+        with self.assertRaises(HTTPError) as raised:
+            urlopen_with_tls_config(request, timeout=5, context=None)
+
+        raised.exception.close()
+        self.assertEqual(raised.exception.code, 302)
+        self.assertEqual(other.requests, [])
+        self.assertEqual(len(origin.requests), 1)
+
+    def test_same_origin_redirect_is_still_followed(self) -> None:
+        origin = self.start_server()
+        origin.location = f"{origin.base_url}/final"
+        request = Request(f"{origin.base_url}/qstorapi/storageSystemEnum", headers={"Authorization": "Basic c3ludGhldGlj"})
+
+        with urlopen_with_tls_config(request, timeout=5, context=None) as response:
+            self.assertEqual(response.read(), b"[]")
+
+        self.assertEqual([path for path, _auth in origin.requests], ["/qstorapi/storageSystemEnum", "/final"])
+
+    def test_quantastor_client_refuses_cross_origin_redirect(self) -> None:
+        other = self.start_server()
+        origin = self.start_server(location=f"{other.base_url}/final")
+        client = QuantastorRESTClient(
+            TrueNASConfig(
+                host=origin.base_url,
+                api_user="synthetic-user",
+                api_password="synthetic-password",
+                platform="quantastor",
+                timeout_seconds=5,
+            )
+        )
+
+        with self.assertRaises(TrueNASAPIError) as raised:
+            client._request_json("storageSystemEnum", {"flags": 0})
+
+        self.assertIn("302", str(raised.exception))
+        self.assertNotIn("synthetic-password", str(raised.exception))
+        self.assertEqual(other.requests, [])
+
+    def test_bmc_requests_refuse_cross_origin_redirect(self) -> None:
+        other = self.start_server()
+        origin = self.start_server(location=f"{other.base_url}/final")
+        service = SupermicroBMCService(
+            BMCConfig(
+                enabled=True,
+                host=origin.base_url,
+                username="synthetic-user",
+                password="synthetic-password",
+                timeout_seconds=5,
+            )
+        )
+
+        with self.assertRaises(TrueNASAPIError):
+            service._redfish_get_json("/redfish/v1/Systems/1")
+
+        self.assertEqual(other.requests, [])
+        self.assertEqual(len(origin.requests), 1)
+
+
+class TLSBundleStagingTests(unittest.TestCase):
+    """#737: each bundle write stages and publishes only its own bytes."""
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_dir = Path(temp_dir.name)
+        config_path = self.temp_dir / "config.yaml"
+        config_path.write_text("systems: []\n", encoding="utf-8")
+        self.service = TLSTrustStoreService(str(config_path))
+
+    def test_write_does_not_reuse_another_operations_staging_file(self) -> None:
+        trust_dir = self.temp_dir / "tls"
+        trust_dir.mkdir()
+        foreign_staging = trust_dir / "archive-core.pem.tmp"
+        foreign_staging.write_text("another operation's staged bytes\n", encoding="utf-8")
+        pem_text = build_self_signed_pem("archive-core.example.test")
+
+        result = self.service.import_pem_bundle(pem_text, bundle_name="archive-core")
+
+        bundle_path = Path(result["bundle_path"])
+        self.assertEqual(
+            x509.load_pem_x509_certificate(bundle_path.read_bytes()).fingerprint(hashes.SHA256()),
+            x509.load_pem_x509_certificate(pem_text.encode("ascii")).fingerprint(hashes.SHA256()),
+        )
+        self.assertEqual(foreign_staging.read_text(encoding="utf-8"), "another operation's staged bytes\n")
+        self.assertEqual(sorted(path.name for path in trust_dir.iterdir()), ["archive-core.pem", "archive-core.pem.tmp"])
+
+    def test_failed_write_removes_its_staging_file_and_keeps_the_published_bundle(self) -> None:
+        first = self.service.import_pem_bundle(build_self_signed_pem("archive-core.example.test"), bundle_name="archive-core")
+        bundle_path = Path(first["bundle_path"])
+        published = bundle_path.read_bytes()
+
+        with patch("os.replace", side_effect=OSError("synthetic publish failure")):
+            with self.assertRaises(OSError):
+                self.service.import_pem_bundle(build_self_signed_pem("archive-core.example.test"), bundle_name="archive-core")
+
+        self.assertEqual(bundle_path.read_bytes(), published)
+        self.assertEqual([path.name for path in bundle_path.parent.iterdir()], ["archive-core.pem"])
