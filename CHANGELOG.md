@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Admin timing saves rejected fractional and boolean values instead of
+  truncating them, delayed demo creation kept newer setup drafts, history
+  adoption used the maintenance deadline and reported unconfirmed results as
+  unknown, and storage-view history returned 422/413 for rejected requests (#1049).
 - Directed ownership-repair advice to the guarded troubleshooting procedure
   instead of a blanket recursive command (#1045).
 - CORE bootstrap supplied a validated next UID before creating a missing service
