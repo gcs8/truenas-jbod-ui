@@ -51,6 +51,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Directed ownership-repair advice to the guarded troubleshooting procedure
+  instead of a blanket recursive command (#1045).
 - CORE bootstrap supplied a validated next UID before creating a missing service
   account, avoiding the CORE13 home-permission UID failure while preserving
   existing accounts and refusing malformed allocation results (#1025).
