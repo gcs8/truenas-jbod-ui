@@ -7206,6 +7206,142 @@ sys.stdout.flush()
         finally:
             transaction._cleanup_root()
 
+    def test_segmented_hot_staging_failure_before_registration_removes_its_own_file(self) -> None:
+        target_path = self.temp_dir / "existing-hot.sqlite3"
+        target_path.write_bytes(b"LIVE-HOT")
+        real_fsync = os.fsync
+
+        def partial_copy(source_handle, target_handle, *args, **kwargs):
+            target_handle.write(b"PART")
+            target_handle.flush()
+            raise OSError("synthetic partial copy failure")
+
+        def fail_file_fsync(descriptor):
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("synthetic file fsync failure")
+            return real_fsync(descriptor)
+
+        cases = {
+            "missing-source": (None, FileNotFoundError),
+            "partial-copy": (
+                lambda: patch.object(
+                    system_backup_module.shutil,
+                    "copyfileobj",
+                    side_effect=partial_copy,
+                ),
+                OSError,
+            ),
+            "chmod": (
+                lambda: patch.object(
+                    system_backup_module.os,
+                    "fchmod",
+                    side_effect=PermissionError("synthetic chmod failure"),
+                ),
+                PermissionError,
+            ),
+            "file-fsync": (
+                lambda: patch.object(
+                    system_backup_module.os,
+                    "fsync",
+                    side_effect=fail_file_fsync,
+                ),
+                OSError,
+            ),
+        }
+        for name, (make_patch, expected_error) in cases.items():
+            with self.subTest(failure=name):
+                staged_path = self.temp_dir / f".existing-hot.sqlite3.restore-{name}"
+                transaction = _ImportActivationTransaction({"hot": b"HOT"})
+                try:
+                    entry = transaction._record_target(target_path, expected_kind="file")
+                    source_path = transaction._staged_member("hot")
+                    if make_patch is None:
+                        source_path.unlink()
+                    with make_patch() if make_patch is not None else ExitStack():
+                        with self.assertRaises(expected_error):
+                            transaction._stage_segmented_hot(
+                                staged_path,
+                                source_path=source_path,
+                                target_path=target_path,
+                                entry=entry,
+                            )
+
+                    self.assertFalse(os.path.lexists(staged_path))
+                    self.assertEqual(transaction._sibling_artifacts, {})
+                    self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+                    self.assertEqual(target_path.read_bytes(), b"LIVE-HOT")
+                    if make_patch is not None:
+                        self.assertEqual(source_path.read_bytes(), b"HOT")
+                finally:
+                    if os.path.lexists(staged_path):
+                        staged_path.unlink()
+                    transaction._cleanup_root()
+
+    def test_segmented_hot_staging_failure_keeps_a_replaced_staging_path(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+
+        def replace_then_fail(source_handle, target_handle, *args, **kwargs):
+            staged_path.unlink()
+            staged_path.write_bytes(b"UNOWNED-REPLACEMENT")
+            raise OSError("synthetic copy failure after replacement")
+
+        try:
+            with patch.object(
+                system_backup_module.shutil,
+                "copyfileobj",
+                side_effect=replace_then_fail,
+            ):
+                with self.assertRaisesRegex(OSError, "after replacement"):
+                    transaction._stage_segmented_hot(
+                        staged_path,
+                        source_path=transaction._staged_member("hot"),
+                        target_path=target_path,
+                        entry=entry,
+                    )
+
+            self.assertEqual(staged_path.read_bytes(), b"UNOWNED-REPLACEMENT")
+            self.assertEqual(transaction._sibling_artifacts, {})
+            self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+            self.assertEqual(staged_path.read_bytes(), b"UNOWNED-REPLACEMENT")
+            self.assertFalse(os.path.lexists(target_path))
+        finally:
+            if os.path.lexists(staged_path):
+                staged_path.unlink()
+            transaction._cleanup_root()
+
+    def test_segmented_hot_staging_failure_after_registration_uses_registered_cleanup(self) -> None:
+        target_path = self.temp_dir / "missing-hot.sqlite3"
+        staged_path = self.temp_dir / ".missing-hot.sqlite3.restore-synthetic"
+        transaction = _ImportActivationTransaction({"hot": b"HOT"})
+        entry = transaction._record_target(target_path, expected_kind="file")
+
+        try:
+            with patch.object(
+                transaction,
+                "_fsync_directory",
+                side_effect=OSError("synthetic directory fsync failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "directory fsync"):
+                    transaction._stage_segmented_hot(
+                        staged_path,
+                        source_path=transaction._staged_member("hot"),
+                        target_path=target_path,
+                        entry=entry,
+                    )
+
+            self.assertEqual(staged_path.read_bytes(), b"HOT")
+            self.assertEqual(transaction._sibling_artifacts, {staged_path: "file"})
+            self.assertEqual(transaction._cleanup_sibling_artifacts(), [])
+            self.assertFalse(os.path.lexists(staged_path))
+            self.assertFalse(os.path.lexists(target_path))
+        finally:
+            if os.path.lexists(staged_path):
+                staged_path.unlink()
+            transaction._cleanup_root()
+
     def test_segmented_directory_staging_does_not_reopen_owned_member_files(self) -> None:
         target_dir = self.temp_dir / "missing-segments"
         staged_dir = self.temp_dir / ".missing-segments.restore-synthetic"
