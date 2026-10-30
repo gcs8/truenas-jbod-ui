@@ -162,8 +162,9 @@ run as root; do not assume every deployment uses UID 10001. Symptoms include:
   `/livez`, so Docker does not restart it or mark it unhealthy for this.
 - For example, with the optional overlay's default app identity and a root-owned
   history directory, the history service logs
-  `Cannot write to /app/history (owned by uid 0, running as uid 10001). For write
-  access to ./history, follow the guarded ownership procedure in Troubleshooting
+  `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
+  Docker host, for write access to ./history, follow the guarded ownership
+  procedure in Troubleshooting
   (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). Stop
   every writer and keep them stopped during repair; do not recursively change
   segmented history.`, retries a few times with growing backoff, and then stops

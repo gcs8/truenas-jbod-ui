@@ -43,6 +43,7 @@ class DescribeUnwritableDirectoryTests(unittest.TestCase):
                     self.assertIn(f"Cannot write to {directory}", message)
                     self.assertIn("owner unknown" if isinstance(owner, OSError) else "owned by uid 0", message)
                     self.assertIn("running as this user" if identity[0] is None else "running as uid 10001", message)
+                    self.assertIn("On the Docker host", message)
                     self.assertIn("write access to ./synthetic-bind", message)
                     self.assertIn("wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied", message)
                     self.assertIn("Stop every writer", message)
@@ -237,7 +238,7 @@ class HistoryCapacityFailureTests(unittest.TestCase):
                 self.assertEqual(
                     raised.exception.reason,
                     "Cannot write to /app/history (owned by uid 0, running as uid 10001). "
-                    "For write access to ./history, follow the guarded ownership procedure in "
+                    "On the Docker host, for write access to ./history, follow the guarded ownership procedure in "
                     "Troubleshooting (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). "
                     "Stop every writer and keep them stopped during repair; "
                     "do not recursively change segmented history.",

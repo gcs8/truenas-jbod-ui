@@ -76,7 +76,7 @@ def _ownership_and_remedy(path: Path, *, access: str, recursive: bool) -> str:
     target = host_repair_path(path)
     if recursive:
         remedy = (
-            f"For {access} access to {target}, follow the guarded ownership procedure in "
+            f"On the Docker host, for {access} access to {target}, follow the guarded ownership procedure in "
             "Troubleshooting (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). "
             "Stop every writer and keep them stopped during repair; "
             "do not recursively change segmented history."
