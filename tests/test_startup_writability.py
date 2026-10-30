@@ -26,19 +26,39 @@ from history_service.startup import (
 
 
 class DescribeUnwritableDirectoryTests(unittest.TestCase):
-    def test_the_line_names_the_path_the_owner_and_the_command_to_run(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            directory = Path(raw) / "history"
-            directory.mkdir()
+    def test_the_line_names_the_path_owner_and_guarded_repair(self) -> None:
+        from app.services.storage_writability import _ownership_and_remedy
 
-            message = describe_unwritable_directory(directory)
+        directory = Path("SANITIZED-directory")
+        for identity in ((10001, 10001), (None, None), (10001, None), (None, 10001)):
+            for owner in (SimpleNamespace(st_uid=0), OSError("synthetic stat failure")):
+                with (
+                    self.subTest(identity=identity, owner=owner),
+                    patch("app.services.storage_writability._running_identity", return_value=identity),
+                    patch("app.services.storage_writability.host_repair_path", return_value="./synthetic-bind"),
+                    patch.object(Path, "stat", return_value=owner,
+                                 side_effect=owner if isinstance(owner, OSError) else None),
+                ):
+                    message = describe_unwritable_directory(directory)
+                    self.assertIn(f"Cannot write to {directory}", message)
+                    self.assertIn("owner unknown" if isinstance(owner, OSError) else "owned by uid 0", message)
+                    self.assertIn("running as this user" if identity[0] is None else "running as uid 10001", message)
+                    self.assertIn("On the Docker host", message)
+                    self.assertIn("write access to ./synthetic-bind", message)
+                    self.assertIn("wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied", message)
+                    self.assertIn("Stop every writer", message)
+                    self.assertIn("keep them stopped", message)
+                    self.assertIn("do not recursively change segmented history", message)
+                    self.assertNotIn("sudo chown", message)
+                    self.assertNotIn("Traceback", message)
 
-        self.assertIn(str(directory), message)
-        self.assertIn("Cannot write to", message)
-        # The chown command needs the uid this process runs as; Windows has no
-        # POSIX identity, so the line names the fix in words there instead.
-        self.assertIn("chown" if hasattr(os, "geteuid") else "write access", message)
-        self.assertNotIn("Traceback", message)
+                    # A single-file remedy remains available for ordinary paths.
+                    ordinary = _ownership_and_remedy(directory, access="read", recursive=False)
+                    if None in identity:
+                        self.assertIn("give the app user read access to ./synthetic-bind", ordinary)
+                    else:
+                        self.assertIn("sudo chown 10001:10001 ./synthetic-bind", ordinary)
+                    self.assertNotIn("chown -R", ordinary)
 
     def test_only_permission_shaped_errors_are_classified(self) -> None:
         directory = Path("/app/history")
@@ -85,7 +105,7 @@ class HistoryStartupRetryTests(unittest.TestCase):
         self.assertEqual(slept, [1.0, 2.0], "each retry must back off further")
         reason = raised.exception.reason
         self.assertIn(str(directory), reason)
-        self.assertIn("chown" if hasattr(os, "geteuid") else "write access", reason)
+        self.assertIn("guarded ownership procedure", reason)
         self.assertEqual(str(raised.exception), reason)
 
     def test_a_directory_that_becomes_writable_starts_normally(self) -> None:
@@ -215,9 +235,14 @@ class HistoryCapacityFailureTests(unittest.TestCase):
                 ):
                     with self.assertRaises(HistoryStartupError) as raised:
                         open_history_store_with_retries(factory, directory="/app/history", attempts=1)
-                self.assertEqual(raised.exception.reason,
-                                 "Cannot write to /app/history (owned by uid 0, running as uid 10001). "
-                                 "On the Docker host run: sudo chown -R 10001:10001 ./history")
+                self.assertEqual(
+                    raised.exception.reason,
+                    "Cannot write to /app/history (owned by uid 0, running as uid 10001). "
+                    "On the Docker host, for write access to ./history, follow the guarded ownership procedure in "
+                    "Troubleshooting (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). "
+                    "Stop every writer and keep them stopped during repair; "
+                    "do not recursively change segmented history.",
+                )
                 statvfs.assert_not_called()
 
     def test_sqlite_open_failure_needs_capacity_evidence_before_replacing_ownership(self) -> None:
@@ -505,23 +530,43 @@ class TroubleshootingHostPathTests(unittest.TestCase):
         self.assertEqual(offenders, [], "\n".join(offenders))
 
     def test_the_quoted_log_line_is_the_line_the_code_emits(self) -> None:
-        quoted = " ".join(
-            (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8").split()
+        text = (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8")
+        symptom, guarded = text.split("## A non-root container gets permission denied", 1)
+        symptom = symptom.split("## Saves fail and the history service keeps restarting", 1)[1]
+        guarded = guarded.split("\n## ", 1)[0]
+        self.assertNotIn("chown", symptom)
+        self.assertNotIn("The containers run as uid", symptom)
+        self.assertIn("optional", symptom)
+        self.assertIn("docker-compose.nonroot.yml", symptom)
+        self.assertIn(
+            "[guarded ownership procedure](#a-non-root-container-gets-permission-denied)", symptom
         )
-        checked = 0
-        for container, host in CONTAINER_BIND_SOURCES:
-            self.assertEqual(host_repair_path(container), host)
-            if f"Cannot write to {container} " not in quoted:
-                continue
-            checked += 1
-            self.assertIn(
-                f"sudo chown -R 10001:10001 {host}",
-                quoted,
-                f"the quoted line for {container} does not name the host path {host}",
-            )
-        self.assertTrue(checked, "Troubleshooting.md no longer quotes the unwritable-directory line")
+        # Preconditions must precede the commands, not follow the repair.
+        preconditions = " ".join(guarded.split("```bash", 1)[0].split())
+        for required in (
+            "runs the UI and history as root", "APP_UID", "APP_GID", "BACKUP_UID",
+            "HISTORY_SEGMENT_CATALOG_PATH", "not run a recursive change",
+            "Backup-Restore-and-Debug-Bundles", "Stop every writer", "host job",
+            "keep them stopped", "backup-secrets",
+        ):
+            with self.subTest(precondition=required):
+                self.assertIn(required, preconditions)
+        self.assertIn('-path ./config/backup-secrets -prune', guarded)
+        self.assertIn('-o "$backup_uid" -g "$app_gid"', guarded)
+        self.assertIn("Run the dry check first", guarded)
+        self.assertIn("point-in-time", guarded)
+
+        with (
+            patch("app.services.storage_writability._running_identity", return_value=(10001, 10001)),
+            patch.object(Path, "stat", return_value=SimpleNamespace(st_uid=0)),
+        ):
+            message = describe_unwritable_directory("/app/history")
+        self.assertIn(message, " ".join(symptom.split()))
+        self.assertIn("write access to ./history", message)
 
     def test_every_documented_chown_target_is_a_compose_bind_source(self) -> None:
+        for container, host in CONTAINER_BIND_SOURCES:
+            self.assertEqual(host_repair_path(container), host)
         sources = self._bind_sources()
         text = (self.ROOT / "wiki" / "Troubleshooting.md").read_text(encoding="utf-8")
         unknown = [

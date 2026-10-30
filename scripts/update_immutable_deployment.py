@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -54,6 +55,14 @@ MAX_RETENTION_ERROR_BYTES = 4096
 # in total, before treating the check as failed.
 RETENTION_BUSY_MAX_WAIT_SECONDS = 120
 RETENTION_BUSY_MAX_RETRY_AFTER_SECONDS = 30
+# Durable history state (#463). History /healthz answers HTTP 200 for both an
+# unreachable appliance and a store that needs recovery, so HTTP readiness says
+# nothing about the local store. Only these two boolean flags are read or
+# recorded; no detail text, timestamp or other health field reaches the receipt.
+DURABLE_STATE_FLAGS = ("history_recovery_required", "history_collection_paused")
+DURABLE_STATES = ("intact", "recovery_required", "collection_paused", "unknown")
+MAX_HISTORY_HEALTH_BYTES = 1024 * 1024
+DURABLE_STATE_EXIT_CODE = 3
 
 
 class DeploymentError(RuntimeError):
@@ -62,6 +71,21 @@ class DeploymentError(RuntimeError):
 
 class RetentionTotalsUnavailable(DeploymentError):
     """The inventory answered normally but its summary has no retention totals."""
+
+
+class DurableStateNotAccepted(DeploymentError):
+    """The image converged, but history reports durable state that is not intact.
+
+    This is a distinct non-pass, not an activation failure: nothing is rolled
+    back or restarted, because a previous image cannot repair a damaged store.
+    """
+
+    def __init__(self, result: JsonObject) -> None:
+        state = result["durable_state"]["state"]
+        super().__init__(
+            f"durable history state is {state}; the converged image was not rolled back or restarted"
+        )
+        self.result = result
 
 
 class InventoryBusy(DeploymentError):
@@ -104,6 +128,7 @@ class DeploymentSpec:
     health_urls: tuple[str, ...]
     replace_compose: bool = False
     inventory_url: str | None = None
+    history_health_url: str | None = None
 
 
 def _sha256(data: bytes) -> str:
@@ -366,6 +391,64 @@ def _default_fetch_json(url: str) -> object:
         raise DeploymentError("inventory response is not JSON") from exc
 
 
+def _default_fetch_history_health(url: str) -> object:
+    """Read one bounded history /healthz JSON body after HTTP readiness passed."""
+
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        with opener.open(url, timeout=10) as response:
+            if response.geturl() != url or not 200 <= response.status < 300:
+                raise DeploymentError("history health response was redirected or unsuccessful")
+            data = response.read(MAX_HISTORY_HEALTH_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise DeploymentError("history health could not be read") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise DeploymentError("history health could not be read") from exc
+    if len(data) > MAX_HISTORY_HEALTH_BYTES:
+        raise DeploymentError("history health response exceeds its size limit")
+    try:
+        return json.loads(data)
+    except (ValueError, RecursionError) as exc:
+        raise DeploymentError("history health response is not JSON") from exc
+
+
+def _durable_state_name(recovery_required: bool | None, collection_paused: bool | None) -> str:
+    # A pause is about the database in use now, so it outranks an earlier
+    # quarantine, as in history /healthz. A missing or non-boolean flag is
+    # unknown, never healthy.
+    if collection_paused is True:
+        return "collection_paused"
+    if recovery_required is True:
+        return "recovery_required"
+    if recovery_required is None or collection_paused is None:
+        return "unknown"
+    return "intact"
+
+
+def _read_durable_state(fetch_health: FetchJson, url: str) -> JsonObject:
+    """Record only the two durable-state booleans from history /healthz."""
+    try:
+        payload = fetch_health(url)
+    except DeploymentError:
+        payload = None
+    collector = payload.get("collector") if isinstance(payload, dict) else None
+    flags: dict[str, bool | None] = {key: None for key in DURABLE_STATE_FLAGS}
+    if isinstance(collector, dict):
+        for key in DURABLE_STATE_FLAGS:
+            value = collector.get(key)
+            flags[key] = value if type(value) is bool else None
+    return {
+        "history_health_url": url,
+        "state": _durable_state_name(flags["history_recovery_required"], flags["history_collection_paused"]),
+        **flags,
+    }
+
+
 def _system_retention_url(url: str) -> str:
     """Ask for totals across every enclosure and storage view of the system (#911).
 
@@ -507,6 +590,8 @@ def _validate_spec(spec: DeploymentSpec) -> Path:
         _validate_health_url(url)
     if spec.inventory_url is not None:
         _validate_health_url(spec.inventory_url, label="inventory URL")
+    if spec.history_health_url is not None:
+        _validate_health_url(spec.history_health_url, label="history health URL")
     env_path = root / ".env"
     if env_path.is_symlink() or not env_path.is_file():
         raise DeploymentError(".env must be a regular non-symlink file")
@@ -670,6 +755,17 @@ def _receipt_payload(
             if spec.inventory_url is not None
             else {}
         ),
+        **(
+            {
+                "durable_state": {
+                    "history_health_url": spec.history_health_url,
+                    "state": None,
+                    **{key: None for key in DURABLE_STATE_FLAGS},
+                }
+            }
+            if spec.history_health_url is not None
+            else {}
+        ),
     }
 
 
@@ -740,6 +836,24 @@ def _validate_retention_record(record: object) -> None:
             raise DeploymentError(f"receipt retention {side} totals are invalid")
 
 
+def _validate_durable_state_record(record: object) -> None:
+    if not isinstance(record, dict) or set(record) != {"history_health_url", "state", *DURABLE_STATE_FLAGS}:
+        raise DeploymentError("receipt durable_state record is invalid")
+    if not isinstance(record["history_health_url"], str):
+        raise DeploymentError("receipt durable_state history health URL is invalid")
+    _validate_health_url(record["history_health_url"], label="receipt durable_state history health URL")
+    flags = [record[key] for key in DURABLE_STATE_FLAGS]
+    if not all(value is None or type(value) is bool for value in flags):
+        raise DeploymentError("receipt durable_state flags are invalid")
+    state = record["state"]
+    if state is None:
+        # Not observed yet (prepared, or activation failed before the read).
+        if any(value is not None for value in flags):
+            raise DeploymentError("receipt durable_state is inconsistent")
+    elif state not in DURABLE_STATES or state != _durable_state_name(*flags):
+        raise DeploymentError("receipt durable_state is inconsistent")
+
+
 def _validate_receipt_shape(receipt: object) -> JsonObject:
     if not isinstance(receipt, dict):
         raise DeploymentError("receipt must be a JSON object")
@@ -769,6 +883,10 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
     if "retention" in receipt:
         expected_keys.add("retention")
         _validate_retention_record(receipt["retention"])
+    # Receipts written without --history-health-url carry no durable-state record.
+    if "durable_state" in receipt:
+        expected_keys.add("durable_state")
+        _validate_durable_state_record(receipt["durable_state"])
     if set(receipt) != expected_keys:
         raise DeploymentError("receipt key set does not match the schema")
     if type(receipt["schema"]) is not int or receipt["schema"] != RECEIPT_SCHEMA:
@@ -1082,6 +1200,7 @@ def update_deployment(
     download: Download = _default_download,
     probe: Probe = _default_probe,
     fetch_json: FetchJson = _default_fetch_json,
+    fetch_health: FetchJson = _default_fetch_history_health,
 ) -> JsonObject:
     root = _validate_spec(spec)
     receipt_dir = root / RECEIPT_DIR_NAME
@@ -1173,9 +1292,9 @@ def update_deployment(
         receipt["status"] = "active"
         receipt["result"] = result
         _write_receipt(receipt_dir, receipt)
+        output: JsonObject = {"status": "active", **result}
         if spec.inventory_url is not None:
-            return {"status": "active", **result, "retention": receipt["retention"]}
-        return {"status": "active", **result}
+            output["retention"] = receipt["retention"]
     except BaseException as activation_error:
         # Name the cause (#910): "activation failed" alone hid an unhealthy
         # container behind a first-start index build.
@@ -1188,6 +1307,16 @@ def update_deployment(
                 f"({_failure_summary(rollback_error)})"
             ) from rollback_error
         raise DeploymentError(f"activation failed ({cause}); automatic rollback completed") from activation_error
+    if spec.history_health_url is not None:
+        # Outside the rollback scope on purpose (#463): a damaged or paused store
+        # is a separate non-pass. Do not roll back, restart or repair; an older
+        # image cannot restore lost history.
+        receipt["durable_state"] = _read_durable_state(fetch_health, spec.history_health_url)
+        _write_receipt(receipt_dir, receipt)
+        output["durable_state"] = receipt["durable_state"]
+        if output["durable_state"]["state"] != "intact":
+            raise DurableStateNotAccepted(output)
+    return output
 
 
 def verify_deployment(
@@ -1195,13 +1324,20 @@ def verify_deployment(
     *,
     run: RunCommand = _default_run,
     probe: Probe = _default_probe,
+    fetch_health: FetchJson = _default_fetch_history_health,
 ) -> JsonObject:
     root = root.resolve(strict=True)
     receipt = validate_receipt(root)
     if receipt["status"] == "prepared":
         raise DeploymentError("prepared receipt has no terminal deployment state")
     image = str(receipt["expected_image"] if receipt["status"] == "active" else receipt["previous_image"])
-    return _verify_runtime(root, receipt, image, run=run, probe=probe)
+    result = _verify_runtime(root, receipt, image, run=run, probe=probe)
+    if "durable_state" in receipt:
+        url = str(receipt["durable_state"]["history_health_url"])
+        result = {**result, "durable_state": _read_durable_state(fetch_health, url)}
+        if result["durable_state"]["state"] != "intact":
+            raise DurableStateNotAccepted(result)
+    return result
 
 
 def rollback_deployment(
@@ -1245,6 +1381,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "(aggregate totals only) or rolls back"
         ),
     )
+    update.add_argument(
+        "--history-health-url",
+        help=(
+            "loopback history /healthz URL; when given, update and verify also read its "
+            "history_recovery_required and history_collection_paused flags and exit with status "
+            f"{DURABLE_STATE_EXIT_CODE} unless durable history state is intact, without rolling back"
+        ),
+    )
     for action in ("verify", "rollback"):
         command = subparsers.add_parser(action)
         command.add_argument("root", type=Path)
@@ -1269,12 +1413,17 @@ def main(argv: list[str] | None = None) -> int:
                     health_urls=tuple(args.health_url),
                     replace_compose=args.replace_compose,
                     inventory_url=args.inventory_url,
+                    history_health_url=args.history_health_url,
                 )
             )
         elif args.action == "verify":
             result = verify_deployment(args.root)
         else:
             result = rollback_deployment(args.root)
+    except DurableStateNotAccepted as exc:
+        print(json.dumps(exc.result, indent=2, sort_keys=True))
+        print(f"durable state not accepted: {exc}", file=sys.stderr)
+        return DURABLE_STATE_EXIT_CODE
     except DeploymentError as exc:
         print(f"deployment error: {exc}", file=sys.stderr)
         return 1

@@ -187,6 +187,48 @@ class DiskRetentionAccountingUnitTests(unittest.TestCase):
             # da1 (persistent id, no serial) was dropped by the rendering.
             self.assertEqual(accounting.unplaced_disk_count, 1)
 
+    def test_bare_mapper_reason_counts_observations_not_names(self) -> None:
+        for field in (
+            "identifier", "device_name", "path_device_name", "multipath_name",
+            "multipath_member", "smart_devices",
+        ):
+            for name in ("dm-16", "/dev/dm-317", " DM-42 "):
+                with self.subTest(field=field, name=name):
+                    record = SimpleNamespace(**{field: [name, name] if field == "smart_devices" else name})
+                    accounting = build_disk_retention_accounting(
+                        source_disks=[record, record, SimpleNamespace()], slots=[],
+                    )
+                    self.assertEqual(accounting.source_disk_count, 3)
+                    self.assertEqual(accounting.rendered_unique_disk_count, 0)
+                    self.assertEqual(accounting.duplicate_disk_view_count, 0)
+                    self.assertEqual(accounting.unplaced_disk_count, 3)
+                    self.assertEqual(accounting.bare_device_mapper_unplaced_count, 2)
+
+    def test_bare_mapper_reason_excludes_other_identity_and_collision_refusals(self) -> None:
+        records = [
+            SimpleNamespace(device_name="dm-16", **fields)
+            for fields in (
+                {"serial": "SANITIZED-RETENTION-A"},
+                {"lunid": "SANITIZED-LUN-A"},
+                {"identifier": "disk/by-id/dm-uuid-mpath-SANITIZED-A"},
+                {"path_device_name": "sda"},
+                {"multipath_name": "multipath/SANITIZED-A"},
+                {"multipath_member": "sdb"},
+                {"smart_devices": ["sdc"]},
+                {},
+            )
+        ]
+        records.extend([
+            SimpleNamespace(),
+            SimpleNamespace(serial="SANITIZED-A", lunid="SANITIZED-SHARED", device_name="sdd"),
+            SimpleNamespace(serial="SANITIZED-A0000", lunid="SANITIZED-SHARED", device_name="sde"),
+            SimpleNamespace(device_name="dm-17", path_device_name="sdd", smart_devices=["sde"]),
+        ])
+        accounting = build_disk_retention_accounting(source_disks=records, slots=[])
+        self.assertEqual(accounting.source_disk_count, 12)
+        self.assertEqual(accounting.unplaced_disk_count, 12)
+        self.assertEqual(accounting.bare_device_mapper_unplaced_count, 1)
+
     def test_identity_free_occupied_bays_do_not_consume_a_source_disk(self) -> None:
         # Only bay-scoped attributes: nothing here identifies the occupant.
         unknown = self._slot(
@@ -425,6 +467,71 @@ class VirtualFallbackRetentionTests(unittest.TestCase):
         )
         self.assertEqual(predecessor.summary.unplaced_disk_count, 0)
         self.assertEqual(successor.summary.unplaced_disk_count, 0)
+
+
+class BareMapperSnapshotWarningTests(unittest.TestCase):
+    def _snapshot(self, disks, *, physical=False):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="system-a", truenas=TrueNASConfig(platform="scale"))
+            service = build_service(Settings(systems=[system]), system, temp_dir)
+            return build_snapshot(
+                service,
+                raw_data_for(disks, enclosures=synthetic_enclosure_rows(disks) if physical else []),
+            )
+
+    def test_snapshot_and_page_explain_only_bare_mapper_unplaced_observations(self) -> None:
+        from starlette.requests import Request
+        from starlette.routing import Mount, Route, Router
+        from app.models.domain import StorageViewRuntimePayload
+        from app.route_support import build_index_context, templates
+
+        disks = [{"name": "dm-317"}, {"name": "dm-419"}, {"name": "da0", "serial": "SANITIZED-A"}]
+        warning = (
+            "2 source disk observations remain unplaced because their only identity evidence "
+            "is a bare dm-N device-mapper minor, which is not a trustworthy disk identity."
+        )
+        for physical in (False, True):
+            with self.subTest(physical=physical):
+                snapshot = self._snapshot(disks, physical=physical)
+                summary = snapshot.summary
+                self.assertEqual(
+                    (summary.disk_count, summary.source_disk_count, summary.rendered_unique_disk_count,
+                     summary.duplicate_disk_view_count, summary.unplaced_disk_count),
+                    (3, 3, 1, 0, 2),
+                )
+                self.assertEqual([w for w in snapshot.warnings if "bare dm-N" in w], [warning])
+                request = Request({
+                    "type": "http", "scheme": "http", "path": "/", "root_path": "",
+                    "headers": [], "server": ("testserver", 80), "query_string": b"",
+                    "router": Router(routes=[
+                        Mount("/static", app=Router(), name="static"),
+                        Route("/sas-fabric", lambda request: None, name="sas_fabric_view"),
+                    ]),
+                })
+                context = build_index_context(
+                    request=request, snapshot=snapshot,
+                    storage_view_runtime=StorageViewRuntimePayload(system_id="system-a", views=[]),
+                    settings=Settings(), history_configured=False,
+                )
+                html = templates.get_template("index.html").render(context)
+                banners = html.split('id="warning-list"', 1)[1].split("</section>", 1)[0]
+                self.assertIn(warning, banners)
+                self.assertNotIn("dm-317", banners)
+                self.assertNotIn("dm-419", banners)
+                self.assertNotIn("SANITIZED-A", banners)
+
+    def test_snapshot_does_not_blame_bare_mapper_when_other_identity_is_available(self) -> None:
+        for fields in (
+            {"serial": "SANITIZED-A"},
+            {"lunid": "SANITIZED-LUN-A"},
+            {"identifier": "disk/by-id/dm-uuid-mpath-SANITIZED-A"},
+            {"multipath_member": "sda"},
+        ):
+            with self.subTest(fields=fields):
+                snapshot = self._snapshot([{"name": "dm-317", **fields}])
+                self.assertEqual(snapshot.summary.source_disk_count, 1)
+                self.assertEqual(snapshot.summary.unplaced_disk_count, 0)
+                self.assertFalse(any("bare dm-N" in w for w in snapshot.warnings))
 
 
 class QuantaStorNodeScopedRetentionTests(unittest.TestCase):

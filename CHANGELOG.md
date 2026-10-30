@@ -51,6 +51,33 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Explained unplaced source observations whose only identity evidence was a bare
+  device-mapper minor, without changing disk identity or retention totals (#1026).
+- Quantastor and Supermicro BMC requests no longer follow redirects to another
+  host, port or plain HTTP with credentials, a competing first SSH connection
+  can no longer replace a pinned host key, BMC discovery caps reported
+  controller and drive counts, and TLS bundle saves stage in their own file
+  (#1052).
+- The immutable update helper's new opt-in `--history-health-url` reported a
+  history store that needs recovery or has paused collection as a distinct
+  non-pass (exit 3) instead of a pass, without rolling back. The upgrade
+  matrix listed read-only and full history state as tested, and the sudo
+  examples used anchored arguments instead of trailing globs (#1051).
+- Admin kept late-rendered buttons locked after it stopped, rejected fractional
+  profile builder sizes with a message, showed a failed drive discovery as a
+  failure, and let Move Up/Down reorder views that share an order (#1050).
+- Admin timing saves rejected fractional and boolean values instead of
+  truncating them, delayed demo creation kept newer setup drafts, history
+  adoption used the maintenance deadline and reported unconfirmed results as
+  unknown, and storage-view history returned 422/413 for rejected requests (#1049).
+- Quantastor CLI trailing-comma repair kept commas inside quoted values, and
+  SMART summaries kept a reported zero temperature or self-test lifetime
+  instead of replacing it with slot fallback values (#1046).
+- Failed segmented history restore staging removed the hot-copy file it had
+  created; SAS diagnostics labelled LOG SENSE page controls in command order
+  and decoded REPORT LUNS and INQUIRY allocation lengths at full width (#1047).
+- Directed ownership-repair advice to the guarded troubleshooting procedure
+  instead of a blanket recursive command (#1045).
 - CORE bootstrap supplied a validated next UID before creating a missing service
   account, avoiding the CORE13 home-permission UID failure while preserving
   existing accounts and refusing malformed allocation results (#1025).

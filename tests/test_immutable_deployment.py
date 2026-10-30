@@ -12,6 +12,7 @@ import threading
 import unittest
 import urllib.error
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 from scripts import update_immutable_deployment as deployment
@@ -950,6 +951,299 @@ class ImmutableDeploymentTests(unittest.TestCase):
             with self.assertRaisesRegex(deployment.DeploymentError, "receipt result"):
                 deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)
             self.assertEqual(len(runtime.commands), command_count)
+
+    HISTORY_HEALTH_URL = "http://127.0.0.1:8081/healthz"
+
+    @staticmethod
+    def history_health(*, recovery_required: object = False, paused: object = False,
+                       detail: str | None = None) -> dict[str, object]:
+        """A synthetic history /healthz body: HTTP 200 for ok and degraded alike."""
+        degraded = bool(detail) or recovery_required is True or paused is True
+        return {
+            "status": "degraded" if degraded else "ok",
+            "detail": detail,
+            "collector": {
+                "history_recovery_required": recovery_required,
+                "history_quarantined_at": "2026-01-02T03:04:05Z" if recovery_required is True else None,
+                "history_collection_paused": paused,
+                "history_collection_paused_at": "2026-01-02T03:04:06Z" if paused is True else None,
+                "last_error": "History collector error; see service logs." if detail else None,
+            },
+            "database_size_bytes": 4096,
+        }
+
+    def durable_update(
+        self, root: Path, answers: list[object],
+    ) -> tuple[FakeRuntime, Callable[[], dict[str, object]], list[str]]:
+        runtime = FakeRuntime(root)
+        spec = deployment.DeploymentSpec(
+            **{**self.make_spec(root).__dict__, "history_health_url": self.HISTORY_HEALTH_URL},
+        )
+        reads: list[str] = []
+
+        def fetch_health(url: str) -> object:
+            reads.append(url)
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        def update() -> dict[str, object]:
+            return deployment.update_deployment(
+                spec, run=runtime.run, download=runtime.download, probe=runtime.probe,
+                fetch_health=fetch_health,
+            )
+
+        runtime.fetch_health = fetch_health  # type: ignore[attr-defined]
+        return runtime, update, reads
+
+    def assert_durable_non_pass_without_rollback(self, answers: list[object], expected: dict[str, object]) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime, update, reads = self.durable_update(root, answers)
+
+            with self.assertRaises(deployment.DurableStateNotAccepted) as caught:
+                update()
+
+            record = {"history_health_url": self.HISTORY_HEALTH_URL, **expected}
+            # Image convergence is real and stays recorded; durable acceptance is separate.
+            self.assertEqual(caught.exception.result["status"], "active")
+            self.assertEqual(caught.exception.result["durable_state"], record)
+            self.assertIn(str(expected["state"]), str(caught.exception))
+            self.assertIn("not rolled back", str(caught.exception))
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "active")
+            self.assertEqual(receipt["durable_state"], record)
+            # No automatic rollback, restart or repair: one activation only.
+            self.assertEqual(runtime.active_image_id, NEW_IMAGE_ID)
+            self.assertEqual(sum(1 for command in runtime.commands if "up" in command), 1)
+            self.assertIn(f"JBOD_UI_IMAGE={NEW_DIGEST}", (root / ".env").read_text())
+            self.assertEqual(reads, [self.HISTORY_HEALTH_URL])
+            receipt_text = (root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_text(encoding="utf-8")
+            self.assertNotIn("2026-01-02", receipt_text)
+            self.assertNotIn("SYNTH", receipt_text)
+
+            # verify re-reads the same durable state and keeps reporting the non-pass.
+            answers.append(self.history_health(
+                recovery_required=expected["history_recovery_required"],
+                paused=expected["history_collection_paused"],
+            ) if expected["state"] != "unknown" else None)
+            with self.assertRaises(deployment.DurableStateNotAccepted) as verified:
+                deployment.verify_deployment(
+                    root, run=runtime.run, probe=runtime.probe,
+                    fetch_health=runtime.fetch_health,  # type: ignore[attr-defined]
+                )
+            self.assertEqual(verified.exception.result["image"], NEW_DIGEST)
+            self.assertEqual(verified.exception.result["durable_state"]["state"], expected["state"])
+
+            # A deliberate manual rollback stays available, does not read or
+            # claim to repair durable state, and keeps the activation evidence.
+            reads.clear()
+            deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["status"], "rolled_back")
+            self.assertEqual(receipt["durable_state"], record)
+            self.assertEqual(reads, [])
+
+    def test_durable_state_accepts_normal_history_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime, update, reads = self.durable_update(root, [self.history_health(), self.history_health()])
+
+            result = update()
+
+            record = {
+                "history_health_url": self.HISTORY_HEALTH_URL,
+                "state": "intact",
+                "history_recovery_required": False,
+                "history_collection_paused": False,
+            }
+            self.assertEqual(result["status"], "active")
+            self.assertEqual(result["durable_state"], record)
+            self.assertEqual(deployment.validate_receipt(root)["durable_state"], record)
+            self.assertEqual(reads, [self.HISTORY_HEALTH_URL])
+            verified = deployment.verify_deployment(
+                root, run=runtime.run, probe=runtime.probe,
+                fetch_health=runtime.fetch_health,  # type: ignore[attr-defined]
+            )
+            self.assertEqual(verified["durable_state"], record)
+
+    def test_durable_state_accepts_benign_appliance_degradation(self) -> None:
+        # A failed collection pass against an unreachable appliance is degraded
+        # (HTTP 200) but says nothing about the local store; it must still pass.
+        degraded = self.history_health(detail="SYNTH appliance unreachable")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime, update, _ = self.durable_update(root, [degraded])
+
+            result = update()
+
+            self.assertEqual(result["durable_state"]["state"], "intact")
+            self.assertEqual(runtime.active_image_id, NEW_IMAGE_ID)
+            receipt_text = (root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_text(encoding="utf-8")
+            self.assertNotIn("SYNTH", receipt_text)
+            self.assertNotIn("degraded", receipt_text)
+
+    def test_recovery_required_history_is_a_distinct_non_pass(self) -> None:
+        self.assert_durable_non_pass_without_rollback(
+            [self.history_health(recovery_required=True)],
+            {"state": "recovery_required", "history_recovery_required": True,
+             "history_collection_paused": False},
+        )
+
+    def test_paused_history_collection_is_a_distinct_non_pass(self) -> None:
+        self.assert_durable_non_pass_without_rollback(
+            [self.history_health(paused=True)],
+            {"state": "collection_paused", "history_recovery_required": False,
+             "history_collection_paused": True},
+        )
+
+    def test_unreadable_durable_state_is_unknown_not_healthy(self) -> None:
+        for label, answer in (
+            ("read failure", deployment.DeploymentError("history health could not be read")),
+            ("no collector", {"status": "ok", "detail": None}),
+            ("string flag", self.history_health(recovery_required="false")),
+            ("integer flag", self.history_health(paused=0)),
+            ("not an object", ["ok"]),
+        ):
+            with self.subTest(label=label):
+                recovery = None if label in {"read failure", "no collector", "not an object", "string flag"} else False
+                paused = None if label != "string flag" else False
+                self.assert_durable_non_pass_without_rollback(
+                    [answer],
+                    {"state": "unknown", "history_recovery_required": recovery,
+                     "history_collection_paused": paused},
+                )
+
+    def test_durable_state_is_opt_in_and_absent_receipts_stay_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root)
+
+            def unexpected(url: str) -> object:
+                raise AssertionError("durable state must not be read without --history-health-url")
+
+            result = deployment.update_deployment(
+                self.make_spec(root), run=runtime.run, download=runtime.download,
+                probe=runtime.probe, fetch_health=unexpected,
+            )
+            self.assertNotIn("durable_state", result)
+            self.assertNotIn("durable_state", deployment.validate_receipt(root))
+            self.assertNotIn(
+                "durable_state",
+                deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe, fetch_health=unexpected),
+            )
+
+    def test_history_health_url_must_be_loopback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root)
+            spec = deployment.DeploymentSpec(
+                **{**self.make_spec(root).__dict__, "history_health_url": "http://192.0.2.10:8081/healthz"},
+            )
+            with self.assertRaisesRegex(deployment.DeploymentError, "history health URL must use an explicit loopback"):
+                deployment.update_deployment(spec, run=runtime.run)
+            self.assertEqual(runtime.commands, [])
+
+    def test_receipt_durable_state_record_is_revalidated_before_runtime_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime, update, _ = self.durable_update(root, [self.history_health()])
+            update()
+            receipt_path = root / deployment.RECEIPT_DIR_NAME / "receipt.json"
+            original = json.loads(receipt_path.read_text(encoding="utf-8"))
+            command_count = len(runtime.commands)
+            cases = (
+                ("remote URL", lambda record: record.__setitem__("history_health_url", "http://192.0.2.10:8081/healthz")),
+                ("unknown state", lambda record: record.__setitem__("state", "repaired")),
+                ("integer flag", lambda record: record.__setitem__("history_collection_paused", 0)),
+                ("extra key", lambda record: record.__setitem__("detail", "SYNTH")),
+                ("missing key", lambda record: record.pop("history_recovery_required")),
+                ("intact while paused", lambda record: record.__setitem__("history_collection_paused", True)),
+                ("unobserved with flags", lambda record: record.__setitem__("state", None)),
+            )
+            for label, mutate in cases:
+                with self.subTest(label=label):
+                    receipt = json.loads(json.dumps(original))
+                    mutate(receipt["durable_state"])
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                    os.chmod(receipt_path, 0o600)
+                    with self.assertRaisesRegex(deployment.DeploymentError, "durable"):
+                        deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)
+                    self.assertEqual(len(runtime.commands), command_count)
+
+    def test_default_history_health_reader_is_bounded_loopback_json_only(self) -> None:
+        body = json.dumps(self.history_health(recovery_required=True)).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/healthz")
+                    self.end_headers()
+                    return
+                payload = {
+                    "/healthz": body,
+                    "/down": b'{"status": "down"}',
+                    "/text": b"not json",
+                    "/huge": b" " * (deployment.MAX_HISTORY_HEALTH_BYTES + 1),
+                }[self.path]
+                self.send_response(503 if self.path == "/down" else 200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            self.assertEqual(deployment._default_fetch_history_health(f"{base}/healthz"), json.loads(body))
+            for path in ("/redirect", "/down", "/text", "/huge"):
+                with self.subTest(path=path):
+                    with self.assertRaises(deployment.DeploymentError):
+                        deployment._default_fetch_history_health(f"{base}{path}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_cli_forwards_history_health_url_and_exits_three_on_durable_non_pass(self) -> None:
+        argv = [
+            "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
+            "--expected-image=" + NEW_DIGEST, "--candidate-tag=" + CANDIDATE_TAG,
+            "--compose=docker-compose.yml=live.yml", "--service=app",
+            "--health-url=http://127.0.0.1:8081/healthz",
+            "--history-health-url=" + self.HISTORY_HEALTH_URL,
+        ]
+        self.assertEqual(deployment._build_parser().parse_args(argv).history_health_url, self.HISTORY_HEALTH_URL)
+        result = {
+            "status": "active", "image": NEW_DIGEST,
+            "durable_state": {"history_health_url": self.HISTORY_HEALTH_URL, "state": "recovery_required",
+                              "history_recovery_required": True, "history_collection_paused": False},
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(deployment, "_require_linux_docker_host"),
+            mock.patch.object(deployment, "update_deployment",
+                              side_effect=deployment.DurableStateNotAccepted(result)) as update,
+            mock.patch("sys.stdout", stdout),
+            mock.patch("sys.stderr", stderr),
+        ):
+            code = deployment.main(argv)
+        self.assertEqual(code, 3)
+        self.assertEqual(update.call_args.args[0].history_health_url, self.HISTORY_HEALTH_URL)
+        self.assertEqual(json.loads(stdout.getvalue()), result)
+        self.assertIn("recovery_required", stderr.getvalue())
+
+    def test_runbook_documents_opt_in_durable_state_acceptance(self) -> None:
+        runbook = " ".join(Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8").split())
+        for text in ("--history-health-url http://127.0.0.1:8081/healthz", "history_recovery_required",
+                     "history_collection_paused", "exits with status 3", "does not roll back"):
+            self.assertIn(text, runbook)
 
     def test_runbook_uses_transactional_helper_instead_of_sourcing_receipts(self) -> None:
         runbook = Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8")

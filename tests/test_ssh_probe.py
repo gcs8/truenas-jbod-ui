@@ -46,6 +46,9 @@ class SSHProbeTests(unittest.TestCase):
             def add(self, hostname: str, _key_type: str, _key) -> None:
                 self.hosts.add(hostname)
 
+            def lookup(self, _hostname: str) -> None:
+                return None
+
         class FakeClient:
             def __init__(self) -> None:
                 self._host_keys = FakeHostKeys()
@@ -94,6 +97,62 @@ class SSHProbeTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(shared_hosts, {"host-a.example.test", "host-b.example.test"})
         self.assertEqual(peak_saves, 1)
+
+    def _pin_with_real_known_hosts(self, known_hosts: Path, hostname: str, key: paramiko.PKey) -> None:
+        client = RealSSHClient()
+        client.load_host_keys(str(known_hosts))
+        AutoPinHostKeyPolicy(str(known_hosts)).missing_host_key(client, hostname, key)
+
+    def test_tofu_pinning_never_replaces_a_pin_established_by_a_competing_session(self) -> None:
+        # #737: both sessions loaded an empty file, then one pinned first.
+        with tempfile.TemporaryDirectory() as raw:
+            known_hosts = Path(raw) / "known_hosts"
+            known_hosts.touch()
+            first_key = paramiko.ECDSAKey.generate()
+            competing_key = paramiko.ECDSAKey.generate()
+            late_client = RealSSHClient()
+            late_client.load_host_keys(str(known_hosts))
+
+            self._pin_with_real_known_hosts(known_hosts, "nas.example.test", first_key)
+            with self.assertRaises(paramiko.BadHostKeyException):
+                AutoPinHostKeyPolicy(str(known_hosts)).missing_host_key(
+                    late_client, "nas.example.test", competing_key,
+                )
+
+            stored = paramiko.HostKeys(str(known_hosts))
+            self.assertEqual(stored.lookup("nas.example.test"), {first_key.get_name(): first_key})
+
+    def test_tofu_pinning_rejects_a_different_key_type_beside_an_existing_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            known_hosts = Path(raw) / "known_hosts"
+            known_hosts.touch()
+            first_key = paramiko.ECDSAKey.generate()
+            other_type_key = paramiko.ECDSAKey.generate(bits=384)
+            late_client = RealSSHClient()
+            late_client.load_host_keys(str(known_hosts))
+
+            self._pin_with_real_known_hosts(known_hosts, "nas.example.test", first_key)
+            with self.assertRaises(paramiko.BadHostKeyException):
+                AutoPinHostKeyPolicy(str(known_hosts)).missing_host_key(
+                    late_client, "nas.example.test", other_type_key,
+                )
+
+            stored = paramiko.HostKeys(str(known_hosts))
+            self.assertEqual(stored.lookup("nas.example.test"), {first_key.get_name(): first_key})
+
+    def test_tofu_pinning_accepts_the_same_key_a_competing_session_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            known_hosts = Path(raw) / "known_hosts"
+            known_hosts.touch()
+            key = paramiko.ECDSAKey.generate()
+            late_client = RealSSHClient()
+            late_client.load_host_keys(str(known_hosts))
+
+            self._pin_with_real_known_hosts(known_hosts, "nas.example.test", key)
+            pinned_bytes = known_hosts.read_bytes()
+            AutoPinHostKeyPolicy(str(known_hosts)).missing_host_key(late_client, "nas.example.test", key)
+
+            self.assertEqual(known_hosts.read_bytes(), pinned_bytes)
 
     def test_redact_ssh_command_masks_inline_quantastor_server_secret(self) -> None:
         command = "/usr/bin/qs disk-list --json '--server=localhost,jbodmap,super-secret'"

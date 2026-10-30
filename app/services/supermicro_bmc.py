@@ -14,11 +14,17 @@ from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
 
 from app.config import BMCConfig, normalize_text, normalize_value_text
+from app.services.tls_context import SameOriginRedirectHandler
 from app.services.truenas_ws import TrueNASAPIError
 
 logger = logging.getLogger(__name__)
 
 SUPER_MICRO_STORAGE_PAGE = "/cgi/url_redirect.cgi?url_name=sys_storage"
+# #737: bound web-XML discovery. One inventory pass makes four fixed requests
+# plus three per controller, so the controller cap is also its request budget
+# (52 requests at the cap).
+BMC_MAX_CONTROLLERS = 16
+BMC_MAX_DRIVES_PER_CONTROLLER = 256
 DRIVE_LINK_SPEEDS = {
     1: "1.5 Gbps",
     2: "3.0 Gbps",
@@ -239,6 +245,13 @@ class SupermicroBMCService:
         controller_count = _int_from_decimal(ctrl_attr_node.get("ctrl_found_num")) if ctrl_attr_node is not None else None
         if not controller_count:
             raise TrueNASAPIError("Supermicro BMC did not report any Broadcom controllers.")
+        # #737: the reported count sets how many requests follow (three per
+        # controller), so an implausible value is refused before any of them.
+        if not 0 < controller_count <= BMC_MAX_CONTROLLERS:
+            raise TrueNASAPIError(
+                f"Supermicro BMC reported an unsupported Broadcom controller count "
+                f"(supported: 1 to {BMC_MAX_CONTROLLERS})."
+            )
 
         uid_root = self._post_web_xml(opener, csrf, "/cgi/ipmi.cgi", {"op": "GET_UID_STATUS.XML", "r": "(0,0)"})
         uid_node = uid_root.find("UID_INFO")
@@ -283,7 +296,13 @@ class SupermicroBMCService:
             hdd_info = phy_root.find("HDDInfo")
             if hdd_info is None:
                 continue
-            for physical_index, drive_node in enumerate(hdd_info.findall("HDD")):
+            drive_nodes = hdd_info.findall("HDD")
+            if len(drive_nodes) > BMC_MAX_DRIVES_PER_CONTROLLER:
+                raise TrueNASAPIError(
+                    f"Supermicro BMC reported more physical drives on controller {controller_id} "
+                    f"than the supported {BMC_MAX_DRIVES_PER_CONTROLLER}."
+                )
+            for physical_index, drive_node in enumerate(drive_nodes):
                 drive = self._parse_web_drive_node(controller_id, physical_index, drive_node)
                 if drive is not None:
                     inventory.drives.append(drive)
@@ -445,7 +464,9 @@ class SupermicroBMCService:
 
     def _build_https_opener(self, cookie_jar: http.cookiejar.CookieJar | None = None):
         context = ssl.create_default_context() if self.config.verify_ssl else ssl._create_unverified_context()
-        handlers = [HTTPSHandler(context=context)]
+        # Basic auth, the session cookie and the CSRF token follow same-origin
+        # redirects only (#737).
+        handlers: list[Any] = [HTTPSHandler(context=context), SameOriginRedirectHandler()]
         if cookie_jar is not None:
             handlers.insert(0, HTTPCookieProcessor(cookie_jar))
         return build_opener(*handlers)

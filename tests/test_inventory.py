@@ -8,7 +8,9 @@ import inspect
 import json
 import tempfile
 import threading
+import time
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12395,6 +12397,36 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_quantastor_cli_json_trailing_comma_repair_preserves_quoted_scalars(self) -> None:
+        # Each pair is (needs repair, valid equivalent); both must parse to the same values.
+        cases = (
+            ('[{"v": "x,]"},]', '[{"v": "x,]"}]', [{"v": "x,]"}]),
+            ('{"v": "x,}",}', '{"v": "x,}"}', {"v": "x,}"}),
+            ('[{"v": "x,  ]"},]', '[{"v": "x,  ]"}]', [{"v": "x,  ]"}]),
+            ('[{"v": "a\\",]"},]', '[{"v": "a\\",]"}]', [{"v": 'a",]'}]),
+            ('{"a,}": "b\\\\", "w": [1, 2 ,\n],}', '{"a,}": "b\\\\", "w": [1, 2]}', {"a,}": "b\\", "w": [1, 2]}),
+        )
+        for repair_payload, valid_payload, expected in cases:
+            with self.subTest(payload=repair_payload):
+                self.assertEqual(InventoryService._parse_quantastor_cli_json(valid_payload), expected)
+                self.assertEqual(InventoryService._parse_quantastor_cli_json(repair_payload), expected)
+
+        for malformed in ('{"v": "x",', '[{"v": 1,}, oops]', '{"v": "x,}'):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(InventoryService._parse_quantastor_cli_json(malformed))
+
+    def test_quantastor_cli_json_repair_scans_unterminated_strings_once(self) -> None:
+        # An unterminated string of escaped quotes made a string-aware regex rescan the suffix
+        # from every quote; the repair must stay linear for malformed CLI output.
+        payload = '[{"v": "' + '\\"' * 16384 + ",]"
+
+        started = time.perf_counter()
+        parsed = InventoryService._parse_quantastor_cli_json(payload)
+        elapsed = time.perf_counter() - started
+
+        self.assertIsNone(parsed)
+        self.assertLess(elapsed, 1.0)
+
     async def test_fetch_quantastor_cli_overlay_batches_primary_host_commands(self) -> None:
         class RecordingSSHProbe(SSHProbe):
             def __init__(self) -> None:
@@ -14550,6 +14582,61 @@ Enclosure Status diagnostic page:
 
         self.assertEqual(summary.read_commands, 7)
         self.assertTrue(summary.available)
+
+    def test_smart_merge_preserves_parsed_zero_temperature_and_lifetime(self) -> None:
+        def payload(temperature: int | None, lifetime: int | None) -> str:
+            document: dict[str, object] = {
+                "serial_number": "SANITIZED-SMART-ZERO",
+                "power_on_time": {"hours": 100},
+            }
+            if temperature is not None:
+                document["temperature"] = {"current": temperature}
+            if lifetime is not None:
+                document["ata_smart_self_test_log"] = {
+                    "standard": {
+                        "table": [
+                            {
+                                "type": {"string": "Short offline"},
+                                "status": {"string": "Completed without error"},
+                                "lifetime_hours": lifetime,
+                            }
+                        ]
+                    }
+                }
+            return json.dumps(document)
+
+        # (parsed temperature, parsed lifetime, slot temperature, slot lifetime,
+        #  expected temperature, expected lifetime, expected age)
+        cases = (
+            (0, 0, 36, 60, 0, 0, 100),
+            (0, 0, None, None, 0, 0, 100),
+            (0, 0, 0, 0, 0, 0, 100),
+            (31, 40, 36, 60, 31, 40, 60),
+            (None, None, 36, 60, 36, 60, 40),
+            (None, None, None, None, None, None, None),
+        )
+        for parsed_temp, parsed_life, slot_temp, slot_life, want_temp, want_life, want_age in cases:
+            with self.subTest(parsed=(parsed_temp, parsed_life), slot=(slot_temp, slot_life)):
+                slot = SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    serial="SANITIZED-SMART-ZERO",
+                    temperature_c=slot_temp,
+                    last_smart_test_lifetime_hours=slot_life,
+                )
+                parsed = InventoryService._parse_smart_payload_for_slot(slot, payload(parsed_temp, parsed_life))
+                self.assertEqual((parsed.temperature_c, parsed.last_test_lifetime_hours), (parsed_temp, parsed_life))
+
+                summary = InventoryService._merge_smart_summary(slot, parsed)
+
+                self.assertEqual(
+                    (summary.temperature_c, summary.last_test_lifetime_hours, summary.last_test_age_hours),
+                    (want_temp, want_life, want_age),
+                )
+                self.assertEqual(summary.power_on_hours, 100)
+                self.assertEqual((slot.temperature_c, slot.last_smart_test_lifetime_hours), (slot_temp, slot_life))
 
     def test_smart_summary_value_field_contract_tracks_the_model(self) -> None:
         self.assertEqual(
@@ -25510,3 +25597,69 @@ class StorageViewPoolHealthTests(unittest.IsolatedAsyncioTestCase):
             disk_temperatures={}, smart_test_results=[],
         )
         self.assertEqual(quantastor._pool_state_warnings(quantastor_pools, ParsedSSHData()), [])
+
+
+class SupermicroBMCDiscoveryBoundTests(unittest.TestCase):
+    """#737: BMC-reported counts must not drive unbounded discovery requests."""
+
+    def _service(self, responses: dict[str, str]):
+        from app.services.supermicro_bmc import SupermicroBMCService
+
+        service = SupermicroBMCService(
+            BMCConfig(enabled=True, host="https://bmc.example.test", username="synthetic", password="synthetic")
+        )
+        calls: list[str] = []
+        # Fail fast instead of hanging if discovery ignores the cap.
+        request_budget = 200
+
+        def post_web_xml(_opener, _csrf, _path, params):
+            calls.append(params["op"])
+            if len(calls) > request_budget:
+                raise AssertionError(f"BMC discovery exceeded {request_budget} requests")
+            return ET.fromstring(responses.get(params["op"], "<IPMI/>"))
+
+        service._open_web_session = MagicMock(return_value=(object(), "synthetic-csrf"))
+        service._post_web_xml = post_web_xml
+        return service, calls
+
+    def test_implausible_controller_count_is_refused_before_per_controller_requests(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        for reported in (str(BMC_MAX_CONTROLLERS + 1), "1000000000", "-3"):
+            with self.subTest(reported=reported):
+                service, calls = self._service(
+                    {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{reported}"/></IPMI>'}
+                )
+                with self.assertRaises(TrueNASAPIError):
+                    service._populate_web_inventory(BMCInventory())
+                self.assertEqual(calls, ["Get_BrcmStorCtrlAttr.XML"])
+
+    def test_controller_count_at_the_cap_is_still_collected(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        service, calls = self._service(
+            {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{BMC_MAX_CONTROLLERS}"/></IPMI>'}
+        )
+        inventory = BMCInventory()
+        service._populate_web_inventory(inventory)
+
+        self.assertEqual(len(inventory.controllers), BMC_MAX_CONTROLLERS)
+        self.assertEqual(len(calls), 2 + 3 * BMC_MAX_CONTROLLERS)
+        self.assertTrue(inventory.source_details["web_xml_ok"])
+
+    def test_oversized_drive_list_is_refused(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_DRIVES_PER_CONTROLLER, BMCInventory
+
+        drives = '<HDD Vendor="SANITIZED" ModelName="SANITIZED" SN="SANITIZED-1" Status="1"/>' * (
+            BMC_MAX_DRIVES_PER_CONTROLLER + 1
+        )
+        service, _calls = self._service(
+            {
+                "Get_BrcmStorCtrlAttr.XML": '<IPMI><BrcmStorCtrlAttr ctrl_found_num="1"/></IPMI>',
+                "Get_BrcmStorCtrlPhyDrvInfo.XML": f"<IPMI><HDDInfo>{drives}</HDDInfo></IPMI>",
+            }
+        )
+        inventory = BMCInventory()
+        with self.assertRaises(TrueNASAPIError):
+            service._populate_web_inventory(inventory)
+        self.assertEqual(inventory.drives, [])

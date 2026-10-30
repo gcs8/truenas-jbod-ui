@@ -985,15 +985,41 @@ class _ImportActivationTransaction:
             | getattr(os, "O_NOFOLLOW", 0),
             mode,
         )
+        created: os.stat_result | None = None
         try:
+            created = os.fstat(descriptor)
             cls._copy_file_to_descriptor(
                 source_path,
                 descriptor,
                 owner=owner,
                 mode=mode,
             )
+        except Exception as copy_error:
+            # Callers register the path only after this returns, so remove the
+            # file this open created on a handled failure; leave any object
+            # that replaced it, and leave crash artifacts to recovery.
+            if created is not None:
+                try:
+                    cls._remove_created_file(target_path, created)
+                except Exception as cleanup_error:
+                    copy_error.add_note(f"Staged restore file cleanup failed: {cleanup_error}")
+            raise
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _remove_created_file(cls, path: Path, created: os.stat_result) -> None:
+        try:
+            current = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+            created.st_dev,
+            created.st_ino,
+        ):
+            return
+        path.unlink()
+        cls._fsync_directory(path.parent)
 
     def activate_file(self, target_path: Path, member_key: str) -> None:
         self._activate_file(target_path, member_key, allow_history=False)

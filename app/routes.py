@@ -1397,6 +1397,13 @@ def build_router() -> APIRouter:
             )
         except HistoryBackendBusyError:
             return _history_read_busy_response()
+        except (HistoryRequestShapeError, HistoryBudgetExceeded) as exc:
+            # The local read planner rejected the request shape or budget
+            # before any backend call (#1044); other errors stay server errors.
+            raise HTTPException(
+                status_code=413 if isinstance(exc, HistoryBudgetExceeded) else 422,
+                detail=str(exc),
+            ) from exc
         histories_by_display_slot: dict[str, dict[str, Any]] = {}
         for scope_payload in payload.get("scopes", []):
             if not isinstance(scope_payload, dict):
