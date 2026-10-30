@@ -1361,7 +1361,7 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
         self.assertEqual(unmap["parameter_list_length"], 24)
         self.assertEqual(log_sense["log_page"], "Protocol-Specific Port")
         self.assertEqual(log_sense["log_page_control"], "0x1")
-        self.assertEqual(log_sense["log_page_control_label"], "Current threshold values")
+        self.assertEqual(log_sense["log_page_control_label"], "Current cumulative values")
         self.assertTrue(log_sense["log_save_parameters"])
         self.assertEqual(log_sense["allocation_length"], 64)
         self.assertEqual(receive_copy_results["operation"], "FAILED SEGMENT DETAILS")
@@ -1373,6 +1373,83 @@ mpr0: Controller reported scsi ioc terminated tgt 182 SMID 142 loginfo 30030200
         self.assertEqual(read_element_status["decode_source"], "t10_scsi_operation_codes")
         self.assertEqual(spare_in["operation"], "SPARE (IN)")
         self.assertEqual(spare_in["decode_confidence"], "standard")
+
+    @staticmethod
+    def _decoded_cdb_rows(lines: list[str]) -> dict[str, dict]:
+        events = parse_mpr_dmesg_events("\n".join(lines))
+        return {
+            record["target"]: record
+            for record in events["by_controller"]["mpr0"]["event_table"]["rows"]
+        }
+
+    def test_log_sense_page_control_labels_follow_command_field_order(self) -> None:
+        # LOG SENSE CDB byte 2 bits 7-6 (PC): 00b threshold, 01b cumulative,
+        # 10b default threshold, 11b default cumulative. A device may support
+        # only a subset; that never changes what each encoding means.
+        expected = {
+            0: ("0x0", "Current threshold values"),
+            1: ("0x1", "Current cumulative values"),
+            2: ("0x2", "Default threshold values"),
+            3: ("0x3", "Default cumulative values"),
+        }
+        lines = [
+            f"(da8{pc}:mpr0:0:30{pc}:0): LOG SENSE. CDB: "
+            f"4d 00 {(pc << 6) | 0x18:02x} 00 00 00 00 00 40 00"
+            for pc in expected
+        ]
+        rows = self._decoded_cdb_rows(lines)
+
+        for pc, (raw, label) in expected.items():
+            with self.subTest(page_control=pc):
+                cdb = f"4d 00 {(pc << 6) | 0x18:02x} 00 00 00 00 00 40 00"
+                decoded = decode_scsi_cdb_message(f"LOG SENSE. CDB: {cdb}")
+                self.assertEqual(decoded["log_page_control"], raw)
+                self.assertEqual(decoded["log_page_control_label"], label)
+                self.assertEqual(decoded["log_page_code"], "0x18")
+                row = rows[f"30{pc}"]
+                self.assertEqual(row["log_page_control"], raw)
+                self.assertEqual(row["log_page_control_label"], label)
+                self.assertEqual(row["decoded"]["log_page_control"], raw)
+                self.assertEqual(row["decoded"]["log_page_control_label"], label)
+
+    def test_cdb_allocation_length_uses_each_command_field_width(self) -> None:
+        rows = self._decoded_cdb_rows(
+            [
+                # REPORT LUNS: four-byte allocation length in bytes 6-9, MSB first.
+                "(da90:mpr0:0:400:0): REPORT LUNS. CDB: a0 00 00 00 00 00 01 02 03 04 00 00",
+                # INQUIRY: two-byte allocation length in bytes 3-4.
+                "(da91:mpr0:0:401:0): INQUIRY. CDB: 12 01 00 01 02 00",
+                # One-byte allocation lengths stay at byte 4.
+                "(da92:mpr0:0:402:0): REQUEST SENSE. CDB: 03 00 00 01 12 00",
+                "(da93:mpr0:0:403:0): MODE SENSE(6). CDB: 1a 00 3f 01 c0 00",
+                # LOG SENSE keeps its two-byte field in bytes 7-8.
+                "(da94:mpr0:0:404:0): LOG SENSE. CDB: 4d 00 58 00 00 00 09 01 02 07",
+            ]
+        )
+        expected = {
+            "400": ("REPORT LUNS", 0x01020304),
+            "401": ("INQUIRY", 0x0102),
+            "402": ("REQUEST SENSE", 0x12),
+            "403": ("MODE SENSE(6)", 0xC0),
+            "404": ("LOG SENSE", 0x0102),
+        }
+        for target, (operation, allocation_length) in expected.items():
+            with self.subTest(operation=operation):
+                row = rows[target]
+                self.assertEqual(row["operation"], operation)
+                self.assertEqual(row["allocation_length"], allocation_length)
+                self.assertEqual(row["decoded"]["allocation_length"], allocation_length)
+
+    def test_cdb_allocation_length_is_omitted_when_the_field_is_truncated(self) -> None:
+        for message, cdb_hex in (
+            ("REPORT LUNS. CDB: a0 00 00 00 00 00 01 02 03", "a0 00 00 00 00 00 01 02 03"),
+            ("INQUIRY. CDB: 12 01 00 01", "12 01 00 01"),
+        ):
+            with self.subTest(message=message):
+                decoded = decode_scsi_cdb_message(message)
+                self.assertNotIn("allocation_length", decoded)
+                self.assertEqual(decoded["cdb_hex"], cdb_hex)
+                self.assertEqual(decoded["byte_count"], len(cdb_hex.split()))
 
     def test_parse_mpr_dmesg_events_decodes_deeper_lsi_reference_tables(self) -> None:
         events = parse_mpr_dmesg_events(
