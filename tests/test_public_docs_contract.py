@@ -750,6 +750,33 @@ class PublicDocsContractTests(unittest.TestCase):
                 self.assertIn("verify_ssl: false", initial_setup)
                 self.assertNotIn("verify_ssl: true", initial_setup)
 
+    def test_sudo_grant_examples_use_anchored_or_exact_arguments(self) -> None:
+        # #992: a trailing sudo glob such as `/dev/sd*` or `--output *` can
+        # consume spaces and further options. Documented grants must use an
+        # anchored ^...$ argument regex or an exact, glob-free argument list.
+        def assert_bounded(relative: str, number: int, grant: str) -> None:
+            _, _, arguments = grant.strip().partition(" ")
+            with self.subTest(file=relative, line=number, grant=grant):
+                if arguments.startswith("^"):
+                    self.assertTrue(arguments.endswith("$"), "anchored grant must end with $")
+                else:
+                    self.assertNotRegex(arguments, r"[*?\[]", "unanchored grant uses a sudo glob")
+
+        checked = 0
+        for path in sorted([*(ROOT / "docs").glob("*.md"), *(ROOT / "wiki").glob("*.md")]):
+            relative = path.relative_to(ROOT).as_posix()
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                grant = line.split("NOPASSWD:", 1)[1].strip() if "NOPASSWD:" in line else ""
+                if grant.startswith("/"):
+                    assert_bounded(relative, number, grant)
+                    checked += 1
+        notes = (ROOT / "docs/GPU_SERVER_NOTES.md").read_text(encoding="utf-8")
+        rules = notes.split("- Sudo rules", 1)[1].split("\n## ", 1)[0]
+        for item in re.findall(r"^  - `([^`]+)`$", rules, re.MULTILINE):
+            assert_bounded("docs/GPU_SERVER_NOTES.md", 0, item)
+            checked += 1
+        self.assertGreaterEqual(checked, 20)
+
     def test_admin_guide_does_not_describe_the_main_ui_as_read_only(self) -> None:
         guide = (ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(
             encoding="utf-8"

@@ -517,6 +517,35 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
         self.assertIn("Not tested yet", matrix)
 
+    def test_support_matrix_does_not_list_ci_checked_storage_faults_as_untested(self):
+        # #463: readonly-state and enospc-state run in CI; the table must say so.
+        import re
+        workflow = yaml.safe_load((self.ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["image-upgrade-scenarios"]["steps"]
+        ci_scenarios = {name for step in steps for name in re.findall(r"--scenario (\S+)", step.get("run", ""))}
+        self.assertTrue({"readonly-state", "enospc-state"} <= ci_scenarios)
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        # Every scenario CI runs is named, so a tested cell cannot outlive its check.
+        for scenario in sorted(ci_scenarios):
+            self.assertIn(f"--scenario {scenario}", " ".join(matrix.split()))
+        rows = {}
+        for line in matrix.splitlines():
+            cells = [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+            if line.startswith("| ") and len(cells) == 3:
+                rows[cells[0]] = cells[1:]
+        tested, untested = rows["Local state"]
+        self.assertIn("read-only", tested)
+        self.assertIn("full", tested)
+        self.assertIn("HTTP 503", tested)
+        self.assertNotIn("read-only or full disks", untested)
+        # Bounds the CI runs do not cover stay listed as untested.
+        for bound in ("Network filesystems", "config or UI data directory", "data blocks"):
+            self.assertIn(bound, untested)
+        recovery_tested, recovery_untested = rows["Recovery"]
+        self.assertIn("fault is removed by hand", recovery_tested)
+        self.assertNotIn("a full disk", recovery_untested)
+
     def test_expected_history_view_matches_the_seed_shape(self):
         smoke = self.load_smoke()
         view = smoke.expected_history_view({1: 2, 4: 1})
