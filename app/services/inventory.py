@@ -12154,7 +12154,15 @@ class InventoryService:
         # Some qs commands, notably network-port-list on some appliances, emit
         # otherwise valid JSON with trailing commas. Keep the compatibility
         # shim narrow so normal parser failures still surface as failures.
-        sanitized = re.sub(r",(\s*[\]}])", r"\1", stdout)
+        # Match whole string literals first so commas inside quoted values
+        # are never removed. The closing quote is optional so an unterminated
+        # string is consumed once instead of rescanned from every quote.
+        sanitized = re.sub(
+            r'("[^"\\]*(?:\\.[^"\\]*)*"?)|,(\s*[\]}])',
+            r"\1\2",
+            stdout,
+            flags=re.DOTALL,
+        )
         if sanitized != stdout:
             try:
                 return json.loads(sanitized)
@@ -16240,12 +16248,14 @@ class InventoryService:
     def _merge_smart_summary(slot_view: SlotView, summary: SmartSummaryView) -> SmartSummaryView:
         if InventoryService._smart_summary_identity_conflicts(slot_view, summary):
             raise _SmartIdentityConflict()
-        summary.temperature_c = summary.temperature_c or slot_view.temperature_c
+        # Parsers report unknown numeric values as None; a parsed zero is a
+        # reading and must not be replaced by slot fallback values.
+        if summary.temperature_c is None:
+            summary.temperature_c = slot_view.temperature_c
         summary.last_test_type = summary.last_test_type or slot_view.last_smart_test_type
         summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
-        summary.last_test_lifetime_hours = (
-            summary.last_test_lifetime_hours or slot_view.last_smart_test_lifetime_hours
-        )
+        if summary.last_test_lifetime_hours is None:
+            summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
         summary.logical_block_size = summary.logical_block_size or slot_view.logical_block_size
         summary.physical_block_size = summary.physical_block_size or slot_view.physical_block_size
         summary.logical_unit_id = summary.logical_unit_id or slot_view.logical_unit_id

@@ -55,6 +55,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   truncating them, delayed demo creation kept newer setup drafts, history
   adoption used the maintenance deadline and reported unconfirmed results as
   unknown, and storage-view history returned 422/413 for rejected requests (#1049).
+- Quantastor CLI trailing-comma repair kept commas inside quoted values, and
+  SMART summaries kept a reported zero temperature or self-test lifetime
+  instead of replacing it with slot fallback values (#1046).
+- Failed segmented history restore staging removed the hot-copy file it had
+  created; SAS diagnostics labelled LOG SENSE page controls in command order
+  and decoded REPORT LUNS and INQUIRY allocation lengths at full width (#1047).
 - Directed ownership-repair advice to the guarded troubleshooting procedure
   instead of a blanket recursive command (#1045).
 - CORE bootstrap supplied a validated next UID before creating a missing service
