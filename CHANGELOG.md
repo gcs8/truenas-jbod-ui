@@ -51,6 +51,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Small segmented history reads skipped older sealed segments that could not
+  change the newest rows, avoiding a full sort of each unindexed segment (#1053).
 - Admin kept late-rendered buttons locked after it stopped, rejected fractional
   profile builder sizes with a message, showed a failed drive discovery as a
   failure, and let Move Up/Down reorder views that share an order (#1050).
