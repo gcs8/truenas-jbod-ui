@@ -12155,10 +12155,11 @@ class InventoryService:
         # otherwise valid JSON with trailing commas. Keep the compatibility
         # shim narrow so normal parser failures still surface as failures.
         # Match whole string literals first so commas inside quoted values
-        # are never removed.
+        # are never removed. The closing quote is optional so an unterminated
+        # string is consumed once instead of rescanned from every quote.
         sanitized = re.sub(
-            r'("[^"\\]*(?:\\.[^"\\]*)*")|,(\s*[\]}])',
-            lambda match: match.group(1) if match.group(1) is not None else match.group(2),
+            r'("[^"\\]*(?:\\.[^"\\]*)*"?)|,(\s*[\]}])',
+            r"\1\2",
             stdout,
             flags=re.DOTALL,
         )

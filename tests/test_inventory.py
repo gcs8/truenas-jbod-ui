@@ -8,6 +8,7 @@ import inspect
 import json
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -12412,6 +12413,18 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
         for malformed in ('{"v": "x",', '[{"v": 1,}, oops]', '{"v": "x,}'):
             with self.subTest(malformed=malformed):
                 self.assertIsNone(InventoryService._parse_quantastor_cli_json(malformed))
+
+    def test_quantastor_cli_json_repair_scans_unterminated_strings_once(self) -> None:
+        # An unterminated string of escaped quotes made a string-aware regex rescan the suffix
+        # from every quote; the repair must stay linear for malformed CLI output.
+        payload = '[{"v": "' + '\\"' * 16384 + ",]"
+
+        started = time.perf_counter()
+        parsed = InventoryService._parse_quantastor_cli_json(payload)
+        elapsed = time.perf_counter() - started
+
+        self.assertIsNone(parsed)
+        self.assertLess(elapsed, 1.0)
 
     async def test_fetch_quantastor_cli_overlay_batches_primary_host_commands(self) -> None:
         class RecordingSSHProbe(SSHProbe):
