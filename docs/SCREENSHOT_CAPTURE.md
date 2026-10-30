@@ -26,7 +26,7 @@ never on a workstation.
 
 | Thing | Pin |
 |---|---|
-| Container image | `mcr.microsoft.com/playwright:v1.64.0-jammy@sha256:c064e7f355d2dda32f669801a1b09e86a1e9252395c844d2cfbbe5c44acb9b79` |
+| Container image | `mcr.microsoft.com/playwright:v1.64.1-jammy@sha256:6075bd984554db82aee96bcdde53197f091dfe8c4b89322c61da77b86308b810` |
 | Playwright package | `package-lock.json`, installed with `npm ci --ignore-scripts` |
 | Browser build | the Chromium inside that image |
 | Fonts | the font packages inside that image, listed in the run log |
@@ -42,7 +42,7 @@ log, and `tests/test_ci_contract.py` fails if the `container.image` pin loses it
 
 ```bash
 curl -sSI -H "Accept: application/vnd.oci.image.index.v1+json" \
-  https://mcr.microsoft.com/v2/playwright/manifests/v1.64.0-jammy |
+  https://mcr.microsoft.com/v2/playwright/manifests/v1.64.1-jammy |
   grep -i docker-content-digest
 ```
 
@@ -56,10 +56,10 @@ already in the image. When Dependabot raises `@playwright/test`, raise the tag i
 image pin in the same pull request. Resolve and verify the new digest from the
 official registry; changing the tag alone is insufficient.
 
-The 1.64.0 pin was resolved from [Microsoft's registry](https://mcr.microsoft.com/v2/playwright/manifests/v1.64.0-jammy)
-on 2026-10-13. Its OCI index response hash matches the registry's
+The 1.64.1 pin was resolved from [Microsoft's registry](https://mcr.microsoft.com/v2/playwright/manifests/v1.64.1-jammy)
+on 2026-10-30. Its OCI index response hash matches the registry's
 `Docker-Content-Digest` header. The package version is the upstream
-[`v1.64.0` release](https://github.com/microsoft/playwright/releases/tag/v1.64.0).
+[`v1.64.1` release](https://github.com/microsoft/playwright/releases/tag/v1.64.1).
 This is source compatibility only:
 the new image has not yet been runtime-qualified. Image execution, browser
 availability, rendered fonts, and two-capture repeatability remain required
