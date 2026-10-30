@@ -51,6 +51,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Quantastor CLI trailing-comma repair kept commas inside quoted values, and
+  SMART summaries kept a reported zero temperature or self-test lifetime
+  instead of replacing it with slot fallback values (#1046).
 - Directed ownership-repair advice to the guarded troubleshooting procedure
   instead of a blanket recursive command (#1045).
 - CORE bootstrap supplied a validated next UID before creating a missing service
