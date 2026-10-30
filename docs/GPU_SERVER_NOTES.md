@@ -12,18 +12,21 @@ Hardware:
 
 - SSH user: `jbodmap`
 - Installed tools: `smartmontools`, `sg3-utils`, `lsscsi`, `mdadm`, `nvme-cli`
-- Sudo rules granted for:
-  - `smartctl -x -j /dev/sd*`
-  - `smartctl -x -j /dev/nvme*n*`
+- Sudo rules granted for the commands below. Use anchored argument regexes
+  (sudo 1.9.10 or newer) or exact per-device commands, never a trailing glob
+  such as `/dev/sd*`, which can also match extra options; see
+  [SSH read-only setup](SSH_READ_ONLY_SETUP.md#generic-linux-nvme-notes):
+  - `smartctl ^-x -j /dev/sd[a-z]+$`
+  - `smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$`
   - `nvme smart-log -o json /dev/nvmeN`
   - `nvme id-ctrl -o json /dev/nvmeN`
   - `nvme id-ns -o json /dev/nvmeNnM`
   - `lsscsi -g`
   - `lsblk -OJ`
   - `mdadm --detail --scan`
-  - `mdadm --detail /dev/md*`
-  - `sg_ses -p aes /dev/sg*`
-  - `sg_ses -p ec /dev/sg*`
+  - `mdadm ^--detail /dev/md[0-9]+$`
+  - `sg_ses ^-p aes /dev/sg[0-9]+$`
+  - `sg_ses ^-p ec /dev/sg[0-9]+$`
   - optional LED rules for `sg_ses --set/--clear=ident`
 
 ## Current Discovery Results
