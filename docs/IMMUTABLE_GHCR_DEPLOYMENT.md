@@ -110,6 +110,26 @@ budget. The helper never silently disables a requested retention check.
 retention verification for that update; there is no `--skip-retention-check`
 option.
 
+Add `--history-health-url http://127.0.0.1:8081/healthz` to also accept
+durable history state separately from image convergence (#463). History
+`/healthz` answers HTTP 200 both when a monitored appliance is unreachable and
+when the local store needs recovery, so a successful health probe alone does
+not show that history is intact. After the image converges, the helper reads
+only the `collector.history_recovery_required` and
+`collector.history_collection_paused` booleans and stores them, with a state
+name, under `durable_state` in the receipt; it stores no detail text or
+timestamps. The state is `intact` when both are `false`, `collection_paused` or
+`recovery_required` when either is set, and `unknown` when the body cannot be
+read or a flag is missing or not a boolean. Appliance-only degradation stays
+`intact`. Any other state is a distinct non-pass: the receipt stays `active`,
+the helper prints the result and exits with status 3, and `verify` repeats the
+same read and exit status. It does not roll back, restart or repair anything,
+because an older image cannot restore damaged history. Follow
+[Recover a damaged history database](../wiki/History-Maintenance-and-Recovery.md#recover-a-damaged-history-database)
+and run the explicit acknowledgement there only after recovery is complete;
+the `rollback` command remains a separate manual choice and does not repair
+durable data.
+
 The receipt is JSON data, not shell code. The helper rejects symlinks, wrong owners or modes, duplicate or extra keys, missing or extra files, hash changes, and cardinality mismatches before verify or rollback touches Docker. An existing receipt blocks another update so a rerun cannot erase rollback evidence.
 
 Activation and rollback allow up to 120 seconds of Docker `starting` health,
