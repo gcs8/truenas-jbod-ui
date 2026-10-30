@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25596,3 +25597,69 @@ class StorageViewPoolHealthTests(unittest.IsolatedAsyncioTestCase):
             disk_temperatures={}, smart_test_results=[],
         )
         self.assertEqual(quantastor._pool_state_warnings(quantastor_pools, ParsedSSHData()), [])
+
+
+class SupermicroBMCDiscoveryBoundTests(unittest.TestCase):
+    """#737: BMC-reported counts must not drive unbounded discovery requests."""
+
+    def _service(self, responses: dict[str, str]):
+        from app.services.supermicro_bmc import SupermicroBMCService
+
+        service = SupermicroBMCService(
+            BMCConfig(enabled=True, host="https://bmc.example.test", username="synthetic", password="synthetic")
+        )
+        calls: list[str] = []
+        # Fail fast instead of hanging if discovery ignores the cap.
+        request_budget = 200
+
+        def post_web_xml(_opener, _csrf, _path, params):
+            calls.append(params["op"])
+            if len(calls) > request_budget:
+                raise AssertionError(f"BMC discovery exceeded {request_budget} requests")
+            return ET.fromstring(responses.get(params["op"], "<IPMI/>"))
+
+        service._open_web_session = MagicMock(return_value=(object(), "synthetic-csrf"))
+        service._post_web_xml = post_web_xml
+        return service, calls
+
+    def test_implausible_controller_count_is_refused_before_per_controller_requests(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        for reported in (str(BMC_MAX_CONTROLLERS + 1), "1000000000", "-3"):
+            with self.subTest(reported=reported):
+                service, calls = self._service(
+                    {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{reported}"/></IPMI>'}
+                )
+                with self.assertRaises(TrueNASAPIError):
+                    service._populate_web_inventory(BMCInventory())
+                self.assertEqual(calls, ["Get_BrcmStorCtrlAttr.XML"])
+
+    def test_controller_count_at_the_cap_is_still_collected(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        service, calls = self._service(
+            {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{BMC_MAX_CONTROLLERS}"/></IPMI>'}
+        )
+        inventory = BMCInventory()
+        service._populate_web_inventory(inventory)
+
+        self.assertEqual(len(inventory.controllers), BMC_MAX_CONTROLLERS)
+        self.assertEqual(len(calls), 2 + 3 * BMC_MAX_CONTROLLERS)
+        self.assertTrue(inventory.source_details["web_xml_ok"])
+
+    def test_oversized_drive_list_is_refused(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_DRIVES_PER_CONTROLLER, BMCInventory
+
+        drives = '<HDD Vendor="SANITIZED" ModelName="SANITIZED" SN="SANITIZED-1" Status="1"/>' * (
+            BMC_MAX_DRIVES_PER_CONTROLLER + 1
+        )
+        service, _calls = self._service(
+            {
+                "Get_BrcmStorCtrlAttr.XML": '<IPMI><BrcmStorCtrlAttr ctrl_found_num="1"/></IPMI>',
+                "Get_BrcmStorCtrlPhyDrvInfo.XML": f"<IPMI><HDDInfo>{drives}</HDDInfo></IPMI>",
+            }
+        )
+        inventory = BMCInventory()
+        with self.assertRaises(TrueNASAPIError):
+            service._populate_web_inventory(inventory)
+        self.assertEqual(inventory.drives, [])

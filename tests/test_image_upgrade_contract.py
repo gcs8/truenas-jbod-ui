@@ -1654,3 +1654,233 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertEqual(smoke.build_parser().parse_args(base).scenario, "base")
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             smoke.main([*base, "--scenario", "hardened"])
+
+    def test_clean_host_admission_refuses_existing_root_and_missing_consent(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "jbod-clean-host-fixture"
+            with self.assertRaises(smoke.SmokeError):
+                smoke.admit_clean_host_root(root, consent=False)
+            self.assertFalse(root.exists())
+            root.mkdir()
+            marker = root / "keep"
+            marker.write_text("untouched")
+            with self.assertRaises(smoke.SmokeError):
+                smoke.admit_clean_host_root(root, consent=True)
+            self.assertEqual(marker.read_text(), "untouched")
+
+    def test_clean_host_admission_refuses_symlink_and_unbounded_names(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            (parent / "link").symlink_to(parent, target_is_directory=True)
+            for root in (parent / "other", parent / "link" / "jbod-clean-host-fixture"):
+                with self.subTest(root=root), self.assertRaises(smoke.SmokeError):
+                    smoke.admit_clean_host_root(root, consent=True)
+
+    def test_clean_host_resource_census_never_calls_inspect_absence(self):
+        smoke = self.load_smoke()
+        for failure in range(4):
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if len(calls) - 1 == failure:
+                    raise smoke.SmokeError("daemon unavailable")
+                return ""
+
+            with mock.patch.object(smoke, "run", side_effect=run):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.clean_host_absent("owned", {})
+            self.assertEqual(len(calls), 4)
+            self.assertTrue(all("ls" in command for command in calls))
+
+    def test_clean_host_resource_census_refuses_reserved_names_and_residuals(self):
+        smoke = self.load_smoke()
+        for index in range(4):
+            output = ["", "", "", ""]
+            output[index] = "truenas-jbod-admin" if index == 0 else "residual"
+            with mock.patch.object(smoke, "run", side_effect=output):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.clean_host_absent("owned", {})
+
+    def test_clean_host_teardown_failure_still_checks_absence_and_retains_files(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "recovery.7z"
+            archive.write_bytes(b"retain")
+            deployment = smoke.Deployment(root)
+            deployment.compose = mock.Mock(side_effect=smoke.SmokeError("down failed"))
+            with mock.patch.object(smoke, "clean_host_absent") as census:
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.clean_host_down(deployment, "owned", {})
+            census.assert_called_once()
+            self.assertEqual(archive.read_bytes(), b"retain")
+
+    def test_clean_host_unknown_cleanup_retains_recovery_after_successful_down(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "key-input").write_text("synthetic")
+            deployment = smoke.Deployment(root)
+            deployment.compose = mock.Mock(return_value="")
+            with mock.patch.object(smoke, "clean_host_absent", side_effect=smoke.SmokeError("unknown")):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.clean_host_down(deployment, "owned", {})
+            self.assertTrue((root / "key-input").is_file())
+            deployment.compose.assert_called_once()
+            command = deployment.compose.call_args.args
+            deployment.set_image("synthetic-image")
+            self.assertIn("COMPOSE_PROFILES=history", (root / ".env").read_text())
+            # Explicit --profile flags replace the .env profile selection.
+            # Check both supplied Compose documents, without claiming a Docker run.
+            profiles = {command[index + 1] for index, value in enumerate(command[:-1])
+                        if value == "--profile"}
+            for fixture in ("tests/fixtures/compose/v0.22.2.yml", "docker-compose.yml"):
+                services = yaml.safe_load((self.ROOT / fixture).read_text())["services"]
+                selected = {name for name, service in services.items()
+                            if not service.get("profiles") or profiles.intersection(service["profiles"])}
+                self.assertTrue({"enclosure-ui", "enclosure-history", "enclosure-admin"} <= selected)
+            self.assertEqual(command[-2:], ("down", "--volumes"))
+
+    def test_clean_host_http_restore_uses_encrypted_inspection_receipt(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "recovery.7z"
+            archive.write_bytes(b"encrypted fixture")
+            calls = []
+
+            def post(path, body, headers):
+                calls.append((path, body, headers))
+                if path.endswith("inspect"):
+                    return {"ok": True, "encrypted": True, "encryption_mode": "encrypted",
+                            "inspection_receipt": "single-use", "present_groups": list(smoke.CLEAN_HOST_GROUPS),
+                            "selected_groups": list(smoke.CLEAN_HOST_GROUPS), "absent_groups": []}
+                return {"ok": True, "included_groups": list(smoke.CLEAN_HOST_GROUPS)}
+
+            with mock.patch.object(smoke, "clean_host_post", side_effect=post):
+                smoke.clean_host_import(archive, "synthetic recovery input")
+            self.assertEqual(len(calls), 2)
+            self.assertIn("stop_services=true&restart_services=false", calls[1][0])
+            self.assertEqual(calls[1][2]["X-Backup-Inspection-Receipt"], "single-use")
+            self.assertEqual(calls[1][2]["X-Backup-Expected-Encryption"], "encrypted")
+            self.assertEqual(calls[0][1], calls[1][1])
+
+    def test_clean_host_refuses_plaintext_missing_group_and_missing_receipt_before_import(self):
+        smoke = self.load_smoke()
+        good = {"ok": True, "encrypted": True, "encryption_mode": "encrypted",
+                "inspection_receipt": "single-use", "present_groups": list(smoke.CLEAN_HOST_GROUPS),
+                "selected_groups": list(smoke.CLEAN_HOST_GROUPS), "absent_groups": []}
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "recovery.7z"
+            archive.write_bytes(b"synthetic")
+            for changed in ({"encrypted": False}, {"present_groups": []}, {"inspection_receipt": ""}):
+                with self.subTest(changed=changed):
+                    with mock.patch.object(smoke, "clean_host_post", return_value={**good, **changed}) as post:
+                        with self.assertRaises(smoke.SmokeError):
+                            smoke.clean_host_import(archive, "synthetic")
+                    self.assertEqual(post.call_count, 1)
+
+    def test_clean_host_restore_oracle_rejects_count_byte_and_identity_changes(self):
+        smoke = self.load_smoke()
+        before = {"config_sha256": "a", "mapping_sha256": "b", "history_rows": {"events": "c"}}
+        self.assertIsNone(smoke.check_clean_host_identity(before, dict(before)))
+        for field in before:
+            with self.subTest(field=field), self.assertRaises(smoke.SmokeError):
+                smoke.check_clean_host_identity(before, {**before, field: "changed"})
+
+    def test_clean_host_is_dispatched_without_legacy_unconditional_cleanup(self):
+        smoke = self.load_smoke()
+        argv = ["--root", "/nonexistent", "--compose-fixture", "a", "--config-fixture", "b",
+                "--previous-image", "p", "--previous-version", "1", "--candidate-image", "c",
+                "--candidate-version", "2", "--candidate-revision", "r", "--scenario", "clean-host-restore"]
+        with mock.patch.object(smoke, "clean_host_restore", return_value="ok") as scenario:
+            with mock.patch.object(smoke, "cleanup", side_effect=AssertionError("legacy cleanup")):
+                self.assertEqual(smoke.main(argv), 0)
+        scenario.assert_called_once()
+
+    def test_clean_host_orchestration_erases_source_and_retains_recovery_on_faults(self):
+        import io
+        import shutil
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        for fault in (None, "import", "partial-start", "cleanup-unknown"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "jbod-clean-host-fixture"
+                events = []
+                identity = {"history_rows": {"slot_events": [3, "synthetic-digest"]}}
+
+                class Transport(smoke.CleanHostDeployment):
+                    def compose(self, *command, **kwargs):
+                        events.append(command)
+                        return ""
+
+                    def run_python(self, service, script, extra=()):
+                        return identity if script == smoke.READ_CLEAN_HISTORY else {"config_sha256": "a", "mapping_sha256": "b"}
+
+                    def exec_python(self, service, script):
+                        if script == smoke.READ_HISTORY:
+                            return {"integrity": "ok", "counts": {
+                                "slot_state_current": 3, "slot_events": 3, "metric_samples": 12}}
+                        return self.run_python(service, script)
+
+                def prepare(path, compose, config):
+                    if path.name == "target":
+                        self.assertNotEqual(config.read_bytes(), args.config_fixture.read_bytes())
+                    path.mkdir()
+                    (path / "docker-compose.yml").write_text("synthetic transport only")
+                    (path / "must-not-survive").write_text("source" if path.name == "source" else "target")
+
+                def run(command, **kwargs):
+                    if command[:3] == ["sudo", "rm", "-rf"]:
+                        shutil.rmtree(command[-1])
+                    elif fault == "cleanup-unknown" and (root / "target").exists() and "ls" in command:
+                        raise smoke.SmokeError("unknown cleanup")
+                    return ""
+
+                def seed(deployment, args):
+                    deployment.set_image(args.previous_image)
+                    if fault == "partial-start":
+                        raise smoke.SmokeError("partial startup")
+
+                def post(path, body, headers):
+                    self.assertFalse((root / "source").exists())
+                    self.assertTrue((root / "target").is_dir())
+                    self.assertEqual(set((root / "recovery").iterdir()), {
+                        root / "recovery/backup.7z", root / "recovery/operator-key-input"})
+                    if fault == "import":
+                        raise smoke.SmokeError("import refused")
+                    if path.endswith("inspect"):
+                        return {"ok": True, "encrypted": True, "encryption_mode": "encrypted",
+                                "inspection_receipt": "single-use", "selected_groups": list(smoke.CLEAN_HOST_GROUPS),
+                                "present_groups": list(smoke.CLEAN_HOST_GROUPS), "absent_groups": []}
+                    return {"ok": True, "included_groups": list(smoke.CLEAN_HOST_GROUPS)}
+
+                args = SimpleNamespace(root=root, disposable_clean_host_restore=True,
+                    compose_fixture=self.ROOT / "tests/fixtures/compose/v0.22.2.yml",
+                    config_fixture=self.ROOT / "tests/fixtures/ci-smoke-config.yaml",
+                    previous_image="predecessor", previous_version="0.22.2", candidate_image="candidate",
+                    candidate_version="current", candidate_revision="a" * 40)
+                opener = mock.Mock()
+                opener.open.return_value = io.BytesIO(b"7z\xbc\xaf\x27\x1csynthetic-transport")
+                with mock.patch.object(smoke, "CleanHostDeployment", Transport), \
+                     mock.patch.object(smoke, "prepare_root", side_effect=prepare), \
+                     mock.patch.object(smoke, "run", side_effect=run), \
+                     mock.patch.object(smoke, "seed_previous_release", side_effect=seed), \
+                     mock.patch.object(smoke, "check_runtime"), \
+                     mock.patch.object(smoke, "history_api_view", return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})), \
+                     mock.patch.object(smoke, "clean_host_post", side_effect=post), \
+                     mock.patch.object(smoke.urllib.request, "build_opener", return_value=opener):
+                    if fault:
+                        with self.assertRaises(smoke.SmokeError):
+                            smoke.clean_host_restore(args)
+                        self.assertTrue((root / "recovery/operator-key-input").is_file())
+                        if fault != "partial-start":
+                            self.assertTrue((root / "recovery/backup.7z").is_file())
+                    else:
+                        self.assertIn("cleanup=verified", smoke.clean_host_restore(args))
+                        self.assertFalse(root.exists())
+                        restart = events.index(("restart", *smoke.SERVICES))
+                        self.assertEqual(events[restart + 1], ("up", "-d", "--wait", "--wait-timeout", "300"))

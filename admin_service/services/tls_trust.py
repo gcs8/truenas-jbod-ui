@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import secrets
 import socket
 import ssl
 from datetime import datetime, timezone
@@ -341,6 +343,24 @@ class TLSTrustStoreService:
 
     def _write_text_atomic(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(f"{path.suffix}.tmp")
-        temp_path.write_text(content, encoding="utf-8", newline="\n")
-        temp_path.replace(path)
+        # #737: each write stages into its own exclusively created file, so a
+        # concurrent import of the same bundle can neither truncate this
+        # operation's bytes nor publish them as its own. Mode 0o666 keeps the
+        # previous umask-derived mode for this public CA material.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        while True:
+            temp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                descriptor = os.open(temp_path, flags, 0o666)
+            except FileExistsError:
+                continue
+            break
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise

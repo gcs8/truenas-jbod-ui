@@ -53,6 +53,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Small segmented history reads skipped older sealed segments that could not
   change the newest rows, avoiding a full sort of each unindexed segment (#1053).
+- Explained unplaced source observations whose only identity evidence was a bare
+  device-mapper minor, without changing disk identity or retention totals (#1026).
+- Quantastor and Supermicro BMC requests no longer follow redirects to another
+  host, port or plain HTTP with credentials, a competing first SSH connection
+  can no longer replace a pinned host key, BMC discovery caps reported
+  controller and drive counts, and TLS bundle saves stage in their own file
+  (#1052).
 - The immutable update helper's new opt-in `--history-health-url` reported a
   history store that needs recovery or has paused collection as a distinct
   non-pass (exit 3) instead of a pass, without rolling back. The upgrade

@@ -7345,6 +7345,13 @@ class InventoryService:
                 ),
                 slots=slots,
             )
+        if retention.bare_device_mapper_unplaced_count:
+            count = retention.bare_device_mapper_unplaced_count
+            warnings.append(
+                f"{count} source disk observation{'s remain' if count != 1 else ' remains'} unplaced "
+                f"because {'their' if count != 1 else 'its'} only identity evidence is a bare dm-N "
+                "device-mapper minor, which is not a trustworthy disk identity."
+            )
         summary = InventorySummary(
             disk_count=disk_count,
             pool_count=pool_count,

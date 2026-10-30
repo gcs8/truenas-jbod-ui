@@ -199,7 +199,17 @@ class AutoPinHostKeyPolicy(paramiko.MissingHostKeyPolicy):
             # inside the path lock so saving this new key cannot overwrite a key
             # pinned by another host session in the meantime.
             client.load_host_keys(self.known_hosts_path)
-            client.get_host_keys().add(hostname, key.get_name(), key)
+            host_keys = client.get_host_keys()
+            # #737: a competing first use may have pinned this host since the
+            # handshake started. Never replace or add beside that pin; the same
+            # key needs no write, and any other key is a host key mismatch.
+            pinned = host_keys.lookup(hostname)
+            if pinned:
+                if pinned.get(key.get_name()) == key:
+                    return
+                expected = pinned.get(key.get_name()) or next(iter(pinned.values()))
+                raise paramiko.BadHostKeyException(hostname, key, expected)
+            host_keys.add(hostname, key.get_name(), key)
             client.save_host_keys(self.known_hosts_path)
         logger.info(
             "Pinned new SSH host key for %s (%s) in %s",

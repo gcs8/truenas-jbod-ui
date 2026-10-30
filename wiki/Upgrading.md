@@ -165,6 +165,51 @@ recorded after the upgrade is lost. There are no down-migrations. See
 Windows hosts, including Docker Desktop, are best-effort. CI does not run the
 app or its tests on Windows.
 
+### Synthetic clean-host recovery driver
+
+`scripts/run_image_upgrade_smoke.py --scenario clean-host-restore` adds a
+manual qualification cell. It is not included in the CI jobs above, and its
+Docker/image run remains unverified. Source tests do not change the recovery
+row of the table or establish support, scale, promotion or human acceptance.
+
+On an explicitly admitted exclusive disposable Linux Docker host, the driver
+uses the existing v0.22.2 Compose and synthetic seed contracts. The predecessor
+exports encrypted `7z` through Admin. The driver tears down its resources,
+checks container/network/volume absence, and removes its entire installation
+before creating a separate target from current Compose. The target starts
+with different bootstrap config and no predecessor mappings or history.
+Its current Admin inspect/import API requires the encrypted-mode inspection
+receipt. Config and mapping bytes, history counts and logical disk identity,
+integrity, history API reads, health, image/revision and restart survival are
+checked. SQLite file-byte equality is not promised across snapshot/restore.
+
+Inputs are the encrypted archive, its separate synthetic operator key input,
+the public bootstrap fixture and current Compose/image/version information.
+The original installation is not a recovery input. This cell uses legacy
+`7z`, which the predecessor can export, not a claim that v0.22.2 exports the
+new encrypted FULL stream format. Offline tests separately exercise the real
+current `tar.zst.enc` exporter/importer without an original source tree.
+The key input is separate from the archive and is not printed. This fixture
+does not choose a password manager, recovery-key custody/loss policy or human
+sign-off process. An independent docs-only walkthrough remains unverified.
+
+After separate runtime admission, use the existing image-smoke arguments with
+`--scenario clean-host-restore --disposable-clean-host-restore` and a new
+`--root "$TMPDIR/jbod-clean-host-<unique-run>"`. The root must be absent,
+below the selected scratch directory and free of symlink ancestors. Use
+`tests/fixtures/compose/v0.22.2.yml` and
+`tests/fixtures/ci-smoke-config.yaml` unchanged, the pinned predecessor image
+from CI, and the admitted exact candidate image and OCI revision. The driver
+uses only the local Docker socket and an empty task-owned Docker client config.
+Reserve ports 18180, 18181 and 18182 and the existing JBOD container names.
+Do not run on a shared or production daemon. No workflow or registry
+publication is added by this driver.
+
+Success removes task runtime resources and files. Any scenario failure,
+teardown failure, residual resource or unknown census retains recovery files
+and runtime configuration for diagnosis. Never replace an existing root or
+erase retained recovery material merely to retry.
+
 ## Rolling back a release
 
 Set `JBOD_UI_IMAGE` back to the recorded tag or digest and run the same `pull`

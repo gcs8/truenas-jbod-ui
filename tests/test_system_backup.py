@@ -2135,6 +2135,100 @@ class SystemBackupServiceTests(unittest.TestCase):
         finally:
             artifact.cleanup()
 
+    def test_encrypted_clean_target_restores_after_source_tree_is_removed(self) -> None:
+        # Real current exporter/envelope/importer and supported writers. This
+        # offline source control is not the predecessor-image Docker scenario.
+        import importlib.util
+        import contextlib
+        from app.services.mapping_store import MappingStore
+        from history_service.backup_archive import stream_envelope
+
+        repository = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("clean_host_smoke", repository / "scripts/run_image_upgrade_smoke.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            target = root / "target"
+            config_bytes = (repository / "tests/fixtures/ci-smoke-config.yaml").read_bytes()
+            passphrase = "synthetic independent recovery input"
+            archive = root / "only-archive.tar.zst.enc"
+
+            def identity(installation):
+                result = {}
+                for template in (smoke.READ_CLEAN_FILES, smoke.READ_CLEAN_HISTORY):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        exec(template.replace("/app/", str(installation) + "/"), {})
+                    result.update(json.loads(output.getvalue()))
+                return result
+
+            def initialize(installation, *, fresh=False):
+                config = installation / "config/config.yaml"
+                config.parent.mkdir(parents=True)
+                config.write_bytes(config_bytes.replace(b"WARNING", b"ERROR") if fresh else config_bytes)
+                history = HistorySettings(sqlite_path=str(installation / "history/history.db"),
+                                          backup_dir=str(installation / "history/backups"), startup_grace_seconds=0)
+                store = HistoryStore(history.sqlite_path, recover_unreadable_database=False)
+                return config, history, store, SystemBackupService(history, store)
+
+            config, history, store, service = initialize(source)
+            with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config)}):
+                get_settings.cache_clear()
+                settings = get_settings()
+                mappings = MappingStore(settings.paths.mapping_file)
+                mappings.save_mapping(ManualMapping(system_id=smoke.SMOKE_SYSTEM, enclosure_id="shelf-a",
+                                                    slot=1, serial="SANITIZED-0001", notes="synthetic restore"))
+                mapping_bytes = Path(settings.paths.mapping_file).read_bytes()
+                with patch("history_service.config.get_history_settings", return_value=history):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        exec(smoke.seed_script(smoke.SEED_HISTORY, (1,), metrics_per_slot=2), {})
+                counts = store.counts()
+                before_identity = identity(source)
+                artifact = service.export_bundle_to_file(encrypt=True, passphrase=passphrase, packaging="tar.zst",
+                                                         included_paths=list(smoke.CLEAN_HOST_GROUPS))
+                try:
+                    shutil.copyfile(artifact.path, archive)
+                finally:
+                    artifact.cleanup()
+            raw = archive.read_bytes()
+            self.assertTrue(raw.startswith(stream_envelope.MAGIC))
+            self.assertNotIn(passphrase.encode(), raw)
+            del store, service, settings, mappings, history
+            get_settings.cache_clear()
+            shutil.rmtree(source)
+            self.assertFalse(source.exists())
+            self.assertFalse(target.exists())
+            config, history, store, service = initialize(target, fresh=True)
+            self.assertNotEqual(config.read_bytes(), config_bytes)
+            with patch.dict(os.environ, {"APP_CONFIG_PATH": str(config)}):
+                get_settings.cache_clear()
+                target_mapping = Path(get_settings().paths.mapping_file)
+                for wrong_key in (None, "wrong synthetic input"):
+                    with self.subTest(wrong_key=wrong_key), self.assertRaises(ValueError):
+                        service.inspect_bundle_file(archive, passphrase=wrong_key, expected_encrypted=True)
+                    self.assertFalse(target_mapping.exists())
+                damaged = root / "damaged.tar.zst.enc"
+                damaged.write_bytes(raw[:-20])
+                with self.assertRaises(ValueError):
+                    service.import_bundle_from_file(damaged, passphrase=passphrase, expected_encrypted=True)
+                self.assertFalse(target_mapping.exists())
+                inspection = service.inspect_bundle_file(archive, passphrase=passphrase, expected_encrypted=True)
+                self.assertEqual(set(inspection["present_groups"]), set(smoke.CLEAN_HOST_GROUPS))
+                result = service.import_bundle_from_file(archive, passphrase=passphrase, expected_encrypted=True)
+                self.assertEqual(set(result["included_groups"]), set(smoke.CLEAN_HOST_GROUPS))
+                self.assertEqual(config.read_bytes(), config_bytes)
+                self.assertEqual(target_mapping.read_bytes(), mapping_bytes)
+                self.assertEqual(HistoryStore(history.sqlite_path).counts(), counts)
+                smoke.check_clean_host_identity(before_identity, identity(target))
+                with contextlib.closing(sqlite3.connect(history.sqlite_path)) as connection:
+                    self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(connection.execute("SELECT serial FROM metric_samples ORDER BY rowid").fetchall(),
+                                     [("SYNTH-0001",), ("SYNTH-0001",)])
+            self.assertFalse(source.exists())
+            self.assertEqual(archive.read_bytes(), raw)
+
     def test_stream_encrypted_full_backup_refuses_wrong_passphrase_and_damage(self) -> None:
         passphrase = "fast full damage passphrase"
         artifact = self._export_stream_full(passphrase)
