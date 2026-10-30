@@ -30,6 +30,74 @@ def freeze_operation_bounds_now(now: datetime):
         yield
 
 
+def _populate_history_source(
+    path: Path,
+    *,
+    first_id: int,
+    events: tuple[str, ...] = (),
+    samples: tuple[tuple[str, str], ...] = (),
+    rollups: tuple[tuple[str, str], ...] = (),
+    legacy_unindexed: bool = False,
+) -> None:
+    """Write synthetic rows; ``legacy_unindexed`` drops the chronological indexes
+    that immutable segments sealed before #875 do not have."""
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.executescript(SCHEMA)
+        connection.executemany(
+            """INSERT INTO slot_events (
+                id, observed_at, system_id, enclosure_key, slot, slot_label, event_type, details_json
+            ) VALUES (?, ?, 'system-1', 'enclosure-1', 1, 'slot-1', 'state', '{}')""",
+            [(first_id + offset, observed_at) for offset, observed_at in enumerate(events)],
+        )
+        connection.executemany(
+            """INSERT INTO metric_samples (
+                id, observed_at, system_id, enclosure_key, slot, slot_label,
+                metric_name, value_integer, disk_identity_key
+            ) VALUES (?, ?, 'system-1', 'enclosure-1', 1, 'slot-1', ?, ?, 'disk-a')""",
+            [
+                (first_id + offset, observed_at, metric_name, first_id + offset)
+                for offset, (observed_at, metric_name) in enumerate(samples)
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO metric_rollups (
+                bucket_start, bucket_seconds, system_id, enclosure_key, slot, slot_label,
+                metric_name, sample_count, value_sum, value_min, value_max, last_value,
+                last_observed_at, disk_identity_key
+            ) VALUES (?, 3600, 'system-1', 'enclosure-1', 1, 'slot-1', ?, 1, 7, 7, 7, 7, ?, 'disk-a')""",
+            [(bucket_start, metric_name, bucket_start) for bucket_start, metric_name in rollups],
+        )
+        if legacy_unindexed:
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE '%chronological'"
+            ).fetchall():
+                connection.execute(f"DROP INDEX {name}")
+
+
+def _write_covering_catalog(catalog_path: Path, segment_paths: list[Path]) -> None:
+    from history_service.segment_sealer import HISTORY_TABLE_TIMESTAMPS
+
+    entries = []
+    for path in segment_paths:
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as connection:
+            timestamps = [
+                datetime.fromisoformat(row[0])
+                for table_name, column in HISTORY_TABLE_TIMESTAMPS.items()
+                for row in connection.execute(f"SELECT {column} FROM {table_name}")
+            ]
+        entries.append({
+            "segment_id": path.stem,
+            "file_name": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "coverage_start": min(timestamps).isoformat() if timestamps else None,
+            "coverage_end": max(timestamps).isoformat() if timestamps else None,
+        })
+    catalog_path.write_text(json.dumps({
+        "catalog_version": 1, "generation_id": "generation-0001", "complete": True, "segments": entries,
+    }), encoding="utf-8")
+
+
 class HistoryReadConsistencyTests(unittest.TestCase):
     def test_followed_counter_rollups_use_bucket_and_interval_identity(self) -> None:
         point = {
@@ -160,6 +228,194 @@ class HistoryReadConsistencyTests(unittest.TestCase):
                             self.assertEqual(rows[0]["observed_at"], "2025-01-01T23:30:00-12:00")
                         self.assertLess(sum(counts), 2_000, f"SQLite VM work {counts}, since={since}")
             self.assertFalse(any("TEMP B-TREE" in plan for plan in plans), plans)
+
+    def test_newer_hot_rows_skip_older_unindexed_segments_for_tiny_limits(self) -> None:
+        # Segments sealed before the chronological indexes keep their bytes, so
+        # each one read costs a full temporary sort (#864). When the hot source
+        # already holds `limit` rows newer than a segment's whole coverage, that
+        # segment cannot change the answer and must not be opened or scanned.
+        minus_twelve = timezone(timedelta(hours=-12))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hot = root / "hot.sqlite3"
+            segments = [root / f"segment-{day:04d}.sqlite3" for day in (1, 2)]
+            for day, path in enumerate(segments, start=1):
+                start = datetime(2025, 1, day, 10, tzinfo=timezone.utc)
+                # Mixed offsets: the -12:00 text sorts earlier but is the later instant.
+                stamps = [
+                    (start + timedelta(seconds=index)).astimezone(
+                        minus_twelve if index % 2 else timezone.utc
+                    ).isoformat()
+                    for index in range(20_000)
+                ]
+                _populate_history_source(
+                    path, first_id=(day - 1) * 20_000 + 1, events=tuple(stamps),
+                    samples=tuple((stamp, "temperature") for stamp in stamps),
+                    rollups=tuple((stamp, "read_errors") for stamp in stamps),
+                    legacy_unindexed=True,
+                )
+            hot_stamps = ("2025-01-03T10:00:00+00:00", "2025-01-02T23:30:00-12:00", "2025-01-03T10:00:00+00:00")
+            _populate_history_source(
+                hot, first_id=40_001, events=hot_stamps,
+                samples=tuple((stamp, "temperature") for stamp in hot_stamps),
+                rollups=(("2025-01-03T09:00:00+00:00", "read_errors"),
+                         ("2025-01-02T23:00:00-12:00", "read_errors")),
+            )
+            catalog = root / "catalog.json"
+            _write_covering_catalog(catalog, segments)
+            before = [path.read_bytes() for path in segments]
+            reader = SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+            original_query = reader._query_connection
+            work: list[int] = []
+            opened: list[Path] = []
+
+            @contextmanager
+            def counted_query(path, hot_connection=None):
+                opened.append(path)
+                with original_query(path, hot_connection) as connection:
+                    count = 0
+
+                    def progress():
+                        nonlocal count
+                        count += 100
+                        return 0
+
+                    connection.set_progress_handler(progress, 100)
+                    try:
+                        yield connection
+                    finally:
+                        connection.set_progress_handler(None, 0)
+                        work.append(count)
+
+            queries = {
+                "events": (lambda limit: reader.list_slot_events("system-1", "enclosure-1", 1, limit=limit),
+                           [40_002, 40_003, 40_001]),
+                "raw": (lambda limit: reader.list_raw_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name="temperature", limit=limit,
+                ), [40_002, 40_003, 40_001]),
+                "disk": (lambda limit: reader.list_disk_metric_samples("disk-a", limit=limit),
+                         [40_002, 40_003, 40_001]),
+                "followed": (lambda limit: reader.list_followed_metric_samples(
+                    "system-1", "enclosure-1", 1, "disk-a", metric_name="temperature", limit=limit,
+                ), [40_002, 40_003, 40_001]),
+                "rollups": (lambda limit: reader.list_metric_samples(
+                    "system-1", "enclosure-1", 1, metric_name="read_errors", limit=limit,
+                ), ["2025-01-02T23:00:00-12:00", "2025-01-03T09:00:00+00:00"]),
+            }
+            with patch.object(reader, "_query_connection", side_effect=counted_query):
+                for name, (query, expected) in queries.items():
+                    for limit in range(1, len(expected) + 1):
+                        with self.subTest(query=name, limit=limit):
+                            work.clear()
+                            opened.clear()
+                            rows = query(limit)
+                            self.assertEqual(
+                                [row["id"] if name != "rollups" else row["bucket_start"] for row in rows],
+                                expected[:limit],
+                            )
+                            self.assertLess(sum(work), 5_000, f"SQLite VM work {work}")
+                            if name != "rollups":
+                                # The rollup path first finds no raw rows anywhere, which
+                                # the legacy scope index answers cheaply in each segment.
+                                self.assertEqual(set(opened), {hot.absolute()})
+                # One more row than the hot holds still needs the newest segment.
+                work.clear()
+                opened.clear()
+                rows = reader.list_slot_events("system-1", "enclosure-1", 1, limit=4)
+            self.assertEqual(rows[3]["observed_at"], "2025-01-02T03:33:19-12:00")
+            self.assertEqual(set(opened), {hot.absolute(), segments[1].absolute()})
+            self.assertEqual([path.read_bytes() for path in segments], before)
+
+    def test_pruned_limited_reads_match_reading_every_selected_segment(self) -> None:
+        # The oracle disables coverage pruning, which restores the previous
+        # read-every-source order. Ties at one instant across sources, mixed
+        # offsets, split rollup fragments and a segment without coverage must
+        # all produce identical results. segment-0003 ends exactly at the hot
+        # row 101 instant with a higher id; segment-0006 holds only a second
+        # fragment of the hot 2025-01-05 bucket, so its coverage ends on it.
+        sources = {
+            "hot": dict(first_id=100, events=("2025-01-05T00:00:00+00:00", "2025-01-04T12:00:00+00:00"),
+                        rollups=("2025-01-04T00:00:00+00:00", "2025-01-05T00:00:00+00:00")),
+            "segment-0001": dict(first_id=1, events=("2025-01-01T00:00:00+00:00", "2025-01-01T06:00:00+00:00"),
+                                 rollups=("2025-01-01T00:00:00+00:00", "2024-12-31T00:00:00+00:00")),
+            "segment-0002": dict(first_id=10, events=("2025-01-02T00:00:00+00:00", "2025-01-01T23:30:00-12:00"),
+                                 rollups=("2025-01-02T00:00:00+00:00",)),
+            "segment-0003": dict(first_id=200, events=("2025-01-04T00:00:00-12:00", "2025-01-03T00:00:00+00:00"),
+                                 rollups=("2025-01-04T00:00:00+00:00", "2025-01-03T00:00:00+00:00")),
+            "segment-0004": dict(first_id=30, events=("2025-01-04T23:30:00-12:00",),
+                                 rollups=("2025-01-04T13:00:00-12:00",)),
+            "segment-0005": dict(first_id=40, events=(), rollups=()),
+            "segment-0006": dict(first_id=50, events=(), rollups=("2025-01-05T00:00:00+00:00",)),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, source in sources.items():
+                _populate_history_source(
+                    root / f"{name}.sqlite3", first_id=source["first_id"], events=source["events"],
+                    samples=tuple((stamp, "temperature") for stamp in source["events"]),
+                    rollups=tuple((stamp, "read_errors") for stamp in source["rollups"]),
+                    legacy_unindexed=name != "hot",
+                )
+            with closing(sqlite3.connect(root / "hot.sqlite3")) as connection, connection:
+                connection.execute("""INSERT INTO slot_state_current (
+                    system_id, enclosure_key, slot, slot_label, present,
+                    identify_active, last_seen_at, disk_identity_key
+                ) VALUES ('system-1', 'enclosure-1', 1, 'slot-1', 1, 0,
+                          '2025-01-05T00:00:00+00:00', 'disk-a')""")
+            catalog = root / "catalog.json"
+            _write_covering_catalog(catalog, [root / f"segment-000{day}.sqlite3" for day in range(1, 7)])
+            reader = SegmentedHistoryReader.from_catalog(hot_path=root / "hot.sqlite3", catalog_path=catalog)
+            original_query = reader._query_connection
+            opened = {"pruned": 0, "oracle": 0}
+            mode = "pruned"
+
+            def counted_query(path, hot_connection=None):
+                opened[mode] += 1
+                return original_query(path, hot_connection)
+
+            def read_all(limit: int, since: str | None) -> dict[str, Any]:
+                return {
+                    "events": reader.list_slot_events("system-1", "enclosure-1", 1, limit=limit, since=since),
+                    "raw": reader.list_raw_metric_samples(
+                        "system-1", "enclosure-1", 1, metric_name="temperature", limit=limit, since=since,
+                    ),
+                    "metrics": reader.list_metric_samples(
+                        "system-1", "enclosure-1", 1, metric_name="temperature", limit=limit, since=since,
+                    ),
+                    "disk": reader.list_disk_metric_samples(
+                        "disk-a", metric_name="temperature", limit=limit, since=since,
+                    ),
+                    "rollups": reader.list_metric_samples(
+                        "system-1", "enclosure-1", 1, metric_name="read_errors", limit=limit, since=since,
+                    ),
+                    "disk_rollups": reader.list_disk_metric_samples(
+                        "disk-a", metric_name="read_errors", limit=limit, since=since,
+                    ),
+                    "bundle": reader.get_slot_history_bundle(
+                        "system-1", "enclosure-1", 1, event_limit=limit,
+                        metric_limits={"temperature": limit, "read_errors": limit}, since=since,
+                    ),
+                }
+
+            with patch.object(reader, "_query_connection", side_effect=counted_query):
+                for since in (None, "2025-01-02T00:00:00+00:00", "2025-01-04T12:00:00+00:00"):
+                    for limit in range(1, 12):
+                        with self.subTest(since=since, limit=limit):
+                            mode = "pruned"
+                            pruned = read_all(limit, since)
+                            mode = "oracle"
+                            with patch.object(reader, "_segment_coverage_ends", return_value={}):
+                                oracle = read_all(limit, since)
+                            self.assertEqual(pruned, oracle)
+                mode = "pruned"
+                newest = reader.list_slot_events("system-1", "enclosure-1", 1, limit=1)
+            # The -12:00 text looks older than the hot rows but is the newest instant.
+            self.assertEqual([row["id"] for row in newest], [30])
+            self.assertLess(opened["pruned"], opened["oracle"])
+            tie = reader.list_slot_events("system-1", "enclosure-1", 1, limit=3)
+            self.assertEqual([row["id"] for row in tie], [30, 100, 200])
+            merged = reader.list_metric_samples("system-1", "enclosure-1", 1, metric_name="read_errors", limit=2)
+            self.assertEqual([row["sample_count"] for row in merged], [1, 2])
 
     def test_bundle_pins_hot_snapshot_across_committed_replacement(self) -> None:
         for segmented in (False, True):
