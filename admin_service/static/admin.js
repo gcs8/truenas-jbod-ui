@@ -52,6 +52,7 @@
     storageViewCandidatesTargetSystemId: null,
     storageViewCandidatesScope: null,
     storageViewCandidatesRequestScope: null,
+    storageViewCandidatesError: null,
     liveEnclosures: [],
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
@@ -672,6 +673,16 @@
     document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
       button.disabled = true;
     });
+    // A reply that lands after the stop can still render buttons from its own
+    // rules (cards, result offers, scans). Lock each one as it appears (#823).
+    if (typeof MutationObserver === "function" && document.body) {
+      new MutationObserver(() => lockActionsIfStopped()).observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["disabled"],
+      });
+    }
   }
 
   function lockActionsIfStopped() {
@@ -680,7 +691,10 @@
       return;
     }
     document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
-      button.disabled = true;
+      // Only write enabled buttons, so the stopped-page observer does not wake itself.
+      if (!button.disabled) {
+        button.disabled = true;
+      }
     });
   }
 
@@ -1013,7 +1027,7 @@
     button.dataset.runtimeAction = action;
     button.dataset.containerKey = String(container.key || "");
     button.textContent = label;
-    button.disabled = state.runtimeActionPromises.has(button.dataset.containerKey);
+    button.disabled = Boolean(state.sessionStopped) || state.runtimeActionPromises.has(button.dataset.containerKey);
     return button;
   }
 
@@ -1160,7 +1174,7 @@
       })
       .join("");
     if (elements.runtimeBehaviorSaveButton) {
-      elements.runtimeBehaviorSaveButton.disabled = !fields.some((field) => field.writable);
+      elements.runtimeBehaviorSaveButton.disabled = Boolean(state.sessionStopped) || !fields.some((field) => field.writable);
     }
   }
 
@@ -2397,6 +2411,20 @@
     const ordering = String(draft?.ordering_preset || "source-layout");
     const usesSourceLayout = ordering === "source-layout" && builderDraftUsesSourceLayout(draft, sourceProfile);
 
+    // Bays sit at whole row and column positions; a fractional size cannot be laid out (#1032).
+    if (![draft?.rows, draft?.columns, draft?.slot_count].every((value) => Number.isInteger(Number(value)))) {
+      const error = "Rows, columns and visible bays must be whole numbers.";
+      return {
+        previewRows: [],
+        slotLayoutForSave: null,
+        badge: "Draft",
+        summary: error,
+        error,
+        fixHint: "use whole numbers before save",
+        orderingLabel: builderOrderingLabel(ordering),
+      };
+    }
+
     if (ordering === "custom-layout") {
       const parsed = parseProfileLayoutText(draft.layout_text, draft.rows, draft.columns, draft.slot_count);
       if (parsed.error) {
@@ -2406,6 +2434,7 @@
           badge: "Custom Matrix",
           summary: parsed.error,
           error: parsed.error,
+          fixHint: "fix custom matrix before save",
           orderingLabel: builderOrderingLabel(ordering),
         };
       }
@@ -2700,7 +2729,7 @@
       draft.face_style || null,
       draft.latch_edge ? `latch: ${draft.latch_edge}` : null,
       draft.row_groups.length ? `groups: ${draft.row_groups.join("-")}` : null,
-      layoutResolution.error ? "fix custom matrix before save" : null,
+      layoutResolution.error ? layoutResolution.fixHint || "fix custom matrix before save" : null,
       sourceProfile?.source ? `source: ${sourceProfile.source}` : null,
       Number(sourceProfile?.reference_count || 0) > 0 ? `${sourceProfile.reference_count} refs` : null,
     ].filter(Boolean);
@@ -3978,6 +4007,7 @@
     state.storageViewCandidatesScope = null;
     state.storageViewCandidatesRequestScope = null;
     state.storageViewCandidatesLoading = false;
+    state.storageViewCandidatesError = null;
   }
 
   async function fetchLiveEnclosures({ force = false, quiet = false } = {}) {
@@ -4141,6 +4171,14 @@
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
+    // A failed discovery for this view is not an empty result (#1033).
+    if (state.storageViewCandidatesError && state.storageViewCandidatesRequestScope === currentStorageViewCandidateScope()) {
+      const reason = String(state.storageViewCandidatesError).trim().replace(/[.\s]+$/, "");
+      elements.setupStorageViewCandidatesHelp.textContent =
+        `Could not list the drives on ${where}${reason ? `: ${reason}.` : "."} Use Refresh to try again.`;
+      elements.setupStorageViewCandidatesList.innerHTML = "";
+      return;
+    }
     if (!availableCandidates.length) {
       elements.setupStorageViewCandidatesHelp.textContent = claimedElsewhereCount > 0
         ? "Every unassigned drive is already in another view."
@@ -4202,6 +4240,7 @@
     state.storageViewCandidatesScope = null;
     state.storageViewCandidates = [];
     state.storageViewCandidatesLoading = true;
+    state.storageViewCandidatesError = null;
     scheduleStorageViewRender({ full: false });
     try {
       const params = new URLSearchParams({ system_id: systemId });
@@ -4232,6 +4271,7 @@
       }
       state.storageViewCandidates = [];
       state.storageViewCandidatesSystemId = systemId;
+      state.storageViewCandidatesError = error?.message || String(error);
       if (!quiet) {
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
@@ -4333,6 +4373,13 @@
     const targetIndex = currentIndex + direction;
     if (targetIndex < 0 || targetIndex >= ordered.length) {
       return;
+    }
+    // Views that share an order value cannot be swapped by value. Space them
+    // out first, keeping the order shown, so the move takes effect (#1034).
+    if (new Set(ordered.map((storageView) => Number(storageView.order) || 0)).size !== ordered.length) {
+      ordered.forEach((storageView, index) => {
+        storageView.order = (index + 1) * 10;
+      });
     }
     const currentOrder = ordered[currentIndex].order;
     ordered[currentIndex].order = ordered[targetIndex].order;
@@ -6102,6 +6149,7 @@
     button.className = "button secondary small";
     button.type = "button";
     button.textContent = label;
+    button.disabled = Boolean(state.sessionStopped);
     button.addEventListener("click", () => {
       button.disabled = true;
       void runRuntimeAction(containerKey, action).finally(() => {
@@ -7249,6 +7297,9 @@
 
   function runRuntimeAction(containerKey, action, options = {}) {
     const key = String(containerKey || "");
+    if (state.sessionStopped) {
+      return Promise.resolve(false);
+    }
     const existing = state.runtimeActionPromises.get(key);
     if (existing) {
       return existing;
