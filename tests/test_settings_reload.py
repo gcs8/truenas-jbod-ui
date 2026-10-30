@@ -1059,6 +1059,36 @@ class RuntimeOverrideTransactionTests(ConfigReloadTestCase):
                 self.assertEqual((first_fields["smart_cache_ttl_seconds"], first_fields["refresh_interval_seconds"]), (777, 30))
                 self.assertEqual((second_fields["smart_cache_ttl_seconds"], second_fields["refresh_interval_seconds"]), (777, 55))
 
+    def test_fractional_and_boolean_timing_values_are_rejected_before_writing(self) -> None:
+        # Direct API callers can send JSON numbers; never truncate or coerce them (#1038).
+        self.overrides_path.write_text("app:\n  smart_cache_ttl_seconds: 300\n", encoding="utf-8")
+        settings = app_config.load_settings()
+        before = self.overrides_path.read_bytes()
+        for value in (30.5, 0.25, "30.5", True, False, float("inf"), float("nan"), None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "SMART reuse must be a whole number of seconds"):
+                    app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": value})
+                self.assertEqual(self.overrides_path.read_bytes(), before)
+        for value in (86401, -1, 86400.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": value})
+            self.assertEqual(self.overrides_path.read_bytes(), before)
+        with patch.dict(os.environ, {"APP_SMART_CACHE_TTL_SECONDS": "777"}):
+            with self.assertRaisesRegex(ValueError, "owned by .env"):
+                app_config.save_runtime_behavior_overrides(app_config.load_settings(), {"smart_cache_ttl_seconds": 30.5})
+        self.assertEqual(self.overrides_path.read_bytes(), before)
+
+    def test_whole_number_timing_values_keep_saving(self) -> None:
+        settings = app_config.load_settings()
+        for value, expected in ((45, 45), ("46", 46), (47.0, 47), (0, 0), (86400, 86400)):
+            with self.subTest(value=value):
+                response = app_config.save_runtime_behavior_overrides(settings, {"smart_cache_ttl_seconds": value})
+                field = RuntimeOverrideOwnershipTests._field(response, "smart_cache_ttl_seconds")
+                self.assertEqual(field["value"], expected)
+                saved = yaml.safe_load(self.overrides_path.read_text())["app"]["smart_cache_ttl_seconds"]
+                self.assertEqual(saved, expected)
+                self.assertIs(type(saved), int)
+
     def test_each_writer_owns_a_unique_stage_and_leaves_other_files_alone(self) -> None:
         sibling = self.overrides_path.with_suffix(".tmp")
         sibling.write_text("another writer's stage", encoding="utf-8")

@@ -149,9 +149,10 @@ access-restricted workflow; the override does not make the archive safe to share
 
 ## Saves fail and the history service keeps restarting
 
-Docker creates a missing bind mount as `root:root`. The containers run as uid
-10001, so nothing can be written until the host directories are owned by that
-uid. What you see:
+Docker creates a missing bind mount as `root:root`. A service running under a
+non-root identity, such as with the optional `docker-compose.nonroot.yml`
+overlay, may then be unable to write. The base Compose UI and history services
+run as root; do not assume every deployment uses UID 10001. Symptoms include:
 
 - Every mapping or alias save fails with
   `Could not save: the data folder is not writable by the app. See
@@ -159,37 +160,44 @@ uid. What you see:
 - The main UI `/healthz` answers HTTP 503 with `status: down` and the same
   `Cannot write to ...` line in `problems`. The container healthcheck probes
   `/livez`, so Docker does not restart it or mark it unhealthy for this.
-- The history service logs
+- For example, with the optional overlay's default app identity and a root-owned
+  history directory, the history service logs
   `Cannot write to /app/history (owned by uid 0, running as uid 10001). On the
-  Docker host run: sudo chown -R 10001:10001 ./history`, retries a few times
-  with growing backoff, and then stops with that same line instead of looping a
-  traceback.
+  Docker host, for write access to ./history, follow the guarded ownership
+  procedure in Troubleshooting
+  (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). Stop
+  every writer and keep them stopped during repair; do not recursively change
+  segmented history.`, retries a few times with growing backoff, and then stops
+  with that same line instead of looping a traceback.
 
-The log line already names the host path: the container sees `/app/history`,
-but compose binds `./history` from the directory holding `docker-compose.yml`,
-so that is what you chown. Run it from that directory, for every bound
-directory at once:
-
-```bash
-sudo chown -R 10001:10001 ./config ./data ./history ./logs ./backup-status
-docker compose up -d
-```
-
-Create the directories before the first `docker compose up -d` to avoid this
-entirely:
-
-```bash
-mkdir -p config/ssh data history logs backup-status
-```
+The diagnostic names both the container path and its host bind source. Follow the
+[guarded ownership procedure](#a-non-root-container-gets-permission-denied)
+below using your actual configured identities and mounts. Do not apply a
+blanket ownership change or restart writers before completing that procedure.
+Creating bind directories before first startup avoids Docker creating them as
+root, but their ownership and modes must still suit the configured services.
 
 ## A non-root container gets permission denied
 
 The default `docker-compose.yml` runs the UI and history as root, so a normal
 image update needs no ownership change. Non-root services come only from the
 optional `docker-compose.nonroot.yml` overlay. If you added that overlay and a
-service now reports `permission denied`, the bind mounts are still owned by
-root. From the folder that holds your Compose files, with a published image and
-no repository checkout:
+service now reports `permission denied`, check the bind mounts' ownership.
+Before either ownership-repair procedure below:
+
+- Use the configured `APP_UID`, `APP_GID` and separate `BACKUP_UID`. If `.env`
+  sets them, set the same shell values below; shell variables do not read `.env`.
+- If `HISTORY_SEGMENT_CATALOG_PATH` is set, do not run a recursive change over
+  the segmented history tree; follow
+  [[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] instead.
+- Stop every writer, including the Compose services and any host job that writes
+  under this folder, and keep them stopped until the repair finishes.
+  `docker compose down` alone does not stop host jobs or other deployments.
+- Keep `config/backup-secrets` excluded and preserve the separate backup identity
+  for `backup-status`.
+
+For non-segmented bind mounts, from the folder that holds your Compose files,
+with a published image and no repository checkout:
 
 ```bash
 docker compose down
@@ -202,10 +210,6 @@ sudo install -d -o "$backup_uid" -g "$app_gid" -m 2750 ./backup-status
 docker compose -f docker-compose.yml -f docker-compose.nonroot.yml up -d
 ```
 
-If `.env` sets `APP_UID`, `APP_GID` or `BACKUP_UID`, set the same values above;
-shell variables do not read `.env`. If `HISTORY_SEGMENT_CATALOG_PATH` is set, do
-not run a recursive change over the segmented history tree; follow
-[[Backup, Restore, and Debug Bundles|Backup-Restore-and-Debug-Bundles]] instead.
 To undo, drop the overlay from the `-f` chain; root-run services still read
 files owned by the app identity.
 

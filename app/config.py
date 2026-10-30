@@ -1135,6 +1135,25 @@ def save_runtime_behavior_overrides(settings: Settings, values: dict[str, Any]) 
         return _save_runtime_behavior_overrides(settings, values, runtime_overrides_path)
 
 
+def _runtime_behavior_whole_seconds(raw_value: Any) -> int:
+    """Convert one submitted timing value without truncating or coercing it.
+
+    The admin form sends text; direct API callers can send JSON numbers. A
+    fractional number or a boolean is rejected instead of becoming an int.
+    """
+    if isinstance(raw_value, bool):
+        raise TypeError("Booleans are not timing values.")
+    if isinstance(raw_value, int):
+        return raw_value
+    if isinstance(raw_value, float):
+        if not raw_value.is_integer():
+            raise ValueError("Timing values must not have a fractional part.")
+        return int(raw_value)
+    if isinstance(raw_value, str):
+        return int(raw_value)
+    raise TypeError("Timing values must be numbers or numeric text.")
+
+
 def _save_runtime_behavior_overrides(
     settings: Settings, values: dict[str, Any], runtime_overrides_path: Path,
 ) -> dict[str, Any]:
@@ -1149,8 +1168,8 @@ def _save_runtime_behavior_overrides(
         if env_name:
             raise ValueError(f"{metadata['label']} is owned by .env ({env_name}) and cannot be saved from admin.")
         try:
-            value = int(raw_value)
-        except (TypeError, ValueError) as exc:
+            value = _runtime_behavior_whole_seconds(raw_value)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(f"{metadata['label']} must be a whole number of seconds.") from exc
         minimum = int(metadata["minimum"])
         maximum = int(metadata["maximum"])

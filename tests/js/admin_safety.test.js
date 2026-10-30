@@ -268,6 +268,159 @@ test("demo creation ignores loaded editor ID and avoids both ID namespaces", asy
   await load(["createDemoSystem", ...MUTATION_RESULT_HELPERS], {state, elements: {setupSystemId: {value: "real-system"}, setupSystemLabel: {value: "Keep original"}}, fetchJson: async (_url, options) => {body = JSON.parse(options.body); return {ok: true, system: {id: body.system_id, label: "Demo Builder Lab"}, systems: [], profile: {id: `${body.system_id}-chassis`}, profiles: []};}, refreshState: async () => {}, getSystemById: () => null, renderAll() {}, setBanner() {}}).createDemoSystem();
   assert.equal(body.system_id, "demo-builder-lab-3"); assert.equal(body.replace_existing, false); assert.notEqual(body.label, "Keep original");
 });
+// #1042: a delayed demo completion must not replace a newer setup draft.
+function demoProbe() {
+  const posts = [], refreshes = [], banners = [], loads = [];
+  const later = () => {let resolve; const promise = new Promise((yes) => {resolve = yes;}); return {promise, resolve};};
+  const elements = {setupResult: {textContent: ""}, setupCreateDemoButton: {}, setupSystemLabel: {value: "System A"}};
+  const state = {systems: [{id: "system-a", label: "System A"}, {id: "system-b", label: "System B"}], profiles: [],
+    setupEditorGeneration: 1, setupDraftRevision: 0, setupDirty: false, loadedSystemId: "system-a", selectedExistingSystemId: "system-a"};
+  const api = load(["createDemoSystem", ...MUTATION_RESULT_HELPERS], {
+    state, elements,
+    fetchJson: () => {const d = later(); posts.push(d); return d.promise;},
+    refreshState: () => {const d = later(); refreshes.push(d); return d.promise;},
+    getSystemById: (id) => state.systems.find((system) => system.id === id) || null,
+    loadSystemIntoForm(system) {
+      loads.push(system.id);
+      state.setupEditorGeneration++; state.setupDirty = false;
+      state.loadedSystemId = system.id; state.selectedExistingSystemId = system.id;
+      elements.setupSystemLabel.value = system.label;
+    },
+    renderAll() {}, setBanner(text, kind) {banners.push({text, kind});},
+  });
+  const created = {ok: true, system: {id: "demo-builder-lab", label: "Demo Builder Lab"}, systems: [], profile: {id: "demo-builder-lab-chassis"}, profiles: [], detail: "Demo builder system created."};
+  async function flush() {for (let i = 0; i < 12; i++) await Promise.resolve();}
+  async function finishPost() {posts[0].resolve(created); await flush();}
+  async function finishReadback() {state.systems = [...state.systems, created.system]; refreshes[0].resolve(true); await flush();}
+  function change(mode) {
+    if (mode === "A-B") {state.setupEditorGeneration++; state.loadedSystemId = "system-b"; state.selectedExistingSystemId = "system-b";}
+    if (mode === "A-B-A") {state.setupEditorGeneration += 2; state.loadedSystemId = "system-a"; state.selectedExistingSystemId = "system-a";}
+    state.setupDraftRevision++; state.setupDirty = true;
+    elements.setupSystemLabel.value = "Newer unsaved label";
+    if (mode !== "later edit") elements.setupResult.textContent = "Newer visit";
+  }
+  const snapshot = () => JSON.stringify([state.setupEditorGeneration, state.setupDraftRevision, state.setupDirty,
+    state.loadedSystemId, state.selectedExistingSystemId, elements.setupSystemLabel.value]);
+  return {api, state, elements, banners, loads, posts, refreshes, finishPost, finishReadback, change, snapshot};
+}
+for (const phase of ["POST", "readback"]) {
+  for (const mode of ["later edit", "A-B", "A-B-A"]) {
+    test(`demo creation keeps a newer draft after ${mode} during ${phase}`, async () => {
+      const probe = demoProbe();
+      const run = probe.api.createDemoSystem();
+      if (phase === "POST") probe.change(mode);
+      await probe.finishPost();
+      if (phase === "readback") probe.change(mode);
+      const before = probe.snapshot();
+      const resultBefore = probe.elements.setupResult.textContent;
+      await probe.finishReadback(); await run;
+      assert.deepEqual(probe.loads, [], "created demo must not replace the newer draft");
+      assert.equal(probe.snapshot(), before, "label, dirty flag, revision and navigation retained");
+      assert.equal(probe.refreshes.length, 1, "saved-system catalog still refreshes");
+      assert.equal(probe.posts.length, 1);
+      if (mode === "later edit") {
+        assert.match(probe.elements.setupResult.textContent, /Demo builder system created/);
+        assert.match(probe.elements.setupResult.textContent, /kept/);
+      } else {
+        assert.equal(probe.elements.setupResult.textContent, resultBefore, "a newer visit keeps its own result line");
+      }
+      assert.equal(probe.banners.at(-1).kind, "success");
+      assert.match(probe.banners.at(-1).text, /Demo Builder Lab/);
+    });
+  }
+}
+test("demo creation still opens the created system when the originating draft is unchanged", async () => {
+  const probe = demoProbe();
+  const run = probe.api.createDemoSystem();
+  await probe.finishPost(); await probe.finishReadback(); await run;
+  assert.deepEqual(probe.loads, ["demo-builder-lab"]);
+  assert.equal(probe.state.loadedSystemId, "demo-builder-lab");
+  assert.equal(probe.state.setupDirty, false);
+  assert.equal(probe.elements.setupResult.textContent, "Demo builder system created.");
+  assert.equal(probe.banners.at(-1).kind, "success");
+});
+// #1043: adoption uses the maintenance deadline and keeps an unknown outcome unknown.
+function adoptionProbe(fetchJson, bindings = {}) {
+  const rows = [{system_id: "removed-one", total_rows: 4}];
+  const state = {admin: {}, orphanedHistory: rows, systems: [{id: "current", label: "Current system"}], selectedHistoryAdoptSourceId: "removed-one"};
+  const select = (value) => ({value, innerHTML: "", disabled: false});
+  const elements = {historyAdoptButton: {disabled: false}, historyAdoptSourceSelect: select("removed-one"), historyAdoptTargetSelect: select("current"), historyAdoptResult: {textContent: ""}};
+  const banners = [];
+  const handlers = load(["adoptRemovedSystemHistory", "renderHistoryMaintenance", "loadOrphanedHistory", "startOrphanedHistoryScan", "runOrphanedHistoryScan", ...bindings.names || []], {
+    state, elements, window: {confirm: () => true},
+    getSystemById: (id) => state.systems.find((system) => system.id === id) || null, escapeHtml: (text) => text,
+    fetchJson, setBanner(text, kind) {banners.push({text, kind});}, SERVER_REQUEST_ID_PATTERN: /^[0-9a-f]{32}$/,
+    ...bindings.extra,
+  });
+  return {handlers, state, elements, banners, rows};
+}
+test("history adoption POST uses the history maintenance deadline", async () => {
+  const calls = [];
+  const probe = adoptionProbe(async (url, options = {}) => {
+    calls.push({url, method: options.method || "GET", timeoutMs: options.timeoutMs});
+    return {ok: true, summary: {total_rows: 4}, detail: "History adopted.", orphaned_systems: []};
+  }, {extra: {HISTORY_MAINTENANCE_TIMEOUT_MS: 1234567}});
+  await probe.handlers.adoptRemovedSystemHistory();
+  assert.deepEqual(calls, [{url: "/api/admin/history/adopt-removed-system", method: "POST", timeoutMs: 1234567}]);
+});
+for (const [label, fetchFor] of [
+  ["deadline expiry", () => () => new Promise(() => {})],
+  ["dispatched transport failure", () => async () => {throw new TypeError("synthetic socket reset");}],
+]) {
+  test(`history adoption ${label} is reported as an unknown outcome until readback`, async () => {
+    let posts = 0;
+    let transport = fetchFor();
+    const probe = adoptionProbe(null, {names: FETCH_JSON_HELPERS, extra: {
+      HISTORY_MAINTENANCE_TIMEOUT_MS: 5,
+      fetch: (url, options) => {if (options?.method === "POST") posts++; return transport(url, options);},
+    }});
+    await probe.handlers.adoptRemovedSystemHistory();
+    assert.equal(posts, 1, "never retry the adoption");
+    const text = probe.elements.historyAdoptResult.textContent;
+    assert.doesNotMatch(text, /adoption failed/i);
+    assert.match(text, /outcome is unknown/i);
+    assert.match(text, /Refresh the history source list/);
+    assert.doesNotMatch(probe.banners.at(-1).text, /failed/i);
+    assert.equal(probe.banners.at(-1).kind, "info");
+    assert.equal(probe.elements.historyAdoptButton.disabled, true, "Adopt stays disabled until readback");
+    assert.equal(probe.state.orphanedHistory, probe.rows, "last-known rows stay visible");
+    probe.handlers.renderHistoryMaintenance();
+    assert.equal(probe.elements.historyAdoptButton.disabled, true, "a later render keeps the unknown result");
+    // An explicit readback (GET scan) establishes the current state and re-enables Adopt.
+    transport = async () => ({ok: true, status: 200, headers: {get: () => ""}, json: async () => ({orphaned_systems: [{system_id: "removed-two", total_rows: 2}]})});
+    await probe.handlers.loadOrphanedHistory({fresh: true});
+    assert.equal(posts, 1);
+    assert.equal(probe.state.orphanedHistoryError, false);
+    assert.equal(probe.elements.historyAdoptButton.disabled, false);
+  });
+}
+test("confirmed adoption refusals and undispatched requests still report failure and re-enable Adopt", async () => {
+  for (const [outcome, status] of [["validation", 400], ["transport", undefined]]) {
+    const probe = adoptionProbe(async () => {
+      const error = new Error(outcome === "validation" ? "Target already owns history." : "Admin could not be reached, so nothing was changed.");
+      error.adminOutcome = outcome; error.outcomeUnknown = false; error.status = status;
+      throw error;
+    });
+    await probe.handlers.adoptRemovedSystemHistory();
+    assert.match(probe.elements.historyAdoptResult.textContent, /^History adoption failed: /, outcome);
+    assert.equal(probe.banners.at(-1).kind, "error");
+    assert.equal(probe.elements.historyAdoptButton.disabled, false, outcome);
+    assert.notEqual(probe.state.orphanedHistoryError, true, outcome);
+  }
+});
+test("a render during a pending adoption keeps Adopt disabled", async () => {
+  let finish;
+  const probe = adoptionProbe(() => new Promise((resolve) => {finish = resolve;}));
+  const run = probe.handlers.adoptRemovedSystemHistory();
+  probe.handlers.renderHistoryMaintenance();
+  assert.equal(probe.elements.historyAdoptButton.disabled, true);
+  assert.equal(probe.elements.historyAdoptSourceSelect.disabled, true);
+  assert.equal(probe.elements.historyAdoptTargetSelect.disabled, true);
+  finish({ok: true, summary: {total_rows: 4}, detail: "History adopted.", orphaned_systems: [{system_id: "removed-two", total_rows: 2}]});
+  await run;
+  assert.equal(probe.elements.historyAdoptButton.disabled, false);
+  assert.match(probe.elements.historyAdoptResult.textContent, /History adopted/);
+});
 test("purge cancel sends no delete and confirmation names exact preview", async () => {
   let posts = 0, message = "";
   const elements = {historyPurgeOrphanedButton: {}, historyPurgeOrphanedResult: {}};

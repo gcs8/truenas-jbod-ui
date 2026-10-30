@@ -74,11 +74,17 @@ def _ownership_and_remedy(path: Path, *, access: str, recursive: bool) -> str:
     owner = f"owned by uid {owner_uid}" if owner_uid is not None else "owner unknown"
     running = f"running as uid {running_uid}" if running_uid is not None else "running as this user"
     target = host_repair_path(path)
-    if running_uid is None or running_gid is None:
+    if recursive:
+        remedy = (
+            f"On the Docker host, for {access} access to {target}, follow the guarded ownership procedure in "
+            "Troubleshooting (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). "
+            "Stop every writer and keep them stopped during repair; "
+            "do not recursively change segmented history."
+        )
+    elif running_uid is None or running_gid is None:
         remedy = f"On the Docker host, give the app user {access} access to {target}."
     else:
-        flag = "-R " if recursive else ""
-        remedy = f"On the Docker host run: sudo chown {flag}{running_uid}:{running_gid} {target}"
+        remedy = f"On the Docker host run: sudo chown {running_uid}:{running_gid} {target}"
     return f"({owner}, {running}). {remedy}"
 
 

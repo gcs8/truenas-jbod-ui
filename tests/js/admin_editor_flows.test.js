@@ -912,3 +912,173 @@ test("loading a system restores its generated-view setting", () => {
   loadSystemIntoForm({ id: "fresh-core", storage_views: [] });
   assert.equal(state.autoStorageViews, true);
 });
+
+// #1032 and #1034 load the real functions by name; stubs cover only rendering
+// helpers and selection lookups.
+function namedFunctions(...names) {
+  return names.map((name) => {
+    const match = SOURCE.match(new RegExp(`^  (?:async )?function ${name}\\([\\s\\S]*?^  }`, "m"));
+    assert.ok(match, `function ${name} must exist`);
+    return match[0];
+  });
+}
+
+function namedConstant(name) {
+  const match = SOURCE.match(new RegExp(`^  const ${name} = [\\s\\S]*?^  };`, "m"));
+  assert.ok(match, `constant ${name} must exist`);
+  return match[0];
+}
+
+function builderField(value = "") {
+  return {
+    value, textContent: "", innerHTML: "", disabled: false, title: "", dataset: {}, style: {},
+    classList: { add() {}, remove() {}, toggle() {} },
+  };
+}
+
+function profileBuilderHarness(values) {
+  const sourceProfile = { id: "synthetic-base", label: "Synthetic Base", rows: 1, columns: 1, slot_count: 1, slot_layout: [[0]] };
+  const elements = new Proxy({
+    profileBuilderPreviewSummary: builderField(), profileBuilderPreviewGrid: builderField(),
+    profileBuilderPreviewMeta: builderField(), profileBuilderPreviewBadge: builderField(),
+    profileBuilderDeleteButton: builderField(), profileBuilderBadge: builderField(),
+    profileBuilderOrdering: builderField("source-layout"), profileBuilderLayoutEditor: builderField(),
+    profileBuilderResult: builderField(), profileBuilderLabel: builderField("Synthetic Copy"),
+    profileBuilderId: builderField("synthetic-copy"), profileBuilderRows: builderField(values.rows),
+    profileBuilderColumns: builderField(values.columns), profileBuilderSlotCount: builderField(values.slots),
+  }, { get: (target, key) => target[key] ?? null });
+  const banners = [];
+  const requests = [];
+  const api = loadFunctions(
+    [
+      namedConstant("BUILDER_ORDERING_LABELS"),
+      ...namedFunctions(
+        "builderOrderingLabel", "countSlots", "buildRectangularProfileLayout", "serializeProfileLayoutText",
+        "parseProfileLayoutText", "layoutsEqual", "detectGeneratedLayoutOrdering", "buildProfileRows",
+        "currentBuilderOrdering", "resolveBuilderDraftLayout", "readProfileBuilderDraft",
+        "builderDraftUsesSourceLayout", "renderProfileBuilder", "profileReferenceCount",
+        "describeProfileReferences", "lockActionsIfStopped", "saveCustomProfile",
+      ),
+    ],
+    ["renderProfileBuilder", "saveCustomProfile"],
+    {
+      state: { profiles: [sourceProfile], loadedBuilderProfileId: "" },
+      elements,
+      currentBuilderSourceProfile: () => sourceProfile,
+      suggestedCustomProfileId: () => "synthetic-copy",
+      parseRowGroupsText: () => [],
+      profileRowGroupsText: () => "",
+      getProfileById: () => null,
+      escapeHtml: String,
+      applyProfilePreviewGeometry() {},
+      clearProfilePreviewGeometry() {},
+      buildProfilePreviewGeometry: () => ({}),
+      renderProfilePreviewCells: (rows) => JSON.stringify(rows),
+      setBanner: (message, tone) => banners.push([message, tone]),
+      captureAdminEditorOperation: () => ({ owns: () => true, advance() {} }),
+      fetchJson: async (url) => {
+        requests.push(url);
+        throw new Error("no save in this test");
+      },
+      recordAdminEditorOutcome() {},
+      describeMutationFailure: (action) => `${action} failed`,
+    }
+  );
+  return { api, elements, banners, requests };
+}
+
+test("a fractional profile builder dimension shows a message instead of breaking the preview or Save", async () => {
+  for (const values of [
+    { rows: "1.5", columns: "1", slots: "1" },
+    { rows: "1", columns: "1.5", slots: "1" },
+    { rows: "2", columns: "2", slots: "2.5" },
+  ]) {
+    const { api, elements, banners, requests } = profileBuilderHarness(values);
+    api.renderProfileBuilder();
+    const label = JSON.stringify(values);
+    assert.match(elements.profileBuilderPreviewSummary.textContent, /whole numbers/, label);
+    assert.equal(elements.profileBuilderPreviewGrid.innerHTML, "[]", `${label} draws no partial layout`);
+
+    await api.saveCustomProfile();
+    assert.equal(requests.length, 0, `${label} is not sent`);
+    assert.equal(banners.at(-1)[1], "error");
+    assert.match(banners.at(-1)[0], /^Builder layout needs fixes before save: .*whole numbers/, label);
+    assert.match(elements.profileBuilderResult.textContent, /whole numbers/, label);
+
+    // The editor stays usable: a whole number renders the layout again.
+    elements.profileBuilderRows.value = "2";
+    elements.profileBuilderColumns.value = "1";
+    elements.profileBuilderSlotCount.value = "2";
+    api.renderProfileBuilder();
+    assert.equal(elements.profileBuilderPreviewGrid.innerHTML, "[[1],[0]]", label);
+    assert.doesNotMatch(elements.profileBuilderPreviewSummary.textContent, /whole numbers/, label);
+  }
+});
+
+function storageViewMoveHarness(storageViews, selectedStorageViewId) {
+  const state = { storageViews, selectedStorageViewId, storageViewTemplates: [], setupDirty: false, setupDraftRevision: 0 };
+  const api = loadFunctions(
+    [
+      sourceBetween("  function normalizeStorageView(", "\n  function createStorageViewFromTemplate"),
+      sourceBetween("  function adoptGeneratedStorageViews(", "\n  function updateSelectedStorageView"),
+      ...namedFunctions("moveSelectedStorageView"),
+    ],
+    ["moveSelectedStorageView", "normalizeStorageViews"],
+    {
+      state,
+      getSelectedStorageView: () => state.storageViews.find((view) => view.id === state.selectedStorageViewId) || null,
+      getStorageViewTemplate: () => null,
+      normalizeSlotLabelMap: () => ({}),
+      normalizeSlotSizeMap: () => ({}),
+      slugify: (value) => String(value),
+      renderStorageViews() {},
+    }
+  );
+  return { api, state };
+}
+
+function savedView(id, order) {
+  return { id, label: id, kind: "ses_enclosure", template_id: "ses-auto", order };
+}
+
+test("Move Up and Move Down reorder saved views that share an order value", () => {
+  const { api, state } = storageViewMoveHarness(
+    [savedView("view-a", 10), savedView("view-b", 10), savedView("view-c", 10)],
+    "view-a"
+  );
+  state.storageViews = api.normalizeStorageViews(state.storageViews);
+  const ids = () => state.storageViews.map((view) => view.id).join(",");
+  const reloaded = () => api.normalizeStorageViews(JSON.parse(JSON.stringify(state.storageViews)))
+    .map((view) => view.id).join(",");
+
+  api.moveSelectedStorageView(1);
+  assert.equal(ids(), "view-b,view-a,view-c");
+  assert.equal(reloaded(), "view-b,view-a,view-c", "the saved order values keep the move");
+  assert.equal(state.setupDirty, true);
+  assert.equal(state.selectedStorageViewId, "view-a");
+
+  api.moveSelectedStorageView(1);
+  assert.equal(ids(), "view-b,view-c,view-a");
+  state.selectedStorageViewId = "view-c";
+  api.moveSelectedStorageView(-1);
+  assert.equal(ids(), "view-c,view-b,view-a");
+  assert.equal(reloaded(), "view-c,view-b,view-a");
+  assert.equal(new Set(state.storageViews.map((view) => view.order)).size, 3, "every view has its own order value");
+
+  // The first view cannot move up.
+  api.moveSelectedStorageView(-1);
+  assert.equal(ids(), "view-c,view-b,view-a");
+});
+
+test("moving views with distinct order values still swaps only those two values", () => {
+  const { api, state } = storageViewMoveHarness(
+    [savedView("view-a", 10), savedView("view-b", 25), savedView("view-c", 40)],
+    "view-b"
+  );
+  state.storageViews = api.normalizeStorageViews(state.storageViews);
+  api.moveSelectedStorageView(1);
+  assert.equal(
+    JSON.stringify(state.storageViews.map((view) => [view.id, view.order])),
+    JSON.stringify([["view-a", 10], ["view-c", 25], ["view-b", 40]])
+  );
+});
