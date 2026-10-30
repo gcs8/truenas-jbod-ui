@@ -689,10 +689,15 @@ jbodmap ALL=(root) NOPASSWD: /usr/sbin/smartctl ^-x -j /dev/nvme[0-9]+n[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme ^smart-log -o json /dev/nvme[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme ^id-ctrl -o json /dev/nvme[0-9]+$
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/nvme ^id-ns -o json /dev/nvme[0-9]+n[0-9]+$
-jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk --json --bytes --output *
+jbodmap ALL=(root) NOPASSWD: /usr/bin/lsblk --json --bytes --output NAME\,KNAME\,PATH\,TYPE\,SIZE\,MODEL\,SERIAL\,WWN\,TRAN\,HCTL\,PKNAME\,MOUNTPOINTS\,FSTYPE\,UUID\,PARTUUID\,LOG-SEC\,PHY-SEC
 jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail --scan
-jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm --detail /dev/md*
+jbodmap ALL=(root) NOPASSWD: /usr/sbin/mdadm ^--detail /dev/md[0-9]+$
 ```
+
+The `lsblk` line grants the exact column list the app requests; sudoers needs
+each comma in an argument escaped as `\,`. Do not shorten it to a trailing
+`--output *` or `/dev/md*` glob: sudo globs can consume spaces and further
+options.
 
 `nvme list-subsys -o json` may work without sudo and is useful for controller
 and PCIe-path discovery. The app treats the standing subsystem probe as an
