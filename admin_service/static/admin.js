@@ -1378,7 +1378,7 @@
         }).join("");
         sourceSelect.value = currentSourceId;
       }
-      sourceSelect.disabled = state.orphanedHistoryLoading || !orphanedSystems.length;
+      sourceSelect.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending) || !orphanedSystems.length;
     }
 
     if (targetSelect) {
@@ -1397,11 +1397,12 @@
         )).join("");
         targetSelect.value = currentTargetId;
       }
-      targetSelect.disabled = state.orphanedHistoryLoading || !savedSystems.length;
+      targetSelect.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending) || !savedSystems.length;
     }
 
     if (adoptButton) {
-      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
+      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending)
+        || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
     }
   }
 
@@ -7594,6 +7595,12 @@
     if (elements.setupResult) {
       elements.setupResult.textContent = "Creating demo builder system...";
     }
+    // Opening the created demo belongs to the visit and draft revision that
+    // asked for it; later edits or navigation keep their own form (#1042).
+    const editorGeneration = state.setupEditorGeneration;
+    const draftRevision = state.setupDraftRevision;
+    const ownsEditor = () => state.setupEditorGeneration === editorGeneration;
+    const ownsDraft = () => ownsEditor() && state.setupDraftRevision === draftRevision;
     try {
       let systemId = "demo-builder-lab";
       let suffix = 2;
@@ -7614,18 +7621,23 @@
       });
       requireMutationResult(validDemoSystemResult(payload), "demo system");
       await refreshState({ quiet: true });
-      state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
-      const createdSystem = getSystemById(payload.system?.id || "");
-      if (createdSystem) {
-        loadSystemIntoForm(createdSystem);
-      } else {
-        renderAll();
+      const detail = payload.detail || "Demo builder system created.";
+      if (ownsDraft()) {
+        state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
+        const createdSystem = getSystemById(payload.system?.id || "");
+        if (createdSystem) {
+          loadSystemIntoForm(createdSystem);
+        } else {
+          renderAll();
+        }
+        renderSaveResult(elements.setupResult, detail, payload);
+      } else if (ownsEditor()) {
+        renderSaveResult(elements.setupResult, `${detail} Your newer edits were kept; open it from the saved systems list.`, payload);
       }
-      renderSaveResult(elements.setupResult, payload.detail || "Demo builder system created.", payload);
       setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
     } catch (error) {
       const message = describeMutationFailure("Demo builder system creation", error);
-      if (elements.setupResult) {
+      if (ownsEditor() && elements.setupResult) {
         elements.setupResult.textContent = message;
       }
       setBanner(message, "error");
@@ -7787,6 +7799,7 @@
       return;
     }
 
+    state.historyAdoptPending = true;
     if (elements.historyAdoptButton) {
       elements.historyAdoptButton.disabled = true;
     }
@@ -7801,6 +7814,8 @@
     }
 
     try {
+      // Adoption rewrites history rows like a purge, so it gets the same long
+      // maintenance deadline instead of the 60-second default (#1043).
       const payload = await fetchJson("/api/admin/history/adopt-removed-system", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -7808,6 +7823,7 @@
           source_system_id: sourceSystem.system_id,
           target_system_id: targetSystem.id,
         }),
+        timeoutMs: HISTORY_MAINTENANCE_TIMEOUT_MS,
       });
       const refreshed = Array.isArray(payload.orphaned_systems);
       if (refreshed) {
@@ -7829,11 +7845,22 @@
         !warning && Number(payload.summary?.total_rows || 0) > 0 ? "success" : "info"
       );
     } catch (error) {
-      if (elements.historyAdoptResult) {
-        elements.historyAdoptResult.textContent = `History adoption failed: ${error.message || error}`;
+      // A timed-out or interrupted adoption may still be running or have
+      // committed. Keep the last-known rows but leave Adopt unavailable until a
+      // fresh scan reads back what remains.
+      const unknown = error?.adminOutcome === "unknown" || error?.outcomeUnknown;
+      if (unknown) {
+        state.orphanedHistoryError = true;
       }
-      setBanner(`History adoption failed: ${error.message || error}`, "error");
+      const detail = unknown
+        ? `History adoption outcome is unknown. ${error.message || error} Refresh the history source list to see what remains before adopting again.`
+        : `History adoption failed: ${error.message || error}`;
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = detail;
+      }
+      setBanner(detail, unknown ? "info" : "error");
     } finally {
+      state.historyAdoptPending = false;
       renderHistoryMaintenance();
     }
   }
