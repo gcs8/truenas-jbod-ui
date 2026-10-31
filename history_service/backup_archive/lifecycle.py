@@ -43,6 +43,7 @@ from .catalog import (
     validate_location,
     validate_object_name,
 )
+from .errors import describe_error
 
 DEFAULT_UNVERIFIED_GRACE = timedelta(hours=24)
 DEFAULT_ACTOR = "lifecycle"
@@ -291,7 +292,7 @@ class LifecycleManager:
                 try:
                     targets[record.location] = target_resolver(record.location)
                 except Exception as exc:  # noqa: BLE001 - reported per location, not swallowed
-                    failed_locations[record.location] = f"{type(exc).__name__}: {exc}"
+                    failed_locations[record.location] = describe_error(exc)
                     first_failure = first_failure or (item, failed_locations[record.location])
                     skipped.append(item)
                     continue
@@ -299,7 +300,7 @@ class LifecycleManager:
             try:
                 self.catalog.claim_deletion(record, actor=actor, now=clock())
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-                return stop(f"{type(exc).__name__}: {exc}")
+                return stop(describe_error(exc))
             gone = False
             try:
                 target.delete(record.name)
@@ -307,14 +308,14 @@ class LifecycleManager:
                 gone = True
             except (ConnectionError, TimeoutError) as exc:
                 self.catalog.release_deletion(record.artifact_id)
-                message = f"{type(exc).__name__}: {exc}"
+                message = describe_error(exc)
                 failed_locations[record.location] = message
                 first_failure = first_failure or (item, message)
                 skipped.append(item)
                 continue
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
                 self.catalog.release_deletion(record.artifact_id)
-                return stop(f"{type(exc).__name__}: {exc}")
+                return stop(describe_error(exc))
             try:
                 reason = f"{item.kind}: {item.reason}"
                 if gone:
@@ -323,7 +324,7 @@ class LifecycleManager:
                     record.artifact_id, reason=reason, actor=actor, now=clock(), expected=record
                 )
             except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-                return stop(f"{type(exc).__name__}: {exc}")
+                return stop(describe_error(exc))
             (missing if gone else deleted).append(item)
         failed, error = first_failure or (None, None)
         return ApplyResult(

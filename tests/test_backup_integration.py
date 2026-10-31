@@ -2293,7 +2293,8 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(sorted(r.location for r in scheduler.catalog.list()), ["cloud", "local"])
         status = json.loads(self._paths.status_file.read_text())
         self.assertFalse(status["targets"]["nas"]["ok"])
-        self.assertIn("connection refused", status["targets"]["nas"]["detail"])
+        self.assertEqual(status["targets"]["nas"]["detail"], "ConnectionRefusedError")
+        self.assertNotIn("nas.example.test", self._paths.status_file.read_text())
         self.assertTrue(status["targets"]["cloud"]["ok"])
         self.assertEqual(stat.S_IMODE(self._paths.status_file.stat().st_mode), 0o640)
 
@@ -2421,7 +2422,7 @@ class SchedulerTests(SchedulerTestBase):
         self.assertFalse(grooming["ok"])
         self.assertEqual(grooming["deleted"], 3)
         self.assertEqual(sorted(grooming["failed_locations"]), ["nas"])
-        self.assertIn("connection refused", grooming["failed_locations"]["nas"])
+        self.assertEqual(grooming["failed_locations"]["nas"], "ConnectionRefusedError")
 
         from app.services.backup_health import backup_archive_problems
 
@@ -2450,6 +2451,85 @@ class SchedulerTests(SchedulerTestBase):
         self.assertIn("remote copy could not be verified", status["targets"]["nas"]["detail"])
         self.assertFalse((remote_dir / record.name).exists())
 
+    def test_provider_error_text_stays_out_of_shared_status_and_api(self) -> None:
+        # #737: a provider or client library can put its own reply text in an
+        # exception. Shared status and API responses carry only the class name,
+        # plus local strerror text for an errno, never that raw text.
+        import errno as errno_module
+
+        from history_service.backup_scheduler.api import build_app
+
+        leak = "SYNTHETIC-PROVIDER-REPLY banner sftp-user@nas.example.test /srv/private/path"
+        provider_errors = {
+            "nas": ConnectionResetError(errno_module.ECONNRESET, leak),
+            "cloud": EOFError(leak),
+        }
+
+        def open_target(settings):
+            @contextlib.contextmanager
+            def opened():
+                failure = provider_errors.get(settings.target_id)
+                if failure is not None:
+                    raise failure
+                yield LocalDirectoryTarget(self.remote_root / settings.target_id)
+
+            return opened()
+
+        self.open_target = open_target  # type: ignore[method-assign]
+        cloud = {**TARGET, "target_id": "cloud", "label": "Cloud", "root": "/unused-cloud"}
+        scheduler = self.make({"full": {"enabled": True}, "targets": [TARGET, cloud]})
+        scheduler.run_now("full")
+        status_text = self._paths.status_file.read_text(encoding="utf-8")
+        status = json.loads(status_text)
+        self.assertNotIn("SYNTHETIC-PROVIDER-REPLY", status_text)
+        self.assertNotIn("nas.example.test", status_text)
+        self.assertEqual(
+            status["targets"]["nas"]["detail"], f"ConnectionResetError: {os.strerror(errno_module.ECONNRESET)}"
+        )
+        self.assertEqual(status["targets"]["cloud"]["detail"], "EOFError")
+
+        tested = scheduler.test_target("cloud")
+        self.assertFalse(tested["ok"])
+        self.assertEqual(tested["detail"], "EOFError")
+
+        app = build_app(scheduler)
+        library_text = asgi_call(app, "GET", "/internal/backups")[1].decode("utf-8")
+        self.assertNotIn("SYNTHETIC-PROVIDER-REPLY", library_text)
+
+        # A remote copy that cannot be fetched: the 502 detail is bounded too.
+        provider_errors.pop("nas")
+        record = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list(location="nas") if r.created_at == record.created_at)
+        provider_errors["nas"] = EOFError(leak)
+        status_code, body = asgi_call(app, "GET", f"/internal/backups/{remote.artifact_id}/download")
+        self.assertEqual(status_code, 502)
+        self.assertEqual(json.loads(body)["detail"], "Could not read the backup: EOFError")
+        status_code, body = asgi_call(app, "POST", f"/internal/backups/{remote.artifact_id}/verify")
+        self.assertNotIn("SYNTHETIC-PROVIDER-REPLY", body.decode("utf-8"))
+
+    def test_describe_error_keeps_application_text_and_bounds_it(self) -> None:
+        from history_service.backup_archive.transport import ArchiveTransportError
+        from history_service.backup_scheduler.service import MAX_DETAIL_CHARS, describe_error
+
+        # This application's own wording is still shown, cleaned and bounded.
+        own = ArchiveTransportError("Archive root is not a directory.\n\x1b[2Jtail " + "x" * 600)
+        text = describe_error(own)
+        self.assertTrue(text.startswith("ArchiveTransportError: Archive root is not a directory. [2Jtail"))
+        self.assertLessEqual(len(text), MAX_DETAIL_CHARS)
+        self.assertNotIn("\x1b", text)
+
+        def raised_here() -> RuntimeError:
+            try:
+                raise RuntimeError("remote copy could not be verified")
+            except RuntimeError as exc:
+                return exc
+
+        # A builtin raised outside the application packages (a test file stands
+        # in for a client library) keeps only its class.
+        self.assertEqual(describe_error(raised_here()), "RuntimeError")
+        self.assertEqual(describe_error(RuntimeError("never raised")), "RuntimeError")
+        self.assertEqual(describe_error(PermissionError(13, "SYNTHETIC denied", "/srv/x")), "PermissionError: Permission denied")
+
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
 
@@ -2459,7 +2539,8 @@ class SchedulerTests(SchedulerTestBase):
             scheduler.run_now("full")
         from app.services.backup_health import backup_archive_problems
 
-        self.assertEqual(backup_archive_problems(self._paths.status_file), ["Full backup failed: RuntimeError: export failed"])
+        # #737: the runner's message is not this module's wording, so only its class is shared.
+        self.assertEqual(backup_archive_problems(self._paths.status_file), ["Full backup failed: RuntimeError"])
         FakeRunner.fail = False
         with scheduler._job("full"), self.assertRaises(SchedulerBusyError):
             scheduler.run_now("full")
