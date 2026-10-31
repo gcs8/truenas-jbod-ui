@@ -2531,32 +2531,31 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(describe_error(PermissionError(13, "SYNTHETIC denied", "/srv/x")), "PermissionError: Permission denied")
 
         # Inside an application file, only an explicit raise keeps its text; a
-        # builtin call that quotes a provider value does not.
-        import history_service.backup_archive as archive_package
+        # builtin call that quotes a provider value does not. This test file
+        # stands in for an application file (no synthetic source on disk).
+        from history_service.backup_archive import errors as archive_errors
 
-        namespace: dict[str, Any] = {}
-        exec(  # noqa: S102 - synthetic code compiled under an application filename
-            compile(
-                "def own():\n    raise RuntimeError('remote copy does not match the local archive')\n"
-                "def parse(value):\n    return int(value)\n",
-                str(Path(archive_package.__file__).with_name("synthetic_737.py")),
-                "exec",
-            ),
-            namespace,
-        )
-        # assertRaises drops the traceback, so catch these directly.
-        try:
-            namespace["own"]()
-        except RuntimeError as exc:
-            self.assertEqual(describe_error(exc), "RuntimeError: remote copy does not match the local archive")
-        else:
-            self.fail("own() must raise")
-        try:
-            namespace["parse"]("SYNTHETIC-PROVIDER-REPLY")
-        except ValueError as exc:
-            self.assertEqual(describe_error(exc), "ValueError")
-        else:
-            self.fail("parse() must raise")
+        def own() -> None:
+            raise RuntimeError("remote copy does not match the local archive")
+
+        def parse(value: str) -> int:
+            return int(value)
+
+        here = os.path.abspath(__file__)
+        with patch.object(archive_errors, "_is_source_file", side_effect=lambda name: os.path.abspath(name) == here):
+            # assertRaises drops the traceback, so catch these directly.
+            try:
+                own()
+            except RuntimeError as exc:
+                self.assertEqual(describe_error(exc), "RuntimeError: remote copy does not match the local archive")
+            else:
+                self.fail("own() must raise")
+            try:
+                parse("SYNTHETIC-PROVIDER-REPLY")
+            except ValueError as exc:
+                self.assertEqual(describe_error(exc), "ValueError")
+            else:
+                self.fail("parse() must raise")
 
     def test_failed_backup_recorded_and_single_flight(self) -> None:
         from history_service.backup_scheduler.service import SchedulerBusyError
