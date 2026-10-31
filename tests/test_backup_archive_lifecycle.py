@@ -415,7 +415,8 @@ class LifecycleApplyTests(CatalogCase):
 
         result = self.manager.apply(plan, resolver)
         self.assertEqual(result.deleted, local_items)
-        self.assertEqual(dict(result.failed_locations), {"nas-1": "OSError: synthetic connection refused"})
+        # #737: provider text stays out of shared grooming status; the class remains.
+        self.assertEqual(dict(result.failed_locations), {"nas-1": "OSError"})
         self.assertEqual(result.failed, remote_items[0])
         self.assertIn("OSError", result.error)
         self.assertEqual(result.not_attempted, remote_items[1:])
@@ -439,10 +440,7 @@ class LifecycleApplyTests(CatalogCase):
         result = self.manager.apply(plan, resolver)
 
         self.assertEqual(result.deleted, local_items)
-        self.assertEqual(
-            dict(result.failed_locations),
-            {"nas-1": "ConnectionRefusedError: synthetic lazy connection refused"},
-        )
+        self.assertEqual(dict(result.failed_locations), {"nas-1": "ConnectionRefusedError"})
         self.assertEqual(result.failed, remote_items[0])
         self.assertEqual(result.not_attempted, remote_items[1:])
         self.assertFalse(result.location_complete("nas-1"))

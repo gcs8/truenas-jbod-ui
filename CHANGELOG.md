@@ -51,6 +51,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Late TLS certificate inspect and trust answers stopped changing a different
+  editor or target, and backup status and API responses stopped carrying raw
+  provider error text (#1054).
 - Small segmented history reads skipped older sealed segments that could not
   change the newest rows, avoiding a full sort of each unindexed segment (#1053).
 - Explained unplaced source observations whose only identity evidence was a bare

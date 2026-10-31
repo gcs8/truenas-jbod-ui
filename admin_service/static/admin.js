@@ -5902,6 +5902,9 @@
       if (elements.setupBootstrapButton) {
         elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
       }
+      for (const control of [elements.setupInspectTlsButton, elements.setupTrustRemoteTlsButton]) {
+        if (control) control.disabled = Boolean(state.sessionStopped);
+      }
       const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
       const selected = state.systems?.some((system) => system.id === selectedId);
       for (const control of [elements.existingSystemDeleteButton, elements.existingSystemDeleteHistoryToggle]) {
@@ -6795,12 +6798,30 @@
     }
   }
 
+  function captureTlsEditorOperation(name, host) {
+    // The TLS target is the HTTPS host plus the optional certificate name. The
+    // editor owner already covers visits, draft edits and the host field; the
+    // server name is checked here because it is not part of that target.
+    const operation = captureAdminEditorOperation(name);
+    const sequence = state.adminEditorOperationSeq[name];
+    const serverName = collectTlsServerName();
+    const owns = () => operation.owns() && collectTlsTargetHost() === host
+      && collectTlsServerName() === serverName;
+    // This request's button is released by whichever request of this kind is
+    // newest. Not every draft change (storage-view delete, duplicate or order
+    // reset) releases editor controls, so a retired request still releases its
+    // button unless a newer request of the same kind now holds it.
+    const latest = () => state.adminEditorOperationSeq[name] === sequence;
+    return { owns, latest, serverName, advance: operation.advance };
+  }
+
   async function inspectTlsCertificate() {
     const host = collectTlsTargetHost();
     if (!host) {
       setBanner("Enter the HTTPS host first.", "error");
       return;
     }
+    const owner = captureTlsEditorOperation("tls-inspect", host);
     if (elements.setupInspectTlsButton) {
       elements.setupInspectTlsButton.disabled = true;
     }
@@ -6814,9 +6835,11 @@
         body: JSON.stringify({
           host,
           timeout_seconds: 10,
-          tls_server_name: collectTlsServerName() || null,
+          tls_server_name: owner.serverName || null,
         }),
       });
+      // #737: a late answer for an earlier editor or target is dropped.
+      if (!owner.owns()) return;
       state.tlsInspection = payload.inspection || null;
       renderTlsInspection();
       syncTlsServerNameHelp();
@@ -6834,12 +6857,15 @@
         validityWarning ? "error" : "success"
       );
     } catch (error) {
+      if (!owner.owns()) return;
       if (elements.setupTlsInspectionResult) {
         elements.setupTlsInspectionResult.textContent = `TLS inspection failed: ${error.message || error}`;
       }
       setBanner(`TLS inspection failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupInspectTlsButton) {
+      // A newer inspection holds the button; otherwise release it, even when
+      // this answer was dropped as stale (#737 review).
+      if (owner.latest() && elements.setupInspectTlsButton) {
         elements.setupInspectTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -6851,6 +6877,7 @@
       setBanner("Enter the HTTPS host first.", "error");
       return;
     }
+    const owner = captureTlsEditorOperation("tls-trust-remote", host);
     if (elements.setupTrustRemoteTlsButton) {
       elements.setupTrustRemoteTlsButton.disabled = true;
     }
@@ -6866,9 +6893,12 @@
           timeout_seconds: 10,
           system_id: elements.setupSystemId?.value?.trim() || null,
           bundle_name: suggestedTlsBundleName(),
-          tls_server_name: collectTlsServerName() || null,
+          tls_server_name: owner.serverName || null,
         }),
       });
+      // #737: never put another editor's or target's bundle path or
+      // verify-SSL state into the form that is open now.
+      if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
       state.tlsInspection = payload.inspection || state.tlsInspection;
       if (elements.setupTlsCaBundlePath) {
@@ -6881,6 +6911,7 @@
       }
       const leftOff = !validated && !elements.setupVerifySsl?.checked;
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       renderTlsInspection();
       syncVerifySslHelp();
       syncTlsServerNameHelp();
@@ -6899,13 +6930,14 @@
           : `Saved the presented remote certificate material for ${host}, but it has not validated cleanly yet.`
       , trusted ? "success" : "info");
     } catch (error) {
+      if (!owner.owns()) return;
       syncTlsTrustStatus();
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = `Saving the remote certificate material failed: ${error.message || error}`;
       }
       setBanner(`Saving the remote certificate material failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupTrustRemoteTlsButton) {
+      if (owner.latest() && elements.setupTrustRemoteTlsButton) {
         elements.setupTrustRemoteTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }

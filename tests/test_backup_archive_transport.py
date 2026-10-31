@@ -13,6 +13,7 @@ import io
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -701,6 +702,21 @@ class FtpTargetTests(_TempCase):
                     target.put(self.source(b"payload"), "a.bin")
         self.assertEqual(FakeFTP.instances[0].files, {})
 
+    def test_provider_reply_text_is_not_copied_into_errors_or_probe_results(self) -> None:
+        # #737: an FTP reply is provider text; only its class reaches status.
+        reply = "550 SYNTHETIC-PROVIDER-REPLY ftp-user@ftp.example.test /srv/private"
+        with open_target(self.settings()) as target:
+            target.put(self.source(b"x"), "a.bin")
+            ftp = FakeFTP.instances[0]
+            with mock.patch.object(ftp, "delete", side_effect=ftplib.error_perm(reply)):
+                with self.assertRaises(transport.ArchiveTransportError) as caught:
+                    target.delete("a.bin")
+            self.assertEqual(str(caught.exception), "FTP archive delete failed: error_perm")
+            with mock.patch.object(ftp, "storbinary", side_effect=ftplib.error_temp(reply)):
+                result = target.test()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["detail"], "error_temp")
+
     def test_mkdir_permission_error_is_not_swallowed(self) -> None:
         with open_target(self.settings()) as target:
             FakeFTP.instances[0].deny_mkd.add("/pub/jbod-ui/locked")
@@ -1369,6 +1385,19 @@ class NfsTargetTests(_TempCase):
         )
         self.assertEqual(mounts.commands[1], ["/usr/bin/umount", mount_dir])
         self.assertFalse(os.path.exists(mount_dir))
+
+    def test_mount_command_output_stays_in_the_log_not_the_error(self) -> None:
+        # #737: mount/umount output names the server and export. It is logged
+        # locally; the error that reaches shared status carries the exit code only.
+        completed = subprocess.CompletedProcess(
+            ["/usr/bin/mount"], 32, stdout="", stderr="mount.nfs: SYNTHETIC-PROVIDER-REPLY nfs.example.test:/export denied\n"
+        )
+        with mock.patch.object(transport.subprocess, "run", return_value=completed):
+            with self.assertLogs("history_service.backup_archive.transport", "WARNING") as logs:
+                with self.assertRaises(transport.ArchiveTransportError) as caught:
+                    transport._run_mount_command(["/usr/bin/mount"], "mount NFS archive")
+        self.assertEqual(str(caught.exception), "mount NFS archive failed with exit code 32.")
+        self.assertTrue(any("SYNTHETIC-PROVIDER-REPLY" in line for line in logs.output))
 
     def test_failed_unmount_never_deletes_files_on_the_still_mounted_export(self) -> None:
         """Data-loss regression (gcs8/switch-explorer#179).
