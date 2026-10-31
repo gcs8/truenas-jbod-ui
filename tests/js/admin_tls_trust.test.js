@@ -150,7 +150,7 @@ function trustHarness({ validation, endpoint = "trust" }) {
     state,
     collectTlsTargetHost: () => "https://truenas.example.test",
     collectTlsServerName: () => "",
-    captureTlsEditorOperation: () => ({ owns: () => true, serverName: "", advance: () => {} }),
+    captureTlsEditorOperation: () => ({ owns: () => true, latest: () => true, serverName: "", advance: () => {} }),
     suggestedTlsBundleName: () => "synthetic-core",
     readTextFile: async () => "synthetic pem text",
     fetchJson: async () => ({
@@ -384,6 +384,42 @@ test("a current TLS answer still applies and is sent with the target it belongs 
   assert.equal(harness.elements.setupVerifySsl.checked, true);
   assert.equal(harness.elements.setupTrustRemoteTlsButton.disabled, false);
   assert.equal(harness.banners.at(-1).tone, "success");
+});
+
+// #737 review: some draft changes (storage-view delete, duplicate, order
+// reset) bump the revision without releasing editor controls.
+const UNRELEASED_DRAFT_CHANGE = (h) => {
+  h.state.setupDraftRevision += 1;
+};
+
+test("a dropped late TLS answer still releases its button when nothing else released it", async () => {
+  const harness = tlsEditorHarness();
+  const inspect = harness.inspectTlsCertificate();
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, true);
+  UNRELEASED_DRAFT_CHANGE(harness);
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await inspect;
+  assert.equal(harness.state.tlsInspection, null, "the stale answer is still dropped");
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, false);
+
+  const trust = harness.trustRemoteTlsCertificate();
+  UNRELEASED_DRAFT_CHANGE(harness);
+  harness.requests[1].reject(new Error("synthetic handshake failure"));
+  await trust;
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupTrustRemoteTlsButton.disabled, false);
+});
+
+test("an older TLS request never releases the button a newer request holds", async () => {
+  const harness = tlsEditorHarness();
+  const first = harness.inspectTlsCertificate();
+  const second = harness.inspectTlsCertificate();
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await first;
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, true, "the newer inspection still holds it");
+  harness.requests[1].resolve({ inspection: INSPECTION_A });
+  await second;
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, false);
 });
 
 test("editing or leaving the form releases the TLS buttons a retired request held", () => {

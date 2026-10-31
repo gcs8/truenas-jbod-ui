@@ -6803,10 +6803,16 @@
     // editor owner already covers visits, draft edits and the host field; the
     // server name is checked here because it is not part of that target.
     const operation = captureAdminEditorOperation(name);
+    const sequence = state.adminEditorOperationSeq[name];
     const serverName = collectTlsServerName();
     const owns = () => operation.owns() && collectTlsTargetHost() === host
       && collectTlsServerName() === serverName;
-    return { owns, serverName, advance: operation.advance };
+    // This request's button is released by whichever request of this kind is
+    // newest. Not every draft change (storage-view delete, duplicate or order
+    // reset) releases editor controls, so a retired request still releases its
+    // button unless a newer request of the same kind now holds it.
+    const latest = () => state.adminEditorOperationSeq[name] === sequence;
+    return { owns, latest, serverName, advance: operation.advance };
   }
 
   async function inspectTlsCertificate() {
@@ -6857,8 +6863,9 @@
       }
       setBanner(`TLS inspection failed: ${error.message || error}`, "error");
     } finally {
-      // A retired operation's controls were already released by the edit or navigation.
-      if (owner.owns() && elements.setupInspectTlsButton) {
+      // A newer inspection holds the button; otherwise release it, even when
+      // this answer was dropped as stale (#737 review).
+      if (owner.latest() && elements.setupInspectTlsButton) {
         elements.setupInspectTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -6930,7 +6937,7 @@
       }
       setBanner(`Saving the remote certificate material failed: ${error.message || error}`, "error");
     } finally {
-      if (owner.owns() && elements.setupTrustRemoteTlsButton) {
+      if (owner.latest() && elements.setupTrustRemoteTlsButton) {
         elements.setupTrustRemoteTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
