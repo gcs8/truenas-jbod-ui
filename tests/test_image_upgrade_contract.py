@@ -1,6 +1,7 @@
 """Synthetic deployment contracts, not Docker acceptance evidence."""
 from dataclasses import replace
 from pathlib import Path
+import contextlib
 import tempfile
 import unittest
 from unittest import mock
@@ -511,7 +512,7 @@ class ImageOnlyUpgradeSmokeContractTests(unittest.TestCase):
         matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
         self.assertIn(workflow["jobs"]["image-upgrade-smoke"]["name"], " ".join(matrix.split()))
         self.assertIn(workflow["jobs"]["image-upgrade-scenarios"]["name"], " ".join(matrix.split()))
-        for scenario in ("hardened", "interrupted-migration", "segmented-catalog"):
+        for scenario in ("hardened", "interrupted-migration", "segmented-catalog", "unavailable-backup-storage"):
             self.assertIn(f"--scenario {scenario}", " ".join(matrix.split()))
         self.assertIn("scripts/run_image_upgrade_smoke.py", matrix)
         self.assertIn(f"v{workflow['jobs']['image-upgrade-smoke']['env']['PREVIOUS_VERSION']}", matrix)
@@ -1444,6 +1445,914 @@ class EnospcStateScenarioTests(unittest.TestCase):
                 execute(smoke.CLEAR_ENOSPC_HISTORY)
 
 
+class UnavailableBackupStorageScenarioTests(unittest.TestCase):
+    """#463: maintained driver regressions, not real-container evidence."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def test_backup_target_readback_requires_the_recovered_copy_shipped_after_the_restore(self):
+        from datetime import datetime, timedelta, timezone
+
+        smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        baseline_at = base
+        refused_one_at = base + timedelta(hours=1)
+        refused_two_at = base + timedelta(minutes=65)
+        recovery_at = base + timedelta(minutes=70)
+        # The scenario's host-side instants: the fault goes in before the
+        # refused builds and is restored before the recovery build.
+        injection_ts = base.timestamp() + 3599.5
+        restore_ts = refused_two_at.timestamp() + 30.5
+
+        def artifact(at):
+            return "config/jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
+        digests = {name: "d" + str(index) for index, name in enumerate([
+            artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at), artifact(recovery_at)])}
+        digests["config/.scheduled-backup.lock"] = "bookkeeping"
+
+        def digests_of(path):
+            return digests["config/" + Path(path).name]
+
+        def fixture(local_names, remote_names):
+            def run_without_sudo(command, **kwargs):
+                if command[:2] == ["sudo", "find"]:
+                    names = remote_names if "backup-targets" in command[2] else local_names
+                    return "\n".join(names) + "\n"
+                raise AssertionError(command)
+            return mock.patch.object(smoke, "run", side_effect=run_without_sudo)
+
+        lock = "config/.scheduled-backup.lock"
+        all_local = [artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at),
+                     artifact(recovery_at), lock]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (fixture(all_local, [artifact(baseline_at)]),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # The recovery artifact missing remotely is refused: everything
+                # built at/after the restore instant must ship byte-identically.
+                with self.assertRaisesRegex(smoke.SmokeError, "must be shipped byte-identically"):
+                    smoke.check_backup_target_readback(root, window_start=injection_ts, window_end=restore_ts)
+            with (fixture(all_local, [artifact(baseline_at), artifact(recovery_at)]),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # The documented shape holds: the target is the local archive
+                # minus the refusal-window artifacts, plus the recovered copy.
+                shipped = smoke.check_backup_target_readback(root, window_start=injection_ts, window_end=restore_ts)
+            self.assertEqual(set(shipped), {artifact(baseline_at), artifact(recovery_at)})
+
+    def test_backup_target_status_wait_requires_a_coherent_refusal_snapshot(self):
+        smoke = self.load_smoke()
+
+        # Records exactly as the released writer persists them. Target failure
+        # record: RunRecord.as_dict plus the writer's label merge (the shape
+        # fork CI dumped). Class records: RunRecord.as_dict
+        # (history_service/backup_scheduler/service.py:145-146) with
+        # at = _iso(started) from _run_class entry (:808) - the archive BUILD
+        # time, strictly BEFORE the target record's at, which _ship takes
+        # inside its per-target loop (:1132) after the build.
+        def target_failure_record(at):
+            return {"artifact_id": None, "at": at,
+                    "detail": ("ConfigurationError: Configuration error: Filesystem archive target "
+                               "'smoke-nas': Filesystem archive target root must resolve through "
+                               "directories only."),
+                    "label": "smoke-nas", "ok": False}
+
+        def class_record(at, detail):
+            return {"at": at, "ok": True, "detail": detail, "artifact_id": "artifact-" + at[:19]}
+
+        def snapshot(target_at, failure_record, class_at, class_detail):
+            return {"schema_version": 1,
+                    "classes": {"config": class_record(class_at, class_detail)},
+                    "targets": {"smoke-nas": failure_record}}
+
+        ship_at = "2026-10-24T22:43:01.541158+00:00"
+        baseline_build_at = "2026-10-24T22:42:40.112000+00:00"
+        refused_build_at = "2026-10-24T22:43:00.900000+00:00"
+        # Intermediate write: _ship persisted the fresh target failure beside
+        # the previous (baseline) class record, _record_class has not run.
+        incoherent = snapshot(ship_at, target_failure_record(ship_at), baseline_build_at, None)
+        # The coherent pair the scheduler ends with: the class record is the
+        # refused run's OWN record, so its at predates the target record's at.
+        coherent = snapshot(ship_at, target_failure_record(ship_at), refused_build_at,
+                            "1 remote copy failure(s)")
+        with (mock.patch.object(smoke, "read_backup_archive_status", return_value=incoherent),
+              mock.patch.object(smoke.time, "monotonic", side_effect=[0, 30, 90]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            # A fresh target failure beside a stale class record is the
+            # intermediate write between _ship and _record_class: keep polling.
+            with self.assertRaisesRegex(smoke.SmokeError, "never reported"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=[incoherent, coherent]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            self.assertEqual(smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False), coherent)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        with mock.patch.object(smoke, "read_backup_archive_status", return_value=coherent):
+            # The first poll may already see the resolved pair: the refused
+            # class record's detail shape is what makes it coherent, never an
+            # at comparison against the target record it predates.
+            self.assertEqual(smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False), coherent)
+
+    def test_unavailable_backup_storage_is_dispatched_and_invoked_in_the_existing_report_only_job(self):
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        self.assertIn("unavailable-backup-storage", smoke.SCENARIOS)
+        for name, script in (
+            ("config_change", smoke.config_change_script("upgrade-smoke-backup-before")),
+            ("journal_append", smoke.journal_append_script("upgrade-smoke-backup-before")),
+        ):
+            with self.subTest(script=name):
+                compile(script, name, "exec")
+        self.assertIn("save_mapping", smoke.CONFIG_CHANGE_PROBE)
+        self.assertIn('journal.append("mapping.save", SUBJECT)', smoke.BACKUP_JOURNAL_APPEND)
+        # Every sibling dispatch target answers too, so routing this scenario to
+        # one of them fails on the returned value rather than on a missing argument.
+        siblings = ("enospc_state", "readonly_state", "interrupted_migration", "segmented_catalog_upgrade",
+                    "upgrade_and_rollback")
+        with contextlib.ExitStack() as stack:
+            for sibling in siblings:
+                stack.enter_context(mock.patch.object(smoke, sibling, return_value=f"routed to {sibling}"))
+            scenario = stack.enter_context(
+                mock.patch.object(smoke, "unavailable_backup_storage", return_value="qualified"))
+            args = SimpleNamespace(scenario="unavailable-backup-storage")
+            self.assertEqual(smoke.smoke(args), "qualified")
+            scenario.assert_called_once_with(args)
+        workflow = yaml.safe_load((self.ROOT / ".github/workflows/ci.yml").read_text())
+        job = workflow["jobs"]["image-upgrade-scenarios"]
+        runs = [step["run"] for step in job["steps"] if "--scenario unavailable-backup-storage" in step.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        for argument in (
+            '--root "$RUNNER_TEMP/image-upgrade-backup"',
+            '--compose-fixture tests/fixtures/compose/v0.22.2.yml',
+            '--config-fixture tests/fixtures/ci-smoke-config.yaml',
+            '--previous-image "$PREVIOUS_IMAGE"',
+            '--previous-version "$PREVIOUS_VERSION"',
+            '--candidate-image "$CANDIDATE_IMAGE"',
+            '--candidate-revision "$GITHUB_SHA"',
+        ):
+            self.assertIn(argument, runs[0])
+        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertNotIn("--scenario unavailable-backup-storage", str(workflow["jobs"]["image-upgrade-smoke"]))
+
+    def scenario_args(self, root):
+        from types import SimpleNamespace
+        return SimpleNamespace(root=root, compose_fixture=Path("compose-fixture"),
+                               config_fixture=Path("config-fixture"), previous_image="previous",
+                               previous_version="1", candidate_image="candidate", candidate_version="2",
+                               candidate_revision="revision", scenario="unavailable-backup-storage")
+
+    def test_unavailable_backup_storage_lifecycle_preserves_bytes_and_recovers_only_after_explicit_removal(self):
+        self.exercise_lifecycle()
+
+    def test_unavailable_backup_storage_lifecycle_refuses_lost_replaced_or_fresh_history(self):
+        for changed in ({}, {"history.db": [0, "fresh"]}, {"history.db.broken-1": [20, "original"]}):
+            with self.subTest(changed=changed):
+                self.exercise_lifecycle(changed=changed)
+
+    def test_unavailable_backup_storage_lifecycle_refuses_a_replaced_scheduler_container(self):
+        self.exercise_lifecycle(replaced=True)
+
+    def test_unavailable_backup_storage_refuses_an_unisolated_target_failure(self):
+        for refusal_detail in (None, "unrelated failure"):
+            with self.subTest(refusal_detail=refusal_detail):
+                self.exercise_lifecycle(refusal_detail=refusal_detail)
+
+    def test_unavailable_backup_storage_lifecycle_refuses_drifted_config_bytes(self):
+        self.exercise_lifecycle(config_drift=True)
+
+    def test_unavailable_backup_storage_history_guard_does_not_depend_on_an_idle_collector(self):
+        # The released history service writes on its own clock while it runs:
+        # _run_loop starts a background pass after startup_grace_seconds (20 s,
+        # history_service/config.py:74) and repeats it on the poll or failure
+        # backoff interval (history_service/collector.py:888-1006, config.py:67
+        # and :71), and a pass may run retention (collector.py:630, :1232).
+        # Model that writer as landing at any step while the service is up.
+        self.exercise_lifecycle(history_writer="collector")
+
+    def test_unavailable_backup_storage_history_guard_still_catches_a_write_during_the_refusal(self):
+        # A write that does not come from the history service (the scheduler
+        # mounts ./history read-write) must still fail the unchanged-bytes guard.
+        self.exercise_lifecycle(history_writer="other")
+
+    def exercise_lifecycle(self, *, changed=None, replaced=False, refusal_detail="1 remote copy failure(s)",
+                           config_drift=False, history_writer=None):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self.scenario_args(root)
+            deployment = mock.Mock(spec=smoke.Deployment)
+            deployment.files = ()
+            deployment.root = root
+            before = {"history.db": [20, "original"], "segments": [4, "sidecar"]}
+            ui = {"mappings": [["shelf-a", 1, "SYNTH-0001", "synthetic"]]}
+            history = {"counts": {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12},
+                       "integrity": "ok"}
+            refused = {"schema_version": 1, "classes": {
+                "config": {"at": "t", "ok": True, "detail": refusal_detail, "artifact_id": "artifact-during"}},
+                "targets": {"smoke-nas": {"at": "2026-01-01T00:01:00+00:00", "ok": False, "detail": (
+                    "ConfigurationError: Configuration error: Filesystem archive target 'smoke-nas': "
+                    "Filesystem archive target root must resolve through directories only.")}}}
+            recovered_status = {"schema_version": 1, "classes": {}, "targets": {
+                "smoke-nas": {"at": "2026-01-01T00:02:00+00:00", "ok": True, "detail": None,
+                              "artifact_id": "artifact-after"}}}
+            shipped = {"schema_version": 1, "classes": {}, "targets": {
+                "smoke-nas": {"at": "2026-01-01T00:00:00+00:00", "ok": True, "detail": None,
+                              "artifact_id": "artifact-before"}}}
+            identity = {"enclosure-backup-scheduler": ["container", "start"]}
+            replacement = {"enclosure-backup-scheduler": ["container-2", "start-2"]}
+            tree_reads = []
+            ui_reads = []
+            sha_calls = []
+            order = []
+            history_service = {"running": False, "writes": 0}
+
+            def history_writer_step():
+                # "collector": only the live history service writes; "other":
+                # a writer outside it writes whether or not the service runs.
+                if history_writer == "other" or (history_writer == "collector" and history_service["running"]):
+                    history_service["writes"] += 1
+
+            def history_tree():
+                if not history_service["writes"]:
+                    return before
+                return {**before, "history.db": [20 + history_service["writes"], "written"]}
+
+            def compose(*command, **kwargs):
+                services = [part for part in command[1:] if not part.startswith("-")]
+                if command[0] == "stop" and (not services or "enclosure-history" in services):
+                    history_service["running"] = False
+                elif command[0] in ("up", "start", "restart") and (
+                        not services or "enclosure-history" in services):
+                    history_service["running"] = True
+                return ""
+
+            def pull_and_up():
+                history_service["running"] = True
+
+            deployment.compose.side_effect = compose
+            deployment.pull_and_up.side_effect = pull_and_up
+
+            def sha_digest(path):
+                sha_calls.append(path)
+                # First call: the seeded capture. Later calls: drifted only
+                # when this entry drives the config-bytes refusal branch.
+                if len(sha_calls) == 1 or not config_drift:
+                    return "digest-seeded"
+                return "digest-drifted"
+
+            def run_python(service, script):
+                if script == smoke.READ_HISTORY_TREE:
+                    tree_reads.append(script)
+                    # A live writer may land just before and just after any read.
+                    history_writer_step()
+                    if len(tree_reads) == 1 or changed is None:
+                        tree = history_tree()
+                    else:
+                        tree = changed
+                    history_writer_step()
+                    return tree
+                raise AssertionError(f"unexpected one-off probe: {script[:60]!r}")
+
+            def read(service, script):
+                history_writer_step()
+                if script == smoke.READ_HISTORY:
+                    return history
+                if script == smoke.READ_UI:
+                    ui_reads.append(script)
+                    notes = ("upgrade-smoke-backup-during" if len(ui_reads) == 1
+                             else "upgrade-smoke-backup-after")
+                    return {"mappings": ui["mappings"] + [["shelf-a", 4, "SYNTH-0004", notes]]}
+                if "save_mapping" in script:
+                    return {"ok": True}
+                if "ChangeJournal" in script:
+                    return {"change_id": "chg_synthetic"}
+                raise AssertionError(f"unexpected probe: {service} {script[:60]!r}")
+
+            deployment.run_python.side_effect = run_python
+            deployment.exec_python.side_effect = read
+
+            def wait(root_arg, *, want_ok, after=""):
+                if want_ok and not after:
+                    return shipped
+                if not want_ok:
+                    return refused
+                return recovered_status
+
+            with (
+                mock.patch.object(smoke, "Deployment", return_value=deployment),
+                mock.patch.object(smoke, "prepare_root"),
+                mock.patch.object(smoke, "install_backup_secrets") as bootstrap,
+                mock.patch.object(smoke, "install_backup_scheduler_with_target") as install,
+                mock.patch.object(smoke, "seed_previous_release",
+                                  side_effect=lambda *args, **kwargs:
+                                      order.append("seed") or (ui, history, {1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "sha256", side_effect=sha_digest),
+                mock.patch.object(smoke, "wait_for_backup_target_status", side_effect=wait) as wait_mock,
+                mock.patch.object(smoke, "make_backup_target_unavailable", return_value=1000.0) as fault,
+                mock.patch.object(smoke, "make_backup_target_available", return_value=2000.0) as restore,
+                mock.patch.object(smoke, "check_backup_target_readback", return_value={"config/after.7z": "d"}) as readback,
+                mock.patch.object(smoke, "check_runtime") as healthy,
+                mock.patch.object(smoke, "history_api_view",
+                                  return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke.time, "sleep", side_effect=lambda seconds: history_writer_step()) as sleep,
+            ):
+                bootstrap.side_effect = lambda *args, **kwargs: order.append("bootstrap") or mock.DEFAULT
+                if replaced:
+                    # The probe runs once for the identity and once per bounded
+                    # observation step; every later reading is the replacement,
+                    # so the loop's equality against the first reading fails.
+                    readings = [identity] + [replacement] * 10
+                else:
+                    readings = [identity] * 11
+                with mock.patch.object(smoke, "check_backup_scheduler_runtime", side_effect=readings) as probe:
+                    if replaced:
+                        with self.assertRaisesRegex(smoke.SmokeError, "scheduler identity changed"):
+                            smoke.unavailable_backup_storage(args)
+                        self.assertEqual(fault.call_count, 1)
+                        restore.assert_not_called()
+                        readback.assert_not_called()
+                        self.assertEqual(wait_mock.call_count, 2)
+                        self.assertEqual(healthy.call_count, 1)
+                    elif changed is not None or history_writer == "other":
+                        with self.assertRaisesRegex(smoke.SmokeError, "history bytes or entries changed"):
+                            smoke.unavailable_backup_storage(args)
+                        self.assertEqual(fault.call_count, 1)
+                        restore.assert_not_called()
+                        readback.assert_not_called()
+                        self.assertEqual(wait_mock.call_count, 2)
+                        self.assertEqual(healthy.call_count, 1)
+                    elif refusal_detail != "1 remote copy failure(s)":
+                        with self.assertRaisesRegex(smoke.SmokeError, "isolate the remote copy failures"):
+                            smoke.unavailable_backup_storage(args)
+                        self.assertEqual(fault.call_count, 1)
+                        restore.assert_not_called()
+                        readback.assert_not_called()
+                        self.assertEqual(wait_mock.call_count, 2)
+                        self.assertEqual(healthy.call_count, 1)
+                    elif config_drift:
+                        with self.assertRaisesRegex(smoke.SmokeError, "config changed during the backup-target refusal"):
+                            smoke.unavailable_backup_storage(args)
+                        self.assertEqual(fault.call_count, 1)
+                        restore.assert_not_called()
+                        readback.assert_not_called()
+                        self.assertEqual(wait_mock.call_count, 2)
+                        self.assertEqual(healthy.call_count, 1)
+                        self.assertEqual([path.resolve() for path in sha_calls],
+                                         [root.resolve() / "config/config.yaml"] * 2,
+                                         "the invariant limb must compare the seeded config digest, not a stub")
+                    else:
+                        try:
+                            result = smoke.unavailable_backup_storage(args)
+                        except smoke.SmokeError as exc:
+                            self.fail(f"the qualification refused a healthy run: {exc}")
+                        self.assertTrue(history_service["running"],
+                                        "the history service must be running again before the recovery checks")
+                        self.assertIn("scenario=unavailable-backup-storage", result)
+                        self.assertIn("target_refusals=1", result)
+                        self.assertIn("target_refusal=ConfigurationError", result)
+                        self.assertIn("target_recovery=ok", result)
+                        self.assertIn("backup_local_kept=ok", result)
+                        self.assertIn("target_readback=ok", result)
+                        self.assertIn("history_bytes=unchanged", result)
+                        self.assertEqual(probe.call_count, 11)
+                        self.assertEqual(sleep.call_args_list, [mock.call(2)] * 10)
+                        install.assert_called_once_with(deployment)
+                        fault.assert_called_once_with(root)
+                        restore.assert_called_once_with(root)
+                        readback.assert_called_once_with(
+                            root,
+                            window_start=1000.0,
+                            window_end=2000.0,
+                        )
+                        self.assertEqual(healthy.call_count, 2)
+                        for call in healthy.call_args_list:
+                            self.assertEqual(call.args, (deployment, "candidate", "2", "revision"))
+                        deployment.pull_and_up.assert_called_once_with()
+                # The sudo bootstrap is CI-proven only: mocked here (as the
+                # enospc mount is), called once with the deployment root, and
+                # strictly before seeding, so the pre-seed ordering stays
+                # pinned executably in the harness as well as by source text.
+                bootstrap.assert_called_once_with(root)
+                self.assertEqual(order, ["bootstrap", "seed"])
+                self.assertFalse((root / "config" / "backup-secrets").exists(),
+                                 "the harness must not run the real sudo bootstrap inside the temporary root")
+                waits = [(call.kwargs["want_ok"], call.kwargs.get("after", ""))
+                         for call in wait_mock.call_args_list]
+                self.assertEqual(waits, [(True, ""), (False, "2026-01-01T00:00:00+00:00"),
+                                         (True, "2026-01-01T00:01:00+00:00")][:len(waits)])
+                deployment.set_image.assert_called_once_with("candidate")
+                # The history service is stopped for the snapshot and the
+                # refusal window, then started again unless the run failed first.
+                failed_before_restart = (replaced or changed is not None or history_writer == "other"
+                                         or refusal_detail != "1 remote copy failure(s)")
+                self.assertEqual(deployment.compose.call_args_list,
+                                 [mock.call("stop", *smoke.SERVICES), mock.call("pull"),
+                                  mock.call("stop", "enclosure-history")]
+                                 + ([] if failed_before_restart else [
+                                     mock.call("up", "-d", "--wait", "--wait-timeout", "300", "enclosure-history",
+                                               timeout=420)]))
+                journal_notes = [call.args[1] for call in deployment.exec_python.call_args_list
+                                 if "ChangeJournal" in call.args[1]]
+                self.assertEqual(journal_notes, [smoke.journal_append_script(note)
+                                                 for note in ("upgrade-smoke-backup-before",
+                                                              "upgrade-smoke-backup-during",
+                                                              "upgrade-smoke-backup-after")][:len(journal_notes)])
+
+    def test_backup_target_status_wait_is_bounded_and_refuses_stale_or_missing_records(self):
+        import itertools
+
+        smoke = self.load_smoke()
+        stale = {"schema_version": 1, "classes": {}, "targets": {
+            "smoke-nas": {"at": "2026-01-01T00:00:00+00:00", "ok": True, "detail": None, "artifact_id": "a"}}}
+        fresh = {"schema_version": 1, "classes": {}, "targets": {
+            "smoke-nas": {"at": "2026-01-01T00:09:00+00:00", "ok": True, "detail": None, "artifact_id": "b"}}}
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=[stale, fresh]),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            self.assertEqual(smoke.wait_for_backup_target_status(
+                Path("/nonexistent"), want_ok=True, after="2026-01-01T00:01:00+00:00"), fresh)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)])
+        with (mock.patch.object(smoke, "read_backup_archive_status", return_value=stale),
+              mock.patch.object(smoke.time, "monotonic", side_effect=itertools.count(0, 30)),
+              mock.patch.object(smoke.time, "sleep")):
+            with self.assertRaisesRegex(smoke.SmokeError, "within 90 seconds"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=False)
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=smoke.SmokeError("missing")),
+              mock.patch.object(smoke.time, "monotonic", side_effect=itertools.count(0, 30)),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            with self.assertRaisesRegex(smoke.SmokeError, "within 90 seconds"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=True)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)] * 2)
+
+    def test_backup_target_status_wait_survives_malformed_reads_until_the_deadline(self):
+        import itertools
+        import json
+
+        smoke = self.load_smoke()
+        torn = json.JSONDecodeError("Expecting value", "backup-archive.json", 0)
+        with (mock.patch.object(smoke, "read_backup_archive_status", side_effect=torn),
+              mock.patch.object(smoke.time, "monotonic", side_effect=itertools.count(0, 30)),
+              mock.patch.object(smoke.time, "sleep") as sleep):
+            # A malformed or torn read is "no fresh status yet", never a failed
+            # qualification: the poll keeps going until the bounded deadline,
+            # whose message names the last record seen.
+            with self.assertRaisesRegex(smoke.SmokeError, "never reported"):
+                smoke.wait_for_backup_target_status(Path("/nonexistent"), want_ok=True)
+            self.assertEqual(sleep.call_args_list, [mock.call(2)] * 2)
+
+    def test_backup_archive_status_reader_refuses_malformed_payloads(self):
+        import json
+
+        smoke = self.load_smoke()
+        good = {"schema_version": 1, "classes": {}, "targets": {}}
+        for payload in ({}, [], "not an object",
+                        {"schema_version": 2, "classes": {}, "targets": {}},
+                        {"schema_version": 1, "classes": {}},
+                        {"schema_version": 1, "targets": {}},
+                        {"schema_version": 1, "classes": [], "targets": {}},
+                        {"schema_version": 1, "classes": {}, "targets": "smoke-nas"}):
+            with self.subTest(payload=payload):
+                with mock.patch.object(smoke, "run", return_value=json.dumps(payload)):
+                    with self.assertRaisesRegex(smoke.SmokeError, "unexpected shape"):
+                        smoke.read_backup_archive_status(Path("/nonexistent"))
+        with mock.patch.object(smoke, "run", return_value=json.dumps(good)):
+            self.assertEqual(smoke.read_backup_archive_status(Path("/nonexistent")), good)
+
+    def test_backup_target_refusal_pins_the_scheduler_diagnosis_and_rejects_sibling_faults(self):
+        smoke = self.load_smoke()
+        detail = ("ConfigurationError: Configuration error: Filesystem archive target 'smoke-nas': "
+                  "Filesystem archive target root must resolve through directories only.")
+
+        def status_for(target_record, class_record=None):
+            return {"schema_version": 1,
+                    "classes": {"config": class_record if class_record is not None else {
+                        "at": "t", "ok": True, "detail": "1 remote copy failure(s)", "artifact_id": "a"}},
+                    "targets": {"smoke-nas": target_record}}
+
+        smoke.check_backup_target_refusal(status_for({"at": "t", "ok": False, "detail": detail}))
+        # The per-run count is the scheduler's own bookkeeping; any count and
+        # the multi-failure plural form must both pass the shape pin.
+        smoke.check_backup_target_refusal(status_for(
+            {"at": "t", "ok": False, "detail": detail},
+            class_record={"at": "t", "ok": True, "detail": "2 remote copy failure(s)", "artifact_id": "a"}))
+        sibling_contamination = detail.replace(
+            "must resolve through directories only",
+            "must resolve through directories only; the filesystem is full")
+        mutants = (
+            status_for({"at": "t", "ok": True, "detail": None}),
+            status_for({"at": "t", "ok": False, "detail": None}),
+            status_for({"at": "t", "ok": False, "detail": detail.replace("ConfigurationError: ", "")}),
+            status_for({"at": "t", "ok": False, "detail": detail.replace(
+                "Filesystem archive target 'smoke-nas': ", "")}),
+            status_for({"at": "t", "ok": False, "detail": detail.replace(
+                "must resolve through directories only", "something else happened")}),
+            status_for({"at": "t", "ok": False, "detail": sibling_contamination}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": False, "detail": "1 remote copy failure(s)", "artifact_id": "a"}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": None, "artifact_id": None}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": "1 remote copy failures", "artifact_id": "a"}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": "unrelated failure", "artifact_id": "a"}),
+            status_for({"at": "t", "ok": False, "detail": detail}, class_record={
+                "at": "t", "ok": True, "detail": "remote copy failure(s)", "artifact_id": "a"}),
+        )
+        for mutant in mutants:
+            with self.subTest(mutant=repr(mutant["targets"]["smoke-nas"])[:100]):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.check_backup_target_refusal(mutant)
+        recovered = smoke.check_backup_target_recovery({"schema_version": 1, "classes": {}, "targets": {
+            "smoke-nas": {"at": "t", "ok": True, "detail": None, "artifact_id": "b"}}})
+        self.assertEqual(recovered["artifact_id"], "b")
+        for mutant in (
+            {"schema_version": 1, "classes": {}, "targets": {
+                "smoke-nas": {"at": "t", "ok": False, "detail": detail}}},
+            {"schema_version": 1, "classes": {}, "targets": {
+                "smoke-nas": {"at": "t", "ok": True, "detail": None, "artifact_id": None}}},
+            {"schema_version": 1, "classes": {}, "targets": {
+                "smoke-nas": {"at": "t", "ok": True, "detail": "leftover", "artifact_id": "b"}}},
+        ):
+            with self.subTest(mutant=repr(mutant)[:100]):
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.check_backup_target_recovery(mutant)
+
+    def test_backup_scheduler_runtime_probe_refuses_restarts_or_replacement(self):
+        import copy
+        import json
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deployment = smoke.Deployment(root)
+            baseline = {"State": {"Status": "running", "StartedAt": "start"}, "Image": "image-id",
+                        "RestartCount": 0}
+            for fault in (None, "restarted", "exited"):
+                with self.subTest(fault=fault):
+                    state = copy.deepcopy(baseline)
+                    if fault == "restarted":
+                        state["RestartCount"] = 1
+                    elif fault == "exited":
+                        state["State"]["Status"] = "exited"
+
+                    def run(command, **kwargs):
+                        return json.dumps(state)
+
+                    with (mock.patch.object(smoke, "run", side_effect=run),
+                          mock.patch.object(deployment, "compose", return_value="container")):
+                        if fault is None:
+                            self.assertEqual(smoke.check_backup_scheduler_runtime(deployment),
+                                             {"enclosure-backup-scheduler": ["container", "start"]})
+                        else:
+                            with self.assertRaises(smoke.SmokeError):
+                                smoke.check_backup_scheduler_runtime(deployment)
+
+    def test_readback_sha256_is_binary_safe_and_hashes_exact_bytes(self):
+        import hashlib
+
+        smoke = self.load_smoke()
+        payload = bytes(range(256))
+        with (mock.patch.object(smoke, "run", return_value=payload),
+              mock.patch.object(smoke, "run_bytes", return_value=payload, create=True)):
+            try:
+                digest = smoke.sha256(Path("/nonexistent"))
+            except (UnicodeDecodeError, AttributeError) as error:
+                # The pre-fix seam decoded or re-encoded the bytes as text;
+                # either failure mode is the same binary-safety defect.
+                self.fail(f"sha256 is not binary-safe: {error!r}")
+            self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+
+    def test_backup_target_readback_attribute_missing_artifacts_to_the_refusal_window(self):
+        from datetime import datetime, timedelta, timezone
+
+        smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        baseline_at = base
+        refused_one_at = base + timedelta(hours=1)
+        refused_two_at = base + timedelta(minutes=65)
+        recovery_at = base + timedelta(minutes=70)
+
+        def artifact(at):
+            return "config/jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
+        local_names = [artifact(baseline_at), artifact(refused_one_at), artifact(refused_two_at),
+                       artifact(recovery_at), "config/.scheduled-backup.lock"]
+        remote_names = [artifact(baseline_at), artifact(recovery_at)]
+        digests = {name: "d" + name[-13] for name in local_names + remote_names}
+
+        def find_listing(sub_root):
+            return "\n".join(remote_names if "backup-targets" in sub_root else local_names) + "\n"
+
+        def run_without_sudo(command, **kwargs):
+            if command[:2] == ["sudo", "find"]:
+                return find_listing(command[2])
+            raise AssertionError(command)
+
+        def digests_of(path):
+            return digests["config/" + Path(path).name]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of)):
+                # Two refusal-window artifacts missing remotely is exactly the
+                # contract: the target is the local archive minus the window.
+                # The window starts at the raw host injection instant — the
+                # refused build (12:00:00) predates its own refusal record
+                # (12:00:01) because the artifact-name stamp is the archive
+                # build time, so the refused record's `at` must never bound it.
+                injection_ts = base.timestamp() + 3599.5
+                shipped = smoke.check_backup_target_readback(
+                    root, window_start=injection_ts, window_end=recovery_at.isoformat())
+            self.assertEqual(set(shipped), {artifact(baseline_at), artifact(recovery_at)})
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window")):
+                # A window that starts after the first refusal must refuse its
+                # artifact: the attribution is by timestamp, not by "any gap".
+                smoke.check_backup_target_readback(
+                    root, window_start=refused_two_at.isoformat(), window_end=recovery_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=run_without_sudo),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "must be shipped byte-identically")):
+                # An artifact at/after the window end is post-restore: missing
+                # remotely it is the unshipped recovery, never an allowed gap.
+                smoke.check_backup_target_readback(
+                    root, window_start=baseline_at.isoformat(), window_end=refused_two_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs:
+                                        find_listing(command[2]) if "backup-targets" in command[2]
+                                        else "\n".join(remote_names) + "\n"),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "produced no unshipped artifact")):
+                # Nothing missing at all: the target already holds every local artifact.
+                smoke.check_backup_target_readback(
+                    root, window_start=refused_one_at.isoformat(), window_end=recovery_at.isoformat())
+            with (mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs:
+                                        "config/.scheduled-backup.lock\n"),
+                  mock.patch.object(smoke, "sha256", side_effect=digests_of),
+                  self.assertRaisesRegex(smoke.SmokeError, "must hold only shipped archive artifacts")):
+                smoke.check_backup_target_readback(
+                    root, window_start=baseline_at.isoformat(), window_end=recovery_at.isoformat())
+
+    def test_backup_target_readback_requires_byte_identical_local_twins_on_disk(self):
+        import contextlib
+        import subprocess
+        from datetime import datetime, timedelta, timezone
+
+        smoke = self.load_smoke()
+        base = datetime(2026, 1, 1, 11, 0, 0, tzinfo=timezone.utc)
+        refusal_at = base + timedelta(minutes=1)
+        recovery_at = base + timedelta(minutes=2)
+
+        def artifact(at):
+            return "jbod-scheduled-backup-" + at.strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "backup-targets" / "remote" / "config").mkdir(parents=True)
+            (root / "backups" / "archive" / "config").mkdir(parents=True)
+            (root / "backups" / "archive" / "config" / ".scheduled-backup.lock").write_bytes(b"bookkeeping")
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backups" / "archive" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).write_bytes(b"\x02synthetic")
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            (root / "backups" / "archive" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+
+            def run_without_sudo(command, **kwargs):
+                if command[:2] == ["sudo", "find"]:
+                    result = subprocess.run(["find", command[2], "-type", "f", "-printf", "%P\n"],
+                                            capture_output=True, text=True, check=True)
+                    return result.stdout
+                raise AssertionError(command)
+
+            def run_bytes_without_sudo(command, **kwargs):
+                if command[:2] == ["sudo", "cat"]:
+                    result = subprocess.run(["cat", command[2]], capture_output=True, check=True)
+                    return result.stdout
+                raise AssertionError(command)
+
+            def readback_mocks():
+                stack = contextlib.ExitStack()
+                stack.enter_context(mock.patch.object(smoke, "run", side_effect=run_without_sudo))
+                stack.enter_context(mock.patch.object(smoke, "run_bytes", side_effect=run_bytes_without_sudo,
+                                                      create=True))
+                return stack
+
+            with readback_mocks():
+                shipped = smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.timestamp() - 0.5, window_end=recovery_at.isoformat())
+            self.assertEqual(set(shipped), {"config/" + artifact(base), "config/" + artifact(recovery_at)})
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x04drifted")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            orphan = "jbod-scheduled-backup-" + (base + timedelta(minutes=3)).strftime("%Y%m%dT%H%M%SZ") + "-0123abcd.7z"
+            (root / "backup-targets" / "remote" / "config" / orphan).write_bytes(b"\x05synthetic")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "does not byte-match"):
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backup-targets" / "remote" / "config" / orphan).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).unlink()
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "no shipped backup bytes"):
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).unlink()
+            (root / "backup-targets" / "remote" / "config" / artifact(base)).write_bytes(b"\x01synthetic")
+            (root / "backup-targets" / "remote" / "config" / artifact(recovery_at)).write_bytes(b"\x03synthetic")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "produced no unshipped artifact"):
+                smoke.check_backup_target_readback(
+                    root, window_start=refusal_at.isoformat(), window_end=recovery_at.isoformat())
+            (root / "backups" / "archive" / "config" / artifact(refusal_at)).write_bytes(b"\x02synthetic")
+            later_refusal = base + timedelta(seconds=90)
+            (root / "backups" / "archive" / "config" / artifact(later_refusal)).write_bytes(b"\x07synthetic")
+            with readback_mocks(), self.assertRaisesRegex(smoke.SmokeError, "not attributable to the refusal window"):
+                # With a second in-window artifact, the early one's stamp before
+                # the window start is what the attribution pin rejects.
+                smoke.check_backup_target_readback(
+                    root, window_start=(refusal_at + timedelta(seconds=1)).isoformat(),
+                    window_end=recovery_at.isoformat())
+
+    def test_backup_target_fixture_is_bounded_and_cleanup_uses_its_compose_chain(self):
+        smoke = self.load_smoke()
+        self.assertTrue(callable(getattr(smoke, "unavailable_backup_storage", None)),
+                        "the runtime scenario must exist, not only a static validator")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docker-compose.yml").write_text("services: {}")
+            deployment = smoke.Deployment(root)
+            with mock.patch.object(smoke, "run") as run:
+                smoke.install_backup_scheduler_with_target(deployment)
+            self.assertEqual(deployment.files, ("docker-compose.yml", "docker-compose.unavailable-backup.yml"))
+            overlay = yaml.safe_load((root / "docker-compose.unavailable-backup.yml").read_text())
+            service = overlay["services"]["enclosure-backup-scheduler"]
+            self.assertEqual(service["image"], "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}")
+            self.assertEqual(service["command"], ["python", "-m", "history_service.backup_scheduler.main"])
+            self.assertEqual(service["user"], "0:0")
+            self.assertTrue(service["read_only"])
+            self.assertEqual(service["cap_drop"], ["ALL"])
+            self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
+            self.assertEqual(service["group_add"], ["10001"])
+            self.assertEqual(service["environment"]["BACKUP_CONFIG_ENABLED"], "true")
+            self.assertEqual(service["environment"]["BACKUP_CONFIG_DEBOUNCE_SECONDS"], "2")
+            self.assertEqual(service["environment"]["BACKUP_CONFIG_MAX_DELAY_SECONDS"], "10")
+            self.assertEqual(service["environment"]["APP_GID"], "10001")
+            self.assertEqual(service["environment"]["SCHEDULED_BACKUP_PASSPHRASE_FILE"],
+                             "/app/config/backup-secrets/backup-passphrase")
+            self.assertEqual(service["environment"]["BACKUP_TARGETS_JSON"],
+                             '[{"target_id":"smoke-nas","provider":"filesystem","root":"/app/backups/targets/remote"}]')
+            self.assertIn("./backup-targets:/app/backups/targets", service["volumes"])
+            self.assertIn("./backup-journal:/app/backup-journal", service["volumes"])
+            self.assertIn("./backup-status:/app/backup-status", service["volumes"])
+            self.assertIn("./backup-api:/app/backup-api", service["volumes"])
+            self.assertIn("./config:/app/config:ro", service["volumes"])
+            self.assertIn("./data:/app/data:ro", service["volumes"])
+            self.assertIn("./history:/app/history", service["volumes"])
+            self.assertIn("./backups:/app/backups", service["volumes"])
+            self.assertIn("./config/ssh:/run/ssh:ro", service["volumes"])
+            self.assertEqual(service["restart"], "unless-stopped")
+            self.assertIn("scheduler.sock", service["healthcheck"]["test"][3])
+            privileged = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(privileged[:2], [
+                ["sudo", "chown", "0:10001", str(root / "backup-status")],
+                ["sudo", "chmod", "2750", str(root / "backup-status")],
+            ])
+            self.assertEqual(privileged[2:7], [
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backups")],
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-journal")],
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "2750", str(root / "backup-api")],
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets")],
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0755", str(root / "backup-targets" / "remote")],
+            ])
+            self.assertFalse((root / "config" / "backup-secrets").exists(),
+                             "the post-seed helper must not touch the hardened config dir")
+            with mock.patch.object(smoke, "run") as run:
+                smoke.make_backup_target_unavailable(root)
+                smoke.make_backup_target_available(root)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands, [
+                ["sudo", "mv", str(root / "backup-targets" / "remote"),
+                 str(root / "backup-targets" / "remote.held")],
+                ["sudo", "install", "-m", "0644", "-o", "0", "-g", "0", "/dev/null",
+                 str(root / "backup-targets" / "remote")],
+                ["sudo", "rm", str(root / "backup-targets" / "remote")],
+                ["sudo", "mv", str(root / "backup-targets" / "remote.held"),
+                 str(root / "backup-targets" / "remote")],
+            ])
+            with (mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                  mock.patch.object(smoke.os.path, "ismount", return_value=False)):
+                smoke.cleanup(root)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(commands, [
+                ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.unavailable-backup.yml",
+                 "down", "--volumes", "--remove-orphans"],
+                ["sudo", "rm", "-rf", str(root)],
+            ])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docker-compose.yml").write_text("services: {}")
+            (root / "docker-compose.unavailable-backup.yml").write_text("services: {}")
+            with mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+                smoke.cleanup(root)
+            self.assertEqual(run.call_args_list[0].args[0][:6],
+                             ["docker", "compose", "-f", "docker-compose.yml",
+                              "-f", "docker-compose.unavailable-backup.yml"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(smoke, "run") as run:
+                smoke.install_backup_secrets(root)
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["sudo", "install", "-d", "-o", "0", "-g", "0", "-m", "0700",
+                 str(root / "config" / "backup-secrets")],
+                ["sudo", "install", "-m", "0600", "-o", "0", "-g", "0",
+                 str(root / "backup-passphrase.tmp"), str(root / "config" / "backup-secrets" / "backup-passphrase")],
+            ])
+            self.assertFalse((root / "backup-passphrase.tmp").exists(),
+                             "the staging copy must not survive the install")
+
+    def test_backup_passphrase_staging_file_is_private_from_creation(self):
+        import os
+        import re
+        import stat
+
+        smoke = self.load_smoke()
+        real_open = os.open
+        created = []
+        staged = []
+
+        def recording_open(path, flags, mode=0o777, *args, **kwargs):
+            descriptor = real_open(path, flags, mode, *args, **kwargs)
+            created.append((Path(path).name, flags, stat.S_IMODE(os.fstat(descriptor).st_mode)))
+            return descriptor
+
+        def fake_run(command, **kwargs):
+            if command[:4] == ["sudo", "install", "-m", "0600"]:
+                staged.append(Path(command[-2]).read_text(encoding="ascii"))
+            return ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # umask 0 shows the requested mode itself: a world-readable request
+            # would be visible here even though a later chmod could repair it.
+            previous_umask = os.umask(0)
+            try:
+                with (mock.patch.object(smoke.os, "open", side_effect=recording_open),
+                      mock.patch.object(smoke, "run", side_effect=fake_run)):
+                    smoke.install_backup_secrets(root)
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(created, [("backup-passphrase.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)],
+                             "the passphrase staging file must be created exclusively with mode 0600")
+            self.assertEqual(len(staged), 1)
+            self.assertRegex(staged[0], re.compile(r"\A[0-9a-f]{32}\n\Z"))
+            self.assertFalse((root / "backup-passphrase.tmp").exists())
+
+    def test_backup_secrets_bootstrap_precedes_seeding_and_the_overlay_joins_after(self):
+        import inspect
+
+        smoke = self.load_smoke()
+        source = inspect.getsource(smoke.unavailable_backup_storage)
+        # The secrets bootstrap must run while the deployment tree is still the
+        # invoking user's (before the released writers harden ./config), the
+        # seed phase must not see the scheduler, and the overlay must join the
+        # compose chain only after seeding (v0.22.2 has no scheduler module).
+        self.assertIn("install_backup_secrets(root)", source)
+        self.assertLess(source.index("install_backup_secrets(root)"),
+                        source.index("seed_previous_release(deployment, args)"))
+        self.assertLess(source.index("seed_previous_release(deployment, args)"),
+                        source.index('deployment.compose("stop", *SERVICES)'))
+        self.assertLess(source.index('deployment.compose("stop", *SERVICES)'),
+                        source.index("install_backup_scheduler_with_target(deployment)"))
+        self.assertNotIn("install_backup_scheduler_with_target", source[:source.index("seed_previous_release")])
+        self.assertNotIn("UNAVAILABLE_BACKUP_FILES", inspect.getsource(smoke.install_backup_secrets))
+        self.assertNotIn("backup-secrets", inspect.getsource(smoke.install_backup_scheduler_with_target))
+
+    def test_unavailable_backup_cli_cleans_up_on_both_success_and_qualification_failure(self):
+        smoke = self.load_smoke()
+        for failure in (None, smoke.SmokeError("synthetic refusal contract failed")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "docker-compose.yml").write_text("services: {}")
+                with mock.patch.object(smoke, "run"):
+                    smoke.install_backup_scheduler_with_target(smoke.Deployment(root))
+                argv = ["--scenario", "unavailable-backup-storage", "--root", str(root),
+                        "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
+                        "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
+                        "--candidate-version", "2", "--candidate-revision", "revision"]
+                with (mock.patch.object(smoke, "smoke", side_effect=failure, return_value="synthetic result"),
+                      mock.patch.object(smoke.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                      mock.patch("sys.stdout"), mock.patch("sys.stderr")):
+                    self.assertEqual(smoke.main(argv), 1 if failure else 0)
+                commands = [call.args[0] for call in run.call_args_list]
+                self.assertEqual(commands[-2:], [
+                    ["docker", "compose", "-f", "docker-compose.yml", "-f", "docker-compose.unavailable-backup.yml",
+                     "down", "--volumes", "--remove-orphans"], ["sudo", "rm", "-rf", str(root)],
+                ])
+
+
 class UpgradeScenarioContractTests(unittest.TestCase):
     """#399/#463: hardened, interrupted-migration and segmented-catalog upgrades."""
 
@@ -1469,8 +2378,10 @@ class UpgradeScenarioContractTests(unittest.TestCase):
         self.assertEqual(len(segmented), 1)
         enospc = [command for command in runs if "--scenario enospc-state" in command]
         self.assertEqual(len(enospc), 1)
+        backup = [command for command in runs if "--scenario unavailable-backup-storage" in command]
+        self.assertEqual(len(backup), 1)
         self.assertIn("--nonroot-fixture tests/fixtures/compose/v0.22.2.nonroot.yml", hardened[0])
-        for command in hardened + interrupted + segmented + enospc:
+        for command in hardened + interrupted + segmented + enospc + backup:
             self.assertIn("--compose-fixture tests/fixtures/compose/v0.22.2.yml", command)
             self.assertIn('--candidate-revision "$GITHUB_SHA"', command)
         # The required job stays the fast base scenario.

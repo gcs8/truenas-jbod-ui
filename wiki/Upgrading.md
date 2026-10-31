@@ -101,7 +101,7 @@ treat it as unverified, not as broken.
 | --- | --- | --- |
 | Docker host | Linux, Docker Engine with Compose v2, `linux/amd64` image | Docker Desktop, other architectures, rootless Docker |
 | Local state | Bind mounts on a local POSIX filesystem, owned by root; or, with the hardening overlay, handed to uid 10001 by the one-time ownership step in [[Troubleshooting]]. The history directory mounted read-only (`--scenario readonly-state`), or full with no free inodes on a small disposable `tmpfs` (`--scenario enospc-state`), when the new release starts: history refuses with HTTP 503 while both processes stay up, with no restarts and no change to history bytes, config or mappings | Network filesystems; a read-only or full config or UI data directory; a full disk that runs out of data blocks rather than inodes |
-| Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml` | Admin and backup services during an upgrade |
+| Services | Main UI and history on the published base Compose file, and on the base file plus `docker-compose.nonroot.yml`. At the upgrade, `--scenario unavailable-backup-storage` adds a new candidate backup scheduler (v0.22.2 has none) with one filesystem backup target through a test-only Compose overlay. That overlay differs from the published `enclosure-backup-scheduler` service: a different passphrase path, a 1g memory limit, directory modes `0755`/`2750` against the documented `0700`/`2770`, and no profile | Admin service during an upgrade; the published backup scheduler's upgrade path; NFS, SMB, S3, SFTP and FTP backup targets |
 | Upgrade path | v0.22.2 to the current build: change `JBOD_UI_IMAGE`, then `pull` and `up -d`, with the same `-f` files each time | Releases before v0.22.2, skipping several releases |
 | After upgrading | Both containers healthy with no restarts; the new version and revision are reported; bay mappings, history rows and `config.yaml` unchanged; database integrity and schema compatibility checks pass; the report says `schema_transition=none` because the table layout and logical schema-version marker remain unchanged, while startup adds chronological indexes to the hot database; a v0.22.2 segmented catalog keeps the exact generation, catalog bytes and referenced segment bytes; no change of file ownership, and hardened services still run as uid 10001 | Large (multi-GiB) history databases, many enclosures, production-scale index construction time and headroom |
 | Rollback | Pin back to v0.22.2 with the same two commands, on base, hardened and segmented-history deployments; the older release starts and reads what the newer one wrote | Rollback across a history schema change |
@@ -109,8 +109,20 @@ treat it as unverified, not as broken.
 
 The checks are `scripts/run_image_upgrade_smoke.py`: the base upgrade runs in
 the `Image-only upgrade smoke` CI job, and `--scenario hardened`,
-`--scenario interrupted-migration` and `--scenario segmented-catalog` run as
-separate steps of the `Hardened, interrupted and segmented upgrade smoke` job.
+`--scenario interrupted-migration`, `--scenario segmented-catalog`,
+`--scenario readonly-state`, `--scenario enospc-state` and
+`--scenario unavailable-backup-storage` run as separate steps of the
+`Hardened, interrupted and segmented upgrade smoke` job. The
+unavailable-backup-storage run uses that test-only scheduler overlay, not the
+published service. It proves the shipped copy once, makes the target
+root not a directory through the existing bind mount, and requires the
+scheduler's own visible refusal: the status file names the target and the
+failure class, the local archive keeps the artifact, and the scheduler never
+restarts over 20 seconds. After that observation the operator restores the
+root, and the next backup ships byte-identically by readback. An artifact
+built while the target is unavailable is never shipped later: the scheduler
+copies an archive to its targets only when it builds it, with no backfill, so
+that artifact stays local-only.
 The segmented run uses v0.22.2's own migration module and reader, captures the
 catalog generation plus exact catalog and segment digests, and requires the
 same identity and combined history view after upgrade and rollback. v0.22.2

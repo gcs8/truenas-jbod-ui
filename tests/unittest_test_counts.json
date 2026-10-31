@@ -50,7 +50,7 @@
     "test_history_runtime_damage_pause": 13,
     "test_history_schema_version_gate": 17,
     "test_history_service": 341,
-    "test_image_upgrade_contract": 80,
+    "test_image_upgrade_contract": 102,
     "test_immutable_deployment": 42,
     "test_inventory": 583,
     "test_inventory_registry_routes": 15,
