@@ -26,17 +26,25 @@ const bootstrap = {
   default_system_id: "system-a", admin: {},
   storage_view_templates: [{ id: "synthetic-manual", label: "Synthetic manual", kind: "manual", slot_count: 2, rows: 1, columns: 2 }],
 };
-const html = execFileSync(process.env.PYTHON || "python", ["-c", `
+const renderFixture = (fixture) => execFileSync(process.env.PYTHON || "python", ["-c", `
 import json, sys
 from jinja2 import Environment, FileSystemLoader
 from markupsafe import Markup
 env = Environment(loader=FileSystemLoader(sys.argv[1]), autoescape=True)
 env.filters['script_json_text'] = lambda text: Markup(text.replace('<', '\\\\u003c'))
 print(env.get_template('index.html').render(admin_bootstrap_json=sys.stdin.read(), url_for=lambda name, path: '/static/' + path))
-`, path.join(root, "admin_service/templates")], { input: JSON.stringify(bootstrap), encoding: "utf8" });
+`, path.join(root, "admin_service/templates")], { input: JSON.stringify(fixture), encoding: "utf8" });
+const html = renderFixture(bootstrap);
 
-async function openFixture(page) {
+async function openFixture(page, { platformBindings = false, beforeCandidate = null } = {}) {
   const pending = { saves: [], candidates: [], edits: [], states: 0, lists: 0, restores: [], inspections: 0, heldStates: [], holdState: false, errors: [], unexpected: [], state: JSON.parse(JSON.stringify(bootstrap)) };
+  if (platformBindings) {
+    pending.state.storage_view_templates[0].default_binding = view("view-a", "node-a").binding;
+    pending.state.storage_view_templates[0].platform_binding_defaults = {
+      esxi: { mode: "manual", device_names: ["synthetic-esxi-member"] },
+    };
+  }
+  const fixtureHtml = platformBindings ? renderFixture(pending.state) : html;
   page.on("pageerror", (error) => pending.errors.push(error.message));
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -45,7 +53,7 @@ async function openFixture(page) {
       pending.unexpected.push(url.href);
       return route.abort();
     }
-    if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: html });
+    if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: fixtureHtml });
     if (["admin.js", "admin_backups.js", "admin.css"].some((name) => url.pathname === `/static/${name}`)) {
       // Optional exact predecessor bytes allow semantic RED replay without editing the candidate.
       const source = url.pathname === "/static/admin.js" && process.env.ADMIN_DRAFT_SCRIPT
@@ -57,7 +65,8 @@ async function openFixture(page) {
       return;
     }
     if (url.pathname === "/api/admin/storage-views/candidates") {
-      pending.candidates.push({ system: url.searchParams.get("system_id"), target: url.searchParams.get("target_system_id"), respond: json });
+      if (beforeCandidate) await beforeCandidate(url);
+      pending.candidates.push({ request: route.request(), system: url.searchParams.get("system_id"), target: url.searchParams.get("target_system_id"), respond: json });
       return;
     }
     if (url.pathname === "/api/admin/tls/inspect") return json({ inspection: { host: "node-a.example.test", leaf: { san_dns: ["tls.example.test", "second.example.test"] } } });
@@ -95,7 +104,7 @@ async function openFixture(page) {
   await page.locator('[data-existing-system-id="system-a"]').click();
   await expect(page.locator("#setup-system-id")).toHaveValue("system-a");
   await page.locator("details").evaluateAll((nodes) => nodes.forEach((node) => { node.open = true; }));
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(0);
+  pending.initialCandidate = await newTargetCandidate(pending, 0, "system-a", "node-a");
   // Discovery dispatch can precede the queued storage-view paint.
   await expect(page.locator('[data-storage-view-id="view-b"]')).toBeVisible();
   return pending;
@@ -193,20 +202,23 @@ test("unchanged save acknowledges its draft; rejected save and retry keep existi
   clean(pending);
 });
 
-test("target switch fences delayed A and disables actions until B is loaded", async ({ page }) => {
+for (const queued of [false, true]) {
+// #1007: the queued case reproduces the pre-#1003 stale A render without
+// waiting for B discovery first, so request-selection repair cannot hide it.
+test(`target switch ${queued ? "queued" : "settled"} fences delayed A and disables actions until B is loaded`, async ({ page }) => {
   const pending = await openFixture(page);
-  const a = pending.candidates.at(-1);
+  const a = pending.initialCandidate;
   expect(a.target).toBe("node-a");
   const before = pending.candidates.length;
-  await page.locator("#setup-storage-view-target-system").selectOption("node-b");
-  const staleResponse = page.waitForResponse((r) => r.url().includes("/candidates?") && r.url().includes("node-a"));
+  if (queued) await changeStorageField(page, "setup-storage-view-target-system", "node-b");
+  else await page.locator("#setup-storage-view-target-system").selectOption("node-b");
+  const staleResponse = page.waitForResponse((r) => r.request() === a.request);
   await candidateResponse(a);
-  await staleResponse;
+  await (await staleResponse).finished();
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await expect(page.locator("#setup-storage-view-candidates-list")).not.toContainText("Synthetic candidate node-a");
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(before);
-  const b = pending.candidates.at(-1);
+  const b = await newTargetCandidate(pending, before, "system-a", "node-b");
   expect(b.target).toBe("node-b");
   await candidateResponse(b, "sdb");
   await page.locator('[data-storage-view-candidate-id="candidate-node-b"]').click();
@@ -220,24 +232,205 @@ test("target switch fences delayed A and disables actions until B is loaded", as
   clean(pending);
 });
 
+}
+
+// Queue through the shipping delegated callback and edit in the same task.
+// Waiting for a paint here would remove the input/render interleaving under test.
+async function changeStorageField(page, id, value, { queued = true, viewId = "view-a", checkbox = false } = {}) {
+  return page.evaluate(({ id, value, queued, viewId, checkbox }) => {
+    if (queued) document.querySelector(`[data-storage-view-id="${viewId}"]`).click();
+    const field = document.getElementById(id);
+    if (checkbox) field.checked = value;
+    else field.value = value;
+    field.dispatchEvent(new Event("change", { bubbles: true }));
+    return checkbox ? field.checked : field.value;
+  }, { id, value, queued, viewId, checkbox });
+}
+
+for (const queued of [true, false]) {
+  test(`input/render target ${queued ? "queued" : "settled"} retains B through late A and submits B/sdb`, async ({ page }) => {
+    const p = await openFixture(page);
+    const a = p.initialCandidate;
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const before = p.candidates.length;
+    expect(await changeStorageField(page, "setup-storage-view-target-system", "node-b", { queued })).toBe("node-b");
+    const b = await newTargetCandidate(p, before, "system-a", "node-b");
+    const response = page.waitForResponse(r => r.request() === a.request);
+    await candidateResponse(a);
+    await (await response).finished();
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(page.locator("#setup-storage-view-target-system")).toHaveValue("node-b");
+    await expect(page.locator("#setup-storage-view-candidates-list")).not.toContainText("Synthetic candidate node-a");
+    await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
+    await candidateResponse(b, "sdb");
+    await page.locator("#setup-storage-view-candidates-add-all-button").click();
+    const r = await save(page, p);
+    expect(r.body.storage_views[0].binding.target_system_id).toBe("node-b");
+    expect(r.body.storage_views[0].binding.device_names).toEqual(["sdb"]);
+    await acknowledge(r); await finished(page); clean(p);
+  });
+}
+
+for (const [field, value, property, checkbox] of [
+  ["label", "Edited view", v => v.label, false],
+  ["device-names", "sdb", v => v.binding.device_names.join(","), false],
+  ["binding-mode", "auto", v => v.binding.mode, false],
+  ["enabled", false, v => v.enabled, true],
+  ["show-main", false, v => v.render.show_in_main_ui, true],
+  ["collapsed", true, v => v.render.default_collapsed, true],
+]) {
+  test(`input/render queued ${field} survives repaint and real save`, async ({ page }) => {
+    const p = await openFixture(page);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    expect(await changeStorageField(page, `setup-storage-view-${field}`, value, { checkbox })).toBe(value);
+    const r = await save(page, p);
+    expect(property(r.body.storage_views[0])).toBe(value);
+    await acknowledge(r); await finished(page); clean(p);
+  });
+}
+
+test("input/render genuine view switch cannot copy the old editor into the new view", async ({ page }) => {
+  const p = await openFixture(page);
+  const a = p.initialCandidate;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const before = p.candidates.length;
+  // B owns selection, while the rendered inputs still belong to A.
+  await changeStorageField(page, "setup-storage-view-label", "Stale A text", { viewId: "view-b" });
+  await expect(page.locator("#setup-storage-view-label")).toHaveValue("view-b");
+  await expect(page.locator("#setup-storage-view-target-system")).toHaveValue("node-b");
+  const b = await newTargetCandidate(p, before, "system-a", "node-b");
+  await candidateResponse(b, "sdb");
+  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-b"]')).toBeEnabled();
+  const response = page.waitForResponse(r => r.request() === a.request);
+  await candidateResponse(a); await (await response).finished();
+  await page.locator("#setup-storage-view-candidates-add-all-button").click();
+  const r = await save(page, p);
+  expect(r.body.storage_views.map(v => v.label)).toEqual(["view-a", "view-b"]);
+  expect(r.body.storage_views.map(v => v.binding.target_system_id)).toEqual(["node-a", "node-b"]);
+  expect(r.body.storage_views.map(v => v.binding.device_names)).toEqual([[], ["sdb"]]);
+  await acknowledge(r); await finished(page); clean(p);
+});
+
+for (const next of ["rename", "system switch"]) {
+  test(`input/render ${next} preserves editor ownership before paint`, async ({ page }) => {
+    const p = await openFixture(page);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await page.evaluate(next => {
+      if (next === "rename") {
+        document.querySelector('[data-storage-view-id="view-a"]').click();
+        const id = document.querySelector("#setup-storage-view-id");
+        id.value = "renamed-view";
+        id.dispatchEvent(new Event("change", { bubbles: true }));
+      } else document.querySelector('[data-existing-system-id="system-b"]').click();
+      const label = document.querySelector("#setup-storage-view-label");
+      label.value = "Later label";
+      label.dispatchEvent(new Event("change", { bubbles: true }));
+    }, next);
+    const r = await save(page, p);
+    expect(r.body.system_id).toBe(next === "rename" ? "system-a" : "system-b");
+    expect(r.body.storage_views[0].id).toBe(next === "rename" ? "renamed-view" : "view-a");
+    expect(r.body.storage_views[0].label).toBe(next === "rename" ? "Later label" : "view-a");
+    expect(r.body.storage_views[1].label).toBe("view-b");
+    await acknowledge(r); await finished(page); clean(p);
+  });
+}
+
+for (const [field, value, checkbox] of [["label", "After platform", false], ["enabled", false, true]]) {
+  test(`model/input platform binding then ${field} retains members and new input`, async ({ page }) => {
+    const p = await openFixture(page, { platformBindings: true });
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const immediate = await page.evaluate(({ field, value, checkbox }) => {
+      const platform = document.querySelector("#setup-platform");
+      platform.value = "esxi";
+      platform.dispatchEvent(new Event("change", { bubbles: true }));
+      const control = document.getElementById(`setup-storage-view-${field}`);
+      if (checkbox) control.checked = value;
+      else control.value = value;
+      control.dispatchEvent(new Event("change", { bubbles: true }));
+      return checkbox ? control.checked : control.value;
+    }, { field, value, checkbox });
+    expect(immediate).toBe(value);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("synthetic-esxi-member");
+    const r = await save(page, p);
+    expect(r.body.platform).toBe("esxi");
+    expect(r.body.storage_views[0].binding.device_names).toEqual(["synthetic-esxi-member"]);
+    expect(r.body.storage_views[0][field]).toBe(value);
+    await acknowledge(r); await finished(page); clean(p);
+  });
+}
+
+for (const action of ["one", "all"]) {
+  for (const [field, value, checkbox] of [["label", "After candidate", false], ["enabled", false, true], ["binding-mode", "hybrid", false], ["id", "after-candidate", false]]) {
+    test(`model/input candidate ${action} then ${field} retains binding and new input`, async ({ page }) => {
+      const p = await openFixture(page);
+      await candidateResponse(p.initialCandidate, "sdb");
+      await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
+      const immediate = await page.evaluate(({ action, field, value, checkbox }) => {
+        document.querySelector(action === "one"
+          ? '[data-storage-view-candidate-id="candidate-node-a"]'
+          : "#setup-storage-view-candidates-add-all-button").click();
+        const control = document.getElementById(`setup-storage-view-${field}`);
+        if (checkbox) control.checked = value;
+        else control.value = value;
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+        return checkbox ? control.checked : control.value;
+      }, { action, field, value, checkbox });
+      expect(immediate).toBe(value);
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sdb");
+      const r = await save(page, p);
+      expect(r.body.storage_views[0].binding.device_names).toEqual(["sdb"]);
+      expect(r.body.storage_views[0].binding.target_system_id).toBe("node-a");
+      const saved = r.body.storage_views[0];
+      expect(field === "binding-mode" ? saved.binding.mode : saved[field]).toBe(value);
+      expect(saved.binding.serials).toEqual([]);
+      expect(saved.binding.pcie_addresses).toEqual([]);
+      await acknowledge(r); await finished(page); clean(p);
+    });
+  }
+}
+
+test("model/input consumed edit then candidate and raw draft retain both model delta and new controls", async ({ page }) => {
+  const p = await openFixture(page);
+  await candidateResponse(p.initialCandidate, "sdb");
+  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
+  await page.evaluate(() => {
+    const devices = document.querySelector("#setup-storage-view-device-names");
+    devices.value = "sdc";
+    devices.dispatchEvent(new Event("change", { bubbles: true }));
+    document.querySelector('[data-storage-view-candidate-id="candidate-node-a"]').click();
+    const label = document.querySelector("#setup-storage-view-label");
+    label.value = "Raw newer draft";
+    label.dispatchEvent(new Event("input", { bubbles: true }));
+    const enabled = document.querySelector("#setup-storage-view-enabled");
+    enabled.checked = false;
+    enabled.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const r = await save(page, p);
+  expect(r.body.storage_views[0].binding.device_names).toEqual(["sdc", "sdb"]);
+  expect(r.body.storage_views[0].label).toBe("Raw newer draft");
+  expect(r.body.storage_views[0].enabled).toBe(false);
+  await acknowledge(r); await finished(page); clean(p);
+});
+
 test("loaded HA views with shared device names keep Add Hints and Add all target-local", async ({ page }) => {
   const pending = await openFixture(page);
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(pending.initialCandidate);
   await page.locator('[data-storage-view-candidate-id="candidate-node-a"]').click();
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sda");
   let before = pending.candidates.length;
   await page.locator('[data-storage-view-id="view-b"]').click();
   await expect(page.locator("#setup-storage-view-target-system")).toHaveValue("node-b");
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(before);
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(await newTargetCandidate(pending, before, "system-a", "node-b"));
   await expect(page.locator('[data-storage-view-candidate-id="candidate-node-b"]')).toBeEnabled();
   await page.locator("#setup-storage-view-candidates-add-all-button").click();
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sda");
   before = pending.candidates.length;
   await page.locator('[data-storage-view-id="view-a"]').click();
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(before);
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(await newTargetCandidate(pending, before, "system-a", "node-a"));
   await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeDisabled();
   const request = await save(page, pending);
   expect(request.body.storage_views.map((item) => item.binding.target_system_id)).toEqual(["node-a", "node-b"]);
@@ -249,8 +442,9 @@ test("loaded HA views with shared device names keep Add Hints and Add all target
 
 test("refresh pending and failed discovery cannot apply previously loaded hints", async ({ page }) => {
   const pending = await openFixture(page);
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(pending.initialCandidate);
   await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
+  let before = pending.candidates.length;
   await page.evaluate(() => {
     // Old nodes can still be visible before the queued paint. Both registered
     // handlers must refuse them immediately, not just disable the next render.
@@ -260,11 +454,13 @@ test("refresh pending and failed discovery cannot apply previously loaded hints"
   });
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("");
-  await pending.candidates.at(-1).respond({ detail: "Synthetic unavailable" }, 503);
+  const rejected = await newTargetCandidate(pending, before, "system-a", "node-a");
+  await rejected.respond({ detail: "Synthetic unavailable" }, 503);
   await expect(page.locator("#admin-status-banner")).toContainText("Unable to load");
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
+  before = pending.candidates.length;
   await page.locator("#setup-storage-view-candidates-refresh-button").click();
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(await newTargetCandidate(pending, before, "system-a", "node-a"));
   await page.locator("#setup-storage-view-candidates-add-all-button").click();
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sda");
   clean(pending);
@@ -295,7 +491,7 @@ test("typing back to submitted value is still a later draft revision", async ({ 
 
 test("candidate button edits after dispatch remain dirty despite no input event", async ({ page }) => {
   const pending = await openFixture(page);
-  await candidateResponse(pending.candidates.at(-1));
+  await candidateResponse(pending.initialCandidate);
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeEnabled();
   const request = await save(page, pending);
   await page.locator("#setup-storage-view-candidates-add-all-button").click();
@@ -321,20 +517,20 @@ for (const action of ["add", "remove", "duplicate", "move-down"]) {
 
 test("rapid view A to B to A invalidates discovery before the queued paint", async ({ page }) => {
   const pending = await openFixture(page);
-  const old = pending.candidates.at(-1);
+  const old = pending.initialCandidate;
   const before = pending.candidates.length;
   await page.evaluate(() => {
     document.querySelector('[data-storage-view-id="view-b"]').click();
     document.querySelector('[data-storage-view-id="view-a"]').click();
   });
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(before);
-  const response = page.waitForResponse((r) => r.url().includes("/candidates?"));
+  const current = await newTargetCandidate(pending, before, "system-a", "node-a");
+  const response = page.waitForResponse((r) => r.request() === old.request);
   await candidateResponse(old, "sda");
-  await response;
+  await (await response).finished();
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await expect(page.locator("#setup-storage-view-candidates-add-all-button")).toBeDisabled();
   await expect(page.locator("#setup-storage-view-candidates-list")).toBeEmpty();
-  await candidateResponse(pending.candidates.at(-1), "sdb");
+  await candidateResponse(current, "sdb");
   await page.locator("#setup-storage-view-candidates-add-all-button").click();
   await expect(page.locator("#setup-storage-view-device-names")).toHaveValue("sdb");
   clean(pending);
@@ -342,15 +538,15 @@ test("rapid view A to B to A invalidates discovery before the queued paint", asy
 
 test("late target failure cannot clear the newer target candidates or publish its error", async ({ page }) => {
   const pending = await openFixture(page);
-  const a = pending.candidates.at(-1);
+  const a = pending.initialCandidate;
+  const before = pending.candidates.length;
   await page.locator("#setup-storage-view-target-system").selectOption("node-b");
-  await expect.poll(() => pending.candidates.length).toBeGreaterThan(1);
-  const b = pending.candidates.at(-1);
+  const b = await newTargetCandidate(pending, before, "system-a", "node-b");
   await candidateResponse(b, "sdb");
   await expect(page.locator('[data-storage-view-candidate-id="candidate-node-b"]')).toBeEnabled();
-  const response = page.waitForResponse((r) => r.url().includes("/candidates?") && r.url().includes("node-a"));
+  const response = page.waitForResponse((r) => r.request() === a.request);
   await a.respond({ detail: "Synthetic stale target failure" }, 503);
-  await response;
+  await (await response).finished();
   // Drain browser promise work and scheduled rendering, not a fixed sleep.
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   await expect(page.locator("#admin-status-banner")).not.toContainText("Synthetic stale target failure");
@@ -737,15 +933,15 @@ test('TLS suggestion button after save retains dirty protection', async ({page})
 
 for (const outcome of ['success','failure']) {
  test(`system A to B late candidate ${outcome} cannot overwrite B`, async ({page}) => {
-  const p=await openFixture(page); const a=p.candidates.at(-1);
+  const p=await openFixture(page); const a=p.initialCandidate;
+  const before=p.candidates.length;
   await page.locator('[data-existing-system-id="system-b"]').click();
-  await expect.poll(()=>p.candidates.at(-1).system).toBe('system-b');
-  const b=p.candidates.at(-1); await candidateResponse(b,'sdb');
+  const b=await newTargetCandidate(p,before,'system-b','node-a'); await candidateResponse(b,'sdb');
   await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
-  const response=page.waitForResponse(r=>r.url().includes('/candidates?')&&r.url().includes('system-a'));
+  const response=page.waitForResponse(r=>r.request() === a.request);
   if(outcome==='success') await candidateResponse(a,'stale-device');
   else await a.respond({detail:'Synthetic stale system failure'},503);
-  await response;
+  await (await response).finished();
   await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   await expect(page.locator('#setup-storage-view-candidates-list')).toContainText('sdb');
   await expect(page.locator('#setup-storage-view-candidates-list')).not.toContainText('stale-device');
@@ -757,8 +953,28 @@ for (const outcome of ['success','failure']) {
  });
 }
 
+async function newTargetCandidate(pending, before, system, target) {
+  const find = () => pending.candidates.slice(before).find((request) => request.system === system && request.target === target);
+  await expect.poll(() => Boolean(find())).toBe(true);
+  const request = find();
+  expect(request.system).toBe(system);
+  expect(request.target).toBe(target);
+  return request;
+}
+
+async function expectFreshTargetBinding(page, pending) {
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue('node-a');
+  const request = await save(page, pending);
+  expect(request.body.system_id).toBe('system-a');
+  const savedView = request.body.storage_views.find((storageView) => storageView.id === 'view-a');
+  expect(savedView.binding.target_system_id).toBe('node-a');
+  expect(savedView.binding.device_names).toEqual(['fresh-device']);
+  await acknowledge(request);
+  await finished(page);
+}
+
 test('rapid target A to B to A rejects old hints before paint',async ({page})=>{
- const p=await openFixture(page); await candidateResponse(p.candidates.at(-1));
+ const p=await openFixture(page); await candidateResponse(p.initialCandidate);
  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
  const before=p.candidates.length;
  await page.evaluate(()=>{
@@ -768,12 +984,70 @@ test('rapid target A to B to A rejects old hints before paint',async ({page})=>{
   document.querySelector('#setup-storage-view-candidates-add-all-button').dispatchEvent(new MouseEvent('click',{bubbles:true}));
  });
  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
- await expect.poll(()=>p.candidates.length).toBeGreaterThan(before);
- await candidateResponse(p.candidates.at(-1),'fresh-device');
+ const a=await newTargetCandidate(p,before,'system-a','node-a');
+ await expect(page.locator('#setup-storage-view-target-system')).toHaveValue(a.target);
+ await candidateResponse(a,'fresh-device');
  await page.locator('#setup-storage-view-candidates-add-all-button').click();
- await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');clean(p);
+ await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');
+ await expectFreshTargetBinding(page,p);clean(p);
 });
 
+
+test('rapid target A to B to A ignores intermediate B while exact final A is pending',async ({page})=>{
+ let holdFinalA=false, finalAHeld=false, releaseFinalA;
+ const finalAGate=new Promise(resolve=>{releaseFinalA=resolve;});
+ const p=await openFixture(page,{beforeCandidate:async url=>{
+  if(holdFinalA&&url.searchParams.get('system_id')==='system-a'&&url.searchParams.get('target_system_id')==='node-a') {
+   finalAHeld=true;await finalAGate;
+  }
+ }});
+ try {
+  await candidateResponse(p.initialCandidate);
+  await expect(page.locator('[data-storage-view-candidate-id="candidate-node-a"]')).toBeEnabled();
+  const before=p.candidates.length;holdFinalA=true;
+  // Keep both changes and stale action attempts in one task, through shipping callbacks.
+  await page.evaluate(()=>{
+   const target=document.querySelector('#setup-storage-view-target-system');
+   for(const value of ['node-b','node-a']) {target.value=value;target.dispatchEvent(new Event('change',{bubbles:true}));}
+   document.querySelector('[data-storage-view-candidate-id="candidate-node-a"]')?.click();
+   document.querySelector('#setup-storage-view-candidates-add-all-button').dispatchEvent(new MouseEvent('click',{bubbles:true}));
+  });
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
+  const b=await newTargetCandidate(p,before,'system-a','node-b');
+  await expect.poll(()=>finalAHeld).toBe(true);
+  // The old count/array-tail selector would now choose B, not the final A owner.
+  expect(p.candidates.slice(before).map(request=>[request.system,request.target])).toEqual([['system-a','node-b']]);
+  expect(p.candidates[before]).toBe(b);
+  // Exercise the selector while only B is observable. It must remain pending,
+  // rather than claim B or reject before the exact final A is admitted.
+  let selection = null;
+  const finalA = newTargetCandidate(p,before,'system-a','node-a').then(
+   request => { selection = { request }; }, error => { selection = { error }; }
+  );
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  expect(selection).toBe(null);
+  releaseFinalA();
+  await finalA;
+  expect(selection.error).toBeUndefined();
+  const a=selection.request;
+  expect(a).not.toBe(b);
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue(a.target);
+  const response=page.waitForResponse(r=>r.request()===b.request);
+  await candidateResponse(b,'stale-b-device');
+  await (await response).finished();
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  await expect(page.locator('#setup-storage-view-candidates-list')).not.toContainText('stale-b-device');
+  await expect(page.locator('[data-storage-view-candidate-id]')).toHaveCount(0);
+  await expect(page.locator('#setup-storage-view-candidates-add-all-button')).toBeDisabled();
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('');
+  await expect(page.locator('#setup-storage-view-target-system')).toHaveValue('node-a');
+  await candidateResponse(a,'fresh-device');
+  await expect(page.locator('#setup-storage-view-candidates-add-all-button')).toBeEnabled();
+  await page.locator('#setup-storage-view-candidates-add-all-button').click();
+  await expect(page.locator('#setup-storage-view-device-names')).toHaveValue('fresh-device');
+  await expectFreshTargetBinding(page,p);clean(p);
+ } finally {releaseFinalA();}
+});
 
 test('Reset to defaults button after save retains dirty protection', async ({page})=>{
  const p=await openFixture(page);

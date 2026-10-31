@@ -1,11 +1,66 @@
 from __future__ import annotations
 
 import http.client
+import io
 import ssl
+import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
 from app.config import TrueNASConfig
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+CROSS_ORIGIN_REDIRECT_REASON = "redirect to a different origin was refused"
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not scheme or not hostname:
+        return None
+    return scheme, hostname, port if port is not None else _DEFAULT_PORTS.get(scheme)
+
+
+def redirect_keeps_origin(source_url: str, target_url: str) -> bool:
+    """Whether a redirect keeps the request's host and does not weaken its transport.
+
+    The scheme, host and port must match. The one exception is an HTTP to
+    HTTPS upgrade on the same host and the default HTTPS port.
+    """
+    source = _url_origin(source_url)
+    target = _url_origin(target_url)
+    if source is None or target is None or source[1] != target[1]:
+        return False
+    if source == target:
+        return True
+    return source[0] == "http" and target[0] == "https" and target[2] == _DEFAULT_PORTS["https"]
+
+
+class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only when it keeps the origin and transport (#737).
+
+    The stock handler copies request headers, including `Authorization`, to
+    whatever `Location` names, so an endpoint could forward configured
+    credentials to another host or downgrade them from HTTPS to HTTP.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        if not redirect_keeps_origin(req.full_url, newurl):
+            if fp is not None:
+                fp.close()
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                CROSS_ORIGIN_REDIRECT_REASON,
+                headers,
+                io.BytesIO(b""),
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def normalize_tls_target(host: str) -> str:
@@ -151,13 +206,14 @@ def urlopen_with_tls_config(
             and normalized_server_hostname.lower() == request_host.lower()
         )
     ):
-        return urllib.request.urlopen(request, timeout=timeout, context=context)
-
-    opener = urllib.request.build_opener(
-        _HostnameOverrideHTTPSHandler(
+        https_handler: urllib.request.HTTPSHandler = urllib.request.HTTPSHandler(context=context)
+    else:
+        https_handler = _HostnameOverrideHTTPSHandler(
             context=context,
             check_hostname=context.check_hostname,
             server_hostname=normalized_server_hostname,
         )
-    )
+
+    # Credential-carrying requests follow same-origin redirects only (#737).
+    opener = urllib.request.build_opener(https_handler, SameOriginRedirectHandler())
     return opener.open(request, timeout=timeout)

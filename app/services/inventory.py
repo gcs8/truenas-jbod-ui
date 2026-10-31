@@ -10,9 +10,10 @@ import re
 import shlex
 import time
 import threading
+import weakref
 from contextlib import contextmanager, nullcontext
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,11 @@ from app.services.credential_authority import (
     ssh_credential_authorities,
 )
 from app.services.inventory_accounting import DiskRetentionAccounting, build_disk_retention_accounting
+from app.services.combined_shelf_ids import (
+    combined_enclosure_parts,
+    combined_mapping_warnings,
+    combined_reference_warnings,
+)
 from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
@@ -475,6 +481,9 @@ LED_SSH_ADMISSION_WAIT_SECONDS = 5.0
 # option. Real systems have a handful; refuse a topology far past that rather
 # than let one unauthenticated request occupy the worker for every one of them.
 SYSTEM_RETENTION_MAX_ENCLOSURES = 32
+# Opening-order scoring is optional page enrichment, not page admission.
+OPENING_ORDER_MAX_WAITERS = 8
+OPENING_ORDER_TIMEOUT_SECONDS = 2.0
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 # Storage-view bays are numbered from here so they never collide with a real
 # enclosure slot number in the same snapshot.
@@ -974,6 +983,23 @@ class UnknownEnclosureError(Exception):
         super().__init__("Requested enclosure is not available for this system.")
 
 
+class SplitEnclosureError(UnknownEnclosureError):
+    """A combined shelf id from before #1000 whose shelves are now separate (#1006).
+
+    It stays an UnknownEnclosureError, so every caller that tolerates an
+    unknown id keeps doing so; the route answer names the separate shelves.
+    """
+
+    def __init__(self, enclosure_id: str, member_ids: Sequence[str]) -> None:
+        self.enclosure_id = enclosure_id
+        self.member_ids = tuple(member_ids)
+        Exception.__init__(
+            self,
+            f"Enclosure {enclosure_id} combined {len(self.member_ids)} shelves that are now shown "
+            f"separately: {', '.join(self.member_ids)}. Choose one of them instead.",
+        )
+
+
 class SnapshotStateBusyError(Exception):
     """Raised when every bounded snapshot-state entry is active."""
 
@@ -1036,6 +1062,7 @@ _snapshot_detail_commits: ContextVar[list[Callable[[Callable[[], bool]], Awaitab
 _snapshot_build_source_publications: ContextVar[list[SourcePublication] | None] = ContextVar(
     "snapshot_build_source_publications", default=None,
 )
+_snapshot_background_refresh: ContextVar[bool] = ContextVar("snapshot_background_refresh", default=False)
 
 
 async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
@@ -1312,15 +1339,19 @@ class InventoryService:
         self._snapshot_discovery_lock = asyncio.Lock()
         self._system_retention_lock = asyncio.Lock()
         self._view_order_recompute_lock = asyncio.Lock()
+        self._view_order_waiters = 0
         self._canonical_enclosure_options: dict[str, EnclosureOption] | None = None
         self._canonical_default_enclosure_id: str | None = None
         self._view_order_source_bundle: InventorySourceBundle | None = None
         self._view_order_topology_generation = -1
-        self._view_order_context: tuple[Any, ...] | None = None
-        self._cached_effective_view_order: list[str] = []
+        self._view_order_cache: OrderedDict[tuple[Any, ...], list[str]] = OrderedDict()
+        # Inputs belong to the exact built snapshot, never the last concurrent
+        # builder. Weak references release sources when snapshots are retired.
+        self._view_order_read_inputs: OrderedDict[int, tuple[Any, ...]] = OrderedDict()
         self._canonical_options_request_sequence = 0
         # Sources behind the current canonical options; None when unknown.
         self._canonical_options_source_publication: SourcePublication | None = None
+        self._canonical_options_background_refresh = False
         self._snapshot_topology_generation = 0
         self._source_bundle_lock = asyncio.Lock()
         self._ssh_session_locks: dict[str, asyncio.Lock] = {}
@@ -1659,18 +1690,55 @@ class InventoryService:
                 )
                 build_started = time.perf_counter()
                 detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
-                source_publications.clear()
-                detail_token = _snapshot_detail_commits.set(detail_commits)
-                source_token = _snapshot_build_source_publications.set(source_publications)
-                try:
-                    with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
-                        snapshot = await self._build_snapshot(
-                            selected_enclosure_id=selected_enclosure_id,
-                            force_source_refresh=refresh_sources,
-                        )
-                finally:
-                    _snapshot_build_source_publications.reset(source_token)
-                    _snapshot_detail_commits.reset(detail_token)
+                retry_bundle: InventorySourceBundle | None = None
+                retry_generation = self._source_bundle_generation
+                for attempt in range(2):
+                    source_publications.clear()
+                    detail_commits.clear()
+                    detail_token = _snapshot_detail_commits.set(detail_commits)
+                    source_token = _snapshot_build_source_publications.set(source_publications)
+                    try:
+                        with perf_stage("inventory.build_snapshot", system_id=self.system.id, enclosure_id=cache_key):
+                            if retry_bundle is None:
+                                snapshot = await self._build_snapshot(
+                                    selected_enclosure_id=selected_enclosure_id,
+                                    force_source_refresh=refresh_sources,
+                                )
+                            else:
+                                snapshot = await self._build_snapshot(
+                                    selected_enclosure_id=selected_enclosure_id,
+                                    source_bundle=retry_bundle,
+                                )
+                    finally:
+                        _snapshot_build_source_publications.reset(source_token)
+                        _snapshot_detail_commits.reset(detail_token)
+                    if retry_bundle is not None and retry_generation != self._source_bundle_generation:
+                        raise SnapshotStateBusyError()
+                    # A background warm-up can collect S2 while this forced
+                    # request is correlating S1. Re-correlate once from the exact
+                    # published S2, never publish S1 or start another source flight.
+                    # Unrelated foreground supersession and topology changes keep
+                    # their fail-closed behavior.
+                    current_bundle = self._source_bundle
+                    if (
+                        attempt == 0 and force_refresh and refresh_sources
+                        and selected_enclosure_id is not None
+                        and snapshot.selected_enclosure_id == selected_enclosure_id
+                        and self._snapshot_has_trusted_topology(snapshot)
+                        and topology_generation == self._snapshot_topology_generation
+                        and cache_key not in self._snapshot_invalidated
+                        and request_sequence < self._canonical_options_request_sequence
+                        and self._canonical_options_background_refresh
+                        and current_bundle is not None and source_publications
+                        and current_bundle.publication == self._canonical_options_source_publication
+                        and current_bundle.publication.sequence > source_publications[-1].sequence
+                        and self._source_publication_meets(current_bundle.publication, required_source_publication)
+                        and {option.id for option in snapshot.enclosures} == set(self._canonical_enclosure_options or {})
+                    ):
+                        retry_bundle = current_bundle
+                        retry_generation = self._source_bundle_generation
+                        continue
+                    break
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and cache_key in self._snapshot_invalidated:
                     raise SnapshotStateBusyError()
@@ -1980,8 +2048,7 @@ class InventoryService:
         self._snapshot_publication_generation += 1
         self._view_order_source_bundle = None
         self._view_order_topology_generation = -1
-        self._view_order_context = None
-        self._cached_effective_view_order = []
+        self._view_order_cache.clear()
         self._touch_snapshot_key(cache_key)
         return snapshot, True
 
@@ -2119,12 +2186,33 @@ class InventoryService:
                     self._canonical_options_source_publication = (
                         source_publications[-1] if source_publications else None
                     )
+                    self._canonical_options_background_refresh = _snapshot_background_refresh.get()
                     if not trusted_topology:
                         discovered_snapshot = None
         if selected_enclosure_id is None:
             return self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY, discovered_snapshot
         if selected_enclosure_id not in options:
-            raise UnknownEnclosureError()
+            # Explicit CORE stacks are opt-in views of discovered shelves, not
+            # new identities inferred from matching model names. Admit only
+            # distinct, exact component IDs already offered by discovery.
+            parts = selected_enclosure_id.split("+")
+            if not (
+                self.system.truenas.platform == "core"
+                and len(parts) > 1
+                and len(set(parts)) == len(parts)
+                and all(part in options and ":" not in part and options[part].slot_count for part in parts)
+            ):
+                # Elsewhere a combined id is a pre-#1000 default view whose
+                # shelves are now separate. Say so instead of "unknown" when
+                # every shelf it joined is still offered (#1006).
+                members = combined_enclosure_parts(selected_enclosure_id)
+                if (
+                    self.system.truenas.platform != "core"
+                    and members is not None
+                    and all(member in options for member in members)
+                ):
+                    raise SplitEnclosureError(selected_enclosure_id, members)
+                raise UnknownEnclosureError()
         return selected_enclosure_id, (
             discovered_snapshot
             if discovered_snapshot is not None
@@ -2182,6 +2270,7 @@ class InventoryService:
             self._canonical_default_enclosure_id = next(iter(options), None)
         self._canonical_options_request_sequence = request_sequence
         self._canonical_options_source_publication = source_publications[-1] if source_publications else None
+        self._canonical_options_background_refresh = _snapshot_background_refresh.get()
         for key in removed_keys:
             self._remove_snapshot_state_key(key, cancel_task=True)
         self._forget_led_targets(removed_keys, request_sequence=request_sequence)
@@ -2462,6 +2551,58 @@ class InventoryService:
             )
         ).value
 
+    def _opening_order_inputs_for(self, snapshot: InventorySnapshot) -> tuple[Any, ...] | None:
+        entry = self._view_order_read_inputs.get(id(snapshot))
+        if entry is None or entry[0]() is not snapshot:
+            return None
+        return entry[1:]
+
+    async def _get_opening_order_snapshot(
+        self,
+        enclosure_id: str,
+        *,
+        source_bundle: InventorySourceBundle,
+        active_snapshot: InventorySnapshot,
+    ) -> InventorySnapshot | None:
+        # Optional scoring cannot enter publication, persistence or collection.
+        # Those producers retain ownership while draining non-cancellable work.
+        inputs = self._opening_order_inputs_for(active_snapshot)
+        source_publication = self._source_bundle_published_sequence
+
+        def inputs_are_current():
+            return (inputs is not None and inputs[0] is source_bundle
+                    and inputs[1] == self._snapshot_topology_generation
+                    and inputs[4] == self._source_bundle_generation
+                    and source_publication == self._source_bundle_published_sequence)
+
+        if inputs is None or not inputs_are_current():
+            return None
+        await asyncio.sleep(0)
+        if not inputs_are_current():
+            return None
+        ssh_data = (
+            self._parsed_ssh_data_for_enclosure(source_bundle, enclosure_id)
+            if source_bundle.ssh_collected else ParsedSSHData()
+        )
+        if self.system.truenas.platform == "scale" and source_bundle.scale_ses_data.ses_enclosures:
+            ssh_data = self._merge_ses_overlay_data(ssh_data, source_bundle.scale_ses_data)
+        token = _snapshot_read_inputs.set((self, inputs[2], inputs[3]))
+        try:
+            slots, *_rest = self._correlate(
+                source_bundle.raw_data, ssh_data, [],
+                selected_enclosure_id=enclosure_id,
+                quantastor_ses_data=source_bundle.quantastor_ses_data,
+                bmc_inventory=source_bundle.bmc_inventory,
+            )
+        finally:
+            _snapshot_read_inputs.reset(token)
+        # Observe cancellation after synchronous correlation as well. These
+        # request-local slots have no executor, persistence or identity owner.
+        await asyncio.sleep(0)
+        if not inputs_are_current():
+            return None
+        return active_snapshot.model_copy(update={"slots": slots, "selected_enclosure_id": enclosure_id})
+
     async def _effective_runtime_view_order(
         self,
         *,
@@ -2474,6 +2615,20 @@ class InventoryService:
         force_refresh: bool,
         ignore_saved_order: bool = False,
     ) -> list[str]:
+        topology_generation = self._snapshot_topology_generation
+        source_generation = self._source_bundle_generation
+        source_publication = self._source_bundle_published_sequence
+        active_inputs = self._opening_order_inputs_for(active_snapshot)
+
+        def inputs_are_current():
+            return (topology_generation == self._snapshot_topology_generation
+                    and source_generation == self._source_bundle_generation
+                    and source_publication == self._source_bundle_published_sequence
+                    and active_inputs is not None
+                    and active_inputs[0] is source_bundle
+                    and active_inputs[1] == topology_generation
+                    and active_inputs[4] == source_generation)
+
         saved_order = () if ignore_saved_order else tuple(self.system.view_order)
         view_counts = [
             (view.id, view.matched_count)
@@ -2484,6 +2639,9 @@ class InventoryService:
         # enclosure, so their counts (and the HA preference) belong in the key.
         order_context = (
             active_snapshot.selected_enclosure_id,
+            # A legacy/unassociated snapshot cannot reuse a scored result from
+            # a different mapping read merely because its visible counts agree.
+            active_inputs[5] if active_inputs is not None else None,
             tuple(view_counts),
             ha_primary_view_id,
             ha_owner_enclosure_id,
@@ -2492,56 +2650,114 @@ class InventoryService:
 
         def cached_order() -> list[str] | None:
             if (
-                self._view_order_source_bundle is source_bundle
+                inputs_are_current()
+                and self._view_order_source_bundle is source_bundle
                 and self._view_order_topology_generation == self._snapshot_topology_generation
-                and self._view_order_context == order_context
-                and self._cached_effective_view_order
             ):
-                return list(self._cached_effective_view_order)
+                cached = self._view_order_cache.get(order_context)
+                if cached is not None:
+                    self._view_order_cache.move_to_end(order_context)
+                    return list(cached)
             return None
 
+        def fallback_order(reason: str) -> list[str]:
+            warning = (
+                f"Opening-view scoring was skipped because {reason}; "
+                "saved order followed by discovery order is shown."
+            )
+            if warning not in active_snapshot.warnings:
+                active_snapshot.warnings.append(warning)
+            # This bounds scoring, not rendering. Equal zero counts retain
+            # discovery order and saved preferences without building other shelves.
+            return effective_main_view_order(
+                enclosure_counts=[(option.id, 0) for option in active_snapshot.enclosures],
+                view_counts=[(view_id, 0) for view_id, _count in view_counts],
+                saved_order=saved_order,
+            )
+
+        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
+            return fallback_order("this system exceeds the enclosure limit")
+        if not inputs_are_current():
+            return fallback_order("current correlation inputs are unavailable")
         cached = cached_order()
         if cached is not None:
             return cached
-        if len({option.id for option in active_snapshot.enclosures}) > SYSTEM_RETENTION_MAX_ENCLOSURES:
-            raise SystemRetentionTooLargeError()
-        if self._view_order_recompute_lock.locked():
-            raise SystemRetentionBusyError()
 
-        async with self._view_order_recompute_lock:
-            cached = cached_order()
-            if cached is not None:
-                return cached
-            publication_generation = self._snapshot_publication_generation
-            enclosure_counts: list[tuple[str, int]] = []
-            for option in active_snapshot.enclosures:
-                snapshot = known_snapshots.get(option.id)
-                if snapshot is None:
-                    # The request already collected the source bundle. Building each
-                    # option from that bundle adds no appliance/API/SSH refresh.
-                    snapshot = await self._get_secondary_runtime_snapshot(
-                        option.id,
-                        force_refresh=force_refresh,
+        # Ordinary browser collisions may wait, but a burst cannot retain an
+        # unbounded queue. Admission and lock acquisition have no intervening
+        # await, so the counter covers every queued contender on this event loop.
+        collided = self._view_order_recompute_lock.locked() or self._view_order_waiters > 0
+        queued = collided
+        if queued:
+            if self._view_order_waiters >= OPENING_ORDER_MAX_WAITERS:
+                return fallback_order("opening-order scoring is busy")
+            self._view_order_waiters += 1
+        try:
+            # Bound both queue time and optional secondary scoring. Cancellation
+            # unwinds the lock and counter; no detached scoring task survives.
+            async with asyncio.timeout(OPENING_ORDER_TIMEOUT_SECONDS):
+                async with self._view_order_recompute_lock:
+                    if queued:
+                        self._view_order_waiters -= 1
+                        queued = False
+                    cached = cached_order()
+                    if cached is not None:
+                        return cached
+                    if collided and force_refresh:
+                        # Secondary forced publications invalidate the order cache.
+                        # A waiting forced request must not repeat that work just
+                        # because its predecessor could not safely cache a result.
+                        return fallback_order("opening-order scoring is busy")
+                    publication_generation = self._snapshot_publication_generation
+                    enclosure_counts: list[tuple[str, int]] = []
+                    for option in active_snapshot.enclosures:
+                        snapshot = known_snapshots.get(option.id)
+                        if snapshot is not None and snapshot is not active_snapshot:
+                            known_inputs = self._opening_order_inputs_for(snapshot)
+                            if active_inputs is not None and (known_inputs is None
+                                    or known_inputs[0] is not source_bundle
+                                    or known_inputs[1] != topology_generation
+                                    or known_inputs[4] != source_generation):
+                                snapshot = None
+                        if snapshot is None:
+                            snapshot = await self._get_opening_order_snapshot(
+                                option.id,
+                                source_bundle=source_bundle,
+                                active_snapshot=active_snapshot,
+                            )
+                            if snapshot is None:
+                                return fallback_order("current correlation inputs are unavailable")
+                            known_snapshots[option.id] = snapshot
+                        if not inputs_are_current():
+                            return fallback_order("current correlation inputs are unavailable")
+                        enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+
+                    order = effective_main_view_order(
+                        enclosure_counts=enclosure_counts,
+                        view_counts=view_counts,
+                        saved_order=saved_order,
+                        ha_primary_view_id=ha_primary_view_id,
+                        ha_owner_enclosure_id=ha_owner_enclosure_id,
                     )
-                    known_snapshots[option.id] = snapshot
-                enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
-
-            order = effective_main_view_order(
-                enclosure_counts=enclosure_counts,
-                view_counts=view_counts,
-                saved_order=saved_order,
-                ha_primary_view_id=ha_primary_view_id,
-                ha_owner_enclosure_id=ha_owner_enclosure_id,
-            )
-            # A stale-hit can publish a refreshed snapshot while another option
-            # is awaited. Return this request's coherent result, but only cache it
-            # when no snapshot publication raced the computation.
-            if publication_generation == self._snapshot_publication_generation:
-                self._view_order_source_bundle = source_bundle
-                self._view_order_topology_generation = self._snapshot_topology_generation
-                self._view_order_context = order_context
-                self._cached_effective_view_order = list(order)
-            return order
+                    # A stale-hit can publish a refreshed snapshot while another
+                    # option is awaited. Only cache when no publication raced it.
+                    if publication_generation == self._snapshot_publication_generation and inputs_are_current():
+                        if (self._view_order_source_bundle is not source_bundle
+                                or self._view_order_topology_generation != self._snapshot_topology_generation):
+                            self._view_order_cache.clear()
+                        self._view_order_source_bundle = source_bundle
+                        self._view_order_topology_generation = self._snapshot_topology_generation
+                        self._view_order_cache[order_context] = list(order)
+                        self._view_order_cache.move_to_end(order_context)
+                        # Bound saved/automatic contexts for each selected shelf.
+                        while len(self._view_order_cache) > 2 * SYSTEM_RETENTION_MAX_ENCLOSURES:
+                            self._view_order_cache.popitem(last=False)
+                    return order
+        except TimeoutError:
+            return fallback_order("opening-order scoring timed out")
+        finally:
+            if queued:
+                self._view_order_waiters -= 1
 
     async def get_storage_view_runtime(
         self,
@@ -2567,7 +2783,11 @@ class InventoryService:
             selected_enclosure_id=selected_enclosure_id,
             allow_stale_cache=not force_refresh,
         )
-        source_bundle = await self._get_inventory_source_bundle(
+        active_inputs = self._opening_order_inputs_for(active_snapshot)
+        # Cached, supplied and freshly built snapshots retain their own source.
+        # Legacy snapshots without an association still serialize via the normal
+        # provider, but cannot invent inputs for optional secondary scoring.
+        source_bundle = active_inputs[0] if active_inputs is not None else await self._get_inventory_source_bundle(
             force_refresh=force_refresh,
             allow_stale_cache=not force_refresh,
         )
@@ -3057,10 +3277,12 @@ class InventoryService:
         return runtime_slot.slot_index, f"storage-view:{runtime_view.id}"
 
     @classmethod
-    def _storage_view_runtime_slot_state(cls, runtime_slot: StorageViewRuntimeSlot) -> SlotState:
+    def _storage_view_runtime_slot_state(
+        cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
+    ) -> SlotState:
         if not runtime_slot.occupied:
             return SlotState.empty
-        if runtime_slot.state == SlotState.identify.value:
+        if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
             return SlotState.fault
@@ -3097,6 +3319,7 @@ class InventoryService:
             enclosure_name=runtime_view.label,
             present=runtime_slot.occupied,
             state=self._storage_view_runtime_slot_state(runtime_slot),
+            non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
             smart_device_names=list(runtime_slot.smart_device_names),
             smart_device_type=runtime_slot.smart_device_type,
@@ -4666,6 +4889,7 @@ class InventoryService:
         task.add_done_callback(_cleanup)
 
     async def _background_snapshot_refresh(self, cache_key: str, *, default_selection: bool = False) -> None:
+        background_token = _snapshot_background_refresh.set(True)
         try:
             observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
             source_task = self._schedule_background_source_bundle_refresh()
@@ -4702,6 +4926,8 @@ class InventoryService:
             logger.debug("Background snapshot refresh for %s was superseded.", cache_key)
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
+        finally:
+            _snapshot_background_refresh.reset(background_token)
 
     @staticmethod
     def _snapshot_has_trusted_topology(snapshot: InventorySnapshot) -> bool:
@@ -6917,8 +7143,9 @@ class InventoryService:
         selected_enclosure_id: str | None = None,
         *,
         force_source_refresh: bool = False,
+        source_bundle: InventorySourceBundle | None = None,
     ) -> InventorySnapshot:
-        source_bundle = await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
+        source_bundle = source_bundle or await self._get_inventory_source_bundle(force_refresh=force_source_refresh)
         source_publications = _snapshot_build_source_publications.get()
         if source_publications is not None:
             source_publications.append(source_bundle.publication)
@@ -6983,9 +7210,13 @@ class InventoryService:
             )
             return mappings, aliases
 
+        read_generation = self._snapshot_topology_generation
+        read_source_generation = self._source_bundle_generation
         mappings, aliases = await _drain_inventory_worker(
             asyncio.get_running_loop().run_in_executor(None, copy_context().run, read_inputs)
         )
+        # Reuse this admitted read for optional secondary counts. Do not reopen
+        # stores from the deadline-bounded scorer, even if source TTL expires.
         token = _snapshot_read_inputs.set((self, mappings, aliases))
         try:
             with perf_stage("inventory.correlate"):
@@ -6999,6 +7230,9 @@ class InventoryService:
                 )
         finally:
             _snapshot_read_inputs.reset(token)
+        for warning in self._combined_shelf_scope_warnings(available_enclosures, mappings):
+            if warning not in warnings:
+                warnings.append(warning)
         enclosure_source = self._enclosure_source(raw_data, available_enclosures)
         if (
             core_no_bays_warning
@@ -7111,6 +7345,13 @@ class InventoryService:
                 ),
                 slots=slots,
             )
+        if retention.bare_device_mapper_unplaced_count:
+            count = retention.bare_device_mapper_unplaced_count
+            warnings.append(
+                f"{count} source disk observation{'s remain' if count != 1 else ' remains'} unplaced "
+                f"because {'their' if count != 1 else 'its'} only identity evidence is a bare dm-N "
+                "device-mapper minor, which is not a trustworthy disk identity."
+            )
         summary = InventorySummary(
             disk_count=disk_count,
             pool_count=pool_count,
@@ -7136,7 +7377,7 @@ class InventoryService:
             platform_context=platform_context,
             selected_profile=selected_profile,
         )
-        return InventorySnapshot(
+        snapshot = InventorySnapshot(
             slots=slots,
             layout_rows=layout_rows,
             layout_slot_count=layout_slot_count,
@@ -7166,6 +7407,19 @@ class InventoryService:
             capabilities=capabilities,
             summary=summary,
         )
+        # Do not admit a read that crossed invalidation, even when the ordinary
+        # producer later rejects its candidate before publication.
+        if (read_generation == self._snapshot_topology_generation
+                and read_source_generation == self._source_bundle_generation):
+            snapshot_id = id(snapshot)
+            entries = self._view_order_read_inputs
+            entries[snapshot_id] = (
+                weakref.ref(snapshot, lambda _ref: entries.pop(snapshot_id, None)),
+                source_bundle, read_generation, mappings, aliases, read_source_generation, object(),
+            )
+            while len(entries) > 2 * SNAPSHOT_STATE_MAX_ENTRIES:
+                entries.popitem(last=False)
+        return snapshot
 
     def _attach_mapping_revisions(self, slots: list[SlotView], *, loaded_entries=None) -> list[SlotView]:
         targets = list({
@@ -11907,7 +12161,15 @@ class InventoryService:
         # Some qs commands, notably network-port-list on some appliances, emit
         # otherwise valid JSON with trailing commas. Keep the compatibility
         # shim narrow so normal parser failures still surface as failures.
-        sanitized = re.sub(r",(\s*[\]}])", r"\1", stdout)
+        # Match whole string literals first so commas inside quoted values
+        # are never removed. The closing quote is optional so an unterminated
+        # string is consumed once instead of rescanned from every quote.
+        sanitized = re.sub(
+            r'("[^"\\]*(?:\\.[^"\\]*)*"?)|,(\s*[\]}])',
+            r"\1\2",
+            stdout,
+            flags=re.DOTALL,
+        )
         if sanitized != stdout:
             try:
                 return json.loads(sanitized)
@@ -12444,11 +12706,7 @@ class InventoryService:
                 seen_ids.add(selected_id)
                 options.append(
                     selected_option
-                    or EnclosureOption(
-                        id=selected_id,
-                        label=normalize_text(selected_meta.get("label")) or selected_id,
-                        name=normalize_text(selected_meta.get("name")),
-                    )
+                    or self._core_ssh_primary_option(ssh_data, selected_id, selected_ids, selected_meta)
                 )
             if primary_id and primary_id not in seen_ids:
                 seen_ids.add(primary_id)
@@ -12458,7 +12716,9 @@ class InventoryService:
             for enclosure in self._build_core_ssh_enclosure_options(
                 ssh_data,
                 filter_value=filter_value,
-                excluded_ids=primary_ids | selected_ids,
+                # Keep component shelves selectable after an explicit stack;
+                # the opt-in view must not replace their automatic identities.
+                excluded_ids=primary_ids,
                 finalize=False,
             ):
                 if enclosure.id in seen_ids:
@@ -12627,6 +12887,65 @@ class InventoryService:
             else []
         )
         return finalize_enclosure_option_labels(options, aliases)
+
+    def _combined_shelf_scope_warnings(
+        self,
+        available_enclosures: list[EnclosureOption],
+        loaded_mappings: Mapping[str, ManualMapping],
+    ) -> list[str]:
+        """Name saved state still filed under a split combined shelf id (#1006).
+
+        Read only: the warning says where each saved bay belongs when that is
+        unambiguous and leaves the save to the operator, who can check the
+        disk first.
+        """
+        offered = {option.id: option for option in available_enclosures if option.kind == "physical"}
+        system_ids = {self.system.id, None}
+        combined_scopes: dict[str, list[int]] = {}
+        assigned: dict[tuple[str, int], bool] = {}
+        for key in loaded_mappings:
+            mapping = loaded_mappings[key]
+            if mapping.system_id not in system_ids or not mapping.enclosure_id:
+                continue
+            assigned[(mapping.enclosure_id, mapping.slot)] = True
+            if combined_enclosure_parts(mapping.enclosure_id) is not None:
+                combined_scopes.setdefault(mapping.enclosure_id, []).append(mapping.slot)
+        # A shelf that is merely offline is not a split; say nothing until at
+        # least one shelf the id joined is reported again.
+        combined_scopes = {
+            enclosure_id: slots
+            for enclosure_id, slots in combined_scopes.items()
+            if any(part in offered for part in combined_enclosure_parts(enclosure_id) or ())
+        }
+        reopenable = {
+            enclosure_id
+            for enclosure_id in combined_scopes
+            if self.system.truenas.platform == "core"
+            and all(
+                part in offered and offered[part].slot_count
+                for part in combined_enclosure_parts(enclosure_id) or ()
+            )
+        }
+        warnings = combined_mapping_warnings(
+            combined_scopes,
+            offered_ids=offered,
+            bay_counts={enclosure_id: option.slot_count for enclosure_id, option in offered.items()},
+            has_assignment=assigned,
+            reopenable_ids=reopenable,
+        )
+        if offered:
+            # With no shelf reported there is nothing to compare against.
+            warnings.extend(
+                combined_reference_warnings(
+                    offered_ids=offered,
+                    view_order=self.system.view_order,
+                    storage_view_bindings=[
+                        (storage_view.id, storage_view.binding.enclosure_ids)
+                        for storage_view in self.system.storage_views
+                    ],
+                )
+            )
+        return warnings
 
     def _warn_unapplied_legacy_mappings(
         self,
@@ -14359,7 +14678,10 @@ class InventoryService:
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
-            if zpool := self._lookup_zpool_member(None, peer, peer_gptid, ssh_data, api_topology_members):
+            # A bay peer may supply direct membership, not SSH-only geom inference.
+            if zpool := self._lookup_zpool_member(
+                None, peer, peer_gptid, ssh_data, api_topology_members, allow_geom_inference=False,
+            ):
                 gptid = gptid or peer_gptid
                 break
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
@@ -14414,18 +14736,17 @@ class InventoryService:
             or (not ses_says_empty_without_disk and status_says_populated)
         )
 
-        if identify_active:
-            state = SlotState.identify
-        elif faulty and not ses_says_empty_without_disk:
-            state = SlotState.fault
+        if faulty and not ses_says_empty_without_disk:
+            non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
-            state = SlotState.empty
+            non_identify_state = SlotState.empty
         elif disk or bmc_present:
-            state = SlotState.healthy
+            non_identify_state = SlotState.healthy
         elif mapping:
-            state = SlotState.unmapped
+            non_identify_state = SlotState.unmapped
         else:
-            state = SlotState.unknown
+            non_identify_state = SlotState.unknown
+        state = SlotState.identify if identify_active else non_identify_state
 
         identity_mapping = None if stale_manual_mapping else mapping
         serial = disk.serial if disk else normalize_text(raw_slot_status.get("serial_hint"))
@@ -14642,6 +14963,7 @@ class InventoryService:
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
             state=state,
+            non_identify_state=non_identify_state.value,
             identify_active=identify_active,
             device_name=device_name,
             smart_device_names=list(disk.smart_devices) if disk else [],
@@ -14926,6 +15248,17 @@ class InventoryService:
         sg_action = "--set=ident" if requested_active else "--clear=ident"
         acted_on_another_path = False
         for target_host, host_targets in by_host.items():
+            # Keep every required path, including failed/unread paths. Omitting
+            # one could turn a single off readback into a false global off.
+            host_paths = [
+                {
+                    "ses_device": normalize_text(target.get("ses_device")),
+                    "ses_element_id": target["ses_element_id"],
+                    "identify_active": None,
+                }
+                for target in host_targets
+            ]
+            paths.extend(host_paths)
             # Discovery only maps a device whose AES page it read, so the same
             # page, read first in this session, says which shelf it is now.
             preflight_commands = [
@@ -14982,6 +15315,13 @@ class InventoryService:
                         f"{exc} The other enclosure path also failed: " + "; ".join(failures)
                     ) from exc
                 raise
+            except LedSessionBusyError:
+                raise
+            except TrueNASAPIError as exc:
+                # An ordinary preflight failure leaves this host untouched,
+                # but must not discard a confirmed action on another host.
+                failures.append(str(exc))
+                continue
             results = results[len(preflight_commands):]
             # Only a successful locate command counts as switching this bay.
             acted_on_another_path = acted_on_another_path or any(
@@ -15030,16 +15370,15 @@ class InventoryService:
                         )
                         if mapped_slot is not None:
                             observed = bool(mapped_slot.identify_active)
-                paths.append(
-                    {
-                        "ses_device": target_device,
-                        "ses_element_id": target_element,
-                        "identify_active": observed,
-                    }
-                )
+                host_paths[index]["identify_active"] = observed
+        result = self._led_readback_result(requested_active, paths)
         if failures:
-            raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
-        return self._led_readback_result(requested_active, paths)
+            # A successful command alone is not partial success: at least one
+            # successful path must actually read back the requested state.
+            if not any(path["identify_active"] is requested_active for path in paths):
+                raise TrueNASAPIError("SSH LED action failed: " + " | ".join(failures))
+            result.update(partial=True, failures=[failure[:240] for failure in failures[:8]])
+        return result
 
     @staticmethod
     def _led_readback_result(
@@ -15597,6 +15936,8 @@ class InventoryService:
         gptid: str | None,
         ssh_data: ParsedSSHData,
         api_topology_members: dict[str, Any],
+        *,
+        allow_geom_inference: bool = True,
     ):
         seen: set[str] = set()
         candidate_keys: list[str] = []
@@ -15635,7 +15976,31 @@ class InventoryService:
             member = ssh_data.zpool_device_members.get(key)
             if member:
                 return replace(member, raw_name="", raw_path=None)
-        return None
+        if not allow_geom_inference or disk is not None or self.system.truenas.platform != "core":
+            return None
+
+        # An SSH-only SES consumer may have its GPT label on the owning geom.
+        # Require that exact consumer's unique owner, never a camcontrol peer.
+        consumer = normalize_device_name(device_name)
+        info = self._index_multipath_consumers(ssh_data).get((consumer or "").lower())
+        if info is None:
+            return None
+        provider = normalize_device_name(info.device_name)
+        derived_keys = normalize_lookup_keys(info.device_name)
+        derived_keys.update(normalize_lookup_keys(ssh_data.glabel.device_to_gptid.get((provider or "").lower())))
+        inferred_member = None
+        for key in sorted(derived_keys):
+            for members in (ssh_data.zpool_members, api_topology_members, ssh_data.zpool_device_members):
+                member = members.get(key)
+                if member is None:
+                    continue
+                # Provider/GPTID aliases must agree on all membership metadata.
+                # Neither inferred raw path is a persistent disk identity.
+                member = replace(member, raw_name="", raw_path=None)
+                if inferred_member is not None and member != inferred_member:
+                    return None
+                inferred_member = member
+        return inferred_member
 
     def _disk_sas_alias_tiers(self, disk: DiskRecord) -> tuple[set[str], set[str]]:
         sources: list[str | None] = [disk.lunid]
@@ -15890,12 +16255,14 @@ class InventoryService:
     def _merge_smart_summary(slot_view: SlotView, summary: SmartSummaryView) -> SmartSummaryView:
         if InventoryService._smart_summary_identity_conflicts(slot_view, summary):
             raise _SmartIdentityConflict()
-        summary.temperature_c = summary.temperature_c or slot_view.temperature_c
+        # Parsers report unknown numeric values as None; a parsed zero is a
+        # reading and must not be replaced by slot fallback values.
+        if summary.temperature_c is None:
+            summary.temperature_c = slot_view.temperature_c
         summary.last_test_type = summary.last_test_type or slot_view.last_smart_test_type
         summary.last_test_status = summary.last_test_status or slot_view.last_smart_test_status
-        summary.last_test_lifetime_hours = (
-            summary.last_test_lifetime_hours or slot_view.last_smart_test_lifetime_hours
-        )
+        if summary.last_test_lifetime_hours is None:
+            summary.last_test_lifetime_hours = slot_view.last_smart_test_lifetime_hours
         summary.logical_block_size = summary.logical_block_size or slot_view.logical_block_size
         summary.physical_block_size = summary.physical_block_size or slot_view.physical_block_size
         summary.logical_unit_id = summary.logical_unit_id or slot_view.logical_unit_id

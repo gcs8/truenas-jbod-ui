@@ -25,8 +25,8 @@ SAVE_DETAIL = "Could not save: the data folder is not writable by the app. See T
 
 # SQLite reports a read-only directory as a message with no errno, so the
 # errno test alone misses exactly the startup failure this module explains.
-# Only these two messages are permission failures; "database is locked" and a
-# malformed image keep their own error.
+# These messages may be permission failures; startup checks capacity for the
+# ambiguous open failure. Locked and malformed databases keep their own error.
 SQLITE_UNWRITABLE_MESSAGES = (
     "attempt to write a readonly database",
     "unable to open database file",
@@ -74,11 +74,17 @@ def _ownership_and_remedy(path: Path, *, access: str, recursive: bool) -> str:
     owner = f"owned by uid {owner_uid}" if owner_uid is not None else "owner unknown"
     running = f"running as uid {running_uid}" if running_uid is not None else "running as this user"
     target = host_repair_path(path)
-    if running_uid is None or running_gid is None:
+    if recursive:
+        remedy = (
+            f"On the Docker host, for {access} access to {target}, follow the guarded ownership procedure in "
+            "Troubleshooting (wiki/Troubleshooting.md#a-non-root-container-gets-permission-denied). "
+            "Stop every writer and keep them stopped during repair; "
+            "do not recursively change segmented history."
+        )
+    elif running_uid is None or running_gid is None:
         remedy = f"On the Docker host, give the app user {access} access to {target}."
     else:
-        flag = "-R " if recursive else ""
-        remedy = f"On the Docker host run: sudo chown {flag}{running_uid}:{running_gid} {target}"
+        remedy = f"On the Docker host run: sudo chown {running_uid}:{running_gid} {target}"
     return f"({owner}, {running}). {remedy}"
 
 
@@ -86,6 +92,39 @@ def describe_unwritable_directory(directory: Path | str) -> str:
     """Return the one line that tells an operator what to do about `directory`."""
     path = Path(directory)
     return f"Cannot write to {path} {_ownership_and_remedy(path, access='write', recursive=True)}"
+
+
+def describe_capacity_failure(exc: BaseException, directory: Path | str) -> str | None:
+    """Explain explicit capacity/quota faults or evidenced SQLite open failures."""
+    quota_errno = getattr(errno, "EDQUOT", None)
+    quota = quota_errno is not None and isinstance(exc, OSError) and exc.errno == quota_errno
+    full = isinstance(exc, OSError) and (exc.errno == errno.ENOSPC or quota)
+    if type(exc) is sqlite3.OperationalError:
+        message = str(exc).strip().lower()
+        full = message == "database or disk is full"
+        if message == "unable to open database file":
+            statvfs = getattr(os, "statvfs", None)
+            if statvfs is None:
+                return None
+            try:
+                space = statvfs(directory)
+            except OSError:
+                return None
+            # Read-only filesystems can report zero available blocks/inodes
+            # without being full (for example squashfs and iso9660).
+            if getattr(space, "f_flag", 0) & getattr(os, "ST_RDONLY", 0):
+                return None
+            # Some filesystems do not report inode counts (f_files == 0).
+            full = space.f_bavail == 0 or (space.f_files > 0 and space.f_favail == 0)
+    if not full:
+        return None
+    cause = "the filesystem capacity or quota is exhausted" if quota else "the filesystem is full"
+    quota_remedy = " and check the applicable quota" if quota else ""
+    return (
+        f"Cannot write to {directory} because {cause}. "
+        "On the Docker host, free space or inodes on the volume containing "
+        f"{host_repair_path(directory)}{quota_remedy}."
+    )
 
 
 class StorageDirectoryUnwritable(RuntimeError):
@@ -98,6 +137,18 @@ class StorageDirectoryUnwritable(RuntimeError):
         self.directory = Path(directory)
         self.operator_message = describe_unwritable_directory(self.directory)
         super().__init__(self.operator_message)
+
+
+class StorageDirectoryCapacityExhausted(StorageDirectoryUnwritable):
+    """An explicit capacity fault, handled by the existing save-refusal routes."""
+
+    error_code = "data_directory_capacity_exhausted"
+    public_detail = "Could not save: the data folder has insufficient capacity. See Troubleshooting."
+
+    def __init__(self, directory: Path | str, operator_message: str) -> None:
+        self.directory = Path(directory)
+        self.operator_message = operator_message
+        RuntimeError.__init__(self, operator_message)
 
 
 def is_unwritable_error(exc: BaseException) -> bool:
@@ -121,8 +172,8 @@ def unwritable_directory_error(
 def probe_writable_directories(directories: Iterable[Path | str | None]) -> list[str]:
     """Create and delete a probe file in each directory; one operator line per refusal.
 
-    Only permission-shaped failures (see `is_unwritable_error`) are reported;
-    anything else is left for the code that actually writes there to surface.
+    Permission and explicit capacity failures are reported; anything else is
+    left for the code that actually writes there to surface.
     Missing directories are created first, as the stores do on first write.
     """
     problems: list[str] = []
@@ -142,7 +193,10 @@ def probe_writable_directories(directories: Iterable[Path | str | None]) -> list
             os.close(descriptor)
             probe.unlink()
         except OSError as exc:
-            if is_unwritable_error(exc):
+            capacity_reason = describe_capacity_failure(exc, directory)
+            if capacity_reason is not None:
+                problems.append(capacity_reason)
+            elif is_unwritable_error(exc):
                 problems.append(describe_unwritable_directory(directory))
     return problems
 

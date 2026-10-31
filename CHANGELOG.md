@@ -33,6 +33,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - On TrueNAS CORE hosts read over SSH only, separate backplanes and AHCI SGPIO
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
+- Same-model SES shelves that an earlier version joined into one enclosure
+  with a combined id such as `A+B` are now separate shelves. Outside CORE a
+  link or API call naming `A+B` answers 404 with the separate shelf ids, and
+  the page opens the first shelf. Bay assignments, history, the saved
+  main-page order and storage-view bindings filed under `A+B` stay there and
+  are named in the page warnings and the admin banner, with each bay's place
+  on the separate shelves. Save those assignments again on the shelf they
+  belong to (#1008).
+
+### Added
+
+- Disk details showed already-collected SAS JSON/text port counters and SATA
+  PHY events, preserving reported identities, missing values, exact totals and
+  saturation. Duplicate rows and retained metadata were bounded, without new
+  collection commands or counter resets (#1018).
 
 ### Fixed
 
@@ -40,6 +55,73 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   reported parents, retained verified ancestors in selected traces, and bounded
   propagated bay memberships; missing, conflicting or over-limit ancestry stayed
   unknown (#970).
+- Late TLS certificate inspect and trust answers stopped changing a different
+  editor or target, and backup status and API responses stopped carrying raw
+  provider error text (#1054).
+- Small segmented history reads skipped older sealed segments that could not
+  change the newest rows, avoiding a full sort of each unindexed segment (#1053).
+- Explained unplaced source observations whose only identity evidence was a bare
+  device-mapper minor, without changing disk identity or retention totals (#1026).
+- Quantastor and Supermicro BMC requests no longer follow redirects to another
+  host, port or plain HTTP with credentials, a competing first SSH connection
+  can no longer replace a pinned host key, BMC discovery caps reported
+  controller and drive counts, and TLS bundle saves stage in their own file
+  (#1052).
+- The immutable update helper's new opt-in `--history-health-url` reported a
+  history store that needs recovery or has paused collection as a distinct
+  non-pass (exit 3) instead of a pass, without rolling back. The upgrade
+  matrix listed read-only and full history state as tested, and the sudo
+  examples used anchored arguments instead of trailing globs (#1051).
+- Admin kept late-rendered buttons locked after it stopped, rejected fractional
+  profile builder sizes with a message, showed a failed drive discovery as a
+  failure, and let Move Up/Down reorder views that share an order (#1050).
+- Admin timing saves rejected fractional and boolean values instead of
+  truncating them, delayed demo creation kept newer setup drafts, history
+  adoption used the maintenance deadline and reported unconfirmed results as
+  unknown, and storage-view history returned 422/413 for rejected requests (#1049).
+- Quantastor CLI trailing-comma repair kept commas inside quoted values, and
+  SMART summaries kept a reported zero temperature or self-test lifetime
+  instead of replacing it with slot fallback values (#1046).
+- Failed segmented history restore staging removed the hot-copy file it had
+  created; SAS diagnostics labelled LOG SENSE page controls in command order
+  and decoded REPORT LUNS and INQUIRY allocation lengths at full width (#1047).
+- Directed ownership-repair advice to the guarded troubleshooting procedure
+  instead of a blanket recursive command (#1045).
+- CORE bootstrap supplied a validated next UID before creating a missing service
+  account, avoiding the CORE13 home-permission UID failure while preserving
+  existing accounts and refusing malformed allocation results (#1025).
+- Mapping and SAS-alias saves and writability probes reported capacity failures
+  without permission advice or private response details; SQLite open failures
+  on read-only filesystems retained the read-only diagnosis (#1024).
+- Restored pool and vdev labels for SSH-only TrueNAS CORE bays through explicit
+  multipath consumer ownership and provider GPTIDs, while leaving ambiguous or
+  conflicting attribution unknown and preserving disk identity (#1022).
+- History startup diagnosed full volumes and exhausted inodes with a space or
+  inode recovery remedy, while retaining ownership remedies for permissions (#1020).
+- Opening-view requests bounded scoring waits, kept persistence and collection
+  out of optional scoring, retained each snapshot's exact source and mapping
+  generation, and used saved then discovery order with a warning when busy,
+  timed out, over cap, or missing a snapshot association; forced refreshes retried
+  correlation once after overlapping background source updates (#997).
+- Locate actions retained a verified partial path result when another enclosure
+  path failed, warned about the incomplete readback and refreshed once, without
+  treating an unread path as confirmed off. Mapping saves also warned when an
+  automatic locator clear was only partially confirmed (#1013).
+- Admin storage-view edits survived queued repaints without restoring old input
+  values or losing pending candidate and platform bindings, while view and system
+  switches retained their own editor state (#1003).
+- Identical unprofiled SES shelves with different logical IDs stayed separate,
+  without joining their bays or locate targets. Verified Front/Rear shelf
+  parts still stacked, and explicitly selected combined shelves kept their
+  summed bay geometry and shelf-local locate targets (#1000).
+- History retained trusted disk identities when degraded SSH mapping lost or
+  contradicted bay assignments, while healthy observations still recorded real
+  changes (#1002).
+- Encrypted portable 7z backups waited for password-terminal readiness before
+  sending the passphrase, avoiding an echoed or discarded password line (#1001).
+- Locate light readback immediately updated bay tiles and restored their prior
+  state on clear, including cached views, and Connections Show all retained
+  keyboard focus on its heading (#998).
 - History adoption kept its committed success when the optional follow-up scan
   failed, warned that the source list needed a refresh, and preserved the last
   known list instead of displaying an empty result (#999).
@@ -89,6 +171,33 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and the system Chassis layout list offered them; each is now listed once, a
   system saved with one keeps it, the drive list heading matches its drives,
   and NVMe drives no longer start with "UNKNOWN" (#966).
+
+### Performance
+
+- History summary scans reused authenticated immutable segment counts on warm
+  reads, retaining existing segment admission checks and fresh hot-database
+  counts (#1012).
+
+### Docs
+
+- Added an upgrade qualification for an unavailable filesystem backup target
+  on a test-only scheduler overlay: the scheduler's own refusal names the
+  target and failure class, the local archive keeps the artifact with no
+  restarts, and the operator restoring the target is proven by byte readback;
+  the published matrix documents the bounded slice and keeps the published
+  backup scheduler's upgrade path untested (#1028).
+
+### Internal
+
+- Added an inactive per-system SAS graph preview that preserved supplied
+  topology and enclosure-local evidence, with reciprocal reported PHY metadata
+  only where available; no collection or application activation changed (#1015).
+- Added an inactive source-qualified CORE expander-counter command policy
+  draft with exact read-only request shapes; no grant, collector or host
+  capability was enabled (#1017).
+- Added an inactive all-writer orchestration prototype with synthetic process
+  tests; the ownership helper's stop-every-writer precondition remained
+  unchanged, with no live backend or activation (#1014).
 
 ## v0.24.0-beta.3 - 2026-10-11
 

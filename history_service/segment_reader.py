@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import sqlite3
@@ -10,7 +11,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
@@ -147,6 +148,9 @@ class SegmentedHistoryReader:
         self._catalog_generation_id: str | None = None
         self._verified_segment_digests: dict[tuple[str, Path], _VerifiedSegmentDigest] = {}
         self._verified_segment_digests_lock = threading.Lock()
+        self._segment_system_summaries: dict[
+            Path, tuple[_VerifiedSegmentDigest, tuple[tuple[str, sqlite3.Row], ...]]
+        ] = {}
 
     @classmethod
     def from_catalog(
@@ -511,6 +515,57 @@ class SegmentedHistoryReader:
             raise HistoryStorageUnavailableError("Segmented history query exceeds its segment limit.")
         return tuple(segment.path for segment in candidates)
 
+    def _segment_coverage_ends(self) -> dict[Path, datetime | None]:
+        # Catalog coverage is checked against the authenticated segment rows
+        # when the reader loads. Uncatalogued sources have no coverage bound.
+        return {segment.path: segment.coverage_end for segment in self._catalog_segments or ()}
+
+    def _limited_source_rows(
+        self,
+        paths: tuple[Path, ...],
+        *,
+        limit: int,
+        timestamp_field: str,
+        fetch: Callable[[sqlite3.Connection], list[dict[str, Any]]],
+        hot_connection: sqlite3.Connection | None = None,
+        identity: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Read a newest-first LIMIT query without opening sources that cannot win (#864).
+
+        The hot database is read first, then catalog segments by coverage end,
+        newest first. A segment whose coverage ends strictly before the current
+        limit-th newest candidate cannot add a row to the merged result, so it
+        is not opened. Equal instants are always read, as is a segment without
+        coverage. Rows come back in the original source order, so merge tie
+        order is unchanged. ``identity`` counts repeated logical rows once.
+        """
+        coverage_ends = self._segment_coverage_ends()
+        unbounded: list[int] = []
+        bounded: list[tuple[datetime, int]] = []
+        for index in range(1, len(paths)):
+            coverage_end = coverage_ends.get(paths[index])
+            if coverage_end is None:
+                unbounded.append(index)
+            else:
+                bounded.append((coverage_end, index))
+        bounded.sort(key=lambda item: item[0], reverse=True)
+        rows_by_source: dict[int, list[dict[str, Any]]] = {}
+        newest: dict[Any, datetime] = {}
+        threshold: datetime | None = None
+        for index in (0, *unbounded, *(index for _, index in bounded)) if paths else ():
+            coverage_end = coverage_ends.get(paths[index]) if index else None
+            if coverage_end is not None and threshold is not None and coverage_end < threshold:
+                continue
+            with self._query_connection(paths[index], hot_connection) as connection:
+                rows = fetch(connection)
+            rows_by_source[index] = rows
+            for position, row in enumerate(rows):
+                key = identity(row) if identity is not None else (index, position)
+                newest.setdefault(key, _parse_catalog_timestamp(row[timestamp_field]))
+            if len(newest) >= limit:
+                threshold = heapq.nlargest(limit, newest.values())[-1]
+        return [rows_by_source[index] for index in sorted(rows_by_source)]
+
     @contextmanager
     def _query_connection(
         self, path: Path, hot_connection: sqlite3.Connection | None = None,
@@ -698,37 +753,57 @@ class SegmentedHistoryReader:
         summaries: dict[str, dict[str, Any]] = {}
         for path in (self.hot_path, *self._selected_segment_paths(since=None)):
             with self._query_connection(path) as connection:
-                for table_name, key in (
-                    ("slot_state_current", "tracked_slots"),
-                    ("slot_events", "event_count"),
-                    ("metric_samples", "metric_sample_count"),
-                    ("metric_rollups", "metric_rollup_count"),
-                ):
-                    for row in connection.execute(
-                        f"""
-                        SELECT system_id, MAX(system_label) AS system_label,
-                               COUNT(*) AS row_count
-                        FROM {table_name}
-                        GROUP BY system_id
-                        """
-                    ).fetchall():
-                        system_id = str(row["system_id"])
-                        if system_id in excludes:
-                            continue
-                        summary = summaries.setdefault(
-                            system_id,
-                            {
-                                "system_id": system_id,
-                                "system_label": row["system_label"],
-                                "tracked_slots": 0,
-                                "event_count": 0,
-                                "metric_sample_count": 0,
-                                "metric_rollup_count": 0,
-                            },
+                # Always enter the guarded connection first: cached counts do
+                # not authenticate a segment, bypass sidecars/activation, or
+                # replace the digest check after file-identity changes. Only a
+                # catalog-authenticated immutable source can reuse its rows;
+                # the hot database and uncatalogued sources are counted fresh.
+                verified = (
+                    self._verified_segment_digests.get((self._catalog_generation_id, path))
+                    if self._catalog_generation_id is not None and path != self.hot_path
+                    else None
+                )
+                cached = self._segment_system_summaries.get(path)
+                if verified is not None and cached is not None and cached[0] == verified:
+                    table_rows = cached[1]
+                else:
+                    table_rows = tuple(
+                        (key, row)
+                        for table_name, key in (
+                            ("slot_state_current", "tracked_slots"),
+                            ("slot_events", "event_count"),
+                            ("metric_samples", "metric_sample_count"),
+                            ("metric_rollups", "metric_rollup_count"),
                         )
-                        if row["system_label"]:
-                            summary["system_label"] = row["system_label"]
-                        summary[key] += int(row["row_count"])
+                        for row in connection.execute(
+                            f"""
+                            SELECT system_id, MAX(system_label) AS system_label,
+                                   COUNT(*) AS row_count
+                            FROM {table_name}
+                            GROUP BY system_id
+                            """
+                        ).fetchall()
+                    )
+                    if verified is not None:
+                        self._segment_system_summaries[path] = (verified, table_rows)
+                for key, row in table_rows:
+                    system_id = str(row["system_id"])
+                    if system_id in excludes:
+                        continue
+                    summary = summaries.setdefault(
+                        system_id,
+                        {
+                            "system_id": system_id,
+                            "system_label": row["system_label"],
+                            "tracked_slots": 0,
+                            "event_count": 0,
+                            "metric_sample_count": 0,
+                            "metric_rollup_count": 0,
+                        },
+                    )
+                    if row["system_label"]:
+                        summary["system_label"] = row["system_label"]
+                    summary[key] += int(row["row_count"])
         return sorted(
             summaries.values(),
             key=lambda summary: (
@@ -756,21 +831,26 @@ class SegmentedHistoryReader:
             parameters.append(since)
         parameters.append(limit)
         rows: list[dict[str, Any]] = []
-        for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-            with self._query_connection(path, hot_connection) as connection:
-                rows.extend(
-                    dict(row)
-                    for row in connection.execute(
-                        f"""
-                        SELECT *
-                        FROM slot_events
-                        WHERE {' AND '.join(where_clauses)}
-                        ORDER BY julianday(observed_at) DESC, id DESC
-                        LIMIT ?
-                        """,
-                        parameters,
-                    ).fetchall()
-                )
+        for source_rows in self._limited_source_rows(
+            (self.hot_path, *self._selected_segment_paths(since=since)),
+            limit=limit,
+            timestamp_field="observed_at",
+            hot_connection=hot_connection,
+            fetch=lambda connection: [
+                dict(row)
+                for row in connection.execute(
+                    f"""
+                    SELECT *
+                    FROM slot_events
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY julianday(observed_at) DESC, id DESC
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
+            ],
+        ):
+            rows.extend(source_rows)
         return sorted(
             rows,
             key=lambda row: (_parse_catalog_timestamp(row["observed_at"]), int(row["id"])),
@@ -824,9 +904,16 @@ class SegmentedHistoryReader:
             LIMIT ?
         """
         rows: list[dict[str, Any]] = []
-        for path in (self.hot_path, *self._selected_segment_paths(since=since)):
-            with self._query_connection(path, hot_connection) as connection:
-                rows.extend(dict(row) for row in connection.execute(query, query_parameters).fetchall())
+        for source_rows in self._limited_source_rows(
+            (self.hot_path, *self._selected_segment_paths(since=since)),
+            limit=limit,
+            timestamp_field="observed_at",
+            hot_connection=hot_connection,
+            fetch=lambda connection: [
+                dict(row) for row in connection.execute(query, query_parameters).fetchall()
+            ],
+        ):
+            rows.extend(source_rows)
         for row in rows:
             row["value"] = row["value_integer"] if row["value_integer"] is not None else row["value_real"]
         return sorted(
@@ -1605,9 +1692,15 @@ class SegmentedHistoryReader:
             # Each source contributes at most `remaining` keys, and the retained
             # set is trimmed after each source. Ties retain source precedence.
             retained_keys: dict[tuple[Any, ...], None] = {}
-            for path in paths:
-                with self._query_connection(path, hot_connection) as connection:
-                    rows = connection.execute(
+            for rows in self._limited_source_rows(
+                paths,
+                limit=remaining,
+                timestamp_field="_bucket_start",
+                hot_connection=hot_connection,
+                identity=self._rollup_key,
+                fetch=lambda connection: [
+                    dict(row)
+                    for row in connection.execute(
                         f"""
                         SELECT bucket_seconds AS rollup_seconds,
                                bucket_start AS _bucket_start, system_id,
@@ -1620,13 +1713,24 @@ class SegmentedHistoryReader:
                         """,
                         [*rollup_parameters, remaining],
                     ).fetchall()
+                ],
+            ):
                 for row in rows:
-                    retained_keys[self._rollup_key(dict(row))] = None
+                    retained_keys[self._rollup_key(row)] = None
                 retained_keys = dict.fromkeys(sorted(
                     retained_keys, key=lambda key: _parse_catalog_timestamp(key[1]), reverse=True
                 )[:remaining])
             if not retained_keys:
                 continue
+            # A fragment shares its key's bucket_start, so a segment whose
+            # coverage ends before the oldest retained bucket holds none (#864).
+            oldest_retained = min(_parse_catalog_timestamp(key[1]) for key in retained_keys)
+            coverage_ends = self._segment_coverage_ends()
+            paths = tuple(
+                path
+                for path in paths
+                if (coverage_end := coverage_ends.get(path)) is None or coverage_end >= oldest_retained
+            )
             # Drive hydration from retained keys. Tuple IN can scan the whole
             # interval on SQLite 3.45; CROSS JOIN keeps full primary-key lookups.
             query = """

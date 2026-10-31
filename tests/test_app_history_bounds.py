@@ -349,6 +349,87 @@ class AppHistoryBoundsTests(unittest.TestCase):
             )
         self._assert_busy_response(response)
 
+    def test_storage_view_route_maps_real_planner_rejections_to_422_and_413(self) -> None:
+        # The planner runs before the backend-configured branch, so an
+        # unconfigured real client still reaches it (#1044).
+        route = self._route("/api/storage-views/{view_id}/history")
+        runtime_view = SimpleNamespace(
+            id="view-a",
+            backing_enclosure_id="front",
+            slots=[
+                SimpleNamespace(slot_index=0, snapshot_slot=0, snapshot_enclosure_id=None),
+                SimpleNamespace(slot_index=1, snapshot_slot=1, snapshot_enclosure_id=None),
+            ],
+        )
+        service = Mock()
+        service.system = SimpleNamespace(id="synthetic", truenas=SimpleNamespace(platform="core"))
+        service.get_storage_view_runtime = AsyncMock(return_value=SimpleNamespace(views=[runtime_view]))
+        registry = Mock()
+        registry.get_service.return_value = service
+        backend = history_backend_module.HistoryBackendClient(HistoryConfig(service_url=""))
+
+        def call(metrics: list[str], event_limit: int, metric_limit: int):
+            return asyncio.run(
+                route.endpoint(
+                    view_id="view-a",
+                    system_id=None,
+                    enclosure_id=None,
+                    window_hours=24,
+                    metrics=metrics,
+                    event_limit=event_limit,
+                    metric_limit=metric_limit,
+                )
+            )
+
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
+        ):
+            response = call(["temperature_c"], 0, 1)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(set(json.loads(response.body)["histories"]), {"0", "1"})
+            for metrics, event_limit, metric_limit, status in (
+                (["not_a_metric"], 0, 1, 422),
+                (["temperature_c"], 0, 0, 422),
+                (["temperature_c"], 2049, 1, 413),
+            ):
+                with self.subTest(metrics=metrics, event_limit=event_limit, metric_limit=metric_limit):
+                    with self.assertRaises(HTTPException) as raised:
+                        call(metrics, event_limit, metric_limit)
+                    self.assertEqual(raised.exception.status_code, status)
+                    self.assertTrue(str(raised.exception.detail))
+
+    def test_storage_view_route_does_not_translate_other_value_errors(self) -> None:
+        route = self._route("/api/storage-views/{view_id}/history")
+        runtime_view = SimpleNamespace(
+            id="view-a",
+            backing_enclosure_id="front",
+            slots=[SimpleNamespace(slot_index=0, snapshot_slot=0, snapshot_enclosure_id=None)],
+        )
+        service = Mock()
+        service.system = SimpleNamespace(id="synthetic", truenas=SimpleNamespace(platform="core"))
+        service.get_storage_view_runtime = AsyncMock(return_value=SimpleNamespace(views=[runtime_view]))
+        registry = Mock()
+        registry.get_service.return_value = service
+        backend = Mock(configured=True)
+        backend.get_scopes_history = AsyncMock(side_effect=ValueError("internal store failure"))
+        with (
+            patch.object(app_routes, "get_inventory_registry", return_value=registry),
+            patch.object(app_routes, "get_history_backend", return_value=backend),
+            self.assertRaisesRegex(ValueError, "internal store failure"),
+        ):
+            asyncio.run(
+                route.endpoint(
+                    view_id="view-a",
+                    system_id=None,
+                    enclosure_id=None,
+                    window_hours=24,
+                    metrics=["temperature_c"],
+                    event_limit=0,
+                    metric_limit=1,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

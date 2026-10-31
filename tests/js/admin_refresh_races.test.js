@@ -571,3 +571,90 @@ test("runRefreshState reports Refreshed. without waiting for the history scan", 
   assert.ok(banners.some(([message]) => message === "Refreshed."), "the banner does not wait on a slow scan");
   scan.resolve();
 });
+
+// #1033: a failed quiet discovery for the current view is not an empty result.
+test("a failed quiet drive discovery is shown as a failure, and Refresh recovers it", async () => {
+  const requests = [];
+  let systemId = "system-a";
+  const state = {
+    storageViews: [{ id: "view-a", label: "View A", binding: {} }],
+    selectedStorageViewId: "view-a",
+    setupEditorGeneration: 1,
+    storageViewCandidatesRequestSeq: 0,
+    storageViewCandidatesLoading: false,
+    storageViewCandidatesSystemId: null,
+    storageViewCandidatesTargetSystemId: null,
+    storageViewCandidatesScope: null,
+    storageViewCandidatesRequestScope: null,
+    storageViewCandidates: [],
+  };
+  const box = () => ({ textContent: "", innerHTML: "", disabled: false });
+  const elements = {
+    setupStorageViewCandidatesList: box(),
+    setupStorageViewCandidatesHelp: box(),
+    setupStorageViewCandidatesAddAllButton: box(),
+  };
+  const api = loadFunctions(
+    [
+      "fetchStorageViewCandidates", "currentStorageViewCandidateScope", "storageViewCandidatesReady",
+      "resetStorageViewCandidateState", "renderStorageViewCandidates", "visibleStorageViewCandidates",
+      "storageViewCandidateOwner", "candidateBindingAlreadyAttached", "candidateBusLabel", "escapeHtml",
+    ],
+    {
+      state,
+      elements,
+      JSON,
+      Set,
+      Array,
+      currentStorageViewSystemId: () => systemId,
+      currentStorageViewTargetSystemId: () => "",
+      getSelectedStorageView: () => state.storageViews.find((view) => view.id === state.selectedStorageViewId) || null,
+      haTargetOptions: () => [],
+      scheduleStorageViewRender() {},
+      setBanner() {},
+      fetchJson(url) {
+        const request = deferred();
+        requests.push({ url, ...request });
+        return request.promise;
+      },
+    }
+  );
+  const settle = async () => {
+    for (let index = 0; index < 5; index += 1) await Promise.resolve();
+  };
+  const help = () => elements.setupStorageViewCandidatesHelp.textContent;
+
+  // The automatic render starts a quiet discovery, which fails.
+  api.renderStorageViewCandidates();
+  assert.equal(requests.length, 1);
+  const unavailable = new Error("Drive discovery is unavailable.");
+  unavailable.status = 503;
+  requests[0].reject(unavailable);
+  await settle();
+  api.renderStorageViewCandidates();
+  assert.equal(requests.length, 1, "a failed discovery does not retry by itself");
+  assert.doesNotMatch(help(), /No unassigned drives/);
+  assert.match(help(), /^Could not list the drives on system-a: Drive discovery is unavailable\. Use Refresh to try again\.$/);
+  assert.equal(elements.setupStorageViewCandidatesList.innerHTML, "");
+  assert.equal(elements.setupStorageViewCandidatesAddAllButton.disabled, true);
+
+  // Refresh (a forced discovery) clears the failure and shows the result.
+  const retry = api.fetchStorageViewCandidates({ force: true });
+  api.renderStorageViewCandidates();
+  assert.match(help(), /^Checking what system-a already shows/);
+  requests[1].resolve({ system_id: "system-a", candidates: [] });
+  await retry;
+  api.renderStorageViewCandidates();
+  assert.equal(help(), "No unassigned drives on system-a.");
+
+  // A failure that belongs to a system the operator already left changes nothing.
+  const stale = api.fetchStorageViewCandidates({ quiet: true });
+  systemId = "system-b";
+  const fresh = api.fetchStorageViewCandidates({ quiet: true });
+  requests[3].resolve({ system_id: "system-b", candidates: [] });
+  await fresh;
+  requests[2].reject(new Error("stale system-a failure"));
+  await stale;
+  api.renderStorageViewCandidates();
+  assert.equal(help(), "No unassigned drives on system-b.");
+});

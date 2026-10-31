@@ -150,6 +150,7 @@ function trustHarness({ validation, endpoint = "trust" }) {
     state,
     collectTlsTargetHost: () => "https://truenas.example.test",
     collectTlsServerName: () => "",
+    captureTlsEditorOperation: () => ({ owns: () => true, latest: () => true, serverName: "", advance: () => {} }),
     suggestedTlsBundleName: () => "synthetic-core",
     readTextFile: async () => "synthetic pem text",
     fetchJson: async () => ({
@@ -210,6 +211,236 @@ for (const endpoint of ["trust", "import"]) {
     assert.equal(harness.elements.setupVerifySsl.checked, true);
   });
 }
+
+// #737: TLS inspect and trust-remote answers belong to the editor and target
+// that asked. Synthetic hosts, paths and fingerprints only.
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+
+function tlsEditorHarness() {
+  const elements = {
+    setupSystemId: new FakeElement({ value: "synthetic-core" }),
+    setupPlatform: new FakeElement({ value: "core" }),
+    setupTruenasHost: new FakeElement({ value: SYNTHETIC_HOST }),
+    setupTlsServerName: new FakeElement({ value: "" }),
+    setupVerifySsl: new FakeElement({ checked: false }),
+    setupTlsCaBundlePath: new FakeElement({ value: "" }),
+    setupInspectTlsButton: new FakeElement(),
+    setupTrustRemoteTlsButton: new FakeElement(),
+    setupTlsInspectionResult: new FakeElement(),
+    setupTlsImportResult: new FakeElement(),
+  };
+  const state = {
+    sessionStopped: false, setupEditorGeneration: 1, setupDraftRevision: 0, loadedSystemId: "synthetic-core",
+    profileBuilderGeneration: 0, profileBuilderRevision: 0, tlsInspection: null,
+  };
+  const requests = [];
+  const banners = [];
+  const synced = [];
+  const tested = load(
+    ["collectTlsTargetHost", "collectTlsServerName", "captureAdminEditorOperation", "captureTlsEditorOperation",
+      "inspectTlsCertificate", "trustRemoteTlsCertificate"],
+    {
+      elements,
+      state,
+      JSON,
+      fetchJson: (url, options) => {
+        const pending = deferred();
+        requests.push({ ...pending, url, body: JSON.parse(options.body) });
+        return pending.promise;
+      },
+      tlsLeafValidityWarning: () => "",
+      renderTlsInspection: () => {},
+      syncTlsServerNameHelp: () => {},
+      renderTlsServerNameSuggestions: () => {},
+      syncVerifySslHelp: () => {},
+      syncApiSecretReentry: () => {},
+      suggestedTlsBundleName: () => "synthetic-core",
+      setupDraftSnapshot: () => JSON.stringify([elements.setupVerifySsl.checked, elements.setupTlsCaBundlePath.value]),
+      recordSetupDraftChange: (before) => {
+        if (before !== JSON.stringify([elements.setupVerifySsl.checked, elements.setupTlsCaBundlePath.value])) {
+          state.setupDraftRevision += 1;
+        }
+      },
+      syncTlsTrustStatus: (value) => {
+        synced.push(value);
+        return Boolean(value && value.validated);
+      },
+      buildTlsValidationSuggestion: () => "",
+      setBanner: (message, tone) => banners.push({ message, tone }),
+    }
+  );
+  return { ...tested, elements, state, requests, banners, synced };
+}
+
+const INSPECTION_A = { host: SYNTHETIC_HOST, certificate_count: 1, leaf: { sha256: "AA:SYNTHETIC" } };
+const TRUSTED_A = {
+  ok: true,
+  bundle_path: "/synthetic/tls/synthetic-core.pem",
+  inspection: INSPECTION_A,
+  validation: { validated: true, host: SYNTHETIC_HOST },
+};
+
+// Each edit mirrors what the page does: field input bumps the draft revision,
+// loading another system bumps the editor generation.
+const TLS_EDITS = {
+  "the HTTPS host changed": (h) => {
+    h.elements.setupTruenasHost.value = "https://other-nas.example.test";
+    h.state.setupDraftRevision += 1;
+    h.state.tlsInspection = null;
+  },
+  "another system was loaded": (h) => {
+    h.state.setupEditorGeneration += 1;
+    h.state.loadedSystemId = "synthetic-other";
+    h.elements.setupSystemId.value = "synthetic-other";
+  },
+  "only the certificate name changed": (h) => {
+    h.elements.setupTlsServerName.value = "other-name.example.test";
+  },
+};
+
+for (const [label, edit] of Object.entries(TLS_EDITS)) {
+  test(`a late TLS inspection is dropped after ${label}`, async () => {
+    const harness = tlsEditorHarness();
+    const pending = harness.inspectTlsCertificate();
+    assert.equal(harness.requests.length, 1);
+    edit(harness);
+    const shownBefore = harness.elements.setupTlsInspectionResult.textContent;
+    harness.requests[0].resolve({ inspection: INSPECTION_A });
+    await pending;
+
+    assert.equal(harness.state.tlsInspection, null, "an older target's certificate must not be shown");
+    assert.equal(harness.elements.setupTlsInspectionResult.textContent, shownBefore);
+    assert.deepEqual(harness.banners, []);
+  });
+
+  test(`a late trust-remote answer does not change the form after ${label}`, async () => {
+    const harness = tlsEditorHarness();
+    const pending = harness.trustRemoteTlsCertificate();
+    edit(harness);
+    const revision = harness.state.setupDraftRevision;
+    harness.requests[0].resolve(TRUSTED_A);
+    await pending;
+
+    assert.equal(harness.elements.setupTlsCaBundlePath.value, "", "an older target's bundle must not be put in this form");
+    assert.equal(harness.elements.setupVerifySsl.checked, false, "certificate checks must not be turned on for another target");
+    assert.equal(harness.state.tlsInspection, null);
+    assert.equal(harness.state.setupDraftRevision, revision);
+    assert.deepEqual(harness.synced, []);
+    assert.deepEqual(harness.banners, []);
+  });
+}
+
+test("a late TLS failure for an older target does not overwrite the current result", async () => {
+  const harness = tlsEditorHarness();
+  const pending = harness.trustRemoteTlsCertificate();
+  TLS_EDITS["the HTTPS host changed"](harness);
+  harness.requests[0].reject(new Error("synthetic handshake failure"));
+  await pending;
+
+  assert.doesNotMatch(harness.elements.setupTlsImportResult.textContent, /synthetic handshake failure/);
+  assert.deepEqual(harness.synced, []);
+  assert.deepEqual(harness.banners, []);
+});
+
+test("the newer of two TLS inspections wins whichever answer arrives last", async () => {
+  const harness = tlsEditorHarness();
+  const first = harness.inspectTlsCertificate();
+  const second = harness.inspectTlsCertificate();
+  const inspectionB = { ...INSPECTION_A, leaf: { sha256: "BB:SYNTHETIC" } };
+  harness.requests[1].resolve({ inspection: inspectionB });
+  await second;
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await first;
+
+  assert.equal(harness.state.tlsInspection, inspectionB);
+  assert.equal(harness.banners.length, 1);
+});
+
+test("a current TLS answer still applies and is sent with the target it belongs to", async () => {
+  const harness = tlsEditorHarness();
+  harness.elements.setupTlsServerName.value = "truenas.example.test";
+  const inspect = harness.inspectTlsCertificate();
+  assert.deepEqual(
+    [harness.requests[0].body.host, harness.requests[0].body.tls_server_name],
+    [SYNTHETIC_HOST, "truenas.example.test"]
+  );
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await inspect;
+  assert.equal(harness.state.tlsInspection, INSPECTION_A);
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, false);
+
+  const trust = harness.trustRemoteTlsCertificate();
+  harness.requests[1].resolve(TRUSTED_A);
+  await trust;
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, TRUSTED_A.bundle_path);
+  assert.equal(harness.elements.setupVerifySsl.checked, true);
+  assert.equal(harness.elements.setupTrustRemoteTlsButton.disabled, false);
+  assert.equal(harness.banners.at(-1).tone, "success");
+});
+
+// #737 review: some draft changes (storage-view delete, duplicate, order
+// reset) bump the revision without releasing editor controls.
+const UNRELEASED_DRAFT_CHANGE = (h) => {
+  h.state.setupDraftRevision += 1;
+};
+
+test("a dropped late TLS answer still releases its button when nothing else released it", async () => {
+  const harness = tlsEditorHarness();
+  const inspect = harness.inspectTlsCertificate();
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, true);
+  UNRELEASED_DRAFT_CHANGE(harness);
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await inspect;
+  assert.equal(harness.state.tlsInspection, null, "the stale answer is still dropped");
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, false);
+
+  const trust = harness.trustRemoteTlsCertificate();
+  UNRELEASED_DRAFT_CHANGE(harness);
+  harness.requests[1].reject(new Error("synthetic handshake failure"));
+  await trust;
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupTrustRemoteTlsButton.disabled, false);
+});
+
+test("an older TLS request never releases the button a newer request holds", async () => {
+  const harness = tlsEditorHarness();
+  const first = harness.inspectTlsCertificate();
+  const second = harness.inspectTlsCertificate();
+  harness.requests[0].resolve({ inspection: INSPECTION_A });
+  await first;
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, true, "the newer inspection still holds it");
+  harness.requests[1].resolve({ inspection: INSPECTION_A });
+  await second;
+  assert.equal(harness.elements.setupInspectTlsButton.disabled, false);
+});
+
+test("editing or leaving the form releases the TLS buttons a retired request held", () => {
+  const elements = {
+    setupInspectTlsButton: new FakeElement(),
+    setupTrustRemoteTlsButton: new FakeElement(),
+  };
+  elements.setupInspectTlsButton.disabled = true;
+  elements.setupTrustRemoteTlsButton.disabled = true;
+  const { retireAdminEditorControls } = load(["retireAdminEditorControls"], {
+    elements,
+    state: { sessionStopped: false, systems: [] },
+    currentSetupPlatform: () => "core",
+    bootstrapEnabledForSession: () => false,
+    getProfileById: () => null,
+    profileReferenceCount: () => 0,
+  });
+  retireAdminEditorControls();
+  assert.equal(elements.setupInspectTlsButton.disabled, false);
+  assert.equal(elements.setupTrustRemoteTlsButton.disabled, false);
+});
 
 function savedStatusHarness({ system, response, fields = null }) {
   const elements = {

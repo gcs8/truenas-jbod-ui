@@ -57,6 +57,7 @@ from typing import Any, BinaryIO, Protocol, runtime_checkable
 
 import paramiko
 
+from history_service.backup_archive.errors import describe_error
 from history_service.backup_archive.settings import (
     ArchiveConfigError,
     ArchiveTargetSettings,
@@ -337,7 +338,7 @@ class _TargetBase:
             try:
                 self.delete(probe)
             except Exception as exc:  # report the failed cleanup, do not mask it
-                raise ArchiveTransportError(f"Probe written but could not be deleted: {exc}") from exc
+                raise ArchiveTransportError(f"Probe written but could not be deleted: {describe_error(exc)}") from exc
             upload_check = stored.upload_check
             detail = f"{self.provider} archive destination is writable"
             if not stored.verified:
@@ -354,7 +355,7 @@ class _TargetBase:
         except Exception as exc:  # the probe reports any failure instead of raising
             ok = False
             upload_check = None
-            detail = str(exc) or exc.__class__.__name__
+            detail = describe_error(exc)
         return {
             "ok": ok,
             "detail": detail,
@@ -600,7 +601,9 @@ class FtpTarget(_TargetBase):
                 # 550 usually means "exists"; anything else, or a path that is
                 # not a directory afterwards, is a real error.
                 if not self._is_dir(current):
-                    raise ArchiveTransportError(f"FTP archive could not create directory {current!r}: {exc}") from exc
+                    raise ArchiveTransportError(
+                        f"FTP archive could not create directory {current!r}: {describe_error(exc)}"
+                    ) from exc
             self._known_dirs.add(current)
 
     def put(self, local_path: Path, name: str) -> StoredObject:
@@ -641,7 +644,7 @@ class FtpTarget(_TargetBase):
         except ftplib.error_perm as exc:
             if not relative and not self._is_dir(path):
                 return
-            raise ArchiveTransportError(f"FTP archive listing failed (MLSD required): {exc}") from exc
+            raise ArchiveTransportError(f"FTP archive listing failed (MLSD required): {describe_error(exc)}") from exc
         for entry_name, facts in sorted(entries):
             kind = (facts.get("type") or "").lower()
             if kind in {"cdir", "pdir"} or entry_name in {".", ".."}:
@@ -685,9 +688,9 @@ class FtpTarget(_TargetBase):
             try:
                 present = any(entry == leaf for entry, _facts in self._ftp.mlsd(parent, facts=["type"]))
             except ftplib.all_errors as list_error:
-                raise ArchiveTransportError(f"FTP archive delete failed: {exc}") from list_error
+                raise ArchiveTransportError(f"FTP archive delete failed: {describe_error(exc)}") from list_error
             if present:
-                raise ArchiveTransportError(f"FTP archive delete failed: {exc}") from exc
+                raise ArchiveTransportError(f"FTP archive delete failed: {describe_error(exc)}") from exc
 
 
 @contextmanager
@@ -1102,8 +1105,12 @@ def _run_mount_command(command: list[str], label: str) -> None:
     except subprocess.TimeoutExpired as exc:
         raise ArchiveTransportError(f"{label} timed out.") from exc
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[:500]
-        raise ArchiveTransportError(f"{label} failed: {detail or 'exit code ' + str(result.returncode)}")
+        # The command's own output names the server and export; it goes to the
+        # local log only, never into shared status (#737).
+        detail = " ".join((result.stderr or result.stdout or "").split())[:500]
+        if detail:
+            logger.warning("%s failed (exit code %s): %s", label, result.returncode, detail)
+        raise ArchiveTransportError(f"{label} failed with exit code {result.returncode}.")
 
 
 def _is_mounted(path: str) -> bool:

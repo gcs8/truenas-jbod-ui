@@ -19,7 +19,9 @@ from app.models.domain import ManualMapping
 from app.services.profile_registry import ENCLOSURE_SUB_VIEW_PROFILE_IDS
 from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
+    StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
+    describe_capacity_failure,
     is_unwritable_error,
 )
 
@@ -1553,6 +1555,9 @@ class MappingStore:
                 self._unlink_owned_temp_file(temp_path, temp_identity)
             if replaced:
                 raise MappingDurabilityError() from exc
+            capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
+            if capacity_reason is not None:
+                raise StorageDirectoryCapacityExhausted(self.file_path.parent, capacity_reason) from exc
             if is_unwritable_error(exc):
                 raise MappingStorageUnwritable(self.file_path.parent) from exc
             raise

@@ -207,7 +207,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -273,7 +273,7 @@ jobs:
 
       - name: Upload shard result
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: python-unittest-${{ matrix.python-version }}-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: shard-results/
@@ -305,7 +305,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -317,7 +317,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Download shard results
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: python-unittest-${{ matrix.python-version }}-shard-*
           path: shard-results
@@ -344,7 +344,7 @@ jobs:
 
       - name: Upload coverage XML artifact
         if: matrix.python-version == '3.14'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: python-coverage-xml-attempt-${{ github.run_attempt }}
           path: coverage.xml
@@ -363,7 +363,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -392,7 +392,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           cache: npm
@@ -840,6 +840,48 @@ jobs:
             --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
             --candidate-revision "$GITHUB_SHA"
 
+      - name: Refuse read-only required history state without data loss or restart storms
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario readonly-state \
+            --root "$RUNNER_TEMP/image-upgrade-readonly" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
+      - name: Refuse full required history state without data loss or restart storms
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario enospc-state \
+            --root "$RUNNER_TEMP/image-upgrade-enospc" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
+      - name: Refuse an unavailable backup target without data loss or restart storms
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario unavailable-backup-storage \
+            --root "$RUNNER_TEMP/image-upgrade-backup" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
   admin-browser-cleanroom:
     name: Admin clean-room browser QA
     needs: route
@@ -855,7 +897,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -868,7 +910,7 @@ jobs:
           python -m pip check
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           cache: npm
@@ -939,7 +981,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
 
@@ -957,7 +999,7 @@ jobs:
           python scripts/check_public_screenshots.py
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           cache: npm

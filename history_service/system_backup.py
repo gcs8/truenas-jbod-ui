@@ -985,15 +985,41 @@ class _ImportActivationTransaction:
             | getattr(os, "O_NOFOLLOW", 0),
             mode,
         )
+        created: os.stat_result | None = None
         try:
+            created = os.fstat(descriptor)
             cls._copy_file_to_descriptor(
                 source_path,
                 descriptor,
                 owner=owner,
                 mode=mode,
             )
+        except Exception as copy_error:
+            # Callers register the path only after this returns, so remove the
+            # file this open created on a handled failure; leave any object
+            # that replaced it, and leave crash artifacts to recovery.
+            if created is not None:
+                try:
+                    cls._remove_created_file(target_path, created)
+                except Exception as cleanup_error:
+                    copy_error.add_note(f"Staged restore file cleanup failed: {cleanup_error}")
+            raise
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _remove_created_file(cls, path: Path, created: os.stat_result) -> None:
+        try:
+            current = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+            created.st_dev,
+            created.st_ino,
+        ):
+            return
+        path.unlink()
+        cls._fsync_directory(path.parent)
 
     def activate_file(self, target_path: Path, member_key: str) -> None:
         self._activate_file(target_path, member_key, allow_history=False)
@@ -7254,6 +7280,7 @@ class SystemBackupService:
         try:
             import errno
             import pty
+            import termios
         except ImportError as exc:  # pragma: no cover - production images are Linux-based.
             raise ValueError("Portable encrypted 7z backup support requires a POSIX terminal.") from exc
 
@@ -7261,7 +7288,15 @@ class SystemBackupService:
         process: subprocess.Popen[bytes] | None = None
         output = bytearray()
         prompt_seen = False
+        password_sent = False
         try:
+            # A fresh, echo-enabled PTY makes the child's no-echo state a real
+            # transition, not an inherited setting. Native 7-Zip prints its
+            # prompt BEFORE tcsetattr(TCSAFLUSH); writing on prompt alone can
+            # both echo the secret and have that flush discard it. Do not change
+            # terminal flags here: only the child can establish input readiness.
+            if not termios.tcgetattr(slave_fd)[3] & termios.ECHO:
+                raise ValueError("Portable 7z password terminal readiness is unsupported.")
             process = subprocess.Popen(
                 command,
                 cwd=str(cwd) if cwd is not None else None,
@@ -7296,12 +7331,20 @@ class SystemBackupService:
                         process.kill()
                         process.wait()
                         raise ValueError("Portable 7z backup command output exceeded its byte limit.")
-                    if not prompt_seen and b"Enter password" in output:
-                        os.write(master_fd, passphrase.encode("utf-8") + b"\n")
-                        prompt_seen = True
+                    prompt_seen = prompt_seen or b"Enter password" in output
+                # Terminal changes need not produce readable output. Check on
+                # every bounded poll, using the existing operation deadline.
+                if prompt_seen and not password_sent and process.poll() is None:
+                    if not termios.tcgetattr(master_fd)[3] & termios.ECHO:
+                        password = passphrase.encode("utf-8") + b"\n"
+                        if os.write(master_fd, password) != len(password):
+                            raise ValueError("Portable 7z password delivery was incomplete.")
+                        password_sent = True
                 if process.poll() is not None and not ready:
                     break
             returncode = process.wait(timeout=max(deadline - time.monotonic(), 0.001))
+            if prompt_seen and not password_sent and returncode == 0:
+                raise ValueError("Portable 7z password terminal readiness was not established.")
             return subprocess.CompletedProcess(
                 command,
                 returncode,

@@ -448,11 +448,13 @@ LOG_SENSE_PAGE_NAMES = {
     0x3F: "All Log Pages",
 }
 
+# LOG SENSE CDB byte 2 bits 7-6 (PC). These are the command-field meanings; a
+# device may accept only a subset of them, which does not change the meaning.
 LOG_SENSE_PAGE_CONTROL_LABELS = {
-    0x00: "Current cumulative values",
-    0x01: "Current threshold values",
-    0x02: "Default cumulative values",
-    0x03: "Default threshold values",
+    0x00: "Current threshold values",
+    0x01: "Current cumulative values",
+    0x02: "Default threshold values",
+    0x03: "Default cumulative values",
 }
 
 SAS_PHY_LOG_PARAMETERS = [
@@ -699,7 +701,11 @@ def _decode_cdb_lengths(cdb_bytes: list[int]) -> dict[str, Any]:
     if not cdb_bytes:
         return {}
     opcode = cdb_bytes[0]
-    if opcode in {0x03, 0x12, 0x1A} and len(cdb_bytes) >= 5:
+    # Each command owns its allocation-length width and offset. A CDB too short
+    # to hold the whole field yields no value rather than a partial one.
+    if opcode == 0x12 and len(cdb_bytes) >= 5:
+        return {"allocation_length": _int_from_bytes(cdb_bytes[3:5])}
+    if opcode in {0x03, 0x1A} and len(cdb_bytes) >= 5:
         return {"allocation_length": cdb_bytes[4]}
     if opcode in {0x15} and len(cdb_bytes) >= 5:
         return {"parameter_list_length": cdb_bytes[4]}
@@ -707,8 +713,10 @@ def _decode_cdb_lengths(cdb_bytes: list[int]) -> dict[str, Any]:
         return {"parameter_list_length": _int_from_bytes(cdb_bytes[7:9])}
     if opcode in {0x42} and len(cdb_bytes) >= 9:
         return {"parameter_list_length": _int_from_bytes(cdb_bytes[7:9])}
-    if opcode in {0x4D, 0x5A, 0x5E, 0xA0} and len(cdb_bytes) >= 9:
+    if opcode in {0x4D, 0x5A, 0x5E} and len(cdb_bytes) >= 9:
         return {"allocation_length": _int_from_bytes(cdb_bytes[7:9])}
+    if opcode == 0xA0 and len(cdb_bytes) >= 10:
+        return {"allocation_length": _int_from_bytes(cdb_bytes[6:10])}
     if opcode in {0x84} and len(cdb_bytes) >= 14:
         return {"allocation_length": _int_from_bytes(cdb_bytes[10:14])}
     if opcode == 0xA3 and len(cdb_bytes) >= 10:

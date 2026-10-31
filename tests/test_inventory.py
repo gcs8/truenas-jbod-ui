@@ -8,7 +8,9 @@ import inspect
 import json
 import tempfile
 import threading
+import time
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -157,6 +159,55 @@ class InventoryQualifiedAdmissionTests(unittest.IsolatedAsyncioTestCase):
             ssh=SSHConfig(enabled=True, host="host.example.test", commands=[]),
         )
         return build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name, MagicMock())
+
+    def test_non_identify_state_matches_unmasked_producer_and_survives_caches(self):
+        service = self.service()
+        for expected, raw, mapping in (
+            ("unknown", {}, None),
+            ("unmapped", {}, ManualMapping(slot=0, serial="SANITIZED-MAPPED")),
+            ("empty", {"present": False, "status": "Critical"}, None),
+            ("fault", {"status": "Fault"}, None),
+            ("healthy", {"present": True, "bmc_slot_number": 0}, None),
+        ):
+            with self.subTest(expected=expected):
+                for active in (False, True, False):
+                    slot = service._build_slot_view(
+                        0, 0, 0, {"id": "shelf-a"}, {**raw, "identify_active": active},
+                        None, mapping, ParsedSSHData(), {}, set(),
+                    )
+                    self.assertEqual(slot.state.value, "identify" if active else expected)
+                    self.assertEqual(slot.non_identify_state, expected)
+                    payload = slot.model_dump(mode="json")
+                    self.assertEqual(SlotView.model_validate(payload).non_identify_state, expected)
+                    snapshot = InventorySnapshot(slots=[slot], refresh_interval_seconds=30,
+                                                 selected_enclosure_id="shelf-a")
+                    service._remember_led_snapshot("shelf-a", snapshot)
+                    self.assertEqual(service._led_slot_targets[("shelf-a", 0)].non_identify_state, expected)
+
+    def test_non_identify_state_storage_runtime_producer(self):
+        service = self.service()
+        view = StorageViewRuntimeView(id="synthetic-view", label="Synthetic view", kind="boot_devices", template_id="synthetic")
+        for occupied, health, expected in ((False, "FAULTED", "empty"),
+                                           (True, "FAULTED", "fault"),
+                                           (True, "ONLINE", "healthy")):
+            with self.subTest(occupied=occupied, health=health):
+                slot = service._build_slot_view_from_storage_view_runtime_slot(
+                    view, StorageViewRuntimeSlot(slot_index=0, slot_label="00", occupied=occupied,
+                                                 state="identify", health=health),
+                )
+                self.assertEqual(slot.non_identify_state, expected)
+
+    def test_non_identify_state_model_allowlist_and_legacy_default(self):
+        from pydantic import ValidationError
+
+        legacy = dict(slot=0, slot_label="00", row_index=0, column_index=0, state="identify")
+        self.assertIsNone(SlotView(**legacy).non_identify_state)
+        self.assertNotIn("non_identify_state", SlotView(**legacy).model_dump(mode="json"))
+        for value in ("healthy", "fault", "empty", "unknown", "unmapped"):
+            self.assertEqual(SlotView(**legacy, non_identify_state=value).non_identify_state, value)
+        for value in ("identify", "invalid", False, {}, []):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                SlotView(**legacy, non_identify_state=value)
 
     @staticmethod
     def overlay(host, enclosure_id, device, *, bay=0, sas="0x5eeeee01"):
@@ -4151,6 +4202,33 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
         self.assertEqual(view.profile_id, SCALE_SSG_FRONT_24_PROFILE_ID)
         self.assertIs(view.profile_pinned, True)
 
+    @staticmethod
+    def _bind_mock_order_producer(service: InventoryService) -> None:
+        # These tests replace the snapshot producer. Supply the same source/read
+        # association as that producer, without weakening ordering assertions or
+        # changing the separate unassociated-snapshot negative controls.
+        import weakref
+
+        original = service.get_snapshot
+        source = None  # The fixed fake provider represents one already-fetched bundle.
+
+        async def associated_snapshot(**kwargs):
+            nonlocal source
+            snapshot = await original(**kwargs)
+            inputs = service._opening_order_inputs_for(snapshot)
+            if (inputs is None or inputs[1] != service._snapshot_topology_generation
+                    or inputs[4] != service._source_bundle_generation):
+                if source is None:
+                    source = await service._get_inventory_source_bundle()
+                service._view_order_read_inputs[id(snapshot)] = (
+                    weakref.ref(snapshot), source, service._snapshot_topology_generation,
+                    service.mapping_store.load_read_snapshot(), [],
+                    service._source_bundle_generation, object(),
+                )
+            return snapshot
+
+        service.get_snapshot = AsyncMock(side_effect=associated_snapshot)
+
     def test_storage_view_runtime_ranks_all_enclosures_without_another_source_fetch(self) -> None:
         options = [
             EnclosureOption(id="enc-a", label="Enclosure A"),
@@ -4168,7 +4246,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             system = SystemConfig(id="synthetic-system", label="Synthetic system")
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            self._bind_mock_order_producer(service)
             service._canonical_default_enclosure_id = "enc-a"
 
             runtime = asyncio.run(service.get_storage_view_runtime())
@@ -4200,7 +4282,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             system = SystemConfig(id="synthetic-system", label="Synthetic system")
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            self._bind_mock_order_producer(service)
             return service
 
         with tempfile.TemporaryDirectory() as primed_dir, tempfile.TemporaryDirectory() as fresh_dir:
@@ -4239,7 +4325,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             )
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            self._bind_mock_order_producer(service)
             saved = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
             automatic = asyncio.run(
                 service.get_storage_view_runtime(selected_enclosure_id="enc-a", ignore_saved_view_order=True)
@@ -4271,7 +4361,11 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             source_bundle = self._empty_source_bundle()
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+            self._bind_mock_order_producer(service)
 
             before = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
             self.assertEqual(before.view_order[:2], ["enclosure:enc-b", "enclosure:enc-a"])
@@ -4311,14 +4405,18 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             source_bundle = self._empty_source_bundle()
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+            self._bind_mock_order_producer(service)
 
             before = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="enc-b"))
             self.assertLess(
                 before.view_order.index("enclosure:enc-b"),
                 before.view_order.index("enclosure:enc-a"),
             )
-            self.assertTrue(service._cached_effective_view_order)
+            self.assertTrue(service._view_order_cache)
 
             refreshed = self._view_order_snapshot(
                 "synthetic-system", "enc-a", "Enclosure A", 4, options,
@@ -4354,24 +4452,26 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             source_bundle = self._empty_source_bundle()
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: fresh_other,
+            )
             service._get_snapshot_result = AsyncMock(
                 return_value=inventory_module.CacheResult(fresh_other, "forced")
             )
             service._get_inventory_source_bundle = AsyncMock(return_value=source_bundle)
+            self._bind_mock_order_producer(service)
 
             runtime = asyncio.run(
                 service.get_storage_view_runtime(force_refresh=True, selected_enclosure_id="enc-a")
             )
 
         self.assertEqual(runtime.view_order[0], "enclosure:enc-a")
-        service._get_snapshot_result.assert_awaited_once_with(
-            force_refresh=True,
-            selected_enclosure_id="enc-b",
-            allow_stale_cache=False,
-            force_source_refresh=False,
+        service._get_snapshot_result.assert_not_awaited()
+        service._get_opening_order_snapshot.assert_awaited_once_with(
+            "enc-b", source_bundle=source_bundle, active_snapshot=active,
         )
 
-    def test_runtime_view_order_refuses_oversized_enclosure_enumeration(self) -> None:
+    def test_runtime_view_order_falls_back_for_oversized_enclosure_enumeration(self) -> None:
         options = [
             EnclosureOption(id=f"enc-{index}", label=f"Enclosure {index}")
             for index in range(inventory_module.SYSTEM_RETENTION_MAX_ENCLOSURES + 1)
@@ -4390,10 +4490,17 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             system = SystemConfig(id="synthetic-system", label="Synthetic system")
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
 
-            with self.assertRaises(inventory_module.SystemRetentionTooLargeError):
-                asyncio.run(service.get_storage_view_runtime(selected_enclosure_id=options[0].id))
+            runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id=options[0].id))
+            self.assertEqual(runtime.view_order, [
+                *(f"enclosure:{option.id}" for option in options), "view:primary-chassis",
+            ])
+            self.assertTrue(any("Opening-view scoring was skipped" in warning
+                                for warning in snapshots[options[0].id].warnings))
 
         self.assertEqual(service.get_snapshot.await_count, 1)
 
@@ -4414,22 +4521,29 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
 
         async def exercise(service: InventoryService) -> None:
             await service._view_order_recompute_lock.acquire()
+            task = asyncio.create_task(service.get_storage_view_runtime(selected_enclosure_id="enc-a"))
             try:
-                with self.assertRaises(inventory_module.SystemRetentionBusyError):
-                    await service.get_storage_view_runtime(selected_enclosure_id="enc-a")
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
             finally:
                 service._view_order_recompute_lock.release()
+            await asyncio.wait_for(task, 2)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(id="synthetic-system", label="Synthetic system")
             service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
             service._view_order_recompute_lock = asyncio.Lock()
             service.get_snapshot = AsyncMock(side_effect=get_snapshot)
+            service._get_opening_order_snapshot = AsyncMock(
+                side_effect=lambda enclosure_id, **kwargs: snapshots[enclosure_id],
+            )
             service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+            self._bind_mock_order_producer(service)
 
             asyncio.run(exercise(service))
 
         self.assertEqual(service.get_snapshot.await_count, 1)
+        service._get_opening_order_snapshot.assert_awaited_once()
 
     def test_filtered_storage_view_runtime_preserves_opening_order_metadata(self) -> None:
         runtime = StorageViewRuntimePayload(
@@ -4505,6 +4619,7 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             service._get_inventory_source_bundle = AsyncMock(
                 return_value=self._empty_source_bundle(raw_data=raw_data)
             )
+            self._bind_mock_order_producer(service)
 
             runtime = asyncio.run(service.get_storage_view_runtime(selected_enclosure_id="node-a"))
 
@@ -12282,6 +12397,36 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_quantastor_cli_json_trailing_comma_repair_preserves_quoted_scalars(self) -> None:
+        # Each pair is (needs repair, valid equivalent); both must parse to the same values.
+        cases = (
+            ('[{"v": "x,]"},]', '[{"v": "x,]"}]', [{"v": "x,]"}]),
+            ('{"v": "x,}",}', '{"v": "x,}"}', {"v": "x,}"}),
+            ('[{"v": "x,  ]"},]', '[{"v": "x,  ]"}]', [{"v": "x,  ]"}]),
+            ('[{"v": "a\\",]"},]', '[{"v": "a\\",]"}]', [{"v": 'a",]'}]),
+            ('{"a,}": "b\\\\", "w": [1, 2 ,\n],}', '{"a,}": "b\\\\", "w": [1, 2]}', {"a,}": "b\\", "w": [1, 2]}),
+        )
+        for repair_payload, valid_payload, expected in cases:
+            with self.subTest(payload=repair_payload):
+                self.assertEqual(InventoryService._parse_quantastor_cli_json(valid_payload), expected)
+                self.assertEqual(InventoryService._parse_quantastor_cli_json(repair_payload), expected)
+
+        for malformed in ('{"v": "x",', '[{"v": 1,}, oops]', '{"v": "x,}'):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(InventoryService._parse_quantastor_cli_json(malformed))
+
+    def test_quantastor_cli_json_repair_scans_unterminated_strings_once(self) -> None:
+        # An unterminated string of escaped quotes made a string-aware regex rescan the suffix
+        # from every quote; the repair must stay linear for malformed CLI output.
+        payload = '[{"v": "' + '\\"' * 16384 + ",]"
+
+        started = time.perf_counter()
+        parsed = InventoryService._parse_quantastor_cli_json(payload)
+        elapsed = time.perf_counter() - started
+
+        self.assertIsNone(parsed)
+        self.assertLess(elapsed, 1.0)
+
     async def test_fetch_quantastor_cli_overlay_batches_primary_host_commands(self) -> None:
         class RecordingSSHProbe(SSHProbe):
             def __init__(self) -> None:
@@ -14437,6 +14582,61 @@ Enclosure Status diagnostic page:
 
         self.assertEqual(summary.read_commands, 7)
         self.assertTrue(summary.available)
+
+    def test_smart_merge_preserves_parsed_zero_temperature_and_lifetime(self) -> None:
+        def payload(temperature: int | None, lifetime: int | None) -> str:
+            document: dict[str, object] = {
+                "serial_number": "SANITIZED-SMART-ZERO",
+                "power_on_time": {"hours": 100},
+            }
+            if temperature is not None:
+                document["temperature"] = {"current": temperature}
+            if lifetime is not None:
+                document["ata_smart_self_test_log"] = {
+                    "standard": {
+                        "table": [
+                            {
+                                "type": {"string": "Short offline"},
+                                "status": {"string": "Completed without error"},
+                                "lifetime_hours": lifetime,
+                            }
+                        ]
+                    }
+                }
+            return json.dumps(document)
+
+        # (parsed temperature, parsed lifetime, slot temperature, slot lifetime,
+        #  expected temperature, expected lifetime, expected age)
+        cases = (
+            (0, 0, 36, 60, 0, 0, 100),
+            (0, 0, None, None, 0, 0, 100),
+            (0, 0, 0, 0, 0, 0, 100),
+            (31, 40, 36, 60, 31, 40, 60),
+            (None, None, 36, 60, 36, 60, 40),
+            (None, None, None, None, None, None, None),
+        )
+        for parsed_temp, parsed_life, slot_temp, slot_life, want_temp, want_life, want_age in cases:
+            with self.subTest(parsed=(parsed_temp, parsed_life), slot=(slot_temp, slot_life)):
+                slot = SlotView(
+                    slot=0,
+                    slot_label="00",
+                    row_index=0,
+                    column_index=0,
+                    serial="SANITIZED-SMART-ZERO",
+                    temperature_c=slot_temp,
+                    last_smart_test_lifetime_hours=slot_life,
+                )
+                parsed = InventoryService._parse_smart_payload_for_slot(slot, payload(parsed_temp, parsed_life))
+                self.assertEqual((parsed.temperature_c, parsed.last_test_lifetime_hours), (parsed_temp, parsed_life))
+
+                summary = InventoryService._merge_smart_summary(slot, parsed)
+
+                self.assertEqual(
+                    (summary.temperature_c, summary.last_test_lifetime_hours, summary.last_test_age_hours),
+                    (want_temp, want_life, want_age),
+                )
+                self.assertEqual(summary.power_on_hours, 100)
+                self.assertEqual((slot.temperature_c, slot.last_smart_test_lifetime_hours), (slot_temp, slot_life))
 
     def test_smart_summary_value_field_contract_tracks_the_model(self) -> None:
         self.assertEqual(
@@ -19240,7 +19440,129 @@ Consumers:
         self.assertEqual(inventory_module._bay_peer_devices({"device_names": ["da0", "da1"]}, None, {}), [])
 
 
+def partial_locate_fixture(test_case, *, same_host=False, reverse=False, failure="action", observed=True):
+    """Real LED aggregation/session sequencing, with synthetic command transport only."""
+    directory = tempfile.TemporaryDirectory()
+    test_case.addCleanup(directory.cleanup)
+    targets = [
+        {"ses_device": device, "ses_element_id": 0, "ses_slot_number": 0,
+         "enclosure_id": "synthetic-shelf-a", "ssh_host": host}
+        for device, host in (
+            ("/dev/sg27", "node-a.example.test"),
+            ("/dev/sg9", "node-a.example.test" if same_host else "node-b.example.test"),
+        )
+    ]
+    slot = SlotView(
+        slot=0, slot_label="00", row_index=0, column_index=0, enclosure_id="shelf-a",
+        led_supported=True, led_backend="quantastor_sg_ses",
+        ssh_ses_targets=list(reversed(targets)) if reverse else targets,
+    )
+    system = SystemConfig(
+        id="synthetic-led-test", truenas=TrueNASConfig(platform="quantastor"),
+        ssh=SSHConfig(enabled=True, host="node-a.example.test"),
+    )
+    service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), directory.name)
+    service._cache["shelf-a"] = InventorySnapshot(
+        slots=[slot], selected_system_id=system.id, selected_enclosure_id="shelf-a",
+        refresh_interval_seconds=30,
+    )
+    sent = []
+
+    def run(host, command):
+        sent.append((host, command))
+        bad_path = command.endswith("/dev/sg9")
+        preflight = " -p aes " in command
+        readback = " -p ec " in command
+        failed_action = failure == "all_actions" or bad_path and failure == "action"
+        failed = (bad_path and failure == "preflight" and preflight) or (failed_action and not preflight and not readback)
+        if failed:
+            return SSHCommandResult(command=command, ok=False, stderr="synthetic failure " * 200, exit_code=1)
+        shelf = "synthetic-shelf-b" if bad_path and failure == "moved" else "synthetic-shelf-a"
+        stdout = sg_aes_header(shelf) if preflight else ""
+        if readback and observed is not None:
+            stdout = sg_aes_header("synthetic-shelf-b" if observed == "moved" else shelf)
+            stdout += InventoryServiceLedTests.SG_EC_ON.replace("Ident=1", f"Ident={int(observed is True)}")
+        return SSHCommandResult(command=command, ok=True, stdout=stdout, exit_code=0)
+
+    probes = {}
+    for host in {target["ssh_host"] for target in targets}:
+        session = Mock()
+        session.run_command_owned = AsyncMock(side_effect=lambda command, host=host: run(host, command))
+        session.close_owned = AsyncMock()
+        probe = Mock(spec=SSHProbe)
+        probe.open_session.return_value = session
+        probes[host] = probe
+    service._ssh_probe_for_host = lambda host: probes[host]
+    service._ssh_destination_authority_approved = lambda host=None: True
+    service.schedule_led_snapshot_refresh = Mock()
+    service.invalidate_physical_enclosure_snapshot_cache = Mock()
+    return service, sent
+
+
 class InventoryServiceLedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dual_path_locate_returns_partial_only_with_matching_readback(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            requested = action == LedAction.identify
+            for same_host, failure in ((True, "action"), (False, "action"), (False, "preflight")):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, failure=failure, reverse=reverse):
+                        service, sent = partial_locate_fixture(
+                            self, same_host=same_host, reverse=reverse, failure=failure, observed=requested,
+                        )
+                        result = await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                        self.assertTrue(result["partial"])
+                        self.assertFalse(result["confirmed"])
+                        self.assertIs(result["identify_active"], True if requested else None)
+                        self.assertEqual(len(result["paths"]), 2)
+                        states = {path["ses_device"]: path["identify_active"] for path in result["paths"]}
+                        self.assertEqual(states, {"/dev/sg27": requested, "/dev/sg9": None})
+                        self.assertEqual(len(result["failures"]), 1)
+                        self.assertLessEqual(len(result["failures"][0]), 240)
+                        self.assertIn("synthetic failure", result["failures"][0])
+                        if failure == "preflight":
+                            self.assertFalse(any("--dev-slot-num" in command for _, command in sent if command.endswith("/dev/sg9")))
+                        service.schedule_led_snapshot_refresh.assert_not_called()
+                        service.invalidate_physical_enclosure_snapshot_cache.assert_not_called()
+
+    async def test_dual_path_failed_action_without_matching_readback_still_raises(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            for observed in (None, action != LedAction.identify, "moved"):
+                with self.subTest(action=action, observed=observed):
+                    service, _sent = partial_locate_fixture(self, observed=observed)
+                    with self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+
+    async def test_dual_path_total_failure_still_raises_in_both_orders(self) -> None:
+        for reverse in (False, True):
+            for action in (LedAction.identify, LedAction.clear):
+                for failure in ("preflight", "all_actions"):
+                    service, sent = partial_locate_fixture(self, same_host=True, reverse=reverse, failure=failure)
+                    with self.subTest(reverse=reverse, action=action, failure=failure), self.assertRaises(TrueNASAPIError):
+                        await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                    if failure == "preflight":
+                        self.assertFalse(any("--dev-slot-num" in command for _, command in sent))
+
+    async def test_dual_path_complete_readback_can_confirm_off(self) -> None:
+        for same_host in (True, False):
+            service, _sent = partial_locate_fixture(self, same_host=same_host, failure="none", observed=False)
+            result = await service.set_slot_led(0, LedAction.clear, "shelf-a", invalidate_snapshot=False)
+            self.assertIs(result["identify_active"], False)
+            self.assertTrue(result["confirmed"])
+            self.assertNotIn("partial", result)
+            self.assertEqual([path["identify_active"] for path in result["paths"]], [False, False])
+
+    async def test_dual_path_moved_target_keeps_exceptional_refresh_in_both_orders(self) -> None:
+        for action in (LedAction.identify, LedAction.clear):
+            for same_host in (True, False):
+                for reverse in (False, True):
+                    with self.subTest(action=action, same_host=same_host, reverse=reverse):
+                        service, sent = partial_locate_fixture(self, same_host=same_host, reverse=reverse, failure="moved")
+                        with self.assertRaises(inventory_module.LedTargetMovedError):
+                            await service.set_slot_led(0, action, "shelf-a", invalidate_snapshot=False)
+                        self.assertFalse(any("--dev-slot-num" in command for _, command in sent if command.endswith("/dev/sg9")))
+                        self.assertNotIn(("shelf-a", 0), service._led_slot_targets)
+                        service.schedule_led_snapshot_refresh.assert_called_once_with(enclosure_id="shelf-a")
+
     CORE_MAP_ON = """
 ses0:
   Enclosure Name: ExampleCo DualPathShelf
@@ -24147,6 +24469,184 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_slot[0].device_name, "da10")
         self.assertEqual(by_slot[30].device_name, "da40")
 
+    async def test_core_ssh_same_model_shelves_keep_separate_options_bays_and_targets(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        ids = ("500cccc00000010", "500cccc00000020")
+        outputs = {"sesutil map": fx.sesutil_map(
+            ("ses0", "ExampleCo Shelf 0100", ids[0], 24, {0: "da0"}),
+            ("ses1", "ExampleCo Shelf 0100", ids[1], 24, {0: "da24"}),
+        )}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_ssh_only_service(temp_dir, outputs)
+            first = await service.get_snapshot(force_refresh=True)
+            second = await service.get_snapshot(selected_enclosure_id=ids[1])
+
+        self.assertEqual([option.id for option in first.enclosures], list(ids))
+        self.assertEqual([option.slot_count for option in first.enclosures], [24, 24])
+        for snapshot, enclosure_id, disk, device in (
+            (first, ids[0], "da0", "/dev/ses0"),
+            (second, ids[1], "da24", "/dev/ses1"),
+        ):
+            with self.subTest(enclosure_id=enclosure_id):
+                self.assertEqual(snapshot.selected_enclosure_id, enclosure_id)
+                self.assertEqual(len(snapshot.slots), 24)
+                self.assertNotEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+                self.assertEqual({slot.device_name for slot in snapshot.slots if slot.device_name}, {disk})
+                for slot in snapshot.slots:
+                    self.assertEqual(slot.enclosure_id, enclosure_id)
+                    self.assertEqual(slot.ssh_ses_device, device)
+                    self.assertEqual(
+                        {(target["ses_device"], target["enclosure_id"]) for target in slot.ssh_ses_targets},
+                        {(device, enclosure_id)},
+                    )
+
+    async def test_core_explicit_combined_selection_keeps_geometry_and_local_targets(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        ids = ("500cccc00000010", "500cccc00000020", "500cccc00000030")
+        for counts in ((24, 24), (24, 12)):
+            # Keep the parser's established label/shelf order, independent of
+            # source enumeration order. A generic 12-bay label sorts first.
+            part_order = (0, 1) if counts[0] == counts[1] else (1, 0)
+            combined_id = "+".join(ids[index] for index in part_order)
+            parts = (
+                ("ses0", "ExampleCo Shelf 0100", ids[0], counts[0], {0: "da0"}),
+                ("ses1", "ExampleCo Shelf 0100", ids[1], counts[1], {0: "da24"}),
+                ("ses2", "ExampleCo Shelf 0100", ids[2], 8, {0: "da48"}),
+            )
+            for ordered in itertools.permutations(parts):
+                with self.subTest(counts=counts, order=[part[0] for part in ordered]):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        service = self._core_ssh_only_service(temp_dir, {"sesutil map": fx.sesutil_map(*ordered)})
+                        snapshot = await service.get_snapshot(selected_enclosure_id=combined_id, force_refresh=True)
+                        default = await service.get_snapshot()
+                        separate = await service.get_snapshot(selected_enclosure_id=ids[1])
+                    option = next(option for option in snapshot.enclosures if option.id == combined_id)
+                    self.assertEqual(option.slot_count, sum(counts))
+                    self.assertEqual(snapshot.selected_enclosure_id, combined_id)
+                    self.assertEqual(len(snapshot.slots), sum(counts))
+                    self.assertNotEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+                    self.assertEqual(snapshot.selected_profile.slot_count, sum(counts))
+                    self.assertEqual(
+                        sorted(value for row in snapshot.layout_rows for value in row if value is not None),
+                        list(range(sum(counts))),
+                    )
+                    self.assertEqual(default.selected_enclosure_id, ids[0])
+                    self.assertEqual({option.id for option in default.enclosures}, set(ids))
+                    self.assertEqual(len(default.slots), counts[0])
+                    self.assertEqual(len(separate.slots), counts[1])
+                    self.assertEqual({slot.device_name for slot in snapshot.slots if slot.device_name}, {"da0", "da24"})
+                    for slot in snapshot.slots:
+                        first_count = counts[part_order[0]]
+                        part_index = part_order[0] if slot.slot < first_count else part_order[1]
+                        local_slot = slot.slot if slot.slot < first_count else slot.slot - first_count
+                        # View/mapping scope stays combined; only LED
+                        # coordinates name each underlying physical shelf.
+                        self.assertEqual(slot.enclosure_id, combined_id)
+                        self.assertEqual(slot.ssh_ses_device, f"/dev/ses{part_index}")
+                        self.assertEqual({target["ses_slot_number"] for target in slot.ssh_ses_targets}, {local_slot})
+                        self.assertEqual(
+                            {(target["ses_device"], target["enclosure_id"]) for target in slot.ssh_ses_targets},
+                            {(f"/dev/ses{part_index}", ids[part_index])},
+                        )
+
+    async def test_core_verified_same_shelf_stack_keeps_layout_across_source_orders(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        parts = (
+            ("ses2", "LSI-F SAS3x48Front 0c04", fx.HALF_FRONT_ID, 30, {0: "da10"}),
+            ("ses3", "LSI-R SAS3x48Rear 0c04", fx.HALF_REAR_ID, 30, {0: "da40"}),
+            ("ses1", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {}),
+        )
+        combined_id = f"{fx.HALF_FRONT_ID}+{fx.HALF_REAR_ID}"
+        for ordered in itertools.permutations(parts):
+            with self.subTest(order=[part[0] for part in ordered]):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    service = self._core_ssh_only_service(temp_dir, {"sesutil map": fx.sesutil_map(*ordered)})
+                    snapshot = await service.get_snapshot()
+                    explicit = await service.get_snapshot(selected_enclosure_id=combined_id, force_refresh=True)
+                for view in (snapshot, explicit):
+                    self.assertEqual(view.selected_enclosure_id, combined_id)
+                    self.assertEqual(len(view.slots), 60)
+                    self.assertEqual(view.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+                    self.assertEqual(view.layout_rows, view.selected_profile.slot_layout)
+                    for slot in view.slots:
+                        rear = slot.slot >= 30
+                        self.assertEqual(
+                            {(target["ses_device"], target["enclosure_id"], target["ses_slot_number"])
+                             for target in slot.ssh_ses_targets},
+                            {("/dev/ses3" if rear else "/dev/ses2",
+                              fx.HALF_REAR_ID if rear else fx.HALF_FRONT_ID, slot.slot % 30)},
+                        )
+
+    async def test_core_old_explicit_combined_profiled_parts_survive_cache_invalidation(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        combined_id = f"{fx.FRONT_24_ID}+{fx.REAR_12_ID}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_ssh_only_service(temp_dir, {"sesutil map": fx.SSG_SESUTIL_MAP})
+            for invalidate in (False, True):
+                if invalidate:
+                    service.invalidate_snapshot_cache(reason="synthetic-topology-refresh", invalidate_source_bundle=True)
+                snapshot = await service.get_snapshot(selected_enclosure_id=combined_id)
+                cached = await service.get_snapshot(selected_enclosure_id=combined_id)
+                self.assertEqual(snapshot.selected_enclosure_id, combined_id)
+                self.assertEqual(len(snapshot.slots), 36)
+                self.assertEqual(cached.layout_rows, snapshot.layout_rows)
+                self.assertNotEqual(snapshot.selected_profile.id, CORE_CSE_946_PROFILE_ID)
+                for enclosure_id, profile_id, count in (
+                    (fx.FRONT_24_ID, SCALE_SSG_FRONT_24_PROFILE_ID, 24),
+                    (fx.REAR_12_ID, "supermicro-ssg-6048r-rear-12", 12),
+                ):
+                    individual = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+                    self.assertEqual(individual.selected_profile.id, profile_id)
+                    self.assertEqual(len(individual.slots), count)
+            # A retired component must revoke the formerly valid opt-in view.
+            service._get_inventory_source_bundle.return_value.ssh_outputs = {
+                "sesutil map": fx.sesutil_map(("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {})),
+            }
+            service.invalidate_snapshot_cache(reason="synthetic-shelf-retired", invalidate_source_bundle=True)
+            with self.assertRaises(inventory_module.UnknownEnclosureError):
+                await service.get_snapshot(selected_enclosure_id=combined_id)
+
+    async def test_core_explicit_combined_selection_rejects_invalid_components(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        ids = (fx.FRONT_24_ID, fx.REAR_12_ID)
+        invalid_ids = (
+            f"{ids[0]}+unknown", f"unknown+{ids[1]}", f"{ids[0]}+{ids[0]}",
+            f"{ids[0]}++{ids[1]}", f"+{ids[0]}+{ids[1]}", f"{ids[0]}+{ids[1]}+",
+            f"{ids[0]}+ {ids[1]}", f"{ids[0]}+{fx.AHCI_4_ID}",
+            f"{ids[0]}::{SCALE_SSG_FRONT_24_PROFILE_ID}+{ids[1]}",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_ssh_only_service(temp_dir, {"sesutil map": fx.SSG_SESUTIL_MAP})
+            await service.get_snapshot()
+            before = set(service._snapshot_state_keys())
+            for selected in invalid_ids:
+                with self.subTest(selected=selected):
+                    with self.assertRaises(inventory_module.UnknownEnclosureError):
+                        await service.get_snapshot(selected_enclosure_id=selected)
+            self.assertEqual(set(service._snapshot_state_keys()), before)
+
+    def test_core_explicit_combined_option_uses_part_aware_builder(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        ids = ("500cccc00000010", "500cccc00000020")
+        combined_id = "+".join(ids)
+        outputs = {"sesutil map": fx.sesutil_map(
+            ("ses0", "ExampleCo Shelf 0100", ids[0], 24, {}),
+            ("ses1", "ExampleCo Shelf 0100", ids[1], 24, {}),
+        )}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._core_ssh_only_service(temp_dir, outputs)
+            parsed = parse_ssh_outputs(outputs, 60, None, combined_id)
+            options = service._build_enclosure_options(self._core_api_raw_data(0), parsed, parsed.ses_selected_meta)
+        option = next(option for option in options if option.id == combined_id)
+        self.assertEqual(option.slot_count, 48)
+        self.assertIsNone(service.profile_registry.select_profile_id(service.system, option))
+
     def test_a_combined_option_reports_its_real_bay_count(self) -> None:
         """A combined shelf of other than 60 bays is never drawn as the CSE-946."""
         service = self._bare_service()
@@ -24166,13 +24666,14 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
         ssh_data = ParsedSSHData(
             ses_enclosures=[half("5000dddd", "Synthetic Front", 22), half("5000eeee", "Synthetic Rear", 22)]
         )
-        options = service._build_enclosure_options(
-            TrueNASRawData(enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[]),
+        # Explicitly selected stacks keep their real geometry. Automatic
+        # selection no longer infers a physical stack from front/rear labels.
+        combined = service._core_ssh_primary_option(
             ssh_data,
-            {"id": None, "label": None, "name": None},
+            "5000dddd+5000eeee",
+            {"5000dddd", "5000eeee"},
+            {"id": "5000dddd+5000eeee", "label": "Synthetic Front + Synthetic Rear"},
         )
-
-        combined = next(option for option in options if option.id == "5000dddd+5000eeee")
         self.assertEqual(combined.slot_count, 44)
         self.assertIsNone(service.profile_registry.select_profile_id(service.system, combined))
 
@@ -24197,6 +24698,303 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(slot.vdev_class, "data")
                 # A device node is not a stable identity; it is not shown as one.
                 self.assertNotEqual(slot.gptid, f"/dev/{slot.device_name}p2")
+
+    @staticmethod
+    def _core_ssh_only_gptid_multipath_outputs(ses_consumer: str = "da0") -> dict[str, str]:
+        from tests import core_ses_fixtures as fx
+
+        # Invented CORE evidence: SES names a consumer, but only the geom's
+        # partition has a GPT label. Even -LP retains that GPTID path.
+        geoms = []
+        for name, active, passive in (("disk73", "da0", "da1"), ("disk74", "da2", "da3")):
+            geoms.append(
+                f"Geom name: {name}\n"
+                "Type: AUTOMATIC\nMode: Active/Passive\nState: OPTIMAL\n"
+                f"Providers:\n1. Name: multipath/{name}\n   State: OPTIMAL\n"
+                f"Consumers:\n1. Name: {active}\n   State: ACTIVE\n"
+                f"2. Name: {passive}\n   State: PASSIVE\n"
+            )
+        return {
+            "sesutil map": fx.sesutil_map(
+                ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {0: ses_consumer, 1: "da9"}),
+            ),
+            "gmultipath list": "\n".join(geoms),
+            "glabel status": (
+                "Name  Status  Components\n"
+                "gptid/aaaa0073-0000-4000-8000-000000000073  N/A  multipath/disk73p2\n"
+                "gptid/aaaa0074-0000-4000-8000-000000000074  N/A  multipath/disk74p2\n"
+            ),
+            "zpool status -gP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  33330000000000000001     ONLINE       0     0     0\n"
+                "\t    33330000000000000073   ONLINE       0     0     0\n"
+                "\t    33330000000000000074   ONLINE       0     0     0\n\n"
+                "errors: No known data errors\n"
+            ),
+            "zpool status -LP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  mirror-0                 ONLINE       0     0     0\n"
+                "\t    /dev/gptid/aaaa0073-0000-4000-8000-000000000073  ONLINE  0  0  0\n"
+                "\t    /dev/gptid/aaaa0074-0000-4000-8000-000000000074  ONLINE  0  0  0\n\n"
+                "errors: No known data errors\n"
+            ),
+        }
+
+    async def test_core_ssh_only_consumer_joins_pool_vdev_through_geom_gptid(self) -> None:
+        for consumer in ("da0", "da1"):
+            with self.subTest(consumer=consumer), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs(consumer)
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                gptid = "gptid/aaaa0073-0000-4000-8000-000000000073"
+                self.assertEqual(parsed.glabel.device_to_gptid["multipath/disk73"], gptid)
+                self.assertNotIn(consumer, parsed.glabel.device_to_gptid)
+                self.assertNotIn(consumer, parsed.zpool_members)
+                self.assertNotIn(gptid, parsed.zpool_members)
+                self.assertNotIn(consumer, parsed.zpool_device_members)
+                self.assertEqual(parsed.zpool_device_members[gptid].vdev_name, "mirror-0")
+
+                service = self._core_ssh_only_service(temp_dir, outputs)
+                snapshot = await service.get_snapshot(force_refresh=True)
+                self.assertFalse(snapshot.sources["api"].ok)
+                self.assertTrue(snapshot.sources["ssh"].ok)
+                self.assertEqual(snapshot.summary.source_disk_count, 0)
+                by_device = {slot.device_name: slot for slot in snapshot.slots if slot.device_name}
+                self.assertEqual(set(by_device), {consumer, "da9"})
+                self.assertIsNone(by_device["da9"].pool_name)
+                self.assertIsNone(by_device["da9"].vdev_name)
+                self.assertIsNone(by_device["da9"].vdev_class)
+                slot = by_device[consumer]
+                self.assertEqual(slot.mapping_source, "device-name")
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_name, slot.vdev_class),
+                    ("synthpool", "mirror-0", "data"),
+                )
+
+    async def test_core_ssh_only_ambiguous_geom_consumer_keeps_pool_unknown(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs()
+                first, second = outputs["gmultipath list"].split("\nGeom name: disk74", 1)
+                second = "Geom name: disk74" + second + "3. Name: da0\n   State: PASSIVE\n"
+                outputs["gmultipath list"] = "\n".join((second, first) if reverse else (first, second))
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                self.assertEqual(
+                    {info.name for info in parsed.multipath_info.values()
+                     if any(consumer.device_name == "da0" for consumer in info.consumers)},
+                    {"disk73", "disk74"},
+                )
+                service = self._core_ssh_only_service(temp_dir, outputs)
+                snapshot = await service.get_snapshot(force_refresh=True)
+                self.assertFalse(snapshot.sources["api"].ok)
+                self.assertEqual(snapshot.summary.source_disk_count, 0)
+                by_device = {slot.device_name: slot for slot in snapshot.slots if slot.device_name}
+                self.assertEqual(set(by_device), {"da0", "da9"})
+                for slot in by_device.values():
+                    self.assertIsNone(slot.pool_name)
+                    self.assertIsNone(slot.vdev_name)
+                    self.assertIsNone(slot.vdev_class)
+                    self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_unclaimed_consumer_cannot_borrow_a_camcontrol_peer_pool(self) -> None:
+        outputs = self._core_ssh_only_gptid_multipath_outputs("da73")
+        outputs["camcontrol devlist"] = (
+            "<SYNTHETIC DISK 1.0> at scbus0 target 0 lun 0 (da73,da0)\n"
+        )
+        parsed = parse_ssh_outputs(outputs, 24, None)
+        self.assertIn("da0", parsed.camcontrol_peer_devices["da73"])
+        self.assertNotIn("da73", InventoryService._index_multipath_consumers(parsed))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+        placed = [slot for slot in snapshot.slots if slot.device_name]
+        self.assertEqual({slot.device_name for slot in placed}, {"da73", "da9"})
+        for slot in placed:
+            self.assertIsNone(slot.pool_name)
+            self.assertIsNone(slot.vdev_name)
+            self.assertIsNone(slot.vdev_class)
+            self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_conflicting_provider_and_gptid_pools_stay_unknown(self) -> None:
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._core_ssh_only_gptid_multipath_outputs()
+                provider_pool = (
+                    "  pool: otherpool\n state: ONLINE\nconfig:\n\n"
+                    "\tNAME                       STATE     READ WRITE CKSUM\n"
+                    "\totherpool                  ONLINE       0     0     0\n"
+                    "\t  mirror-1                 ONLINE       0     0     0\n"
+                    "\t    /dev/multipath/disk73p2 ONLINE       0     0     0\n\n"
+                    "errors: No known data errors\n"
+                )
+                parts = (provider_pool, outputs["zpool status -LP"])
+                outputs["zpool status -LP"] = "\n".join(parts if reverse else reversed(parts))
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                self.assertEqual(parsed.zpool_device_members["multipath/disk73"].pool_name, "otherpool")
+                gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                self.assertEqual(parsed.zpool_device_members[gptid].pool_name, "synthpool")
+                snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+                for slot in snapshot.slots:
+                    self.assertIsNone(slot.pool_name)
+                    self.assertIsNone(slot.vdev_name)
+                    self.assertIsNone(slot.vdev_class)
+                    self.assertIsNone(slot.gptid)
+
+    async def test_core_ssh_only_direct_device_pool_precedes_geom_inference(self) -> None:
+        outputs = self._core_ssh_only_gptid_multipath_outputs()
+        outputs["zpool status -LP"] += (
+            "\n  pool: directpool\n state: ONLINE\nconfig:\n\n"
+            "\tNAME                       STATE     READ WRITE CKSUM\n"
+            "\tdirectpool                 ONLINE       0     0     0\n"
+            "\t  mirror-9                 ONLINE       0     0     0\n"
+            "\t    /dev/da0p2             ONLINE       0     0     0\n\n"
+            "errors: No known data errors\n"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+        slot = next(slot for slot in snapshot.slots if slot.device_name == "da0")
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), ("directpool", "mirror-9", "data"))
+        self.assertIsNone(slot.gptid)
+
+    def test_core_no_record_geom_pool_inference_is_core_only_and_never_walks_peers(self) -> None:
+        for platform in ("scale", "linux", "quantastor", "esxi"):
+            with self.subTest(platform=platform):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                service = self._bare_service(platform)
+                self.assertIsNone(service._lookup_zpool_member(None, "da0", None, parsed, {}))
+        service = self._bare_service("core")
+        parsed.camcontrol_peer_devices = {"da73": ["da0"]}
+        self.assertIsNone(service._lookup_zpool_member(None, "da73", None, parsed, {}))
+        # Even an ambiguous direct claim cannot be recovered through a unique peer.
+        parsed.multipath_info["multipath/disk74"].consumers.append(
+            copy.deepcopy(parsed.multipath_info["multipath/disk73"].consumers[0])
+        )
+        parsed.camcontrol_peer_devices = {"da0": ["da1"]}
+        self.assertIsNone(InventoryService._index_multipath_consumers(parsed)["da0"])
+        self.assertIsNone(service._lookup_zpool_member(None, "da0", None, parsed, {}))
+
+    def test_core_no_record_geom_pool_inference_normalizes_and_discards_raw_identity(self) -> None:
+        parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+        service = self._bare_service("core")
+        gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+        original = parsed.zpool_device_members[gptid]
+        provider_member = copy.deepcopy(original)
+        provider_member.raw_name = "multipath/disk73p2"
+        provider_member.raw_path = "/dev/multipath/disk73p2"
+        parsed.zpool_members["multipath/disk73"] = provider_member
+        member = service._lookup_zpool_member(None, "/dev/da1p2", None, parsed, {})
+        self.assertIsNotNone(member)
+        self.assertEqual((member.pool_name, member.vdev_name, member.vdev_class), ("synthpool", "mirror-0", "data"))
+        self.assertEqual((member.raw_name, member.raw_path), ("", None))
+        self.assertEqual(original.raw_path, f"/dev/{gptid}")
+        self.assertEqual(provider_member.raw_path, "/dev/multipath/disk73p2")
+
+    def test_core_no_record_geom_pool_inference_refuses_conflicting_membership_authorities(self) -> None:
+        # Contradictory aliases across normalized maps need a narrow unit control.
+        for source in ("zpool_members", "api", "zpool_device_members"):
+            for field, value in (
+                ("pool_name", "otherpool"), ("vdev_name", "mirror-9"),
+                ("vdev_class", "special"), ("health", "FAULTED"),
+                ("topology_label", "otherpool > mirror-9"),
+            ):
+                with self.subTest(source=source, field=field):
+                    parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                    gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                    conflicting = copy.deepcopy(parsed.zpool_device_members[gptid])
+                    setattr(conflicting, field, value)
+                    api = {}
+                    target = api if source == "api" else getattr(parsed, source)
+                    target["multipath/disk73"] = conflicting
+                    self.assertIsNone(self._bare_service("core")._lookup_zpool_member(None, "da0", None, parsed, api))
+
+    def test_core_no_record_geom_pool_inference_preserves_direct_api_and_record_boundaries(self) -> None:
+        service = self._bare_service("core")
+        for source in ("zpool_members", "api", "zpool_device_members"):
+            with self.subTest(source=source):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                gptid = parsed.glabel.device_to_gptid["multipath/disk73"]
+                direct = copy.deepcopy(parsed.zpool_device_members[gptid])
+                direct.pool_name = "directpool"
+                api = {}
+                target = api if source == "api" else getattr(parsed, source)
+                target["da0"] = direct
+                member = service._lookup_zpool_member(None, "da0", None, parsed, api)
+                self.assertEqual(member.pool_name, "directpool")
+                if source != "zpool_device_members":
+                    self.assertIs(member, direct)
+        parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+        record = service._build_disk_records(
+            [{"name": "da0", "devname": "da0", "serial": "SANITIZED-POOL-BOUNDARY"}],
+            ParsedSSHData(), {}, {},
+        )[0]
+        self.assertIsNone(service._lookup_zpool_member(record, "da0", None, parsed, {}))
+
+    async def test_core_record_bay_peer_cannot_enable_geom_pool_inference(self) -> None:
+        from tests import core_ses_fixtures as fx
+
+        service = self._bare_service("core")
+        disk = service._build_disk_records([{"name": "da9"}], ParsedSSHData(), {}, {})[0]
+        self.assertEqual((disk.device_name, disk.smart_devices, disk.lookup_keys), ("da9", ["da9"], {"da9"}))
+        self.assertIsNone(disk.pool_name)
+        raw = {"device_names": ["da9", "da0"], "status": "OK"}
+        peers = inventory_module._bay_peer_devices(raw, disk, {"da9": disk})
+        self.assertEqual(peers, ["da0"])
+        for source in (None, "zpool_members", "api", "zpool_device_members"):
+            with self.subTest(source=source):
+                parsed = parse_ssh_outputs(self._core_ssh_only_gptid_multipath_outputs(), 24, None)
+                self.assertIsNone(service._lookup_zpool_member(disk, "da9", None, parsed, {}))
+                inferred = service._lookup_zpool_member(None, "da0", None, parsed, {})
+                self.assertEqual((inferred.pool_name, inferred.vdev_name, inferred.vdev_class),
+                                 ("synthpool", "mirror-0", "data"))
+                api = {}
+                if source:
+                    direct = copy.deepcopy(inferred)
+                    direct.pool_name = "directpool"
+                    target = api if source == "api" else getattr(parsed, source)
+                    target["da0"] = direct
+                kwargs = dict(
+                    slot=0, row_index=0, column_index=0, enclosure_meta={"id": fx.FRONT_24_ID},
+                    raw_slot_status=raw, disk=disk, mapping=None, ssh_data=parsed,
+                    api_topology_members=api, api_enclosure_ids=set(),
+                )
+                baseline = service._build_slot_view(**kwargs)
+                slot = service._build_slot_view(**kwargs, bay_peer_devices=peers)
+                self.assertEqual(
+                    (slot.device_name, slot.smart_device_names, slot.serial, slot.gptid,
+                     slot.persistent_id_label, slot.multipath),
+                    (baseline.device_name, baseline.smart_device_names, baseline.serial, baseline.gptid,
+                     baseline.persistent_id_label, baseline.multipath),
+                )
+                self.assertEqual(
+                    (slot.pool_name, slot.vdev_name, slot.vdev_class),
+                    ("directpool", "mirror-0", "data") if source else (None, None, None),
+                )
+                if source is None:
+                    self.assertEqual(slot.model_dump(), baseline.model_dump())
+
+        # Also exercise the real peer selection and slot builder through a snapshot.
+        outputs = self._core_ssh_only_gptid_multipath_outputs()
+        outputs["sesutil map"] = fx.sesutil_map(
+            ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {0: "da9,da0"}),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_data = TrueNASRawData(
+                enclosures=[], disks=[{"name": "da9"}], pools=[],
+                disk_temperatures={}, smart_test_results=[],
+            )
+            service = self._core_service(temp_dir, raw_data)
+            bundle = service._get_inventory_source_bundle.return_value
+            bundle.ssh_outputs = outputs
+            bundle.ssh_collected = True
+            snapshot = await service.get_snapshot(force_refresh=True)
+        self.assertEqual(snapshot.summary.source_disk_count, 1)
+        slot = next(slot for slot in snapshot.slots if slot.device_name == "da9")
+        self.assertEqual(set(slot.raw_status["device_names"]), {"da9", "da0"})
+        self.assertEqual((slot.device_name, slot.smart_device_names), ("da9", ["da9"]))
+        self.assertEqual((slot.serial, slot.gptid, slot.persistent_id_label, slot.multipath), (None, None, None, None))
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), (None, None, None))
 
     async def test_core_page_with_the_old_combined_id_in_view_order_still_renders(self) -> None:
         from tests import core_ses_fixtures as fx
@@ -24799,3 +25597,69 @@ class StorageViewPoolHealthTests(unittest.IsolatedAsyncioTestCase):
             disk_temperatures={}, smart_test_results=[],
         )
         self.assertEqual(quantastor._pool_state_warnings(quantastor_pools, ParsedSSHData()), [])
+
+
+class SupermicroBMCDiscoveryBoundTests(unittest.TestCase):
+    """#737: BMC-reported counts must not drive unbounded discovery requests."""
+
+    def _service(self, responses: dict[str, str]):
+        from app.services.supermicro_bmc import SupermicroBMCService
+
+        service = SupermicroBMCService(
+            BMCConfig(enabled=True, host="https://bmc.example.test", username="synthetic", password="synthetic")
+        )
+        calls: list[str] = []
+        # Fail fast instead of hanging if discovery ignores the cap.
+        request_budget = 200
+
+        def post_web_xml(_opener, _csrf, _path, params):
+            calls.append(params["op"])
+            if len(calls) > request_budget:
+                raise AssertionError(f"BMC discovery exceeded {request_budget} requests")
+            return ET.fromstring(responses.get(params["op"], "<IPMI/>"))
+
+        service._open_web_session = MagicMock(return_value=(object(), "synthetic-csrf"))
+        service._post_web_xml = post_web_xml
+        return service, calls
+
+    def test_implausible_controller_count_is_refused_before_per_controller_requests(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        for reported in (str(BMC_MAX_CONTROLLERS + 1), "1000000000", "-3"):
+            with self.subTest(reported=reported):
+                service, calls = self._service(
+                    {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{reported}"/></IPMI>'}
+                )
+                with self.assertRaises(TrueNASAPIError):
+                    service._populate_web_inventory(BMCInventory())
+                self.assertEqual(calls, ["Get_BrcmStorCtrlAttr.XML"])
+
+    def test_controller_count_at_the_cap_is_still_collected(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_CONTROLLERS, BMCInventory
+
+        service, calls = self._service(
+            {"Get_BrcmStorCtrlAttr.XML": f'<IPMI><BrcmStorCtrlAttr ctrl_found_num="{BMC_MAX_CONTROLLERS}"/></IPMI>'}
+        )
+        inventory = BMCInventory()
+        service._populate_web_inventory(inventory)
+
+        self.assertEqual(len(inventory.controllers), BMC_MAX_CONTROLLERS)
+        self.assertEqual(len(calls), 2 + 3 * BMC_MAX_CONTROLLERS)
+        self.assertTrue(inventory.source_details["web_xml_ok"])
+
+    def test_oversized_drive_list_is_refused(self) -> None:
+        from app.services.supermicro_bmc import BMC_MAX_DRIVES_PER_CONTROLLER, BMCInventory
+
+        drives = '<HDD Vendor="SANITIZED" ModelName="SANITIZED" SN="SANITIZED-1" Status="1"/>' * (
+            BMC_MAX_DRIVES_PER_CONTROLLER + 1
+        )
+        service, _calls = self._service(
+            {
+                "Get_BrcmStorCtrlAttr.XML": '<IPMI><BrcmStorCtrlAttr ctrl_found_num="1"/></IPMI>',
+                "Get_BrcmStorCtrlPhyDrvInfo.XML": f"<IPMI><HDDInfo>{drives}</HDDInfo></IPMI>",
+            }
+        )
+        inventory = BMCInventory()
+        with self.assertRaises(TrueNASAPIError):
+            service._populate_web_inventory(inventory)
+        self.assertEqual(inventory.drives, [])

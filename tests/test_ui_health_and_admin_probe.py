@@ -138,12 +138,50 @@ class StartupProbeTests(unittest.TestCase):
         self.assertIn("On the Docker host", problems[0])
 
     def test_non_permission_errors_are_not_reported_as_unwritable(self) -> None:
-        full = OSError(errno.ENOSPC, "No space left on device")
+        full = OSError(errno.EIO, "I/O error")
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("app.services.storage_writability.os.open", side_effect=full),
         ):
             self.assertEqual(probe_writable_directories([temp_dir]), [])
+
+    def test_capacity_probe_reaches_startup_and_periodic_consumers_without_permission_advice(self) -> None:
+        for number in (errno.ENOSPC, errno.EDQUOT, errno.EACCES, errno.EROFS):
+            with self.subTest(errno=number), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                directories = (str(root / "data"), str(root / "logs"))
+                for directory in directories:
+                    Path(directory).mkdir()
+                settings = Settings(ssh=SSHConfig(known_hosts_path=str(root / "data/known_hosts")), paths=PathConfig(
+                    mapping_file=str(root / "data/mappings.json"),
+                    sas_fabric_alias_file=str(root / "data/aliases.json"),
+                    slot_detail_cache_file=str(root / "data/cache.json"),
+                    log_file=str(root / "logs/app.log"),
+                ))
+                request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+                    writable_directories=directories, startup_problems=(),
+                    storage_checked_at_monotonic=0.0,
+                )))
+                with patch("app.services.storage_writability.os.open", side_effect=OSError(number, "synthetic")):
+                    startup = app_route_support.startup_storage_problems(settings)
+                    with self.assertLogs(app_route_support.logger, level="ERROR") as logs:
+                        periodic = app_route_support.refresh_storage_problems(request)
+                self.assertEqual(len(startup), 2)
+                self.assertEqual(periodic, startup)
+                self.assertEqual(request.app.state.startup_problems, tuple(startup))
+                self.assertEqual([r.getMessage() for r in logs.records], startup)
+                for directory, line in zip(directories, startup):
+                    self.assertIn(directory, line)
+                    if number in (errno.ENOSPC, errno.EDQUOT):
+                        self.assertIn("free space or inodes", line)
+                        self.assertNotIn("chown", line)
+                        self.assertNotIn("restart the history", line)
+                    else:
+                        self.assertNotIn("free space or inodes", line)
+                self.assertEqual(list((root / "data").iterdir()), [])
+                with patch.object(app_route_support.time, "monotonic", return_value=float("inf")):
+                    self.assertEqual(app_route_support.refresh_storage_problems(request), [])
+                self.assertEqual(request.app.state.startup_problems, ())
 
     def test_ui_directories_cover_data_logs_and_known_hosts_but_not_config(self) -> None:
         settings = Settings(

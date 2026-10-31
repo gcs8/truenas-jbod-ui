@@ -52,6 +52,7 @@
     storageViewCandidatesTargetSystemId: null,
     storageViewCandidatesScope: null,
     storageViewCandidatesRequestScope: null,
+    storageViewCandidatesError: null,
     liveEnclosures: [],
     liveEnclosuresLoading: false,
     liveEnclosuresSystemId: null,
@@ -672,6 +673,16 @@
     document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
       button.disabled = true;
     });
+    // A reply that lands after the stop can still render buttons from its own
+    // rules (cards, result offers, scans). Lock each one as it appears (#823).
+    if (typeof MutationObserver === "function" && document.body) {
+      new MutationObserver(() => lockActionsIfStopped()).observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["disabled"],
+      });
+    }
   }
 
   function lockActionsIfStopped() {
@@ -680,7 +691,10 @@
       return;
     }
     document.querySelectorAll("button:not(.admin-view-button)").forEach((button) => {
-      button.disabled = true;
+      // Only write enabled buttons, so the stopped-page observer does not wake itself.
+      if (!button.disabled) {
+        button.disabled = true;
+      }
     });
   }
 
@@ -1013,7 +1027,7 @@
     button.dataset.runtimeAction = action;
     button.dataset.containerKey = String(container.key || "");
     button.textContent = label;
-    button.disabled = state.runtimeActionPromises.has(button.dataset.containerKey);
+    button.disabled = Boolean(state.sessionStopped) || state.runtimeActionPromises.has(button.dataset.containerKey);
     return button;
   }
 
@@ -1160,7 +1174,7 @@
       })
       .join("");
     if (elements.runtimeBehaviorSaveButton) {
-      elements.runtimeBehaviorSaveButton.disabled = !fields.some((field) => field.writable);
+      elements.runtimeBehaviorSaveButton.disabled = Boolean(state.sessionStopped) || !fields.some((field) => field.writable);
     }
   }
 
@@ -1378,7 +1392,7 @@
         }).join("");
         sourceSelect.value = currentSourceId;
       }
-      sourceSelect.disabled = state.orphanedHistoryLoading || !orphanedSystems.length;
+      sourceSelect.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending) || !orphanedSystems.length;
     }
 
     if (targetSelect) {
@@ -1397,11 +1411,12 @@
         )).join("");
         targetSelect.value = currentTargetId;
       }
-      targetSelect.disabled = state.orphanedHistoryLoading || !savedSystems.length;
+      targetSelect.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending) || !savedSystems.length;
     }
 
     if (adoptButton) {
-      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
+      adoptButton.disabled = state.orphanedHistoryLoading || Boolean(state.historyAdoptPending)
+        || Boolean(state.orphanedHistoryError) || !orphanedSystems.length || !savedSystems.length;
     }
   }
 
@@ -2397,6 +2412,20 @@
     const ordering = String(draft?.ordering_preset || "source-layout");
     const usesSourceLayout = ordering === "source-layout" && builderDraftUsesSourceLayout(draft, sourceProfile);
 
+    // Bays sit at whole row and column positions; a fractional size cannot be laid out (#1032).
+    if (![draft?.rows, draft?.columns, draft?.slot_count].every((value) => Number.isInteger(Number(value)))) {
+      const error = "Rows, columns and visible bays must be whole numbers.";
+      return {
+        previewRows: [],
+        slotLayoutForSave: null,
+        badge: "Draft",
+        summary: error,
+        error,
+        fixHint: "use whole numbers before save",
+        orderingLabel: builderOrderingLabel(ordering),
+      };
+    }
+
     if (ordering === "custom-layout") {
       const parsed = parseProfileLayoutText(draft.layout_text, draft.rows, draft.columns, draft.slot_count);
       if (parsed.error) {
@@ -2406,6 +2435,7 @@
           badge: "Custom Matrix",
           summary: parsed.error,
           error: parsed.error,
+          fixHint: "fix custom matrix before save",
           orderingLabel: builderOrderingLabel(ordering),
         };
       }
@@ -2700,7 +2730,7 @@
       draft.face_style || null,
       draft.latch_edge ? `latch: ${draft.latch_edge}` : null,
       draft.row_groups.length ? `groups: ${draft.row_groups.join("-")}` : null,
-      layoutResolution.error ? "fix custom matrix before save" : null,
+      layoutResolution.error ? layoutResolution.fixHint || "fix custom matrix before save" : null,
       sourceProfile?.source ? `source: ${sourceProfile.source}` : null,
       Number(sourceProfile?.reference_count || 0) > 0 ? `${sourceProfile.reference_count} refs` : null,
     ].filter(Boolean);
@@ -3598,11 +3628,20 @@
     });
   }
 
+  function storageViewEditorValues() {
+    return new Map(Array.from(
+      elements.setupStorageViewEditor?.querySelectorAll("input, select, textarea") || [],
+      (field) => [field, field.type === "checkbox" ? field.checked : field.value]
+    ));
+  }
+
   function syncStorageViewEditorFromState() {
     const storageView = ensureStorageViewSelection();
     if (!elements.setupStorageViewEditor || !elements.setupStorageViewEmpty || !elements.setupStorageViewTemplateBadge) {
       return;
     }
+    state.storageViewEditorId = state.selectedStorageViewId;
+    state.storageViewEditorGeneration = state.setupEditorGeneration;
     if (!storageView) {
       elements.setupStorageViewEditor.classList.add("hidden");
       elements.setupStorageViewEmpty.classList.remove("hidden");
@@ -3704,6 +3743,7 @@
     if (elements.setupStorageViewMoveDownButton) {
       elements.setupStorageViewMoveDownButton.disabled = state.storageViews[state.storageViews.length - 1]?.id === storageView.id;
     }
+    state.storageViewEditorValues = storageViewEditorValues();
   }
 
   function renderStorageViewPreview() {
@@ -3864,8 +3904,20 @@
   }
 
   function saveStorageViewEditorToState() {
-    // Make sure the editor shows the selected view before reading it back.
+    // Preserve only fresh DOM edits, not stale fields awaiting a model paint
+    // (candidate additions and platform bindings can update this same owner).
+    // A genuine view/system switch still replaces all of the old owner's DOM.
+    const sameEditor = state.storageViewEditorId === state.selectedStorageViewId
+      && state.storageViewEditorGeneration === state.setupEditorGeneration;
+    const edits = sameEditor ? Array.from(storageViewEditorValues()).filter(
+      ([field, value]) => state.storageViewEditorValues?.has(field)
+        && state.storageViewEditorValues.get(field) !== value
+    ) : [];
     flushStorageViewRender();
+    edits.forEach(([field, value]) => {
+      if (field.type === "checkbox") field.checked = value;
+      else field.value = value;
+    });
     updateSelectedStorageView((storageView) => {
       const previousId = storageView.id;
       const editedLabel = String(elements.setupStorageViewLabel?.value || "");
@@ -3905,6 +3957,13 @@
           : null;
       return storageView.id;
     });
+    // Renaming updates selection before its deferred paint. Further changes in
+    // this task still belong to the editor that performed the rename.
+    state.storageViewEditorId = state.selectedStorageViewId;
+    state.storageViewEditorGeneration = state.setupEditorGeneration;
+    // Consumed changes are no longer new input if another model update follows
+    // before the next paint; rename ownership above advances at the same time.
+    state.storageViewEditorValues = storageViewEditorValues();
   }
 
   function currentStorageViewSystemId() {
@@ -3949,6 +4008,7 @@
     state.storageViewCandidatesScope = null;
     state.storageViewCandidatesRequestScope = null;
     state.storageViewCandidatesLoading = false;
+    state.storageViewCandidatesError = null;
   }
 
   async function fetchLiveEnclosures({ force = false, quiet = false } = {}) {
@@ -4112,6 +4172,14 @@
       elements.setupStorageViewCandidatesList.innerHTML = "";
       return;
     }
+    // A failed discovery for this view is not an empty result (#1033).
+    if (state.storageViewCandidatesError && state.storageViewCandidatesRequestScope === currentStorageViewCandidateScope()) {
+      const reason = String(state.storageViewCandidatesError).trim().replace(/[.\s]+$/, "");
+      elements.setupStorageViewCandidatesHelp.textContent =
+        `Could not list the drives on ${where}${reason ? `: ${reason}.` : "."} Use Refresh to try again.`;
+      elements.setupStorageViewCandidatesList.innerHTML = "";
+      return;
+    }
     if (!availableCandidates.length) {
       elements.setupStorageViewCandidatesHelp.textContent = claimedElsewhereCount > 0
         ? "Every unassigned drive is already in another view."
@@ -4173,6 +4241,7 @@
     state.storageViewCandidatesScope = null;
     state.storageViewCandidates = [];
     state.storageViewCandidatesLoading = true;
+    state.storageViewCandidatesError = null;
     scheduleStorageViewRender({ full: false });
     try {
       const params = new URLSearchParams({ system_id: systemId });
@@ -4203,6 +4272,7 @@
       }
       state.storageViewCandidates = [];
       state.storageViewCandidatesSystemId = systemId;
+      state.storageViewCandidatesError = error?.message || String(error);
       if (!quiet) {
         setBanner(`Unable to load unmapped inventory candidates: ${error.message || error}`, "error");
       }
@@ -4304,6 +4374,13 @@
     const targetIndex = currentIndex + direction;
     if (targetIndex < 0 || targetIndex >= ordered.length) {
       return;
+    }
+    // Views that share an order value cannot be swapped by value. Space them
+    // out first, keeping the order shown, so the move takes effect (#1034).
+    if (new Set(ordered.map((storageView) => Number(storageView.order) || 0)).size !== ordered.length) {
+      ordered.forEach((storageView, index) => {
+        storageView.order = (index + 1) * 10;
+      });
     }
     const currentOrder = ordered[currentIndex].order;
     ordered[currentIndex].order = ordered[targetIndex].order;
@@ -5825,6 +5902,9 @@
       if (elements.setupBootstrapButton) {
         elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
       }
+      for (const control of [elements.setupInspectTlsButton, elements.setupTrustRemoteTlsButton]) {
+        if (control) control.disabled = Boolean(state.sessionStopped);
+      }
       const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
       const selected = state.systems?.some((system) => system.id === selectedId);
       for (const control of [elements.existingSystemDeleteButton, elements.existingSystemDeleteHistoryToggle]) {
@@ -6073,6 +6153,7 @@
     button.className = "button secondary small";
     button.type = "button";
     button.textContent = label;
+    button.disabled = Boolean(state.sessionStopped);
     button.addEventListener("click", () => {
       button.disabled = true;
       void runRuntimeAction(containerKey, action).finally(() => {
@@ -6717,12 +6798,30 @@
     }
   }
 
+  function captureTlsEditorOperation(name, host) {
+    // The TLS target is the HTTPS host plus the optional certificate name. The
+    // editor owner already covers visits, draft edits and the host field; the
+    // server name is checked here because it is not part of that target.
+    const operation = captureAdminEditorOperation(name);
+    const sequence = state.adminEditorOperationSeq[name];
+    const serverName = collectTlsServerName();
+    const owns = () => operation.owns() && collectTlsTargetHost() === host
+      && collectTlsServerName() === serverName;
+    // This request's button is released by whichever request of this kind is
+    // newest. Not every draft change (storage-view delete, duplicate or order
+    // reset) releases editor controls, so a retired request still releases its
+    // button unless a newer request of the same kind now holds it.
+    const latest = () => state.adminEditorOperationSeq[name] === sequence;
+    return { owns, latest, serverName, advance: operation.advance };
+  }
+
   async function inspectTlsCertificate() {
     const host = collectTlsTargetHost();
     if (!host) {
       setBanner("Enter the HTTPS host first.", "error");
       return;
     }
+    const owner = captureTlsEditorOperation("tls-inspect", host);
     if (elements.setupInspectTlsButton) {
       elements.setupInspectTlsButton.disabled = true;
     }
@@ -6736,9 +6835,11 @@
         body: JSON.stringify({
           host,
           timeout_seconds: 10,
-          tls_server_name: collectTlsServerName() || null,
+          tls_server_name: owner.serverName || null,
         }),
       });
+      // #737: a late answer for an earlier editor or target is dropped.
+      if (!owner.owns()) return;
       state.tlsInspection = payload.inspection || null;
       renderTlsInspection();
       syncTlsServerNameHelp();
@@ -6756,12 +6857,15 @@
         validityWarning ? "error" : "success"
       );
     } catch (error) {
+      if (!owner.owns()) return;
       if (elements.setupTlsInspectionResult) {
         elements.setupTlsInspectionResult.textContent = `TLS inspection failed: ${error.message || error}`;
       }
       setBanner(`TLS inspection failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupInspectTlsButton) {
+      // A newer inspection holds the button; otherwise release it, even when
+      // this answer was dropped as stale (#737 review).
+      if (owner.latest() && elements.setupInspectTlsButton) {
         elements.setupInspectTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -6773,6 +6877,7 @@
       setBanner("Enter the HTTPS host first.", "error");
       return;
     }
+    const owner = captureTlsEditorOperation("tls-trust-remote", host);
     if (elements.setupTrustRemoteTlsButton) {
       elements.setupTrustRemoteTlsButton.disabled = true;
     }
@@ -6788,9 +6893,12 @@
           timeout_seconds: 10,
           system_id: elements.setupSystemId?.value?.trim() || null,
           bundle_name: suggestedTlsBundleName(),
-          tls_server_name: collectTlsServerName() || null,
+          tls_server_name: owner.serverName || null,
         }),
       });
+      // #737: never put another editor's or target's bundle path or
+      // verify-SSL state into the form that is open now.
+      if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
       state.tlsInspection = payload.inspection || state.tlsInspection;
       if (elements.setupTlsCaBundlePath) {
@@ -6803,6 +6911,7 @@
       }
       const leftOff = !validated && !elements.setupVerifySsl?.checked;
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       renderTlsInspection();
       syncVerifySslHelp();
       syncTlsServerNameHelp();
@@ -6821,13 +6930,14 @@
           : `Saved the presented remote certificate material for ${host}, but it has not validated cleanly yet.`
       , trusted ? "success" : "info");
     } catch (error) {
+      if (!owner.owns()) return;
       syncTlsTrustStatus();
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = `Saving the remote certificate material failed: ${error.message || error}`;
       }
       setBanner(`Saving the remote certificate material failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupTrustRemoteTlsButton) {
+      if (owner.latest() && elements.setupTrustRemoteTlsButton) {
         elements.setupTrustRemoteTlsButton.disabled = Boolean(state.sessionStopped);
       }
     }
@@ -7220,6 +7330,9 @@
 
   function runRuntimeAction(containerKey, action, options = {}) {
     const key = String(containerKey || "");
+    if (state.sessionStopped) {
+      return Promise.resolve(false);
+    }
     const existing = state.runtimeActionPromises.get(key);
     if (existing) {
       return existing;
@@ -7565,6 +7678,12 @@
     if (elements.setupResult) {
       elements.setupResult.textContent = "Creating demo builder system...";
     }
+    // Opening the created demo belongs to the visit and draft revision that
+    // asked for it; later edits or navigation keep their own form (#1042).
+    const editorGeneration = state.setupEditorGeneration;
+    const draftRevision = state.setupDraftRevision;
+    const ownsEditor = () => state.setupEditorGeneration === editorGeneration;
+    const ownsDraft = () => ownsEditor() && state.setupDraftRevision === draftRevision;
     try {
       let systemId = "demo-builder-lab";
       let suffix = 2;
@@ -7585,18 +7704,23 @@
       });
       requireMutationResult(validDemoSystemResult(payload), "demo system");
       await refreshState({ quiet: true });
-      state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
-      const createdSystem = getSystemById(payload.system?.id || "");
-      if (createdSystem) {
-        loadSystemIntoForm(createdSystem);
-      } else {
-        renderAll();
+      const detail = payload.detail || "Demo builder system created.";
+      if (ownsDraft()) {
+        state.selectedExistingSystemId = payload.system?.id || state.selectedExistingSystemId;
+        const createdSystem = getSystemById(payload.system?.id || "");
+        if (createdSystem) {
+          loadSystemIntoForm(createdSystem);
+        } else {
+          renderAll();
+        }
+        renderSaveResult(elements.setupResult, detail, payload);
+      } else if (ownsEditor()) {
+        renderSaveResult(elements.setupResult, `${detail} Your newer edits were kept; open it from the saved systems list.`, payload);
       }
-      renderSaveResult(elements.setupResult, payload.detail || "Demo builder system created.", payload);
       setBanner(`Demo builder system ${payload.system?.label || "saved"}.`, "success");
     } catch (error) {
       const message = describeMutationFailure("Demo builder system creation", error);
-      if (elements.setupResult) {
+      if (ownsEditor() && elements.setupResult) {
         elements.setupResult.textContent = message;
       }
       setBanner(message, "error");
@@ -7758,6 +7882,7 @@
       return;
     }
 
+    state.historyAdoptPending = true;
     if (elements.historyAdoptButton) {
       elements.historyAdoptButton.disabled = true;
     }
@@ -7772,6 +7897,8 @@
     }
 
     try {
+      // Adoption rewrites history rows like a purge, so it gets the same long
+      // maintenance deadline instead of the 60-second default (#1043).
       const payload = await fetchJson("/api/admin/history/adopt-removed-system", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -7779,6 +7906,7 @@
           source_system_id: sourceSystem.system_id,
           target_system_id: targetSystem.id,
         }),
+        timeoutMs: HISTORY_MAINTENANCE_TIMEOUT_MS,
       });
       const refreshed = Array.isArray(payload.orphaned_systems);
       if (refreshed) {
@@ -7800,11 +7928,22 @@
         !warning && Number(payload.summary?.total_rows || 0) > 0 ? "success" : "info"
       );
     } catch (error) {
-      if (elements.historyAdoptResult) {
-        elements.historyAdoptResult.textContent = `History adoption failed: ${error.message || error}`;
+      // A timed-out or interrupted adoption may still be running or have
+      // committed. Keep the last-known rows but leave Adopt unavailable until a
+      // fresh scan reads back what remains.
+      const unknown = error?.adminOutcome === "unknown" || error?.outcomeUnknown;
+      if (unknown) {
+        state.orphanedHistoryError = true;
       }
-      setBanner(`History adoption failed: ${error.message || error}`, "error");
+      const detail = unknown
+        ? `History adoption outcome is unknown. ${error.message || error} Refresh the history source list to see what remains before adopting again.`
+        : `History adoption failed: ${error.message || error}`;
+      if (elements.historyAdoptResult) {
+        elements.historyAdoptResult.textContent = detail;
+      }
+      setBanner(detail, unknown ? "info" : "error");
     } finally {
+      state.historyAdoptPending = false;
       renderHistoryMaintenance();
     }
   }

@@ -51,6 +51,7 @@ from history_service.backup_archive.catalog import (
     validate_record,
 )
 from history_service.backup_archive.cron import CronSchedule
+from history_service.backup_archive.errors import describe_error as _describe_error
 from history_service.backup_archive.journal import ChangeJournal, ConfigBackupCoalescer, CoalescerResult
 from history_service.backup_archive.lifecycle import (
     GroomingPlan,
@@ -113,11 +114,9 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def describe_error(exc: BaseException) -> str:
-    """Short operator-facing text. Transport errors never contain secret values."""
+    """Short operator-facing text without raw provider data (#737)."""
 
-    message = " ".join(str(exc).split())
-    text = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
-    return text[:MAX_DETAIL_CHARS]
+    return _describe_error(exc, MAX_DETAIL_CHARS)
 
 
 def config_group_keys(all_backup_groups: tuple[str, ...], history_group: str) -> list[str]:

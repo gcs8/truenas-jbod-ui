@@ -514,6 +514,8 @@ class ServiceAccountBootstrapService:
         through `user.update` (#947). A missing account is created with one
         `user.create` call when the operator gave a home on a pool; otherwise
         bootstrap stops and asks for one. An existing account keeps its home.
+        CORE13 reads uid for home permissions before its automatic allocation,
+        so resolve the next UID read-only and send it explicitly on creation.
         """
         nothing_changed = "Nothing was changed on the host."
         if home_error:
@@ -523,7 +525,25 @@ class ServiceAccountBootstrapService:
             ]
         elif create_payload and service_home:
             missing_lines = [
+                "  core_uid_error() {",
+                (
+                    "    echo \"TrueNAS CORE user.get_next_uid did not return a safe available UID. "
+                    f"{nothing_changed}\" >&2"
+                ),
+                "    exit 1",
+                "  }",
+                "  svc_uid=$(midclt call user.get_next_uid 2>/dev/null) || core_uid_error",
+                "  case \"$svc_uid\" in ''|*[!0-9]*|0*) core_uid_error ;; esac",
+                # Bound length before numeric tests; reject system/nobody IDs
+                # and values outside a conservative signed 32-bit UID range.
+                "  if [ \"${#svc_uid}\" -gt 10 ] || [ \"$svc_uid\" -lt 1000 ] ||",
+                "     [ \"$svc_uid\" -gt 2147483647 ] || [ \"$svc_uid\" -eq 65534 ]; then",
+                "    core_uid_error",
+                "  fi",
                 f"  create_payload={shlex.quote(create_payload)}",
+                # The local template is a JSON object. Only validated decimal
+                # digits cross into its numeric uid field; never eval output.
+                '  create_payload=$(printf \'{"uid":%s,%s\' "$svc_uid" "${create_payload#?}")',
                 "  if ! create_output=$(midclt call user.create \"$create_payload\" 2>&1); then",
                 (
                     "    echo \"TrueNAS CORE could not create the account $svc_user with home directory "
@@ -759,8 +779,10 @@ class ServiceAccountBootstrapService:
         service_home: str,
         public_key: str,
     ) -> str:
-        """JSON for one `midclt call user.create` of a missing CORE account.
+        """JSON template for `midclt call user.create` of a missing CORE account.
 
+        The remote missing-account branch adds a validated user.get_next_uid
+        result before creation, ahead of CORE13's home-permission stage.
         The middleware makes the home with ``home_mode``, owns it and writes
         authorized_keys from ``sshpubkey``. No password is sent; the account
         logs in by key only. Grants are added afterwards by `user.update`.

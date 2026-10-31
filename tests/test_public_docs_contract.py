@@ -251,6 +251,8 @@ class OperatorRecipeTests(unittest.TestCase):
                         client.save_host_keys.assert_not_called()
                     else:
                         self.assertIsInstance(policy, AutoPinHostKeyPolicy)
+                        # The reloaded known_hosts file has no pin for this host yet.
+                        client.get_host_keys.return_value.lookup.return_value = None
                         policy.missing_host_key(client, "core.example.test", key)
                         client.save_host_keys.assert_called_once_with(path)
 
@@ -502,7 +504,8 @@ class OperatorRecipeTests(unittest.TestCase):
                           "history_group", "backup_group", "status_group", "archive_group",
                           "backup_mode", "status_mode", "archive_mode", "digest", "size",
                           "archive_symlink", "status_symlink", "backup_symlink", "hardlink",
-                          "changed_status", "changed_source", "missing_history"):
+                          "changed_status", "changed_source", "missing_history",
+                          "zero_status_group", "existing_stage"):
                 with self.subTest(history=history_ids, backup=backup_ids, fault=fault):
                     with tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
@@ -551,9 +554,7 @@ class OperatorRecipeTests(unittest.TestCase):
                             os.link(archive, archive.with_name("another-link"))
                         env: dict[str, str] = dict(zip(("HISTORY_UID", "HISTORY_GID", "BACKUP_UID", "BACKUP_GID"),
                                        map(str, (*history_ids, *backup_ids))))
-                        env["APP_GID"] = "10001"
-                        # APP_UID keeps the baseline executable; candidate must use HISTORY_UID.
-                        env["APP_UID"] = str(history_ids[0])
+                        env["APP_GID"] = "0" if fault == "zero_status_group" else "10001"
                         fake_os = SyntheticStagingOS(root, env, owners, change_status=fault == "changed_status",
                                                      change_source=fault == "changed_source")
 
@@ -566,6 +567,38 @@ class OperatorRecipeTests(unittest.TestCase):
 
                         namespace = {"__builtins__": dict(vars(builtins), __import__=safe_import)}
                         stage = root / "history/.segment-rotation-backup"
+                        if fault == "existing_stage":
+                            stage.mkdir(mode=0o700)
+                            (stage / "untouched").write_bytes(b"synthetic prior staging evidence")
+
+                        def snapshot(path):
+                            metadata = path.lstat()
+                            content = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+                            target = os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None
+                            links = metadata.st_nlink if stat.S_ISREG(metadata.st_mode) else None
+                            labels = owners.get((metadata.st_dev, metadata.st_ino),
+                                                (metadata.st_uid, metadata.st_gid))
+                            return (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid,
+                                    metadata.st_mode, links, content, target, labels)
+
+                        # The recipe may create new staging files, never repair or replace
+                        # existing ownership, modes, archive bytes, or refusal evidence.
+                        originals = {path: snapshot(path) for path in root.rglob("*")}
+
+                        def assert_originals_unchanged():
+                            for path, before in originals.items():
+                                # These two injected writers intentionally change bytes.
+                                # The recipe must leave even those replacements intact.
+                                if fault == "changed_status" and path == status_path:
+                                    original_status = before[6]
+                                    assert isinstance(original_status, bytes)
+                                    before = (*before[:6], original_status + b" ", *before[7:])
+                                if fault == "changed_source" and path == archive:
+                                    before = (*before[:6], b"changed synthetic archive", *before[7:])
+                                relative = str(path.relative_to(root))
+                                self.assertTrue(path.exists() or path.is_symlink(), relative)
+                                self.assertEqual(snapshot(path), before, relative)
+
                         output = io.StringIO()
                         try:
                             with redirect_stdout(output):
@@ -573,7 +606,7 @@ class OperatorRecipeTests(unittest.TestCase):
                         except (SystemExit, OSError) as error:
                             if fault is None:
                                 self.fail(f"supported ownership labels rejected: {error}")
-                            if fault.endswith("_symlink"):
+                            if fault.endswith("_symlink") or fault == "existing_stage":
                                 self.assertIsInstance(error, OSError)
                             else:
                                 reason = {
@@ -587,12 +620,16 @@ class OperatorRecipeTests(unittest.TestCase):
                                     "changed": ("status changed" if fault == "changed_status"
                                                 else "integrity verification"),
                                     "missing": "complete FULL backup evidence",
+                                    "zero": "APP_GID must be a positive shared-status group ID",
                                 }[fault.split("_", 1)[0]]
                                 self.assertIn(reason, str(error))
-                            self.assertFalse(stage.exists(), "refused staging left publishable evidence")
+                            self.assertEqual(stage.exists(), fault == "existing_stage",
+                                             "refusal created or removed staging evidence")
                             self.assertNotIn("staged_backup=ok", output.getvalue())
+                            assert_originals_unchanged()
                         else:
                             self.assertIsNone(fault, "unsafe evidence was staged")
+                            assert_originals_unchanged()
                             self.assertEqual(output.getvalue(), "staged_backup=ok\n")
                             staged = stage / archive_name
                             self.assertEqual(staged.read_bytes(), payload)
@@ -714,6 +751,33 @@ class PublicDocsContractTests(unittest.TestCase):
             with self.subTest(guide=relative_path):
                 self.assertIn("verify_ssl: false", initial_setup)
                 self.assertNotIn("verify_ssl: true", initial_setup)
+
+    def test_sudo_grant_examples_use_anchored_or_exact_arguments(self) -> None:
+        # #992: a trailing sudo glob such as `/dev/sd*` or `--output *` can
+        # consume spaces and further options. Documented grants must use an
+        # anchored ^...$ argument regex or an exact, glob-free argument list.
+        def assert_bounded(relative: str, number: int, grant: str) -> None:
+            _, _, arguments = grant.strip().partition(" ")
+            with self.subTest(file=relative, line=number, grant=grant):
+                if arguments.startswith("^"):
+                    self.assertTrue(arguments.endswith("$"), "anchored grant must end with $")
+                else:
+                    self.assertNotRegex(arguments, r"[*?\[]", "unanchored grant uses a sudo glob")
+
+        checked = 0
+        for path in sorted([*(ROOT / "docs").glob("*.md"), *(ROOT / "wiki").glob("*.md")]):
+            relative = path.relative_to(ROOT).as_posix()
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                grant = line.split("NOPASSWD:", 1)[1].strip() if "NOPASSWD:" in line else ""
+                if grant.startswith("/"):
+                    assert_bounded(relative, number, grant)
+                    checked += 1
+        notes = (ROOT / "docs/GPU_SERVER_NOTES.md").read_text(encoding="utf-8")
+        rules = notes.split("- Sudo rules", 1)[1].split("\n## ", 1)[0]
+        for item in re.findall(r"^  - `([^`]+)`$", rules, re.MULTILINE):
+            assert_bounded("docs/GPU_SERVER_NOTES.md", 0, item)
+            checked += 1
+        self.assertGreaterEqual(checked, 20)
 
     def test_admin_guide_does_not_describe_the_main_ui_as_read_only(self) -> None:
         guide = (ROOT / "wiki/Admin-UI-and-System-Setup.md").read_text(

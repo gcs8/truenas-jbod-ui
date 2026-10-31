@@ -9,7 +9,9 @@ from typing import Iterable
 from app.models.domain import SasFabricAlias
 from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
+    StorageDirectoryCapacityExhausted,
     StorageDirectoryUnwritable,
+    describe_capacity_failure,
     is_unwritable_error,
 )
 
@@ -163,6 +165,9 @@ class SasFabricAliasStore:
                 json.dump(payload, handle, indent=2, sort_keys=True)
             temp_path.replace(self.file_path)
         except OSError as exc:
+            capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
+            if capacity_reason is not None:
+                raise StorageDirectoryCapacityExhausted(self.file_path.parent, capacity_reason) from exc
             if is_unwritable_error(exc):
                 raise SasFabricAliasStorageUnwritable(self.file_path.parent) from exc
             raise

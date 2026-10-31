@@ -100,6 +100,11 @@ class FakeElement {
     (this.listeners.get("click") || []).forEach((listener) => listener({ target: this }));
   }
 
+  appendChild(node) {
+    this.children.push(node);
+    return node;
+  }
+
   append(...nodes) {
     nodes.forEach((node) => {
       if (typeof node === "string") {
@@ -520,6 +525,136 @@ test("a purge that finds admin stopped leaves Purge disabled", async () => {
 
   assert.equal(state.sessionStopped, true);
   assert.equal(purgeButton.disabled, true);
+});
+
+// #823: a reply that lands after the stop renders new cards and result
+// buttons; none of them may come back clickable.
+test("a timing save that resolves after admin stopped renders its cards and restart offer locked", async () => {
+  const saveButton = new FakeElement();
+  const result = new FakeElement();
+  const cards = new FakeElement();
+  const actions = [];
+  let resolveSave = null;
+  const state = stoppedSessionState({
+    runtimeBehavior: { fields: [{ key: "interval", value: 30, writable: true }] },
+    runtime: { available: true, containers: [] },
+    runtimeActionPromises: new Map(),
+    runtimeActionControllers: new Map(),
+  });
+  const functions = loadFunctions(
+    [
+      ...SESSION_FUNCTIONS, ...MAINTENANCE_FUNCTIONS,
+      "saveRuntimeBehaviorSettings", "collectRuntimeBehaviorValues", "renderRuntimeBehaviorSettings",
+      "renderRuntimeCards", "createRuntimeActionButton", "createRuntimeVersionRow", "renderRuntimeCardElement",
+      "runtimeStatusClass", "runtimeVersionNoteClass", "formatRuntimeMetaValue", "runRuntimeAction",
+    ],
+    {
+      state,
+      elements: sparseElements({
+        sessionBanner: new FakeElement({ classes: ["hidden"] }),
+        runtimeBehaviorSaveButton: saveButton,
+        runtimeBehaviorResult: result,
+        runtimeBehaviorFields: new FakeElement({ querySelectorAll: () => [] }),
+        runtimeBehaviorDetail: new FakeElement(),
+        runtimeCards: cards,
+        runtimeDetail: new FakeElement(),
+      }),
+      document: {
+        ...fakeDocument([saveButton]),
+        createElement: (tagName) => new FakeElement({ tagName: tagName.toUpperCase(), dataset: {} }),
+      },
+      window: { clearInterval() {} },
+      setBanner() {},
+      escapeHtml: String,
+      runtimeBehaviorOwnerLabel: () => "Admin",
+      fetchJson: () => new Promise((resolve) => { resolveSave = resolve; }),
+      executeRuntimeAction: async (key, action) => {
+        actions.push([key, action]);
+        return true;
+      },
+      setRuntimeContainerPending() {},
+    },
+    SESSION_CONSTANTS
+  );
+
+  const saving = functions.saveRuntimeBehaviorSettings();
+  functions.markAdminStopped();
+  resolveSave({
+    detail: "Timing saved.",
+    runtime_behavior: { fields: [{ key: "interval", value: 30, writable: true }] },
+    runtime: { available: true, containers: [{ key: "ui", label: "Main UI", can_stop: true, can_restart: true }] },
+    restart_required: ["ui"],
+  });
+  await saving;
+
+  const cardButtons = cards.children
+    .flatMap((card) => card.children.flatMap((part) => part.children))
+    .filter((node) => node.tagName === "BUTTON");
+  assert.equal(cardButtons.length, 2);
+  assert.ok(cardButtons.every((button) => button.disabled), "late card buttons stay locked");
+  const offers = result.children.filter((node) => node.tagName === "BUTTON");
+  assert.equal(offers.length, 1);
+  assert.equal(offers[0].disabled, true, "the late restart offer stays locked");
+  assert.equal(saveButton.disabled, true);
+
+  // The registered card delegate and the offer both go through runRuntimeAction.
+  await functions.runRuntimeAction("ui", "restart");
+  assert.deepEqual(actions, [], "no container action starts after admin stopped");
+});
+
+test("after admin stopped, a later partial render cannot leave a button enabled", () => {
+  const observers = [];
+  class FakeMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      observers.push(this);
+    }
+
+    observe(target, options) {
+      this.target = target;
+      this.options = options;
+    }
+  }
+  const buttons = [];
+  const body = new FakeElement();
+  const functions = loadFunctions(
+    [...SESSION_FUNCTIONS, "lockActionsIfStopped"],
+    {
+      state: stoppedSessionState(),
+      elements: sparseElements({ sessionBanner: new FakeElement({ classes: ["hidden"] }) }),
+      document: { ...fakeDocument(buttons), body },
+      window: { clearInterval() {} },
+      MutationObserver: FakeMutationObserver,
+    },
+    SESSION_CONSTANTS
+  );
+
+  functions.markAdminStopped();
+  functions.markAdminStopped();
+  assert.equal(observers.length, 1, "one watcher for the stopped page");
+  assert.equal(observers[0].target, body);
+  assert.equal(observers[0].options.subtree, true);
+  assert.equal(observers[0].options.childList, true);
+  assert.deepEqual([...observers[0].options.attributeFilter], ["disabled"]);
+
+  // A history scan, candidate list or TLS chip render adds an enabled button.
+  const lateButton = new FakeElement();
+  buttons.push(lateButton);
+  observers[0].callback([]);
+  assert.equal(lateButton.disabled, true);
+
+  // Locked buttons are not written again, so the watcher does not wake itself.
+  let writes = 0;
+  buttons.push({
+    get disabled() {
+      return true;
+    },
+    set disabled(value) {
+      writes += 1;
+    },
+  });
+  observers[0].callback([]);
+  assert.equal(writes, 0);
 });
 
 // Debug bundle exports never pause production by default.

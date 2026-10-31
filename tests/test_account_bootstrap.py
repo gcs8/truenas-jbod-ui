@@ -8,6 +8,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -481,6 +482,9 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         *,
         created_output: str = "[]",
         create_fails: bool = False,
+        create_error: str = "[EINVAL] user_create.home: synthetic refusal",
+        uid_output: str = "3001",
+        uid_fails: bool = False,
         **updates: object,
     ) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
         """Run the real CORE exec string and script against recording stubs.
@@ -490,6 +494,9 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         does for root on TrueNAS CORE. `user.query` answers with
         ``query_output`` until `user.create` runs, then with ``created_output``.
         The `user.create` JSON argument is saved to ``self.created_payload``.
+        Its synthetic CORE13 model reads uid for home permissions before the
+        later automatic-allocation step, matching the installed ordering defect.
+        This models that contract only, not complete middleware user creation.
         `grep` reports the key as present, as the middleware writes it when it
         creates the account.
         """
@@ -502,14 +509,33 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         midclt_input = root / "midclt.stdin"
         created_marker = root / "created"
         create_argument = root / "user-create.json"
+        core13_create = root / "core13_create.py"
+        core13_create.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "data = json.loads(sys.argv[1])\n"
+            "with open(os.environ['CALL_LOG'], 'a') as log:\n"
+            "    log.write('core13 group.create_internal\\n')\n"
+            "    # CORE13 reads this before its later get_next_uid fallback.\n"
+            "    uid = data['uid']\n"
+            "    log.write(f'core13 filesystem.setperm uid={uid}\\n')\n"
+            "if not data.get('uid'):\n"
+            "    raise AssertionError('late UID allocation reached')\n"
+            "Path(os.environ['CREATED_MARKER']).touch()\n"
+            "print(61)\n"
+        )
         (stubs / "midclt").write_text(
             "#!/bin/sh\n"
             'printf "midclt %s\\n" "$*" >> "$CALL_LOG"\n'
             'cat >> "$MIDCLT_INPUT"\n'
             'if [ "$2" = user.create ]; then\n'
             '  printf "%s" "$3" > "$CREATE_ARGUMENT"\n'
-            '  if [ -n "$CREATE_FAILS" ]; then echo "[EINVAL] user_create.home: synthetic refusal" >&2; exit 1; fi\n'
-            '  : > "$CREATED_MARKER"; echo 61\n'
+            '  if [ -n "$CREATE_FAILS" ]; then printf "%s\\n" "$CREATE_ERROR" >&2; exit 1; fi\n'
+            f'  exec {shlex.quote(sys.executable)} "$CORE13_CREATE" "$3"\n'
+            "fi\n"
+            'if [ "$2" = user.get_next_uid ]; then\n'
+            '  if [ -n "$UID_FAILS" ]; then echo "synthetic UID lookup failure" >&2; exit 1; fi\n'
+            '  printf "%s\\n" "$UID_OUTPUT"\n'
             "fi\n"
             'if [ "$2" = user.query ]; then\n'
             '  if [ -e "$CREATED_MARKER" ]; then printf "%s\\n" "$CREATED_OUTPUT"; '
@@ -543,6 +569,10 @@ class BootstrapRemoteExecTests(unittest.TestCase):
                 "CREATED_MARKER": str(created_marker),
                 "CREATE_ARGUMENT": str(create_argument),
                 "CREATE_FAILS": "1" if create_fails else "",
+                "CREATE_ERROR": create_error,
+                "CORE13_CREATE": str(core13_create),
+                "UID_OUTPUT": uid_output,
+                "UID_FAILS": "1" if uid_fails else "",
             },
         )
         logged = calls.read_text().splitlines() if calls.exists() else []
@@ -660,9 +690,10 @@ class BootstrapRemoteExecTests(unittest.TestCase):
             service_home=SYNTHETIC_CORE_HOME,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(self.created_payload, self.expected_user_create())
+        self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": 3001})
         midclt_calls = [line.split(" ", 3)[2] for line in logged if line.startswith("midclt ")]
-        self.assertEqual(midclt_calls, ["user.query", "user.create", "user.query", "user.update"])
+        self.assertEqual(midclt_calls, ["user.query", "user.get_next_uid", "user.create", "user.query", "user.update"])
+        self.assertIn("core13 filesystem.setperm uid=3001", logged)
         self.assertTrue(any(line.startswith("midclt call user.update 61 ") for line in logged), logged)
         create_index = next(i for i, line in enumerate(logged) if line.startswith("midclt call user.create "))
         for change in ("mkdir ", "chmod ", "chown ", "touch "):
@@ -673,12 +704,73 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIn("BOOTSTRAP_PERMISSION_TARGET=midclt:user.update:61\n", completed.stdout)
         self.assertEqual(received, "")
 
+    def test_core_uid_allocation_precedes_create_and_home_permissions(self) -> None:
+        for uid in (1000, 4017, 2147483647):
+            for install_sudo_rules in (True, False):
+                with self.subTest(uid=uid, install_sudo_rules=install_sudo_rules):
+                    completed, logged, received = self.run_core_script(
+                        "[]", uid_output=str(uid), service_home=SYNTHETIC_CORE_HOME,
+                        created_output=f'[{json.dumps({"id": 61, "home": SYNTHETIC_CORE_HOME})}]',
+                        install_sudo_rules=install_sudo_rules,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": uid})
+                    self.assertEqual(logged[1], "midclt call user.get_next_uid")
+                    self.assertTrue(logged[2].startswith("midclt call user.create "), logged)
+                    self.assertEqual(logged[3:5], [
+                        "core13 group.create_internal", f"core13 filesystem.setperm uid={uid}",
+                    ])
+                    self.assertEqual(received, "")
+
+    def test_core_malformed_uid_fails_before_create_or_host_changes(self) -> None:
+        for malformed in (
+            "", "null", "true", "false", "[]", "{}", '"3001"', '{"uid":3001}',
+            "0", "1", "999", "65534", "-1", "2147483648", "4294967295",
+            "999999999999999999999999999999", "03001", "+3001", "3001.0", "3e3",
+            " 3001", "3001 ", "\n".join(("3001", "3002")), "３００１",
+            '3001,"sudo":true', "$(id)", "3001; id", "3001`id`",
+        ):
+            with self.subTest(malformed=malformed):
+                completed, logged, received = self.run_core_script(
+                    "[]", uid_output=malformed, service_home=SYNTHETIC_CORE_HOME,
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertIn("UID", completed.stderr)
+                self.assertIn("Nothing was changed on the host.", completed.stderr)
+                self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid"])
+                self.assertIsNone(self.created_payload)
+                self.assertNotIn("BOOTSTRAP_", completed.stdout)
+                self.assertEqual(received, "")
+
+    def test_core_failed_uid_lookup_fails_before_create_or_host_changes(self) -> None:
+        completed, logged, received = self.run_core_script(
+            "[]", uid_fails=True, service_home=SYNTHETIC_CORE_HOME,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("UID", completed.stderr)
+        self.assertIn("Nothing was changed on the host.", completed.stderr)
+        self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid"])
+        self.assertIsNone(self.created_payload)
+        self.assertEqual(received, "")
+
     def test_core_missing_service_user_without_a_home_points_at_the_home_field(self) -> None:
         completed, logged, received = self.run_core_script("[]")
         self.assert_only_the_account_lookup_ran(completed, logged, received)
         self.assertIsNone(self.created_payload)
         self.assertIn("Home directory", completed.stderr)
         self.assertIn("Accounts > Users", completed.stderr)
+
+    def test_core_uid_collision_is_reported_without_reallocation_or_retry(self) -> None:
+        completed, logged, received = self.run_core_script(
+            "[]", create_fails=True, create_error="[EEXIST] user_create.uid: synthetic collision",
+            service_home=SYNTHETIC_CORE_HOME,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("synthetic collision", completed.stderr)
+        self.assertEqual([line.split(" ", 3)[2] for line in logged], ["user.query", "user.get_next_uid", "user.create"])
+        self.assertEqual(self.created_payload, {**self.expected_user_create(), "uid": 3001})
+        self.assertNotIn("BOOTSTRAP_", completed.stdout)
+        self.assertEqual(received, "")
 
     def test_core_existing_service_user_ignores_the_home_field(self) -> None:
         completed, logged, received = self.run_core_script(
@@ -688,6 +780,7 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIsNone(self.created_payload)
         self.assertFalse(any("user.create" in line for line in logged), logged)
+        self.assertFalse(any("user.get_next_uid" in line for line in logged), logged)
         self.assertTrue(any(line.startswith("midclt call user.update 54 ") for line in logged), logged)
         self.assertIn("BOOTSTRAP_SERVICE_HOME=/mnt/tank/svc/jbodmap\n", completed.stdout)
         self.assertIn("BOOTSTRAP_ACCOUNT_CREATED=0\n", completed.stdout)
@@ -745,7 +838,7 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertNotIn("BOOTSTRAP_", completed.stdout)
         self.assertEqual(
             [line.split(" ", 3)[2] for line in logged],
-            ["user.query", "user.create"],
+            ["user.query", "user.get_next_uid", "user.create"],
         )
         self.assertEqual(received, "")
 
@@ -757,8 +850,8 @@ class BootstrapRemoteExecTests(unittest.TestCase):
         self.assertIn("jbodmap", completed.stderr)
         self.assertNotIn("BOOTSTRAP_", completed.stdout)
         self.assertEqual(
-            [line.split(" ", 3)[2] for line in logged],
-            ["user.query", "user.create", "user.query"],
+            [line.split(" ", 3)[2] for line in logged if line.startswith("midclt ")],
+            ["user.query", "user.get_next_uid", "user.create", "user.query"],
         )
 
     def test_bootstrap_result_reports_a_created_account(self) -> None:
@@ -1401,6 +1494,140 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                 for grant in SUDO_COMMANDS_BY_PLATFORM["quantastor"]
             )
         )
+
+
+class CoreExpanderCounterDraftTests(unittest.TestCase):
+    """Source-only policy: no CORE binary, sudo or device is exercised."""
+
+    def policy(self, argv, **updates):
+        from scripts.core_expander_counter_draft import draft_readonly_policy
+
+        evidence = {
+            "freebsd_release": "13.2",
+            "tool_path": "/sbin/camcontrol",
+            "sudo_version": "1.9.10",
+            "opt_in": True,
+        }
+        evidence.update(updates)
+        return draft_readonly_policy(argv, **evidence)
+
+    def test_default_is_disabled_without_commands_or_grants(self):
+        from scripts.core_expander_counter_draft import draft_readonly_policy
+
+        result = draft_readonly_policy(("/sbin/camcontrol", "smpphylist", "pass3"))
+        self.assertEqual(result["state"], "disabled")
+        self.assertIs(result["enabled"], False)
+        self.assertEqual(result["argv"], ())
+        self.assertIsNone(result["candidate_grant"])
+        self.assertIs(result["host_validated"], False)
+
+    def test_topology_is_not_mislabeled_as_error_counters(self):
+        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
+        result = self.policy(argv)
+        self.assertEqual(result["capability"], "phy_topology_only")
+        self.assertEqual(result["state"], "inactive_draft")
+        self.assertIs(result["enabled"], False)
+        self.assertEqual(result["argv"], argv)
+        self.assertEqual(result["candidate_grant"], "/sbin/camcontrol ^smpphylist pass3$")
+
+    def test_counter_request_has_only_the_exact_report_phy_error_log_bytes(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        for phy in (0, 3, 127, 254):
+            with self.subTest(phy=phy):
+                argv = phy_error_log_argv("pass3", phy)
+                request = bytes.fromhex(" ".join(argv[5].split("{}")))
+                self.assertEqual(request, bytes((0x40, 0x11, 6, 2, 0, 0, 0, 0, 0, phy, 0, 0)))
+                self.assertEqual(argv[:5], ("/sbin/camcontrol", "smpcmd", "pass3", "-r", "12"))
+                self.assertEqual(argv[6:], ("-R", "28", "-"))
+                result = self.policy(argv)
+                self.assertEqual(result["capability"], "expander_phy_error_log")
+                self.assertEqual(result["argv"], argv)
+                self.assertIs(result["host_validated"], False)
+                self.assertIs(result["enabled"], False)
+                grant = result["candidate_grant"]
+                self.assertTrue(core_stored_grant_matches(grant, shlex.join(argv)))
+                self.assertNotIn("*", grant)
+                self.assertNotIn("\\", grant)
+                self.assertNotIn(",", grant)
+                self.assertNotIn(":", grant)
+                self.assertFalse(core_stored_grant_matches(
+                    grant, shlex.join(phy_error_log_argv("pass4", phy))))
+                self.assertFalse(core_stored_grant_matches(
+                    grant, shlex.join(phy_error_log_argv("pass3", (phy + 1) % 255))))
+
+    def test_missing_or_unqualified_version_and_tool_evidence_is_refused(self):
+        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
+        for updates in (
+            {"freebsd_release": None}, {"freebsd_release": "13.0"},
+            {"freebsd_release": "14.0"}, {"freebsd_release": "TrueNAS-13"},
+            {"tool_path": None}, {"tool_path": "/usr/local/sbin/smp_rep_phy_err_log"},
+            {"tool_path": "/sbin/../sbin/camcontrol"},
+            {"sudo_version": None}, {"sudo_version": "1.9.9"},
+            {"sudo_version": "1.9.10 garbage"}, {"sudo_version": "1.8.31"},
+            {"opt_in": "yes"},
+        ):
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                self.policy(argv, **updates)
+        for version in ("1.9.10p1", "1.9.17"):
+            self.assertEqual(self.policy(argv, sudo_version=version)["state"], "inactive_draft")
+
+    def test_mutations_options_paths_and_unsupported_tools_are_refused(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        good = phy_error_log_argv("pass3", 3)
+        refused = [
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "reset"),
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "disable"),
+            ("/sbin/camcontrol", "reset", "pass3"),
+            ("/usr/local/sbin/smp_rep_phy_err_log", "--phy=3", "/dev/ses3"),
+            ("/usr/local/sbin/smartctl", "-l", "sasphy,reset", "/dev/da3"),
+            ("/usr/bin/sg_logs", "--select", "/dev/sg3"),
+            ("/sbin/camcontrol", "smpphylist", "pass3", "-l"),
+            ("/sbin/camcontrol", "smpphylist", "/dev/pass3"),
+            ("/sbin/camcontrol", "smpphylist", "pass3/../../etc/master.passwd"),
+            ("/sbin/camcontrol", "smpphylist", "pass3\nreset"),
+            ("/sbin/camcontrol", "smpphylist", "pass３"),
+            ("/sbin/../sbin/camcontrol", *good[1:]),
+            (*good, "-r", "12", "-"),  # stdin-controlled replacement request
+            (*good[:5], "-", *good[6:]),
+            (*good[:5], good[5].replace("11", "91", 1), *good[6:]),
+            (*good[:4], "16", *good[5:]),
+            (*good[:7], "32", "-"),
+            (*good[:5], "40 11 06 02 00 00 00 00 00 03 00 00", *good[6:]),
+            (*good, ";", "reset"),
+            " ".join(good),
+        ]
+        grants = (self.policy(good)["candidate_grant"],
+                  self.policy(("/sbin/camcontrol", "smpphylist", "pass3"))["candidate_grant"])
+        for argv in refused:
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                self.policy(argv)
+            if not isinstance(argv, str):
+                self.assertFalse(any(core_stored_grant_matches(grant, shlex.join(argv)) for grant in grants))
+
+    def test_builder_rejects_bad_phy_and_device_instead_of_normalizing(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        for phy in (-1, 255, True, "3", None, 3.0):
+            with self.subTest(phy=phy), self.assertRaises(ValueError):
+                phy_error_log_argv("pass3", phy)
+        for device in ("pass3 -v", "../pass3", "/dev/pass3", "pass3\x00", "pass３", "ses3"):
+            with self.subTest(device=device), self.assertRaises(ValueError):
+                phy_error_log_argv(device, 3)
+
+    def test_draft_does_not_touch_live_policy_or_io(self):
+        from scripts.core_expander_counter_draft import phy_error_log_argv
+
+        before = core_grant_sources()
+        with patch("builtins.open", side_effect=AssertionError("file IO")), \
+                patch("subprocess.run", side_effect=AssertionError("exec")), \
+                patch("socket.create_connection", side_effect=AssertionError("network")):
+            result = self.policy(phy_error_log_argv("pass3", 3))
+        self.assertEqual(result["state"], "inactive_draft")
+        self.assertEqual(core_grant_sources(), before)
+        for grants in before.values():
+            self.assertFalse(any("smpcmd" in grant or "smpphylist" in grant for grant in grants))
 
 
 if __name__ == "__main__":
