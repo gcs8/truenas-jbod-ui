@@ -1092,6 +1092,9 @@ for (const action of ["catalog", "TLS suggestion", "recommended commands"]) {
       } else if (action === "TLS suggestion") {
         field = page.locator("#setup-tls-server-name"); original = "tls.example.test"; different = "other.example.test";
         await page.locator("#setup-inspect-tls-button").click();
+        // A late inspection for a changed certificate name is dropped (#737),
+        // so let this one land before the name is typed.
+        await expect(page.locator('[data-tls-server-name="tls.example.test"]')).toBeVisible();
         await field.fill(original);
         apply = () => page.locator('[data-tls-server-name="tls.example.test"]').click();
       } else {
@@ -1223,6 +1226,9 @@ for (const kind of ["catalog", "TLS suggestions"]) {
       await page.locator("#setup-profile").selectOption("synthetic-profile");
     } else {
       await page.locator("#setup-inspect-tls-button").click();
+      // A late inspection for a changed certificate name is dropped (#737),
+      // so let this one land before the name is typed.
+      await expect(page.locator('[data-tls-server-name="tls.example.test"]')).toBeVisible();
       await page.locator("#setup-tls-server-name").fill("tls.example.test");
     }
     const r = await save(page, p);
