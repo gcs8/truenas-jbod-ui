@@ -84,6 +84,11 @@ _LINUX_SES_BAY_EVIDENCE = (
 _SG_SES_AES_EVIDENCE = ("sg_ses AES/EC",)
 _BMC_INVENTORY_EVIDENCE = ("BMC inventory",)
 
+# One retained ancestry membership is repeated on links, payloads and traces.
+# Reject the complete expansion on overflow, never publish a partial path.
+_MAX_MPR_ANCESTRY_NODES = 4096
+_MAX_MPR_ANCESTRY_MEMBERSHIPS = 16384
+
 
 def _select_sas_fabric_builder_key(system: SystemConfig, snapshot: InventorySnapshot) -> str:
     platform = system.truenas.platform
@@ -689,12 +694,12 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             evidence=["inventory snapshot", *_SLOT_MULTIPATH_EVIDENCE],
         )
 
-    _scope_mpr_infrastructure(
+    fabric_warnings.extend(_scope_mpr_infrastructure(
         nodes=nodes,
         links=links,
         traces=traces,
         snapshot=snapshot,
-    )
+    ))
     for controller in controllers:
         controller_node = nodes.get(str(controller.get("id") or ""))
         if controller_node:
@@ -2795,6 +2800,56 @@ def _mpr_evidence(unit: int, subcommand: str) -> list[str]:
     return [f"mprutil -u {unit} show {subcommand}"] if unit >= 0 else [f"mprutil show {subcommand}"]
 
 
+def _mpr_expander_parent_context(
+    expanders: list[dict[str, Any]], controller_id: str,
+) -> list[tuple[str | None, str]]:
+    """Admit only unique, level-consistent chains rooted at this controller.
+
+    Handles are local to one MPR unit. A level-1 row proves direct attachment
+    only when its parent is not another observed expander. Missing or conflicting
+    evidence never becomes an HBA fallback, including for descendants.
+    """
+    handles = [str(row.get("dev_handle") or "").lower() for row in expanders]
+    identities = [str(row.get("sas_address") or row.get("dev_handle") or "").lower() for row in expanders]
+    handle_counts, identity_counts = Counter(handles), Counter(identities)
+    by_handle = {handle: index for index, handle in enumerate(handles) if handle_counts[handle] == 1}
+    levels = [
+        int(value) if len(value) <= 10 and re.fullmatch(r"[0-9]+", value) else 0
+        for row in expanders
+        for value in [str(row.get("sas_level") or "")]
+    ]
+    result: list[tuple[str | None, str]] = [(None, "unknown") for _ in expanders]
+    # Increasing levels make admission independent of source enumeration and
+    # ensure a cycle cannot be admitted. No recursive traversal of source data.
+    for index in sorted(range(len(expanders)), key=lambda item: levels[item]):
+        row = expanders[index]
+        parent = str(row.get("parent") or "").lower()
+        if not handles[index] or handle_counts[handles[index]] != 1 or identity_counts[identities[index]] != 1:
+            reason = "ambiguous_identity"
+        elif levels[index] < 1:
+            reason = "invalid_level"
+        elif not parent:
+            reason = "missing_parent"
+        elif levels[index] == 1 and parent not in handle_counts:
+            result[index] = (controller_id, "resolved")
+            continue
+        elif parent not in by_handle:
+            reason = "unresolved_parent"
+        else:
+            parent_index = by_handle[parent]
+            if levels[parent_index] != levels[index] - 1:
+                reason = "contradictory_parent_level"
+            elif result[parent_index][0] is None:
+                reason = "upstream_unresolved"
+            else:
+                parent_row = expanders[parent_index]
+                parent_id = f"expander:{controller_id}:{parent_row.get('sas_address') or parent_row.get('dev_handle')}"
+                result[index] = (parent_id, "resolved")
+                continue
+        result[index] = (None, reason)
+    return result
+
+
 def _add_mpr_infrastructure(
     *,
     nodes: dict[str, SasFabricNode],
@@ -2819,7 +2874,9 @@ def _add_mpr_infrastructure(
         }
         selected_enc_handles.discard("")
         expander_ids_by_enc_handle: dict[str, list[str]] = defaultdict(list)
-        for expander in payload.get("expanders") or []:
+        expanders = payload.get("expanders") or []
+        parent_context = _mpr_expander_parent_context(expanders, controller_id)
+        for expander, (parent_id, parent_reason) in zip(expanders, parent_context, strict=True):
             expander_id = f"expander:{controller_id}:{expander.get('sas_address') or expander.get('dev_handle')}"
             expander_key = _identifier_lookup_key(expander.get("sas_address"))
             enc_handle = str(expander.get("enc_handle") or "")
@@ -2834,6 +2891,8 @@ def _add_mpr_infrastructure(
                 "selected_enclosure_candidate": selected_candidate,
                 "fabric_scope": "selected_enclosure" if selected_candidate else "unscoped",
                 **expander,
+                "parent_link_state": "resolved" if parent_id else "unknown",
+                "parent_link_reason": parent_reason,
             }
             add_node(
                 nodes,
@@ -2852,7 +2911,12 @@ def _add_mpr_infrastructure(
                     raw=raw,
                 ),
             )
-            add_link(links, controller_id, expander_id, "controller-expander")
+            if parent_id:
+                add_link(
+                    links, parent_id, expander_id,
+                    "controller-expander" if parent_id == controller_id else "expander-expander",
+                    evidence=_mpr_evidence(unit, "expanders"),
+                )
             if enc_handle:
                 expander_ids_by_enc_handle[enc_handle].append(expander_id)
 
@@ -2896,16 +2960,24 @@ def _scope_mpr_infrastructure(
     links: dict[str, SasFabricLink],
     traces: dict[str, SasFabricTrace],
     snapshot: InventorySnapshot,
-) -> None:
+) -> list[str]:
     selected_bay_slots = _snapshot_slot_numbers(snapshot.slots)
     selected_disk_slots = _snapshot_disk_slot_numbers(snapshot.slots)
     scoped_node_ids: set[str] = set()
     controller_slot_updates: dict[str, list[int]] = defaultdict(list)
+    expanders = [node for node in nodes.values() if node.kind == "expander"]
+    # Include selected-scope seeding in the budget before copying any bay list.
+    seed_memberships = sum(len(node.related_slots) if node.related_slots else
+                           len(selected_bay_slots) if node.raw.get("selected_enclosure_candidate") else 0
+                           for node in expanders)
+    limited = len(expanders) > _MAX_MPR_ANCESTRY_NODES or seed_memberships > _MAX_MPR_ANCESTRY_MEMBERSHIPS
 
     for node in list(nodes.values()):
         if node.kind not in {"expander", "mpr-enclosure"}:
             continue
         if not node.raw.get("selected_enclosure_candidate"):
+            continue
+        if limited and node.kind == "expander":
             continue
         scoped_node_ids.add(node.id)
         if not node.related_slots and selected_bay_slots:
@@ -2929,6 +3001,54 @@ def _scope_mpr_infrastructure(
         if node.controller_id:
             controller_slot_updates[node.controller_id].extend(node.related_slots)
 
+    # Keep verified upstream context for selected expanders, not their siblings
+    # or enclosures. Related bays describe reachability here, not bay identity
+    # or membership in the selected enclosure.
+    upstream_by_target = {
+        link.target: link.source for link in links.values() if link.kind == "expander-expander"
+    }
+    context_node_ids = set(scoped_node_ids)
+    # Parent links are already admitted as unique, level-consistent chains by
+    # _mpr_expander_parent_context. Process children before parents so each
+    # edge contributes its complete slot set once, not once per arriving leaf.
+    membership_count = sum(len(node.related_slots) for node in expanders)
+    slot_sets = {} if limited else {node.id: set(node.related_slots) for node in expanders}
+    child_counts = dict.fromkeys(slot_sets, 0)
+    for child_id, parent_id in upstream_by_target.items():
+        if child_id in slot_sets and parent_id in slot_sets:
+            child_counts[parent_id] += 1
+    pending = [node_id for node_id, count in child_counts.items() if count == 0]
+    updated_node_ids: set[str] = set()
+    while pending:
+        child_id = pending.pop()
+        parent_id = upstream_by_target.get(child_id)
+        if parent_id not in slot_sets:
+            continue
+        if slot_sets[child_id]:
+            additions = slot_sets[child_id] - slot_sets[parent_id]
+            if membership_count + len(additions) > _MAX_MPR_ANCESTRY_MEMBERSHIPS:
+                limited = True
+                break
+            membership_count += len(additions)
+            slot_sets[parent_id].update(additions)
+            context_node_ids.add(parent_id)
+            updated_node_ids.add(parent_id)
+        child_counts[parent_id] -= 1
+        if child_counts[parent_id] == 0:
+            pending.append(parent_id)
+    if limited:
+        # Staged memberships have not reached nodes. Retain direct observations,
+        # but no partial ancestry can imply verified controller connectivity.
+        context_node_ids = set(scoped_node_ids)
+        for node in expanders:
+            node.raw.update(parent_link_state="unknown", parent_link_reason="resource_limit")
+        for link_id, link in list(links.items()):
+            if link.kind in {"controller-expander", "expander-expander"}:
+                links.pop(link_id)
+    else:
+        for node_id in updated_node_ids:
+            nodes[node_id].related_slots = sorted(slot_sets[node_id])
+
     for controller_id, slots in controller_slot_updates.items():
         controller = nodes.get(controller_id)
         if not controller:
@@ -2942,7 +3062,7 @@ def _scope_mpr_infrastructure(
         source = nodes.get(link.source)
         target = nodes.get(link.target)
         related_slots = _dedupe_ints([*(source.related_slots if source else []), *(target.related_slots if target else [])])
-        if not link.related_slots and (link.source in scoped_node_ids or link.target in scoped_node_ids):
+        if not link.related_slots and (link.source in context_node_ids or link.target in context_node_ids):
             link.related_slots = related_slots or list(selected_bay_slots)
         if link.kind == "host-controller" and link.target in controller_slot_updates:
             link.related_slots = _dedupe_ints([*link.related_slots, *controller_slot_updates[link.target]])
@@ -2962,18 +3082,18 @@ def _scope_mpr_infrastructure(
 
     scoped_controller_ids = {
         node.controller_id
-        for node_id in scoped_node_ids
+        for node_id in context_node_ids
         for node in [nodes.get(node_id)]
         if node and node.controller_id
     }
     scoped_link_ids = [
         link.id
         for link in links.values()
-        if link.source in scoped_node_ids
-        or link.target in scoped_node_ids
+        if (link.source in context_node_ids and link.target in context_node_ids)
+        or (link.source in scoped_controller_ids and link.target in context_node_ids)
         or (link.kind == "host-controller" and link.target in scoped_controller_ids)
     ]
-    scoped_trace_node_ids = _dedupe_strings(["host", *scoped_controller_ids, *scoped_node_ids])
+    scoped_trace_node_ids = _dedupe_strings(["host", *sorted(scoped_controller_ids), *sorted(context_node_ids)])
     for trace in traces.values():
         if trace.kind != "bay" or not slots_overlap(trace.slots, selected_bay_slots):
             continue
@@ -2984,9 +3104,26 @@ def _scope_mpr_infrastructure(
         trace.evidence = _dedupe_strings([*trace.evidence, "selected enclosure scope"])
         trace.metrics["selected_enclosure_scope"] = True
 
+    # Existing member-derived bay/path traces need only their verified upstream
+    # chain, never sibling expanders or the ancestors' other enclosures.
+    parent_links = {link.target: link for link in links.values()
+                    if link.kind in {"controller-expander", "expander-expander", "host-controller"}}
     for trace in traces.values():
-        trace.node_ids = [node_id for node_id in trace.node_ids if node_id in nodes]
-        trace.link_ids = [link_id for link_id in trace.link_ids if link_id in links]
+        trace_nodes = set(trace.node_ids)
+        trace_links = set(trace.link_ids)
+        pending_nodes = list(trace_nodes)
+        while pending_nodes:
+            link = parent_links.get(pending_nodes.pop())
+            if link is None:
+                continue
+            trace_links.add(link.id)
+            if link.source not in trace_nodes:
+                trace_nodes.add(link.source)
+                pending_nodes.append(link.source)
+        trace.node_ids = [node_id for node_id in _dedupe_strings([*trace.node_ids, *sorted(trace_nodes)]) if node_id in nodes]
+        trace.link_ids = [link_id for link_id in _dedupe_strings([*trace.link_ids, *sorted(trace_links)]) if link_id in links
+                          and links[link_id].source in trace_nodes and links[link_id].target in trace_nodes]
+    return ["MPR expander ancestry resource limit exceeded; upstream connectivity is unknown."] if limited else []
 
 
 def slots_overlap(left: list[int], right: list[int]) -> bool:

@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Storage Fabric linked cascaded MPR expanders through unique, consistent
+  reported parents, retained verified ancestors in selected traces, and bounded
+  propagated bay memberships; missing, conflicting or over-limit ancestry stayed
+  unknown (#970).
 - Late TLS certificate inspect and trust answers stopped changing a different
   editor or target, and backup status and API responses stopped carrying raw
   provider error text (#1054).
