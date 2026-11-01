@@ -315,6 +315,18 @@ BACKUP_OPERATION_DURATION_SECONDS = Histogram(
     namespace=METRICS_NAMESPACE,
     buckets=HTTP_DURATION_BUCKETS,
 )
+BACKUP_7Z_DEADLINE_SECONDS = Gauge(
+    "backup_7z_deadline_seconds",
+    "Deadline applied to the latest portable 7z backup step, scaled from its input size.",
+    labelnames=("operation",),
+    namespace=METRICS_NAMESPACE,
+)
+BACKUP_7Z_INPUT_BYTES = Gauge(
+    "backup_7z_input_bytes",
+    "Staged input bytes of the latest portable 7z backup step.",
+    labelnames=("operation",),
+    namespace=METRICS_NAMESPACE,
+)
 
 
 def metrics_enabled() -> bool:
@@ -449,6 +461,14 @@ def observe_backup_operation(
     }
     BACKUP_OPERATIONS_TOTAL.labels(**labels).inc()
     BACKUP_OPERATION_DURATION_SECONDS.labels(**labels).observe(max(0.0, duration_seconds))
+
+
+def observe_backup_7z_deadline(*, operation: str, input_bytes: int, deadline_seconds: int) -> None:
+    if not metrics_enabled():
+        return
+    normalized_operation = operation if operation == "create" else "unknown"
+    BACKUP_7Z_DEADLINE_SECONDS.labels(operation=normalized_operation).set(max(0, deadline_seconds))
+    BACKUP_7Z_INPUT_BYTES.labels(operation=normalized_operation).set(max(0, input_bytes))
 
 
 def set_history_collector_running(service_name: str, running: bool) -> None:

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import warnings
 import zipfile
@@ -23,6 +24,7 @@ from typing import Any
 from unittest.mock import patch
 
 import yaml
+from prometheus_client import REGISTRY
 
 from tests import heap_probe
 from app.config import PathConfig, Settings, get_settings
@@ -62,7 +64,10 @@ from history_service.system_backup import (
     SAS_FABRIC_ALIAS_FILE_KEY,
     SEGMENT_FILE_MODE,
     SEVEN_ZIP_SIGNATURE,
+    SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND,
+    SEVEN_ZIP_MAX_TIMEOUT_SECONDS,
     SEVEN_ZIP_TIMEOUT_SECONDS,
+    seven_zip_create_timeout_seconds,
     SLOT_DETAIL_FILE_KEY,
     SSH_KEYS_KEY,
     TLS_TRUST_KEY,
@@ -3652,6 +3657,166 @@ class SystemBackupServiceTests(unittest.TestCase):
     def test_7z_timeout_allows_restore_grade_full_history_archives(self) -> None:
         self.assertGreaterEqual(SEVEN_ZIP_TIMEOUT_SECONDS, 600)
 
+    def test_7z_create_deadline_keeps_base_for_small_input(self) -> None:
+        floor = SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND
+        for input_bytes in (0, 1, 64 * 1024 * 1024, SEVEN_ZIP_TIMEOUT_SECONDS * floor):
+            with self.subTest(input_bytes=input_bytes):
+                self.assertEqual(seven_zip_create_timeout_seconds(input_bytes), SEVEN_ZIP_TIMEOUT_SECONDS)
+
+    def test_7z_create_deadline_scales_with_large_input(self) -> None:
+        floor = SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND
+        base_bytes = SEVEN_ZIP_TIMEOUT_SECONDS * floor
+        self.assertEqual(seven_zip_create_timeout_seconds(base_bytes + 1), SEVEN_ZIP_TIMEOUT_SECONDS + 1)
+        self.assertEqual(
+            seven_zip_create_timeout_seconds(2 * 1024 * 1024 * 1024),
+            -(-2 * 1024 * 1024 * 1024 // floor),
+        )
+        self.assertGreater(seven_zip_create_timeout_seconds(2 * 1024 * 1024 * 1024), SEVEN_ZIP_TIMEOUT_SECONDS)
+
+    def test_7z_create_deadline_ceiling_holds(self) -> None:
+        floor = SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND
+        ceiling_bytes = SEVEN_ZIP_MAX_TIMEOUT_SECONDS * floor
+        self.assertEqual(SEVEN_ZIP_MAX_TIMEOUT_SECONDS, 4 * 60 * 60)
+        self.assertEqual(seven_zip_create_timeout_seconds(ceiling_bytes), SEVEN_ZIP_MAX_TIMEOUT_SECONDS)
+        for input_bytes in (ceiling_bytes + 1, 1024**4):
+            with self.subTest(input_bytes=input_bytes):
+                self.assertEqual(seven_zip_create_timeout_seconds(input_bytes), SEVEN_ZIP_MAX_TIMEOUT_SECONDS)
+        # The largest admitted FULL archive input still gets its scaled deadline.
+        self.assertLess(
+            seven_zip_create_timeout_seconds(MAX_FILE_BACKED_ARCHIVE_EXPANDED_BYTES),
+            SEVEN_ZIP_MAX_TIMEOUT_SECONDS,
+        )
+        for invalid in (-1, 1.5, True, None):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    seven_zip_create_timeout_seconds(invalid)  # type: ignore[arg-type]
+
+    def _staged_7z_build(self, *, passphrase: str | None = None, payload_bytes: int = 5000):
+        archive_path = self.temp_dir / "scaled.7z"
+        member_path = self.temp_dir / "synthetic-history.db"
+        member_path.write_bytes(b"s" * payload_bytes)
+        member = BundleMember(
+            key=HISTORY_DB_KEY,
+            group_key=HISTORY_DB_KEY,
+            archive_path="history/history.db",
+            source_path=None,
+            present=True,
+            content=None,
+            file_path=member_path,
+        )
+        manifest_bytes = b'{"synthetic": true}'
+        return archive_path, member, manifest_bytes, payload_bytes + len(manifest_bytes)
+
+    def test_7z_create_passes_size_scaled_deadline_and_records_it(self) -> None:
+        archive_path, member, manifest_bytes, input_bytes = self._staged_7z_build()
+        success = subprocess.CompletedProcess(args=["7z"], returncode=0, stdout="Everything is Ok", stderr="")
+        with (
+            patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 1),
+            patch("history_service.system_backup.SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND", 1024),
+            patch.dict("os.environ", {"METRICS_ENABLED": "true"}, clear=False),
+            patch.object(self.backup_service, "_run_7z_command", return_value=success) as run_7z,
+            self.assertLogs("history_service.system_backup", level="INFO") as captured,
+        ):
+            self.backup_service._build_7z_archive_to_path([member], manifest_bytes, archive_path)
+
+        expected = -(-input_bytes // 1024)
+        self.assertEqual(run_7z.call_args.kwargs["timeout_seconds"], expected)
+        self.assertEqual(
+            REGISTRY.get_sample_value(
+                "truenas_jbod_ui_backup_7z_deadline_seconds", {"operation": "create"}
+            ),
+            expected,
+        )
+        self.assertEqual(
+            REGISTRY.get_sample_value(
+                "truenas_jbod_ui_backup_7z_input_bytes", {"operation": "create"}
+            ),
+            input_bytes,
+        )
+        joined = "\n".join(captured.output)
+        self.assertIn(f"deadline_seconds={expected}", joined)
+        self.assertIn(f"input_bytes={input_bytes}", joined)
+        self.assertNotIn(str(self.temp_dir), joined)
+
+    def test_7z_create_timeout_past_scaled_deadline_raises_same_error(self) -> None:
+        archive_path, member, manifest_bytes, input_bytes = self._staged_7z_build()
+        waits: list[float | None] = []
+
+        class SlowProcess:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.returncode: int | None = None
+                self.killed = False
+
+            def wait(self, timeout: float | None = None) -> int:
+                waits.append(timeout)
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("7z", timeout)
+                self.returncode = -9
+                return -9
+
+            def kill(self) -> None:
+                self.killed = True
+
+        processes: list[SlowProcess] = []
+
+        def popen(*args, **kwargs):
+            process = SlowProcess()
+            processes.append(process)
+            return process
+
+        with (
+            patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 1),
+            patch("history_service.system_backup.SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND", 1024),
+            patch("history_service.system_backup.subprocess.Popen", side_effect=popen),
+        ):
+            with self.assertRaisesRegex(ValueError, r"^Portable 7z backup operation timed out\.$"):
+                self.backup_service._build_7z_archive_to_path([member], manifest_bytes, archive_path)
+
+        self.assertEqual(waits[0], -(-input_bytes // 1024))
+        self.assertTrue(processes and all(process.killed for process in processes))
+
+    def test_7z_prompt_command_honors_explicit_deadline(self) -> None:
+        program = "import os, time\nos.write(1, b'working')\ntime.sleep(30)\n"
+        started = time.monotonic()
+        with patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 30):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                self.backup_service._run_7z_prompt_command(
+                    [sys.executable, "-c", program],
+                    cwd=None,
+                    passphrase="synthetic-only",
+                    timeout_seconds=0.3,
+                )
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(raised.exception.timeout, 0.3)
+
+    def test_7z_encrypted_create_keeps_passphrase_out_of_args_with_scaled_deadline(self) -> None:
+        secret = "synthetic scaled-deadline secret"
+        archive_path, member, manifest_bytes, input_bytes = self._staged_7z_build(passphrase=secret)
+        calls: list[dict[str, Any]] = []
+
+        def prompt(command, *, cwd, passphrase, timeout_seconds=None):
+            calls.append({"command": list(command), "timeout_seconds": timeout_seconds})
+            return subprocess.CompletedProcess(command, 0, stdout="Everything is Ok", stderr="")
+
+        with (
+            patch("history_service.system_backup.SEVEN_ZIP_TIMEOUT_SECONDS", 1),
+            patch("history_service.system_backup.SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND", 1024),
+            patch.object(SystemBackupService, "_run_7z_prompt_command", side_effect=prompt),
+            self.assertLogs("history_service.system_backup", level="INFO") as captured,
+        ):
+            self.backup_service._build_7z_archive_to_path(
+                [member], manifest_bytes, archive_path, passphrase=secret
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["timeout_seconds"], -(-input_bytes // 1024))
+        self.assertIn("-p", calls[0]["command"])
+        self.assertIn("-mmt=1", calls[0]["command"])
+        self.assertNotIn(secret, json.dumps(calls[0]["command"]))
+        self.assertNotIn(secret, "\n".join(captured.output))
+
     def test_7z_export_uses_memory_bounded_compression_profile(self) -> None:
         archive_path = self.temp_dir / "bounded.7z"
         success = subprocess.CompletedProcess(
@@ -4519,8 +4684,9 @@ sys.stdout.flush()
             *,
             cwd: Path | None = None,
             passphrase: str | None = None,
+            timeout_seconds: float | None = None,
         ) -> subprocess.CompletedProcess[str]:
-            del cwd, passphrase
+            del cwd, passphrase, timeout_seconds
             nonlocal payload_extraction_started
             if args[0] == "l":
                 return subprocess.CompletedProcess(
@@ -5476,7 +5642,9 @@ sys.stdout.flush()
         *,
         cwd: Path | None = None,
         passphrase: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
         command = args[0]
         argv_passphrase = None
         output_dir: Path | None = None
@@ -6573,7 +6741,9 @@ sys.stdout.flush()
             *,
             cwd: Path | None = None,
             passphrase: str | None = None,
+            timeout_seconds: float | None = None,
         ) -> subprocess.CompletedProcess[str]:
+            del timeout_seconds
             self.assertFalse(any(expected_passphrase in arg for arg in args))
             observed_commands.append((list(args), passphrase))
             return self._fake_7z_command(
