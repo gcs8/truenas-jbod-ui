@@ -51,6 +51,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- On TrueNAS CORE a multipath bay no longer shows another disk's GPTID, pool
+  and vdev when that label's hex happens to contain the bay's device name:
+  `glabel status` is read by column, each geom keeps its pooled partition's
+  label, and a bay whose gmultipath, glabel and pool sources disagree shows
+  its membership as unknown with a warning (#1060).
 - `prepare_nonroot_bind_mounts.py --apply` stopped running alongside services:
   it took the deployment's `writer-fence` lock exclusively, refused to start
   while a service from the current Compose files was up, and made services
