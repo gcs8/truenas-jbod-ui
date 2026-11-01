@@ -206,6 +206,13 @@ METRICS_PATH=/metrics
 
 Allowed `operation` values: `inspect`, `import`, or `unknown`. Allowed `outcome` values: `success`, `rejected`, or `error`. Unexpected values use the bounded `unknown` or `error` buckets.
 
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `truenas_jbod_ui_backup_7z_deadline_seconds` | `operation` | Deadline, in seconds, applied to the latest portable 7z create step in this process |
+| `truenas_jbod_ui_backup_7z_input_bytes` | `operation` | Staged input bytes of that 7z create step |
+
+The 7z create deadline is 600 seconds or the staged input divided by 512 KiB/s, whichever is longer, capped at 4 hours. The only `operation` value is `create`. A process that does not serve `/metrics`, such as the scheduled backup job, logs the same values in its `Portable 7z create deadline` line instead.
+
 Request IDs never become metric labels. Metric labels also omit paths, archive names, system identifiers, credentials, request content, and exception messages.
 
 ### HTTP request labels

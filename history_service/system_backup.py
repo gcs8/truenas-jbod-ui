@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover - exercised in runtime validation instea
     zstd = None
 
 from app import __version__
+from app.metrics import observe_backup_7z_deadline
 from app.config import (
     EnclosureProfileConfig,
     Settings,
@@ -258,6 +259,15 @@ ENCRYPTED_BACKUP_SCRYPT_N = 2**15
 ENCRYPTED_BACKUP_SCRYPT_R = 8
 ENCRYPTED_BACKUP_SCRYPT_P = 1
 SEVEN_ZIP_TIMEOUT_SECONDS = 600
+# The portable 7z FULL writer stays single-threaded LZMA2 (-mx=5 -mmt=1), so its
+# create step scales with the staged input. Its deadline is the base above or the
+# input divided by a conservative measured throughput floor, whichever is longer,
+# never above the hard ceiling. A synthetic history-schema SQLite file compressed
+# at about 3.7 MiB/s (mixed text) and 0.95 MiB/s (mostly random) on one 2.3 GHz
+# Xeon core; the floor sits below both for slower or busier hosts. Below about
+# 300 MiB of input the deadline stays 600 s. List, test and extract keep 600 s.
+SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND = 512 * 1024
+SEVEN_ZIP_MAX_TIMEOUT_SECONDS = 4 * 60 * 60
 SEVEN_ZIP_BINARY = "7z"
 MAX_BACKUP_ARCHIVE_BYTES = 256 * 1024 * 1024
 MAX_FILE_BACKED_BACKUP_ARCHIVE_BYTES = 6 * 1024 * 1024 * 1024
@@ -2197,6 +2207,15 @@ class _PreadView:
         if len(data) != length:
             raise ValueError("Backup bundle TAR member data is truncated.")
         return data
+
+
+def seven_zip_create_timeout_seconds(input_bytes: int) -> int:
+    """Deadline for one portable 7z create step over ``input_bytes`` of staged input."""
+
+    if type(input_bytes) is not int or input_bytes < 0:
+        raise ValueError("Portable 7z input size must be a non-negative byte count.")
+    scaled = -(-input_bytes // SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND)
+    return min(max(SEVEN_ZIP_TIMEOUT_SECONDS, scaled), SEVEN_ZIP_MAX_TIMEOUT_SECONDS)
 
 
 class SystemBackupService:
@@ -5457,10 +5476,28 @@ class SystemBackupService:
             if passphrase is not None:
                 command.insert(4, "-mhe=on")
                 command.insert(4, "-p")
+            input_bytes = sum(
+                path.stat().st_size for path in staging_dir.rglob("*") if path.is_file()
+            )
+            timeout_seconds = seven_zip_create_timeout_seconds(input_bytes)
+            observe_backup_7z_deadline(
+                operation="create",
+                input_bytes=input_bytes,
+                deadline_seconds=timeout_seconds,
+            )
+            logger.info(
+                "Portable 7z create deadline: input_bytes=%d deadline_seconds=%d "
+                "floor_bytes_per_second=%d ceiling_seconds=%d",
+                input_bytes,
+                timeout_seconds,
+                SEVEN_ZIP_CREATE_MIN_BYTES_PER_SECOND,
+                SEVEN_ZIP_MAX_TIMEOUT_SECONDS,
+            )
             result = self._run_7z_command(
                 command,
                 cwd=staging_dir,
                 passphrase=passphrase,
+                timeout_seconds=timeout_seconds,
             )
             self._raise_for_7z_failure(
                 result,
@@ -7187,7 +7224,9 @@ class SystemBackupService:
         *,
         cwd: Path | None = None,
         passphrase: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        timeout = SEVEN_ZIP_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         try:
             command = [SEVEN_ZIP_BINARY, *args]
             if passphrase is not None:
@@ -7195,6 +7234,7 @@ class SystemBackupService:
                     command,
                     cwd=cwd,
                     passphrase=passphrase,
+                    timeout_seconds=timeout,
                 )
             process = subprocess.Popen(
                 command,
@@ -7240,7 +7280,7 @@ class SystemBackupService:
             stdout_thread.start()
             stderr_thread.start()
             try:
-                returncode = process.wait(timeout=SEVEN_ZIP_TIMEOUT_SECONDS)
+                returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
@@ -7274,7 +7314,9 @@ class SystemBackupService:
         *,
         cwd: Path | None,
         passphrase: str,
+        timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        timeout = SEVEN_ZIP_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
         if "\n" in passphrase or "\r" in passphrase:
             raise ValueError("Portable 7z backup passphrases cannot contain line breaks.")
         try:
@@ -7307,7 +7349,7 @@ class SystemBackupService:
             )
             os.close(slave_fd)
             slave_fd = -1
-            deadline = time.monotonic() + SEVEN_ZIP_TIMEOUT_SECONDS
+            deadline = time.monotonic() + timeout
             poller = select.poll()
             poller.register(master_fd, select.POLLIN | select.POLLHUP | select.POLLERR)
             while True:
@@ -7315,7 +7357,7 @@ class SystemBackupService:
                 if remaining <= 0:
                     process.kill()
                     process.wait()
-                    raise subprocess.TimeoutExpired(command, SEVEN_ZIP_TIMEOUT_SECONDS)
+                    raise subprocess.TimeoutExpired(command, timeout)
                 ready = bool(poller.poll(max(1, int(min(remaining, 0.1) * 1000))))
                 if ready:
                     try:

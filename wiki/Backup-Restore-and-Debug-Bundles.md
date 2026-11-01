@@ -71,7 +71,7 @@ first, then restore.`
 
 A hot-only deployment exports backup schema 1. A deployment with `HISTORY_SEGMENT_CATALOG_PATH` exports schema 2. Schema 2 includes the hot database, every immutable segment, and the complete catalog generation. Restore validates every member and stages the hot database and segment directory as one rollback-capable transaction. The target must configure `HISTORY_SEGMENT_CATALOG_PATH` before restoring schema 2.
 
-Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive space for the hot database plus every active segment. Each 7z create, verify, list, or extract operation has a 10-minute limit and uses normal compression with one worker thread.
+Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive space for the hot database plus every active segment. 7z uses normal compression with one worker thread. Each 7z verify, list, or extract operation has a 10-minute limit. The create step allows 10 minutes or one second per 512 KiB of staged input, whichever is longer, up to 4 hours.
 
 The base Compose file keeps large temporary workspaces on disk-backed scratch
 inside an existing state mount. `TMPDIR` points history work at `/app/history`,
@@ -320,9 +320,14 @@ These are whole production operations measured with
 `scripts/benchmark_full_backup.py`, with a 1 GiB address-space limit on each
 phase.
 
-`7z` spends most of a full backup compressing on one core, and each 7z step
-stops after 10 minutes, so a history database of about 2 GiB or more can fail
-there. That is why `tar.zst` is the default. Choose `7z` if you may need to
+`7z` spends most of a full backup compressing on one core, so its create step
+gets 10 minutes or one second per 512 KiB of staged input, whichever is longer,
+up to 4 hours (about 7 GiB). The 512 KiB/s floor sits below the single-core
+rates measured on synthetic history (about 3.6 MiB/s for mixed text and
+0.95 MiB/s for mostly random data). The export log and the
+`truenas_jbod_ui_backup_7z_deadline_seconds` metric show the deadline used.
+Verify, list and extract steps still stop after 10 minutes. That is why
+`tar.zst` is the default. Choose `7z` if you may need to
 restore on an older app version or open the file with 7-Zip.
 
 The `tar.zst` file checks every 1 MiB chunk before using it, so a wrong
