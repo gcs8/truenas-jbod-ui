@@ -94,7 +94,7 @@ strict host-key checking against a pinned key:
 
 - #1055: bootstrap for BMC/IPMI and ESXi was refused before any key lookup or
   connection, and the IPMI sudo preview is disabled.
-- #957, #960, #1025: a Home directory outside `/mnt/<pool>/` was refused
+- #957, #960, #1025: a Home directory that is not a folder on a pool was refused
   before connecting. A missing account with no Home directory was refused with
   no account, group or home created. With a Home directory on the pool,
   bootstrap created the account through `user.create`; the middleware readback
