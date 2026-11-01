@@ -26,10 +26,54 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.4 - 2026-11-01
+
+This prerelease adds the fixes merged after `v0.24.0-beta.3`. GHCR gets the
+fixed `v0.24.0-beta.4` and `0.24.0-beta.4` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- TrueNAS CORE setup works from a fresh host: the one-time bootstrap sends its
+  script on stdin, creates a missing service account through the middleware
+  with a validated UID, and stores SMART grants that still match after TrueNAS
+  saves them. It refuses BMC/IPMI targets and any empty sudo policy instead of
+  writing one (#957, #960, #1025, #1055).
+- CORE read over SSH shows each backplane as its own shelf, restores pool and
+  vdev labels through multipath without moving a geom's label onto another
+  bay, and names the real source of its bays (#955, #958, #1022, #1060).
+- An expired or not-yet-valid TrueNAS certificate is named as the problem, and
+  late TLS inspect answers no longer change a different editor (#965, #1054).
+- Same-model SES shelves stay separate, cascaded expanders keep their verified
+  parents in Storage Fabric, and disk details show the SAS and SATA error
+  counters already collected (#970, #1000, #1008, #1018).
+- `prepare_nonroot_bind_mounts.py --apply` now holds a writer fence, so it
+  refuses to run while a fenced service is up and services started during the
+  run wait for it (#1057).
 
 ### Upgrade notes
 
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.3`, read every
+  note below; upgrading from `v0.23.0` or older, read the `v0.24.0-beta.1` to
+  `v0.24.0-beta.3` upgrade notes too.
+- The image now starts every service through a writer-fence entrypoint, and
+  the published Compose files mount `./writer-fence:/run/writer-fence:ro` on
+  all five services. Take the new `docker-compose.yml` with the image. Docker
+  creates `./writer-fence` next to `data` on first start. With an older
+  Compose file the services still start, and each logs `writer fence:
+  /run/writer-fence is not mounted; this container is not fenced against the
+  non-root ownership helper`; stop every service yourself before running
+  `prepare_nonroot_bind_mounts.py --apply` in that case. If `./writer-fence`
+  exists but is a file or symlink, the containers refuse to start. Wrap host
+  jobs that write under the deployment folder in
+  `flock --shared ./writer-fence <command>` (#1057).
+- CORE hosts set up by an older bootstrap keep SMART grants that TrueNAS no
+  longer matches. Re-run SSH access setup to replace them. The bootstrap no
+  longer takes a sudo password on any platform: bootstrap as `root`, or as a
+  user with password-less sudo (#957, #960).
+- Changing a saved system's platform, host, user or TLS settings in System
+  Setup now asks for its API key or password again before Save (#965).
 - On TrueNAS CORE hosts read over SSH only, separate backplanes and AHCI SGPIO
   ports are no longer one combined enclosure, so its id changes; save bay
   assignments made on the old combined view again (#955).
@@ -147,19 +191,19 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   recognised, so it no longer confirms another drive's light (#984).
 - CORE SSH stopped stacking separate backplanes and AHCI SGPIO ports into one
   shelf drawn as the 60-bay CSE-946, and read pool names without the API
-  (#955).
+  (#955, fixes #948).
 - A storage-view disk whose pool member was DEGRADED or FAULTED was drawn
   Fault instead of Healthy, and a TrueNAS pool that was not ONLINE was named
-  in the page warnings (#956).
+  in the page warnings (#956, fixes #949).
 - The TrueNAS CORE one-time bootstrap ran its script through
   `/bin/sh -lc` and created missing users with `pw useradd`. It now sends the
   script on stdin, stops before any change when the CORE account is missing or
   its home is not under `/mnt`, and stores SMART grants that still match after
-  the middleware escapes commas (#957).
+  the middleware escapes commas (#957, fixes #943).
 - The TrueNAS CORE one-time bootstrap stopped when the service account did not
   exist yet. It now creates the account through `midclt call user.create` when
   the new Home directory field names a folder on a pool, and the unused
-  bootstrap sudo-password field was removed (#960).
+  bootstrap sudo-password field was removed (#960, fixes #947).
 - The TrueNAS CORE one-time bootstrap ignored an invalid Home directory field
   for an existing account, while still refusing it before any host change when
   account creation was needed (#993).
@@ -167,22 +211,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   had mapped the bays, named the real source of enclosures and bay positions,
   said "Empty" for an empty NVMe slot, did not offer locate lights on a view
   without them, and dropped "Previous version unknown" on a first start
-  (#958).
+  (#958, fixes #950).
 - Admin no longer saves the generated Primary Chassis with the layout it picked
   before one was chosen; it follows the system's Chassis layout, stays deleted
-  once removed, and the main page labels it Chassis, not Saved view (#959).
+  once removed, and the main page labels it Chassis, not Saved view
+  (#959, fixes #953).
 - A view added from the AOC-SLG4-2H8M2 template now shows on the main page and
   gets the ESXi RAID member IDs only on ESXi, and a 2x M.2 carrier (passive)
-  template was added for plain two-slot cards (#963).
+  template was added for plain two-slot cards (#963, fixes #951).
 - System Setup no longer pins an expired or not-yet-valid certificate or turns
   certificate checks on for a bundle that failed validation. It shows the
   saved bundle's real failure after a reload and marks the API key for
   re-entry when TLS settings change, and the main page names a failed
-  certificate check instead of calling the API unreachable (#965).
+  certificate check instead of calling the API unreachable (#965, fixes #954).
 - Admin's Add a view listed the AOC-SLG4-2H8M2 card and FatTwin Rear 2 twice,
   and the system Chassis layout list offered them; each is now listed once, a
   system saved with one keeps it, the drive list heading matches its drives,
-  and NVMe drives no longer start with "UNKNOWN" (#966).
+  and NVMe drives no longer start with "UNKNOWN" (#966, fixes #952).
 
 ### Performance
 
