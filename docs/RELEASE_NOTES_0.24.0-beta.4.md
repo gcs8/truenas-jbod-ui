@@ -21,7 +21,8 @@ each pull request.
   without a command-limited sudo policy instead of writing one.
 - CORE read over SSH draws each backplane and AHCI SGPIO port as its own shelf
   instead of one 60-bay CSE-946, restores pool and vdev labels through
-  multipath, and names the real source of its bays.
+  multipath, keeps each multipath bay on its own geom's label, pool and vdev,
+  and names the real source of its bays.
 - An expired or not-yet-valid TrueNAS certificate is named as the problem.
   System Setup refuses to pin it, and late certificate inspect answers no
   longer change a different editor.

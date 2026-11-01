@@ -40,8 +40,8 @@ fixed `v0.24.0-beta.4` and `0.24.0-beta.4` tags and moves `dev` to it;
   saves them. It refuses BMC/IPMI targets and any empty sudo policy instead of
   writing one (#957, #960, #1025, #1055).
 - CORE read over SSH shows each backplane as its own shelf, restores pool and
-  vdev labels through multipath, and names the real source of its bays
-  (#955, #958, #1022).
+  vdev labels through multipath without moving a geom's label onto another
+  bay, and names the real source of its bays (#955, #958, #1022, #1060).
 - An expired or not-yet-valid TrueNAS certificate is named as the problem, and
   late TLS inspect answers no longer change a different editor (#965, #1054).
 - Same-model SES shelves stay separate, cascaded expanders keep their verified
