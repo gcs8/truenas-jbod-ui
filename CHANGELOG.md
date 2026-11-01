@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- An explicit `7z` FULL backup of a large history no longer times out after
+  10 minutes: the single-thread 7z create step now gets 10 minutes or one
+  second per 512 KiB of staged input, whichever is longer, up to 4 hours, and
+  logs and exports the deadline it used (#1062).
 - On TrueNAS CORE a multipath bay no longer shows another disk's GPTID, pool
   and vdev when that label's hex happens to contain the bay's device name:
   `glabel status` is read by column, each geom keeps its pooled partition's
