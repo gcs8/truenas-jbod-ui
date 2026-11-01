@@ -43,6 +43,7 @@ config/*
 !config/config.example.yaml
 backups/
 backup-status/
+writer-fence/
 host-prep/
 data/*
 history/*

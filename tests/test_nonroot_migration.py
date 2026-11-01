@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import os
 import resource
+import shutil
 import stat
 import subprocess
 import sys
@@ -566,6 +567,340 @@ class NonRootMigrationTests(unittest.TestCase):
                 MODULE._close_opened_descriptors(opened)
 
         self.assertEqual(close.call_args_list, [call(11), call(10)])
+
+
+WRITER_FENCE_ENTRYPOINT = SCRIPT_PATH.parents[1] / "app/writer_fence.py"
+
+
+class NonRootWriterFenceTests(unittest.TestCase):
+    """#884 option 1: writers hold LOCK_SH on ROOT/writer-fence; --apply holds LOCK_EX|LOCK_NB.
+
+    Writers are real subprocesses: the image entrypoint script for containers and
+    the documented shared flock for host jobs. Ownership changes target the
+    test's own uid/gid, so nothing here needs or performs a privileged chown.
+    """
+
+    ATTACK = (
+        "import os, sys; "
+        "os.link(sys.argv[2], sys.argv[3]) if sys.argv[1] == 'link' "
+        "else os.rename(sys.argv[2], sys.argv[3])"
+    )
+    HOLD = "import sys; print('running', flush=True); sys.stdin.read()"
+    # MODULE.os is this process's os module, so hooks must call the saved originals.
+    REAL_FCHOWN = staticmethod(os.fchown)
+    REAL_FCHMOD = staticmethod(os.fchmod)
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.fence = self.root / "writer-fence"
+        self.selected = self.root / "data/nested/runtime.db"
+        self.selected.parent.mkdir(parents=True, mode=0o700)
+        self.selected.write_bytes(b"synthetic runtime")
+        self.selected.chmod(0o600)
+        (self.root / "backups").mkdir(mode=0o700)
+        self.sentinel = self.root / "backups/untouched"
+        self.sentinel.write_bytes(b"synthetic excluded")
+        self.sentinel.chmod(0o600)
+        self.alias = self.root / "backups/alias"
+
+    def _reap(self, child: subprocess.Popen) -> None:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+        for stream in (child.stdin, child.stdout, child.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+    def _spawn(self, command: list[str]) -> subprocess.Popen:
+        child = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self._reap, child)
+        return child
+
+    def _container(self, code: str, *args: object) -> subprocess.Popen:
+        # The image ENTRYPOINT script, pointed at this fixture's fence.
+        return self._spawn([
+            sys.executable, "-I", "-B", str(WRITER_FENCE_ENTRYPOINT),
+            "--fence-dir", str(self.fence), "--",
+            sys.executable, "-I", "-B", "-c", code, *map(str, args),
+        ])
+
+    def _host_job(self, form: str) -> subprocess.Popen:
+        if form == "flock-cli":
+            # The documented host-job form, verbatim: flock --shared ROOT/writer-fence COMMAND.
+            return self._spawn(["flock", "--shared", str(self.fence), sys.executable, "-I", "-B", "-c", self.HOLD])
+        code = (
+            "import fcntl, os, sys; "
+            "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY); "
+            "fcntl.flock(fd, fcntl.LOCK_SH); " + self.HOLD
+        )
+        return self._spawn([sys.executable, "-I", "-B", "-c", code, str(self.fence)])
+
+    def _readline(self, stream, timeout: float = 15) -> str:
+        import select
+
+        ready, _, _ = select.select([stream], [], [], timeout)
+        self.assertTrue(ready, "writer neither reported nor exited")
+        return stream.readline()
+
+    def _try_exclusive(self) -> bool:
+        import fcntl
+
+        descriptor = os.open(self.fence, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _run_main(self, *arguments: str) -> tuple[int, str]:
+        import contextlib
+        import io
+
+        stderr = io.StringIO()
+        argv = ["prepare_nonroot_bind_mounts.py", str(self.root), "--uid", str(os.getuid()),
+                "--gid", str(os.getgid()), *arguments]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(stderr):
+            code = MODULE.main()
+        return code, stderr.getvalue()
+
+    def test_apply_refuses_while_a_fenced_writer_runs(self) -> None:
+        # Race 1: a writer is already running when --apply starts.
+        forms = ["container", "host-job"]
+        if shutil.which("flock"):
+            forms.append("flock-cli")
+        for form in forms:
+            with self.subTest(writer=form):
+                self.fence.mkdir(exist_ok=True)
+                writer = self._container(self.HOLD) if form == "container" else self._host_job(form)
+                self.assertEqual(self._readline(writer.stdout).strip(), "running")
+                before = self.selected.stat()
+                with (
+                    patch.object(MODULE.os, "geteuid", return_value=0),
+                    patch.object(MODULE, "inventory", wraps=MODULE.inventory) as inventory,
+                    patch.object(MODULE.os, "fchown", wraps=os.fchown) as fchown,
+                    patch.object(MODULE.os, "fchmod", wraps=os.fchmod) as fchmod,
+                ):
+                    code, stderr = self._run_main("--apply")
+                self.assertEqual(code, 1)
+                self.assertIn("writer fence busy", stderr)
+                inventory.assert_not_called()
+                fchown.assert_not_called()
+                fchmod.assert_not_called()
+                after = self.selected.stat()
+                self.assertEqual((after.st_ino, after.st_mode), (before.st_ino, before.st_mode))
+                writer.stdin.close()
+                self.assertEqual(writer.wait(timeout=10), 0)
+
+    def test_writer_started_mid_window_waits_until_apply_releases_the_fence(self) -> None:
+        # Race 2: a writer starts during the window, e.g. a concurrent docker compose up.
+        for operation in ("link", "rename"):
+            for stage in ("inventory", "after-bind", "before-ownership"):
+                with self.subTest(operation=operation, stage=stage):
+                    # Undo the previous subtest's completed attack.
+                    if self.selected.exists() and os.path.lexists(self.alias):
+                        self.alias.unlink()
+                    elif os.path.lexists(self.alias):
+                        self.alias.rename(self.selected)
+                    self.assertEqual(self.selected.stat().st_nlink, 1)
+                    self.selected.chmod(0o600)
+                    inode = self.selected.stat().st_ino
+                    state = {"apply": False, "writer": None}
+                    changes: list[tuple[int, bool, int]] = []
+
+                    def start_writer() -> None:
+                        if state["writer"] is not None:
+                            return
+                        writer = self._container(self.ATTACK, operation, self.selected, self.alias)
+                        state["writer"] = writer
+                        self.assertIn("waiting for it to finish", self._readline(writer.stderr))
+                        self.assertIsNone(writer.poll())
+                        self.assertFalse(os.path.lexists(self.alias))
+                        self.assertEqual(self.selected.stat().st_nlink, 1)
+
+                    real_inventory = MODULE.inventory
+                    real_apply = MODULE.apply_ownership
+                    real_bind_child = MODULE._bind_child
+
+                    def inventory_hook(root):
+                        if stage == "inventory":
+                            start_writer()
+                        return real_inventory(root)
+
+                    def apply_hook(entries, **kwargs):
+                        state["apply"] = True
+                        return real_apply(entries, **kwargs)
+
+                    def bind_hook(parent_descriptor, name, path, **requirements):
+                        result = real_bind_child(parent_descriptor, name, path, **requirements)
+                        if stage == "after-bind" and state["apply"] and path == self.selected:
+                            start_writer()
+                        return result
+
+                    def record(descriptor):
+                        metadata = os.fstat(descriptor)
+                        changes.append((metadata.st_ino, os.path.lexists(self.alias), metadata.st_nlink))
+                        return metadata
+
+                    def fchown_hook(descriptor, uid, gid):
+                        if stage == "before-ownership" and record(descriptor).st_ino == inode:
+                            start_writer()
+                        record(descriptor)
+                        return self.REAL_FCHOWN(descriptor, uid, gid)
+
+                    def fchmod_hook(descriptor, mode):
+                        record(descriptor)
+                        return self.REAL_FCHMOD(descriptor, mode)
+
+                    with (
+                        patch.object(MODULE, "inventory", side_effect=inventory_hook),
+                        patch.object(MODULE, "apply_ownership", side_effect=apply_hook),
+                        patch.object(MODULE, "_bind_child", side_effect=bind_hook),
+                        patch.object(MODULE.os, "fchown", side_effect=fchown_hook),
+                        patch.object(MODULE.os, "fchmod", side_effect=fchmod_hook),
+                    ):
+                        MODULE.apply_with_writer_fence(self.root, uid=os.getuid(), gid=os.getgid())
+
+                    writer = state["writer"]
+                    self.assertIsNotNone(writer, "the writer was never started inside the window")
+                    # Every ownership/mode change ran with no alias in place and the
+                    # selected file singly linked; the excluded tree kept its mode.
+                    self.assertEqual({nlink for ino, _, nlink in changes if ino == inode}, {1})
+                    self.assertFalse(any(aliased for _, aliased, _ in changes))
+                    self.assertEqual(stat.S_IMODE(self.selected.stat().st_mode), 0o660)
+                    self.assertEqual(stat.S_IMODE(self.sentinel.stat().st_mode), 0o600)
+                    # The writer was alive and blocked, not dead: it runs once the fence is free.
+                    _, stderr = writer.communicate(timeout=15)
+                    self.assertEqual(writer.returncode, 0, stderr)
+                    self.assertEqual(self.alias.stat().st_ino, inode)
+
+    def test_unfenced_writer_is_not_held_back_control(self) -> None:
+        # Control for the precondition the docs keep: a writer that bypasses the
+        # fence (old Compose file, --entrypoint override, unwrapped host job) still races.
+        inode = self.selected.stat().st_ino
+        seen: list[bool] = []
+
+        def fchown_hook(descriptor, uid, gid):
+            if os.fstat(descriptor).st_ino == inode and not seen:
+                attacker = self._spawn([sys.executable, "-I", "-B", "-c", self.ATTACK,
+                                        "link", str(self.selected), str(self.alias)])
+                self.assertEqual(attacker.wait(timeout=15), 0)
+                seen.append(os.path.lexists(self.alias))
+            return self.REAL_FCHOWN(descriptor, uid, gid)
+
+        with patch.object(MODULE.os, "fchown", side_effect=fchown_hook):
+            MODULE.apply_with_writer_fence(self.root, uid=os.getuid(), gid=os.getgid())
+        self.assertEqual(seen, [True])
+        self.assertEqual(stat.S_IMODE(self.alias.stat().st_mode), 0o660)
+
+    def test_entrypoint_holds_a_shared_fence_until_its_command_exits(self) -> None:
+        self.fence.mkdir()
+        first, second = self._container(self.HOLD), self._container(self.HOLD)
+        for writer in (first, second):
+            # Shared: a second container starts at once, without waiting.
+            self.assertEqual(self._readline(writer.stdout).strip(), "running")
+        self.assertFalse(self._try_exclusive())
+        first.stdin.close()
+        self.assertEqual(first.wait(timeout=10), 0)
+        self.assertFalse(self._try_exclusive())
+        second.stdin.close()
+        self.assertEqual(second.wait(timeout=10), 0)
+        self.assertNotIn("waiting", second.stderr.read())
+        self.assertTrue(self._try_exclusive())
+
+    def test_entrypoint_runs_unfenced_with_notice_when_the_fence_is_not_mounted(self) -> None:
+        marker = self.root / "ran"
+        writer = self._container("import sys; open(sys.argv[1], 'w').close()", marker)
+        _, stderr = writer.communicate(timeout=15)
+        self.assertEqual(writer.returncode, 0, stderr)
+        self.assertIn("is not mounted; this container is not fenced", stderr)
+        self.assertTrue(marker.exists())
+
+    def test_entrypoint_refuses_a_fence_it_cannot_hold(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        marker = self.root / "ran"
+        for kind in ("file", "symlink"):
+            with self.subTest(fence=kind):
+                if kind == "file":
+                    self.fence.write_text("", encoding="utf-8")
+                else:
+                    self.fence.unlink()
+                    self.fence.symlink_to(elsewhere, target_is_directory=True)
+                writer = self._container("import sys; open(sys.argv[1], 'w').close()", marker)
+                _, stderr = writer.communicate(timeout=15)
+                self.assertEqual(writer.returncode, 1, stderr)
+                self.assertIn("refusing to start", stderr)
+                self.assertFalse(marker.exists())
+
+    def test_entrypoint_waiting_on_the_fence_stops_on_sigterm(self) -> None:
+        import fcntl
+        import signal
+
+        self.fence.mkdir()
+        holder = os.open(self.fence, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        marker = self.root / "ran"
+        writer = self._container("import sys; open(sys.argv[1], 'w').close()", marker)
+        self.assertIn("waiting for it to finish", self._readline(writer.stderr))
+        writer.send_signal(signal.SIGTERM)
+        self.assertEqual(writer.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertFalse(marker.exists())
+
+    def test_entrypoint_reports_a_filesystem_without_kernel_locks(self) -> None:
+        import errno
+
+        from app import writer_fence
+
+        self.fence.mkdir()
+        error = OSError(errno.ENOLCK, "No locks available")
+        with patch("fcntl.flock", side_effect=error), self.assertRaises(writer_fence.LockingUnsupported):
+            writer_fence.hold_shared_fence(self.fence)
+        with patch("fcntl.flock", side_effect=PermissionError(errno.EACCES, "denied")), \
+                self.assertRaises(PermissionError):
+            writer_fence.hold_shared_fence(self.fence)
+
+    def test_preflight_never_creates_or_takes_the_fence(self) -> None:
+        code, stderr = self._run_main()
+        self.assertEqual(code, 0, stderr)
+        self.assertFalse(os.path.lexists(self.fence))
+
+    def test_apply_creates_a_fence_non_root_writers_can_open(self) -> None:
+        previous = os.umask(0o077)
+        try:
+            MODULE.apply_with_writer_fence(self.root, uid=os.getuid(), gid=os.getgid())
+        finally:
+            os.umask(previous)
+        metadata = self.fence.stat(follow_symlinks=False)
+        self.assertTrue(stat.S_ISDIR(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o755)
+        self.assertTrue(self._try_exclusive())
+
+    def test_apply_refuses_a_substituted_fence_before_any_change(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        for kind, message in (("symlink", "symlink"), ("file", "not a directory")):
+            with self.subTest(fence=kind):
+                if os.path.lexists(self.fence):
+                    self.fence.unlink()
+                if kind == "symlink":
+                    self.fence.symlink_to(elsewhere, target_is_directory=True)
+                else:
+                    self.fence.write_text("", encoding="utf-8")
+                with (
+                    patch.object(MODULE.os, "fchown") as fchown,
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    MODULE.apply_with_writer_fence(self.root, uid=os.getuid(), gid=os.getgid())
+                fchown.assert_not_called()
 
 
 class _DisposableWriterAuthority:

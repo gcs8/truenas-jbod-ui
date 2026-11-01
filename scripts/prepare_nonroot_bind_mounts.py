@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import os
 import stat
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 APP_RECURSIVE_ROOTS = ("data", "history", "logs")
 APP_CONFIG_PATHS = ("config.yaml", "ssh", "tls")
+# Keep in sync with the ./writer-fence:/run/writer-fence:ro Compose mounts and
+# app/writer_fence.py (CONTRIBUTING.md "Things that must move together").
+WRITER_FENCE_NAME = "writer-fence"
+WRITER_FENCE_MODE = 0o755
 MAX_ENTRIES = 100_000
 MAX_TREE_DEPTH = 256
 DESCRIPTOR_RESERVE = 64
@@ -34,10 +40,14 @@ def parse_args() -> argparse.Namespace:
         description="Preflight or apply bounded non-root bind-mount ownership on a POSIX deployment host.",
         epilog=(
             "Default is read-only preflight. Run on the deployment host with POSIX ownership and descriptor support; "
-            "--apply requires root. Stop every writer first (docker compose down, plus any host job that writes under "
-            "the deployment root) and keep them stopped until --apply finishes. The hard-link and descriptor checks "
-            "are point-in-time: a process that creates hard links or renames files during the run can still steer a "
-            "mode or ownership change onto an excluded file."
+            "--apply requires root. --apply takes the deployment writer fence (ROOT/writer-fence) exclusively for "
+            "the whole inventory and change, and refuses to start while any container or host job holds it. "
+            "Containers started from this release's Compose files hold it for their whole life, and one started "
+            "during --apply waits until it finishes. Stop every writer that does not hold the fence (an older "
+            "Compose file without the writer-fence mount, an --entrypoint override, or a host job not run under "
+            "flock --shared ROOT/writer-fence) and keep it stopped until --apply finishes. The hard-link and "
+            "descriptor checks are point-in-time: an unfenced process that creates hard links or renames files "
+            "during the run can still steer a mode or ownership change onto an excluded file."
         ),
     )
     parser.add_argument("root", type=Path, help="Deployment directory containing config, data, history and logs, e.g. /srv/enclosure.")
@@ -462,6 +472,66 @@ def apply_ownership(
         _close_opened_descriptors(opened)
 
 
+class WriterFenceBusy(RuntimeError):
+    """A fenced writer holds the deployment writer fence."""
+
+
+@contextlib.contextmanager
+def writer_fence(root: Path) -> Iterator[os.stat_result]:
+    """Hold ROOT/writer-fence exclusively, or refuse at once (#884).
+
+    Fenced containers hold a shared flock on the same directory for their whole
+    life, so success proves none is running and keeps new ones waiting until
+    this context exits. Yields the fenced deployment root's metadata.
+    """
+    import fcntl
+
+    if os.mkdir not in os.supports_dir_fd:
+        raise RuntimeError("descriptor-relative writer fence creation is unsupported on this platform")
+    absolute_root, root_descriptor, root_metadata = _open_approved_root(root)
+    fence_path = absolute_root / WRITER_FENCE_NAME
+    try:
+        try:
+            os.mkdir(WRITER_FENCE_NAME, WRITER_FENCE_MODE, dir_fd=root_descriptor)
+        except FileExistsError:
+            created = False
+        else:
+            created = True
+        fence_descriptor, _ = _bind_child(
+            root_descriptor,
+            WRITER_FENCE_NAME,
+            fence_path,
+            directory_only=True,
+            check_stale=False,
+        )
+    finally:
+        _close_descriptor(root_descriptor)
+    try:
+        if created:
+            # Undo a restrictive umask: non-root containers must open it to lock.
+            os.fchmod(fence_descriptor, WRITER_FENCE_MODE)
+        try:
+            fcntl.flock(fence_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise WriterFenceBusy(
+                f"a fenced writer holds {fence_path}; stop the Compose services "
+                "(docker compose down) and any host job holding the fence, then retry"
+            ) from exc
+        yield root_metadata
+    finally:
+        _close_descriptor(fence_descriptor)
+
+
+def apply_with_writer_fence(root: Path, *, uid: int, gid: int) -> OwnershipEntries:
+    """Inventory and apply ownership inside one exclusive writer-fence window."""
+    with writer_fence(root) as fenced_root:
+        entries = inventory(root)
+        if not _same_inode(entries.root_metadata, fenced_root):
+            raise ValueError(f"deployment root changed after the writer fence was taken: {entries.root}")
+        apply_ownership(entries, uid=uid, gid=gid)
+    return entries
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -477,11 +547,16 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    entries = inventory(args.root)
     if args.apply:
         if os.geteuid() != 0:
             raise PermissionError("--apply requires root so rollback can restore every original owner")
-        apply_ownership(entries, uid=args.uid, gid=args.gid)
+        try:
+            entries = apply_with_writer_fence(args.root, uid=args.uid, gid=args.gid)
+        except WriterFenceBusy as exc:
+            print(f"writer fence busy: {exc}", file=sys.stderr)
+            return 1
+    else:
+        entries = inventory(args.root)
     print(f"preflight=ok entries={len(entries)} apply={str(args.apply).lower()} uid={args.uid} gid={args.gid}")
     return 0
 

@@ -1358,6 +1358,26 @@ class ContainerResourceContractTests(unittest.TestCase):
                             )
                             self.assertTrue(config_mount["read_only"])
 
+    def test_every_compose_writer_holds_the_deployment_writer_fence(self) -> None:
+        # #884: the image entrypoint takes a shared flock on the mounted fence;
+        # prepare_nonroot_bind_mounts.py --apply takes the same directory exclusively.
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn('ENTRYPOINT ["python", "-I", "/app/app/writer_fence.py", "--"]', dockerfile)
+        # An image-local /run/writer-fence would be a private lock that fences nothing.
+        self.assertNotIn("/run/writer-fence", dockerfile)
+        helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
+        self.assertIn('WRITER_FENCE_NAME = "writer-fence"', helper)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", helper)
+        entrypoint = (REPO_ROOT / "app/writer_fence.py").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_FENCE_DIR = Path("/run/writer-fence")', entrypoint)
+        for compose_name in COMPOSE_FILES:
+            compose = yaml.safe_load((REPO_ROOT / compose_name).read_text(encoding="utf-8"))
+            for service_name, service in compose["services"].items():
+                with self.subTest(compose=compose_name, service=service_name):
+                    self.assertNotIn("entrypoint", service)
+                    self.assertIn("./writer-fence:/run/writer-fence:ro", service["volumes"])
+        self.assertIn("writer-fence/", (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+
     def test_nonroot_migration_helper_is_bounded_no_follow_and_dry_run_by_default(self) -> None:
         helper = (REPO_ROOT / "scripts/prepare_nonroot_bind_mounts.py").read_text(encoding="utf-8")
         self.assertIn('APP_RECURSIVE_ROOTS = ("data", "history", "logs")', helper)

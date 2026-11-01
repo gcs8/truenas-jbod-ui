@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- `prepare_nonroot_bind_mounts.py --apply` stopped running alongside services:
+  it took the deployment's `writer-fence` lock exclusively, refused to start
+  while a service from the current Compose files was up, and made services
+  started during the run wait for it to finish (#1057).
 - Storage Fabric linked cascaded MPR expanders through unique, consistent
   reported parents, retained verified ancestors in selected traces, and bounded
   propagated bay memberships; missing, conflicting or over-limit ancestry stayed

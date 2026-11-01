@@ -43,6 +43,9 @@ services:
     ports:
       - "${APP_BIND_ADDRESS:-0.0.0.0}:${APP_PORT:-8080}:8000"
     volumes:
+      # Writer fence (#884): the entrypoint holds a shared flock on it so
+      # scripts/prepare_nonroot_bind_mounts.py --apply cannot run alongside.
+      - ./writer-fence:/run/writer-fence:ro
       - ./config:/app/config:ro
       - ./data:/app/data
       - ./logs:/app/logs
@@ -121,6 +124,7 @@ services:
     ports:
       - "${HISTORY_BIND_ADDRESS:-127.0.0.1}:${HISTORY_PORT:-8081}:8001"
     volumes:
+      - ./writer-fence:/run/writer-fence:ro
       - ./history:/app/history
       - ./backup-status:/app/backup-status:ro
     depends_on:
@@ -209,6 +213,7 @@ services:
     ports:
       - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8082}:8002"
     volumes:
+      - ./writer-fence:/run/writer-fence:ro
       - ./config:/app/config
       - ./data:/app/data
       - ./history:/app/history
@@ -264,6 +269,7 @@ services:
       SCHEDULED_BACKUP_PASSPHRASE_FILE: ${SCHEDULED_BACKUP_PASSPHRASE_FILE:-}
       BACKUP_FULL_ARCHIVE_FORMAT: ${BACKUP_FULL_ARCHIVE_FORMAT:-}
     volumes:
+      - ./writer-fence:/run/writer-fence:ro
       - ./config:/app/config:ro
       - ./data:/app/data:ro
       - ./history:/app/history
@@ -331,6 +337,7 @@ services:
       BACKUP_TARGETS_JSON: '${BACKUP_TARGETS_JSON:-}'
       TZ: ${TZ:-UTC}
     volumes:
+      - ./writer-fence:/run/writer-fence:ro
       - ./config:/app/config:ro
       - ./data:/app/data:ro
       - ./history:/app/history
