@@ -48,9 +48,9 @@ Changelog coverage: pass (50 PRs)
 | Docker build and health gates | yes | QA image `sha256:7e29be4f41e7` built from `d6325c0` with a matching revision label; reports `0.24.0-beta.4`. UI, history and admin `/livez` and `/healthz` passed in every matrix variant and restore drill. The image's writer-fence entrypoint started every service in each run | Pass |  |
 | Optional-sidecar runtime matrix | yes | `scripts/run_compose_runtime_matrix.py` on the Linux QA host at `d6325c0`: 8 variants passed (including the non-root UI variant); 5 alias cycles, 5 mapping cycles, 1 admin setup, 1 scheduler disabled, 1 scheduler backup, 2 journal reads; no containers left | Pass |  |
 | Full Playwright/browser gates | yes | Live read-only restore at `d6325c0`: 16 passed, 2 skipped for `qa/ui-switching.spec.js` and `qa/esxi-smoke.spec.js` (the history refresh actions need fixtures the restored data lacks; auto-refresh after a switch needs UI timing); 16 passed, 1 skipped for `qa/private-restore.spec.js` and `qa/admin-operations.spec.js` in each restore. Locally at `d6325c0`: the 8 fixture-only specs 274 passed, `qa/admin-operations.spec.js` 15 passed, `qa/public-demo.spec.js` against a current-source demo build 9 passed | Pass |  |
-| Feature-specific live API/UI gates | yes | Disposable CORE VM (TrueNAS 13.0-U6.8) through the candidate's admin routes at `d6325c0`: all bootstrap, SMART-grant and TLS checks passed and the task account was removed (see "Fix checks"). Read-only SSH-only collection on a CORE host with SES shelves, in the candidate image `sha256:7e29be4f41e7`: every read succeeded and the independent comparator (its own parsers, no app code) confirmed pool, vdev and class for every occupied bay, on two identical runs. Storage views on that host have no occupied bays, so views were not exercised there. Blocked: the storage-view fixes #956, #959, #963 and #966 have not been exercised in the browser on a populated storage view (checklist live API and browser check) | Blocked |  |
+| Feature-specific live API/UI gates | yes | Disposable CORE VM (TrueNAS 13.0-U6.8) through the candidate's admin routes at `d6325c0`: all bootstrap, SMART-grant and TLS checks passed and the task account was removed (see "Fix checks"). Read-only SSH-only collection on a CORE host with SES shelves, in the candidate image `sha256:7e29be4f41e7`: every read succeeded and the independent comparator (its own parsers, no app code) confirmed pool, vdev and class for every occupied bay, on two identical runs. Storage-view fixes #956, #959, #963 and #966 exercised in Chromium on populated views of a live read-only restored stack in the same image, with that stack's own admin service (see "Storage-view checks"); the degraded-pool state for #956 used the repo's fixture generator because it cannot be produced read-only. 0 console errors | Pass |  |
 | Local release perf harnesses | yes | Against the live restored stack at `d6325c0`, after a completed full history pass: `run_perf_harness.py`, 8 workflows passed (forced and cached inventory, storage views, health, history status, SMART batch, chunked SMART prefetch, snapshot estimate); `run_history_perf_harness.py`, 5 workflows passed including exact counts. `build_perf_baseline.py --check` passed in the source gate | Pass |  |
-| Linux QA restore gate | yes | At `d6325c0`: default `tar.zst` round trip (the beta.3-made default archive restored with exact counts; a FULL export with no `packaging` field came out `tar.zst`; that export, made by `0.24.0-beta.4`, restored with exact counts, restart survival and verified cleanup) and the legacy `7z` round trip of a `0.22.2` backup in live read-only mode. Receipts under "Restore evidence". Blocked: no explicit `packaging: "7z"` FULL export from `0.24.0-beta.4` has been restored yet; the `0.22.2` drill proves only that older archives still read | Blocked |  |
+| Linux QA restore gate | yes | At `d6325c0`: default `tar.zst` round trip (the beta.3-made default archive restored with exact counts; a FULL export with no `packaging` field came out `tar.zst`; that export, made by `0.24.0-beta.4`, restored with exact counts, restart survival and verified cleanup) and the legacy `7z` round trip of a `0.22.2` backup in live read-only mode. Blocked: the explicit `packaging: "7z"` FULL export with the full path set, from a stack restored with exact counts, failed with HTTP 400 "Portable 7z backup operation timed out." The export runs single-threaded LZMA2 under a fixed 600-second limit (unchanged since v0.10.0), and the restored history is too large to finish in time, so there was no `7z` archive to restore. Receipts under "Restore evidence" | Blocked |  |
 | Restored Linux QA perf harnesses | yes | The live read-only restore of the `0.22.2` `7z` backup at `d6325c0` passed the app and history harnesses; both egress-blocked `tar.zst` restores passed the history harness | Pass |  |
 | Snapshot/export/offline artifact gate | yes | Redacted Auto and Force ZIP exports from two restored stacks at `d6325c0` rendered all 60 slots in Chromium with network blocked: offline badge shown, 0 external requests, 0 console errors, 0 private IPv4 addresses, 0 host paths. The 2 credential-pattern hits are the app's own sign-in field code | Pass |  |
 | Docs/wiki/public-demo gate | yes | `check_public_docs.py` passed (26 documents, 195 wiki links, 0 prose patterns); `check_public_screenshots.py` passed; `check_public_demo_artifact.py` found the demo publishable (2,095,850 raw bytes); `validate_release_wrap.py 0.24.0-beta.4 --public-demo-only` passed. Public demo deferred: prerelease. `wiki/` changed in 5 files since `v0.24.0-beta.3` (`Admin-UI-and-System-Setup.md`, `SSH-Setup-and-Sudo.md`, `Troubleshooting.md`, `TrueNAS-CORE-Setup.md`, `Upgrading.md`) | Pass |  |
@@ -88,6 +88,17 @@ history live pass and history performance checks passed. The QA host's
 long-running beta deployment was stopped during the run so only one collector
 polled the appliances. It came back healthy on the same container IDs with 0
 restarts.
+
+**Explicit `7z` FULL export round trip: failed.** On the same Linux QA host and
+image, the beta.3-made default archive was restored again with exact counts
+and restart survival, then the admin API was asked for an encrypted FULL export
+with `packaging: "7z"` and all ten backup groups. After about 11 minutes the
+export answered HTTP 400 "Portable 7z backup operation timed out." and wrote no
+archive, so no `7z` restore could run. The `7z` writer uses one thread and a fixed
+600-second limit. Both are unchanged since v0.10.0, so this is not new in this
+beta, but production-sized history no longer fits in the limit. The stack was
+torn down with no containers, networks or volumes left, and the long-running
+beta deployment came back on the same container IDs.
 
 ## Fix checks
 
@@ -129,8 +140,40 @@ only SSH data; #955, #958, #1022, #1060):
   identical runs. On `95ba5be` (before #1060) the same comparator found two
   bays with another geom's label and vdev; both are now confirmed, and every
   label the page shows sits on that bay's own disk in the raw `glabel` rows.
-- Storage views on that host, and the CORE fixes through the browser, were not
-  exercised: its saved views have no occupied bays (#956, #959, #963, #966).
+- Storage views on that host have no occupied bays, so the storage-view fixes
+  were checked on other restored systems (next section).
+
+## Storage-view checks
+
+In Chromium against a live read-only restore of the production backup, in
+image `sha256:7e29be4f41e7` at `d6325c0`, choosing systems whose views have
+occupied slots. Admin checks used that restored stack's own admin service, and
+its saves changed only that disposable stack's configuration:
+
+- #956: on a CORE system, every occupied NVMe-carrier and SATADOM slot was drawn
+  healthy, and the detail panel and tooltip showed `Vdev` and `Health ONLINE`.
+  No pool warning appeared. A DEGRADED pool cannot be made read-only, so the
+  degraded state ran as a fixture: the real inventory code with the repo's
+  synthetic degraded pool, rendered by
+  `scripts/build_current_source_browser_fixture.py` with the candidate's
+  `app.js`. The degraded member was drawn as Fault with `Health DEGRADED`, and
+  the page warned `Pool flashpool is DEGRADED.`. The ONLINE control had neither.
+- #959: on a SCALE system with a populated generated chassis view, choosing a
+  layout and saving set the system layout. The generated Primary Chassis
+  stayed unsaved and unpinned, and the main page still called it "Chassis". A
+  pinned saved chassis on another system still reads "Saved view". After the
+  Primary Chassis was deleted and saved, it stayed deleted through a reload and
+  another save. The live shelf still showed its occupied bays.
+- #963: on CORE, new passive 2-slot and AOC-SLG4-2H8M2 views started with no
+  ESXi RAID IDs and were shown on the main page. Bound by serial to real NVMe
+  drives, each showed 2 of 2 slots occupied and healthy. On an ESXi system, the
+  same AOC template filled in the `C0 x4`/`C1 x4` and `13:0`/`13:1` IDs, and its
+  live AOC enclosure still showed both drives.
+- #966: Add a view listed the AOC card and the FatTwin rear 2-bay group once, as
+  views only. The Chassis layout list left both out, while the ESXi system kept
+  its saved AOC layout as `Current:`. The drive list read "Drives on <system>
+  that are not in a chassis bay or another view:" under "Drives for this view",
+  and showed no bare `UNKNOWN`.
 
 ## Deviations
 
@@ -146,6 +189,11 @@ only SSH data; #955, #958, #1022, #1060):
   same fixed container names as the restore controller and the Compose
   matrix. It was stopped and its containers renamed aside for each run, then
   renamed back and started on the same container IDs.
+
+- The storage-view browser checks needed a few harness fixes (a hidden order
+  field, the carrier claim order, and committing typed serials). No product
+  code changed. One check read a cached snapshot taken while that CORE system's
+  API was briefly down. It was rerun after a forced read with the API back.
 
 ## Known issues carried into the beta
 
