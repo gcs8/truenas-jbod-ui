@@ -43,6 +43,10 @@ ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL = (
     "VMware ESXi does not use the Linux one-time bootstrap or sudoers flow. "
     "Save the SSH host, root or key-based auth, and the read-only runtime commands directly instead."
 )
+IPMI_BOOTSTRAP_UNSUPPORTED_DETAIL = (
+    "BMC/IPMI does not support the host service-account bootstrap or sudoers flow. "
+    "Configure the BMC account and access permissions directly instead."
+)
 CORE_MPRUTIL_SUDO_COMMANDS = (
     "/usr/sbin/mprutil show adapter",
     "/usr/sbin/mprutil show adapters",
@@ -234,6 +238,11 @@ class ServiceAccountBootstrapService:
     def bootstrap_service_account(self, payload: SystemSetupBootstrapRequest) -> dict[str, object]:
         if payload.platform == "esxi":
             raise ValueError(ESXI_BOOTSTRAP_UNSUPPORTED_DETAIL)
+        if payload.platform == "ipmi":
+            raise ValueError(IPMI_BOOTSTRAP_UNSUPPORTED_DETAIL)
+        if payload.install_sudo_rules:
+            # Admit the effective policy before resolving keys or creating a probe.
+            self._resolve_sudo_commands(payload.platform, payload.sudo_commands)
         requires_sudo = self._requires_sudo(payload.bootstrap_user)
         if requires_sudo and payload.bootstrap_sudo_password:
             # The script travels on stdin, which a piped sudo password would share.
@@ -670,6 +679,14 @@ class ServiceAccountBootstrapService:
     ) -> dict[str, object]:
         filename = cls._sudoers_filename(service_user)
         path_candidates = [f"{directory}/{filename}" for directory in SUDOERS_DIR_CANDIDATES]
+        if platform == "ipmi":
+            return {
+                "enabled": False,
+                "filename": filename,
+                "path_candidates": [],
+                "detail": IPMI_BOOTSTRAP_UNSUPPORTED_DETAIL,
+                "content": f"# {IPMI_BOOTSTRAP_UNSUPPORTED_DETAIL}\n",
+            }
         if platform == "esxi":
             return {
                 "enabled": False,
@@ -750,12 +767,9 @@ class ServiceAccountBootstrapService:
             f"# Managed by truenas-jbod-ui admin bootstrap for {service_user}",
             f"Defaults:{service_user} !requiretty",
         ]
-        if commands:
-            wrapped_commands = ", \\\n  ".join(commands)
-            lines.append(f"Cmnd_Alias {alias_name} = {wrapped_commands}")
-            lines.append(f"{service_user} ALL=(root) NOPASSWD: {alias_name}")
-        else:
-            lines.append(f"{service_user} ALL=(root) NOPASSWD: ALL")
+        wrapped_commands = ", \\\n  ".join(commands)
+        lines.append(f"Cmnd_Alias {alias_name} = {wrapped_commands}")
+        lines.append(f"{service_user} ALL=(root) NOPASSWD: {alias_name}")
         return "\n".join(lines) + "\n"
 
     @classmethod
@@ -818,15 +832,23 @@ class ServiceAccountBootstrapService:
         platform: str,
         requested_commands: list[str] | tuple[str, ...] | None = None,
     ) -> tuple[str, ...]:
+        if platform == "ipmi":
+            raise ValueError(IPMI_BOOTSTRAP_UNSUPPORTED_DETAIL)
+        if platform not in SUDO_COMMANDS_BY_PLATFORM:
+            raise ValueError("Command-limited sudo bootstrap is unsupported for this platform.")
         normalized_requested = cls._normalize_requested_sudo_commands(requested_commands or [])
         if normalized_requested:
-            return cls._dedupe_commands(
+            commands = cls._dedupe_commands(
                 (
                     *normalized_requested,
                     *SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM.get(platform, ()),
                 )
             )
-        return cls._dedupe_commands(SUDO_COMMANDS_BY_PLATFORM.get(platform, ()))
+        else:
+            commands = cls._dedupe_commands(SUDO_COMMANDS_BY_PLATFORM[platform])
+        if not commands:
+            raise ValueError("No command-limited sudo policy is available for this platform.")
+        return commands
 
     @classmethod
     def _normalize_requested_sudo_commands(cls, commands: list[str] | tuple[str, ...]) -> tuple[str, ...]:
