@@ -23,6 +23,7 @@ from app.logging_config import JsonFormatter, SafeTextFormatter
 from app.metrics import (
     ScheduledBackupStatusCollector,
     install_metrics,
+    observe_backup_7z_deadline,
     observe_backup_operation,
     observe_history_collection_run,
     observe_history_retention_run,
@@ -472,6 +473,29 @@ class MetricsRouteTests(unittest.TestCase):
         self.assertIn("truenas_jbod_ui_backup_operation_duration_seconds", metrics_text)
         for forbidden in ("private/system-alpha/history.db", "secret-token", "request_id", "exception"):
             self.assertNotIn(forbidden, metrics_text)
+
+    def test_backup_7z_deadline_metrics_use_only_bounded_labels(self) -> None:
+        app = FastAPI()
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true", "METRICS_PATH": "/metrics"}, clear=False):
+            install_metrics(app, service_name="test-backup-7z-deadline", version="0.0.0-test")
+            observe_backup_7z_deadline(operation="create", input_bytes=4096, deadline_seconds=900)
+            observe_backup_7z_deadline(
+                operation="private/system-alpha/history.db",
+                input_bytes=-5,
+                deadline_seconds=-1,
+            )
+
+        metrics_text = response_body(asyncio.run(invoke_asgi(app, "/metrics")))
+
+        self.assertIn('truenas_jbod_ui_backup_7z_deadline_seconds{operation="create"} 900.0', metrics_text)
+        self.assertIn('truenas_jbod_ui_backup_7z_input_bytes{operation="create"} 4096.0', metrics_text)
+        self.assertIn('truenas_jbod_ui_backup_7z_deadline_seconds{operation="unknown"} 0.0', metrics_text)
+        self.assertNotIn("private/system-alpha/history.db", metrics_text)
+        operations_doc = (
+            Path(__file__).resolve().parents[1] / "wiki" / "Operations-Logging-and-Metrics.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("`truenas_jbod_ui_backup_7z_deadline_seconds`", operations_doc)
+        self.assertIn("`truenas_jbod_ui_backup_7z_input_bytes`", operations_doc)
 
 
 class SnapshotExportMetricsTests(unittest.TestCase):
