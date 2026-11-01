@@ -343,7 +343,7 @@ class OperatorRecipeTests(unittest.TestCase):
             "./config:/app/config", "./data:/app/data", "./history:/app/history",
             "host-prep-staging:/app/host-prep", "./config/ssh:/run/ssh:ro",
             "/var/run/docker.sock:/var/run/docker.sock", "./backup-journal:/app/backup-journal",
-            "./backup-api:/app/backup-api:ro",
+            "./backup-api:/app/backup-api:ro", "./writer-fence:/run/writer-fence:ro",
         })
         for name, service in base.items():
             if name != "enclosure-admin":

@@ -65,6 +65,11 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                 text = " ".join((repo / relative).read_text(encoding="utf-8").split())
                 self.assertIn("Stop every writer", text)
                 self.assertIn("hard link", text)
+                # #884: the fence narrows the precondition to unfenced writers.
+                self.assertIn("writer-fence", text)
+                self.assertIn("flock --shared", text)
+        self.assertIn("writer fence", help_text)
+        self.assertIn("flock --shared", help_text)
 
     def test_unsupported_execution_fails_before_inspecting_root(self) -> None:
         for mode in ("resource", "identity", "descriptors"):

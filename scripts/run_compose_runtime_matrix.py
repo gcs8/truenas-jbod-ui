@@ -1258,7 +1258,8 @@ def _verify_rendered_contract(
     bind_paths = {"/app/" + name: root / name for name in (
         "config", "data", "logs", "history", "backups", "backup-status", "backup-journal", "backup-api")}
     bind_paths.update({"/run/ssh": root / "config/ssh",
-                       "/run/backup-secrets": root / "config/backup-secrets"})
+                       "/run/backup-secrets": root / "config/backup-secrets",
+                       "/run/writer-fence": root / "writer-fence"})
     project = _compose_project_name(prefix)
     for name, service in services.items():
         if name not in port_map or not isinstance(service, dict) or service.get("image") != image:

@@ -28,6 +28,7 @@ history/backups/*
 !history/backups/.gitkeep
 backups/*
 backup-status/*
+writer-fence/
 logs/*.log*
 docker-compose.override.yml
 node_modules/

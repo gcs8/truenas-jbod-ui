@@ -221,11 +221,21 @@ sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$a
 sudo python3 scripts/prepare_nonroot_bind_mounts.py . --uid "$app_uid" --gid "$app_gid" --apply
 ```
 
-Run the dry check first. Stop every writer before `--apply` (`docker compose
-down` above, plus any host job that writes under this folder) and keep them
-stopped until it finishes: the helper's hard link checks are point-in-time and
-do not protect against files linked or renamed during the run. Do not use
-recursive `chmod 777`. If SSH then fails to
+Run the dry check first. `--apply` takes the deployment writer fence, a
+`writer-fence` folder next to `data`, exclusively for the whole check and
+change. It refuses to start while any service holds the fence, and a service
+started during the run, for example by a concurrent `docker compose up`, waits
+until it finishes. Services started from this release's Compose files hold the
+fence for their whole life, so run `docker compose down` first. Wrap any host job
+that writes under this folder in `flock --shared ./writer-fence <command>` so it
+takes the same lock.
+
+Stop every writer that does not hold the fence before `--apply` and keep it
+stopped until it finishes: services started from an older Compose file without
+the `./writer-fence` mount, one-off `docker compose run --entrypoint ...`
+commands, and host jobs not wrapped in `flock`. The helper's hard link checks
+are point-in-time and do not protect against files linked or renamed by such a
+writer during the run. Do not use recursive `chmod 777`. If SSH then fails to
 load `known_hosts`, verify that `data/known_hosts` (or the file named by
 `ssh.known_hosts_path` / `SSH_KNOWN_HOSTS_PATH`, if set) is owned by the
 configured app UID/GID and uses mode `0660`.
