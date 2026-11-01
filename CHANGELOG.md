@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- `prepare_nonroot_bind_mounts.py --apply` now holds the deployment's
+  `writer-fence` lock exclusively and refuses to run while any service started
+  from the current Compose files is up; services started during the run wait
+  for it to finish (#1057).
 - Late TLS certificate inspect and trust answers stopped changing a different
   editor or target, and backup status and API responses stopped carrying raw
   provider error text (#1054).
