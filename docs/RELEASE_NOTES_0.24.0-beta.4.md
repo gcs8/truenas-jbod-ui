@@ -54,7 +54,8 @@ each pull request.
   API key or password again before Save.
 - A `.tar.zst.enc` backup made by a v0.24.0 beta cannot be restored by v0.23.0
   or older. Keep a `.7z` backup, or set `BACKUP_FULL_ARCHIVE_FORMAT=7z`, if you
-  may roll back.
+  may roll back. A `7z` backup of a large history now gets more time to
+  compress instead of timing out after 10 minutes.
 - The pre-release security review in #737 still has open items. They will be
   closed before v0.24.0.
 - To roll back, set `JBOD_UI_IMAGE` to the previous tag or digest and run
