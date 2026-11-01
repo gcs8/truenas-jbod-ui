@@ -266,6 +266,14 @@ _CORE_GMULTIPATH_BACKFILL_WARNING = (
     "backfill multipath attribution. Use the live TrueNAS disk inventory controls in the enclosure header to "
     "sync the multipath table."
 )
+# One bay's disk sources contradict each other (#1059): its record names one
+# multipath geom while gmultipath lists its path under another, its own GPT
+# labels resolve to different pool members, or a label it would show sits on
+# another geom. Membership is left unknown rather than borrowed.
+_CORE_POOL_MEMBERSHIP_CONFLICT_WARNING = (
+    "Bay {slot_label}: gmultipath, glabel and pool sources disagree about the disk in this bay, "
+    "so its pool membership is shown as unknown."
+)
 
 
 def _structural_enclosure_topology(value: Any) -> Any:
@@ -7989,6 +7997,10 @@ class InventoryService:
                 bay_peer_devices=_bay_peer_devices(candidate, disk, disks_by_key),
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "disk")
+            if slot_view.raw_status.get("pool_membership_conflict") is True:
+                conflict_warning = _CORE_POOL_MEMBERSHIP_CONFLICT_WARNING.format(slot_label=slot_view.slot_label)
+                if conflict_warning not in warnings:
+                    warnings.append(conflict_warning)
             slot_views.append(slot_view)
 
         return frame.result(slot_views)
@@ -8176,7 +8188,11 @@ class InventoryService:
                 continue
             pool_member = None
             if api_topology_members is not None:
-                gptid = ssh_data.glabel.device_to_gptid.get(disk.device_name.lower()) if disk.device_name else None
+                gptid = (
+                    self._select_gpt_label(disk.device_name, ssh_data, api_topology_members)
+                    if disk.device_name
+                    else None
+                )
                 pool_member = self._lookup_zpool_member(disk, disk.device_name, gptid, ssh_data, api_topology_members)
             serialized = self._serialize_storage_view_candidate(disk, pool_member=pool_member)
             if snapshot.selected_enclosure_label:
@@ -14130,8 +14146,7 @@ class InventoryService:
                 lookup_keys.update(normalize_lookup_keys(f"multipath/{multipath_name}"))
 
             if device_name:
-                gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower())
-                if gptid:
+                for gptid in self._gpt_labels_for_device(device_name, ssh_data):
                     lookup_keys.update(normalize_lookup_keys(gptid))
 
             for candidate in dict.fromkeys(filter(None, [path_device_name, multipath_member, device_name])):
@@ -14674,7 +14689,7 @@ class InventoryService:
             # No disk record matched (CORE over SSH without the API), but SES
             # named the device in this bay, so the position came from SSH (#950).
             resolution_source = "enclosure-sysfs" if ses_device_names_source == "enclosure_sysfs" else "device-name"
-        gptid = ssh_data.glabel.device_to_gptid.get(device_name.lower()) if device_name else None
+        gptid = self._select_gpt_label(device_name, ssh_data, api_topology_members) if device_name else None
         zpool = self._lookup_zpool_member(disk, device_name, gptid, ssh_data, api_topology_members)
         for peer in () if zpool else bay_peer_devices:
             peer_gptid = ssh_data.glabel.device_to_gptid.get(peer.lower())
@@ -14684,6 +14699,16 @@ class InventoryService:
             ):
                 gptid = gptid or peer_gptid
                 break
+        membership_conflict = (
+            self.system.truenas.platform == "core"
+            and bool(device_name)
+            and self._core_bay_membership_conflict(
+                disk, device_name, gptid, zpool, ssh_data, api_topology_members,
+            )
+        )
+        if membership_conflict:
+            gptid = None
+            zpool = None
         model = disk.model if disk else normalize_text(raw_slot_status.get("model_hint"))
         if not model and device_name:
             model = ssh_data.camcontrol_models.get(device_name.lower())
@@ -14933,6 +14958,8 @@ class InventoryService:
             else None
         )
         enriched_raw_status = dict(raw_slot_status)
+        if membership_conflict:
+            enriched_raw_status["pool_membership_conflict"] = True
         if stale_manual_mapping:
             enriched_raw_status["stale_manual_mapping"] = True
             enriched_raw_status["stale_manual_mapping_source"] = mapping.source if mapping else "manual"
@@ -14977,7 +15004,11 @@ class InventoryService:
             size_human=size_human,
             gptid=persistent_id,
             persistent_id_label=persistent_id_label,
-            pool_name=disk.pool_name if (disk and disk.pool_name) else zpool.pool_name if zpool else None,
+            pool_name=(
+                None if membership_conflict
+                else disk.pool_name if (disk and disk.pool_name)
+                else zpool.pool_name if zpool else None
+            ),
             vdev_name=zpool.vdev_name if zpool else None,
             vdev_class=zpool.vdev_class if zpool else None,
             topology_label=zpool.topology_label if zpool else None,
@@ -15929,6 +15960,97 @@ class InventoryService:
             ]
         return [await self._run_ssh_command(command, host) for command in command_list]
 
+    @staticmethod
+    def _gpt_labels_for_device(device_name: str | None, ssh_data: ParsedSSHData) -> list[str]:
+        """Every GPT label glabel places on one provider, swap and ZFS partitions alike."""
+        key = (normalize_device_name(device_name) or "").lower()
+        if not key:
+            return []
+        labels = list(ssh_data.glabel.device_to_gptids.get(key, ()))
+        single = ssh_data.glabel.device_to_gptid.get(key)
+        if single and single not in labels:
+            labels.append(single)
+        return labels
+
+    def _select_gpt_label(
+        self,
+        device_name: str | None,
+        ssh_data: ParsedSSHData,
+        api_topology_members: dict[str, Any],
+    ) -> str | None:
+        """The provider's own label to show: its one pooled partition, else its last label.
+
+        A multipath provider usually carries an unpooled swap partition beside
+        the pooled one; which row glabel lists last must not decide the bay.
+        """
+        labels = self._gpt_labels_for_device(device_name, ssh_data)
+        if len(labels) < 2:
+            return labels[0] if labels else None
+        pooled = [
+            label
+            for label in labels
+            if any(
+                members.get(key)
+                for key in normalize_lookup_keys(label)
+                for members in (ssh_data.zpool_members, api_topology_members, ssh_data.zpool_device_members)
+            )
+        ]
+        if len(pooled) == 1:
+            return pooled[0]
+        return ssh_data.glabel.device_to_gptid.get((normalize_device_name(device_name) or "").lower()) or labels[-1]
+
+    def _core_bay_membership_conflict(
+        self,
+        disk: DiskRecord | None,
+        device_name: str | None,
+        gptid: str | None,
+        zpool: ZpoolMember | None,
+        ssh_data: ParsedSSHData,
+        api_topology_members: dict[str, Any],
+    ) -> bool:
+        """Whether this bay's sources name different geoms for the disk in it (#1059).
+
+        The bay's geom comes from the disk in it: its record's multipath name and
+        the geom gmultipath lists its paths under. A GPT label to be shown, or the
+        pool member's own GPTID path, must sit on that geom (or on no geom). An
+        ambiguous gmultipath claim is no evidence either way.
+        """
+        if not ssh_data.multipath_info:
+            return False
+        index = self._index_multipath_consumers(ssh_data)
+
+        def geom_of(name: str | None) -> str | None:
+            normalized = (normalize_device_name(name) or "").lower()
+            if not normalized:
+                return None
+            if normalized.startswith("multipath/"):
+                info = ssh_data.multipath_info.get(normalized)
+                return (info.name if info else normalized.removeprefix("multipath/")).lower()
+            info = index.get(normalized)
+            return info.name.lower() if info is not None else None
+
+        own_geoms: set[str] = set()
+        if disk is not None and disk.multipath_name:
+            own_geoms.add(disk.multipath_name.lower())
+        path_names = [device_name]
+        if disk is not None:
+            path_names.extend((disk.device_name, disk.path_device_name, disk.multipath_member))
+        own_geoms.update(geom for geom in map(geom_of, path_names) if geom)
+        if len(own_geoms) > 1:
+            return True
+
+        labels = [gptid]
+        if zpool is not None:
+            labels.extend((zpool.raw_path, zpool.raw_name))
+        for value in labels:
+            label = normalize_gptid(value) if value else None
+            if not label or not label.lower().startswith("gptid/"):
+                continue
+            owner_geom = geom_of(ssh_data.glabel.gptid_to_device.get(label.lower()))
+            if owner_geom and owner_geom not in own_geoms:
+                return True
+        return False
+
     def _lookup_zpool_member(
         self,
         disk: DiskRecord | None,
@@ -15987,7 +16109,10 @@ class InventoryService:
             return None
         provider = normalize_device_name(info.device_name)
         derived_keys = normalize_lookup_keys(info.device_name)
-        derived_keys.update(normalize_lookup_keys(ssh_data.glabel.device_to_gptid.get((provider or "").lower())))
+        # Every partition label on the geom's provider: the pooled one may be
+        # listed before an unpooled swap label (#1059).
+        for label in self._gpt_labels_for_device(provider, ssh_data):
+            derived_keys.update(normalize_lookup_keys(label))
         inferred_member = None
         for key in sorted(derived_keys):
             for members in (ssh_data.zpool_members, api_topology_members, ssh_data.zpool_device_members):

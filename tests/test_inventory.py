@@ -24858,6 +24858,187 @@ class InventoryDefaultRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class), ("directpool", "mirror-9", "data"))
         self.assertIsNone(slot.gptid)
 
+    # #1059 synthetic shape: geom disk11 (consumers da1, da2) and geom disk12
+    # (da3, da4). Each provider has an unpooled p1 and a pooled p2; disk12p2's
+    # label happens to contain `da1` in its hex. SES puts da1 and da3 in bays.
+    ISSUE_1059_LABELS = {
+        "disk11p1": "gptid/aaaa1101-0000-4000-8000-000000000001",
+        "disk11p2": "gptid/aaaa1102-0000-4000-8000-000000000002",
+        "disk12p1": "gptid/aaaa1201-0000-4000-8000-000000000003",
+        "disk12p2": "gptid/aaaa1202-da1f-4000-8000-000000000004",
+    }
+
+    @classmethod
+    def _issue_1059_outputs(cls, *, glabel_order: tuple[str, ...] = ("disk12p2", "disk12p1", "disk11p2", "disk11p1")):
+        from tests import core_ses_fixtures as fx
+
+        geoms = []
+        for name, active, passive in (("disk11", "da1", "da2"), ("disk12", "da3", "da4")):
+            geoms.append(
+                f"Geom name: {name}\n"
+                "Type: AUTOMATIC\nMode: Active/Passive\nState: OPTIMAL\n"
+                f"Providers:\n1. Name: multipath/{name}\n   State: OPTIMAL\n"
+                f"Consumers:\n1. Name: {active}\n   State: ACTIVE\n"
+                f"2. Name: {passive}\n   State: PASSIVE\n"
+            )
+        labels = cls.ISSUE_1059_LABELS
+        return {
+            "sesutil map": fx.sesutil_map(
+                ("ses0", "LSI SAS3x40 0601", fx.FRONT_24_ID, 24, {4: "da1", 22: "da3"}),
+            ),
+            "gmultipath list": "\n".join(geoms),
+            "glabel status": "                                      Name  Status  Components\n" + "".join(
+                f"{labels[part]}     N/A  multipath/{part}\n" for part in glabel_order
+            ),
+            "zpool status -gP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  44440000000000000001     ONLINE       0     0     0\n"
+                "\t    44440000000000000012   ONLINE       0     0     0\n"
+                "\t  44440000000000000002     ONLINE       0     0     0\n"
+                "\t    44440000000000000011   ONLINE       0     0     0\n\n"
+                "errors: No known data errors\n"
+            ),
+            "zpool status -LP": (
+                "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+                "\tNAME                       STATE     READ WRITE CKSUM\n"
+                "\tsynthpool                  ONLINE       0     0     0\n"
+                "\t  mirror-0                 ONLINE       0     0     0\n"
+                f"\t    /dev/{labels['disk12p2']}  ONLINE  0  0  0\n"
+                "\t  mirror-1                 ONLINE       0     0     0\n"
+                f"\t    /dev/{labels['disk11p2']}  ONLINE  0  0  0\n\n"
+                "errors: No known data errors\n"
+            ),
+        }
+
+    @staticmethod
+    def _issue_1059_api_service(temp_dir: str, ssh_outputs: dict[str, str], disks: list[dict]) -> InventoryService:
+        system = SystemConfig(
+            id="core-1059",
+            label="Synthetic CORE",
+            truenas=TrueNASConfig(host="https://core.example.test", api_key="token", platform="core"),
+            ssh=SSHConfig(enabled=True, host="core.example.test", user="jbodmap"),
+        )
+        service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+        service._get_inventory_source_bundle = AsyncMock(
+            return_value=InventorySourceBundle(
+                raw_data=TrueNASRawData(
+                    enclosures=[], disks=disks, pools=[], disk_temperatures={}, smart_test_results=[],
+                ),
+                ssh_outputs=ssh_outputs,
+                ssh_collected=True,
+                warnings=[],
+                sources={
+                    "api": SourceStatus(enabled=True, ok=True),
+                    "ssh": SourceStatus(enabled=True, ok=True),
+                },
+                scale_ses_data=ParsedSSHData(),
+                quantastor_ses_data=ParsedSSHData(),
+            )
+        )
+        return service
+
+    def _assert_issue_1059_bays(self, snapshot) -> None:
+        by_slot = {slot.slot: slot for slot in snapshot.slots if slot.present}
+        self.assertEqual(set(by_slot), {4, 22})
+        # Each bay shows its own geom's pooled vdev: disk11p2 is mirror-1 and
+        # disk12p2 is mirror-0.
+        self.assertEqual(
+            (by_slot[4].pool_name, by_slot[4].vdev_name, by_slot[4].vdev_class), ("synthpool", "mirror-1", "data"),
+        )
+        self.assertEqual(
+            (by_slot[22].pool_name, by_slot[22].vdev_name, by_slot[22].vdev_class), ("synthpool", "mirror-0", "data"),
+        )
+        own_labels = {4: {"disk11p1", "disk11p2"}, 22: {"disk12p1", "disk12p2"}}
+        for slot_number, slot in by_slot.items():
+            foreign = {
+                label for part, label in self.ISSUE_1059_LABELS.items() if part not in own_labels[slot_number]
+            }
+            with self.subTest(slot=slot_number):
+                self.assertNotIn(slot.gptid, foreign)
+                self.assertFalse(foreign & {value.lower() for value in slot.smart_device_names})
+                self.assertNotIn("pool_membership_conflict", slot.raw_status)
+        self.assertFalse(any("sources disagree" in warning for warning in snapshot.warnings))
+
+    async def test_issue_1059_ssh_only_multipath_bays_take_their_own_geoms_membership(self) -> None:
+        orders = (
+            ("disk12p2", "disk12p1", "disk11p2", "disk11p1"),
+            ("disk11p1", "disk11p2", "disk12p1", "disk12p2"),
+        )
+        for order in orders:
+            with self.subTest(order=order), tempfile.TemporaryDirectory() as temp_dir:
+                outputs = self._issue_1059_outputs(glabel_order=order)
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                self.assertNotIn("da1", parsed.glabel.device_to_gptid)
+                self.assertNotIn("da1", parsed.zpool_device_members)
+                snapshot = await self._core_ssh_only_service(temp_dir, outputs).get_snapshot(force_refresh=True)
+                self.assertFalse(snapshot.sources["api"].ok)
+                self._assert_issue_1059_bays(snapshot)
+
+    async def test_issue_1059_api_record_without_multipath_name_keeps_bays_on_their_geoms(self) -> None:
+        # da1's API row lacks multipath_name (the #355 shape, backfilled from
+        # gmultipath); da3's row names its geom. Neither may borrow the other.
+        disks = [
+            {"name": "da1", "devname": "da1", "serial": "SYNTH-1059-A", "multipath_name": "", "multipath_member": ""},
+            {
+                "name": "da3", "devname": "multipath/disk12", "serial": "SYNTH-1059-B",
+                "multipath_name": "disk12", "multipath_member": "da4",
+            },
+        ]
+        for order in (("disk12p2", "disk12p1", "disk11p2", "disk11p1"), ("disk11p2", "disk11p1", "disk12p1", "disk12p2")):
+            for reverse in (False, True):
+                with self.subTest(order=order, reverse=reverse), tempfile.TemporaryDirectory() as temp_dir:
+                    rows = [dict(row) for row in (reversed(disks) if reverse else disks)]
+                    service = self._issue_1059_api_service(temp_dir, self._issue_1059_outputs(glabel_order=order), rows)
+                    snapshot = await service.get_snapshot(force_refresh=True)
+                    self._assert_issue_1059_bays(snapshot)
+                    by_slot = {slot.slot: slot for slot in snapshot.slots if slot.present}
+                    self.assertEqual(by_slot[4].device_name, "multipath/disk11")
+                    self.assertEqual(by_slot[4].multipath.name, "disk11")
+                    self.assertEqual(by_slot[22].device_name, "multipath/disk12")
+                    self.assertEqual(by_slot[4].gptid, self.ISSUE_1059_LABELS["disk11p2"])
+                    self.assertEqual(by_slot[22].gptid, self.ISSUE_1059_LABELS["disk12p2"])
+                    # #355 behaviour: the backfill warning still names the gap.
+                    self.assertIn(inventory_module._CORE_GMULTIPATH_BACKFILL_WARNING, snapshot.warnings)
+
+    async def test_issue_1059_conflicting_geom_sources_leave_bay_membership_unknown_with_warning(self) -> None:
+        # The API row says da1 is a path of disk12, but gmultipath lists da1
+        # under disk11. Either answer could be wrong, so neither is shown.
+        disks = [{
+            "name": "da1", "devname": "multipath/disk12", "serial": "SYNTH-1059-C",
+            "multipath_name": "disk12", "multipath_member": "da4",
+        }]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self._issue_1059_api_service(temp_dir, self._issue_1059_outputs(), disks)
+            snapshot = await service.get_snapshot(force_refresh=True)
+        slot = next(slot for slot in snapshot.slots if slot.slot == 4)
+        self.assertTrue(slot.present)
+        self.assertEqual((slot.pool_name, slot.vdev_name, slot.vdev_class, slot.topology_label), (None,) * 4)
+        self.assertIsNone(slot.gptid)
+        self.assertIs(slot.raw_status.get("pool_membership_conflict"), True)
+        self.assertIn(
+            inventory_module._CORE_POOL_MEMBERSHIP_CONFLICT_WARNING.format(slot_label=slot.slot_label),
+            snapshot.warnings,
+        )
+        for label in self.ISSUE_1059_LABELS.values():
+            self.assertFalse(any(label in warning for warning in snapshot.warnings))
+
+    def test_issue_1059_pooled_label_wins_over_a_later_swap_label_on_one_provider(self) -> None:
+        service = self._bare_service("core")
+        for order in (("disk11p2", "disk11p1"), ("disk11p1", "disk11p2")):
+            with self.subTest(order=order):
+                outputs = self._issue_1059_outputs(glabel_order=order)
+                parsed = parse_ssh_outputs(outputs, 24, None)
+                # The SSH-only consumer joins through either listing order.
+                member = service._lookup_zpool_member(None, "da2", None, parsed, {})
+                self.assertIsNotNone(member)
+                self.assertEqual((member.pool_name, member.vdev_name), ("synthpool", "mirror-1"))
+                if hasattr(service, "_select_gpt_label"):
+                    self.assertEqual(
+                        service._select_gpt_label("multipath/disk11", parsed, {}), self.ISSUE_1059_LABELS["disk11p2"],
+                    )
+
     def test_core_no_record_geom_pool_inference_is_core_only_and_never_walks_peers(self) -> None:
         for platform in ("scale", "linux", "quantastor", "esxi"):
             with self.subTest(platform=platform):

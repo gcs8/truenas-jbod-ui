@@ -16,7 +16,10 @@ from app.services.parsers import (
     esxi_storcli_fallback_command,
     merge_slot_candidate_maps,
     normalize_device_name,
+    normalize_lookup_keys,
     parse_camcontrol_devlist,
+    parse_glabel_status,
+    parse_zpool_status_by_device,
     parse_enclosure_sysfs_map,
     parse_esxcli_smart_get,
     parse_gmultipath_list,
@@ -119,6 +122,69 @@ Slot13          -       -                         -                    Not Insta
         self.assertEqual(normalize_device_name("/dev/multipath/disk0"), "multipath/disk0")
         self.assertEqual(normalize_device_name("(pass0,da0)"), "da0")
         self.assertEqual(normalize_device_name("gptid/abc"), "gptid/abc")
+
+    def test_glabel_takes_the_provider_from_its_column_not_from_the_label_hex(self) -> None:
+        # #1059: a GPTID's hex can contain `da<N>`. Scanning the whole row keyed
+        # that label under bare `da1`, so da1's bay borrowed another geom's
+        # label and the real provider lost it. Synthetic labels only.
+        output = (
+            "                                      Name  Status  Components\n"
+            "gptid/aaaa1202-da1f-4000-8000-000000000004     N/A  multipath/disk12p2\n"
+            "gptid/aaaa1201-0000-4000-8000-000000000003     N/A  multipath/disk12p1\n"
+            "gptid/aaaa1102-0000-4000-8000-000000000002     N/A  multipath/disk11p2\n"
+            "gptid/aaaa1101-0000-4000-8000-000000000001     N/A  multipath/disk11p1\n"
+            "gptid/bbbb0003-0000-4000-8000-000000000005     N/A  da9p2\n"
+        )
+        info = parse_glabel_status(output)
+        self.assertNotIn("da1", info.device_to_gptid)
+        self.assertEqual(info.gptid_to_device["gptid/aaaa1202-da1f-4000-8000-000000000004"], "multipath/disk12")
+        self.assertEqual(
+            info.device_to_gptids,
+            {
+                "multipath/disk12": [
+                    "gptid/aaaa1202-da1f-4000-8000-000000000004", "gptid/aaaa1201-0000-4000-8000-000000000003",
+                ],
+                "multipath/disk11": [
+                    "gptid/aaaa1102-0000-4000-8000-000000000002", "gptid/aaaa1101-0000-4000-8000-000000000001",
+                ],
+                "da9": ["gptid/bbbb0003-0000-4000-8000-000000000005"],
+            },
+        )
+
+    def test_glabel_drops_a_label_listed_on_two_partitions(self) -> None:
+        output = (
+            "gptid/cccc0001-0000-4000-8000-000000000001  N/A  multipath/disk11p2\n"
+            "gptid/cccc0001-0000-4000-8000-000000000001  N/A  multipath/disk12p2\n"
+            "gptid/cccc0002-0000-4000-8000-000000000002  N/A  multipath/disk12p1\n"
+        )
+        info = parse_glabel_status(output)
+        self.assertNotIn("gptid/cccc0001-0000-4000-8000-000000000001", info.gptid_to_device)
+        self.assertNotIn("multipath/disk11", info.device_to_gptid)
+        self.assertEqual(info.device_to_gptids, {"multipath/disk12": ["gptid/cccc0002-0000-4000-8000-000000000002"]})
+
+    def test_label_paths_never_normalize_to_a_device_inside_them(self) -> None:
+        for value in (
+            "gptid/aaaa1202-da1f-4000-8000-000000000004",
+            "/dev/gptid/aaaa1202-da1f-4000-8000-000000000004",
+            "diskid/DISK-SYNTHda7",
+            "gpt/ada3-boot",
+        ):
+            with self.subTest(value=value):
+                stripped = value.removeprefix("/dev/")
+                self.assertEqual(normalize_device_name(value), stripped)
+                self.assertEqual(normalize_lookup_keys(value), {stripped.lower()})
+        self.assertEqual(normalize_device_name("/dev/multipath/disk12p2"), "multipath/disk12")
+        self.assertEqual(normalize_device_name("da1p2"), "da1")
+        members = parse_zpool_status_by_device(
+            "  pool: synthpool\n state: ONLINE\nconfig:\n\n"
+            "\tNAME                                              STATE     READ WRITE CKSUM\n"
+            "\tsynthpool                                         ONLINE       0     0     0\n"
+            "\t  mirror-0                                        ONLINE       0     0     0\n"
+            "\t    /dev/gptid/aaaa1202-da1f-4000-8000-000000000004  ONLINE  0  0  0\n\n"
+            "errors: No known data errors\n"
+        )
+        self.assertNotIn("da1", members)
+        self.assertEqual(members["gptid/aaaa1202-da1f-4000-8000-000000000004"].vdev_name, "mirror-0")
 
     def test_parse_camcontrol_devlist_tracks_models_and_controllers(self) -> None:
         output = """

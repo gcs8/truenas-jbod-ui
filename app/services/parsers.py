@@ -34,6 +34,12 @@ DEVICE_NAME_REGEX = re.compile(
     re.IGNORECASE,
 )
 GPTID_REGEX = re.compile(r"(?P<gptid>(?:/dev/)?gptid/[A-Za-z0-9\-_.]+)", re.IGNORECASE)
+# GEOM label namespaces. A path under one of these names a label, never a
+# device: a GPTID's hex or a diskid's serial can contain `da<N>`, and reading a
+# device out of it attributes another disk's label to that bay (#1059).
+GEOM_LABEL_NAMESPACES = (
+    "gptid/", "gpt/", "diskid/", "label/", "ufsid/", "ufs/", "msdosfs/", "ntfs/", "ext2fs/", "iso9660/",
+)
 GUID_REGEX = re.compile(r"^[0-9]{16,}$")
 SLOT_REGEX = re.compile(r"(?:slot|bay|element)\D{0,4}(?P<slot>\d{1,3})", re.IGNORECASE)
 HEX_VALUE_REGEX = re.compile(r"^(?:0x)?(?P<value>[0-9a-fA-F]+)$")
@@ -62,6 +68,10 @@ MAX_SES_AES_DESCRIPTORS = MAX_SES_ELEMENTS
 class GlabelInfo:
     gptid_to_device: dict[str, str] = field(default_factory=dict)
     device_to_gptid: dict[str, str] = field(default_factory=dict)
+    # Every GPT label on each provider, in `glabel status` order. A provider can
+    # carry one label per partition (swap and ZFS), and `device_to_gptid` keeps
+    # only the last one listed.
+    device_to_gptids: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -233,11 +243,20 @@ class CamcontrolInfo:
 def normalize_device_name(value: str | None) -> str | None:
     if not value:
         return None
+    if is_geom_label_path(value):
+        return value.strip().removeprefix("/dev/")
     match = DEVICE_NAME_REGEX.search(value)
     if not match:
         return value.strip().removeprefix("/dev/")
     normalized = match.group("device").removeprefix("/dev/")
     return re.sub(r"(p\d+)$", "", normalized, flags=re.IGNORECASE)
+
+
+def is_geom_label_path(value: str | None) -> bool:
+    """Whether a value names a GEOM label (`gptid/...`, `diskid/...`), not a device."""
+    if not value:
+        return False
+    return value.strip().removeprefix("/dev/").lower().startswith(GEOM_LABEL_NAMESPACES)
 
 
 def normalize_gptid(value: str | None) -> str | None:
@@ -540,21 +559,39 @@ SMARTCTL_CACHE_TOGGLE_PREFIXES = {
 
 
 def parse_glabel_status(output: str) -> GlabelInfo:
-    info = GlabelInfo()
+    """Parse `glabel status` rows of `Name  Status  Components`.
+
+    The label is the first column and the provider is the last. The device must
+    come from the Components column itself: scanning the whole row used to read
+    `da<N>` out of the label's own hex and key the label under that bare disk,
+    so a bay borrowed another geom's GPTID and that geom lost it (#1059). A label
+    listed on more than one partition is ambiguous and keyed under none.
+    """
+    rows: list[tuple[str, str, str]] = []
+    partitions_by_label: dict[str, set[str]] = {}
     for line in output.splitlines():
-        if "gptid/" not in line:
+        fields = line.split()
+        if len(fields) < 3:
             continue
-
-        gptid_match = GPTID_REGEX.search(line)
-        device_match = DEVICE_REGEX.search(line)
-        if not gptid_match or not device_match:
+        label = fields[0].removeprefix("/dev/")
+        component = fields[-1].removeprefix("/dev/")
+        if not GPTID_REGEX.fullmatch(label) or not DEVICE_NAME_REGEX.match(component):
             continue
+        device = normalize_device_name(component)
+        if not device:
+            continue
+        rows.append((label, component.lower(), device))
+        partitions_by_label.setdefault(label.lower(), set()).add(component.lower())
 
-        gptid = gptid_match.group("gptid").removeprefix("/dev/")
-        device = normalize_device_name(device_match.group("device"))
-        if device:
-            info.gptid_to_device[gptid.lower()] = device
-            info.device_to_gptid[device.lower()] = gptid
+    info = GlabelInfo()
+    for gptid, _component, device in rows:
+        if len(partitions_by_label[gptid.lower()]) > 1:
+            continue
+        info.gptid_to_device[gptid.lower()] = device
+        info.device_to_gptid[device.lower()] = gptid
+        labels = info.device_to_gptids.setdefault(device.lower(), [])
+        if gptid not in labels:
+            labels.append(gptid)
     return info
 
 
