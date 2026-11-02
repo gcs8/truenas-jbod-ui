@@ -480,6 +480,7 @@
         panel_title: selectedStorageView.panel_title || selectedStorageView.label || selectedStorageView.id,
         edge_label: selectedStorageView.edge_label || null,
         face_style: selectedStorageView.face_style || "generic",
+        face_variant: selectedStorageView.face_variant || null,
         latch_edge: selectedStorageView.latch_edge || "bottom",
         bay_size: selectedStorageView.bay_size || null,
         row_groups: Array.isArray(selectedStorageView.row_groups) ? selectedStorageView.row_groups : [],
@@ -1167,6 +1168,7 @@
         enclosureTitle: enclosureLabel,
         edgeLabel: "Not a physical layout",
         faceStyle: "generic",
+        faceVariant: null,
         latchEdge: "bottom",
         baySize: null,
         rowGroups: [],
@@ -1212,6 +1214,7 @@
               : selectedStorageView.kind === "ses_enclosure"
                 ? (profile?.face_style || "generic")
                 : "generic",
+        faceVariant: selectedStorageView.kind === "ses_enclosure" ? (profile?.face_variant || null) : null,
         latchEdge:
           selectedStorageView.kind === "ses_enclosure"
             ? (profile?.latch_edge || "bottom")
@@ -1230,6 +1233,7 @@
       enclosureTitle: (state.snapshot.enclosures || []).length > 1 ? enclosureLabel : (profile?.panel_title || enclosureLabel),
       edgeLabel: profile?.edge_label || "System front",
       faceStyle: profile?.face_style || "generic",
+      faceVariant: profile?.face_variant || null,
       latchEdge: profile?.latch_edge || "bottom",
       baySize: profile?.bay_size || null,
       rowGroups: Array.isArray(profile?.row_groups) ? profile.row_groups : [],
@@ -1527,6 +1531,7 @@
       profileId: profile?.profileId || profile?.id || null,
       profileLabel: profile?.profileLabel || profile?.label || null,
       faceStyle: normalizedProfile.faceStyle,
+      faceVariant: profile?.faceVariant || profile?.face_variant || null,
       latchEdge: normalizedProfile.latchEdge,
       baySize: normalizedProfile.baySize,
       rowGroups,
@@ -1646,7 +1651,124 @@
       .join(" ");
   }
 
+  // Per-model decoration for the UniFi NVR faces (#1068). Everything here is
+  // print, vents, lights and ports on the metal: never a bay. It is drawn as
+  // aria-hidden <div>s without data-slot, so clicks, focus, keyboard walking,
+  // search, summaries, the heat map, Connections and exports, which all read
+  // `.slot-tile[data-slot]`, never see it. Unknown variants draw the plain face.
+  function unifiFaceVariantSpec(geometry) {
+    if ((geometry?.faceStyle || geometry?.face_style) !== "unifi-drive") {
+      return null;
+    }
+    const variant = String(geometry?.faceVariant || geometry?.face_variant || "");
+    const specs = {
+      unvr: {
+        top: { ledBar: true, vents: 5 },
+        bottom: { print: "NVR", reset: true },
+        rows: {},
+      },
+      "unvr-pro": {
+        top: { vents: 5 },
+        bottom: { vents: 5, reset: true },
+        // The touchscreen and the two network ports share the top row with
+        // bays 1-3, so those bays sit offset from bays 4-7 below.
+        rows: {
+          0: {
+            before: { kind: "touchscreen", share: 0.3, print: "NVR Pro" },
+            after: { kind: "ports", share: 0.7 },
+          },
+        },
+      },
+    };
+    return Object.prototype.hasOwnProperty.call(specs, variant) ? { variant, ...specs[variant] } : null;
+  }
+
+  function buildUnifiFaceBand(edge, band) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-band unifi-face-band-${edge}`;
+    element.setAttribute("aria-hidden", "true");
+    const parts = [];
+    if (band?.ledBar) {
+      parts.push('<span class="unifi-face-led-bar"></span>');
+    }
+    if (band?.print) {
+      parts.push(`<span class="unifi-face-print">${escapeHtml(band.print)}</span>`);
+    }
+    if (band?.vents) {
+      const vents = Array.from({ length: band.vents }, () => '<span class="unifi-face-vent"></span>').join("");
+      parts.push(`<span class="unifi-face-vents" style="--unifi-vent-count: ${Number(band.vents)}">${vents}</span>`);
+    }
+    if (band?.reset) {
+      parts.push('<span class="unifi-face-reset"><span class="unifi-face-reset-hole"></span>RESET</span>');
+    }
+    element.innerHTML = parts.join("");
+    return element;
+  }
+
+  function buildUnifiFaceDecor(decor) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-decor unifi-face-${decor.kind}`;
+    element.setAttribute("aria-hidden", "true");
+    if (decor.kind === "touchscreen") {
+      element.setAttribute("title", "Touchscreen (not a bay)");
+      element.innerHTML = `
+        <span class="unifi-face-screen">
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-button"></span>
+        </span>
+        <span class="unifi-face-print">${escapeHtml(decor.print || "")}</span>
+      `;
+    } else if (decor.kind === "ports") {
+      element.setAttribute("title", "Network ports (not bays)");
+      element.innerHTML = `
+        <span class="unifi-face-port"><span class="unifi-face-port-rj45"><span class="unifi-face-port-led"></span></span><span class="unifi-face-port-label">1</span></span>
+        <span class="unifi-face-port"><span class="unifi-face-port-sfp"></span><span class="unifi-face-port-status"></span><span class="unifi-face-port-label">2</span></span>
+      `;
+    }
+    return element;
+  }
+
+  function renderUnifiFaceRows(layoutRows, spec, appendTile, target) {
+    target.appendChild(buildUnifiFaceBand("top", spec.top));
+    normalizeLayoutRows(layoutRows).forEach((row, rowIndex) => {
+      const rowDecor = spec.rows?.[rowIndex] || null;
+      const rowWrapper = document.createElement("div");
+      rowWrapper.className = "slot-row";
+      const rowSlots = document.createElement("div");
+      rowSlots.className = "row-slots unifi-face-row";
+      // A decorated row draws the decoration where the layout keeps its empty
+      // cell; the layout itself, and every slot's index, are unchanged.
+      const cells = rowDecor ? row.filter((slotValue) => Number.isInteger(slotValue)) : row;
+      rowSlots.dataset.slotCount = String(cells.length);
+      const tracks = [];
+      if (rowDecor?.before) {
+        rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.before));
+        tracks.push(`minmax(0, ${rowDecor.before.share}fr)`);
+      }
+      cells.forEach((slotValue) => {
+        appendTile(rowSlots, slotValue);
+        tracks.push("minmax(0, 1fr)");
+      });
+      if (rowDecor?.after) {
+        rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.after));
+        tracks.push(`minmax(0, ${rowDecor.after.share}fr)`);
+      }
+      rowWrapper.appendChild(rowSlots);
+      target.appendChild(rowWrapper);
+      rowSlots.style.gridTemplateColumns = tracks.join(" ");
+    });
+    target.appendChild(buildUnifiFaceBand("bottom", spec.bottom));
+  }
+
   function renderChassisRows(layoutRows, geometry, appendTile, target = grid) {
+    const unifiFace = unifiFaceVariantSpec(geometry);
+    if (unifiFace) {
+      renderUnifiFaceRows(layoutRows, unifiFace, appendTile, target);
+      return;
+    }
     buildLayoutGridRows(layoutRows, geometry).forEach((layoutRow) => {
       const row = layoutRow.slots;
       const rowWrapper = document.createElement("div");
@@ -10022,6 +10144,14 @@
     if (chassisShell) {
       chassisShell.dataset.faceStyle = profile.faceStyle;
       chassisShell.dataset.latchEdge = profile.latchEdge;
+      // Only a face that draws this variant's decoration carries the marker
+      // the per-model styles key on.
+      const unifiFace = unifiFaceVariantSpec(profile);
+      if (unifiFace) {
+        chassisShell.dataset.faceVariant = unifiFace.variant;
+      } else {
+        delete chassisShell.dataset.faceVariant;
+      }
     }
     applyChassisDriveScale(profile);
     if (secondaryContextTitle) {

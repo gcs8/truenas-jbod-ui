@@ -78,6 +78,8 @@ The fields used most often are:
 - `id`, `label`, `panel_title`, and `edge_label` for names
 - `rows`, `columns`, `slot_layout`, and `row_groups` for bay placement
 - `face_style`, `latch_edge`, and `bay_size` for appearance
+- `face_variant` for a model's own front inside a face family (`unvr` and
+  `unvr-pro` on `unifi-drive`); the decoration is never a bay
 - `slot_hints` for matching device or controller identifiers to bays
 - `slot_number_base` for zero-based or one-based displayed bay labels
 

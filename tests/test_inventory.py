@@ -7191,6 +7191,72 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertTrue(any("Bay lights on the UNVR Pro are switched through the UniFi service." in warning for warning in warnings))
             self.assertFalse(any("Skipped unrecognized Linux block devices" in warning for warning in warnings))
 
+    def test_unvr_pro_bays_print_chassis_numbers_without_moving_any_disk(self) -> None:
+        # #1068: the UNVR Pro shows the chassis numbers 01-07. The disk in each
+        # slot index, the slot's grid position and saved manual mappings are
+        # unchanged; only the label gains the profile's base of 1.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            system = SystemConfig(
+                id="unvr-pro",
+                label="UniFi UNVR Pro",
+                default_profile_id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id="unvr-pro", slot=4, enclosure_id=None, serial="SANITIZED-MANUAL-04")
+            )
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {"name": "sda", "type": "disk", "path": "/dev/sda", "hctl": "5:0:0:0",
+                     "serial": "SANITIZED-HCTL-5", "size": "14.6T", "tran": "sata", "children": []},
+                    {"name": "sdb", "type": "disk", "path": "/dev/sdb", "hctl": "7:0:0:0",
+                     "serial": "SANITIZED-HCTL-7", "size": "14.6T", "tran": "sata", "children": []},
+                    {"name": "sdc", "type": "disk", "path": "/dev/sdc", "hctl": "9:0:0:0",
+                     "serial": "SANITIZED-MANUAL-04", "size": "14.6T", "tran": "sata", "children": []},
+                ],
+            )
+
+            slot_views, _available, _meta, rows, slot_count, _columns = service._correlate_linux_host(
+                ssh_data, [], None
+            )
+
+            self.assertEqual(slot_count, 7)
+            self.assertEqual(rows, [[0, 1, 2, None], [3, 4, 5, 6]])
+            by_slot = {view.slot: view for view in slot_views}
+            self.assertEqual(sorted(by_slot), [0, 1, 2, 3, 4, 5, 6])
+            self.assertEqual([by_slot[slot].slot_label for slot in range(7)], ["01", "02", "03", "04", "05", "06", "07"])
+            # Validated HCTL hints: slot 0 is 7:0:0:0 and slot 1 is 5:0:0:0.
+            self.assertEqual(by_slot[0].device_name, "sdb")
+            self.assertEqual(by_slot[1].device_name, "sda")
+            # The saved manual mapping for slot index 4 still lands on slot 4.
+            self.assertEqual(by_slot[4].device_name, "sdc")
+            self.assertEqual((by_slot[4].row_index, by_slot[4].column_index), (1, 1))
+            self.assertEqual((by_slot[2].row_index, by_slot[2].column_index), (0, 2))
+
+    def test_unvr_bays_print_chassis_numbers_one_to_four(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="unvr",
+                label="UniFi UNVR",
+                default_profile_id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {"name": "sdd", "type": "disk", "path": "/dev/sdd", "hctl": "6:0:0:0",
+                     "serial": "SANITIZED-HCTL-6", "size": "3.6T", "tran": "sata", "children": []},
+                ],
+            )
+            slot_views, *_rest = service._correlate_linux_host(ssh_data, [], None)
+            self.assertEqual([view.slot for view in slot_views], [0, 1, 2, 3])
+            self.assertEqual([view.slot_label for view in slot_views], ["01", "02", "03", "04"])
+            self.assertEqual(slot_views[3].device_name, "sdd")
+
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings()

@@ -453,6 +453,49 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.slot_hints[0], ["7:0:0:0"])
         self.assertEqual(profile.slot_hints[1], ["5:0:0:0"])
 
+    def test_unifi_nvr_faces_keep_slot_identity_and_show_chassis_numbers(self) -> None:
+        # The UNVR and UNVR Pro faces are drawn per model (#1068). Only the
+        # drawing changes: slot indices, positions in the layout and the
+        # validated HCTL hints stay exactly as they were, so saved mappings
+        # and history, which are keyed by slot index, are unaffected.
+        registry = ProfileRegistry(get_settings())
+        expected = {
+            UNIFI_UNVR_FRONT_4_PROFILE_ID: {
+                "face_variant": "unvr",
+                "slot_count": 4,
+                "slot_layout": [[0, 1, 2, 3]],
+                "slot_hints": {0: ["0:0:0:0"], 1: ["2:0:0:0"], 2: ["4:0:0:0"], 3: ["6:0:0:0"]},
+            },
+            UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID: {
+                "face_variant": "unvr-pro",
+                "slot_count": 7,
+                "slot_layout": [[0, 1, 2, None], [3, 4, 5, 6]],
+                "slot_hints": {0: ["7:0:0:0"], 1: ["5:0:0:0"]},
+            },
+        }
+        for profile_id, want in expected.items():
+            with self.subTest(profile_id=profile_id):
+                profile = registry.get(profile_id)
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.face_style, "unifi-drive")
+                self.assertEqual(profile.face_variant, want["face_variant"])
+                self.assertEqual(profile.slot_count, want["slot_count"])
+                self.assertEqual(profile.slot_layout, want["slot_layout"])
+                self.assertEqual(profile.slot_hints, want["slot_hints"])
+                # The chassis prints bays from 1 (UniFi OS "HDD 1" is slot 0).
+                self.assertEqual(profile.slot_number_base, 1)
+
+    def test_face_variant_is_optional_and_custom_profiles_keep_the_plain_face(self) -> None:
+        custom = EnclosureProfileConfig(
+            id="custom-unifi",
+            label="Custom UniFi",
+            face_style="unifi-drive",
+            rows=1,
+            columns=4,
+        )
+        self.assertIsNone(custom.face_variant)
+        self.assertIsNone(ProfileRegistry(get_settings()).get(GENERIC_FRONT_12_3X4_PROFILE_ID).face_variant)
+
     def test_get_settings_loads_custom_profile_file_and_system_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)

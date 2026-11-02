@@ -79,7 +79,9 @@ subsystem hints. Add SES commands only if the host exposes the corresponding
 ## UniFi UNVR
 
 UNVR and UNVR Pro use the generic Linux path. Their built-in profiles are
-`ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7`. The tested inventory
+`ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7`. Both draw the real
+front (the UNVR Pro's touchscreen and network ports sit beside bays 1-3) and
+number the bays 1-4 and 1-7 as the chassis and UniFi OS do. The tested inventory
 path uses `lsblk`, `mdadm`, `smartctl`, and `ubntstorage` over SSH. It does not
 rely on `/sys/class/enclosure`.
 

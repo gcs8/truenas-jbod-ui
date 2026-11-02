@@ -50,6 +50,7 @@ const LAYOUT_FUNCTIONS = [
   "rowGroupingMetrics",
   "groupColumnTemplate",
   "buildLayoutGridRows",
+  "unifiFaceVariantSpec",
   "renderChassisRows",
 ];
 

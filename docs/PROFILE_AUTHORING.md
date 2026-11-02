@@ -51,6 +51,14 @@ Optional fields:
   - `front-drive`
   - `rear-drive`
   - `drawer` (plain top-down tray field with no service-bay art)
+  - `unifi-drive` (light UniFi trays; pair it with `face_variant` for a
+    model's own front)
+- `face_variant`: optional per-model decoration inside a face family. The
+  UniFi face draws `unvr` (System LED bar, five vents, NVR print, RESET) and
+  `unvr-pro` (touchscreen beside bays 1-3, RJ45 and SFP+ ports, vents above
+  and below, RESET). The decoration is never a bay: it cannot be selected or
+  focused and is not counted or exported. Omitted or unknown values draw the
+  plain face.
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`
@@ -63,8 +71,10 @@ Optional fields:
 - `slot_layout`: explicit row-by-row slot ordering
 - `slot_number_base`: optional bay-label base for chassis whose silk-screen
   numbering differs from the 0-based SES device slot numbers (the Dell MD1280
-  labels bays 1-84); honored on the SCALE/Linux SES path, and omitted profiles
-  inherit the global `layout.slot_number_base`
+  labels bays 1-84, the UniFi NVRs print 1-4 and 1-7); honored on the
+  SCALE/Linux SES path and the generic Linux path, and omitted profiles
+  inherit the global `layout.slot_number_base`. It changes only the printed
+  label; slot indices, saved mappings and history keys stay 0-based
 - `row_groups`: per-row grouping hints used to render divider blocks
 - `slot_hints`: per-slot matching hints for SSH-only or generic Linux systems
   that need controller, device, or transport-address correlation

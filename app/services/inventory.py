@@ -3485,6 +3485,7 @@ class InventoryService:
             panel_title=storage_view_profile.panel_title if storage_view_profile else None,
             edge_label=storage_view_profile.edge_label if storage_view_profile else None,
             face_style=storage_view_profile.face_style if storage_view_profile else "generic",
+            face_variant=storage_view_profile.face_variant if storage_view_profile else None,
             latch_edge=storage_view_profile.latch_edge if storage_view_profile else "bottom",
             bay_size=storage_view_profile.bay_size if storage_view_profile else None,
             row_groups=list(storage_view_profile.row_groups) if storage_view_profile else [],
@@ -3559,6 +3560,7 @@ class InventoryService:
             panel_title=storage_view_profile.panel_title if storage_view_profile else None,
             edge_label=storage_view_profile.edge_label if storage_view_profile else None,
             face_style=storage_view_profile.face_style if storage_view_profile else "generic",
+            face_variant=storage_view_profile.face_variant if storage_view_profile else None,
             latch_edge=storage_view_profile.latch_edge if storage_view_profile else "bottom",
             bay_size=storage_view_profile.bay_size if storage_view_profile else None,
             row_groups=list(storage_view_profile.row_groups) if storage_view_profile else [],
@@ -8406,6 +8408,11 @@ class InventoryService:
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         selected_meta = frame.selected_meta
+        if selected_profile.slot_number_base is not None:
+            # Same rule as the SES path: a chassis that prints its bays from 1
+            # (the UniFi NVRs, #1068) carries the label base on its profile.
+            # Only the label changes; slot indices and mapping keys do not.
+            selected_meta = {**selected_meta, "slot_number_base": selected_profile.slot_number_base}
         vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
         slot_hints = selected_profile.slot_hints or {}
         if not slot_hints and not vendor_slot_candidates:
@@ -8491,7 +8498,7 @@ class InventoryService:
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "Linux device")
             slot_views.append(slot_view)
 
-        return frame.result(slot_views)
+        return frame.result(slot_views, selected_meta=selected_meta)
 
     def _correlate_esxi_host(
         self,

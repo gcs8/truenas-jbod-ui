@@ -318,6 +318,10 @@ class EnclosureProfileConfig(BaseModel):
     # MD1280 manual: "The physical enclosure enumerates hard drives starting
     # from 1" while secli/SES start at 0). None inherits layout.slot_number_base.
     slot_number_base: int | None = None
+    # Optional per-model decoration inside a face family. The UniFi face
+    # (`unifi-drive`) draws the touchscreen, ports, vents and print of each
+    # model from it (#1068). None draws the family's plain face.
+    face_variant: str | None = None
 
     @field_validator("bay_size", mode="before")
     @classmethod
