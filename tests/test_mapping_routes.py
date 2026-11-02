@@ -937,7 +937,7 @@ class UnwritableDataDirectoryRouteTests(unittest.TestCase):
                             original = getattr(Path, stage)
 
                             def fail_temp(target, *args, **kwargs):
-                                if target == path.with_suffix(".tmp"):
+                                if target.name.startswith(f"{path.name}.") and target.name.endswith(".tmp"):
                                     raise error
                                 return original(target, *args, **kwargs)
 

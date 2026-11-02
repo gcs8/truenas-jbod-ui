@@ -19,6 +19,7 @@ from weakref import WeakValueDictionary
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import __version__
+from app.services.atomic_write import write_atomically
 
 
 logger = logging.getLogger(__name__)
@@ -106,9 +107,8 @@ def _read_state(path: Path) -> dict[str, Any]:
 def _write_state(path: Path, state: dict[str, Any]) -> bool:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(state, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        temp_path.replace(path)
+        text = json.dumps(state, sort_keys=True, indent=2) + "\n"
+        write_atomically(path, lambda handle: handle.write(text))
     except OSError as exc:
         logger.warning("Unable to record the app version at %s: %s", path, exc)
         return False

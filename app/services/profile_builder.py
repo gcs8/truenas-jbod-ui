@@ -9,6 +9,7 @@ import yaml
 
 from app.config import EnclosureProfileConfig, Settings, _load_profile_yaml, normalize_text
 from app.models.domain import EnclosureProfileRequest
+from app.services.atomic_write import write_atomically
 from app.services.config_change_journal import record_config_change
 from app.services.profile_registry import ProfileRegistry, built_in_profile_ids, default_slot_layout
 
@@ -248,13 +249,14 @@ class ProfileBuilderService:
                 for profile in profiles
             ]
         }
-        temp_path = self.profile_path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-            yaml.safe_dump(
+        write_atomically(
+            self.profile_path,
+            lambda handle: yaml.safe_dump(
                 payload,
                 handle,
                 default_flow_style=False,
                 sort_keys=False,
                 allow_unicode=False,
-            )
-        temp_path.replace(self.profile_path)
+            ),
+            newline="\n",
+        )
