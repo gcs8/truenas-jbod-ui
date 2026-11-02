@@ -914,16 +914,20 @@ def _profile_is_manual_only(profile: EnclosureProfileView | None) -> bool:
     return bool(profile is not None and profile.manual_mapping_only)
 
 
-# Slot-status keys that only exist because the platform reported something at
-# this slot index. On a layout whose bay order is unvalidated (#1068) they name
-# the wrong bay as often as the right one, so a manual-only bay is built
-# without them: no hinted device, serial or model, no slot-order presence or
-# health, and no SES element (so Identify cannot light an unverified bay).
-_SLOT_ORDER_EVIDENCE_KEYS = frozenset({
-    "device_names", "device_hint", "device_names_source", "serial_hint", "model_hint",
-    "gptid_hint", "sas_address_hint", "present", "status", "value",
-    "ses_device", "ses_targets", "sas_device_type", "presence_conflict",
+# The only slot-status keys a manual-only bay keeps. Everything else a platform
+# put there exists because it observed something at this slot index, and on a
+# layout whose bay order is unvalidated (#1068) that names the wrong bay as
+# often as the right one: device, serial and model hints, presence, health and
+# fault text, a locate light, SES/BMC/StorCLI/vendor coordinates, SAS port
+# facts, size, SMART type and SES flags. An allowlist rather than a denylist,
+# so a key a platform adds later is withheld until someone decides otherwise.
+# `disk_raw` is the resolved (manually mapped) disk's own record, not slot data.
+_MANUAL_ONLY_SLOT_STATUS_KEYS = frozenset({
+    "enclosure_id", "enclosure_label", "enclosure_name", "mapping_resolution_source", "disk_raw",
 })
+# Slot-detail cache fields that describe the bay rather than the disk. The
+# cache is keyed by slot index, so a manual-only bay must not get them back.
+_BAY_SCOPED_SLOT_DETAIL_FIELDS = frozenset({"sas_address", "enclosure_identifier"})
 
 
 def _manual_only_slot_status(
@@ -931,9 +935,29 @@ def _manual_only_slot_status(
 ) -> dict[str, Any]:
     if not _profile_is_manual_only(profile):
         return raw_slot_status
-    stripped = {key: value for key, value in raw_slot_status.items() if key not in _SLOT_ORDER_EVIDENCE_KEYS}
+    stripped = {key: value for key, value in raw_slot_status.items() if key in _MANUAL_ONLY_SLOT_STATUS_KEYS}
+    if raw_slot_status.get("bmc_match_source") == "serial" and raw_slot_status.get("bmc_identify_active"):
+        # The BMC matched the resolved (manually mapped) disk by serial, so its
+        # locate light is that disk's own, wherever the disk physically sits.
+        stripped["mapped_disk_identify_active"] = True
     stripped["manual_mapping_only"] = True
     return stripped
+
+
+def _slot_status_is_manual_only(raw_status: Mapping[str, Any] | None) -> bool:
+    """The one marker every consumer checks for a manual-only bay (#1068)."""
+    return isinstance(raw_status, Mapping) and raw_status.get("manual_mapping_only") is True
+
+
+def _mapped_disk_identify_active(disk: DiskRecord | None, raw_slot_status: Mapping[str, Any]) -> bool:
+    """A locate light the mapped disk's own record reports, never the slot's."""
+    if disk is None:
+        return False
+    return (
+        raw_slot_status.get("mapped_disk_identify_active") is True
+        or bool(disk.raw.get("bmc_identify_active"))
+        or InventoryService._quantastor_bool(disk.raw.get("isBlinking"))
+    )
 
 
 @dataclass(frozen=True)
@@ -5318,7 +5342,13 @@ class InventoryService:
             if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
                 continue
 
+            manual_only = _slot_status_is_manual_only(slot_view.raw_status)
             for field_name in STABLE_SLOT_DETAIL_FIELDS:
+                if manual_only and field_name in _BAY_SCOPED_SLOT_DETAIL_FIELDS:
+                    # The cache is keyed by slot index; on a manual-only layout
+                    # (#1068) a bay-scoped fact cached there names whatever
+                    # bay that index pointed at, not this one.
+                    continue
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
                     continue
@@ -14925,9 +14955,17 @@ class InventoryService:
         multipath = self._build_multipath_view(disk, ssh_data)
 
         status_haystack = self._status_haystack(raw_slot_status)
-        identify_active = bool(raw_slot_status.get("identify_active")) or self._haystack_contains(status_haystack, "identify", "led=locate")
-        if not identify_active and slot in ssh_data.unifi_led_states:
-            identify_active = ssh_data.unifi_led_states[slot]
+        if _slot_status_is_manual_only(raw_slot_status):
+            # A manual-only bay (#1068): a locate light reported at this slot
+            # index (SES, status text, UniFi GPIO) may belong to a different
+            # physical bay. Only the mapped disk's own record may light it.
+            identify_active = _mapped_disk_identify_active(disk, raw_slot_status)
+        else:
+            identify_active = bool(raw_slot_status.get("identify_active")) or self._haystack_contains(
+                status_haystack, "identify", "led=locate",
+            )
+            if not identify_active and slot in ssh_data.unifi_led_states:
+                identify_active = ssh_data.unifi_led_states[slot]
         faulty = self._haystack_contains(status_haystack, "fault") or self._health_is_bad(
             disk.health if disk else None,
             zpool.health if zpool else None,

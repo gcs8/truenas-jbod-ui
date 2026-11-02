@@ -7630,6 +7630,159 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertIsNone(guarded.led_backend)
             self.assertIn("not been validated", guarded.led_reason)
 
+    # Every slot-status field a platform reports only because it observed
+    # something at this slot index. Each value carries SLOTIDX so a leak shows
+    # up anywhere in the published bay, including raw_status and search text.
+    _SLOT_INDEX_RAW_STATUS = {
+        "device_names": ["SLOTIDX-sdz"], "device_hint": "SLOTIDX-sdz", "device_names_source": "enclosure_sysfs",
+        "serial_hint": "SLOTIDX-serial", "model_hint": "SLOTIDX-model", "gptid_hint": "gptid/SLOTIDX",
+        "sas_address_hint": "SLOTIDX-sas", "present": True, "status": "Critical SLOTIDX", "value": "Critical",
+        "value_raw": "LED=locate SLOTIDX", "state": "identify SLOTIDX", "identify_active": True,
+        "ses_device": "/dev/sg-SLOTIDX", "ses_element_id": 7, "ses_slot_number": 8,
+        "ses_targets": [{"ses_device": "/dev/sg-SLOTIDX", "ses_element_id": 7, "ses_slot_number": 8}],
+        "sas_device_type": "end device SLOTIDX", "attached_sas_address": "SLOTIDX-attached",
+        "transport_protocol": "SLOTIDX-protocol", "phy_identifier": "SLOTIDX-phy",
+        "target_port_protocol": "SLOTIDX-target-port", "descriptor": "SLOTIDX-descriptor",
+        "reported_size": "SLOTIDX-size", "smartctl_device_type": "SLOTIDX-type", "slot_number": 3,
+        "vendor_slot": 3, "vendor_slot_number": 4, "vendor_raw": {"node": "SLOTIDX"}, "experimental_led": True,
+        "ses_predicted_failure": True, "ses_fault_sensed": True, "ses_fault_requested": True,
+        "ses_hot_spare": True, "ses_swapped": True, "ses_do_not_remove": True, "ses_disabled": True,
+        "presence_conflict": True, "bmc_slot_number": 3, "bmc_enclosure_id": "SLOTIDX-bmc",
+        "bmc_controller_id": 0, "bmc_physical_index": 3, "bmc_identify_active": True,
+        "bmc_observation": {"serial": "SLOTIDX-bmc"}, "storcli_physical_drive": {"serial": "SLOTIDX-storcli"},
+        "storcli_slot": "SLOTIDX-storcli", "storcli_enclosure_id": "SLOTIDX-storcli",
+        "transport_address": "SLOTIDX-address",
+        "enclosure_id": "enc", "enclosure_label": "Shelf", "enclosure_name": "Shelf",
+        "mapping_resolution_source": "unknown",
+    }
+
+    def _manual_only_bay(self, platform: str, *, disk: DiskRecord | None, mapping: ManualMapping | None,
+                         ssh_data: ParsedSSHData | None = None, raw: dict | None = None) -> SlotView:
+        from app.services.inventory import _manual_only_slot_status
+
+        profile = ProfileRegistry(Settings()).get(sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0])
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        temp_dir = temp.name
+        system = SystemConfig(
+            id="nvr", label="NVR", truenas=TrueNASConfig(platform=platform), ssh=SSHConfig(enabled=True),
+        )
+        service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir, bmc_service=MagicMock())
+        return service._build_slot_view(
+            slot=3, row_index=0, column_index=3,
+            enclosure_meta={"id": "enc", "label": "Shelf", "name": "Shelf"},
+            raw_slot_status=_manual_only_slot_status(dict(raw or self._SLOT_INDEX_RAW_STATUS), profile),
+            disk=disk, mapping=mapping,
+            ssh_data=ssh_data or ParsedSSHData(unifi_led_states={3: True}),
+            api_topology_members={}, api_enclosure_ids={"enc"},
+        )
+
+    @staticmethod
+    def _mapped_disk(**raw: object) -> DiskRecord:
+        return DiskRecord(
+            raw=dict(raw), device_name="sdm", path_device_name="sdm", multipath_name=None, multipath_member=None,
+            serial="SANITIZED-MAPPED-1", model="Synthetic", size_bytes=4_000_000_000_000, identifier=None,
+            health="ONLINE", pool_name=None, lunid=None, bus=None, temperature_c=None, last_smart_test_type=None,
+            last_smart_test_status=None, last_smart_test_lifetime_hours=None, logical_block_size=None,
+            physical_block_size=None, enclosure_id=None, slot=None, smart_devices=["sdm"],
+            lookup_keys={"sdm", "sanitized-mapped-1"},
+        )
+
+    def test_manual_only_bay_takes_locate_state_only_from_its_mapped_disk(self) -> None:
+        # Codex P2 on #1070 (PRRT_kwDOSAqK-M6ypiVd): an active SES locate light,
+        # a "LED=locate" status or a UniFi GPIO light at this slot index marked a
+        # manual-only bay as identify, although its mapped disk may sit in another
+        # physical bay. Only the mapped disk's own observation may light it.
+        mapping = ManualMapping(system_id="nvr", slot=3, enclosure_id="enc", serial="SANITIZED-MAPPED-1")
+        for platform in ("core", "scale", "linux", "quantastor"):
+            with self.subTest(platform=platform):
+                unmapped = self._manual_only_bay(platform, disk=None, mapping=None)
+                self.assertFalse(unmapped.identify_active)
+                self.assertNotEqual(unmapped.state, SlotState.identify)
+                mapped = self._manual_only_bay(platform, disk=self._mapped_disk(), mapping=mapping)
+                self.assertFalse(mapped.identify_active, "the slot index's locate light is not the mapped disk's")
+                self.assertEqual(mapped.state, SlotState.healthy)
+                own = self._manual_only_bay(platform, disk=self._mapped_disk(bmc_identify_active=True), mapping=mapping)
+                self.assertTrue(own.identify_active, "the mapped disk's own locate state still shows")
+                self.assertEqual(own.state, SlotState.identify)
+
+    def test_no_live_slot_index_field_reaches_a_manual_only_bay(self) -> None:
+        # One table for the class of #1070 findings: whatever the platform, and
+        # whether the bay is unassigned or assigned by hand, nothing a platform
+        # observed at this slot index (identity hints, presence, health, fault,
+        # locate, LED backend, SES/BMC/StorCLI/vendor coordinates, SAS port
+        # facts, size, SMART type, SES flags) may appear on the published bay.
+        from app.services import sas_fabric
+
+        mapping = ManualMapping(system_id="nvr", slot=3, enclosure_id="enc", serial="SANITIZED-MAPPED-1")
+        cases = [
+            (platform, label, disk, case_mapping)
+            for platform in ("core", "scale", "linux", "quantastor", "ipmi", "esxi")
+            for label, disk, case_mapping in (
+                ("unassigned", None, None),
+                ("assigned by hand", self._mapped_disk(), mapping),
+            )
+        ]
+        expectations = {
+            "identify_active": False,
+            "led_supported": False,
+            "led_backend": None,
+            "sas_address": None,
+            "attached_sas_address": None,
+            "transport_protocol": None,
+            "phy_identifier": None,
+            "target_port_protocol": None,
+            "enclosure_identifier": None,
+            "ssh_ses_device": None,
+            "ssh_ses_element_id": None,
+            "ssh_ses_targets": [],
+            "sg_device": None,
+            "smart_device_type": None,
+        }
+        for platform, label, disk, case_mapping in cases:
+            with self.subTest(platform=platform, bay=label):
+                bay = self._manual_only_bay(platform, disk=disk, mapping=case_mapping)
+                for field_name, expected in expectations.items():
+                    self.assertEqual(getattr(bay, field_name), expected, field_name)
+                self.assertNotIn(bay.state, {SlotState.identify, SlotState.fault, SlotState.empty})
+                published = json.dumps(bay.model_dump(mode="json"))
+                self.assertNotIn("SLOTIDX", published)
+                self.assertEqual(
+                    set(bay.raw_status) - {"enclosure_id", "enclosure_label", "enclosure_name",
+                                           "mapping_resolution_source", "manual_mapping_only"},
+                    set(),
+                )
+                if disk is None:
+                    self.assertEqual((bay.present, bay.device_name, bay.serial, bay.size_human), (False, None, None, None))
+                else:
+                    self.assertEqual((bay.serial, bay.device_name), ("SANITIZED-MAPPED-1", "sdm"))
+                # Connections join a bay to an MPR location by identity only.
+                self.assertEqual(sas_fabric._slot_location_number_candidates(bay), [])
+
+    def test_manual_only_bay_restores_no_bay_scoped_detail_from_the_cache(self) -> None:
+        # The slot-detail cache is keyed by slot index. A disk's own facts may
+        # come back, but a bay-scoped SAS address or enclosure element recorded
+        # for whatever bay held that index before must not.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="nvr", label="NVR", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            service.slot_detail_store.save_entries([
+                SlotDetailCacheEntry(
+                    system_id="nvr", enclosure_id="enc", slot=3, identifiers=["sanitized-mapped-1"],
+                    slot_fields={"serial": "SANITIZED-MAPPED-1", "model": "Synthetic",
+                                 "sas_address": "SLOTIDX-sas", "enclosure_identifier": "SLOTIDX-descriptor"},
+                )
+            ])
+            bay = self._manual_only_bay(
+                "linux", disk=self._mapped_disk(),
+                mapping=ManualMapping(system_id="nvr", slot=3, enclosure_id="enc", serial="SANITIZED-MAPPED-1"),
+            )
+            bay.model = None
+            service._apply_persisted_slot_details([bay])
+            self.assertEqual(bay.model, "Synthetic", "the disk's own cached facts still return")
+            self.assertIsNone(bay.sas_address)
+            self.assertIsNone(bay.enclosure_identifier)
+
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:

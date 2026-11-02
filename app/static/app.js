@@ -1083,7 +1083,8 @@
       container.appendChild(tile);
     };
 
-    renderChassisRows(slotLayout, geometry, appendTile, target);
+    // Strips and other printed bay numbers follow this view's own bays.
+    renderChassisRows(slotLayout, geometry, appendTile, target, (slotValue) => storageViewStripSlotLabel(slotsByIndex, slotValue));
   }
 
   function renderLiveNvmeCarrierGrid(selectedProfile, target = grid) {
@@ -1718,9 +1719,11 @@
   }
 
   // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
-  // They come from the layout and the same labels the bays show (the profile's
-  // slot_number_base), so a strip can never disagree with the bay tiles.
-  function unifiFaceColumnLabels(layoutRows, rowIndexes = null) {
+  // They come from the layout and the same labels the drawn bays show, so a
+  // strip can never disagree with the bay tiles. The live page reads the live
+  // bays (formatSlotLabel); a saved chassis view passes its own bay labels,
+  // because the live enclosure may use another layout and label base (#1070).
+  function unifiFaceColumnLabels(layoutRows, rowIndexes = null, slotLabelFor = null) {
     const rows = normalizeLayoutRows(layoutRows);
     const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
     const columns = Math.max(0, ...picked.map((row) => row.length));
@@ -1728,11 +1731,20 @@
       picked
         .map((row) => row[column])
         .filter((slotValue) => Number.isInteger(slotValue))
-        .map((slotValue) => String(Number(formatSlotLabel(slotValue))))
+        .map((slotValue) => String(Number((slotLabelFor || formatSlotLabel)(slotValue))))
         .join(" / "));
   }
 
-  function buildUnifiFaceBand(edge, band, layoutRows = []) {
+  // A saved chassis view's strip label for one bay: the label the view's own
+  // runtime slot carries (built from the view's pinned layout), never the live
+  // enclosure's bay at the same index. Non-numeric labels keep their number.
+  function storageViewStripSlotLabel(slotsByIndex, slotValue) {
+    const label = String(slotsByIndex.get(Number(slotValue))?.slot_label ?? "");
+    const digits = label.match(/(\d+)\s*$/);
+    return digits ? digits[1] : String(Number(slotValue) + 1);
+  }
+
+  function buildUnifiFaceBand(edge, band, layoutRows = [], slotLabelFor = null) {
     const element = document.createElement("div");
     element.className = `unifi-face-band unifi-face-band-${edge}`;
     element.setAttribute("aria-hidden", "true");
@@ -1752,7 +1764,7 @@
       parts.push(`<span class="unifi-face-vents" style="--unifi-vent-count: ${Number(band.vents)}">${vents}</span>`);
     }
     if (band?.columnStrips) {
-      const strips = unifiFaceColumnLabels(layoutRows)
+      const strips = unifiFaceColumnLabels(layoutRows, null, slotLabelFor)
         .map((label) => `<span class="unifi-face-column-strip" data-column-label="${escapeHtml(label)}"><span class="unifi-face-vent"></span><span class="unifi-face-column-label">${escapeHtml(label)}</span></span>`)
         .join("");
       parts.push(`<span class="unifi-face-column-strips">${strips}</span>`);
@@ -1767,11 +1779,11 @@
     return element;
   }
 
-  function buildUnifiFaceRowStrip(layoutRows, rowIndex) {
+  function buildUnifiFaceRowStrip(layoutRows, rowIndex, slotLabelFor = null) {
     const element = document.createElement("div");
     element.className = "unifi-face-row-strip";
     element.setAttribute("aria-hidden", "true");
-    element.innerHTML = unifiFaceColumnLabels(layoutRows, [rowIndex, rowIndex + 1])
+    element.innerHTML = unifiFaceColumnLabels(layoutRows, [rowIndex, rowIndex + 1], slotLabelFor)
       .map((label) => `<span class="unifi-face-row-strip-label" data-column-label="${escapeHtml(label)}">${escapeHtml(label)}</span>`)
       .join("");
     return element;
@@ -1810,12 +1822,12 @@
     return element;
   }
 
-  function renderUnifiFaceRows(layoutRows, spec, appendTile, target) {
+  function renderUnifiFaceRows(layoutRows, spec, appendTile, target, slotLabelFor = null) {
     if (spec.handles) {
       target.appendChild(buildUnifiFaceRackHandle("left"));
     }
     if (spec.top) {
-      target.appendChild(buildUnifiFaceBand("top", spec.top, layoutRows));
+      target.appendChild(buildUnifiFaceBand("top", spec.top, layoutRows, slotLabelFor));
     }
     normalizeLayoutRows(layoutRows).forEach((row, rowIndex) => {
       const rowDecor = spec.rows?.[rowIndex] || null;
@@ -1844,21 +1856,21 @@
       target.appendChild(rowWrapper);
       rowSlots.style.gridTemplateColumns = tracks.join(" ");
       if (spec.rowStrip && spec.rowStrip.after === rowIndex) {
-        target.appendChild(buildUnifiFaceRowStrip(layoutRows, rowIndex));
+        target.appendChild(buildUnifiFaceRowStrip(layoutRows, rowIndex, slotLabelFor));
       }
     });
     if (spec.bottom) {
-      target.appendChild(buildUnifiFaceBand("bottom", spec.bottom, layoutRows));
+      target.appendChild(buildUnifiFaceBand("bottom", spec.bottom, layoutRows, slotLabelFor));
     }
     if (spec.handles) {
       target.appendChild(buildUnifiFaceRackHandle("right"));
     }
   }
 
-  function renderChassisRows(layoutRows, geometry, appendTile, target = grid) {
+  function renderChassisRows(layoutRows, geometry, appendTile, target = grid, slotLabelFor = null) {
     const unifiFace = unifiFaceVariantSpec(geometry);
     if (unifiFace) {
-      renderUnifiFaceRows(layoutRows, unifiFace, appendTile, target);
+      renderUnifiFaceRows(layoutRows, unifiFace, appendTile, target, slotLabelFor);
       return;
     }
     buildLayoutGridRows(layoutRows, geometry).forEach((layoutRow) => {

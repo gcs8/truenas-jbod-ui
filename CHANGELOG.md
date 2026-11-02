@@ -38,8 +38,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   disks show as unmapped until they are assigned to a bay, copies of these
   profiles keep that rule, a saved chassis view drawn with one of them over an
   enclosure using another layout shows only disks assigned by hand (in the
-  page, heat map, connections and offline snapshots), and bay lights stay off
-  on them (#1070, refs #1068).
+  page, heat map, connections and offline snapshots), no bay takes a locate
+  light, fault, SES or SAS detail, or printed strip number from the live bay
+  order, and bay lights stay off on them (#1070, refs #1068).
 
 ### Changed
 

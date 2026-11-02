@@ -463,3 +463,71 @@ test("column and row strips follow the profile's bay-label base", () => {
     ["0 / 4 / 8 / 12", "1 / 5 / 9 / 13", "2 / 6 / 10 / 14", "3 / 7 / 11 / 15"],
   );
 });
+
+// Codex P2 on #1070 (PRRT_kwDOSAqK-M6ysJZi): a saved G2-Pro or ENVR chassis
+// view drawn over a live enclosure that labels its bays from 0 printed the
+// strips from the live snapshot and live profile ("0 / 4") above bays the view
+// labels 01 and 05. The strips must come from the saved view's own bays.
+test("a saved chassis view prints its strips from its own bay labels, not the live enclosure's", () => {
+  for (const { profile, layoutRows, strip } of [
+    { ...G2_PRO, strip: "unifi-face-row-strip" },
+    { ...ENVR, strip: "unifi-face-band-top" },
+  ]) {
+    const viewSlots = layoutRows.flat().filter(Number.isInteger).map((slotIndex) => ({
+      slot_index: slotIndex,
+      slot_label: String(slotIndex + 1).padStart(2, "0"),
+      state: "unknown",
+      manual_mapping_only: true,
+    }));
+    const view = {
+      id: "pinned-nvr", kind: "ses_enclosure", slot_layout: layoutRows, slots: viewSlots,
+      face_style: "unifi-drive", face_variant: profile.faceVariant,
+    };
+    const withClassList = (tagName) => {
+      const element = fakeElement(tagName);
+      element.classList = { add() {}, contains: () => false };
+      return element;
+    };
+    const sandbox = vm.createContext({
+      document: { createElement: withClassList },
+      grid: withClassList("div"),
+      state: {
+        // The live enclosure: a different profile with base-0 labels.
+        snapshot: {
+          slots: layoutRows.flat().filter(Number.isInteger).map((slot) => ({ slot, slot_label: String(slot).padStart(2, "0") })),
+          selected_profile: { slot_number_base: 0 },
+        },
+        selectedSlot: null,
+      },
+      hideSlotTooltip() {},
+      getSelectedPeerContext: () => ({ active: false, peerSlots: new Set() }),
+      buildViewProfile: () => ({ ...profile, slotLayout: layoutRows }),
+      buildHeatmapContext: () => ({ enabled: false }),
+      renderHeatmapControls() {},
+      getLiveBackedStorageViewSlot: () => null,
+      storageViewRuntimeMatchesFilter: () => true,
+      buildStorageViewRuntimeTooltip: () => "",
+      storageViewRuntimeShortLabel: () => "",
+      storageViewRuntimeSecondaryLabel: () => "",
+      storageViewRuntimeTertiaryLabel: () => "",
+      stateLabel: () => "",
+      applyHeatmapToTile() {},
+      getSmartSummaryEntry: () => null,
+      getSelectedProfile: () => ({ row_groups: [] }),
+      currentLayoutSlotCount: () => viewSlots.length,
+      activeLayoutRows: () => layoutRows,
+    });
+    const names = [...FUNCTIONS, "storageViewStripSlotLabel", "renderStorageViewGrid"];
+    vm.runInContext(`${names.map(functionSource).join("\n")}\nthis.__render = renderStorageViewGrid;`, sandbox);
+    const target = withClassList("div");
+    sandbox.__render(view, target);
+    const strips = [];
+    walk(target, (node) => {
+      if (String(node.className).split(/\s+/).includes(strip)) strips.push(node);
+    });
+    assert.equal(strips.length, 1, `${profile.faceVariant} draws one ${strip}`);
+    const labels = [...strips[0].innerHTML.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]);
+    assert.equal(labels[0], layoutRows.map((row) => String(row[0] + 1)).join(" / "), profile.faceVariant);
+    assert.doesNotMatch(labels.join(" "), /\b0\b/, "no live base-0 label reaches the saved view's strips");
+  }
+});
