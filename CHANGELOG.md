@@ -26,7 +26,43 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.5 - 2026-11-02
+
+This prerelease adds the changes merged after `v0.24.0-beta.4`. GHCR gets the
+fixed `v0.24.0-beta.5` and `0.24.0-beta.5` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- TrueNAS middleware calls now share one per-appliance limit (4 on CORE, 8 on
+  SCALE) and back off when the appliance is busy, so read bursts no longer
+  starve its own alert checks (#1076).
+- An interrupted login no longer leaves a stale API session on a CORE 13
+  appliance (#1076).
+- Non-TrueNAS systems are labelled by their own sources: the API and SSH chips
+  and the bay source name UniFi storage, StorCLI, the enclosure layout or the
+  BMC instead of the TrueNAS API (#1067).
+- The UniFi UNVR and UNVR Pro fronts are drawn as the real chassis, and the
+  UNVR-G2, UNVR-G2-Pro, ENVR and ENVR-Core get layout-only faces (#1069,
+  #1070).
+
+### Upgrade notes
+
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.4`, read every
+  note below; upgrading from `v0.23.0` or older, read the `v0.24.0-beta.1` to
+  `v0.24.0-beta.4` upgrade notes too. The Compose files are unchanged since
+  `v0.24.0-beta.4`.
+- New setting `max_concurrent_calls` (environment
+  `TRUENAS_MAX_CONCURRENT_CALLS`) caps the middleware calls kept in flight
+  against one appliance. Leave it blank for the defaults, 4 on CORE and 8 on
+  SCALE; set 1 to 10 to override. While the appliance is busy the API source
+  shows as busy instead of unreachable (#1076).
+- API sessions that earlier versions already leaked on a CORE 13 appliance
+  stay listed under `auth.sessions` until its middleware restarts; this
+  release only stops new ones (#1076).
+- The four new UniFi faces are layout only: chosen with `default_profile_id`,
+  their disks show as unmapped until assigned to a bay by hand (#1070).
 
 ### Added
 
