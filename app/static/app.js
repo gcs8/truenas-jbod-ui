@@ -1746,15 +1746,15 @@
       const tracks = [];
       if (rowDecor?.before) {
         rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.before));
-        tracks.push(`minmax(0, ${rowDecor.before.share}fr)`);
+        tracks.push(`minmax(var(--unifi-decor-min, 0px), ${rowDecor.before.share}fr)`);
       }
       cells.forEach((slotValue) => {
         appendTile(rowSlots, slotValue);
-        tracks.push("minmax(0, 1fr)");
+        tracks.push("minmax(var(--unifi-bay-min, 0px), 1fr)");
       });
       if (rowDecor?.after) {
         rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.after));
-        tracks.push(`minmax(0, ${rowDecor.after.share}fr)`);
+        tracks.push(`minmax(var(--unifi-decor-min, 0px), ${rowDecor.after.share}fr)`);
       }
       rowWrapper.appendChild(rowSlots);
       target.appendChild(rowWrapper);

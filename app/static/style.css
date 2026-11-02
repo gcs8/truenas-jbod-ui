@@ -4428,8 +4428,17 @@ button.fabric-trace-crumb:hover {
 }
 
 @media (max-width: 640px) {
+  /* Bays keep a readable width on a phone; the face scrolls sideways, like
+     the other chassis faces, instead of squeezing the tray labels. */
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] {
+    --unifi-bay-min: 76px;
+    --unifi-decor-min: 34px;
     padding: 10px 8px 8px;
+    overflow-x: auto;
+  }
+
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-grid {
+    min-width: max-content;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
