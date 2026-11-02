@@ -130,7 +130,12 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
   await expect(selector.locator("option:checked")).toContainText("Saved copy · Demo 60-Bay Top Loader");
-  await expect(page.locator("#api-status-chip")).toHaveText("TrueNAS API: OK at capture");
+  // The demo has no API (`sources.api.enabled` is false), so a current-source
+  // build says so (#1066); checked-in bytes built before that keep "OK".
+  const currentSourceDemo = path.resolve(demoPath) !== path.resolve(path.join(repoRoot, "public-demo", "index.html"));
+  await expect(page.locator("#api-status-chip")).toHaveText(
+    currentSourceDemo ? "TrueNAS API: not used at capture" : "TrueNAS API: OK at capture"
+  );
   await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: off at capture");
   await expect(page.locator("#history-status-chip")).toHaveText("History: included");
   await expect(page.locator("#last-updated").locator("xpath=.." )).toContainText("Snapshot time");

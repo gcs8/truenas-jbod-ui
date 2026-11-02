@@ -479,6 +479,125 @@ for (const redact of [false, true]) {
   }
 }
 
+// #1066: a profile-backed Linux appliance (synthetic): no API, only an
+// optional SSH read failed, and one array mounted at the same path on every bay.
+function buildOfflineLinuxApplianceSnapshotFixture() {
+  const repoRoot = path.resolve(__dirname, "..");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-linux-appliance-snapshot-"));
+  const outputPath = path.join(tempDir, "offline-linux-appliance.html");
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const script = `
+import asyncio
+import importlib.util
+import pathlib
+import sys
+
+root = pathlib.Path.cwd()
+spec = importlib.util.spec_from_file_location("snapshot_export_fixtures", root / "tests" / "test_snapshot_export.py")
+module = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+async def main():
+    layout = [[0, 1, 2, 3]]
+    slots = [
+        module.SlotView(
+            slot=slot,
+            slot_label=f"{slot + 1:02}",
+            row_index=0,
+            column_index=slot,
+            enclosure_id="synthetic-appliance",
+            enclosure_label="Synthetic Appliance",
+            present=True,
+            state=module.SlotState.healthy,
+            device_name=f"sd{chr(97 + slot)}",
+            serial=f"SYNTHSERIAL00{slot}AB{slot}",
+            model="Synthetic Disk 8TB",
+            size_human="8 TB",
+            pool_name="/volume/synthetic-volume-0000",
+            health="healthy",
+            mapping_source="api-slot",
+        )
+        for slot in range(4)
+    ]
+    snapshot = module.InventorySnapshot(
+        slots=slots,
+        layout_rows=layout,
+        layout_slot_count=4,
+        layout_columns=4,
+        refresh_interval_seconds=30,
+        selected_system_id="synthetic-appliance",
+        selected_system_label="Synthetic Appliance",
+        selected_system_platform="linux",
+        selected_enclosure_id="synthetic-appliance",
+        selected_enclosure_label="Synthetic Appliance",
+        systems=[module.SystemOption(id="synthetic-appliance", label="Synthetic Appliance", platform="linux")],
+        enclosures=[
+            module.EnclosureOption(
+                id="synthetic-appliance", label="Synthetic Appliance", rows=1, columns=4, slot_count=4, slot_layout=layout,
+            )
+        ],
+        sources={
+            "api": module.SourceStatus(
+                enabled=False, ok=True, message="Linux systems have no platform API; disks are read over SSH.",
+            ),
+            "ssh": module.SourceStatus(
+                enabled=True,
+                ok=False,
+                required_ok=True,
+                message="Some optional SSH reads failed (Linux SCSI transport detail). The bay map is complete.",
+            ),
+        },
+        summary=module.InventorySummary(
+            disk_count=4, pool_count=1, enclosure_count=1, mapped_slot_count=4, manual_mapping_count=0, ssh_slot_hint_count=0,
+        ),
+    )
+    exporter = module.SnapshotExportService(module.Settings(), module.FakeHistoryBackend(), module.templates)
+    rendered = await exporter.build_enclosure_snapshot_html(
+        request=module.build_request(),
+        snapshot=snapshot,
+        smart_summary_cache={},
+        selected_slot=0,
+        history_window_hours=24,
+        history_panel_open=False,
+        io_chart_mode="total",
+    )
+    pathlib.Path(sys.argv[1]).write_text(rendered.html, encoding="utf-8")
+
+asyncio.run(main())
+`;
+  const result = spawnSync(python, ["-c", script, outputPath], { cwd: repoRoot, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`Offline Linux appliance snapshot fixture generation failed:\n${result.stdout}\n${result.stderr}`);
+  }
+  return outputPath;
+}
+
+test("offline Linux appliance copy names its own sources and tells shared-mount bays apart", async ({ page }) => {
+  const snapshotPath = buildOfflineLinuxApplianceSnapshotFixture();
+  const consoleErrors = [];
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  await page.goto(pathToFileURL(snapshotPath).href, { waitUntil: "load" });
+
+  await expect(page.locator("#api-status-chip")).toHaveText("API: not used at capture");
+  await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: partial at capture");
+  await expect(page.locator("#ssh-status-chip")).toHaveClass(/\bpartial\b/);
+  await expect(page.locator("#ssh-status-chip")).toHaveAttribute("title", /Linux SCSI transport detail/);
+  await expect(page.locator("#mapping-health-evidence")).toHaveText("Bay positions come from: SSH (UniFi storage).");
+  await expect(page.locator("#detail-kv-grid")).toContainText("Bay reported by");
+  await expect(page.locator("#detail-kv-grid")).toContainText("SSH (UniFi storage)");
+  await expect(page.locator("#detail-kv-grid")).not.toContainText("TrueNAS API");
+
+  const secondLines = await page.locator("#slot-grid .slot-tile .slot-pool").allTextContents();
+  expect(secondLines).toEqual(["S/N …000AB0", "S/N …001AB1", "S/N …002AB2", "S/N …003AB3"]);
+  expect(consoleErrors).toEqual([]);
+});
+
 test("offline snapshot renders preloaded slot history without a live backend", async ({ page }) => {
   const snapshotPath = buildOfflineSnapshotFixture();
 

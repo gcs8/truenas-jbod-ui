@@ -40,7 +40,14 @@ function renderStatusWith(sources) {
   const apiStatusChip = chip();
   const sshStatusChip = chip();
   const historyStatusChip = chip();
-  const { renderStatus } = loadFunctions(["renderStatus", "snapshotSshStatus"], {
+  const { renderStatus } = loadFunctions([
+    "renderStatus",
+    "snapshotSshStatus",
+    "apiStatusChipState",
+    "sshStatusChipState",
+    "platformApiName",
+    "currentPlatform",
+  ], {
     state: {
       snapshotMode: false,
       snapshot: { sources, last_updated: "2026-09-01T12:00:00Z" },

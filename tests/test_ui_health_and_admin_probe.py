@@ -267,6 +267,75 @@ class ConfiguredKnownHostsStartupTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1)
             self.assertIn("new host keys cannot be saved", warnings[0])
 
+    def test_read_only_mount_is_named_instead_of_an_ownership_problem(self) -> None:
+        # #1066: /run/ssh is a read-only bind; uid 0 owning a file the app,
+        # running as uid 0, cannot write is a mount, not an ownership fault.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            read_only = SimpleNamespace(f_flag=os.ST_RDONLY)
+            with (
+                patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.W_OK),
+                patch("app.services.storage_writability.os.statvfs", return_value=read_only),
+            ):
+                problems = app_route_support.startup_storage_problems(settings)
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(problems, [])
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("read-only mount", warnings[0])
+            self.assertIn("new host keys cannot be saved", warnings[0])
+            self.assertIn("still checked against the keys already in it", warnings[0])
+            self.assertNotIn("owned by uid", warnings[0])
+            self.assertNotIn("chown", warnings[0])
+
+    def test_writable_mount_keeps_the_ownership_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            with (
+                patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.W_OK),
+                patch("app.services.storage_writability.os.statvfs", return_value=SimpleNamespace(f_flag=0)),
+            ):
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(len(warnings), 1)
+            self.assertNotIn("read-only mount", warnings[0])
+            self.assertIn("owned by uid", warnings[0])
+
+    def test_read_only_folder_without_a_file_names_the_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            settings = self.settings_with_known_hosts(root, str(root / "host-trust" / "known_hosts"))
+            with (
+                patch("app.services.storage_writability.os.access", return_value=False),
+                patch("app.services.storage_writability.os.statvfs", return_value=SimpleNamespace(f_flag=os.ST_RDONLY)),
+            ):
+                problems = app_route_support.startup_storage_problems(settings)
+            self.assertEqual(len(problems), 1)
+            self.assertIn("read-only mount", problems[0])
+            self.assertNotIn("owned by uid", problems[0])
+
+    def test_unknown_mount_state_keeps_the_ownership_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "host-trust").mkdir()
+            known_hosts = root / "host-trust" / "known_hosts"
+            known_hosts.write_text("", encoding="utf-8")
+            settings = self.settings_with_known_hosts(root, str(known_hosts))
+            with (
+                patch("app.services.storage_writability.os.access", side_effect=lambda p, mode: mode != os.W_OK),
+                patch("app.services.storage_writability.os.statvfs", side_effect=OSError(5, "I/O error")),
+            ):
+                warnings = app_route_support.startup_known_hosts_warnings(settings)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("owned by uid", warnings[0])
+
     def test_unreadable_configured_file_is_a_down_problem(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -513,6 +582,23 @@ class HealthzTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "degraded")
         self.assertEqual(len(body["problems"]), 3)
+
+    def test_api_problem_names_the_platform_api(self) -> None:
+        # #1066: a QuantaStor or ESXi failure is not called a TrueNAS API failure.
+        for platform, label in (("core", "TrueNAS API"), ("scale", "TrueNAS API"), ("quantastor", "QuantaStor API")):
+            with self.subTest(platform=platform):
+                snapshot = _snapshot(api_ok=False, api_message="connection refused")
+                snapshot.selected_system_platform = platform
+                _status, body = self.call_healthz(snapshot)
+                self.assertEqual(body["problems"], [f"{label} degraded: connection refused"])
+
+    def test_unused_api_is_never_a_problem(self) -> None:
+        snapshot = _snapshot()
+        snapshot.selected_system_platform = "linux"
+        snapshot.sources["api"] = SourceStatus(enabled=False, ok=True, message="not used")
+        _status, body = self.call_healthz(snapshot)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["dependency_status"], "ok")
 
     def test_livez_is_unchanged(self) -> None:
         response = asyncio.run(_route("/livez").endpoint())

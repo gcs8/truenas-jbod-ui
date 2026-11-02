@@ -104,6 +104,7 @@ function loadLiveSlotTileRenderer(source) {
     functionSource(source, "escapeHtml"),
     functionSource(source, "stateLabel"),
     functionSource(source, "slotPrimaryLabel"),
+    functionSource(source, "liveSlotSecondaryLabel"),
     functionSource(source, "buildLiveSlotTileMarkup"),
     "this.__buildLiveSlotTileMarkup = buildLiveSlotTileMarkup;",
   ].join("\n");

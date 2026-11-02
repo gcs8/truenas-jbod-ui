@@ -4178,7 +4178,8 @@ class InventoryService:
                     f"Some SSH commands failed ({context_text}). The bay map still works; "
                     "see Debug for the command output."
                 ],
-                "SSH finished with some failed commands.",
+                # The SSH chip's tooltip names the failed optional read (#1066).
+                f"Some optional SSH reads failed ({context_text}). The bay map is complete.",
             )
 
         return (
@@ -4570,18 +4571,20 @@ class InventoryService:
             if self.system.truenas.platform == "ipmi"
             else "TrueNAS API"
         )
-        ssh_only_platform_label = (
-            "ESXi"
+        # #1066: say how disks are read where no platform API is used, rather
+        # than naming an API (TrueNAS) the system does not have.
+        unused_api_message = (
+            "The ESXi API is not used; disks are read over SSH."
             if self.system.truenas.platform == "esxi"
-            else "IPMI / BMC"
+            else "BMC-only systems have no platform API; disks are read from the BMC."
             if self.system.truenas.platform == "ipmi"
-            else "Linux"
+            else "Linux systems have no platform API; disks are read over SSH."
         )
         sources = {
             "api": SourceStatus(
                 enabled=api_enabled,
                 ok=not api_enabled,
-                message=f"{api_label} is not used on {ssh_only_platform_label} systems." if not api_enabled else None,
+                message=unused_api_message if not api_enabled else None,
             ),
             "ssh": SourceStatus(enabled=self.system.ssh.enabled, ok=not self.system.ssh.enabled, message=None),
             "bmc": SourceStatus(
