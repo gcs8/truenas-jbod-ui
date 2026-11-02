@@ -55,7 +55,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `max_concurrent_calls` (`TRUENAS_MAX_CONCURRENT_CALLS`, default 4 on CORE and
   8 on SCALE, at most 10), across refreshes, SMART grids, drawers and LED
   actions. A busy reply or a timed-out inventory read starts a jittered
-  backoff, and the API source shows as busy instead of unreachable (#1076, refs #1072).
+  backoff, and the API source shows as busy instead of unreachable (#1076,
+  refs #1072).
 
 ### Fixed
 
