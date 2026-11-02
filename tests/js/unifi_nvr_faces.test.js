@@ -68,6 +68,8 @@ function functionSource(name) {
 
 const FUNCTIONS = [
   "escapeHtml",
+  "getSlotById",
+  "formatSlotLabel",
   "countLayoutSlots",
   "normalizeLayoutRows",
   "normalizeGeometryRowGroups",
@@ -122,7 +124,14 @@ function loadRenderer(profile, layoutRows) {
   const sandbox = vm.createContext({
     document: { createElement: fakeElement },
     grid: fakeElement("div"),
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: {
+      snapshot: {
+        slots,
+        layout_slot_count: slots.length,
+        selected_profile: { slot_number_base: profile.slotNumberBase === undefined ? 1 : profile.slotNumberBase },
+      },
+      selectedSlot: null,
+    },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: [] }),
     currentLayoutSlotCount: () => slots.length,
@@ -434,4 +443,23 @@ test("the ENVR faces print their column strips 1/5/9/13 to 4/8/12/16 and differ 
   assert.match(bandText(envr, "top"), /unifi-face-accessory-port/);
   assert.match(bandText(core, "top"), />Enterprise NVR Core</);
   assert.doesNotMatch(bandText(core, "top"), /unifi-face-accessory-port/);
+});
+
+// Codex P2 on #1070: a copy of a G2-Pro or ENVR profile may set
+// slot_number_base to 0. The printed strips must then agree with the bays.
+test("column and row strips follow the profile's bay-label base", () => {
+  const g2pro = loadRenderer({ ...G2_PRO.profile, slotNumberBase: 0 }, G2_PRO.layoutRows).target;
+  const strips = [];
+  walk(g2pro, (node) => {
+    if (/\bunifi-face-row-strip\b/.test(String(node.className))) strips.push(node);
+  });
+  assert.deepEqual(
+    [...strips[0].innerHTML.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+    ["0 / 4", "1 / 5", "2 / 6", "3 / 7"],
+  );
+  const envr = loadRenderer({ ...ENVR.profile, slotNumberBase: 0 }, ENVR.layoutRows).target;
+  assert.deepEqual(
+    [...bandText(envr, "top").matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+    ["0 / 4 / 8 / 12", "1 / 5 / 9 / 13", "2 / 6 / 10 / 14", "3 / 7 / 11 / 15"],
+  );
 });

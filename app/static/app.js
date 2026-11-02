@@ -1718,8 +1718,8 @@
   }
 
   // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
-  // They come from the layout and the same 1-based numbering the bays show, so
-  // a strip can never disagree with the bay labels.
+  // They come from the layout and the same labels the bays show (the profile's
+  // slot_number_base), so a strip can never disagree with the bay tiles.
   function unifiFaceColumnLabels(layoutRows, rowIndexes = null) {
     const rows = normalizeLayoutRows(layoutRows);
     const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
@@ -1728,7 +1728,7 @@
       picked
         .map((row) => row[column])
         .filter((slotValue) => Number.isInteger(slotValue))
-        .map((slotValue) => String(slotValue + 1))
+        .map((slotValue) => String(Number(formatSlotLabel(slotValue))))
         .join(" / "));
   }
 
