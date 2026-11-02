@@ -908,6 +908,12 @@ class _LayoutFrame:
         )
 
 
+def _profile_is_manual_only(profile: EnclosureProfileView | None) -> bool:
+    """True for a layout whose bay order is unvalidated (#1068): only saved
+    manual mappings may place a disk on it, on every platform's path."""
+    return bool(profile is not None and profile.manual_mapping_only)
+
+
 def _warn_unmatched_mapping(
     warnings: list[str],
     mapping: ManualMapping | None,
@@ -7980,6 +7986,7 @@ class InventoryService:
                 disks_by_sas,
                 candidate,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             candidate["mapping_resolution_source"] = resolution.source
@@ -8397,7 +8404,7 @@ class InventoryService:
         # Layout-only profiles (#1068) have no validated bay order: neither the
         # UniFi storage service's slot numbers nor slot hints may place a disk.
         # Only saved manual mappings do, as on a generic chassis.
-        layout_only = selected_profile.manual_mapping_only
+        layout_only = _profile_is_manual_only(selected_profile)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
@@ -8481,6 +8488,7 @@ class InventoryService:
                 {},
                 raw_slot_status,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             raw_slot_status["mapping_resolution_source"] = (
@@ -8686,6 +8694,7 @@ class InventoryService:
                     {},
                     raw_slot_status,
                     ssh_data,
+                    manual_only=_profile_is_manual_only(frame.selected_profile),
                 )
                 disk = resolution.disk
             if bmc_disk is not None:
@@ -8819,6 +8828,7 @@ class InventoryService:
                     {},
                     raw_slot_status,
                     empty_ssh,
+                    manual_only=_profile_is_manual_only(frame.selected_profile),
                 )
                 disk = resolution.disk
             raw_slot_status["mapping_resolution_source"] = resolution.source
@@ -8944,6 +8954,7 @@ class InventoryService:
                 disks_by_sas,
                 candidate,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             candidate["mapping_resolution_source"] = resolution.source
@@ -9081,6 +9092,7 @@ class InventoryService:
                 disks_by_sas,
                 slot_hints,
                 empty_ssh,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             slot_hints["mapping_resolution_source"] = resolution.source
@@ -14556,6 +14568,8 @@ class InventoryService:
         disks_by_sas: dict[str, DiskRecord],
         raw_slot_status: dict[str, Any],
         ssh_data: ParsedSSHData,
+        *,
+        manual_only: bool = False,
     ) -> DiskResolution:
         if self._slot_has_live_empty_evidence(raw_slot_status):
             return DiskResolution(
@@ -14572,6 +14586,12 @@ class InventoryService:
                     disk = disks_by_key.get(key)
                     if disk:
                         return DiskResolution(disk=disk, source=mapping.source or "manual")
+
+        if manual_only:
+            # A layout whose bay order is unvalidated (#1068): no API slot,
+            # hint, SAS address or SES slot map may place a disk, only a saved
+            # manual mapping, so a misreporting peer cannot name a bay's disk.
+            return DiskResolution(disk=None, source="unknown")
 
         sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
         if self.system.truenas.platform == "quantastor" and sas_address_hint and sas_address_hint != "0":

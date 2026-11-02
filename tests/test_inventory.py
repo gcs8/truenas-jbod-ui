@@ -7323,6 +7323,67 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(service.profile_registry.get("my-nvr").manual_mapping_only, True)
             self.assertEqual([view.device_name for view in slot_views if view.device_name], [])
 
+    def test_layout_only_unifi_profiles_ignore_ses_slot_maps_too(self) -> None:
+        # Codex security P2 on #1070: a misreporting SSH peer's SES slot map
+        # must not place a disk on a manual-only layout either. Only a saved
+        # manual mapping does.
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = SystemConfig(
+                    id="nvr",
+                    label="UniFi NVR",
+                    default_profile_id=profile_id,
+                    truenas=TrueNASConfig(platform="linux"),
+                    ssh=SSHConfig(enabled=True),
+                )
+                service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+                service.mapping_store.save_mapping(
+                    ManualMapping(system_id="nvr", slot=1, enclosure_id=None, serial="SANITIZED-SES-B")
+                )
+                ssh_data = ParsedSSHData(
+                    linux_blockdevices=[
+                        {"name": "sda", "type": "disk", "path": "/dev/sda", "hctl": "0:0:0:0",
+                         "serial": "SANITIZED-SES-A", "size": "14.6T", "tran": "sata", "children": []},
+                        {"name": "sdb", "type": "disk", "path": "/dev/sdb", "hctl": "1:0:0:0",
+                         "serial": "SANITIZED-SES-B", "size": "14.6T", "tran": "sata", "children": []},
+                    ],
+                    ses_slot_to_device={0: "sda", 1: "sda", 2: "sdb"},
+                )
+                slot_views, *_rest = service._correlate_linux_host(ssh_data, [], None)
+                placed = {view.slot: (view.device_name, view.mapping_source) for view in slot_views if view.device_name}
+                self.assertEqual(placed, {1: ("sdb", "manual")})
+
+    def test_manual_only_resolver_ignores_every_automatic_source(self) -> None:
+        # Every platform's correlator passes manual_only for a manual-only
+        # profile; the resolver must then return only saved manual mappings.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="nvr", label="NVR", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            disk = MagicMock()
+            disks_by_key = {"sda": disk, "sanitized-key": disk}
+            disks_by_slot = {("enc", 0): disk, (None, 0): disk}
+            disks_by_sas = {"500a0b1c2d3e4f50": disk}
+            raw = {
+                "device_names": ["sda"],
+                "device_hint": "sda",
+                "serial_hint": "sanitized-key",
+                "sas_address_hint": "500a0b1c2d3e4f50",
+            }
+            ssh_data = ParsedSSHData(ses_slot_to_device={0: "sda"})
+            automatic = service._resolve_disk_for_slot(0, "enc", None, disks_by_key, disks_by_slot, disks_by_sas, raw, ssh_data)
+            self.assertIs(automatic.disk, disk)
+            blocked = service._resolve_disk_for_slot(
+                0, "enc", None, disks_by_key, disks_by_slot, disks_by_sas, raw, ssh_data, manual_only=True
+            )
+            self.assertIsNone(blocked.disk)
+            self.assertEqual(blocked.source, "unknown")
+            mapping = ManualMapping(system_id="nvr", slot=0, enclosure_id="enc", serial="sanitized-key")
+            manual = service._resolve_disk_for_slot(
+                0, "enc", mapping, disks_by_key, disks_by_slot, disks_by_sas, raw, ssh_data, manual_only=True
+            )
+            self.assertIs(manual.disk, disk)
+            self.assertEqual(manual.source, "manual")
+
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
