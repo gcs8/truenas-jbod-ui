@@ -63,8 +63,10 @@ Optional fields:
   layout, so they always agree with the bay labels.
 - `manual_mapping_only`: `true` for a layout whose bay order has not been
   validated on real hardware. No slot hint or vendor slot number places a disk;
-  only saved manual mappings do, and the builder drops any slot hints. Copies
-  and edits of such a profile keep it. The layout-only UniFi profiles set it.
+  only saved manual mappings do, and the builder drops any slot hints. Bay
+  lights (Identify) stay off, because every light backend addresses a bay by
+  its slot order. Copies and edits of such a profile keep it. The layout-only
+  UniFi profiles set it.
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`

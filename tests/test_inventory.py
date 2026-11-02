@@ -7439,7 +7439,10 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             "enclosure_id": "enc", "mapping_resolution_source": "unknown",
         }
         stripped = _manual_only_slot_status(raw, profile)
-        self.assertEqual(stripped, {"enclosure_id": "enc", "mapping_resolution_source": "unknown"})
+        self.assertEqual(
+            stripped,
+            {"enclosure_id": "enc", "mapping_resolution_source": "unknown", "manual_mapping_only": True},
+        )
         self.assertIn("serial_hint", raw, "the caller's dict is not mutated")
         validated = ProfileRegistry(Settings()).get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
         self.assertIs(_manual_only_slot_status(raw, validated), raw)
@@ -7497,6 +7500,29 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual(mapped[2].mapping_source, "manual")
             self.assertNotEqual(mapped[2].state.value, "empty")
             self.assertTrue(mapped[2].present)
+
+    def test_manual_only_bays_offer_no_light_control(self) -> None:
+        # Codex P2s on #1070: on CORE/SCALE the API backend addresses a bay by
+        # its displayed slot index, which is exactly the unvalidated order. A
+        # manual-only bay offers no Identify until its order is validated.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="core", label="CORE", truenas=TrueNASConfig(platform="core"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            common = dict(
+                slot=3, row_index=0, column_index=3,
+                enclosure_meta={"id": "enc", "label": "Shelf", "name": "Shelf"},
+                disk=None, mapping=None, ssh_data=ParsedSSHData(),
+                api_topology_members={}, api_enclosure_ids={"enc"},
+            )
+            normal = service._build_slot_view(raw_slot_status={"enclosure_id": "enc"}, **common)
+            self.assertTrue(normal.led_supported)
+            self.assertEqual(normal.led_backend, "api")
+            guarded = service._build_slot_view(
+                raw_slot_status={"enclosure_id": "enc", "manual_mapping_only": True}, **common
+            )
+            self.assertFalse(guarded.led_supported)
+            self.assertIsNone(guarded.led_backend)
+            self.assertIn("not been validated", guarded.led_reason)
 
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):

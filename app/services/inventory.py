@@ -931,7 +931,9 @@ def _manual_only_slot_status(
 ) -> dict[str, Any]:
     if not _profile_is_manual_only(profile):
         return raw_slot_status
-    return {key: value for key, value in raw_slot_status.items() if key not in _SLOT_ORDER_EVIDENCE_KEYS}
+    stripped = {key: value for key, value in raw_slot_status.items() if key not in _SLOT_ORDER_EVIDENCE_KEYS}
+    stripped["manual_mapping_only"] = True
+    return stripped
 
 
 def _warn_unmatched_mapping(
@@ -14957,7 +14959,16 @@ class InventoryService:
             and isinstance(raw_slot_status.get("bmc_controller_id"), int)
             and isinstance(raw_slot_status.get("bmc_physical_index"), int)
         )
-        if bmc_led_supported:
+        if raw_slot_status.get("manual_mapping_only") is True:
+            # Every light backend addresses a bay by its slot order, which is
+            # what a manual-only layout (#1068) has not validated, so Identify
+            # could light a different physical bay than the one drawn here.
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                "Bay lights are off for this layout: its bay order has not been validated on real hardware."
+            )
+        elif bmc_led_supported:
             led_supported = True
             led_backend = "supermicro_bmc"
             led_reason = None
