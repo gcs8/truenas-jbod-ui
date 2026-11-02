@@ -914,6 +914,26 @@ def _profile_is_manual_only(profile: EnclosureProfileView | None) -> bool:
     return bool(profile is not None and profile.manual_mapping_only)
 
 
+# Slot-status keys that only exist because the platform reported something at
+# this slot index. On a layout whose bay order is unvalidated (#1068) they name
+# the wrong bay as often as the right one, so a manual-only bay is built
+# without them: no hinted device, serial or model, no slot-order presence or
+# health, and no SES element (so Identify cannot light an unverified bay).
+_SLOT_ORDER_EVIDENCE_KEYS = frozenset({
+    "device_names", "device_hint", "device_names_source", "serial_hint", "model_hint",
+    "gptid_hint", "sas_address_hint", "present", "status", "value",
+    "ses_device", "ses_targets", "sas_device_type", "presence_conflict",
+})
+
+
+def _manual_only_slot_status(
+    raw_slot_status: dict[str, Any], profile: EnclosureProfileView | None,
+) -> dict[str, Any]:
+    if not _profile_is_manual_only(profile):
+        return raw_slot_status
+    return {key: value for key, value in raw_slot_status.items() if key not in _SLOT_ORDER_EVIDENCE_KEYS}
+
+
 def _warn_unmatched_mapping(
     warnings: list[str],
     mapping: ManualMapping | None,
@@ -7999,7 +8019,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=candidate,
+                raw_slot_status=_manual_only_slot_status(candidate, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8502,7 +8522,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8734,7 +8754,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8848,7 +8868,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
@@ -8978,7 +8998,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=mapping_meta,
-                raw_slot_status=candidate,
+                raw_slot_status=_manual_only_slot_status(candidate, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -9134,7 +9154,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
@@ -14581,6 +14601,20 @@ class InventoryService:
         *,
         manual_only: bool = False,
     ) -> DiskResolution:
+        if manual_only:
+            # A layout whose bay order is unvalidated (#1068): only a saved
+            # manual mapping places a disk. Slot-order evidence, including an
+            # "empty" report, says nothing reliable about this bay.
+            if mapping:
+                for candidate in (mapping.serial, mapping.gptid, mapping.device_name):
+                    if not candidate:
+                        continue
+                    for key in normalize_lookup_keys(candidate):
+                        disk = disks_by_key.get(key)
+                        if disk:
+                            return DiskResolution(disk=disk, source=mapping.source or "manual")
+            return DiskResolution(disk=None, source="unknown")
+
         if self._slot_has_live_empty_evidence(raw_slot_status):
             return DiskResolution(
                 disk=None,
@@ -14596,12 +14630,6 @@ class InventoryService:
                     disk = disks_by_key.get(key)
                     if disk:
                         return DiskResolution(disk=disk, source=mapping.source or "manual")
-
-        if manual_only:
-            # A layout whose bay order is unvalidated (#1068): no API slot,
-            # hint, SAS address or SES slot map may place a disk, only a saved
-            # manual mapping, so a misreporting peer cannot name a bay's disk.
-            return DiskResolution(disk=None, source="unknown")
 
         sas_address_hint = normalize_hex_identifier(raw_slot_status.get("sas_address_hint"))
         if self.system.truenas.platform == "quantastor" and sas_address_hint and sas_address_hint != "0":

@@ -7425,6 +7425,79 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             slot_views, *_rest = service._correlate_esxi_host(ssh_data, [], None)
             self.assertEqual([view.slot for view in slot_views if view.device_name or view.serial], [])
 
+    def test_manual_only_slot_status_drops_hint_identity_presence_and_status(self) -> None:
+        # Codex P2 on #1070: with no disk resolved, the slot-view builder still
+        # read device, serial, model, presence and status hints that came from
+        # the unvalidated slot order. Manual-only bays drop them.
+        from app.services.inventory import _manual_only_slot_status
+
+        profile = ProfileRegistry(Settings()).get(sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0])
+        raw = {
+            "device_names": ["sda"], "device_hint": "sda", "device_names_source": "enclosure_sysfs",
+            "serial_hint": "SANITIZED-HINT", "model_hint": "Synthetic", "gptid_hint": "gptid/x",
+            "sas_address_hint": "5abc", "present": False, "status": "OK", "value": "OK",
+            "enclosure_id": "enc", "mapping_resolution_source": "unknown",
+        }
+        stripped = _manual_only_slot_status(raw, profile)
+        self.assertEqual(stripped, {"enclosure_id": "enc", "mapping_resolution_source": "unknown"})
+        self.assertIn("serial_hint", raw, "the caller's dict is not mutated")
+        validated = ProfileRegistry(Settings()).get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
+        self.assertIs(_manual_only_slot_status(raw, validated), raw)
+
+    def test_every_correlator_builds_manual_only_bays_from_stripped_status(self) -> None:
+        source = inspect.getsource(InventoryService)
+        builds = source.count("self._build_slot_view(")
+        guarded = source.count("raw_slot_status=_manual_only_slot_status(")
+        resolvers = source.count("manual_only=_profile_is_manual_only(frame.selected_profile)")
+        self.assertEqual(resolvers, 6)
+        self.assertGreaterEqual(guarded, resolvers)
+        self.assertGreater(builds, 0)
+
+    def test_manual_only_resolver_prefers_the_saved_mapping_over_ses_empty_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(id="nvr", label="NVR", truenas=TrueNASConfig(platform="linux"))
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            disk = MagicMock()
+            raw = {"present": False, "status": "Not Installed", "value": "Not Installed"}
+            empty = service._resolve_disk_for_slot(0, "enc", None, {"k": disk}, {}, {}, raw, ParsedSSHData(), manual_only=True)
+            self.assertEqual(empty.source, "unknown", "slot-order empty evidence is not used either")
+            mapping = ManualMapping(system_id="nvr", slot=0, enclosure_id="enc", serial="k")
+            mapped = service._resolve_disk_for_slot(0, "enc", mapping, {"k": disk}, {}, {}, raw, ParsedSSHData(), manual_only=True)
+            self.assertIs(mapped.disk, disk)
+            self.assertEqual(mapped.source, "manual")
+
+    def test_manual_only_bmc_bay_with_a_saved_mapping_is_not_drawn_empty(self) -> None:
+        profile_id = sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="bmc-nvr",
+                default_profile_id=profile_id,
+                truenas=TrueNASConfig(platform="ipmi"),
+                bmc=BMCConfig(enabled=True, host="bmc.example.invalid", username="ADMIN", password="synthetic"),
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir, bmc_service=MagicMock())
+            bmc_inventory = BMCInventory(
+                system_model="Synthetic",
+                controllers=[BMCControllerRecord(controller_id=0, product_name="Synthetic RAID")],
+                drives=[
+                    BMCDriveRecord(controller_id=0, physical_index=0, slot_number=0, enclosure_id="252",
+                                   model="Synthetic", serial="SANITIZED-BMC-0", size_bytes=4_000_000_000_000,
+                                   health="ONLINE"),
+                ],
+            )
+            unmapped, *_rest = service._correlate_bmc_host([], None, bmc_inventory)
+            self.assertNotEqual(unmapped[0].state.value, "empty", "slot-order presence is not evidence either")
+            self.assertIsNone(unmapped[0].serial)
+            enclosure_id = unmapped[0].enclosure_id
+            service.mapping_store.save_mapping(
+                ManualMapping(system_id="bmc-nvr", slot=2, enclosure_id=enclosure_id, serial="SANITIZED-BMC-0")
+            )
+            mapped, *_rest = service._correlate_bmc_host([], None, bmc_inventory)
+            self.assertEqual(mapped[2].serial, "SANITIZED-BMC-0")
+            self.assertEqual(mapped[2].mapping_source, "manual")
+            self.assertNotEqual(mapped[2].state.value, "empty")
+            self.assertTrue(mapped[2].present)
+
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
