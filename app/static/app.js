@@ -1692,10 +1692,47 @@
         },
       },
     };
+    // UNVR-G2 family: rounded ends, a System LED dot with the model print,
+    // perforated vents (4 segments) top and bottom, trays with a handle block.
+    const g2 = (print) => ({
+      family: "g2",
+      top: { ledDot: true, print, vents: 4, perforated: true },
+      bottom: { vents: 4, perforated: true, reset: true },
+      rows: {},
+    });
+    specs["unvr-g2"] = g2("NVR G2");
+    specs["unvr-g2-pro"] = { ...g2("NVR G2 Pro"), rowStrip: { after: 0 } };
+    // Enterprise NVR family: 3U with rack handles; the top edge carries the LED
+    // bar, the print, the column number strips and RESET (plus a bezel
+    // accessory port on the ENVR only). Bays are full-width trays.
+    const envr = (print, accessoryPort) => ({
+      family: "envr",
+      handles: true,
+      top: { ledBar: true, print, columnStrips: true, reset: true, accessoryPort },
+      bottom: null,
+      rows: {},
+    });
+    specs.envr = envr("Enterprise NVR", true);
+    specs["envr-core"] = envr("Enterprise NVR Core", false);
     return Object.prototype.hasOwnProperty.call(specs, variant) ? { variant, ...specs[variant] } : null;
   }
 
-  function buildUnifiFaceBand(edge, band) {
+  // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
+  // They come from the layout and the same 1-based numbering the bays show, so
+  // a strip can never disagree with the bay labels.
+  function unifiFaceColumnLabels(layoutRows, rowIndexes = null) {
+    const rows = normalizeLayoutRows(layoutRows);
+    const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
+    const columns = Math.max(0, ...picked.map((row) => row.length));
+    return Array.from({ length: columns }, (_, column) =>
+      picked
+        .map((row) => row[column])
+        .filter((slotValue) => Number.isInteger(slotValue))
+        .map((slotValue) => String(slotValue + 1))
+        .join(" / "));
+  }
+
+  function buildUnifiFaceBand(edge, band, layoutRows = []) {
     const element = document.createElement("div");
     element.className = `unifi-face-band unifi-face-band-${edge}`;
     element.setAttribute("aria-hidden", "true");
@@ -1703,17 +1740,47 @@
     if (band?.ledBar) {
       parts.push('<span class="unifi-face-led-bar"></span>');
     }
+    if (band?.ledDot) {
+      parts.push('<span class="unifi-face-led-dot"></span>');
+    }
     if (band?.print) {
       parts.push(`<span class="unifi-face-print">${escapeHtml(band.print)}</span>`);
     }
     if (band?.vents) {
-      const vents = Array.from({ length: band.vents }, () => '<span class="unifi-face-vent"></span>').join("");
+      const ventClass = band.perforated ? "unifi-face-vent unifi-face-vent-perforated" : "unifi-face-vent";
+      const vents = Array.from({ length: band.vents }, () => `<span class="${ventClass}"></span>`).join("");
       parts.push(`<span class="unifi-face-vents" style="--unifi-vent-count: ${Number(band.vents)}">${vents}</span>`);
+    }
+    if (band?.columnStrips) {
+      const strips = unifiFaceColumnLabels(layoutRows)
+        .map((label) => `<span class="unifi-face-column-strip" data-column-label="${escapeHtml(label)}"><span class="unifi-face-vent"></span><span class="unifi-face-column-label">${escapeHtml(label)}</span></span>`)
+        .join("");
+      parts.push(`<span class="unifi-face-column-strips">${strips}</span>`);
     }
     if (band?.reset) {
       parts.push('<span class="unifi-face-reset"><span class="unifi-face-reset-hole"></span>RESET</span>');
     }
+    if (band?.accessoryPort) {
+      parts.push('<span class="unifi-face-accessory-port"></span>');
+    }
     element.innerHTML = parts.join("");
+    return element;
+  }
+
+  function buildUnifiFaceRowStrip(layoutRows, rowIndex) {
+    const element = document.createElement("div");
+    element.className = "unifi-face-row-strip";
+    element.setAttribute("aria-hidden", "true");
+    element.innerHTML = unifiFaceColumnLabels(layoutRows, [rowIndex, rowIndex + 1])
+      .map((label) => `<span class="unifi-face-row-strip-label" data-column-label="${escapeHtml(label)}">${escapeHtml(label)}</span>`)
+      .join("");
+    return element;
+  }
+
+  function buildUnifiFaceRackHandle(side) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-rack-handle unifi-face-rack-handle-${side}`;
+    element.setAttribute("aria-hidden", "true");
     return element;
   }
 
@@ -1744,7 +1811,12 @@
   }
 
   function renderUnifiFaceRows(layoutRows, spec, appendTile, target) {
-    target.appendChild(buildUnifiFaceBand("top", spec.top));
+    if (spec.handles) {
+      target.appendChild(buildUnifiFaceRackHandle("left"));
+    }
+    if (spec.top) {
+      target.appendChild(buildUnifiFaceBand("top", spec.top, layoutRows));
+    }
     normalizeLayoutRows(layoutRows).forEach((row, rowIndex) => {
       const rowDecor = spec.rows?.[rowIndex] || null;
       const rowWrapper = document.createElement("div");
@@ -1771,8 +1843,16 @@
       rowWrapper.appendChild(rowSlots);
       target.appendChild(rowWrapper);
       rowSlots.style.gridTemplateColumns = tracks.join(" ");
+      if (spec.rowStrip && spec.rowStrip.after === rowIndex) {
+        target.appendChild(buildUnifiFaceRowStrip(layoutRows, rowIndex));
+      }
     });
-    target.appendChild(buildUnifiFaceBand("bottom", spec.bottom));
+    if (spec.bottom) {
+      target.appendChild(buildUnifiFaceBand("bottom", spec.bottom, layoutRows));
+    }
+    if (spec.handles) {
+      target.appendChild(buildUnifiFaceRackHandle("right"));
+    }
   }
 
   function renderChassisRows(layoutRows, geometry, appendTile, target = grid) {
@@ -10161,8 +10241,10 @@
       const unifiFace = unifiFaceVariantSpec(profile);
       if (unifiFace) {
         chassisShell.dataset.faceVariant = unifiFace.variant;
+        chassisShell.dataset.faceFamily = unifiFace.family || "unvr";
       } else {
         delete chassisShell.dataset.faceVariant;
+        delete chassisShell.dataset.faceFamily;
       }
     }
     applyChassisDriveScale(profile);

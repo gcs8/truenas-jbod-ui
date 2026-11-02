@@ -58,7 +58,9 @@ Optional fields:
   `unvr-pro` (touchscreen beside bays 1-3, RJ45 and SFP+ ports, vents above
   and below, RESET). The decoration is never a bay: it cannot be selected or
   focused and is not counted or exported. Omitted or unknown values draw the
-  plain face.
+  plain face. The layout-only UniFi profiles use `unvr-g2`, `unvr-g2-pro`,
+  `envr` and `envr-core`; their column number strips are generated from the
+  layout, so they always agree with the bay labels.
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`
@@ -262,6 +264,10 @@ The selection order is:
 - `supermicro-fat-twin-rear-2`
 - `ubiquiti-unvr-front-4`
 - `ubiquiti-unvr-pro-front-7`
+- `ubiquiti-unvr-g2-front-4`
+- `ubiquiti-unvr-g2-pro-front-8`
+- `ubiquiti-envr-front-16`
+- `ubiquiti-envr-core-front-16`
 - `generic-front-24-1x24`
 - `generic-front-12-3x4`
 - `generic-top-60-4x15`

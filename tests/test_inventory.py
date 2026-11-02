@@ -81,7 +81,7 @@ from app.services.parsers import (
     parse_ssh_outputs,
 )
 from app.services.storage_views import storage_view_slot_label
-from app.services.profile_registry import ProfileRegistry
+from app.services.profile_registry import ProfileRegistry, UNIFI_LAYOUT_ONLY_PROFILE_IDS
 from app.services.profile_registry import (
     CORE_CSE_946_PROFILE_ID,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
@@ -7256,6 +7256,70 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertEqual([view.slot for view in slot_views], [0, 1, 2, 3])
             self.assertEqual([view.slot_label for view in slot_views], ["01", "02", "03", "04"])
             self.assertEqual(slot_views[3].device_name, "sdd")
+
+    def test_layout_only_unifi_profiles_place_no_disk_automatically(self) -> None:
+        # #1068: until a G2, G2-Pro, ENVR or ENVR-Core has been checked on real
+        # hardware, nothing guesses its bay order: not slot hints, not the
+        # UniFi storage service's slot numbers, not HCTL order. Every disk
+        # shows as unmapped and the bays wait for a manual assignment.
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = SystemConfig(
+                    id="nvr",
+                    label="UniFi NVR",
+                    default_profile_id=profile_id,
+                    truenas=TrueNASConfig(platform="linux"),
+                    ssh=SSHConfig(enabled=True),
+                )
+                service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+                ssh_data = ParsedSSHData(
+                    linux_blockdevices=[
+                        {"name": f"sd{letter}", "type": "disk", "path": f"/dev/sd{letter}", "hctl": f"{index}:0:0:0",
+                         "serial": f"SANITIZED-LAYOUT-{index}", "size": "14.6T", "tran": "sata", "children": []}
+                        for index, letter in enumerate("abcd")
+                    ],
+                    ubntstorage_disks=[
+                        {"node": f"sd{letter}", "slot": index + 1, "healthy": "good", "state": "normal", "size": 16000000000000}
+                        for index, letter in enumerate("abcd")
+                    ],
+                )
+                warnings: list[str] = []
+                slot_views, _available, _meta, _rows, slot_count, _columns = service._correlate_linux_host(
+                    ssh_data, warnings, None
+                )
+                profile = service.profile_registry.get(profile_id)
+                self.assertEqual(slot_count, profile.slot_count)
+                self.assertEqual([view.slot for view in slot_views], list(range(profile.slot_count)))
+                self.assertEqual([view.device_name for view in slot_views if view.device_name], [])
+                self.assertEqual(slot_views[0].slot_label, "01")
+                self.assertIn("This layout has no bay hints, so disks must be assigned to bays by hand.", warnings)
+
+    def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = SystemConfig(
+                    id="nvr",
+                    label="UniFi NVR",
+                    default_profile_id=profile_id,
+                    truenas=TrueNASConfig(platform="linux"),
+                    ssh=SSHConfig(enabled=True),
+                )
+                service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+                service.mapping_store.save_mapping(
+                    ManualMapping(system_id="nvr", slot=3, enclosure_id=None, serial="SANITIZED-MANUAL-3")
+                )
+                ssh_data = ParsedSSHData(
+                    linux_blockdevices=[
+                        {"name": "sdc", "type": "disk", "path": "/dev/sdc", "hctl": "2:0:0:0",
+                         "serial": "SANITIZED-MANUAL-3", "size": "14.6T", "tran": "sata", "children": []},
+                    ],
+                    ubntstorage_disks=[{"node": "sdc", "slot": 1, "healthy": "good", "state": "normal"}],
+                )
+                slot_views, *_rest = service._correlate_linux_host(ssh_data, [], None)
+                placed = {view.slot: view.device_name for view in slot_views if view.device_name}
+                self.assertEqual(placed, {3: "sdc"})
+                self.assertEqual(slot_views[3].mapping_source, "manual")
+                self.assertEqual(slot_views[3].slot_label, "04")
 
     def test_correlate_linux_host_enables_unvr_led_backend_and_gpio_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

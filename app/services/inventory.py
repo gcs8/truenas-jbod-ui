@@ -74,6 +74,7 @@ from app.services.profile_registry import (
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     ProfileRegistry,
     SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
+    UNIFI_LAYOUT_ONLY_PROFILE_IDS,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
@@ -8394,13 +8395,17 @@ class InventoryService:
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
         disk_records = self._build_linux_disk_records(ssh_data, warnings=warnings)
+        # Layout-only profiles (#1068) have no validated bay order: neither the
+        # UniFi storage service's slot numbers nor slot hints may place a disk.
+        # Only saved manual mappings do, as on a generic chassis.
+        layout_only = selected_profile.id in UNIFI_LAYOUT_ONLY_PROFILE_IDS
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             vendor_slot = disk.raw.get("vendor_slot")
-            if isinstance(vendor_slot, int):
+            if isinstance(vendor_slot, int) and not layout_only:
                 disks_by_slot[(selected_option.id, vendor_slot)] = disk
                 disks_by_slot[(None, vendor_slot)] = disk
 
@@ -8413,8 +8418,10 @@ class InventoryService:
             # (the UniFi NVRs, #1068) carries the label base on its profile.
             # Only the label changes; slot indices and mapping keys do not.
             selected_meta = {**selected_meta, "slot_number_base": selected_profile.slot_number_base}
-        vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
-        slot_hints = selected_profile.slot_hints or {}
+        vendor_slot_candidates = (
+            {} if layout_only else self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
+        )
+        slot_hints = {} if layout_only else (selected_profile.slot_hints or {})
         if not slot_hints and not vendor_slot_candidates:
             warnings.append(
                 "This layout has no bay hints, so disks must be assigned to bays by hand."

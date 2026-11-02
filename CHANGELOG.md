@@ -28,6 +28,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Added
+
+- Added built-in faces for the UniFi UNVR-G2, UNVR-G2-Pro, Enterprise NVR and
+  Enterprise NVR Core (`ubiquiti-unvr-g2-front-4`,
+  `ubiquiti-unvr-g2-pro-front-8`, `ubiquiti-envr-front-16`,
+  `ubiquiti-envr-core-front-16`), chosen with `default_profile_id`. Layout
+  only: bay-to-disk mapping is manual until validated on real hardware, so
+  disks show as unmapped until they are assigned to a bay (#PRNUM, refs #1068).
+
 ### Changed
 
 - Drew the UniFi UNVR and UNVR Pro fronts as the real chassis instead of grey
