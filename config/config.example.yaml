@@ -95,6 +95,11 @@ truenas:
   tls_ca_bundle_path: null
   tls_server_name: null
   timeout_seconds: 15
+  # Most middleware calls the app keeps in flight against this appliance at
+  # once, across refreshes, SMART grids, drawers and LED actions (1-10). null
+  # picks 4 on CORE and 8 on SCALE. The TrueNAS middleware admits 10 calls per
+  # connection and its own alert checks share that process, so stay under 10.
+  max_concurrent_calls: null
   # Optional substring match against enclosure id, name, or label.
   enclosure_filter: null
 

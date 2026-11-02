@@ -185,6 +185,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_slot_detail_store",
         "test_smart_grid_io",
         "test_ssh_probe",
+        "test_truenas_middleware_limits",
         "test_truenas_ws_jsonrpc",
         "test_ui_health_and_admin_probe",
     ),

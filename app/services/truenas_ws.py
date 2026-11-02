@@ -4,8 +4,12 @@ import asyncio
 import itertools
 import json
 import logging
+import random
 import ssl
+import time
 import uuid
+import weakref
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
@@ -15,7 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig
+from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig, effective_max_concurrent_calls
 from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,10 @@ class TrueNASAPIBusyError(TrueNASAPIError):
     retryable = True
 
 
+class _LimiterBusyError(TrueNASAPIBusyError):
+    """Raised by the app's own backoff, before anything is sent."""
+
+
 # Standard JSON-RPC missing-method code and TrueNAS middleware custom codes.
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_TOO_MANY_CONCURRENT_CALLS = -32000
@@ -68,6 +76,144 @@ JSONRPC_METHOD_CALL_ERROR = -32001
 
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
+
+# The DDP endpoint reports a full call queue as ETOOMANYREFS (59 on CORE's
+# FreeBSD, 109 on SCALE's Linux) with this reason text.
+_DDP_BUSY_REASON = "maximum number of concurrent calls"
+_DDP_BUSY_ERRNOS = frozenset({59, 109})
+
+
+def build_ddp_error(method: str, error: Any) -> TrueNASAPIError:
+    busy = False
+    if isinstance(error, dict):
+        reason = str(error.get("reason") or "").lower()
+        busy = _DDP_BUSY_REASON in reason or (not reason and error.get("error") in _DDP_BUSY_ERRNOS)
+    error_class = TrueNASAPIBusyError if busy else TrueNASAPIError
+    return error_class(f"{method} failed: {error}")
+
+
+class MiddlewareCallLimiter:
+    """One appliance's budget of concurrent middleware calls, plus busy backoff (#1072).
+
+    Every call the app makes to one appliance - inventory reads, SMART grid
+    batches, slot drawers, LED actions and logins - takes a slot here, so the
+    total stays at ``limit`` however many requests overlap. A busy reply, or a
+    whole inventory read that times out, starts a cooldown during which calls
+    fail at once with `TrueNASAPIBusyError` instead of reaching the appliance.
+    The cooldown doubles on each further busy reply, up to
+    ``max_delay_seconds``, and is jittered down by at most half so separate
+    workers do not retry in step.
+    """
+
+    base_delay_seconds = 2.0
+    max_delay_seconds = 60.0
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+        self._failures = 0
+        self._cooldown_until = 0.0
+        self.clock: Callable[[], float] = time.monotonic
+        self.random: Callable[[], float] = random.random
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - self.clock())
+
+    def check_open(self) -> None:
+        remaining = self.cooldown_remaining()
+        if remaining > 0:
+            raise _LimiterBusyError(
+                f"TrueNAS middleware is busy; backing off for {max(1, round(remaining))}s "
+                "before calling it again."
+            )
+
+    def note_busy(self) -> None:
+        self._failures += 1
+        delay = min(self.max_delay_seconds, self.base_delay_seconds * 2 ** (self._failures - 1))
+        delay *= 0.5 + 0.5 * self.random()
+        self._cooldown_until = max(self._cooldown_until, self.clock() + delay)
+
+    def note_success(self) -> None:
+        # A call admitted before a busy reply can still succeed; it must not
+        # cut the cooldown short.
+        if self.cooldown_remaining() == 0:
+            self._failures = 0
+
+    async def _acquire(self) -> None:
+        if self.active < self.limit and not self._waiters:
+            self.active += 1
+            return
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter.done() and not waiter.cancelled():
+                # The slot was handed over just as the caller was cancelled.
+                self._release()
+            else:
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    pass
+            raise
+
+    def set_limit(self, limit: int) -> None:
+        """The newest configuration wins; queued calls are admitted if it grew."""
+        self.limit = limit
+        self._admit()
+
+    def _release(self) -> None:
+        self.active -= 1
+        self._admit()
+
+    def _admit(self) -> None:
+        while self._waiters and self.active < self.limit:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                self.active += 1
+                waiter.set_result(None)
+
+    @asynccontextmanager
+    async def slot(self):
+        self.check_open()
+        await self._acquire()
+        try:
+            # A busy reply may have arrived while this call was queued.
+            self.check_open()
+            yield
+        except _LimiterBusyError:
+            raise
+        except TrueNASAPIBusyError:
+            # Record it before releasing, so the next queued call sees it.
+            self.note_busy()
+            raise
+        else:
+            self.note_success()
+        finally:
+            self._release()
+
+
+# One limiter per appliance and event loop. Keyed by the normalized endpoint so
+# every client for the same appliance (including the one a config reload
+# builds) shares it; asyncio primitives cannot cross event loops.
+_LIMITERS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, MiddlewareCallLimiter]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def middleware_call_limiter(config: TrueNASConfig) -> MiddlewareCallLimiter:
+    loop = asyncio.get_running_loop()
+    per_loop = _LIMITERS.setdefault(loop, {})
+    key = build_websocket_url(config.host)
+    limit = effective_max_concurrent_calls(config)
+    limiter = per_loop.get(key)
+    if limiter is None:
+        limiter = per_loop[key] = MiddlewareCallLimiter(limit)
+    elif limiter.limit != limit:
+        limiter.set_limit(limit)
+    return limiter
 
 
 def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
@@ -128,8 +274,9 @@ def normalize_disk_inventory_rows(value: Any, *, source: str = "disk inventory")
 
 
 class _MiddlewareCallDispatcher:
-    def __init__(self, ws: ClientConnection) -> None:
+    def __init__(self, ws: ClientConnection, *, limiter: MiddlewareCallLimiter | None = None) -> None:
         self.ws = ws
+        self._limiter = limiter
         self._pending: dict[Any, tuple[str, asyncio.Future[Any]]] = {}
         self._reader_task = asyncio.create_task(self._reader())
 
@@ -144,7 +291,28 @@ class _MiddlewareCallDispatcher:
             "params": params,
         }
 
-    async def call(self, method: str, params: list[Any]) -> Any:
+    async def call(
+        self, method: str, params: list[Any], *, timeout: Callable[[], float] | None = None,
+    ) -> Any:
+        """Send one call once the appliance's limiter admits it.
+
+        ``timeout`` is read after admission, so time spent queued behind other
+        calls to the same appliance does not count against this call's reply.
+        """
+        if self._limiter is None:
+            return await self._call_with_timeout(method, params, timeout)
+        async with self._limiter.slot():
+            return await self._call_with_timeout(method, params, timeout)
+
+    async def _call_with_timeout(
+        self, method: str, params: list[Any], timeout: Callable[[], float] | None,
+    ) -> Any:
+        if timeout is None:
+            return await self._call(method, params)
+        async with asyncio.timeout(timeout()):
+            return await self._call(method, params)
+
+    async def _call(self, method: str, params: list[Any]) -> Any:
         request_id = self._next_request_id()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
@@ -196,7 +364,7 @@ class _MiddlewareCallDispatcher:
         if future.done():
             return
         if message.get("error"):
-            future.set_exception(TrueNASAPIError(f"{method} failed: {message['error']}"))
+            future.set_exception(build_ddp_error(method, message["error"]))
         else:
             future.set_result(message.get("result"))
 
@@ -224,9 +392,12 @@ class _JsonRpcCallDispatcher(_MiddlewareCallDispatcher):
     a DDP heartbeat message.
     """
 
-    def __init__(self, ws: ClientConnection, *, request_ids: Iterator[int] | None = None) -> None:
+    def __init__(
+        self, ws: ClientConnection, *, request_ids: Iterator[int] | None = None,
+        limiter: MiddlewareCallLimiter | None = None,
+    ) -> None:
         self._request_ids = request_ids if request_ids is not None else itertools.count(1)
-        super().__init__(ws)
+        super().__init__(ws, limiter=limiter)
 
     def _next_request_id(self) -> int:
         return next(self._request_ids)
@@ -304,6 +475,26 @@ class TrueNASRawData:
     cli_network_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
+# #1072: a connection that closes while its login is still running leaves an
+# API session behind on the appliance, so close waits for the login's reply
+# for up to one call timeout, capped here.
+LOGIN_SETTLE_MAX_SECONDS = 15.0
+
+
+@dataclass(slots=True)
+class _PendingLogin:
+    request_id: Any = None
+    # A send interrupted mid-frame leaves the connection unusable.
+    sending: bool = False
+    holds_slot: bool = False
+    limiter: MiddlewareCallLimiter | None = None
+
+    def release(self) -> None:
+        if self.holds_slot and self.limiter is not None:
+            self.holds_slot = False
+            self.limiter._release()
+
+
 # #537: how much longer than one call the whole phase may take before the
 # remaining positions are reported instead of started.
 SMART_BATCH_PHASE_DEADLINE_MULTIPLIER = 2
@@ -336,6 +527,11 @@ class TrueNASWebsocketClient:
         self._jsonrpc_request_ids = itertools.count(1)
 
     @property
+    def call_limiter(self) -> MiddlewareCallLimiter:
+        """The limiter every client for this appliance shares (#1072)."""
+        return middleware_call_limiter(self.config)
+
+    @property
     def _uses_jsonrpc(self) -> bool:
         return self.config.api_dialect == "jsonrpc"
 
@@ -346,8 +542,8 @@ class TrueNASWebsocketClient:
 
     def _make_dispatcher(self, ws: ClientConnection) -> _MiddlewareCallDispatcher:
         if self._uses_jsonrpc:
-            return _JsonRpcCallDispatcher(ws, request_ids=self._jsonrpc_request_ids)
-        return _MiddlewareCallDispatcher(ws)
+            return _JsonRpcCallDispatcher(ws, request_ids=self._jsonrpc_request_ids, limiter=self.call_limiter)
+        return _MiddlewareCallDispatcher(ws, limiter=self.call_limiter)
 
     async def _run_operation(self, operation: Awaitable[Any], *, multiplier: int = 1) -> Any:
         """One monotonic budget for connect, authentication and all replies.
@@ -384,7 +580,14 @@ class TrueNASWebsocketClient:
         return cancelled
 
     async def fetch_all(self) -> TrueNASRawData:
-        return await self._run_operation(self._fetch_all(), multiplier=INVENTORY_DEADLINE_MULTIPLIER)
+        try:
+            return await self._run_operation(self._fetch_all(), multiplier=INVENTORY_DEADLINE_MULTIPLIER)
+        except TimeoutError:
+            # A whole inventory read outlasting its budget means the middleware
+            # is not keeping up; back off instead of starting the next one at
+            # once. A single slow disk (#523) does not trigger this.
+            self.call_limiter.note_busy()
+            raise
 
     async def _fetch_all(self) -> TrueNASRawData:
         async with self._session() as ws:
@@ -496,8 +699,11 @@ class TrueNASWebsocketClient:
         if not disks:
             return []
         # Snapshot caller-owned containers before any await, without deduplication.
+        # The appliance's call limit caps the batch width too (#1072), so a
+        # grid cannot queue more workers than the limiter will ever admit.
+        width = min(max_concurrency, len(disks), self.call_limiter.limit)
         owner = asyncio.create_task(self._run_smartctl_batch(
-            list(disks), list(args or ["-a", "-j"]), min(max_concurrency, len(disks)),
+            list(disks), list(args or ["-a", "-j"]), width,
             return_exceptions=bool(return_exceptions),
         ))
         try:
@@ -554,8 +760,10 @@ class TrueNASWebsocketClient:
                     results[position] = expired
                     continue
                 try:
-                    async with asyncio.timeout(min(self.config.timeout_seconds, remaining)):
-                        result = await dispatcher.call("disk.smartctl", [disk, args])
+                    result = await dispatcher.call(
+                        "disk.smartctl", [disk, args],
+                        timeout=lambda: min(self.config.timeout_seconds, max(phase_deadline - loop.time(), 0.001)),
+                    )
                 except TrueNASAPIError as exc:
                     if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
                         # Not about this disk: the method is absent, so nothing
@@ -656,21 +864,72 @@ class TrueNASWebsocketClient:
             return None
         return build_tls_client_context(self.config)
 
-    async def _perform_handshake(self, ws: ClientConnection) -> None:
-        if self._uses_jsonrpc:
-            # JSON-RPC 2.0 has no session handshake; authentication is the first call.
-            if await self._call(ws, "auth.login_with_api_key", [self.config.api_key]) is not True:
-                raise TrueNASAPIError("TrueNAS API authentication failed.")
-            return
-
-        await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
-        response = json.loads(await ws.recv())
-        if response.get("msg") != "connected":
-            raise TrueNASAPIError(f"Unexpected websocket handshake response: {response}")
-
-        authenticated = await self._call(ws, "auth.login_with_api_key", [self.config.api_key])
-        if authenticated is not True:
+    async def _perform_handshake(self, ws: ClientConnection, login: _PendingLogin) -> None:
+        if not self._uses_jsonrpc:
+            await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
+            response = json.loads(await ws.recv())
+            if response.get("msg") != "connected":
+                raise TrueNASAPIError(f"Unexpected websocket handshake response: {response}")
+        # JSON-RPC 2.0 has no session handshake; authentication is the first call.
+        if await self._login(ws, login) is not True:
             raise TrueNASAPIError("TrueNAS API authentication failed.")
+
+    async def _login(self, ws: ClientConnection, login: _PendingLogin) -> Any:
+        """Authenticate, remembering a login that is still in flight.
+
+        The middleware runs every call, the login included, as a detached task
+        and registers the session's close-time logout only when the login
+        completes. If the socket closes first, the login still finishes and
+        its session is never removed (#1072). `_session` therefore waits for
+        a pending login's reply, within a bounded grace, before it closes.
+        """
+        limiter = self.call_limiter
+        limiter.check_open()
+        await limiter._acquire()
+        login.holds_slot = True
+        login.limiter = limiter
+        method = "auth.login_with_api_key"
+        request_id, payload = self._request_payload(method, [self.config.api_key])
+        logger.debug("Calling TrueNAS middleware method %s", method)
+        login.sending = True
+        await ws.send(json.dumps(payload))
+        login.sending = False
+        # Only a login the appliance has received can complete after close.
+        login.request_id = request_id
+        result = await self._await_reply(ws, method, request_id, login=login)
+        login.request_id = None
+        login.release()
+        return result
+
+    async def _settle_login(
+        self, ws: ClientConnection, login: _PendingLogin, primary: BaseException | None,
+    ) -> None:
+        """Read until an interrupted login answers, for at most one call timeout.
+
+        Only a timeout or cancellation leaves a healthy connection with a login
+        still running. Any other failure, or a frame interrupted mid-send,
+        means the connection cannot be read safely, so it closes at once.
+        """
+        try:
+            if (
+                login.request_id is not None
+                and not login.sending
+                and isinstance(primary, (TimeoutError, asyncio.CancelledError))
+            ):
+                async with asyncio.timeout(min(float(self.config.timeout_seconds), LOGIN_SETTLE_MAX_SECONDS)):
+                    await self._await_reply(ws, "auth.login_with_api_key", login.request_id)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            # The login's outcome no longer matters; only that it finished.
+            if isinstance(exc, TimeoutError):
+                logger.warning(
+                    "TrueNAS login did not answer within the close grace; the appliance "
+                    "may keep a stale API session until its middleware restarts."
+                )
+        finally:
+            login.request_id = None
+            login.release()
 
     async def _fetch_enclosures(self, call_method: MethodCaller) -> list[dict[str, Any]]:
         methods = ["enclosure.query", "enclosure2.query"]
@@ -797,6 +1056,8 @@ class TrueNASWebsocketClient:
 
         if not self.config.api_key:
             raise TrueNASAPIError("TRUENAS_API_KEY is required for API access.")
+        # Fail fast while backing off: no connection, no login.
+        self.call_limiter.check_open()
 
         connection = connect(
             websocket_url,
@@ -809,8 +1070,9 @@ class TrueNASWebsocketClient:
         )
         ws = await connection.__aenter__()
         primary: BaseException | None = None
+        login = _PendingLogin()
         try:
-            await self._perform_handshake(ws)
+            await self._perform_handshake(ws, login)
             yield ws
         except BaseException as exc:
             primary = exc
@@ -819,10 +1081,16 @@ class TrueNASWebsocketClient:
             # Own context exit separately BEFORE awaiting it. The first cancel
             # can arrive after a result/error has already started close; letting
             # it reach close() would cancel the library's timeout/abort path.
-            closing = asyncio.create_task(connection.__aexit__(
-                type(primary) if primary is not None else None, primary,
-                primary.__traceback__ if primary is not None else None,
-            ))
+            async def finish() -> None:
+                try:
+                    await self._settle_login(ws, login, primary)
+                finally:
+                    await connection.__aexit__(
+                        type(primary) if primary is not None else None, primary,
+                        primary.__traceback__ if primary is not None else None,
+                    )
+
+            closing = asyncio.create_task(finish())
             cancelled = await self._drain_owned(closing)
             if cancelled is not None:
                 raise cancelled
@@ -833,21 +1101,32 @@ class TrueNASWebsocketClient:
                 closing.result()
 
     async def _call(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
+        async with self.call_limiter.slot():
+            if self._uses_jsonrpc:
+                return await self._call_jsonrpc(ws, method, params)
+            return await self._call_ddp(ws, method, params)
+
+    def _request_payload(self, method: str, params: list[Any]) -> tuple[Any, dict[str, Any]]:
         if self._uses_jsonrpc:
-            return await self._call_jsonrpc(ws, method, params)
-        return await self._call_ddp(ws, method, params)
+            request_id: Any = next(self._jsonrpc_request_ids)
+            return request_id, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        request_id = str(uuid.uuid4())
+        return request_id, {"id": request_id, "msg": "method", "method": method, "params": params}
+
+    async def _await_reply(
+        self, ws: ClientConnection, method: str, request_id: Any, *, login: _PendingLogin | None = None,
+    ) -> Any:
+        if self._uses_jsonrpc:
+            return await self._await_jsonrpc_reply(ws, method, request_id)
+        return await self._await_ddp_reply(ws, method, request_id, login=login)
 
     async def _call_jsonrpc(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
-        request_id = next(self._jsonrpc_request_ids)
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }
+        request_id, payload = self._request_payload(method, params)
         logger.debug("Calling TrueNAS JSON-RPC method %s", method)
         await ws.send(json.dumps(payload))
+        return await self._await_jsonrpc_reply(ws, method, request_id)
 
+    async def _await_jsonrpc_reply(self, ws: ClientConnection, method: str, request_id: Any) -> Any:
         while True:
             message = json.loads(await ws.recv())
             if not isinstance(message, dict):
@@ -864,16 +1143,14 @@ class TrueNASWebsocketClient:
             return message.get("result")
 
     async def _call_ddp(self, ws: ClientConnection, method: str, params: list[Any]) -> Any:
-        request_id = str(uuid.uuid4())
-        payload = {
-            "id": request_id,
-            "msg": "method",
-            "method": method,
-            "params": params,
-        }
+        request_id, payload = self._request_payload(method, params)
         logger.debug("Calling TrueNAS websocket method %s", method)
         await ws.send(json.dumps(payload))
+        return await self._await_ddp_reply(ws, method, request_id)
 
+    async def _await_ddp_reply(
+        self, ws: ClientConnection, method: str, request_id: Any, *, login: _PendingLogin | None = None,
+    ) -> Any:
         while True:
             raw_message = await ws.recv()
             message = json.loads(raw_message)
@@ -883,7 +1160,11 @@ class TrueNASWebsocketClient:
                 pong = {"msg": "pong"}
                 if "id" in message:
                     pong["id"] = message["id"]
+                if login is not None:
+                    login.sending = True
                 await ws.send(json.dumps(pong))
+                if login is not None:
+                    login.sending = False
                 continue
 
             if message.get("id") != request_id:
@@ -891,7 +1172,7 @@ class TrueNASWebsocketClient:
 
             if msg_type == "result":
                 if "error" in message:
-                    raise TrueNASAPIError(f"{method} failed: {message['error']}")
+                    raise build_ddp_error(method, message["error"])
                 return message.get("result")
 
             raise TrueNASAPIError(f"Unexpected response for {method}: {message}")

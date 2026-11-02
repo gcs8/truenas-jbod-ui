@@ -51,8 +51,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   their bays 1-4 and 1-7 as the chassis does; slot indices, bay hints, saved
   mappings and history are unchanged (#1069, refs #1068).
 
+- TrueNAS middleware calls now share one per-appliance limit,
+  `max_concurrent_calls` (`TRUENAS_MAX_CONCURRENT_CALLS`, default 4 on CORE and
+  8 on SCALE, at most 10), across refreshes, SMART grids, drawers and LED
+  actions. A busy reply or a timed-out inventory read starts a jittered
+  backoff, and the API source shows as busy instead of unreachable (#PRNUM).
+
 ### Fixed
 
+- Closed TrueNAS middleware connections only after an interrupted login
+  answers, within one call timeout, so a timed-out or cancelled read no longer
+  leaves a stale API session on the appliance (#PRNUM).
 - Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
   not used" where a platform has no API and names the QuantaStor or ESXi API
   where it has one, SSH shows "partial" when only optional reads failed and

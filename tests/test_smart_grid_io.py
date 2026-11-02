@@ -246,6 +246,9 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def wire(self, service, peer):
         from app.services.truenas_ws import TrueNASWebsocketClient
         service.system.truenas.api_key = 'synthetic-test-token'
+        # #1072: the appliance limit caps every batch; these budget checks use
+        # its widest value so request and service budgets stay the binding ones.
+        service.system.truenas.max_concurrent_calls = 10
         service.truenas_client = TrueNASWebsocketClient(service.system.truenas)
         with patch('app.services.truenas_ws.connect', peer.connect):
             yield
@@ -289,7 +292,7 @@ class CoreGridWebsocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(s.get_slot_smart_summaries(list(range(84)), max_concurrency=budget), 15)
                     self.assertLessEqual(peer.peak, budget)
                     self.assertEqual(peer.connections, 2)
-        for budget, cap in ((2, 1), (12, 2), (12, 12)):
+        for budget, cap in ((2, 1), (12, 2), (12, 10)):
             with self.subTest(service=budget, request=cap), self.fixture(84) as (s, api, store, other):
                 s._smart_operation_limit = budget
                 s._smart_operation_semaphore = asyncio.Semaphore(budget)

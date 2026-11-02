@@ -35,6 +35,26 @@ Leave `api_dialect` at its `ddp` default on CORE. CORE serves only the legacy
 `/websocket` middleware endpoint, so the JSON-RPC 2.0 dialect described in
 [[TrueNAS SCALE Setup|TrueNAS-SCALE-Setup]] does not apply here.
 
+### Middleware call limit
+
+The app keeps at most `max_concurrent_calls` middleware calls in flight against
+one appliance (environment: `TRUENAS_MAX_CONCURRENT_CALLS`). Inventory
+refreshes, SMART grids, slot drawers, LED actions and QA runs all share that one
+budget. The CORE default is 4. The CORE 13 middleware admits 10 calls per
+connection, and its own internal alert checks run in the same process. During
+heavy read bursts those checks can time out and email a transient
+`Failed to check for alert` message, so the default leaves most of that
+capacity to the appliance. Valid values are 1 to 10.
+
+When the middleware answers that it is busy, or a whole inventory read times
+out, the app backs off. It waits 2 seconds, doubling on each further busy
+reply up to 60 seconds, with random jitter. While backing off, the API source
+shows as busy instead of unreachable, and the app sends no calls.
+
+Each connection waits briefly for its login to answer before it closes. CORE 13
+keeps the API session of a login that finishes after its connection closed; on
+CORE those sessions are cleared only by a middleware restart.
+
 This first connection does not verify the appliance certificate. After the UI
 works, [[Advanced Configuration|Advanced-Configuration]] explains how to enable
 verification with the system trust store or a private CA bundle.
