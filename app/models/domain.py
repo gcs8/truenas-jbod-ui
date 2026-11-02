@@ -378,6 +378,7 @@ class EnclosureProfileView(BaseModel):
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
     slot_number_base: int | None = None
     face_variant: str | None = None
+    manual_mapping_only: bool = False
 
 
 class InventorySummary(BaseModel):

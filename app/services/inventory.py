@@ -74,7 +74,6 @@ from app.services.profile_registry import (
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
     ProfileRegistry,
     SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID,
-    UNIFI_LAYOUT_ONLY_PROFILE_IDS,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
 )
@@ -8398,7 +8397,7 @@ class InventoryService:
         # Layout-only profiles (#1068) have no validated bay order: neither the
         # UniFi storage service's slot numbers nor slot hints may place a disk.
         # Only saved manual mappings do, as on a generic chassis.
-        layout_only = selected_profile.id in UNIFI_LAYOUT_ONLY_PROFILE_IDS
+        layout_only = selected_profile.manual_mapping_only
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:

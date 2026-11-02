@@ -538,12 +538,15 @@ class ProfileRegistryTests(unittest.TestCase):
                 self.assertEqual(profile.slot_count, len([slot for row in layout for slot in row]))
                 self.assertEqual(profile.slot_number_base, 1)
                 self.assertEqual(profile.slot_hints, {})
+                self.assertTrue(profile.manual_mapping_only)
                 self.assertIn(
                     "Layout only: bay-to-disk mapping is manual until validated on real hardware.",
                     profile.summary,
                 )
                 self.assertTrue(profile_is_system_layout(profile))
         # The validated UNVR and UNVR Pro keep their automatic mapping.
+        self.assertFalse(registry.get(UNIFI_UNVR_FRONT_4_PROFILE_ID).manual_mapping_only)
+        self.assertFalse(registry.get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID).manual_mapping_only)
         self.assertNotIn(UNIFI_UNVR_FRONT_4_PROFILE_ID, UNIFI_LAYOUT_ONLY_PROFILE_IDS)
         self.assertNotIn(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID, UNIFI_LAYOUT_ONLY_PROFILE_IDS)
 

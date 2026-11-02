@@ -61,6 +61,10 @@ Optional fields:
   plain face. The layout-only UniFi profiles use `unvr-g2`, `unvr-g2-pro`,
   `envr` and `envr-core`; their column number strips are generated from the
   layout, so they always agree with the bay labels.
+- `manual_mapping_only`: `true` for a layout whose bay order has not been
+  validated on real hardware. No slot hint or vendor slot number places a disk;
+  only saved manual mappings do, and the builder drops any slot hints. Copies
+  and edits of such a profile keep it. The layout-only UniFi profiles set it.
 - `latch_edge`: tray-release edge used for visual polish:
   - `bottom`
   - `right`

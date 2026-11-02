@@ -329,6 +329,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             face_variant="unvr-g2",
+            manual_mapping_only=True,
             latch_edge="bottom",
             bay_size="3.5",
             rows=1,
@@ -350,6 +351,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             face_variant="unvr-g2-pro",
+            manual_mapping_only=True,
             latch_edge="bottom",
             bay_size="3.5",
             rows=2,
@@ -372,6 +374,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             face_variant="envr",
+            manual_mapping_only=True,
             latch_edge="bottom",
             bay_size="3.5",
             rows=4,
@@ -396,6 +399,7 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             edge_label="Front of chassis",
             face_style="unifi-drive",
             face_variant="envr-core",
+            manual_mapping_only=True,
             latch_edge="bottom",
             bay_size="3.5",
             rows=4,
@@ -644,6 +648,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
         slot_number_base=profile.slot_number_base,
         face_variant=profile.face_variant,
+        manual_mapping_only=profile.manual_mapping_only,
     )
 
 

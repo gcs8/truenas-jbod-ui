@@ -16,6 +16,7 @@ from app.models.domain import EnclosureProfileRequest
 from app.services.profile_builder import ProfileBuilderService
 from app.services.profile_registry import ProfileRegistry
 from app.services.profile_registry import DELL_MD1280_DRAWER_BOTTOM_PROFILE_ID, GENERIC_FRONT_24_1X24_PROFILE_ID
+from app.services.profile_registry import UNIFI_LAYOUT_ONLY_PROFILE_IDS, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID
 from app.services.storage_views import storage_view_slot_label
 
 
@@ -69,6 +70,32 @@ class ProfileBuilderServiceTests(unittest.TestCase):
             self.assertEqual(
                 sorted(slot for row in saved.slot_layout for slot in row if slot is not None), list(range(42, 84)),
             )
+
+    def test_copies_of_layout_only_profiles_stay_manual_mapping_only(self) -> None:
+        # Codex P2 on #1070: a copy of a layout-only UniFi profile kept its
+        # layout and note but got a custom id, and the id-only check then let
+        # unvalidated ubntstorage slot numbers place disks again. The policy is
+        # a profile field, so copies, re-saves and resized copies keep it.
+        for source_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(source=source_id), tempfile.TemporaryDirectory() as temp_dir:
+                service = ProfileBuilderService(str(Path(temp_dir) / "config.yaml"), str(Path(temp_dir) / "profiles.yaml"))
+                source = ProfileRegistry(Settings()).get(source_id)
+                assert source is not None
+                self.assertTrue(source.manual_mapping_only)
+                payload = source.model_dump(exclude={"slot_number_base", "face_variant", "manual_mapping_only"})
+                payload.update(id="my-nvr", label="My NVR", source_profile_id=source_id)
+                saved, _ = service.save_profile(EnclosureProfileRequest.model_validate(payload), Settings())
+                self.assertTrue(saved.manual_mapping_only)
+                self.assertEqual(saved.face_variant, source.face_variant)
+                self._reload_saved_profile(service, saved)
+                renamed, updated = service.save_profile(EnclosureProfileRequest.model_validate(
+                    dict(payload, label="Renamed", rows=1, columns=2, slot_layout=None, slot_count=None),
+                ), Settings())
+                self.assertTrue(updated)
+                self.assertTrue(renamed.manual_mapping_only)
+        validated = ProfileRegistry(Settings()).get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
+        assert validated is not None
+        self.assertFalse(validated.manual_mapping_only)
 
     def test_label_edit_preserves_existing_base_instead_of_clone_source(self) -> None:
         for base in (None, 0, 1, -2, 7):

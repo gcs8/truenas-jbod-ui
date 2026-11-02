@@ -7294,6 +7294,35 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
                 self.assertEqual(slot_views[0].slot_label, "01")
                 self.assertIn("This layout has no bay hints, so disks must be assigned to bays by hand.", warnings)
 
+    def test_a_copied_layout_only_profile_still_places_no_disk_automatically(self) -> None:
+        # Codex P2 on #1070: the manual-only policy travels with the profile,
+        # not with the four built-in ids.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = ProfileRegistry(Settings()).get(sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0])
+            copy = EnclosureProfileConfig(
+                **source.model_dump(exclude={"id", "label", "slot_count"}), id="my-nvr", label="My NVR",
+            )
+            settings = Settings()
+            settings.profiles = [copy]
+            system = SystemConfig(
+                id="nvr",
+                label="UniFi NVR",
+                default_profile_id="my-nvr",
+                truenas=TrueNASConfig(platform="linux"),
+                ssh=SSHConfig(enabled=True),
+            )
+            service = build_inventory_service(settings, system, AsyncMock(), AsyncMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                linux_blockdevices=[
+                    {"name": "sda", "type": "disk", "path": "/dev/sda", "hctl": "0:0:0:0",
+                     "serial": "SANITIZED-COPY-0", "size": "14.6T", "tran": "sata", "children": []},
+                ],
+                ubntstorage_disks=[{"node": "sda", "slot": 1, "healthy": "good", "state": "normal"}],
+            )
+            slot_views, *_rest = service._correlate_linux_host(ssh_data, [], None)
+            self.assertEqual(service.profile_registry.get("my-nvr").manual_mapping_only, True)
+            self.assertEqual([view.device_name for view in slot_views if view.device_name], [])
+
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
