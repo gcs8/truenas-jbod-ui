@@ -85,7 +85,7 @@ test("mapping health separates matched empty unmatched and unknown bays", () => 
 test("mapping health reports all matched and names the bay sources in plain words", () => {
   const { summarizeMappingHealth, mappingHealthSourceNote, mappingSourceLabel } = loadFunctions(
     APP_SOURCE,
-    ["summarizeMappingHealth", "mappingHealthSourceNote", "mappingSourceLabel"],
+    ["summarizeMappingHealth", "mappingHealthSourceNote", "mappingSourceLabel", "platformMappingSourceLabel"],
   );
   const slots = [
     { slot: 0, state: "healthy", mapping_source: "api" },
@@ -99,7 +99,7 @@ test("mapping health reports all matched and names the bay sources in plain word
 });
 
 test("mapping source tokens are shown as plain labels in the bay details", () => {
-  const { mappingSourceLabel } = loadFunctions(APP_SOURCE, ["mappingSourceLabel"]);
+  const { mappingSourceLabel } = loadFunctions(APP_SOURCE, ["mappingSourceLabel", "platformMappingSourceLabel"]);
   assert.equal(mappingSourceLabel("inventory_candidate"), "inventory match");
   assert.equal(mappingSourceLabel("scale_sg_ses"), "SSH (SES)");
   assert.equal(mappingSourceLabel("snapshot_slot"), "saved snapshot");
@@ -107,7 +107,7 @@ test("mapping source tokens are shown as plain labels in the bay details", () =>
   assert.equal(mappingSourceLabel("manual"), "saved assignment");
   assert.equal(mappingSourceLabel(""), "n/a");
   assert.equal(mappingSourceLabel("some_future_source"), "some future source");
-  assert.match(APP_SOURCE, /kvRow(?:IfMeaningful)?\("Bay reported by", mappingSourceLabel\(slot\.mapping_source\)\)/);
+  assert.match(APP_SOURCE, /kvRow(?:IfMeaningful)?\("Bay reported by", mappingSourceLabel\(slot\.mapping_source, currentPlatform\(\)\)\)/);
   assert.doesNotMatch(APP_SOURCE, /kvRow\("Mapping", slot\.mapping_source\)/);
 });
 

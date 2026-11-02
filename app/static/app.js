@@ -1057,7 +1057,7 @@
               ? buildSatadomRuntimeTileMarkup(slot, selectedView)
               : buildEmbeddedBootMediaRuntimeTileMarkup(slot))
           : liveSlot
-            ? buildLiveSlotTileMarkup(liveSlot)
+            ? buildLiveSlotTileMarkup(liveSlot, sharedMountPoolName(state.snapshot?.slots, currentPlatform()))
           : `
             <span class="slot-status-led" aria-hidden="true"></span>
             <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
@@ -3597,12 +3597,33 @@
     return "UNKNOWN";
   }
 
-  function buildLiveSlotTileMarkup(slot) {
+  // A Linux or ESXi appliance with one array mounts it at the same path on
+  // every bay, so that path cannot tell bays apart (#1066). TrueNAS and
+  // QuantaStor pool names keep their tile line.
+  function sharedMountPoolName(slots, platform) {
+    const key = String(platform || "").toLowerCase();
+    if (key !== "linux" && key !== "esxi") return null;
+    const disks = (Array.isArray(slots) ? slots : []).filter((slot) => slot && (slot.device_name || slot.serial));
+    if (disks.length < 2) return null;
+    const first = disks[0].pool_name;
+    return first && disks.every((slot) => slot.pool_name === first) ? first : null;
+  }
+
+  function liveSlotSecondaryLabel(slot, sharedMount = null) {
+    if (sharedMount && slot.pool_name === sharedMount) {
+      const serial = String(slot.serial || "").trim();
+      if (serial) return serial.length > 8 ? `S/N …${serial.slice(-6)}` : `S/N ${serial}`;
+      if (slot.model) return slot.model;
+    }
+    return slot.pool_name || stateLabel(slot);
+  }
+
+  function buildLiveSlotTileMarkup(slot, sharedMount = null) {
     return `
       <span class="slot-status-led" aria-hidden="true"></span>
       <span class="slot-number">${escapeHtml(slot.slot_label)}</span>
       <span class="slot-device">${escapeHtml(slotPrimaryLabel(slot))}</span>
-      <span class="slot-pool">${escapeHtml(slot.pool_name || stateLabel(slot))}</span>
+      <span class="slot-pool">${escapeHtml(liveSlotSecondaryLabel(slot, sharedMount))}</span>
       <span class="slot-latch" aria-hidden="true"></span>
     `;
   }
@@ -6986,6 +7007,7 @@
     }
     hideSlotTooltip();
     const slotsByNumber = new Map(state.snapshot.slots.map((slot) => [slot.slot, slot]));
+    const sharedMount = sharedMountPoolName(state.snapshot.slots, currentPlatform());
     const peerContext = getSelectedPeerContext();
     const layoutRows = activeLayoutRows();
     const geometry = buildChassisGeometry(buildViewProfile(), layoutRows);
@@ -7036,7 +7058,7 @@
       tile.setAttribute("aria-label", slotAccessibleName(slot));
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
-      tile.innerHTML = buildLiveSlotTileMarkup(slot);
+      tile.innerHTML = buildLiveSlotTileMarkup(slot, sharedMount);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
       container.appendChild(tile);
     };
@@ -9046,7 +9068,7 @@
         ),
         kvRowIfMeaningful("Enclosure", slot.enclosure_label || slot.enclosure_name || slot.enclosure_id),
         kvRowIfMeaningful("LED", ledStatusLabel(slot)),
-        kvRowIfMeaningful("Bay reported by", mappingSourceLabel(slot.mapping_source)),
+        kvRowIfMeaningful("Bay reported by", mappingSourceLabel(slot.mapping_source, currentPlatform())),
         kvRowIfMeaningful("Notes", slot.notes),
         smartDetailsDisclosure([
           kvRowIfMeaningful("Warning Temp", formatWarningTemperatureValue(smartEntry)),
@@ -9594,14 +9616,73 @@
       return { className: "status-chip snapshot", textContent: "SSH: off at capture" };
     }
     if (!ssh.ok) {
-      return { className: "status-chip error", textContent: "SSH: error at capture" };
+      // #1066: only optional reads failed, so the saved bay map was complete.
+      return ssh.required_ok === true
+        ? { className: "status-chip partial", textContent: "SSH: partial at capture" }
+        : { className: "status-chip error", textContent: "SSH: error at capture" };
     }
     return { className: "status-chip snapshot", textContent: "SSH: OK at capture" };
   }
 
+  // The API a platform's inventory is read from, or null where it has none
+  // (Linux hosts and BMC-only systems are read over SSH or the BMC) (#1066).
+  function platformApiName(platform) {
+    const key = String(platform || "core").toLowerCase();
+    if (key === "core" || key === "scale") return "TrueNAS API";
+    if (key === "quantastor") return "QuantaStor API";
+    if (key === "esxi") return "ESXi API";
+    return null;
+  }
+
+  // The API chip never says OK for an API the platform does not use; a
+  // BMC-only system shows its BMC there instead (#1066).
+  function apiStatusChipState(sources, platform, snapshotMode) {
+    const key = String(platform || "core").toLowerCase();
+    let label = platformApiName(key);
+    let source = sources?.api || { ok: false, message: "Unavailable" };
+    if (key === "ipmi" && sources?.bmc?.enabled) {
+      label = "BMC";
+      source = sources.bmc;
+    }
+    const used = source.enabled !== false;
+    const prefix = label || "API";
+    const suffix = snapshotMode ? " at capture" : "";
+    let className = "status-chip";
+    let stateText = "not used";
+    if (used) {
+      stateText = source.ok ? "OK" : "error";
+      className = snapshotMode ? "status-chip snapshot" : `status-chip ${source.ok ? "ok" : "error"}`;
+    } else if (snapshotMode) {
+      className = "status-chip snapshot";
+    }
+    let title = typeof source.message === "string" ? source.message : "";
+    if (snapshotMode) {
+      title = `Recorded when this copy was saved. No ${label || "API"} is connected.`;
+    }
+    return { className, textContent: `${prefix}: ${stateText}${suffix}`, title };
+  }
+
+  // OK, partial when only optional reads failed (`required_ok`), or error
+  // when a command the bay map needs failed (#927, #1066).
+  function sshStatusChipState(ssh) {
+    if (!ssh.enabled) {
+      // SSH that was never turned on is a normal setup, so it keeps the neutral chip style.
+      return { className: "status-chip", textContent: "SSH: off" };
+    }
+    if (ssh.ok) {
+      return { className: "status-chip ok", textContent: "SSH: OK" };
+    }
+    return ssh.required_ok === true
+      ? { className: "status-chip partial", textContent: "SSH: partial" }
+      : { className: "status-chip error", textContent: "SSH: error" };
+  }
+
   function renderStatus() {
-    const api = state.snapshot.sources?.api || { ok: false, message: "Unavailable" };
     const ssh = state.snapshot.sources?.ssh || { enabled: false, ok: true, message: "Disabled" };
+    const apiChip = apiStatusChipState(state.snapshot.sources, currentPlatform(), state.snapshotMode);
+    apiStatusChip.className = apiChip.className;
+    apiStatusChip.textContent = apiChip.textContent;
+    apiStatusChip.title = apiChip.title;
 
     if (snapshotStatusChip) {
       if (state.snapshotMode) {
@@ -9618,29 +9699,21 @@
       }
     }
 
+    const sshMessage = typeof ssh.message === "string" ? ssh.message : "";
     if (state.snapshotMode) {
-      apiStatusChip.className = "status-chip snapshot";
-      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK at capture" : "TrueNAS API: error at capture";
-      apiStatusChip.title = "Recorded when this copy was saved. No TrueNAS API is connected.";
       const snapshotSsh = snapshotSshStatus(ssh);
       sshStatusChip.className = snapshotSsh.className;
       sshStatusChip.textContent = snapshotSsh.textContent;
-      sshStatusChip.title = "Recorded when this copy was saved. No SSH session is connected.";
+      // A partial read names the optional reads that failed.
+      sshStatusChip.title = [
+        "Recorded when this copy was saved. No SSH session is connected.",
+        ssh.enabled && !ssh.ok && ssh.required_ok === true ? sshMessage : "",
+      ].filter(Boolean).join(" ");
     } else {
-      apiStatusChip.className = `status-chip ${api.ok ? "ok" : "error"}`;
-      apiStatusChip.textContent = api.ok ? "TrueNAS API: OK" : "TrueNAS API: error";
-      apiStatusChip.title = typeof api.message === "string" ? api.message : "";
-
-      // SSH that was never turned on is a normal setup, so it keeps the neutral chip style.
-      let sshClass = "ok";
-      if (!ssh.enabled) {
-        sshClass = "";
-      } else if (!ssh.ok) {
-        sshClass = "error";
-      }
-      sshStatusChip.className = `status-chip ${sshClass}`.trim();
-      sshStatusChip.textContent = !ssh.enabled ? "SSH: off" : ssh.ok ? "SSH: OK" : "SSH: error";
-      sshStatusChip.title = typeof ssh.message === "string" ? ssh.message : "";
+      const sshChip = sshStatusChipState(ssh);
+      sshStatusChip.className = sshChip.className;
+      sshStatusChip.textContent = sshChip.textContent;
+      sshStatusChip.title = sshMessage;
     }
 
     if (historyStatusChip) {
@@ -9752,7 +9825,26 @@
     return { ...counts, populated, total, headline };
   }
 
-  function mappingSourceLabel(source) {
+  // Where a bay source code means something else on a non-TrueNAS platform.
+  // Linux and ESXi bays are drawn from the enclosure layout and filled over
+  // SSH; a bay number on Linux comes from the UniFi storage tool and on ESXi
+  // from StorCLI (#1066).
+  function platformMappingSourceLabel(source, platform) {
+    const key = String(platform || "").toLowerCase();
+    const apiCodes = ["api", "api-slot", "api-slot-fallback"];
+    if (key === "quantastor" && apiCodes.includes(source)) return "QuantaStor API";
+    if (key === "ipmi" && apiCodes.includes(source)) return "BMC";
+    if (key === "linux" || key === "esxi") {
+      if (source === "api-slot" || source === "api-slot-fallback") {
+        return key === "linux" ? "SSH (UniFi storage)" : "SSH (StorCLI)";
+      }
+      if (source === "api" || source === "ssh") return "enclosure layout + SSH";
+      if (source === "device-name") return "enclosure layout + SSH (device name)";
+    }
+    return null;
+  }
+
+  function mappingSourceLabel(source, platform) {
     const labels = {
       api: "TrueNAS API",
       "api-slot": "TrueNAS API",
@@ -9768,8 +9860,8 @@
       "sas-address": "SAS address",
       bmc: "BMC",
       "bmc-slot": "BMC",
-      "storcli-slot": "StorCLI",
-      ubntstorage: "UniFi storage",
+      "storcli-slot": "SSH (StorCLI)",
+      ubntstorage: "SSH (UniFi storage)",
       "system-inventory": "disk list",
       synthetic_fixture: "demo data",
       manual: "saved assignment",
@@ -9787,14 +9879,14 @@
     if (!key) {
       return "n/a";
     }
-    return labels[key] || key.replaceAll("_", " ");
+    return platformMappingSourceLabel(key, platform) || labels[key] || key.replaceAll("_", " ");
   }
 
-  function mappingHealthSourceNote(slots) {
+  function mappingHealthSourceNote(slots, platform) {
     const sources = Array.from(new Set((Array.isArray(slots) ? slots : [])
       .map((slot) => String(slot?.mapping_source || "").trim())
       .filter((source) => source && source !== "unknown" && source !== "empty" && source !== "placeholder")
-      .map((source) => mappingSourceLabel(source))));
+      .map((source) => mappingSourceLabel(source, platform))));
     return sources.length ? `Bay positions come from: ${sources.join(", ")}.` : "Bay positions: source unknown.";
   }
 
@@ -9907,7 +9999,7 @@
       mappingHealthSummary.dataset.tone = health.unmatched > 0 ? "warning" : health.unknown > 0 ? "unknown" : "ok";
     }
     if (mappingHealthEvidence) {
-      setTextIfChanged(mappingHealthEvidence, mappingHealthSourceNote(healthScope.slots));
+      setTextIfChanged(mappingHealthEvidence, mappingHealthSourceNote(healthScope.slots, currentPlatform()));
     }
     renderCapabilities();
   }

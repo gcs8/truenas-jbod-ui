@@ -1525,9 +1525,30 @@ class InventorySSHRequiredCommandTests(unittest.IsolatedAsyncioTestCase):
         ssh = bundle.sources["ssh"]
         self.assertFalse(ssh.ok)
         self.assertIs(ssh.required_ok, True)
-        self.assertEqual(ssh.message, "SSH finished with some failed commands.")
+        # #1066: the status names the optional read that failed, for the SSH chip's tooltip.
+        self.assertEqual(
+            ssh.message,
+            "Some optional SSH reads failed (Linux SCSI transport detail). The bay map is complete.",
+        )
         self.assertTrue(any("The bay map still works" in warning for warning in bundle.warnings), bundle.warnings)
         self.assertIs(ssh.model_dump(mode="json")["required_ok"], True)
+
+    async def test_unused_platform_api_says_how_disks_are_read(self):
+        # #1066: no "TrueNAS API" on a system that has none.
+        expected = {
+            "linux": "Linux systems have no platform API; disks are read over SSH.",
+            "esxi": "The ESXi API is not used; disks are read over SSH.",
+            "ipmi": "BMC-only systems have no platform API; disks are read from the BMC.",
+        }
+        for platform, message in expected.items():
+            with self.subTest(platform=platform):
+                bundle = await self._bundle(platform, [
+                    SSHCommandResult(command="/usr/bin/lsblk -OJ", ok=True, stdout='{"blockdevices": []}', exit_code=0),
+                ])
+                api = bundle.sources["api"]
+                self.assertFalse(api.enabled)
+                self.assertEqual(api.message, message)
+                self.assertNotIn("TrueNAS", api.message)
 
     async def test_unvr_shape_failed_gpio_debug_read_keeps_required_commands_ok(self):
         # The GPIO read only fills the locate-light state; the bay map comes
@@ -2808,7 +2829,7 @@ class InventoryHelpersTests(unittest.TestCase):
                 "see Debug for the command output."
             ],
         )
-        self.assertEqual(status_message, "SSH finished with some failed commands.")
+        self.assertEqual(status_message, "Some optional SSH reads failed (IOC facts). The bay map is complete.")
         self.assertEqual(details[0]["canonical_command"], "mprutil -u 10 show iocfacts")
         self.assertEqual(details[0]["controller"], "mpr10")
         self.assertEqual(details[0]["context"], "sas_fabric_mprutil_iocfacts")
@@ -2860,7 +2881,10 @@ class InventoryHelpersTests(unittest.TestCase):
                 "see Debug for the command output."
             ],
         )
-        self.assertEqual(status_message, "SSH finished with some failed commands.")
+        self.assertEqual(
+            status_message,
+            "Some optional SSH reads failed (Linux NVMe subsystem detail). The bay map is complete.",
+        )
         self.assertEqual(details[0]["canonical_command"], "nvme list-subsys -o json")
         self.assertEqual(details[0]["context"], "storage_fabric_linux_nvme_subsystems")
         self.assertEqual(details[0]["criticality"], "enrichment")

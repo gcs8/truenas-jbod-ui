@@ -52,6 +52,7 @@ function loadFunctions(names, context = {}) {
 test("SSH bay sources are named in plain words, not raw codes", () => {
   const { mappingSourceLabel, mappingHealthSourceNote } = loadFunctions([
     "mappingSourceLabel",
+    "platformMappingSourceLabel",
     "mappingHealthSourceNote",
   ]);
   assert.equal(mappingSourceLabel("device-name"), "SSH (device name)");

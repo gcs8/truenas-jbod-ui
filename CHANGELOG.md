@@ -26,6 +26,20 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
+  not used" where a platform has no API and names the QuantaStor or ESXi API
+  where it has one, SSH shows "partial" when only optional reads failed and
+  names them in its tooltip, "Bay reported by" and "Bay positions come from"
+  name UniFi storage, StorCLI, the enclosure layout or the BMC instead of the
+  TrueNAS API (also in offline copies), bay tiles on a Linux or ESXi system
+  whose bays share one mount show a serial tail instead, and a known-hosts
+  file on a read-only mount is named as such instead of as an ownership
+  problem (#1067, fixes #1066).
+
 ## v0.24.0-beta.4 - 2026-11-01
 
 This prerelease adds the fixes merged after `v0.24.0-beta.3`. GHCR gets the

@@ -1171,6 +1171,13 @@ def history_service_problem(settings: Settings) -> str | None:
 HEALTH_SUMMARY_ALL_OK = "All sources OK"
 HEALTH_SUMMARY_WAITING = "Waiting for the first inventory"
 HEALTH_SOURCE_LABELS = {"api": "TrueNAS API", "ssh": "SSH", "bmc": "BMC/IPMI"}
+HEALTH_API_LABELS = {"quantastor": "QuantaStor API", "esxi": "ESXi API"}
+
+
+def health_api_label(platform: str | None) -> str:
+    """The platform's API by name; TrueNAS when unknown, as before (#1066)."""
+
+    return HEALTH_API_LABELS.get(str(platform or "").lower(), HEALTH_SOURCE_LABELS["api"])
 
 
 def build_health_payload(
@@ -1212,7 +1219,7 @@ def build_health_payload(
             # ok=False covers both a failed API and one that answers with degraded
             # enclosure data, so name the state neutrally and keep the recorded cause.
             api_message = (api_status.message if api_status else None) or "no details recorded"
-            remote.append(f"TrueNAS API degraded: {api_message}")
+            remote.append(f"{health_api_label(snapshot.selected_system_platform)} degraded: {api_message}")
         for name in ("ssh", "bmc"):
             status = snapshot.sources.get(name)
             if status is not None and status.enabled and not status.ok:

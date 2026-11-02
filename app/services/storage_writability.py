@@ -94,6 +94,37 @@ def describe_unwritable_directory(directory: Path | str) -> str:
     return f"Cannot write to {path} {_ownership_and_remedy(path, access='write', recursive=True)}"
 
 
+def is_read_only_mount(path: Path | str) -> bool:
+    """True when `path` sits on a filesystem mounted read-only (EROFS).
+
+    An unknown mount state is False, so the caller keeps its ownership text.
+    """
+    statvfs = getattr(os, "statvfs", None)
+    read_only_flag = getattr(os, "ST_RDONLY", 0)
+    if statvfs is None or not read_only_flag:
+        return False
+    try:
+        return bool(statvfs(path).f_flag & read_only_flag)
+    except OSError:
+        return False
+
+
+def describe_read_only_known_hosts_mount(path: Path, *, file_exists: bool) -> str:
+    """Name a read-only mount instead of an ownership problem (#1066)."""
+    target = host_repair_path(path.parent)
+    if file_exists:
+        return (
+            f"The known-hosts file {path} is on a read-only mount, so new host keys cannot be saved. "
+            "Hosts are still checked against the keys already in it. To let the app save new keys, "
+            f"mount {target} read-write, or remove ssh.known_hosts_path to use the data folder's known_hosts."
+        )
+    return (
+        f"The known-hosts folder {path.parent} is on a read-only mount and has no known_hosts file, "
+        f"so SSH cannot verify host keys. Put a known_hosts file in {target} on the Docker host, mount it "
+        "read-write, or remove ssh.known_hosts_path to use the data folder's known_hosts."
+    )
+
+
 def describe_capacity_failure(exc: BaseException, directory: Path | str) -> str | None:
     """Explain explicit capacity/quota faults or evidenced SQLite open failures."""
     quota_errno = getattr(errno, "EDQUOT", None)
@@ -271,7 +302,13 @@ def check_known_hosts_files(
             continue
         target = path if file_exists else parent
         if not os.access(target, os.W_OK):
-            if target == parent:
+            if is_read_only_mount(target):
+                # #1066: uid 0 cannot write a file uid 0 owns on a read-only
+                # bind; the ownership text would contradict itself.
+                (read_only if file_exists else problems).append(
+                    describe_read_only_known_hosts_mount(path, file_exists=file_exists)
+                )
+            elif target == parent:
                 problems.append(describe_unwritable_directory(parent))
             else:
                 read_only.append(
