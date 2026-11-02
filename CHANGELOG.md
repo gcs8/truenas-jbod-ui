@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   vents, print and RESET pinhole, and the UNVR Pro shows its touchscreen beside
   bays 1-3 and its RJ45 and SFP+ ports instead of an empty block. Both number
   their bays 1-4 and 1-7 as the chassis does; slot indices, bay hints, saved
-  mappings and history are unchanged (#PRNUM, refs #1068).
+  mappings and history are unchanged (#1069, refs #1068).
 
 ### Fixed
 
