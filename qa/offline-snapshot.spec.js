@@ -512,7 +512,7 @@ async def main():
             present=True,
             state=module.SlotState.healthy,
             device_name=f"sd{chr(97 + slot)}",
-            serial=f"SYNTHSERIAL00{slot}AB{slot}",
+            serial=f"SANITIZED-00{slot}AB{slot}",
             model="Synthetic Disk 8TB",
             size_human="8 TB",
             pool_name="/volume/synthetic-volume-0000",

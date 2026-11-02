@@ -254,7 +254,7 @@ test("a mount every bay shares is replaced on the tile by a per-disk line", () =
     slot,
     state: "healthy",
     device_name: `sd${String.fromCharCode(97 + slot)}`,
-    serial: `SYNTHSERIAL00${slot}AB${slot}`,
+    serial: `SANITIZED-00${slot}AB${slot}`,
     model: "Synthetic Disk 8TB",
     pool_name: "/volume/synthetic-volume-0000",
     ...extra,
