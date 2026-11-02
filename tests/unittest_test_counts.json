@@ -14,6 +14,7 @@
     "test_admin_ttl": 5,
     "test_app_history_body_bound": 8,
     "test_app_history_bounds": 12,
+    "test_atomic_write": 11,
     "test_backup_archive_journal": 35,
     "test_backup_archive_lifecycle": 40,
     "test_backup_archive_transport": 78,

@@ -9,6 +9,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from app.services.atomic_write import write_atomically
 
 
 class SSHKeyManager:
@@ -118,9 +119,7 @@ class SSHKeyManager:
     @staticmethod
     def _write_bytes_atomic(path: Path, content: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(f"{path.suffix}.tmp")
-        temp_path.write_bytes(content)
-        temp_path.replace(path)
+        write_atomically(path, lambda handle: handle.write(content), binary=True)
 
     @staticmethod
     def _set_permissions(path: Path, mode: int) -> None:

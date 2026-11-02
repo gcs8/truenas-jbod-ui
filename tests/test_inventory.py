@@ -1051,7 +1051,8 @@ class InventoryDiscoveryDetailPublicationTests(unittest.IsolatedAsyncioTestCase)
                         self.assertIs(service._smart_cache[key], summary)
                         self.assertIs(service._smart_load_tasks[key], retained)
                         self.assertFalse(retained.cancelled())
-                        self.assertFalse(service.slot_detail_store.file_path.with_suffix(".tmp").exists())
+                        cache_path = service.slot_detail_store.file_path
+                        self.assertEqual(list(cache_path.parent.glob(f"{cache_path.name}.*.tmp")), [])
                         self.assertIsNone(inventory_module._snapshot_detail_commits.get())
                     finally:
                         release.set()

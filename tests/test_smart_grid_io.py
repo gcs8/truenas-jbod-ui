@@ -31,7 +31,7 @@ class StoreTrace:
 
     def __init__(self, store):
         self.store = store
-        self.paths = {store.file_path, store.file_path.with_suffix(".tmp")}
+        self.paths = {store.file_path}
         self.loop_thread = threading.get_ident()
         self.operations = Counter()
         self.threads = Counter()
@@ -44,6 +44,14 @@ class StoreTrace:
             category = "loop" if threading.get_ident() == self.loop_thread else "worker"
             self.threads[category] += 1
 
+    def traced(self, path):
+        # Writes stage through a unique sibling ``<name>.<token>.tmp`` (#1063).
+        path = Path(path)
+        target = self.store.file_path
+        return path == target or (
+            path.parent == target.parent and path.name.startswith(f"{target.name}.") and path.name.endswith(".tmp")
+        )
+
     @contextmanager
     def capture(self):
         real_open, real_replace = Path.open, Path.replace
@@ -51,25 +59,25 @@ class StoreTrace:
 
         def opened(path, mode="r", *args, **kwargs):
             handle = real_open(path, mode, *args, **kwargs)
-            if path in self.paths:
-                self.record("write" if "w" in mode else "read")
+            if self.traced(path):
+                self.record("write" if "w" in mode or "x" in mode else "read")
             return handle
 
         def replaced(path, target):
             result = real_replace(path, target)
-            if path in self.paths:
+            if self.traced(path):
                 self.record("replace")
             return result
 
         def loaded(handle, *args, **kwargs):
             result = real_load(handle, *args, **kwargs)
-            if Path(handle.name) in self.paths:
+            if self.traced(handle.name):
                 self.record("json_load")
             return result
 
         def dumped(payload, handle, *args, **kwargs):
             result = real_dump(payload, handle, *args, **kwargs)
-            if Path(handle.name) in self.paths:
+            if self.traced(handle.name):
                 self.record("json_dump")
             return result
 
@@ -1460,7 +1468,10 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
                 loop_thread = threading.get_ident()
                 def blocked(payload, handle, *args, **kwargs):
                     result = original(payload, handle, *args, **kwargs)
-                    if Path(handle.name) == store.file_path.with_suffix('.tmp'):
+                    staged = Path(handle.name)
+                    if staged.parent == store.file_path.parent and staged.name.startswith(
+                        f'{store.file_path.name}.'
+                    ) and staged.name.endswith('.tmp'):
                         entered.set()
                         if threading.get_ident() == loop_thread:
                             raise AssertionError('snapshot serialization on loop')
@@ -1480,7 +1491,7 @@ class SnapshotIOTests(unittest.IsolatedAsyncioTestCase):
                         outcomes = await asyncio.wait_for(asyncio.gather(owner, return_exceptions=True), 3)
                         self.assertIsInstance(outcomes[0], asyncio.CancelledError if cancel else SnapshotStateBusyError)
                     self.assertEqual(store.file_path.read_bytes(), before)
-                    self.assertFalse(store.file_path.with_suffix('.tmp').exists())
+                    self.assertEqual(list(store.file_path.parent.glob(f'{store.file_path.name}.*.tmp')), [])
                 finally:
                     release.set()
                     if owner is not None:
@@ -1907,7 +1918,7 @@ class SmartGridConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                         finally:
                             release.set()
                         self.assertEqual(store.file_path.read_bytes(), before)
-                        self.assertFalse(store.file_path.with_suffix('.tmp').exists())
+                        self.assertEqual(list(store.file_path.parent.glob(f'{store.file_path.name}.*.tmp')), [])
                         self.assertFalse(s._smart_load_tasks)
 
     async def test_cross_owned_grids_publish_before_waiting_dependencies(self):

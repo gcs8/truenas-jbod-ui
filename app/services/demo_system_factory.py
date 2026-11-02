@@ -5,6 +5,7 @@ import re
 
 from app.config import Settings, _normalize_system_id
 from app.models.domain import DemoSystemRequest, EnclosureProfileRequest, SystemSetupRequest
+from app.services.atomic_write import write_atomically
 from app.services.profile_builder import ProfileBuilderService, _PROFILE_WRITE_LOCK
 from app.services.system_setup import SystemSetupService, _CONFIG_WRITE_LOCK
 
@@ -53,9 +54,7 @@ class DemoSystemFactory:
                 if previous is None:
                     profile_path.unlink(missing_ok=True)
                 else:
-                    temporary = profile_path.with_suffix(".tmp")
-                    temporary.write_bytes(previous)
-                    temporary.replace(profile_path)
+                    write_atomically(profile_path, lambda handle: handle.write(previous), binary=True)
                 raise
 
     def _create_new_demo_system(self, payload: DemoSystemRequest, settings: Settings) -> dict[str, object]:

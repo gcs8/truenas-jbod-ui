@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from app.models.domain import SasFabricAlias
+from app.services.atomic_write import write_atomically
 from app.services.config_change_journal import record_config_change
 from app.services.storage_writability import (
     StorageDirectoryCapacityExhausted,
@@ -159,11 +160,11 @@ class SasFabricAliasStore:
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "sas_fabric_aliases": {key: value.model_dump(mode="json") for key, value in aliases.items()},
         }
-        temp_path = self.file_path.with_suffix(".tmp")
         try:
-            with temp_path.open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, sort_keys=True)
-            temp_path.replace(self.file_path)
+            write_atomically(
+                self.file_path,
+                lambda handle: json.dump(payload, handle, indent=2, sort_keys=True),
+            )
         except OSError as exc:
             capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
             if capacity_reason is not None:

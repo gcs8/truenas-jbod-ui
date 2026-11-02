@@ -2344,7 +2344,7 @@ class FabricAliasMutationRegressionTests(unittest.TestCase):
                         write.assert_not_called()
                     self.assertEqual(self.path.read_bytes(), raw)
                     self.journal.assert_not_called()
-                    self.assertFalse(self.path.with_suffix(".tmp").exists())
+                    self.assertEqual(list(self.path.parent.glob(f"{self.path.name}.*.tmp")), [])
 
     def test_public_mutations_reject_authoritative_oserror(self):
         self.seed("pool:Other", "Retained name", object_kind="pool")
