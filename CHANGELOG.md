@@ -51,6 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Concurrent admin requests no longer fail with a 503 when saving the slot
+  detail cache, SAS aliases, profiles, the upgrade notice or SSH keys: each
+  write now stages in its own temporary file instead of one shared `.tmp`
+  file that another request could rename first (#1064).
 - An explicit `7z` FULL backup of a large history no longer times out after
   10 minutes: the single-thread 7z create step now gets 10 minutes or one
   second per 512 KiB of staged input, whichever is longer, up to 4 hours, and
