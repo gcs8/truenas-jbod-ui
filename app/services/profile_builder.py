@@ -142,6 +142,13 @@ class ProfileBuilderService:
                 None,
             )
 
+            # Manual-only placement is a safety property, not appearance: a copy
+            # or edit of an unvalidated layout keeps it whatever else changes.
+            manual_mapping_only = any(
+                candidate is not None and candidate.manual_mapping_only
+                for candidate in (existing_profile, source_profile)
+            )
+
             slot_layout: list[list[int | None]]
             slot_hints: dict[int, list[str]]
             if payload.slot_layout is not None:
@@ -181,6 +188,9 @@ class ProfileBuilderService:
                 slot_layout = default_slot_layout(int(payload.rows), int(payload.columns), slot_count)
                 slot_hints = {}
 
+            if manual_mapping_only:
+                slot_hints = {}
+
             profile = EnclosureProfileConfig(
                 id=profile_id,
                 label=payload.label,
@@ -199,6 +209,7 @@ class ProfileBuilderService:
                 slot_hints=slot_hints,
                 slot_number_base=slot_number_base,
                 face_variant=face_variant,
+                manual_mapping_only=manual_mapping_only,
             )
 
             if existing_index is None:

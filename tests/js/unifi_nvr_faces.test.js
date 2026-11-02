@@ -68,6 +68,8 @@ function functionSource(name) {
 
 const FUNCTIONS = [
   "escapeHtml",
+  "getSlotById",
+  "formatSlotLabel",
   "countLayoutSlots",
   "normalizeLayoutRows",
   "normalizeGeometryRowGroups",
@@ -82,7 +84,10 @@ const FUNCTIONS = [
   "groupColumnTemplate",
   "buildLayoutGridRows",
   "unifiFaceVariantSpec",
+  "unifiFaceColumnLabels",
   "buildUnifiFaceBand",
+  "buildUnifiFaceRowStrip",
+  "buildUnifiFaceRackHandle",
   "buildUnifiFaceDecor",
   "renderUnifiFaceRows",
   "renderChassisRows",
@@ -119,7 +124,14 @@ function loadRenderer(profile, layoutRows) {
   const sandbox = vm.createContext({
     document: { createElement: fakeElement },
     grid: fakeElement("div"),
-    state: { snapshot: { slots, layout_slot_count: slots.length }, selectedSlot: null },
+    state: {
+      snapshot: {
+        slots,
+        layout_slot_count: slots.length,
+        selected_profile: { slot_number_base: profile.slotNumberBase === undefined ? 1 : profile.slotNumberBase },
+      },
+      selectedSlot: null,
+    },
     getSmartSummaryEntry: () => null,
     getSelectedProfile: () => ({ row_groups: [] }),
     currentLayoutSlotCount: () => slots.length,
@@ -165,7 +177,7 @@ function bayTiles(target) {
 function decorNodes(target) {
   const nodes = [];
   walk(target, (node) => {
-    if (/\bunifi-face-(?:decor|band)\b/.test(String(node.className))) {
+    if (/\bunifi-face-(?:decor|band|row-strip|rack-handle)\b/.test(String(node.className))) {
       nodes.push(node);
     }
   });
@@ -344,3 +356,178 @@ for (const [file, source, lookup] of [
     assert.equal(plain(3), "03", "profiles without a base keep zero-based labels");
   });
 }
+const G2 = {
+  profile: { profileId: "ubiquiti-unvr-g2-front-4", faceStyle: "unifi-drive", faceVariant: "unvr-g2", baySize: "3.5" },
+  layoutRows: [[0, 1, 2, 3]],
+};
+const G2_PRO = {
+  profile: { profileId: "ubiquiti-unvr-g2-pro-front-8", faceStyle: "unifi-drive", faceVariant: "unvr-g2-pro", baySize: "3.5" },
+  layoutRows: [[0, 1, 2, 3], [4, 5, 6, 7]],
+};
+const ENVR_ROWS = [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]];
+const ENVR = {
+  profile: { profileId: "ubiquiti-envr-front-16", faceStyle: "unifi-drive", faceVariant: "envr", baySize: "3.5" },
+  layoutRows: ENVR_ROWS,
+};
+const ENVR_CORE = {
+  profile: { profileId: "ubiquiti-envr-core-front-16", faceStyle: "unifi-drive", faceVariant: "envr-core", baySize: "3.5" },
+  layoutRows: ENVR_ROWS,
+};
+
+function bandText(target, edge) {
+  const band = target.children.find((node) => String(node.className).includes(`unifi-face-band-${edge}`));
+  return band ? band.innerHTML : "";
+}
+
+test("the four layout-only UniFi faces keep every bay a bay and every decoration a decoration", () => {
+  for (const { profile, layoutRows } of [G2, G2_PRO, ENVR, ENVR_CORE]) {
+    const { target, geometry } = loadRenderer(profile, layoutRows);
+    assert.equal(geometry.faceVariant, profile.faceVariant);
+    assert.deepEqual(
+      bayTiles(target).map((tile) => Number(tile.dataset.slot)),
+      layoutRows.flat(),
+      `${profile.faceVariant} draws its bays in layout order`,
+    );
+    for (const node of decorNodes(target)) {
+      assert.equal(node.dataset.slot, undefined, node.className);
+      assert.equal(node.getAttribute("aria-hidden"), "true", node.className);
+      assert.doesNotMatch(node.innerHTML, /<(?:button|a|input|select)\b|tabindex|data-slot/i, node.className);
+    }
+  }
+});
+
+test("the G2 faces print NVR G2 / NVR G2 Pro with a System LED dot, perforated vents and RESET", () => {
+  for (const [{ profile, layoutRows }, print] of [[G2, "NVR G2"], [G2_PRO, "NVR G2 Pro"]]) {
+    const { target } = loadRenderer(profile, layoutRows);
+    const top = bandText(target, "top");
+    const bottom = bandText(target, "bottom");
+    assert.match(top, /unifi-face-led-dot/);
+    assert.match(top, new RegExp(`>${print}<`));
+    assert.equal((top.match(/class="unifi-face-vent unifi-face-vent-perforated"/g) || []).length, 4);
+    assert.equal((bottom.match(/class="unifi-face-vent unifi-face-vent-perforated"/g) || []).length, 4);
+    assert.match(bottom, /RESET/);
+  }
+});
+
+test("the G2 Pro divider strip prints each column's top bay over its bottom bay", () => {
+  const { target } = loadRenderer(G2_PRO.profile, G2_PRO.layoutRows);
+  const strips = [];
+  walk(target, (node) => {
+    if (/\bunifi-face-row-strip\b/.test(String(node.className))) strips.push(node);
+  });
+  assert.equal(strips.length, 1);
+  assert.equal(strips[0].getAttribute("aria-hidden"), "true");
+  // Chassis numbers come from the slot labels the app already shows: 1-4 over 5-8.
+  assert.deepEqual(
+    [...strips[0].innerHTML.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+    ["1 / 5", "2 / 6", "3 / 7", "4 / 8"],
+  );
+});
+
+test("the ENVR faces print their column strips 1/5/9/13 to 4/8/12/16 and differ only in print and port", () => {
+  const envr = loadRenderer(ENVR.profile, ENVR.layoutRows).target;
+  const core = loadRenderer(ENVR_CORE.profile, ENVR_CORE.layoutRows).target;
+  for (const target of [envr, core]) {
+    const top = bandText(target, "top");
+    assert.match(top, /unifi-face-led-bar/);
+    assert.deepEqual(
+      [...top.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+      ["1 / 5 / 9 / 13", "2 / 6 / 10 / 14", "3 / 7 / 11 / 15", "4 / 8 / 12 / 16"],
+    );
+    assert.match(top, /RESET/);
+    // Rack handles on both ends are decoration on the shell, not cells.
+    assert.equal(target.children.filter((node) => /unifi-face-rack-handle/.test(String(node.className))).length, 2);
+  }
+  assert.match(bandText(envr, "top"), />Enterprise NVR</);
+  assert.doesNotMatch(bandText(envr, "top"), /Enterprise NVR Core/);
+  assert.match(bandText(envr, "top"), /unifi-face-accessory-port/);
+  assert.match(bandText(core, "top"), />Enterprise NVR Core</);
+  assert.doesNotMatch(bandText(core, "top"), /unifi-face-accessory-port/);
+});
+
+// Codex P2 on #1070: a copy of a G2-Pro or ENVR profile may set
+// slot_number_base to 0. The printed strips must then agree with the bays.
+test("column and row strips follow the profile's bay-label base", () => {
+  const g2pro = loadRenderer({ ...G2_PRO.profile, slotNumberBase: 0 }, G2_PRO.layoutRows).target;
+  const strips = [];
+  walk(g2pro, (node) => {
+    if (/\bunifi-face-row-strip\b/.test(String(node.className))) strips.push(node);
+  });
+  assert.deepEqual(
+    [...strips[0].innerHTML.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+    ["0 / 4", "1 / 5", "2 / 6", "3 / 7"],
+  );
+  const envr = loadRenderer({ ...ENVR.profile, slotNumberBase: 0 }, ENVR.layoutRows).target;
+  assert.deepEqual(
+    [...bandText(envr, "top").matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]),
+    ["0 / 4 / 8 / 12", "1 / 5 / 9 / 13", "2 / 6 / 10 / 14", "3 / 7 / 11 / 15"],
+  );
+});
+
+// Codex P2 on #1070 (PRRT_kwDOSAqK-M6ysJZi): a saved G2-Pro or ENVR chassis
+// view drawn over a live enclosure that labels its bays from 0 printed the
+// strips from the live snapshot and live profile ("0 / 4") above bays the view
+// labels 01 and 05. The strips must come from the saved view's own bays.
+test("a saved chassis view prints its strips from its own bay labels, not the live enclosure's", () => {
+  for (const { profile, layoutRows, strip } of [
+    { ...G2_PRO, strip: "unifi-face-row-strip" },
+    { ...ENVR, strip: "unifi-face-band-top" },
+  ]) {
+    const viewSlots = layoutRows.flat().filter(Number.isInteger).map((slotIndex) => ({
+      slot_index: slotIndex,
+      slot_label: String(slotIndex + 1).padStart(2, "0"),
+      state: "unknown",
+      manual_mapping_only: true,
+    }));
+    const view = {
+      id: "pinned-nvr", kind: "ses_enclosure", slot_layout: layoutRows, slots: viewSlots,
+      face_style: "unifi-drive", face_variant: profile.faceVariant,
+    };
+    const withClassList = (tagName) => {
+      const element = fakeElement(tagName);
+      element.classList = { add() {}, contains: () => false };
+      return element;
+    };
+    const sandbox = vm.createContext({
+      document: { createElement: withClassList },
+      grid: withClassList("div"),
+      state: {
+        // The live enclosure: a different profile with base-0 labels.
+        snapshot: {
+          slots: layoutRows.flat().filter(Number.isInteger).map((slot) => ({ slot, slot_label: String(slot).padStart(2, "0") })),
+          selected_profile: { slot_number_base: 0 },
+        },
+        selectedSlot: null,
+      },
+      hideSlotTooltip() {},
+      getSelectedPeerContext: () => ({ active: false, peerSlots: new Set() }),
+      buildViewProfile: () => ({ ...profile, slotLayout: layoutRows }),
+      buildHeatmapContext: () => ({ enabled: false }),
+      renderHeatmapControls() {},
+      getLiveBackedStorageViewSlot: () => null,
+      storageViewRuntimeMatchesFilter: () => true,
+      buildStorageViewRuntimeTooltip: () => "",
+      storageViewRuntimeShortLabel: () => "",
+      storageViewRuntimeSecondaryLabel: () => "",
+      storageViewRuntimeTertiaryLabel: () => "",
+      stateLabel: () => "",
+      applyHeatmapToTile() {},
+      getSmartSummaryEntry: () => null,
+      getSelectedProfile: () => ({ row_groups: [] }),
+      currentLayoutSlotCount: () => viewSlots.length,
+      activeLayoutRows: () => layoutRows,
+    });
+    const names = [...FUNCTIONS, "storageViewStripSlotLabel", "renderStorageViewGrid"];
+    vm.runInContext(`${names.map(functionSource).join("\n")}\nthis.__render = renderStorageViewGrid;`, sandbox);
+    const target = withClassList("div");
+    sandbox.__render(view, target);
+    const strips = [];
+    walk(target, (node) => {
+      if (String(node.className).split(/\s+/).includes(strip)) strips.push(node);
+    });
+    assert.equal(strips.length, 1, `${profile.faceVariant} draws one ${strip}`);
+    const labels = [...strips[0].innerHTML.matchAll(/data-column-label="([^"]*)"/g)].map((match) => match[1]);
+    assert.equal(labels[0], layoutRows.map((row) => String(row[0] + 1)).join(" / "), profile.faceVariant);
+    assert.doesNotMatch(labels.join(" "), /\b0\b/, "no live base-0 label reaches the saved view's strips");
+  }
+});

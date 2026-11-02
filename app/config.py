@@ -322,6 +322,10 @@ class EnclosureProfileConfig(BaseModel):
     # (`unifi-drive`) draws the touchscreen, ports, vents and print of each
     # model from it (#1068). None draws the family's plain face.
     face_variant: str | None = None
+    # A layout whose bay order has not been checked on real hardware (#1068):
+    # no slot hint or vendor slot number places a disk; only manual mappings
+    # do, as on a generic chassis. Copies of such a profile keep the flag.
+    manual_mapping_only: bool = False
 
     @field_validator("bay_size", mode="before")
     @classmethod

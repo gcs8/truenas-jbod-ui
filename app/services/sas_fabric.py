@@ -2717,6 +2717,10 @@ def _slot_location_number_candidates(slot: SlotView) -> list[int]:
     CAM target joins by identity there.
     """
     raw_status = slot.raw_status if isinstance(slot.raw_status, dict) else {}
+    if raw_status.get("manual_mapping_only") is True:
+        # A manual-only bay (#1068): its index is not a validated position, so
+        # it joins an MPR row by the mapped disk's identity only, never by place.
+        return []
     exact: list[int] = [slot.slot]
     parsed = _parse_mpr_slot_number(raw_status.get("slot_number"))
     if parsed is not None and parsed not in exact:

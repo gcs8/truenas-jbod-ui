@@ -28,6 +28,10 @@ how those entries differ.
 - `supermicro-fat-twin-rear-2`
 - `ubiquiti-unvr-front-4`
 - `ubiquiti-unvr-pro-front-7`
+- `ubiquiti-unvr-g2-front-4`
+- `ubiquiti-unvr-g2-pro-front-8`
+- `ubiquiti-envr-front-16`
+- `ubiquiti-envr-core-front-16`
 - `generic-front-24-1x24`
 - `generic-front-12-3x4`
 - `generic-top-60-4x15`
@@ -78,8 +82,12 @@ The fields used most often are:
 - `id`, `label`, `panel_title`, and `edge_label` for names
 - `rows`, `columns`, `slot_layout`, and `row_groups` for bay placement
 - `face_style`, `latch_edge`, and `bay_size` for appearance
-- `face_variant` for a model's own front inside a face family (`unvr` and
-  `unvr-pro` on `unifi-drive`); the decoration is never a bay
+- `face_variant` for a model's own front inside a face family (`unvr`,
+  `unvr-pro`, `unvr-g2`, `unvr-g2-pro`, `envr` and `envr-core` on
+  `unifi-drive`); the decoration is never a bay
+
+The UNVR-G2, UNVR-G2-Pro, ENVR and ENVR-Core profiles are layout only:
+bay-to-disk mapping is manual until validated on real hardware.
 - `slot_hints` for matching device or controller identifiers to bays
 - `slot_number_base` for zero-based or one-based displayed bay labels
 

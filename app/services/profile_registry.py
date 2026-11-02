@@ -21,6 +21,21 @@ SUPERMICRO_FATTWIN_FRONT_6_PROFILE_ID = "supermicro-fat-twin-front-6"
 SUPERMICRO_FATTWIN_REAR_2_PROFILE_ID = "supermicro-fat-twin-rear-2"
 UNIFI_UNVR_FRONT_4_PROFILE_ID = "ubiquiti-unvr-front-4"
 UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID = "ubiquiti-unvr-pro-front-7"
+UNIFI_UNVR_G2_FRONT_4_PROFILE_ID = "ubiquiti-unvr-g2-front-4"
+UNIFI_UNVR_G2_PRO_FRONT_8_PROFILE_ID = "ubiquiti-unvr-g2-pro-front-8"
+UNIFI_ENVR_FRONT_16_PROFILE_ID = "ubiquiti-envr-front-16"
+UNIFI_ENVR_CORE_FRONT_16_PROFILE_ID = "ubiquiti-envr-core-front-16"
+# UniFi models drawn from product renders whose bay order has not been checked
+# on real hardware (#1068). They carry the face, the layout and the chassis
+# numbers only: no slot hints and no automatic placement, so every disk is
+# assigned to a bay by hand, exactly like a generic chassis.
+UNIFI_LAYOUT_ONLY_PROFILE_IDS = frozenset({
+    UNIFI_UNVR_G2_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_G2_PRO_FRONT_8_PROFILE_ID,
+    UNIFI_ENVR_FRONT_16_PROFILE_ID,
+    UNIFI_ENVR_CORE_FRONT_16_PROFILE_ID,
+})
+UNIFI_LAYOUT_ONLY_NOTE = "Layout only: bay-to-disk mapping is manual until validated on real hardware."
 GENERIC_FRONT_24_1X24_PROFILE_ID = "generic-front-24-1x24"
 GENERIC_FRONT_12_3X4_PROFILE_ID = "generic-front-12-3x4"
 GENERIC_TOP_60_4X15_PROFILE_ID = "generic-top-60-4x15"
@@ -306,6 +321,98 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             slot_number_base=1,
         ),
         EnclosureProfileConfig(
+            id=UNIFI_UNVR_G2_FRONT_4_PROFILE_ID,
+            label="Ubiquiti UniFi UNVR-G2 Front 4",
+            eyebrow="Ubiquiti UniFi UNVR-G2",
+            summary=f"Front of the chassis, 4 bays, numbered 1-4 as printed on the chassis. {UNIFI_LAYOUT_ONLY_NOTE}",
+            panel_title="Front 4 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            face_variant="unvr-g2",
+            manual_mapping_only=True,
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=1,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2, 3],
+            ],
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
+            id=UNIFI_UNVR_G2_PRO_FRONT_8_PROFILE_ID,
+            label="Ubiquiti UniFi UNVR-G2-Pro Front 8",
+            eyebrow="Ubiquiti UniFi UNVR-G2-Pro",
+            summary=(
+                "Front of the chassis, 8 bays: 1-4 on the top row over 5-8, as the strip between the rows prints. "
+                f"{UNIFI_LAYOUT_ONLY_NOTE}"
+            ),
+            panel_title="Front 8 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            face_variant="unvr-g2-pro",
+            manual_mapping_only=True,
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=2,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+            ],
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
+            id=UNIFI_ENVR_FRONT_16_PROFILE_ID,
+            label="Ubiquiti UniFi Enterprise NVR Front 16",
+            eyebrow="Ubiquiti UniFi Enterprise NVR",
+            summary=(
+                "Front of the chassis, 16 bays in four rows: 1-4 on top down to 13-16, as the column strips print. "
+                f"{UNIFI_LAYOUT_ONLY_NOTE}"
+            ),
+            panel_title="Front 16 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            face_variant="envr",
+            manual_mapping_only=True,
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=4,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+                [8, 9, 10, 11],
+                [12, 13, 14, 15],
+            ],
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
+            id=UNIFI_ENVR_CORE_FRONT_16_PROFILE_ID,
+            label="Ubiquiti UniFi Enterprise NVR Core Front 16",
+            eyebrow="Ubiquiti UniFi Enterprise NVR Core",
+            summary=(
+                "Front of the chassis, 16 bays in four rows: 1-4 on top down to 13-16, as the column strips print. "
+                f"{UNIFI_LAYOUT_ONLY_NOTE}"
+            ),
+            panel_title="Front 16 Bay",
+            edge_label="Front of chassis",
+            face_style="unifi-drive",
+            face_variant="envr-core",
+            manual_mapping_only=True,
+            latch_edge="bottom",
+            bay_size="3.5",
+            rows=4,
+            columns=4,
+            slot_layout=[
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+                [8, 9, 10, 11],
+                [12, 13, 14, 15],
+            ],
+            slot_number_base=1,
+        ),
+        EnclosureProfileConfig(
             id=QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
             label="Supermicro SSG-2028R Shared Front 24",
             eyebrow="Supermicro SSG-2028R",
@@ -541,6 +648,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
         slot_number_base=profile.slot_number_base,
         face_variant=profile.face_variant,
+        manual_mapping_only=profile.manual_mapping_only,
     )
 
 

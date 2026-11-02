@@ -4427,6 +4427,163 @@ button.fabric-trace-crumb:hover {
   background: #f4f6f8;
 }
 
+/* UNVR-G2 family: rounded ends with darker metal edges, a narrow handle
+   block at each tray's right end carrying the status dot, perforated vents. */
+.chassis-shell[data-face-family="g2"] {
+  border-radius: 22px;
+  border: 0;
+  background:
+    linear-gradient(90deg, #7d858d 0, #b5bcc3 14px, rgba(0,0,0,0) 15px, rgba(0,0,0,0) calc(100% - 15px), #b5bcc3 calc(100% - 14px), #7d858d 100%),
+    linear-gradient(180deg, rgba(255,255,255,0.5), rgba(255,255,255,0) 6%),
+    linear-gradient(180deg, #e4e7ea, #d4d8dd 50%, #c8cdd2);
+  padding: 12px 26px 10px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile {
+  border-left-width: 2px;
+  padding-right: 58px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile::before {
+  right: 50px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile::after {
+  right: 56px;
+}
+
+/* The handle block: drawn on the tray's right end, the status dot sits in it. */
+.chassis-shell[data-face-family="g2"] .slot-latch {
+  display: block;
+  position: absolute;
+  inset: 4px 4px 4px auto;
+  width: 42px;
+  height: auto;
+  border-radius: 2px;
+  border: 1px solid rgba(29, 37, 44, 0.45);
+  background: linear-gradient(180deg, #e2e5e9, #c4cad1);
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.7);
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile.state-empty .slot-latch {
+  background: linear-gradient(180deg, #e2e5e9, #c4cad1);
+}
+
+.chassis-shell[data-face-family="g2"] .slot-status-led {
+  right: 21px;
+  z-index: 2;
+}
+
+.unifi-face-vent-perforated {
+  height: 4px;
+  border-radius: 0;
+  background: radial-gradient(circle, #1a1f25 0 1px, transparent 1.4px) 0 0 / 5px 4px repeat-x;
+  box-shadow: none;
+}
+
+.unifi-face-led-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3aa9f0;
+  box-shadow: 0 0 6px rgba(58, 169, 240, 0.8);
+}
+
+.unifi-face-row-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-height: 18px;
+  align-items: center;
+  border-top: 2px solid rgba(29, 37, 44, 0.55);
+  border-bottom: 2px solid rgba(29, 37, 44, 0.55);
+  color: var(--unifi-face-ink, #39434d);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  text-align: center;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Enterprise NVR family: 3U, rack handles on both ends, a top edge with the
+   LED bar, print, the per-column number strips, RESET and (ENVR only) the
+   bezel accessory port. */
+.chassis-shell[data-face-family="envr"] {
+  padding: 12px 10px 10px;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-grid {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 30px;
+  column-gap: 10px;
+  row-gap: 6px;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-grid > .slot-row,
+.chassis-shell[data-face-family="envr"] .slot-grid > .unifi-face-band {
+  grid-column: 2;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-tile {
+  height: 74px;
+  min-height: 74px;
+}
+
+.unifi-face-rack-handle {
+  grid-row: 1 / span 6;
+  align-self: stretch;
+  min-height: 120px;
+  border-radius: 6px;
+  border: 1px solid rgba(29, 37, 44, 0.35);
+  background:
+    linear-gradient(90deg, #9aa2aa, #e7eaed 30%, #f3f5f7 50%, #d4d9de 70%, #8f979f);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+.unifi-face-rack-handle-left {
+  grid-column: 1;
+}
+
+.unifi-face-rack-handle-right {
+  grid-column: 3;
+}
+
+.unifi-face-column-strips {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.unifi-face-column-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.unifi-face-column-strip .unifi-face-vent {
+  width: 100%;
+}
+
+.unifi-face-column-label {
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.unifi-face-accessory-port {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 18px;
+  border-radius: 4px;
+  background: linear-gradient(180deg, #3b434b, #1a1f25);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
 @media (max-width: 640px) {
   /* Bays keep a readable width on a phone; the face scrolls sideways, like
      the other chassis faces, instead of squeezing the tray labels. */
