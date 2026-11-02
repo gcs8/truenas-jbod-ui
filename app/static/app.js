@@ -396,8 +396,20 @@
     return lookup.byNumber.get(slotNumber) || null;
   }
 
+  // A bay prints the number the server labelled it with, so a profile whose
+  // chassis counts from 1 (slot_number_base, the UniFi NVRs in #1068) reads
+  // the same on every tab. A bay missing from the snapshot uses that base.
   function formatSlotLabel(slotNumber) {
-    return String(slotNumber).padStart(2, "0");
+    const number = Number(slotNumber);
+    if (!Number.isInteger(number)) {
+      return String(slotNumber).padStart(2, "0");
+    }
+    const label = String(getSlotById(number)?.slot_label ?? "");
+    if (/^\d+$/.test(label)) {
+      return label;
+    }
+    const base = Number(state.snapshot?.selected_profile?.slot_number_base);
+    return String(number + (Number.isInteger(base) ? base : 0)).padStart(2, "0");
   }
 
   function formatScopeLabel() {

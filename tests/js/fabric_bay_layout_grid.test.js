@@ -56,6 +56,7 @@ const LAYOUT_FUNCTIONS = [
 
 const RENDER_FUNCTIONS = [
   "escapeHtml",
+  "getSlotById",
   "formatSlotLabel",
   "sasFabricList",
   "sasFabricSortedSlots",

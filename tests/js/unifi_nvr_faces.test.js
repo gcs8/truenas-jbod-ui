@@ -286,3 +286,61 @@ test("UniFi variant faces drop the grey side plates and the striped vent window"
   );
   assert.match(STYLE_SOURCE, /\.unifi-face-decor \{[^}]*pointer-events: none;/);
 });
+
+const FABRIC_SOURCE = fs.readFileSync(path.join(ROOT, "app/static/sas_fabric_view.js"), "utf8");
+
+function sourceFunction(source, name) {
+  const saved = APP_SOURCE;
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `function ${name} must exist`);
+  // Reuse the comment-aware extractor on the other file by slicing from start.
+  const body = source.slice(start);
+  const end = (() => {
+    let depth = 0;
+    let quote = null;
+    let line = false;
+    let block = false;
+    for (let index = body.indexOf("{"); index < body.length; index += 1) {
+      const character = body[index];
+      const next = body[index + 1];
+      if (line) { line = character !== "\n"; continue; }
+      if (block) { if (character === "*" && next === "/") { block = false; index += 1; } continue; }
+      if (quote) { if (character === "\\") index += 1; else if (character === quote) quote = null; continue; }
+      if (character === "/" && next === "/") { line = true; index += 1; continue; }
+      if (character === "/" && next === "*") { block = true; index += 1; continue; }
+      if (character === "'" || character === '"' || character === "`") { quote = character; continue; }
+      if (character === "{") depth += 1;
+      else if (character === "}") { depth -= 1; if (depth === 0) return index + 1; }
+    }
+    return -1;
+  })();
+  assert.notEqual(end, -1, `${name} must close`);
+  void saved;
+  return body.slice(0, end);
+}
+
+// Codex P2 on #1069: Storage Fabric labelled bays from the zero-based index, so
+// on a UNVR Pro the Fabric chip "01" selected the disk the enclosure shows as 02.
+for (const [file, source, lookup] of [
+  ["app.js", APP_SOURCE, "getSlotById"],
+  ["sas_fabric_view.js", FABRIC_SOURCE, "slotByNumber"],
+]) {
+  test(`${file} bay labels follow the chassis numbering the bays show`, () => {
+    const slots = new Map([[0, { slot: 0, slot_label: "01" }], [6, { slot: 6, slot_label: "07" }], [9, { slot: 9, slot_label: "Disk 10" }]]);
+    const make = (profile) => {
+      const sandbox = vm.createContext({
+        state: { snapshot: { selected_profile: profile } },
+        [lookup]: (slotNumber) => slots.get(slotNumber) || null,
+      });
+      vm.runInContext(`${sourceFunction(source, "formatSlotLabel")}\nthis.__f = formatSlotLabel;`, sandbox);
+      return sandbox.__f;
+    };
+    const unvrPro = make({ slot_number_base: 1 });
+    assert.equal(unvrPro(0), "01", "a known bay uses its own label");
+    assert.equal(unvrPro(6), "07");
+    assert.equal(unvrPro(3), "04", "a bay without a snapshot row uses the profile base");
+    assert.equal(unvrPro(9), "10", "a non-numeric label falls back to the base, never leaks text");
+    const plain = make(null);
+    assert.equal(plain(3), "03", "profiles without a base keep zero-based labels");
+  });
+}

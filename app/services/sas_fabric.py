@@ -563,7 +563,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             SasFabricNode(
                 id=bay_id,
                 kind="bay",
-                label=f"Bay {slot.slot:02d}",
+                label=f"Bay {_bay_label(slot)}",
                 slot=slot.slot,
                 status=slot.state.value if hasattr(slot.state, "value") else str(slot.state),
                 related_slots=[slot.slot],
@@ -672,7 +672,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         )
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
-            label=f"Bay {slot.slot:02d}",
+            label=f"Bay {_bay_label(slot)}",
             kind="bay",
             node_ids=_dedupe_strings(bay_related_nodes),
             link_ids=_dedupe_strings(bay_related_links),
@@ -1016,7 +1016,7 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
             SasFabricNode(
                 id=bay_id,
                 kind="bay",
-                label=f"Bay {slot.slot:02d}",
+                label=f"Bay {_bay_label(slot)}",
                 slot=slot.slot,
                 status=slot.state.value if hasattr(slot.state, "value") else str(slot.state),
                 related_slots=[slot.slot],
@@ -1081,7 +1081,7 @@ def _build_linux_ses_fabric_snapshot(context: SasFabricBuildContext) -> SasFabri
         )
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
-            label=f"Bay {slot.slot:02d}",
+            label=f"Bay {_bay_label(slot)}",
             kind="bay",
             node_ids=_dedupe_strings(bay_related_nodes),
             link_ids=_dedupe_strings(bay_related_links),
@@ -1383,7 +1383,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
             SasFabricNode(
                 id=bay_id,
                 kind="bay",
-                label=f"Bay {slot.slot:02d}",
+                label=f"Bay {_bay_label(slot)}",
                 slot=slot.slot,
                 status=_slot_state_text(slot),
                 related_slots=slot_numbers,
@@ -1438,7 +1438,7 @@ def _build_platform_storage_fabric_snapshot(context: SasFabricBuildContext) -> S
 
         traces[bay_id] = SasFabricTrace(
             id=bay_id,
-            label=f"Bay {slot.slot:02d}",
+            label=f"Bay {_bay_label(slot)}",
             kind="bay",
             node_ids=_dedupe_strings(bay_related_nodes),
             link_ids=_dedupe_strings(bay_related_links),
@@ -3206,7 +3206,18 @@ def _slot_has_disk(slot: SlotView) -> bool:
     return False
 
 
+def _bay_label(slot: SlotView) -> str:
+    """The bay number the chassis prints, as the enclosure view shows it.
+
+    A profile with slot_number_base (the UniFi NVRs, #1068) labels slot index 0
+    "01"; the graph uses that label so a bay reads the same on every tab.
+    """
+    label = str(slot.slot_label or "").strip()
+    return label if label.isdigit() else f"{slot.slot:02d}"
+
+
 def _backplane_zones_for_slots(slots: list[SlotView]) -> dict[int, dict[str, Any]]:
+    labels = {slot.slot: _bay_label(slot) for slot in slots if isinstance(slot.slot, int)}
     slot_numbers = _snapshot_slot_numbers(slots)
     if not slot_numbers:
         return {}
@@ -3225,7 +3236,8 @@ def _backplane_zones_for_slots(slots: list[SlotView]) -> dict[int, dict[str, Any
             "index": zone_index,
             "label": f"Backplane Zone {zone_index + 1}",
             "slots": zone_slots,
-            "range": f"Bays {zone_slots[0]:02d}-{zone_slots[-1]:02d}",
+            "range": f"Bays {labels.get(zone_slots[0], f'{zone_slots[0]:02d}')}-"
+            f"{labels.get(zone_slots[-1], f'{zone_slots[-1]:02d}')}",
         }
         for slot in zone_slots:
             zones_by_slot[slot] = zone
