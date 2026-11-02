@@ -251,6 +251,7 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_ssh_session_reuse",
+            "tests.test_truenas_middleware_limits",
             "tests.test_truenas_ws",
             "tests.test_truenas_ws_jsonrpc",
         ),

@@ -21,7 +21,13 @@ from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from app import __version__
-from app.config import Settings, StorageViewConfig, SystemConfig, normalize_value_text
+from app.config import (
+    Settings,
+    StorageViewConfig,
+    SystemConfig,
+    effective_max_concurrent_calls,
+    normalize_value_text,
+)
 from app.models.domain import (
     CacheState,
     DiskInventorySyncMode,
@@ -152,6 +158,7 @@ from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
+    TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
@@ -4915,6 +4922,14 @@ class InventoryService:
                     certificate_message = f"{api_label} certificate check failed: {certificate_failure}."
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=certificate_message)
                     warnings.append(certificate_message)
+                elif isinstance(exc, TrueNASAPIBusyError):
+                    # #1072: the appliance answered but is out of capacity, or
+                    # the app is backing off after it was. Not "unreachable".
+                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                    warnings.append(
+                        f"{api_label} is busy; the app is backing off before asking again. "
+                        "Slot details may be partial until it answers."
+                    )
                 else:
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
                     warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
@@ -6818,7 +6833,11 @@ class InventoryService:
                 # budget, while two grids cannot deadlock holding partial budgets.
                 async with self._core_grid_reservation_lock:
                     try:
-                        for _ in range(min(width, len(selected))):
+                        # #1072: the appliance's call limit already caps the
+                        # batch width; reserving more service permits than it
+                        # will ever use would only starve drawers.
+                        appliance_limit = effective_max_concurrent_calls(self.system.truenas)
+                        for _ in range(min(width, len(selected), appliance_limit)):
                             await self._smart_operation_semaphore.acquire()
                             permits += 1
                         try:

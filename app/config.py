@@ -187,6 +187,16 @@ class PerfConfig(BaseModel):
 TRUENAS_API_VERSION_PATTERN = re.compile(r"(current|v\d+\.\d+\.\d+)")
 
 
+# #1072: TrueNAS middleware admits this many concurrent calls per connection
+# before queueing (CORE 13 and SCALE: SoftHardSemaphore(10, 20)).
+TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT = 10
+# CORE 13 stalled its own internal alert checks during read bursts well below
+# that limit, so the app keeps to fewer than half of it on CORE. SCALE's
+# middleware has more worker capacity; it still stays under the soft limit.
+CORE_DEFAULT_MAX_CONCURRENT_CALLS = 4
+SCALE_DEFAULT_MAX_CONCURRENT_CALLS = 8
+
+
 class TrueNASConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
@@ -208,6 +218,23 @@ class TrueNASConfig(BaseModel):
     tls_server_name: str | None = None
     timeout_seconds: int = 15
     enclosure_filter: str | None = None
+    # #1072: the most middleware calls this app keeps in flight against one
+    # appliance at once, shared by inventory refreshes, SMART grids, slot
+    # drawers, LED actions and QA runs. Unset picks a per-platform default
+    # (see effective_max_concurrent_calls). The TrueNAS middleware admits 10
+    # concurrent calls per connection and rejects calls past 20
+    # (SoftHardSemaphore(10, 20)), and its own internal alert checks share the
+    # same middleware process, so the ceiling stays at that soft limit.
+    max_concurrent_calls: int | None = Field(
+        default=None, ge=1, le=TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT,
+    )
+
+    @field_validator("max_concurrent_calls", mode="before")
+    @classmethod
+    def _validate_max_concurrent_calls(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("max_concurrent_calls must be a whole number")
+        return value
 
     @field_validator("api_version", mode="after")
     @classmethod
@@ -215,6 +242,15 @@ class TrueNASConfig(BaseModel):
         if not TRUENAS_API_VERSION_PATTERN.fullmatch(value):
             raise ValueError('api_version must be "current" or a pinned version such as "v25.10.0"')
         return value
+
+
+def effective_max_concurrent_calls(config: TrueNASConfig) -> int:
+    """The per-appliance middleware call limit for ``config``."""
+    if config.max_concurrent_calls is not None:
+        return config.max_concurrent_calls
+    if config.platform == "scale":
+        return SCALE_DEFAULT_MAX_CONCURRENT_CALLS
+    return CORE_DEFAULT_MAX_CONCURRENT_CALLS
 
 
 class HANodeConfig(BaseModel):
@@ -625,6 +661,7 @@ ENV_OVERRIDES: dict[str, tuple[str, ...]] = {
     "TRUENAS_TLS_SERVER_NAME": ("truenas", "tls_server_name"),
     "TRUENAS_TIMEOUT": ("truenas", "timeout_seconds"),
     "TRUENAS_ENCLOSURE_FILTER": ("truenas", "enclosure_filter"),
+    "TRUENAS_MAX_CONCURRENT_CALLS": ("truenas", "max_concurrent_calls"),
     "SSH_ENABLED": ("ssh", "enabled"),
     "SSH_HOST": ("ssh", "host"),
     "SSH_EXTRA_HOSTS_JSON": ("ssh", "extra_hosts"),
