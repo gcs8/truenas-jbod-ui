@@ -55,13 +55,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `max_concurrent_calls` (`TRUENAS_MAX_CONCURRENT_CALLS`, default 4 on CORE and
   8 on SCALE, at most 10), across refreshes, SMART grids, drawers and LED
   actions. A busy reply or a timed-out inventory read starts a jittered
-  backoff, and the API source shows as busy instead of unreachable (#PRNUM).
+  backoff, and the API source shows as busy instead of unreachable (#1076, refs #1072).
 
 ### Fixed
 
 - Closed TrueNAS middleware connections only after an interrupted login
   answers, within one call timeout, so a timed-out or cancelled read no longer
-  leaves a stale API session on the appliance (#PRNUM).
+  leaves a stale API session on the appliance (#1076, refs #1072).
 - Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
   not used" where a platform has no API and names the QuantaStor or ESXi API
   where it has one, SSH shows "partial" when only optional reads failed and
