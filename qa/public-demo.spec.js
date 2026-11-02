@@ -130,11 +130,12 @@ test("public demo static artifact is explorable without a live backend", async (
   await expect(page.locator("#system-setup-button")).toHaveCount(0);
   await expect(page.locator("#export-snapshot-button")).toHaveCount(0);
   await expect(selector.locator("option:checked")).toContainText("Saved copy · Demo 60-Bay Top Loader");
-  // The demo has no API (`sources.api.enabled` is false), so a current-source
-  // build says so (#1066); checked-in bytes built before that keep "OK".
-  const currentSourceDemo = path.resolve(demoPath) !== path.resolve(path.join(repoRoot, "public-demo", "index.html"));
+  // The demo has no API (`sources.api.enabled` is false). An artifact built
+  // with the platform-aware chip (#1066) says so; one built before keeps "OK".
+  // Read which renderer the artifact carries, not where it is stored.
+  const platformAwareChip = fs.readFileSync(demoPath, "utf8").includes("function apiStatusChipState(");
   await expect(page.locator("#api-status-chip")).toHaveText(
-    currentSourceDemo ? "TrueNAS API: not used at capture" : "TrueNAS API: OK at capture"
+    platformAwareChip ? "TrueNAS API: not used at capture" : "TrueNAS API: OK at capture"
   );
   await expect(page.locator("#ssh-status-chip")).toHaveText("SSH: off at capture");
   await expect(page.locator("#history-status-chip")).toHaveText("History: included");
