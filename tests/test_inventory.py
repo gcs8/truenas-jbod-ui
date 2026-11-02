@@ -7362,12 +7362,12 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             disk = MagicMock()
             disks_by_key = {"sda": disk, "sanitized-key": disk}
             disks_by_slot = {("enc", 0): disk, (None, 0): disk}
-            disks_by_sas = {"500a0b1c2d3e4f50": disk}
+            disks_by_sas = {"5abc": disk}
             raw = {
                 "device_names": ["sda"],
                 "device_hint": "sda",
                 "serial_hint": "sanitized-key",
-                "sas_address_hint": "500a0b1c2d3e4f50",
+                "sas_address_hint": "5abc",
             }
             ssh_data = ParsedSSHData(ses_slot_to_device={0: "sda"})
             automatic = service._resolve_disk_for_slot(0, "enc", None, disks_by_key, disks_by_slot, disks_by_sas, raw, ssh_data)
