@@ -190,7 +190,7 @@ class UpgradeNoticeServiceTests(unittest.TestCase):
                 with self.worker(retry):
                     pass
                 self.assertEqual(path.read_bytes(), b'{\n  "last_seen_version": "0.23.0"\n}\n')
-                self.assertFalse(path.with_suffix(".tmp").exists())
+                self.assertEqual(list(path.parent.glob(f"{path.name}.*.tmp")), [])
 
     def test_repeat_reads_and_idempotent_dismissal_preserve_json_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

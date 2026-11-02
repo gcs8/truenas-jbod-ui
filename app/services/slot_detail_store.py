@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator
 
 from app.models.domain import utcnow
+from app.services.atomic_write import write_atomically
 
 # Mapping-owned state that caches written before #909 stored beside the disk's
 # hardware facts. It belongs to the mapping store and the live inventory, so a
@@ -197,13 +198,12 @@ class SlotDetailStore:
             "updated_at": utcnow().isoformat(),
             "slot_details": {key: value.model_dump(mode="json") for key, value in entries.items()},
         }
-        temp_path = self.file_path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
         # The store lock still owns the reload/merge/write. A caller's generation
         # guard serializes just publication with invalidation, not JSON I/O.
-        with commit_guard() if commit_guard is not None else nullcontext(True) as valid:
-            if valid:
-                temp_path.replace(self.file_path)
-                return
-        temp_path.unlink()
+        # Separate store instances share no lock, so each write stages into its
+        # own temporary file rather than one fixed ``.tmp`` sibling (#1063).
+        write_atomically(
+            self.file_path,
+            lambda handle: json.dump(payload, handle, indent=2, sort_keys=True),
+            commit_guard=commit_guard,
+        )

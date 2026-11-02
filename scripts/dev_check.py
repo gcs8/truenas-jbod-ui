@@ -216,6 +216,7 @@ WINDOWS_EXCLUSIONS = (
         ),
         modules=(
             "tests.test_account_bootstrap",
+            "tests.test_atomic_write",
             "tests.test_backup_archive_lifecycle",
             "tests.test_backup_archive_transport",
             "tests.test_ci_contract",
