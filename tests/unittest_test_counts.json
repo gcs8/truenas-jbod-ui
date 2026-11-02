@@ -113,7 +113,7 @@
     "test_system_backup": 281,
     "test_system_setup_api_dialect": 17,
     "test_tls_trust": 30,
-    "test_truenas_middleware_limits": 22,
+    "test_truenas_middleware_limits": 25,
     "test_truenas_ws": 66,
     "test_truenas_ws_jsonrpc": 52,
     "test_ui_health_and_admin_probe": 79,

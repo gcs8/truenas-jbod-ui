@@ -175,22 +175,35 @@ class MiddlewareCallLimiter:
                 self.active += 1
                 waiter.set_result(None)
 
-    @asynccontextmanager
-    async def slot(self):
+    def note_outcome(self, exc: BaseException | None) -> None:
+        """Record a finished call: busy replies back off, answers reset."""
+        if exc is None:
+            self.note_success()
+        elif isinstance(exc, TrueNASAPIBusyError) and not isinstance(exc, _LimiterBusyError):
+            self.note_busy()
+
+    async def admit(self) -> None:
+        """Take one slot, failing fast while backing off. Pair with `_release`."""
         self.check_open()
         await self._acquire()
         try:
             # A busy reply may have arrived while this call was queued.
             self.check_open()
-            yield
-        except _LimiterBusyError:
+        except BaseException:
+            self._release()
             raise
-        except TrueNASAPIBusyError:
+
+    @asynccontextmanager
+    async def slot(self):
+        await self.admit()
+        try:
+            yield
+        except BaseException as exc:
             # Record it before releasing, so the next queued call sees it.
-            self.note_busy()
+            self.note_outcome(exc)
             raise
         else:
-            self.note_success()
+            self.note_outcome(None)
         finally:
             self._release()
 
@@ -278,6 +291,10 @@ class _MiddlewareCallDispatcher:
         self.ws = ws
         self._limiter = limiter
         self._pending: dict[Any, tuple[str, asyncio.Future[Any]]] = {}
+        # Calls the client stopped waiting for after sending them. The
+        # middleware keeps running them, so each keeps its limiter slot until
+        # its reply arrives or this connection closes (#1072).
+        self._orphaned: set[Any] = set()
         self._reader_task = asyncio.create_task(self._reader())
 
     def _next_request_id(self) -> Any:
@@ -299,20 +316,37 @@ class _MiddlewareCallDispatcher:
         ``timeout`` is read after admission, so time spent queued behind other
         calls to the same appliance does not count against this call's reply.
         """
-        if self._limiter is None:
-            return await self._call_with_timeout(method, params, timeout)
-        async with self._limiter.slot():
-            return await self._call_with_timeout(method, params, timeout)
+        limiter = self._limiter
+        if limiter is not None:
+            await limiter.admit()
+        sent: list[Any] = []
+        try:
+            if timeout is None:
+                result = await self._call(method, params, sent)
+            else:
+                async with asyncio.timeout(timeout()):
+                    result = await self._call(method, params, sent)
+        except BaseException as exc:
+            if limiter is not None:
+                limiter.note_outcome(exc)
+                if sent and isinstance(exc, (TimeoutError, asyncio.CancelledError)):
+                    # Sent but unanswered: still running on the appliance.
+                    self._orphaned.add(sent[0])
+                else:
+                    limiter._release()
+            raise
+        if limiter is not None:
+            limiter.note_outcome(None)
+            limiter._release()
+        return result
 
-    async def _call_with_timeout(
-        self, method: str, params: list[Any], timeout: Callable[[], float] | None,
-    ) -> Any:
-        if timeout is None:
-            return await self._call(method, params)
-        async with asyncio.timeout(timeout()):
-            return await self._call(method, params)
+    def _release_orphan(self, request_id: Any) -> None:
+        if request_id in self._orphaned:
+            self._orphaned.discard(request_id)
+            assert self._limiter is not None
+            self._limiter._release()
 
-    async def _call(self, method: str, params: list[Any]) -> Any:
+    async def _call(self, method: str, params: list[Any], sent: list[Any] | None = None) -> Any:
         request_id = self._next_request_id()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
@@ -320,6 +354,10 @@ class _MiddlewareCallDispatcher:
         payload = self._build_payload(request_id, method, params)
         logger.debug("Calling TrueNAS websocket method %s", method)
         try:
+            if sent is not None:
+                # Counted as sent from the first byte: a cancelled send may
+                # still have delivered the request.
+                sent.append(request_id)
             await self.ws.send(json.dumps(payload))
             return await future
         finally:
@@ -332,6 +370,9 @@ class _MiddlewareCallDispatcher:
                 future.exception()
 
     async def close(self) -> None:
+        # Once the connection closes no orphaned reply can arrive here.
+        for request_id in list(self._orphaned):
+            self._release_orphan(request_id)
         if not self._reader_task.done():
             self._reader_task.cancel()
         try:
@@ -357,6 +398,7 @@ class _MiddlewareCallDispatcher:
         request_id = message.get("id")
         if not isinstance(request_id, str):
             return
+        self._release_orphan(request_id)
         pending = self._pending.get(request_id)
         if pending is None:
             return
@@ -417,6 +459,7 @@ class _JsonRpcCallDispatcher(_MiddlewareCallDispatcher):
         request_id = message.get("id")
         if not isinstance(request_id, int) or isinstance(request_id, bool):
             return
+        self._release_orphan(request_id)
         pending = self._pending.get(request_id)
         if pending is None:
             return
@@ -760,10 +803,13 @@ class TrueNASWebsocketClient:
                     results[position] = expired
                     continue
                 try:
-                    result = await dispatcher.call(
-                        "disk.smartctl", [disk, args],
-                        timeout=lambda: min(self.config.timeout_seconds, max(phase_deadline - loop.time(), 0.001)),
-                    )
+                    # Waiting for a limiter slot is bounded by the phase too:
+                    # timed-out calls keep their slots until they answer.
+                    async with asyncio.timeout(remaining):
+                        result = await dispatcher.call(
+                            "disk.smartctl", [disk, args],
+                            timeout=lambda: min(self.config.timeout_seconds, max(phase_deadline - loop.time(), 0.001)),
+                        )
                 except TrueNASAPIError as exc:
                     if self.config.platform == "scale" and "ENOMETHOD" in str(exc):
                         # Not about this disk: the method is absent, so nothing
@@ -884,8 +930,7 @@ class TrueNASWebsocketClient:
         a pending login's reply, within a bounded grace, before it closes.
         """
         limiter = self.call_limiter
-        limiter.check_open()
-        await limiter._acquire()
+        await limiter.admit()
         login.holds_slot = True
         login.limiter = limiter
         method = "auth.login_with_api_key"
@@ -896,8 +941,16 @@ class TrueNASWebsocketClient:
         login.sending = False
         # Only a login the appliance has received can complete after close.
         login.request_id = request_id
-        result = await self._await_reply(ws, method, request_id, login=login)
+        try:
+            result = await self._await_reply(ws, method, request_id, login=login)
+        except TrueNASAPIBusyError as exc:
+            # Back off before the slot is released, like any other call.
+            limiter.note_outcome(exc)
+            login.request_id = None
+            raise
         login.request_id = None
+        # A login answer alone does not end a backoff: only a method answer
+        # shows the appliance has capacity again.
         login.release()
         return result
 

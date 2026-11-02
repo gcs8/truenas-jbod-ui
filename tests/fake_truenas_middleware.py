@@ -46,6 +46,8 @@ class FakeMiddleware:
         self.call_delay = 0.0
         # When set, every non-login call answers with the busy error.
         self.busy = False
+        # When set, logins answer with the busy error too.
+        self.busy_login = False
         # Cleared: logins wait. ``login_delay`` adds a fixed wait afterwards.
         self.login_gate = asyncio.Event()
         self.login_gate.set()
@@ -151,6 +153,9 @@ class FakeMiddleware:
                 await self.login_gate.wait()
                 if self.login_delay:
                     await asyncio.sleep(self.login_delay)
+                if self.busy_login:
+                    await self._reply(ws, message, jsonrpc, error=JSONRPC_BUSY_ERROR if jsonrpc else DDP_BUSY_ERROR)
+                    return
                 ok = message["params"] == [API_KEY]
                 if ok:
                     self.logins_completed += 1

@@ -93,7 +93,50 @@ class ConcurrencyLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(fake.peak_inflight, 2)
 
 
+class TimedOutCallPermitTests(unittest.IsolatedAsyncioTestCase):
+    """A call the client stopped waiting for is still running on the appliance."""
+
+    async def test_timed_out_batch_calls_keep_their_permits(self) -> None:
+        async with FakeMiddleware() as fake:
+            client = make_client(fake, limit=2, timeout=0.1)
+            fake.hang_methods = {"disk.smartctl"}
+            results = await asyncio.wait_for(
+                client.smartctl_batch([f"da{index}" for index in range(6)], max_concurrency=2,
+                                      return_exceptions=True), 10,
+            )
+            await wait_for_closes(fake)
+        self.assertTrue(all(isinstance(item, TimeoutError) for item in results), results)
+        # Replacement calls must not pile up behind unanswered ones.
+        self.assertLessEqual(fake.peak_inflight, 2)
+        self.assertEqual(client.call_limiter.active, 0)
+
+    async def test_timed_out_drawer_call_keeps_its_permit_until_close(self) -> None:
+        async with FakeMiddleware() as fake:
+            client = make_client(fake, limit=1, timeout=0.1)
+            fake.hang_methods = {"disk.smartctl"}
+            with self.assertRaises(TimeoutError):
+                await client.fetch_disk_smartctl("da0")
+            await wait_for_closes(fake)
+        self.assertEqual(client.call_limiter.active, 0)
+        self.assertEqual(fake.closes, fake.connections)
+
+
 class BusyBackoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_busy_login_backs_off(self) -> None:
+        for dialect, platform in (("ddp", "core"), ("jsonrpc", "scale")):
+            with self.subTest(dialect=dialect):
+                async with FakeMiddleware() as fake:
+                    client = make_client(fake, dialect=dialect, platform=platform)
+                    client.call_limiter.clock = FakeClock()
+                    fake.busy_login = True
+                    for _ in range(5):
+                        with self.assertRaises(TrueNASAPIBusyError):
+                            await client.fetch_disk_smartctl("da0")
+                    await wait_for_closes(fake)
+                self.assertEqual((fake.connections, fake.logins_started), (1, 1))
+                self.assertGreater(client.call_limiter.cooldown_remaining(), 0)
+                self.assertEqual(client.call_limiter.active, 0)
+
     async def test_repeated_calls_to_a_busy_appliance_do_not_storm_it(self) -> None:
         async with FakeMiddleware() as fake:
             client = make_client(fake)
