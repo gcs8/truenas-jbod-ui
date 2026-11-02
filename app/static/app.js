@@ -2164,6 +2164,7 @@
     const matches = [];
     for (const slot of slots) {
       if (slot?.snapshot_slot !== bayNumber) continue;
+      if (storageViewSlotIsManualOnly(slot)) return null;
       // Only snapshot-produced rows have view-level enclosure provenance.
       // Never borrow that identity for an inventory candidate lacking metadata.
       const slotEnclosureId = slot.snapshot_enclosure_id ?? (
@@ -3853,8 +3854,20 @@
     return Boolean(slotEnclosureId) && Boolean(enclosureId) && slotEnclosureId === enclosureId;
   }
 
+  // A chassis view drawn with a layout whose bay order is unvalidated (#1068)
+  // names a disk only from a saved manual mapping, sent on the view slot. Its
+  // bays never borrow the live bay at the same index, whatever the payload says.
+  function storageViewSlotIsManualOnly(slot) {
+    return slot?.manual_mapping_only === true;
+  }
+
   function getLiveBackedStorageViewSlot(view, slot) {
-    if (!isLiveStyledStorageView(view) || !slot || !Number.isInteger(slot.snapshot_slot)) {
+    if (
+      !isLiveStyledStorageView(view)
+      || !slot
+      || storageViewSlotIsManualOnly(slot)
+      || !Number.isInteger(slot.snapshot_slot)
+    ) {
       return null;
     }
     // getSlotById reads the rendered snapshot, so the bay must belong to it.
@@ -4120,7 +4133,7 @@
 
   function getStorageViewSmartCacheKey(view, slot) {
     if (!smartSnapshotMatchesSelection()) return null;
-    if (Number.isInteger(slot.snapshot_slot)
+    if (Number.isInteger(slot.snapshot_slot) && !storageViewSlotIsManualOnly(slot)
       && (!view.backing_enclosure_id || view.backing_enclosure_id === state.snapshot.selected_enclosure_id)) {
       const liveSlot = getSlotById(slot.snapshot_slot);
       if (!savedSmartIdentityMatchesLive(slot, liveSlot)) return null;
@@ -4135,7 +4148,7 @@
       return null;
     }
     const liveEnclosureId = view.backing_enclosure_id || currentLiveEnclosureId();
-    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot)
+    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot) && !storageViewSlotIsManualOnly(slot)
       && storageViewSlotBayInEnclosure(slot, liveEnclosureId);
     return {
       slot: usesLiveSlotHistory ? slot.snapshot_slot : slot.slot_index,
@@ -10082,6 +10095,7 @@
       import: "imported assignment",
       modeled: "modeled layout",
       inventory_candidate: "inventory match",
+      manual_mapping: "saved assignment",
       snapshot_slot: "saved snapshot",
       scale_sg_ses: "SSH (SES)",
       "live-derived-core-demo": "demo data",

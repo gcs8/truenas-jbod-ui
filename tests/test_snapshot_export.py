@@ -2046,6 +2046,62 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((front_history["enclosure_id"], front_history["slot"]), ("front", 3))
         self.assertNotIn("archive-core|storage-view:boot-doms|1", rendered.history_cache)
 
+    async def test_offline_export_of_a_layout_only_view_carries_no_automatic_identity(self) -> None:
+        # Codex security P2 on #1070: the export embeds the same runtime the
+        # page draws. A view pinned to a layout-only profile over a live
+        # enclosure using another profile carries no device, serial or bay
+        # link copied from the live slot at the same index.
+        from app.config import StorageViewConfig
+        from app.services.inventory import InventoryService
+        from app.services.mapping_store import MappingStore
+        from app.services.profile_registry import ProfileRegistry, UNIFI_LAYOUT_ONLY_PROFILE_IDS
+        from app.services.slot_detail_store import SlotDetailStore
+
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = SystemConfig(id="archive-core", label="Archive CORE", truenas=TrueNASConfig(platform="core"))
+                settings = Settings(systems=[system])
+                service = InventoryService(
+                    settings, system, AsyncMock(), AsyncMock(), None,
+                    MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
+                    ProfileRegistry(settings),
+                    SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
+                )
+                snapshot = build_snapshot()
+                view = StorageViewConfig(
+                    id="pinned-nvr", label="Pinned NVR", kind="ses_enclosure",
+                    template_id="ses-auto", profile_id=profile_id,
+                )
+                runtime = StorageViewRuntimePayload(
+                    system_id=system.id,
+                    views=[service._build_ses_storage_view_runtime(view, snapshot)],
+                )
+                exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)
+                rendered = await exporter.build_enclosure_snapshot_html(
+                    request=build_request(),
+                    snapshot=snapshot,
+                    smart_summary_cache=build_smart_summary_cache(),
+                    storage_view_runtime=runtime,
+                    storage_view_smart_summary_cache={},
+                    selected_slot=None,
+                    selected_storage_view_id="pinned-nvr",
+                    history_window_hours=24,
+                    history_panel_open=False,
+                    io_chart_mode="total",
+                )
+                marker = "storageViewsRuntime: "
+                offset = rendered.html.index(marker) + len(marker)
+                embedded = json.JSONDecoder().raw_decode(rendered.html[offset:])[0]
+                exported = next(item for item in embedded["views"] if item["label"] == "Pinned NVR")
+                for slot in exported["slots"]:
+                    self.assertEqual(
+                        (slot["occupied"], slot["device_name"], slot["serial"], slot["snapshot_slot"]),
+                        (False, None, None, None),
+                    )
+                    self.assertTrue(slot["manual_mapping_only"])
+                self.assertEqual(exported["matched_count"], 0)
+                self.assertNotIn("ABC123456", json.dumps(exported))
+
     def test_request_sanitizes_selected_storage_view_id(self) -> None:
         payload = SnapshotExportRequest(selected_storage_view_id="  boot-doms  ")
 

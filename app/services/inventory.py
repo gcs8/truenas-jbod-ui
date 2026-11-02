@@ -936,6 +936,85 @@ def _manual_only_slot_status(
     return stripped
 
 
+@dataclass(frozen=True)
+class _ManualOnlyStorageViewSlots:
+    """Bays of a saved chassis view drawn with a manual-only layout (#1068).
+
+    The live enclosure's slot order says nothing about such a layout's bays,
+    so a bay is never linked to the live bay at the same index. It names a disk
+    only when a saved manual mapping for that bay does; the disk's own details
+    then come from the live slot holding that disk, found by the mapping's
+    serial, persistent ID or device name. Bay-scoped evidence (SAS address,
+    attached address, the live bay number, its light) is never copied.
+    """
+
+    mappings: dict[int, ManualMapping]
+    live_slots_by_key: dict[str, SlotView]
+
+    def runtime_slot(self, slot_value: int, label: str, slot_size: str | None) -> StorageViewRuntimeSlot:
+        mapping = self.mappings.get(slot_value)
+        common = {
+            "slot_index": slot_value,
+            "slot_label": label,
+            "manual_mapping_only": True,
+            "led_supported": False,
+            "slot_size": slot_size,
+        }
+        if mapping is None:
+            return StorageViewRuntimeSlot(
+                **common, occupied=False, state="unknown", source="placeholder",
+                placement_key="assigned by hand only",
+            )
+        live = next(
+            (
+                self.live_slots_by_key[key]
+                for candidate in (mapping.serial, mapping.gptid, mapping.device_name)
+                for key in normalize_lookup_keys(candidate)
+                if key in self.live_slots_by_key
+            ),
+            None,
+        )
+        if live is None:
+            return StorageViewRuntimeSlot(
+                **common, occupied=False, state=SlotState.unmapped.value, source="manual_mapping",
+                match_reasons=["saved bay assignment"], placement_key="saved bay assignment",
+                device_name=mapping.device_name, serial=mapping.serial, gptid=mapping.gptid,
+                description=mapping.notes,
+            )
+        return StorageViewRuntimeSlot(
+            **common,
+            occupied=True,
+            state=(
+                SlotState.fault.value
+                if live.state == SlotState.fault or InventoryService._health_is_bad(live.health)
+                else SlotState.healthy.value
+            ),
+            source="manual_mapping",
+            match_reasons=["saved bay assignment"],
+            placement_key="saved bay assignment",
+            device_name=live.device_name,
+            smart_device_names=list(live.smart_device_names),
+            smart_device_type=live.smart_device_type,
+            serial=live.serial,
+            pool_name=live.pool_name,
+            vdev_name=live.vdev_name,
+            model=live.model,
+            size_bytes=live.size_bytes,
+            size_human=live.size_human,
+            gptid=live.gptid,
+            persistent_id_label=live.persistent_id_label,
+            health=live.health,
+            temperature_c=live.temperature_c,
+            last_smart_test_type=live.last_smart_test_type,
+            last_smart_test_status=live.last_smart_test_status,
+            last_smart_test_lifetime_hours=live.last_smart_test_lifetime_hours,
+            logical_block_size=live.logical_block_size,
+            physical_block_size=live.physical_block_size,
+            logical_unit_id=live.logical_unit_id,
+            description=mapping.notes,
+        )
+
+
 def _warn_unmatched_mapping(
     warnings: list[str],
     mapping: ManualMapping | None,
@@ -3432,6 +3511,46 @@ class InventoryService:
                     claimed_candidate_ids.add(candidate_key)
         return runtime_views
 
+    def _manual_only_storage_view_slots(
+        self,
+        view_profile: EnclosureProfileView | None,
+        snapshot: InventorySnapshot,
+    ) -> _ManualOnlyStorageViewSlots | None:
+        """The one gate for a chassis view drawn with a manual-only layout.
+
+        None when the view may follow the live bays: its layout is validated
+        (UNVR, UNVR Pro and every other automatic profile), or it is the same
+        manual-only profile the live enclosure was built with, whose bays the
+        correlators already filled from saved manual mappings alone. Otherwise
+        the view's bays are built from saved manual mappings only.
+        """
+        if not _profile_is_manual_only(view_profile):
+            return None
+        live_profile = snapshot.selected_profile
+        if live_profile is not None and live_profile.id == view_profile.id and live_profile.manual_mapping_only:
+            return None
+        loaded = self._correlation_mapping_entries()
+        allow_legacy = self._legacy_mapping_fallback_allowed(snapshot.enclosures)
+        mappings: dict[int, ManualMapping] = {}
+        for slot_value in {value for row in (view_profile.slot_layout or []) for value in row if isinstance(value, int)}:
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                snapshot.selected_enclosure_id,
+                slot_value,
+                allow_legacy_fallback=allow_legacy,
+                loaded_entries=loaded,
+            )
+            if mapping is not None and (mapping.serial or mapping.gptid or mapping.device_name):
+                mappings[slot_value] = mapping
+        live_slots_by_key: dict[str, SlotView] = {}
+        for live_slot in snapshot.slots:
+            if live_slot.identity_state == "unknown":
+                continue
+            for value in (live_slot.serial, live_slot.gptid, live_slot.device_name):
+                for key in normalize_lookup_keys(value):
+                    live_slots_by_key.setdefault(key, live_slot)
+        return _ManualOnlyStorageViewSlots(mappings=mappings, live_slots_by_key=live_slots_by_key)
+
     def _build_ses_storage_view_runtime(
         self,
         storage_view: StorageViewConfig,
@@ -3445,7 +3564,17 @@ class InventoryService:
         layout_rows = build_storage_view_rows(storage_view, selected_profile=storage_view_profile)
         slots_by_number = {slot.slot: slot for slot in snapshot.slots}
         runtime_slots: list[StorageViewRuntimeSlot] = []
+        manual_only_slots = self._manual_only_storage_view_slots(storage_view_profile, snapshot)
         for slot_value in [value for row in layout_rows for value in row if isinstance(value, int)]:
+            if manual_only_slots is not None:
+                runtime_slots.append(
+                    manual_only_slots.runtime_slot(
+                        slot_value,
+                        storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile),
+                        storage_view_slot_size(storage_view, slot_value),
+                    )
+                )
+                continue
             slot = slots_by_number.get(slot_value)
             label = (
                 slot.slot_label
@@ -3501,6 +3630,11 @@ class InventoryService:
             notes.append(f"Chassis view for {snapshot.selected_enclosure_label}.")
         elif storage_view_profile:
             notes.append(f"Chassis view using the {storage_view_profile.label} layout.")
+        if manual_only_slots is not None:
+            notes.append(
+                "This layout's bay order has not been validated on real hardware, so its bays show only "
+                "disks you have assigned by hand. Bay lights are off."
+            )
         return StorageViewRuntimeView(
             id=storage_view.id,
             label=storage_view.label,

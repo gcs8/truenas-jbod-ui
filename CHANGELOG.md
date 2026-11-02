@@ -36,8 +36,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `ubiquiti-envr-core-front-16`), chosen with `default_profile_id`. Layout
   only: bay-to-disk mapping is manual until validated on real hardware, so
   disks show as unmapped until they are assigned to a bay, copies of these
-  profiles keep that rule, and bay lights stay off on them (#1070, refs
-  #1068).
+  profiles keep that rule, a saved chassis view drawn with one of them over an
+  enclosure using another layout shows only disks assigned by hand (in the
+  page, heat map, connections and offline snapshots), and bay lights stay off
+  on them (#1070, refs #1068).
 
 ### Changed
 

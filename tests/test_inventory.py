@@ -4178,6 +4178,112 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             runtime = asyncio.run(service.get_storage_view_runtime())
         return next(view for view in runtime.views if view.id == "primary-chassis")
 
+    def _pinned_view_runtime(self, service: InventoryService, snapshot: InventorySnapshot, view_id: str):
+        service.get_snapshot = AsyncMock(return_value=snapshot)
+        service._get_inventory_source_bundle = AsyncMock(return_value=self._empty_source_bundle())
+        runtime = asyncio.run(service.get_storage_view_runtime())
+        return next(view for view in runtime.views if view.id == view_id)
+
+    def _live_ses_snapshot(self, system_id: str, profile: EnclosureProfileView, bays: int) -> InventorySnapshot:
+        options = [EnclosureOption(id="enc-a", label="Enclosure A")]
+        snapshot = self._view_order_snapshot(system_id, "enc-a", "Enclosure A", bays, options, selected_profile=profile)
+        snapshot.slots = [
+            slot.model_copy(update={
+                "device_name": f"da{slot.slot}",
+                "gptid": f"gptid/sanitized-{slot.slot}",
+                "model": "Synthetic",
+                "sas_address": f"5000c5000000{slot.slot:04x}",
+                "led_supported": True,
+            })
+            for slot in snapshot.slots
+        ]
+        return snapshot
+
+    @staticmethod
+    def _pinned_view_system(profile_id: str) -> SystemConfig:
+        return SystemConfig(
+            id="synthetic-core",
+            label="Synthetic CORE",
+            default_profile_id=CORE_CSE_946_PROFILE_ID,
+            truenas=TrueNASConfig(platform="core"),
+            storage_views=[{
+                "id": "pinned-nvr",
+                "label": "Pinned NVR",
+                "kind": "ses_enclosure",
+                "template_id": "ses-auto",
+                "profile_id": profile_id,
+                "binding": {"mode": "auto"},
+            }],
+        )
+
+    def test_a_saved_layout_only_view_places_only_saved_manual_mappings(self) -> None:
+        # Codex security P2 on #1070: a saved chassis view pinned to a G2,
+        # G2-Pro, ENVR or ENVR-Core layout over a live enclosure that uses
+        # another profile copied each live bay's device and serial into the
+        # unvalidated bay order. It must place nothing until a manual mapping
+        # is saved, then show exactly that mapping.
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = self._pinned_view_system(profile_id)
+                service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+                live = self._live_ses_snapshot(system.id, service.profile_registry.get(CORE_CSE_946_PROFILE_ID), 16)
+
+                view = self._pinned_view_runtime(service, live, "pinned-nvr")
+                self.assertEqual(view.profile_id, profile_id)
+                self.assertTrue(view.slots)
+                for slot in view.slots:
+                    self.assertEqual(
+                        (slot.occupied, slot.device_name, slot.serial, slot.gptid, slot.model, slot.sas_address),
+                        (False, None, None, None, None, None),
+                    )
+                    self.assertIsNone(slot.snapshot_slot, "the view must not borrow the live bay at this index")
+                    self.assertFalse(slot.led_supported)
+                    self.assertTrue(slot.manual_mapping_only)
+                self.assertEqual(view.matched_count, 0)
+
+                service.mapping_store.save_mapping(
+                    ManualMapping(system_id=system.id, slot=2, enclosure_id="enc-a", serial="SANITIZED-enc-a-5")
+                )
+                mapped = self._pinned_view_runtime(service, live, "pinned-nvr")
+                placed = {slot.slot_index: (slot.serial, slot.device_name) for slot in mapped.slots if slot.serial or slot.device_name}
+                self.assertEqual(placed, {2: ("SANITIZED-enc-a-5", "da5")})
+                bay = next(slot for slot in mapped.slots if slot.slot_index == 2)
+                self.assertTrue(bay.occupied)
+                self.assertIsNone(bay.snapshot_slot)
+                self.assertIsNone(bay.sas_address, "a bay-scoped address belongs to the live bay, not this one")
+                self.assertFalse(bay.led_supported)
+                self.assertEqual(mapped.matched_count, 1)
+
+    def test_saved_unvr_and_unvr_pro_views_still_follow_the_live_bays(self) -> None:
+        for profile_id in (UNIFI_UNVR_FRONT_4_PROFILE_ID, UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID):
+            with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
+                system = self._pinned_view_system(profile_id)
+                service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+                live = self._live_ses_snapshot(system.id, service.profile_registry.get(CORE_CSE_946_PROFILE_ID), 16)
+                view = self._pinned_view_runtime(service, live, "pinned-nvr")
+                for slot in view.slots:
+                    self.assertEqual(slot.serial, f"SANITIZED-enc-a-{slot.slot_index}")
+                    self.assertEqual(slot.device_name, f"da{slot.slot_index}")
+                    self.assertEqual(slot.snapshot_slot, slot.slot_index)
+                    self.assertTrue(slot.led_supported)
+                    self.assertFalse(slot.manual_mapping_only)
+
+    def test_a_layout_only_primary_chassis_reuses_its_own_manual_only_bays(self) -> None:
+        # When the live enclosure itself uses the layout-only profile its bays
+        # were already built from saved mappings only, so the generated view
+        # keeps borrowing them (and mappings can still be saved from it).
+        profile_id = sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0]
+        system = SystemConfig(
+            id="nvr", label="NVR", default_profile_id=profile_id, truenas=TrueNASConfig(platform="linux"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir)
+            live = self._live_ses_snapshot(system.id, service.profile_registry.get(profile_id), 2)
+            view = self._pinned_view_runtime(service, live, "primary-chassis")
+        self.assertEqual([slot.snapshot_slot for slot in view.slots][:2], [0, 1])
+        self.assertEqual(view.slots[1].serial, "SANITIZED-enc-a-1")
+        self.assertFalse(any(slot.manual_mapping_only for slot in view.slots))
+
     def test_unpinned_primary_chassis_follows_the_system_layout(self) -> None:
         # #953: the generated Primary Chassis, and one saved without a layout
         # of its own, draw whatever layout the system resolves to and are not
