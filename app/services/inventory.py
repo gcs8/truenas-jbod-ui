@@ -8540,6 +8540,7 @@ class InventoryService:
             return frame
         selected_option = frame.selected_option
         selected_profile = frame.selected_profile
+        manual_only = _profile_is_manual_only(selected_profile)
         if selected_option is None or selected_profile is None:
             return frame.result([])
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
@@ -8636,6 +8637,11 @@ class InventoryService:
 
             if disk is None:
                 disk = disks_by_slot.get((selected_option.id, slot)) or disks_by_slot.get((None, slot))
+            if manual_only:
+                # A layout with an unvalidated bay order (#1068) takes no disk
+                # from StorCLI or BMC slot data, only from a saved manual mapping.
+                disk = None
+                bmc_disk = None
             if disk:
                 raw_slot_status.update(
                     {
@@ -8805,6 +8811,10 @@ class InventoryService:
                 "present": False if slot_hint else None,
             }
             disk = disks_by_slot.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
+            if _profile_is_manual_only(frame.selected_profile):
+                # A layout with an unvalidated bay order (#1068) takes no disk
+                # from BMC slot data, only from a saved manual mapping.
+                disk = None
             if disk is not None:
                 self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, disk)
             mapping = self.mapping_store.get_mapping(

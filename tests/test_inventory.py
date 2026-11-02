@@ -7384,6 +7384,47 @@ class InventoryStorageViewCandidateTests(unittest.TestCase):
             self.assertIs(manual.disk, disk)
             self.assertEqual(manual.source, "manual")
 
+    def test_manual_only_profiles_ignore_bmc_and_storcli_slot_placement(self) -> None:
+        # Codex security P2 on #1070: on IPMI and ESXi hosts the correlators
+        # placed a disk from BMC / StorCLI slot data before the resolver ran,
+        # bypassing manual-only. A manual-only profile shows no automatic disk.
+        profile_id = sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS)[0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="bmc-nvr",
+                default_profile_id=profile_id,
+                truenas=TrueNASConfig(platform="ipmi"),
+                bmc=BMCConfig(enabled=True, host="bmc.example.invalid", username="ADMIN", password="synthetic"),
+            )
+            service = build_inventory_service(Settings(), system, AsyncMock(), AsyncMock(), temp_dir, bmc_service=MagicMock())
+            bmc_inventory = BMCInventory(
+                system_model="Synthetic",
+                controllers=[BMCControllerRecord(controller_id=0, product_name="Synthetic RAID")],
+                drives=[
+                    BMCDriveRecord(controller_id=0, physical_index=0, slot_number=0, enclosure_id="252",
+                                   model="Synthetic", serial="SANITIZED-BMC-0", size_bytes=4_000_000_000_000,
+                                   health="ONLINE"),
+                ],
+            )
+            slot_views, *_rest = service._correlate_bmc_host([], None, bmc_inventory)
+            self.assertEqual([view.slot for view in slot_views if view.present or view.serial], [])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = SystemConfig(
+                id="esxi-nvr",
+                default_profile_id=profile_id,
+                truenas=TrueNASConfig(platform="esxi"),
+                ssh=SSHConfig(enabled=True, host="esxi.example.invalid", user="root"),
+            )
+            service = build_inventory_service(Settings(systems=[system]), system, MagicMock(), MagicMock(), temp_dir)
+            ssh_data = ParsedSSHData(
+                esxi_storcli_physical_drives=[
+                    {"slot_key": "13:0", "enclosure_id": "13", "slot": 0, "controller_id": "c0", "state": "Onln",
+                     "size": "1.818 TB", "interface": "SATA", "model": "Synthetic", "serial": "SANITIZED-STORCLI-0"},
+                ],
+            )
+            slot_views, *_rest = service._correlate_esxi_host(ssh_data, [], None)
+            self.assertEqual([view.slot for view in slot_views if view.device_name or view.serial], [])
+
     def test_layout_only_unifi_profiles_accept_manual_mapping_like_a_generic_chassis(self) -> None:
         for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
             with self.subTest(profile_id=profile_id), tempfile.TemporaryDirectory() as temp_dir:
