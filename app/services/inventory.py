@@ -21,7 +21,13 @@ from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from app import __version__
-from app.config import Settings, StorageViewConfig, SystemConfig, normalize_value_text
+from app.config import (
+    Settings,
+    StorageViewConfig,
+    SystemConfig,
+    effective_max_concurrent_calls,
+    normalize_value_text,
+)
 from app.models.domain import (
     CacheState,
     DiskInventorySyncMode,
@@ -152,6 +158,7 @@ from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
+    TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
@@ -905,6 +912,137 @@ class _LayoutFrame:
             self.layout_rows,
             self.layout_slot_count if layout_slot_count is None else layout_slot_count,
             self.layout_columns,
+        )
+
+
+def _profile_is_manual_only(profile: EnclosureProfileView | None) -> bool:
+    """True for a layout whose bay order is unvalidated (#1068): only saved
+    manual mappings may place a disk on it, on every platform's path."""
+    return bool(profile is not None and profile.manual_mapping_only)
+
+
+# The only slot-status keys a manual-only bay keeps. Everything else a platform
+# put there exists because it observed something at this slot index, and on a
+# layout whose bay order is unvalidated (#1068) that names the wrong bay as
+# often as the right one: device, serial and model hints, presence, health and
+# fault text, a locate light, SES/BMC/StorCLI/vendor coordinates, SAS port
+# facts, size, SMART type and SES flags. An allowlist rather than a denylist,
+# so a key a platform adds later is withheld until someone decides otherwise.
+# `disk_raw` is the resolved (manually mapped) disk's own record, not slot data.
+_MANUAL_ONLY_SLOT_STATUS_KEYS = frozenset({
+    "enclosure_id", "enclosure_label", "enclosure_name", "mapping_resolution_source", "disk_raw",
+})
+# Slot-detail cache fields that describe the bay rather than the disk. The
+# cache is keyed by slot index, so a manual-only bay must not get them back.
+_BAY_SCOPED_SLOT_DETAIL_FIELDS = frozenset({"sas_address", "enclosure_identifier"})
+
+
+def _manual_only_slot_status(
+    raw_slot_status: dict[str, Any], profile: EnclosureProfileView | None,
+) -> dict[str, Any]:
+    if not _profile_is_manual_only(profile):
+        return raw_slot_status
+    stripped = {key: value for key, value in raw_slot_status.items() if key in _MANUAL_ONLY_SLOT_STATUS_KEYS}
+    if raw_slot_status.get("bmc_match_source") == "serial" and raw_slot_status.get("bmc_identify_active"):
+        # The BMC matched the resolved (manually mapped) disk by serial, so its
+        # locate light is that disk's own, wherever the disk physically sits.
+        stripped["mapped_disk_identify_active"] = True
+    stripped["manual_mapping_only"] = True
+    return stripped
+
+
+def _slot_status_is_manual_only(raw_status: Mapping[str, Any] | None) -> bool:
+    """The one marker every consumer checks for a manual-only bay (#1068)."""
+    return isinstance(raw_status, Mapping) and raw_status.get("manual_mapping_only") is True
+
+
+def _mapped_disk_identify_active(disk: DiskRecord | None, raw_slot_status: Mapping[str, Any]) -> bool:
+    """A locate light the mapped disk's own record reports, never the slot's."""
+    if disk is None:
+        return False
+    return (
+        raw_slot_status.get("mapped_disk_identify_active") is True
+        or bool(disk.raw.get("bmc_identify_active"))
+        or InventoryService._quantastor_bool(disk.raw.get("isBlinking"))
+    )
+
+
+@dataclass(frozen=True)
+class _ManualOnlyStorageViewSlots:
+    """Bays of a saved chassis view drawn with a manual-only layout (#1068).
+
+    The live enclosure's slot order says nothing about such a layout's bays,
+    so a bay is never linked to the live bay at the same index. It names a disk
+    only when a saved manual mapping for that bay does; the disk's own details
+    then come from the live slot holding that disk, found by the mapping's
+    serial, persistent ID or device name. Bay-scoped evidence (SAS address,
+    attached address, the live bay number, its light) is never copied.
+    """
+
+    mappings: dict[int, ManualMapping]
+    live_slots_by_key: dict[str, SlotView]
+
+    def runtime_slot(self, slot_value: int, label: str, slot_size: str | None) -> StorageViewRuntimeSlot:
+        mapping = self.mappings.get(slot_value)
+        common = {
+            "slot_index": slot_value,
+            "slot_label": label,
+            "manual_mapping_only": True,
+            "led_supported": False,
+            "slot_size": slot_size,
+        }
+        if mapping is None:
+            return StorageViewRuntimeSlot(
+                **common, occupied=False, state="unknown", source="placeholder",
+                placement_key="assigned by hand only",
+            )
+        live = next(
+            (
+                self.live_slots_by_key[key]
+                for candidate in (mapping.serial, mapping.gptid, mapping.device_name)
+                for key in normalize_lookup_keys(candidate)
+                if key in self.live_slots_by_key
+            ),
+            None,
+        )
+        if live is None:
+            return StorageViewRuntimeSlot(
+                **common, occupied=False, state=SlotState.unmapped.value, source="manual_mapping",
+                match_reasons=["saved bay assignment"], placement_key="saved bay assignment",
+                device_name=mapping.device_name, serial=mapping.serial, gptid=mapping.gptid,
+                description=mapping.notes,
+            )
+        return StorageViewRuntimeSlot(
+            **common,
+            occupied=True,
+            state=(
+                SlotState.fault.value
+                if live.state == SlotState.fault or InventoryService._health_is_bad(live.health)
+                else SlotState.healthy.value
+            ),
+            source="manual_mapping",
+            match_reasons=["saved bay assignment"],
+            placement_key="saved bay assignment",
+            device_name=live.device_name,
+            smart_device_names=list(live.smart_device_names),
+            smart_device_type=live.smart_device_type,
+            serial=live.serial,
+            pool_name=live.pool_name,
+            vdev_name=live.vdev_name,
+            model=live.model,
+            size_bytes=live.size_bytes,
+            size_human=live.size_human,
+            gptid=live.gptid,
+            persistent_id_label=live.persistent_id_label,
+            health=live.health,
+            temperature_c=live.temperature_c,
+            last_smart_test_type=live.last_smart_test_type,
+            last_smart_test_status=live.last_smart_test_status,
+            last_smart_test_lifetime_hours=live.last_smart_test_lifetime_hours,
+            logical_block_size=live.logical_block_size,
+            physical_block_size=live.physical_block_size,
+            logical_unit_id=live.logical_unit_id,
+            description=mapping.notes,
         )
 
 
@@ -3404,6 +3542,46 @@ class InventoryService:
                     claimed_candidate_ids.add(candidate_key)
         return runtime_views
 
+    def _manual_only_storage_view_slots(
+        self,
+        view_profile: EnclosureProfileView | None,
+        snapshot: InventorySnapshot,
+    ) -> _ManualOnlyStorageViewSlots | None:
+        """The one gate for a chassis view drawn with a manual-only layout.
+
+        None when the view may follow the live bays: its layout is validated
+        (UNVR, UNVR Pro and every other automatic profile), or it is the same
+        manual-only profile the live enclosure was built with, whose bays the
+        correlators already filled from saved manual mappings alone. Otherwise
+        the view's bays are built from saved manual mappings only.
+        """
+        if not _profile_is_manual_only(view_profile):
+            return None
+        live_profile = snapshot.selected_profile
+        if live_profile is not None and live_profile.id == view_profile.id and live_profile.manual_mapping_only:
+            return None
+        loaded = self._correlation_mapping_entries()
+        allow_legacy = self._legacy_mapping_fallback_allowed(snapshot.enclosures)
+        mappings: dict[int, ManualMapping] = {}
+        for slot_value in {value for row in (view_profile.slot_layout or []) for value in row if isinstance(value, int)}:
+            mapping = self.mapping_store.get_mapping(
+                self.system.id,
+                snapshot.selected_enclosure_id,
+                slot_value,
+                allow_legacy_fallback=allow_legacy,
+                loaded_entries=loaded,
+            )
+            if mapping is not None and (mapping.serial or mapping.gptid or mapping.device_name):
+                mappings[slot_value] = mapping
+        live_slots_by_key: dict[str, SlotView] = {}
+        for live_slot in snapshot.slots:
+            if live_slot.identity_state == "unknown":
+                continue
+            for value in (live_slot.serial, live_slot.gptid, live_slot.device_name):
+                for key in normalize_lookup_keys(value):
+                    live_slots_by_key.setdefault(key, live_slot)
+        return _ManualOnlyStorageViewSlots(mappings=mappings, live_slots_by_key=live_slots_by_key)
+
     def _build_ses_storage_view_runtime(
         self,
         storage_view: StorageViewConfig,
@@ -3417,7 +3595,17 @@ class InventoryService:
         layout_rows = build_storage_view_rows(storage_view, selected_profile=storage_view_profile)
         slots_by_number = {slot.slot: slot for slot in snapshot.slots}
         runtime_slots: list[StorageViewRuntimeSlot] = []
+        manual_only_slots = self._manual_only_storage_view_slots(storage_view_profile, snapshot)
         for slot_value in [value for row in layout_rows for value in row if isinstance(value, int)]:
+            if manual_only_slots is not None:
+                runtime_slots.append(
+                    manual_only_slots.runtime_slot(
+                        slot_value,
+                        storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile),
+                        storage_view_slot_size(storage_view, slot_value),
+                    )
+                )
+                continue
             slot = slots_by_number.get(slot_value)
             label = (
                 slot.slot_label
@@ -3473,6 +3661,11 @@ class InventoryService:
             notes.append(f"Chassis view for {snapshot.selected_enclosure_label}.")
         elif storage_view_profile:
             notes.append(f"Chassis view using the {storage_view_profile.label} layout.")
+        if manual_only_slots is not None:
+            notes.append(
+                "This layout's bay order has not been validated on real hardware, so its bays show only "
+                "disks you have assigned by hand. Bay lights are off."
+            )
         return StorageViewRuntimeView(
             id=storage_view.id,
             label=storage_view.label,
@@ -3485,6 +3678,7 @@ class InventoryService:
             panel_title=storage_view_profile.panel_title if storage_view_profile else None,
             edge_label=storage_view_profile.edge_label if storage_view_profile else None,
             face_style=storage_view_profile.face_style if storage_view_profile else "generic",
+            face_variant=storage_view_profile.face_variant if storage_view_profile else None,
             latch_edge=storage_view_profile.latch_edge if storage_view_profile else "bottom",
             bay_size=storage_view_profile.bay_size if storage_view_profile else None,
             row_groups=list(storage_view_profile.row_groups) if storage_view_profile else [],
@@ -3559,6 +3753,7 @@ class InventoryService:
             panel_title=storage_view_profile.panel_title if storage_view_profile else None,
             edge_label=storage_view_profile.edge_label if storage_view_profile else None,
             face_style=storage_view_profile.face_style if storage_view_profile else "generic",
+            face_variant=storage_view_profile.face_variant if storage_view_profile else None,
             latch_edge=storage_view_profile.latch_edge if storage_view_profile else "bottom",
             bay_size=storage_view_profile.bay_size if storage_view_profile else None,
             row_groups=list(storage_view_profile.row_groups) if storage_view_profile else [],
@@ -4727,6 +4922,14 @@ class InventoryService:
                     certificate_message = f"{api_label} certificate check failed: {certificate_failure}."
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=certificate_message)
                     warnings.append(certificate_message)
+                elif isinstance(exc, TrueNASAPIBusyError):
+                    # #1072: the appliance answered but is out of capacity, or
+                    # the app is backing off after it was. Not "unreachable".
+                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                    warnings.append(
+                        f"{api_label} is busy; the app is backing off before asking again. "
+                        "Slot details may be partial until it answers."
+                    )
                 else:
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
                     warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
@@ -5154,7 +5357,13 @@ class InventoryService:
             if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
                 continue
 
+            manual_only = _slot_status_is_manual_only(slot_view.raw_status)
             for field_name in STABLE_SLOT_DETAIL_FIELDS:
+                if manual_only and field_name in _BAY_SCOPED_SLOT_DETAIL_FIELDS:
+                    # The cache is keyed by slot index; on a manual-only layout
+                    # (#1068) a bay-scoped fact cached there names whatever
+                    # bay that index pointed at, not this one.
+                    continue
                 cached_value = entry.slot_fields.get(field_name)
                 if cached_value is None:
                     continue
@@ -6624,7 +6833,11 @@ class InventoryService:
                 # budget, while two grids cannot deadlock holding partial budgets.
                 async with self._core_grid_reservation_lock:
                     try:
-                        for _ in range(min(width, len(selected))):
+                        # #1072: the appliance's call limit already caps the
+                        # batch width; reserving more service permits than it
+                        # will ever use would only starve drawers.
+                        appliance_limit = effective_max_concurrent_calls(self.system.truenas)
+                        for _ in range(min(width, len(selected), appliance_limit)):
                             await self._smart_operation_semaphore.acquire()
                             permits += 1
                         try:
@@ -7978,6 +8191,7 @@ class InventoryService:
                 disks_by_sas,
                 candidate,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             candidate["mapping_resolution_source"] = resolution.source
@@ -7990,7 +8204,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=candidate,
+                raw_slot_status=_manual_only_slot_status(candidate, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8392,13 +8606,17 @@ class InventoryService:
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
 
         disk_records = self._build_linux_disk_records(ssh_data, warnings=warnings)
+        # Layout-only profiles (#1068) have no validated bay order: neither the
+        # UniFi storage service's slot numbers nor slot hints may place a disk.
+        # Only saved manual mappings do, as on a generic chassis.
+        layout_only = _profile_is_manual_only(selected_profile)
         disks_by_key: dict[str, DiskRecord] = {}
         disks_by_slot: dict[tuple[str | None, int], DiskRecord] = {}
         for disk in disk_records:
             for key in disk.lookup_keys:
                 disks_by_key[key] = disk
             vendor_slot = disk.raw.get("vendor_slot")
-            if isinstance(vendor_slot, int):
+            if isinstance(vendor_slot, int) and not layout_only:
                 disks_by_slot[(selected_option.id, vendor_slot)] = disk
                 disks_by_slot[(None, vendor_slot)] = disk
 
@@ -8406,8 +8624,15 @@ class InventoryService:
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         selected_meta = frame.selected_meta
-        vendor_slot_candidates = self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
-        slot_hints = selected_profile.slot_hints or {}
+        if selected_profile.slot_number_base is not None:
+            # Same rule as the SES path: a chassis that prints its bays from 1
+            # (the UniFi NVRs, #1068) carries the label base on its profile.
+            # Only the label changes; slot indices and mapping keys do not.
+            selected_meta = {**selected_meta, "slot_number_base": selected_profile.slot_number_base}
+        vendor_slot_candidates = (
+            {} if layout_only else self._build_linux_vendor_slot_candidates(ssh_data, selected_option)
+        )
+        slot_hints = {} if layout_only else (selected_profile.slot_hints or {})
         if not slot_hints and not vendor_slot_candidates:
             warnings.append(
                 "This layout has no bay hints, so disks must be assigned to bays by hand."
@@ -8468,6 +8693,7 @@ class InventoryService:
                 {},
                 raw_slot_status,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             raw_slot_status["mapping_resolution_source"] = (
@@ -8481,7 +8707,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8491,7 +8717,7 @@ class InventoryService:
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "Linux device")
             slot_views.append(slot_view)
 
-        return frame.result(slot_views)
+        return frame.result(slot_views, selected_meta=selected_meta)
 
     def _correlate_esxi_host(
         self,
@@ -8519,6 +8745,7 @@ class InventoryService:
             return frame
         selected_option = frame.selected_option
         selected_profile = frame.selected_profile
+        manual_only = _profile_is_manual_only(selected_profile)
         if selected_option is None or selected_profile is None:
             return frame.result([])
         allow_legacy_mapping_fallback = frame.allow_legacy_mapping_fallback
@@ -8615,6 +8842,11 @@ class InventoryService:
 
             if disk is None:
                 disk = disks_by_slot.get((selected_option.id, slot)) or disks_by_slot.get((None, slot))
+            if manual_only:
+                # A layout with an unvalidated bay order (#1068) takes no disk
+                # from StorCLI or BMC slot data, only from a saved manual mapping.
+                disk = None
+                bmc_disk = None
             if disk:
                 raw_slot_status.update(
                     {
@@ -8673,6 +8905,7 @@ class InventoryService:
                     {},
                     raw_slot_status,
                     ssh_data,
+                    manual_only=_profile_is_manual_only(frame.selected_profile),
                 )
                 disk = resolution.disk
             if bmc_disk is not None:
@@ -8706,7 +8939,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -8783,6 +9016,10 @@ class InventoryService:
                 "present": False if slot_hint else None,
             }
             disk = disks_by_slot.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
+            if _profile_is_manual_only(frame.selected_profile):
+                # A layout with an unvalidated bay order (#1068) takes no disk
+                # from BMC slot data, only from a saved manual mapping.
+                disk = None
             if disk is not None:
                 self._apply_bmc_drive_to_raw_slot_status(raw_slot_status, disk)
             mapping = self.mapping_store.get_mapping(
@@ -8806,6 +9043,7 @@ class InventoryService:
                     {},
                     raw_slot_status,
                     empty_ssh,
+                    manual_only=_profile_is_manual_only(frame.selected_profile),
                 )
                 disk = resolution.disk
             raw_slot_status["mapping_resolution_source"] = resolution.source
@@ -8815,7 +9053,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
@@ -8931,6 +9169,7 @@ class InventoryService:
                 disks_by_sas,
                 candidate,
                 ssh_data,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             candidate["mapping_resolution_source"] = resolution.source
@@ -8944,7 +9183,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=mapping_meta,
-                raw_slot_status=candidate,
+                raw_slot_status=_manual_only_slot_status(candidate, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=ssh_data,
@@ -9068,6 +9307,7 @@ class InventoryService:
                 disks_by_sas,
                 slot_hints,
                 empty_ssh,
+                manual_only=_profile_is_manual_only(frame.selected_profile),
             )
             disk = resolution.disk
             slot_hints["mapping_resolution_source"] = resolution.source
@@ -9099,7 +9339,7 @@ class InventoryService:
                 row_index=row_index,
                 column_index=column_index,
                 enclosure_meta=selected_meta,
-                raw_slot_status=raw_slot_status,
+                raw_slot_status=_manual_only_slot_status(raw_slot_status, frame.selected_profile),
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
@@ -14543,7 +14783,23 @@ class InventoryService:
         disks_by_sas: dict[str, DiskRecord],
         raw_slot_status: dict[str, Any],
         ssh_data: ParsedSSHData,
+        *,
+        manual_only: bool = False,
     ) -> DiskResolution:
+        if manual_only:
+            # A layout whose bay order is unvalidated (#1068): only a saved
+            # manual mapping places a disk. Slot-order evidence, including an
+            # "empty" report, says nothing reliable about this bay.
+            if mapping:
+                for candidate in (mapping.serial, mapping.gptid, mapping.device_name):
+                    if not candidate:
+                        continue
+                    for key in normalize_lookup_keys(candidate):
+                        disk = disks_by_key.get(key)
+                        if disk:
+                            return DiskResolution(disk=disk, source=mapping.source or "manual")
+            return DiskResolution(disk=None, source="unknown")
+
         if self._slot_has_live_empty_evidence(raw_slot_status):
             return DiskResolution(
                 disk=None,
@@ -14718,9 +14974,17 @@ class InventoryService:
         multipath = self._build_multipath_view(disk, ssh_data)
 
         status_haystack = self._status_haystack(raw_slot_status)
-        identify_active = bool(raw_slot_status.get("identify_active")) or self._haystack_contains(status_haystack, "identify", "led=locate")
-        if not identify_active and slot in ssh_data.unifi_led_states:
-            identify_active = ssh_data.unifi_led_states[slot]
+        if _slot_status_is_manual_only(raw_slot_status):
+            # A manual-only bay (#1068): a locate light reported at this slot
+            # index (SES, status text, UniFi GPIO) may belong to a different
+            # physical bay. Only the mapped disk's own record may light it.
+            identify_active = _mapped_disk_identify_active(disk, raw_slot_status)
+        else:
+            identify_active = bool(raw_slot_status.get("identify_active")) or self._haystack_contains(
+                status_haystack, "identify", "led=locate",
+            )
+            if not identify_active and slot in ssh_data.unifi_led_states:
+                identify_active = ssh_data.unifi_led_states[slot]
         faulty = self._haystack_contains(status_haystack, "fault") or self._health_is_bad(
             disk.health if disk else None,
             zpool.health if zpool else None,
@@ -14886,7 +15150,16 @@ class InventoryService:
             and isinstance(raw_slot_status.get("bmc_controller_id"), int)
             and isinstance(raw_slot_status.get("bmc_physical_index"), int)
         )
-        if bmc_led_supported:
+        if raw_slot_status.get("manual_mapping_only") is True:
+            # Every light backend addresses a bay by its slot order, which is
+            # what a manual-only layout (#1068) has not validated, so Identify
+            # could light a different physical bay than the one drawn here.
+            led_supported = False
+            led_backend = None
+            led_reason = (
+                "Bay lights are off for this layout: its bay order has not been validated on real hardware."
+            )
+        elif bmc_led_supported:
             led_supported = True
             led_backend = "supermicro_bmc"
             led_reason = None

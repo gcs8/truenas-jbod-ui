@@ -25,7 +25,12 @@ from app.services.profile_registry import (
     SCALE_SSG_REAR_12_PROFILE_ID,
     SUPERMICRO_FATTWIN_REAR_2_PROFILE_ID,
     ProfileRegistry,
+    UNIFI_ENVR_CORE_FRONT_16_PROFILE_ID,
+    UNIFI_ENVR_FRONT_16_PROFILE_ID,
+    UNIFI_LAYOUT_ONLY_PROFILE_IDS,
     UNIFI_UNVR_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_G2_FRONT_4_PROFILE_ID,
+    UNIFI_UNVR_G2_PRO_FRONT_8_PROFILE_ID,
     UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
     build_profile_reference_warnings,
     built_in_profile_ids,
@@ -452,6 +457,120 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(profile.slot_layout, [[0, 1, 2, None], [3, 4, 5, 6]])
         self.assertEqual(profile.slot_hints[0], ["7:0:0:0"])
         self.assertEqual(profile.slot_hints[1], ["5:0:0:0"])
+
+    def test_unifi_nvr_faces_keep_slot_identity_and_show_chassis_numbers(self) -> None:
+        # The UNVR and UNVR Pro faces are drawn per model (#1068). Only the
+        # drawing changes: slot indices, positions in the layout and the
+        # validated HCTL hints stay exactly as they were, so saved mappings
+        # and history, which are keyed by slot index, are unaffected.
+        registry = ProfileRegistry(get_settings())
+        expected = {
+            UNIFI_UNVR_FRONT_4_PROFILE_ID: {
+                "face_variant": "unvr",
+                "slot_count": 4,
+                "slot_layout": [[0, 1, 2, 3]],
+                "slot_hints": {0: ["0:0:0:0"], 1: ["2:0:0:0"], 2: ["4:0:0:0"], 3: ["6:0:0:0"]},
+            },
+            UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID: {
+                "face_variant": "unvr-pro",
+                "slot_count": 7,
+                "slot_layout": [[0, 1, 2, None], [3, 4, 5, 6]],
+                "slot_hints": {0: ["7:0:0:0"], 1: ["5:0:0:0"]},
+            },
+        }
+        for profile_id, want in expected.items():
+            with self.subTest(profile_id=profile_id):
+                profile = registry.get(profile_id)
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.face_style, "unifi-drive")
+                self.assertEqual(profile.face_variant, want["face_variant"])
+                self.assertEqual(profile.slot_count, want["slot_count"])
+                self.assertEqual(profile.slot_layout, want["slot_layout"])
+                self.assertEqual(profile.slot_hints, want["slot_hints"])
+                # The chassis prints bays from 1 (UniFi OS "HDD 1" is slot 0).
+                self.assertEqual(profile.slot_number_base, 1)
+
+    def test_face_variant_is_optional_and_custom_profiles_keep_the_plain_face(self) -> None:
+        custom = EnclosureProfileConfig(
+            id="custom-unifi",
+            label="Custom UniFi",
+            face_style="unifi-drive",
+            rows=1,
+            columns=4,
+        )
+        self.assertIsNone(custom.face_variant)
+        self.assertIsNone(ProfileRegistry(get_settings()).get(GENERIC_FRONT_12_3X4_PROFILE_ID).face_variant)
+
+    def test_layout_only_unifi_profiles_draw_the_chassis_without_mapping_hints(self) -> None:
+        # #1068: the UNVR-G2, UNVR-G2-Pro, ENVR and ENVR-Core have no validated
+        # bay order yet. They ship the face, the bay layout and the chassis
+        # numbers only; every disk is placed by hand like a generic chassis.
+        registry = ProfileRegistry(get_settings())
+        expected = {
+            UNIFI_UNVR_G2_FRONT_4_PROFILE_ID: ("ubiquiti-unvr-g2-front-4", "unvr-g2", [[0, 1, 2, 3]]),
+            UNIFI_UNVR_G2_PRO_FRONT_8_PROFILE_ID: (
+                "ubiquiti-unvr-g2-pro-front-8",
+                "unvr-g2-pro",
+                # Top row 1-4 over bottom row 5-8, as the divider strip prints.
+                [[0, 1, 2, 3], [4, 5, 6, 7]],
+            ),
+            UNIFI_ENVR_FRONT_16_PROFILE_ID: (
+                "ubiquiti-envr-front-16",
+                "envr",
+                # Column strips read 1/5/9/13 ... 4/8/12/16: row-major from the top.
+                [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]],
+            ),
+            UNIFI_ENVR_CORE_FRONT_16_PROFILE_ID: (
+                "ubiquiti-envr-core-front-16",
+                "envr-core",
+                [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]],
+            ),
+        }
+        self.assertEqual(UNIFI_LAYOUT_ONLY_PROFILE_IDS, frozenset(expected))
+        for profile_id, (literal_id, variant, layout) in expected.items():
+            with self.subTest(profile_id=profile_id):
+                self.assertEqual(profile_id, literal_id)
+                profile = registry.get(profile_id)
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.face_style, "unifi-drive")
+                self.assertEqual(profile.face_variant, variant)
+                self.assertEqual(profile.slot_layout, layout)
+                self.assertEqual(profile.slot_count, len([slot for row in layout for slot in row]))
+                self.assertEqual(profile.slot_number_base, 1)
+                self.assertEqual(profile.slot_hints, {})
+                self.assertTrue(profile.manual_mapping_only)
+                self.assertIn(
+                    "Layout only: bay-to-disk mapping is manual until validated on real hardware.",
+                    profile.summary,
+                )
+                self.assertTrue(profile_is_system_layout(profile))
+        # The validated UNVR and UNVR Pro keep their automatic mapping.
+        self.assertFalse(registry.get(UNIFI_UNVR_FRONT_4_PROFILE_ID).manual_mapping_only)
+        self.assertFalse(registry.get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID).manual_mapping_only)
+        self.assertNotIn(UNIFI_UNVR_FRONT_4_PROFILE_ID, UNIFI_LAYOUT_ONLY_PROFILE_IDS)
+        self.assertNotIn(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID, UNIFI_LAYOUT_ONLY_PROFILE_IDS)
+
+    def test_layout_only_unifi_profiles_are_selected_by_config(self) -> None:
+        # There is no UniFi model-string detection in the app, so these are
+        # chosen with default_profile_id (or enclosure_profiles) only.
+        registry = ProfileRegistry(get_settings())
+        for profile_id in sorted(UNIFI_LAYOUT_ONLY_PROFILE_IDS):
+            with self.subTest(profile_id=profile_id):
+                system = SystemConfig(
+                    id="nvr",
+                    label="UniFi NVR",
+                    default_profile_id=profile_id,
+                    truenas=TrueNASConfig(platform="linux"),
+                )
+                profile = registry.resolve_for_enclosure(system, None, fallback_rows=1, fallback_columns=4)
+                self.assertEqual(profile.id, profile_id)
+                untouched = registry.resolve_for_enclosure(
+                    SystemConfig(id="linux", label="Linux", truenas=TrueNASConfig(platform="linux")),
+                    None,
+                    fallback_rows=1,
+                    fallback_columns=4,
+                )
+                self.assertNotEqual(untouched.id, profile_id)
 
     def test_get_settings_loads_custom_profile_file_and_system_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

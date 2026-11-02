@@ -28,8 +28,41 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Added
+
+- Added built-in faces for the UniFi UNVR-G2, UNVR-G2-Pro, Enterprise NVR and
+  Enterprise NVR Core (`ubiquiti-unvr-g2-front-4`,
+  `ubiquiti-unvr-g2-pro-front-8`, `ubiquiti-envr-front-16`,
+  `ubiquiti-envr-core-front-16`), chosen with `default_profile_id`. Layout
+  only: bay-to-disk mapping is manual until validated on real hardware, so
+  disks show as unmapped until they are assigned to a bay, copies of these
+  profiles keep that rule, a saved chassis view drawn with one of them over an
+  enclosure using another layout shows only disks assigned by hand (in the
+  page, heat map, connections and offline snapshots), no bay takes a locate
+  light, fault, SES or SAS detail, or printed strip number from the live bay
+  order, and bay lights stay off on them (#1070, refs #1068).
+
+### Changed
+
+- Drew the UniFi UNVR and UNVR Pro fronts as the real chassis instead of grey
+  side plates and a striped vent window: the UNVR shows its System LED bar,
+  vents, print and RESET pinhole, and the UNVR Pro shows its touchscreen beside
+  bays 1-3 and its RJ45 and SFP+ ports instead of an empty block. Both number
+  their bays 1-4 and 1-7 as the chassis does; slot indices, bay hints, saved
+  mappings and history are unchanged (#1069, refs #1068).
+
+- TrueNAS middleware calls now share one per-appliance limit,
+  `max_concurrent_calls` (`TRUENAS_MAX_CONCURRENT_CALLS`, default 4 on CORE and
+  8 on SCALE, at most 10), across refreshes, SMART grids, drawers and LED
+  actions. A busy reply or a timed-out inventory read starts a jittered
+  backoff, and the API source shows as busy instead of unreachable (#1076,
+  refs #1072).
+
 ### Fixed
 
+- Closed TrueNAS middleware connections only after an interrupted login
+  answers, within one call timeout, so a timed-out or cancelled read no longer
+  leaves a stale API session on the appliance (#1076, refs #1072).
 - Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
   not used" where a platform has no API and names the QuantaStor or ESXi API
   where it has one, SSH shows "partial" when only optional reads failed and

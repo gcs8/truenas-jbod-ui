@@ -688,7 +688,7 @@ test("runtime removal of selected view rerenders the now-live grid", async () =>
 
 // #837: a storage-view candidate's bay number only names a disk inside its own
 // enclosure. Front and rear enclosures both have a bay 3 holding different disks.
-const BAY_SCOPE_FUNCTIONS = ["storageViewSlotBayInEnclosure", "isLiveStyledStorageView", "getLiveBackedStorageViewSlot", "buildStorageViewHistoryContextSlot"];
+const BAY_SCOPE_FUNCTIONS = ["storageViewSlotBayInEnclosure", "isLiveStyledStorageView", "storageViewSlotIsManualOnly", "getLiveBackedStorageViewSlot", "buildStorageViewHistoryContextSlot"];
 function bayScopeFixture({ liveEnclosureId, selectedEnclosureId = liveEnclosureId }) {
   const bays = {
     front: { slot: 3, enclosure_id: "front", serial: "SANITIZED-FRONT-3" },
@@ -798,6 +798,7 @@ test("mismatched saved chassis cannot send LED or mapping writes to the page enc
   const c = load([
     "storageViewSlotBayInEnclosure",
     "isLiveStyledStorageView",
+    "storageViewSlotIsManualOnly",
     "getLiveBackedStorageViewSlot",
     ...optionalFunctions,
     "mappingFormScopeKey",

@@ -377,6 +377,8 @@ class EnclosureProfileView(BaseModel):
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
     slot_number_base: int | None = None
+    face_variant: str | None = None
+    manual_mapping_only: bool = False
 
 
 class InventorySummary(BaseModel):
@@ -932,7 +934,11 @@ class StorageViewRuntimeSlot(BaseModel):
     target_system_label: str | None = None
     occupied: bool = False
     state: str = "empty"
-    source: Literal["snapshot_slot", "inventory_candidate", "placeholder"] = "placeholder"
+    source: Literal["snapshot_slot", "inventory_candidate", "manual_mapping", "placeholder"] = "placeholder"
+    # The view draws a layout whose bay order is unvalidated (#1068): this bay
+    # names a disk only from a saved manual mapping and is never linked to the
+    # live enclosure bay at the same index (no snapshot_slot, no light).
+    manual_mapping_only: bool = False
     match_reasons: list[str] = Field(default_factory=list)
     placement_key: str | None = None
     assignment_rank: int | None = None
@@ -978,6 +984,7 @@ class StorageViewRuntimeView(BaseModel):
     panel_title: str | None = None
     edge_label: str | None = None
     face_style: str = "generic"
+    face_variant: str | None = None
     latch_edge: str = "bottom"
     bay_size: str | None = None
     row_groups: list[int] = Field(default_factory=list)

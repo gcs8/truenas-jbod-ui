@@ -396,8 +396,20 @@
     return lookup.byNumber.get(slotNumber) || null;
   }
 
+  // A bay prints the number the server labelled it with, so a profile whose
+  // chassis counts from 1 (slot_number_base, the UniFi NVRs in #1068) reads
+  // the same on every tab. A bay missing from the snapshot uses that base.
   function formatSlotLabel(slotNumber) {
-    return String(slotNumber).padStart(2, "0");
+    const number = Number(slotNumber);
+    if (!Number.isInteger(number)) {
+      return String(slotNumber).padStart(2, "0");
+    }
+    const label = String(getSlotById(number)?.slot_label ?? "");
+    if (/^\d+$/.test(label)) {
+      return label;
+    }
+    const base = Number(state.snapshot?.selected_profile?.slot_number_base);
+    return String(number + (Number.isInteger(base) ? base : 0)).padStart(2, "0");
   }
 
   function formatScopeLabel() {
@@ -480,6 +492,7 @@
         panel_title: selectedStorageView.panel_title || selectedStorageView.label || selectedStorageView.id,
         edge_label: selectedStorageView.edge_label || null,
         face_style: selectedStorageView.face_style || "generic",
+        face_variant: selectedStorageView.face_variant || null,
         latch_edge: selectedStorageView.latch_edge || "bottom",
         bay_size: selectedStorageView.bay_size || null,
         row_groups: Array.isArray(selectedStorageView.row_groups) ? selectedStorageView.row_groups : [],
@@ -1070,7 +1083,8 @@
       container.appendChild(tile);
     };
 
-    renderChassisRows(slotLayout, geometry, appendTile, target);
+    // Strips and other printed bay numbers follow this view's own bays.
+    renderChassisRows(slotLayout, geometry, appendTile, target, (slotValue) => storageViewStripSlotLabel(slotsByIndex, slotValue));
   }
 
   function renderLiveNvmeCarrierGrid(selectedProfile, target = grid) {
@@ -1167,6 +1181,7 @@
         enclosureTitle: enclosureLabel,
         edgeLabel: "Not a physical layout",
         faceStyle: "generic",
+        faceVariant: null,
         latchEdge: "bottom",
         baySize: null,
         rowGroups: [],
@@ -1212,6 +1227,7 @@
               : selectedStorageView.kind === "ses_enclosure"
                 ? (profile?.face_style || "generic")
                 : "generic",
+        faceVariant: selectedStorageView.kind === "ses_enclosure" ? (profile?.face_variant || null) : null,
         latchEdge:
           selectedStorageView.kind === "ses_enclosure"
             ? (profile?.latch_edge || "bottom")
@@ -1230,6 +1246,7 @@
       enclosureTitle: (state.snapshot.enclosures || []).length > 1 ? enclosureLabel : (profile?.panel_title || enclosureLabel),
       edgeLabel: profile?.edge_label || "System front",
       faceStyle: profile?.face_style || "generic",
+      faceVariant: profile?.face_variant || null,
       latchEdge: profile?.latch_edge || "bottom",
       baySize: profile?.bay_size || null,
       rowGroups: Array.isArray(profile?.row_groups) ? profile.row_groups : [],
@@ -1527,6 +1544,7 @@
       profileId: profile?.profileId || profile?.id || null,
       profileLabel: profile?.profileLabel || profile?.label || null,
       faceStyle: normalizedProfile.faceStyle,
+      faceVariant: profile?.faceVariant || profile?.face_variant || null,
       latchEdge: normalizedProfile.latchEdge,
       baySize: normalizedProfile.baySize,
       rowGroups,
@@ -1646,7 +1664,215 @@
       .join(" ");
   }
 
-  function renderChassisRows(layoutRows, geometry, appendTile, target = grid) {
+  // Per-model decoration for the UniFi NVR faces (#1068). Everything here is
+  // print, vents, lights and ports on the metal: never a bay. It is drawn as
+  // aria-hidden <div>s without data-slot, so clicks, focus, keyboard walking,
+  // search, summaries, the heat map, Connections and exports, which all read
+  // `.slot-tile[data-slot]`, never see it. Unknown variants draw the plain face.
+  function unifiFaceVariantSpec(geometry) {
+    if ((geometry?.faceStyle || geometry?.face_style) !== "unifi-drive") {
+      return null;
+    }
+    const variant = String(geometry?.faceVariant || geometry?.face_variant || "");
+    const specs = {
+      unvr: {
+        top: { ledBar: true, vents: 5 },
+        bottom: { print: "NVR", reset: true },
+        rows: {},
+      },
+      "unvr-pro": {
+        top: { vents: 5 },
+        bottom: { vents: 5, reset: true },
+        // The touchscreen and the two network ports share the top row with
+        // bays 1-3, so those bays sit offset from bays 4-7 below.
+        rows: {
+          0: {
+            before: { kind: "touchscreen", share: 0.3, print: "NVR Pro" },
+            after: { kind: "ports", share: 0.7 },
+          },
+        },
+      },
+    };
+    // UNVR-G2 family: rounded ends, a System LED dot with the model print,
+    // perforated vents (4 segments) top and bottom, trays with a handle block.
+    const g2 = (print) => ({
+      family: "g2",
+      top: { ledDot: true, print, vents: 4, perforated: true },
+      bottom: { vents: 4, perforated: true, reset: true },
+      rows: {},
+    });
+    specs["unvr-g2"] = g2("NVR G2");
+    specs["unvr-g2-pro"] = { ...g2("NVR G2 Pro"), rowStrip: { after: 0 } };
+    // Enterprise NVR family: 3U with rack handles; the top edge carries the LED
+    // bar, the print, the column number strips and RESET (plus a bezel
+    // accessory port on the ENVR only). Bays are full-width trays.
+    const envr = (print, accessoryPort) => ({
+      family: "envr",
+      handles: true,
+      top: { ledBar: true, print, columnStrips: true, reset: true, accessoryPort },
+      bottom: null,
+      rows: {},
+    });
+    specs.envr = envr("Enterprise NVR", true);
+    specs["envr-core"] = envr("Enterprise NVR Core", false);
+    return Object.prototype.hasOwnProperty.call(specs, variant) ? { variant, ...specs[variant] } : null;
+  }
+
+  // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
+  // They come from the layout and the same labels the drawn bays show, so a
+  // strip can never disagree with the bay tiles. The live page reads the live
+  // bays (formatSlotLabel); a saved chassis view passes its own bay labels,
+  // because the live enclosure may use another layout and label base (#1070).
+  function unifiFaceColumnLabels(layoutRows, rowIndexes = null, slotLabelFor = null) {
+    const rows = normalizeLayoutRows(layoutRows);
+    const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
+    const columns = Math.max(0, ...picked.map((row) => row.length));
+    return Array.from({ length: columns }, (_, column) =>
+      picked
+        .map((row) => row[column])
+        .filter((slotValue) => Number.isInteger(slotValue))
+        .map((slotValue) => String(Number((slotLabelFor || formatSlotLabel)(slotValue))))
+        .join(" / "));
+  }
+
+  // A saved chassis view's strip label for one bay: the label the view's own
+  // runtime slot carries (built from the view's pinned layout), never the live
+  // enclosure's bay at the same index. Non-numeric labels keep their number.
+  function storageViewStripSlotLabel(slotsByIndex, slotValue) {
+    const label = String(slotsByIndex.get(Number(slotValue))?.slot_label ?? "");
+    const digits = label.match(/(\d+)\s*$/);
+    return digits ? digits[1] : String(Number(slotValue) + 1);
+  }
+
+  function buildUnifiFaceBand(edge, band, layoutRows = [], slotLabelFor = null) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-band unifi-face-band-${edge}`;
+    element.setAttribute("aria-hidden", "true");
+    const parts = [];
+    if (band?.ledBar) {
+      parts.push('<span class="unifi-face-led-bar"></span>');
+    }
+    if (band?.ledDot) {
+      parts.push('<span class="unifi-face-led-dot"></span>');
+    }
+    if (band?.print) {
+      parts.push(`<span class="unifi-face-print">${escapeHtml(band.print)}</span>`);
+    }
+    if (band?.vents) {
+      const ventClass = band.perforated ? "unifi-face-vent unifi-face-vent-perforated" : "unifi-face-vent";
+      const vents = Array.from({ length: band.vents }, () => `<span class="${ventClass}"></span>`).join("");
+      parts.push(`<span class="unifi-face-vents" style="--unifi-vent-count: ${Number(band.vents)}">${vents}</span>`);
+    }
+    if (band?.columnStrips) {
+      const strips = unifiFaceColumnLabels(layoutRows, null, slotLabelFor)
+        .map((label) => `<span class="unifi-face-column-strip" data-column-label="${escapeHtml(label)}"><span class="unifi-face-vent"></span><span class="unifi-face-column-label">${escapeHtml(label)}</span></span>`)
+        .join("");
+      parts.push(`<span class="unifi-face-column-strips">${strips}</span>`);
+    }
+    if (band?.reset) {
+      parts.push('<span class="unifi-face-reset"><span class="unifi-face-reset-hole"></span>RESET</span>');
+    }
+    if (band?.accessoryPort) {
+      parts.push('<span class="unifi-face-accessory-port"></span>');
+    }
+    element.innerHTML = parts.join("");
+    return element;
+  }
+
+  function buildUnifiFaceRowStrip(layoutRows, rowIndex, slotLabelFor = null) {
+    const element = document.createElement("div");
+    element.className = "unifi-face-row-strip";
+    element.setAttribute("aria-hidden", "true");
+    element.innerHTML = unifiFaceColumnLabels(layoutRows, [rowIndex, rowIndex + 1], slotLabelFor)
+      .map((label) => `<span class="unifi-face-row-strip-label" data-column-label="${escapeHtml(label)}">${escapeHtml(label)}</span>`)
+      .join("");
+    return element;
+  }
+
+  function buildUnifiFaceRackHandle(side) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-rack-handle unifi-face-rack-handle-${side}`;
+    element.setAttribute("aria-hidden", "true");
+    return element;
+  }
+
+  function buildUnifiFaceDecor(decor) {
+    const element = document.createElement("div");
+    element.className = `unifi-face-decor unifi-face-${decor.kind}`;
+    element.setAttribute("aria-hidden", "true");
+    if (decor.kind === "touchscreen") {
+      element.setAttribute("title", "Touchscreen (not a bay)");
+      element.innerHTML = `
+        <span class="unifi-face-screen">
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-icon"></span>
+          <span class="unifi-face-screen-button"></span>
+        </span>
+        <span class="unifi-face-print">${escapeHtml(decor.print || "")}</span>
+      `;
+    } else if (decor.kind === "ports") {
+      element.setAttribute("title", "Network ports (not bays)");
+      element.innerHTML = `
+        <span class="unifi-face-port"><span class="unifi-face-port-rj45"><span class="unifi-face-port-led"></span></span><span class="unifi-face-port-label">1</span></span>
+        <span class="unifi-face-port"><span class="unifi-face-port-sfp"></span><span class="unifi-face-port-status"></span><span class="unifi-face-port-label">2</span></span>
+      `;
+    }
+    return element;
+  }
+
+  function renderUnifiFaceRows(layoutRows, spec, appendTile, target, slotLabelFor = null) {
+    if (spec.handles) {
+      target.appendChild(buildUnifiFaceRackHandle("left"));
+    }
+    if (spec.top) {
+      target.appendChild(buildUnifiFaceBand("top", spec.top, layoutRows, slotLabelFor));
+    }
+    normalizeLayoutRows(layoutRows).forEach((row, rowIndex) => {
+      const rowDecor = spec.rows?.[rowIndex] || null;
+      const rowWrapper = document.createElement("div");
+      rowWrapper.className = "slot-row";
+      const rowSlots = document.createElement("div");
+      rowSlots.className = "row-slots unifi-face-row";
+      // A decorated row draws the decoration where the layout keeps its empty
+      // cell; the layout itself, and every slot's index, are unchanged.
+      const cells = rowDecor ? row.filter((slotValue) => Number.isInteger(slotValue)) : row;
+      rowSlots.dataset.slotCount = String(cells.length);
+      const tracks = [];
+      if (rowDecor?.before) {
+        rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.before));
+        tracks.push(`minmax(var(--unifi-decor-min, 0px), ${rowDecor.before.share}fr)`);
+      }
+      cells.forEach((slotValue) => {
+        appendTile(rowSlots, slotValue);
+        tracks.push("minmax(var(--unifi-bay-min, 0px), 1fr)");
+      });
+      if (rowDecor?.after) {
+        rowSlots.appendChild(buildUnifiFaceDecor(rowDecor.after));
+        tracks.push(`minmax(var(--unifi-decor-min, 0px), ${rowDecor.after.share}fr)`);
+      }
+      rowWrapper.appendChild(rowSlots);
+      target.appendChild(rowWrapper);
+      rowSlots.style.gridTemplateColumns = tracks.join(" ");
+      if (spec.rowStrip && spec.rowStrip.after === rowIndex) {
+        target.appendChild(buildUnifiFaceRowStrip(layoutRows, rowIndex, slotLabelFor));
+      }
+    });
+    if (spec.bottom) {
+      target.appendChild(buildUnifiFaceBand("bottom", spec.bottom, layoutRows, slotLabelFor));
+    }
+    if (spec.handles) {
+      target.appendChild(buildUnifiFaceRackHandle("right"));
+    }
+  }
+
+  function renderChassisRows(layoutRows, geometry, appendTile, target = grid, slotLabelFor = null) {
+    const unifiFace = unifiFaceVariantSpec(geometry);
+    if (unifiFace) {
+      renderUnifiFaceRows(layoutRows, unifiFace, appendTile, target, slotLabelFor);
+      return;
+    }
     buildLayoutGridRows(layoutRows, geometry).forEach((layoutRow) => {
       const row = layoutRow.slots;
       const rowWrapper = document.createElement("div");
@@ -1950,6 +2176,7 @@
     const matches = [];
     for (const slot of slots) {
       if (slot?.snapshot_slot !== bayNumber) continue;
+      if (storageViewSlotIsManualOnly(slot)) return null;
       // Only snapshot-produced rows have view-level enclosure provenance.
       // Never borrow that identity for an inventory candidate lacking metadata.
       const slotEnclosureId = slot.snapshot_enclosure_id ?? (
@@ -3639,8 +3866,20 @@
     return Boolean(slotEnclosureId) && Boolean(enclosureId) && slotEnclosureId === enclosureId;
   }
 
+  // A chassis view drawn with a layout whose bay order is unvalidated (#1068)
+  // names a disk only from a saved manual mapping, sent on the view slot. Its
+  // bays never borrow the live bay at the same index, whatever the payload says.
+  function storageViewSlotIsManualOnly(slot) {
+    return slot?.manual_mapping_only === true;
+  }
+
   function getLiveBackedStorageViewSlot(view, slot) {
-    if (!isLiveStyledStorageView(view) || !slot || !Number.isInteger(slot.snapshot_slot)) {
+    if (
+      !isLiveStyledStorageView(view)
+      || !slot
+      || storageViewSlotIsManualOnly(slot)
+      || !Number.isInteger(slot.snapshot_slot)
+    ) {
       return null;
     }
     // getSlotById reads the rendered snapshot, so the bay must belong to it.
@@ -3906,7 +4145,7 @@
 
   function getStorageViewSmartCacheKey(view, slot) {
     if (!smartSnapshotMatchesSelection()) return null;
-    if (Number.isInteger(slot.snapshot_slot)
+    if (Number.isInteger(slot.snapshot_slot) && !storageViewSlotIsManualOnly(slot)
       && (!view.backing_enclosure_id || view.backing_enclosure_id === state.snapshot.selected_enclosure_id)) {
       const liveSlot = getSlotById(slot.snapshot_slot);
       if (!savedSmartIdentityMatchesLive(slot, liveSlot)) return null;
@@ -3921,7 +4160,7 @@
       return null;
     }
     const liveEnclosureId = view.backing_enclosure_id || currentLiveEnclosureId();
-    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot)
+    const usesLiveSlotHistory = Number.isInteger(slot.snapshot_slot) && !storageViewSlotIsManualOnly(slot)
       && storageViewSlotBayInEnclosure(slot, liveEnclosureId);
     return {
       slot: usesLiveSlotHistory ? slot.snapshot_slot : slot.slot_index,
@@ -9868,6 +10107,7 @@
       import: "imported assignment",
       modeled: "modeled layout",
       inventory_candidate: "inventory match",
+      manual_mapping: "saved assignment",
       snapshot_slot: "saved snapshot",
       scale_sg_ses: "SSH (SES)",
       "live-derived-core-demo": "demo data",
@@ -10022,6 +10262,16 @@
     if (chassisShell) {
       chassisShell.dataset.faceStyle = profile.faceStyle;
       chassisShell.dataset.latchEdge = profile.latchEdge;
+      // Only a face that draws this variant's decoration carries the marker
+      // the per-model styles key on.
+      const unifiFace = unifiFaceVariantSpec(profile);
+      if (unifiFace) {
+        chassisShell.dataset.faceVariant = unifiFace.variant;
+        chassisShell.dataset.faceFamily = unifiFace.family || "unvr";
+      } else {
+        delete chassisShell.dataset.faceVariant;
+        delete chassisShell.dataset.faceFamily;
+      }
     }
     applyChassisDriveScale(profile);
     if (secondaryContextTitle) {

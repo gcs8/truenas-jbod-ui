@@ -79,9 +79,20 @@ subsystem hints. Add SES commands only if the host exposes the corresponding
 ## UniFi UNVR
 
 UNVR and UNVR Pro use the generic Linux path. Their built-in profiles are
-`ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7`. The tested inventory
+`ubiquiti-unvr-front-4` and `ubiquiti-unvr-pro-front-7`. Both draw the real
+front (the UNVR Pro's touchscreen and network ports sit beside bays 1-3) and
+number the bays 1-4 and 1-7 as the chassis and UniFi OS do. The tested inventory
 path uses `lsblk`, `mdadm`, `smartctl`, and `ubntstorage` over SSH. It does not
 rely on `/sys/class/enclosure`.
+
+The UNVR-G2 (`ubiquiti-unvr-g2-front-4`), UNVR-G2-Pro
+(`ubiquiti-unvr-g2-pro-front-8`), Enterprise NVR (`ubiquiti-envr-front-16`) and
+Enterprise NVR Core (`ubiquiti-envr-core-front-16`) have built-in faces too.
+Layout only: bay-to-disk mapping is manual until validated on real hardware.
+They carry no bay hints and ignore the UniFi storage service's slot numbers, so
+every disk shows as unmapped until it is assigned to a bay with the normal
+manual mapping. Select them with `default_profile_id`; the app does not detect
+UniFi models on its own.
 
 Some appliances permit only password authentication or a root SSH account. If
 that is the only supported path, keep the credential outside tracked YAML and

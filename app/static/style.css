@@ -4201,6 +4201,456 @@ button.fabric-trace-crumb:hover {
   display: none;
 }
 
+/* UniFi NVR model faces (#1068). The shell is the brushed silver front panel;
+   the decoration (vents, print, LED, touchscreen, ports, reset) is aria-hidden
+   and takes no pointer events, so only the bays respond. */
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] {
+  --unifi-face-ink: #39434d;
+  --unifi-face-slot: #1b2128;
+  padding: 14px 18px 12px;
+  border-radius: 10px;
+  border-color: rgba(255, 255, 255, 0.5);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.5), rgba(255,255,255,0) 6%, rgba(0,0,0,0) 94%, rgba(0,0,0,0.08)),
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.05) 0 1px, rgba(0,0,0,0.02) 1px 3px),
+    linear-gradient(180deg, #e3e6ea, #d2d6db 50%, #c6cbd1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 10px 24px rgba(0, 0, 0, 0.28);
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .service-zone {
+  display: none;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-grid {
+  gap: 10px;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
+  display: grid;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
+  height: 92px;
+  min-height: 92px;
+  border-radius: 3px;
+  border: 2px solid var(--unifi-face-slot);
+  border-left-width: 5px;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .front-edge {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top-color: rgba(30, 38, 46, 0.14);
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .front-handle {
+  display: none;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .front-label {
+  margin: 0 auto;
+  font-size: 0.75rem;
+  color: var(--unifi-face-ink);
+}
+
+.unifi-face-band,
+.unifi-face-decor {
+  pointer-events: none;
+  user-select: none;
+}
+
+.unifi-face-decor {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  color: var(--unifi-face-ink, #39434d);
+}
+
+.unifi-face-band {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 12px;
+  color: var(--unifi-face-ink, #39434d);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+}
+
+.unifi-face-vents {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(var(--unifi-vent-count, 5), minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.unifi-face-vent {
+  height: 5px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #0b0e11, #262c33);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.unifi-face-led-bar {
+  flex: 0 0 auto;
+  width: 54px;
+  height: 5px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #8fe3ff, #39b8f0);
+  box-shadow: 0 0 8px rgba(57, 184, 240, 0.65);
+}
+
+.unifi-face-print {
+  flex: 0 0 auto;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #1f262d;
+}
+
+.unifi-face-band-bottom .unifi-face-print {
+  margin-left: 18px;
+}
+
+.unifi-face-reset {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 0.75rem;
+}
+
+.unifi-face-reset-hole {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #151a1f;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.6), 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.unifi-face-touchscreen {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.unifi-face-screen {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  place-items: center;
+  width: min(100%, 58px);
+  aspect-ratio: 1 / 1;
+  padding: 7px;
+  border-radius: 6px;
+  background: radial-gradient(circle at 50% 45%, #13253a, #05080c 72%);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.unifi-face-screen-icon {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: #3a8ff0;
+  opacity: 0.85;
+}
+
+.unifi-face-screen-button {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #3a8ff0;
+  border-radius: 50%;
+  background: #0a121b;
+  transform: translate(-50%, -50%);
+}
+
+.unifi-face-touchscreen .unifi-face-print {
+  font-size: 0.75rem;
+}
+
+.unifi-face-ports {
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.unifi-face-port {
+  position: relative;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+
+.unifi-face-port-rj45,
+.unifi-face-port-sfp {
+  position: relative;
+  display: block;
+  width: 30px;
+  height: 24px;
+  border-radius: 2px;
+  border: 2px solid #9ba3ab;
+  background: linear-gradient(180deg, #1f262c, #0b0e11);
+}
+
+.unifi-face-port-sfp {
+  width: 32px;
+  height: 20px;
+  background: repeating-linear-gradient(180deg, #2a3138 0 2px, #0b0e11 2px 4px);
+}
+
+.unifi-face-port-led {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 4px;
+  background: #46d36a;
+  box-shadow: 0 0 4px rgba(70, 211, 106, 0.8);
+}
+
+.unifi-face-port-status {
+  width: 6px;
+  height: 6px;
+  border: 1px solid #8a939b;
+  background: #f4f6f8;
+}
+
+/* UNVR-G2 family: rounded ends with darker metal edges, a narrow handle
+   block at each tray's right end carrying the status dot, perforated vents. */
+.chassis-shell[data-face-family="g2"] {
+  border-radius: 22px;
+  border: 0;
+  background:
+    linear-gradient(90deg, #7d858d 0, #b5bcc3 14px, rgba(0,0,0,0) 15px, rgba(0,0,0,0) calc(100% - 15px), #b5bcc3 calc(100% - 14px), #7d858d 100%),
+    linear-gradient(180deg, rgba(255,255,255,0.5), rgba(255,255,255,0) 6%),
+    linear-gradient(180deg, #e4e7ea, #d4d8dd 50%, #c8cdd2);
+  padding: 12px 26px 10px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile {
+  border-left-width: 2px;
+  padding-right: 58px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile::before {
+  right: 50px;
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile::after {
+  right: 56px;
+}
+
+/* The handle block: drawn on the tray's right end, the status dot sits in it. */
+.chassis-shell[data-face-family="g2"] .slot-latch {
+  display: block;
+  position: absolute;
+  inset: 4px 4px 4px auto;
+  width: 42px;
+  height: auto;
+  border-radius: 2px;
+  border: 1px solid rgba(29, 37, 44, 0.45);
+  background: linear-gradient(180deg, #e2e5e9, #c4cad1);
+  box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.7);
+}
+
+.chassis-shell[data-face-family="g2"] .slot-tile.state-empty .slot-latch {
+  background: linear-gradient(180deg, #e2e5e9, #c4cad1);
+}
+
+.chassis-shell[data-face-family="g2"] .slot-status-led {
+  right: 21px;
+  z-index: 2;
+}
+
+.unifi-face-vent-perforated {
+  height: 4px;
+  border-radius: 0;
+  background: radial-gradient(circle, #1a1f25 0 1px, transparent 1.4px) 0 0 / 5px 4px repeat-x;
+  box-shadow: none;
+}
+
+.unifi-face-led-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3aa9f0;
+  box-shadow: 0 0 6px rgba(58, 169, 240, 0.8);
+}
+
+.unifi-face-row-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-height: 18px;
+  align-items: center;
+  border-top: 2px solid rgba(29, 37, 44, 0.55);
+  border-bottom: 2px solid rgba(29, 37, 44, 0.55);
+  color: var(--unifi-face-ink, #39434d);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  text-align: center;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Enterprise NVR family: 3U, rack handles on both ends, a top edge with the
+   LED bar, print, the per-column number strips, RESET and (ENVR only) the
+   bezel accessory port. */
+.chassis-shell[data-face-family="envr"] {
+  padding: 12px 10px 10px;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-grid {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 30px;
+  column-gap: 10px;
+  row-gap: 6px;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-grid > .slot-row,
+.chassis-shell[data-face-family="envr"] .slot-grid > .unifi-face-band {
+  grid-column: 2;
+}
+
+.chassis-shell[data-face-family="envr"] .slot-tile {
+  height: 74px;
+  min-height: 74px;
+}
+
+.unifi-face-rack-handle {
+  grid-row: 1 / span 6;
+  align-self: stretch;
+  min-height: 120px;
+  border-radius: 6px;
+  border: 1px solid rgba(29, 37, 44, 0.35);
+  background:
+    linear-gradient(90deg, #9aa2aa, #e7eaed 30%, #f3f5f7 50%, #d4d9de 70%, #8f979f);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+.unifi-face-rack-handle-left {
+  grid-column: 1;
+}
+
+.unifi-face-rack-handle-right {
+  grid-column: 3;
+}
+
+.unifi-face-column-strips {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.unifi-face-column-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.unifi-face-column-strip .unifi-face-vent {
+  width: 100%;
+}
+
+.unifi-face-column-label {
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.unifi-face-accessory-port {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 18px;
+  border-radius: 4px;
+  background: linear-gradient(180deg, #3b434b, #1a1f25);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+@media (max-width: 640px) {
+  /* Bays keep a readable width on a phone; the face scrolls sideways, like
+     the other chassis faces, instead of squeezing the tray labels. */
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] {
+    --unifi-bay-min: 76px;
+    --unifi-decor-min: 34px;
+    padding: 10px 8px 8px;
+    overflow-x: auto;
+  }
+
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-grid {
+    min-width: max-content;
+  }
+
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
+    gap: 4px;
+  }
+
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
+    height: 76px;
+    min-height: 76px;
+    padding: 8px 18px 8px 8px;
+  }
+
+  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-status-led {
+    right: 6px;
+  }
+
+  .unifi-face-band {
+    gap: 6px;
+    font-size: 0.75rem;
+  }
+
+  .unifi-face-vents {
+    gap: 4px;
+  }
+
+  .unifi-face-led-bar {
+    width: 28px;
+  }
+
+  .unifi-face-ports {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .unifi-face-port-rj45,
+  .unifi-face-port-sfp {
+    width: 20px;
+    height: 15px;
+  }
+
+  .unifi-face-screen {
+    padding: 4px;
+  }
+
+  .unifi-face-screen-icon {
+    width: 5px;
+    height: 5px;
+  }
+
+  .unifi-face-screen-button {
+    width: 10px;
+    height: 10px;
+  }
+}
+
 .slot-tile:hover,
 .slot-tile.selected {
   transform: translateY(-2px);

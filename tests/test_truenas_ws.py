@@ -373,7 +373,9 @@ class TrueNASWebsocketClientTests(unittest.IsolatedAsyncioTestCase):
                 yield ReaderFailureWS()
 
         with self.assertRaises(RuntimeError) as caught:
-            await ReaderFailureClient(TrueNASConfig(api_key="token")).fetch_all()
+            # All five inventory calls must be in flight before this peer's
+            # reader fails, so allow five at once (#1072).
+            await ReaderFailureClient(TrueNASConfig(api_key="token", max_concurrent_calls=5)).fetch_all()
 
         self.assertIs(caught.exception, reader_error)
 
@@ -577,6 +579,8 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = TrueNASWebsocketClient(TrueNASConfig(
             host="https://smart-batch.invalid", api_key="synthetic-ephemeral-token", platform="core",
+            # The widest budget below; the CORE default cap has its own tests.
+            max_concurrent_calls=10,
         ))
         self.loop_errors = []
         loop = asyncio.get_running_loop()
@@ -721,7 +725,9 @@ class SmartctlBatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_one_session_bounded_parallelism_and_order(self):
         for size in (60, 84):
-            for budget in (1, 2, 12):
+            # The peer answers in full rounds of `budget`, so each size must be
+            # a multiple of it; 10 is the widest appliance limit (#1072).
+            for budget in (1, 2, 6):
                 with self.subTest(size=size, budget=budget):
                     peer = SyntheticDDPPeer(width=budget)
                     disks = [f"invented{n}" for n in range(size)]
@@ -1064,6 +1070,14 @@ class NormalOperationDeadlineChecks:
             platform="core" if self.dialect == "ddp" else "scale", api_dialect=self.dialect,
         ))
         self.client.config.timeout_seconds = 0.06
+        # #1072: these lifecycle checks need every inventory call in flight at
+        # once, and their subtests time out on purpose one after another on
+        # one host. Backoff and the per-appliance limit have their own tests in
+        # test_truenas_middleware_limits; here they would only couple subtests.
+        self.client.config.max_concurrent_calls = 10
+        no_backoff = patch("app.services.truenas_ws.MiddlewareCallLimiter.note_busy")
+        no_backoff.start()
+        self.addCleanup(no_backoff.stop)
         # These lifecycle checks time every operation against one budget. The
         # longer inventory deadline has its own test below.
         multiplier = patch("app.services.truenas_ws.INVENTORY_DEADLINE_MULTIPLIER", 1)

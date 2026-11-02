@@ -50,14 +50,17 @@ const LAYOUT_FUNCTIONS = [
   "rowGroupingMetrics",
   "groupColumnTemplate",
   "buildLayoutGridRows",
+  "unifiFaceVariantSpec",
   "renderChassisRows",
 ];
 
 const RENDER_FUNCTIONS = [
   "escapeHtml",
+  "getSlotById",
   "formatSlotLabel",
   "sasFabricList",
   "sasFabricSortedSlots",
+  "storageViewSlotIsManualOnly",
   "sasFabricViewSlotForBay",
   "renderSasFabricFlatBayChips",
   "sasFabricBayGridCell",
@@ -379,7 +382,7 @@ const BOOT_VIEW_ON_BAYS = {
   ],
 };
 
-const BAY_TO_VIEW_SLOT_FUNCTIONS = ["sasFabricList", "sasFabricViewSlotForBay"];
+const BAY_TO_VIEW_SLOT_FUNCTIONS = ["sasFabricList", "storageViewSlotIsManualOnly", "sasFabricViewSlotForBay"];
 
 const frontBay = { slot_index: 1, snapshot_slot: 3, snapshot_enclosure_id: "front", source: "inventory_candidate" };
 const rearBay = { slot_index: 0, snapshot_slot: 3, snapshot_enclosure_id: "rear", source: "inventory_candidate" };
