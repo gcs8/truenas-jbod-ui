@@ -377,6 +377,7 @@ class EnclosureProfileView(BaseModel):
     row_groups: list[int] = Field(default_factory=list)
     slot_hints: dict[int, list[str]] = Field(default_factory=dict)
     slot_number_base: int | None = None
+    face_variant: str | None = None
 
 
 class InventorySummary(BaseModel):
@@ -978,6 +979,7 @@ class StorageViewRuntimeView(BaseModel):
     panel_title: str | None = None
     edge_label: str | None = None
     face_style: str = "generic"
+    face_variant: str | None = None
     latch_edge: str = "bottom"
     bay_size: str | None = None
     row_groups: list[int] = Field(default_factory=list)

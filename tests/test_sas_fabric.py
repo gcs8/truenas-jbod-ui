@@ -2571,6 +2571,39 @@ class VirtualFabricTests(unittest.TestCase):
 
 
 class SasFabricSnapshotTests(unittest.TestCase):
+    def test_bay_nodes_and_zone_ranges_use_the_chassis_bay_labels(self) -> None:
+        # Codex P2 on #1069: a UNVR Pro prints its bays 1-7 (slot_number_base
+        # 1), so the Storage Fabric graph must call slot index 0 "Bay 01", not
+        # "Bay 00". Profiles without a base keep their zero-based labels.
+        from app.services.sas_fabric import _backplane_zones_for_slots
+
+        def snapshot(base: int) -> InventorySnapshot:
+            return InventorySnapshot(
+                slots=[
+                    SlotView(
+                        slot=index,
+                        slot_label=f"{index + base:02d}",
+                        row_index=0 if index < 3 else 1,
+                        column_index=index if index < 3 else index - 3,
+                        present=index < 2,
+                        state=SlotState.healthy if index < 2 else SlotState.empty,
+                        device_name=f"sd{chr(97 + index)}" if index < 2 else None,
+                    )
+                    for index in range(7)
+                ],
+                refresh_interval_seconds=30,
+            )
+
+        system = SystemConfig(id="unvr-pro", label="UniFi UNVR Pro", truenas=TrueNASConfig(platform="linux"))
+        for base, first, second in ((1, "Bay 01", "Bay 02"), (0, "Bay 00", "Bay 01")):
+            with self.subTest(base=base):
+                fabric = build_sas_fabric_snapshot(system=system, snapshot=snapshot(base), ssh_outputs={})
+                bay_labels = {node.slot: node.label for node in fabric.nodes if node.kind == "bay"}
+                self.assertEqual(bay_labels[0], first)
+                self.assertEqual(bay_labels[1], second)
+                zones = _backplane_zones_for_slots(snapshot(base).slots)
+                self.assertEqual(zones[0]["range"], f"Bays {base:02d}-{1 + base:02d}")
+
     def test_select_sas_fabric_builder_key_keeps_platform_selection_explicit(self) -> None:
         def system(platform: str) -> SystemConfig:
             return SystemConfig(id=f"{platform}-system", label=platform.upper(), truenas=TrueNASConfig(platform=platform))

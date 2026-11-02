@@ -130,6 +130,18 @@ class ProfileBuilderService:
             else:
                 slot_number_base = None
 
+            # The admin form has no variant field: a copy or re-save keeps the
+            # model decoration of the profile it came from while the face
+            # style is unchanged, and drops it when the face style changes.
+            face_variant = next(
+                (
+                    candidate.face_variant
+                    for candidate in (existing_profile, source_profile)
+                    if candidate is not None and candidate.face_style == payload.face_style
+                ),
+                None,
+            )
+
             slot_layout: list[list[int | None]]
             slot_hints: dict[int, list[str]]
             if payload.slot_layout is not None:
@@ -186,6 +198,7 @@ class ProfileBuilderService:
                 row_groups=_normalize_row_groups(payload.row_groups, int(payload.columns)),
                 slot_hints=slot_hints,
                 slot_number_base=slot_number_base,
+                face_variant=face_variant,
             )
 
             if existing_index is None:

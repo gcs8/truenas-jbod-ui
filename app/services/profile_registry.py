@@ -256,10 +256,11 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
             id=UNIFI_UNVR_FRONT_4_PROFILE_ID,
             label="Ubiquiti UniFi UNVR Front 4",
             eyebrow="Ubiquiti UniFi UNVR",
-            summary="Front of the chassis, 4 bays.",
+            summary="Front of the chassis, 4 bays, numbered 1-4 as printed on the chassis.",
             panel_title="Front 4 Bay",
             edge_label="Front of chassis",
             face_style="unifi-drive",
+            face_variant="unvr",
             latch_edge="bottom",
             bay_size="3.5",
             rows=1,
@@ -273,15 +274,19 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 2: ["4:0:0:0"],
                 3: ["6:0:0:0"],
             },
+            # The chassis and UniFi OS number the bays 1-4; slot indices stay
+            # 0-based, so saved mappings and history keep their keys.
+            slot_number_base=1,
         ),
         EnclosureProfileConfig(
             id=UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID,
             label="Ubiquiti UniFi UNVR Pro Front 7",
             eyebrow="Ubiquiti UniFi UNVR Pro",
-            summary="Front of the chassis, 7 bays: 3 on the top row and 4 below.",
+            summary="Front of the chassis, 7 bays: 1-3 on the top row beside the touchscreen and ports, 4-7 below.",
             panel_title="Front 7 Bay",
             edge_label="Front of chassis",
             face_style="unifi-drive",
+            face_variant="unvr-pro",
             latch_edge="bottom",
             bay_size="3.5",
             rows=2,
@@ -297,6 +302,8 @@ def _built_in_profiles() -> list[EnclosureProfileConfig]:
                 0: ["7:0:0:0"],
                 1: ["5:0:0:0"],
             },
+            # Bays print 1-7 on the chassis; slot indices are unchanged.
+            slot_number_base=1,
         ),
         EnclosureProfileConfig(
             id=QUANTASTOR_SSG_SHARED_24_PROFILE_ID,
@@ -533,6 +540,7 @@ def _profile_to_view(profile: EnclosureProfileConfig) -> EnclosureProfileView:
         row_groups=list(profile.row_groups),
         slot_hints={int(slot): list(hints) for slot, hints in (profile.slot_hints or {}).items()},
         slot_number_base=profile.slot_number_base,
+        face_variant=profile.face_variant,
     )
 
 

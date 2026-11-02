@@ -50,11 +50,13 @@ const LAYOUT_FUNCTIONS = [
   "rowGroupingMetrics",
   "groupColumnTemplate",
   "buildLayoutGridRows",
+  "unifiFaceVariantSpec",
   "renderChassisRows",
 ];
 
 const RENDER_FUNCTIONS = [
   "escapeHtml",
+  "getSlotById",
   "formatSlotLabel",
   "sasFabricList",
   "sasFabricSortedSlots",
