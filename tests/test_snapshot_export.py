@@ -856,6 +856,56 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
                 inlined = {path for path, data_url in photos.items() if data_url in rendered.html}
                 self.assertEqual(inlined, expected)
 
+    async def test_offline_copy_carries_the_unifi_face_variant_and_chassis_numbers(self) -> None:
+        # #1068: an offline copy of a UNVR Pro draws the same model face as the
+        # live page. The face variant travels in the exported snapshot, the
+        # bays keep their slot indices and the chassis label base, and the
+        # decoration never becomes a slot in the exported data.
+        from app.services.profile_registry import UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID, ProfileRegistry
+
+        profile = ProfileRegistry(Settings()).get(UNIFI_UNVR_PRO_FRONT_7_PROFILE_ID)
+        self.assertIsNotNone(profile)
+        positions = [
+            (slot, row_index, column_index)
+            for row_index, row in enumerate(profile.slot_layout)
+            for column_index, slot in enumerate(row)
+            if slot is not None
+        ]
+        snapshot = build_snapshot().model_copy(
+            update={
+                "selected_profile": profile,
+                "layout_rows": profile.slot_layout,
+                "layout_slot_count": len(positions),
+                "layout_columns": profile.columns,
+                "slots": [
+                    build_snapshot().slots[0].model_copy(
+                        update={"slot": slot, "slot_label": f"{slot + 1:02d}", "row_index": row, "column_index": column}
+                    )
+                    for slot, row, column in positions
+                ],
+            }
+        )
+        exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
+        rendered = await exporter.build_enclosure_snapshot_html(
+            request=build_request(),
+            snapshot=snapshot,
+            smart_summary_cache=build_smart_summary_cache(),
+            selected_slot=0,
+            history_window_hours=24,
+            io_chart_mode="total",
+        )
+        html = rendered.html
+        self.assertIsNotNone(re.search(r'"face_variant"\s*:\s*"unvr-pro"', html), "face variant missing from the offline copy")
+        self.assertIsNotNone(
+            re.search(
+                r'"slot_layout"\s*:\s*\[\s*\[\s*0\s*,\s*1\s*,\s*2\s*,\s*null\s*\]\s*,\s*\[\s*3\s*,\s*4\s*,\s*5\s*,\s*6\s*\]\s*\]',
+                html,
+            ),
+            "slot layout changed in the offline copy",
+        )
+        slot_labels = re.findall(r'"slot_label"\s*:\s*"(\d+)"', html)
+        self.assertEqual(sorted(set(slot_labels)), ["01", "02", "03", "04", "05", "06", "07"])
+
     async def test_static_assets_are_read_once_per_service(self) -> None:
         exporter = SnapshotExportService(Settings(), FakeHistoryBackend(), templates)  # type: ignore[arg-type]
         runtime = self._runtime_with_view(
