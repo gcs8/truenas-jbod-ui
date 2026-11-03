@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.config import get_settings
+from app.config import current_service_role, get_settings
 from app.http_auth import configured_origin_identity
 from app.logging_config import configure_logging
 from app.metrics import install_metrics
@@ -46,6 +46,8 @@ from app.services.storage_writability import (
 
 
 def create_app() -> FastAPI:
+    # A misspelled APP_SERVICE_ROLE stops startup, not every later API call (#1072).
+    current_service_role()
     startup_settings = get_settings()
     operator_auth_settings = load_read_ui_auth_settings()
     if (

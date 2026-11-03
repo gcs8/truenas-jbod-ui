@@ -99,6 +99,8 @@ truenas:
   # once, across refreshes, SMART grids, drawers and LED actions (1-10). null
   # picks 4 on CORE and 8 on SCALE. The TrueNAS middleware admits 10 calls per
   # connection and its own alert checks share that process, so stay under 10.
+  # This is the total for the whole app: the main UI, history and Admin
+  # services each take a fixed share (4 is 2/1/1, 8 is 4/2/2).
   max_concurrent_calls: null
   # Optional substring match against enclosure id, name, or label.
   enclosure_filter: null

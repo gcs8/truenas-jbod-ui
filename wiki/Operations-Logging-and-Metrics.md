@@ -182,6 +182,7 @@ Exported metrics include:
 - HTTP request count, in-flight request, and latency metrics
 - build and version information
 - history collector state, tracked-slot counts, and collection duration
+- TrueNAS middleware call limits and calls in flight
 - admin backup inspection and import counts and duration
 - scheduled-backup status metrics
 
@@ -214,6 +215,27 @@ Allowed `operation` values: `inspect`, `import`, or `unknown`. Allowed `outcome`
 The 7z create deadline is 600 seconds or the staged input divided by 512 KiB/s, whichever is longer, capped at 4 hours. The only `operation` value is `create`. A process that does not serve `/metrics`, such as the scheduled backup job, logs the same values in its `Portable 7z create deadline` line instead.
 
 Request IDs never become metric labels. Metric labels also omit paths, archive names, system identifiers, credentials, request content, and exception messages.
+
+### TrueNAS middleware call metrics
+
+The main UI and Admin service report how many middleware calls each has in
+flight against each configured TrueNAS system. History reads through the main
+UI, so it reports none.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `truenas_jbod_ui_truenas_middleware_call_limit` | `role`, `system_id` | Calls this service may have in flight at once: its share of the appliance's `max_concurrent_calls` |
+| `truenas_jbod_ui_truenas_middleware_call_budget` | `role`, `system_id` | The appliance's configured `max_concurrent_calls`, shared by every service |
+| `truenas_jbod_ui_truenas_middleware_calls_in_flight` | `role`, `system_id` | Calls this service has in flight now |
+| `truenas_jbod_ui_truenas_middleware_calls_in_flight_peak` | `role`, `system_id` | Most calls this service has had in flight at once since it started |
+
+`role` is the service's `APP_SERVICE_ROLE` (`ui`, `history` or `admin`), or
+`none` when it is unset. `system_id` is the configured system id. Systems that
+point at the same appliance share one limit and report the same values. The
+series appear after the service first contacts that system, and a system
+removed from the configuration keeps its series until the service restarts.
+Each service's peak stays at or below its limit, and from a budget of 3 upward
+the limits add up to the budget.
 
 ### HTTP request labels
 
