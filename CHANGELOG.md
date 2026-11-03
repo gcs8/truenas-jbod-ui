@@ -66,7 +66,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `APP_SERVICE_ROLE` on each service, and each takes a fixed share (4 is UI 2,
   history 1, Admin 1; 8 is 4, 2, 2). Each service's share and its peak calls in
   flight are exported as `truenas_jbod_ui_truenas_middleware_*` metrics
-  (#PRNUM, refs #1072).
+  (#1078, refs #1072).
 
 ### Fixed
 
