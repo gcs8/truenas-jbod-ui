@@ -60,6 +60,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Closed TrueNAS middleware connections only after an interrupted login
+  answers, within one call timeout, so a timed-out or cancelled read no longer
+  leaves a stale API session on the appliance (#1076, refs #1072).
 - `max_concurrent_calls` is now the total for the whole app instead of a limit
   that the main UI, history and Admin services each applied on their own, so
   together they could go over it. Compose sets
@@ -67,12 +70,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   history 1, Admin 1; 8 is 4, 2, 2). Each service's share and its peak calls in
   flight are exported as `truenas_jbod_ui_truenas_middleware_*` metrics
   (#1078, refs #1072).
-
-### Fixed
-
-- Closed TrueNAS middleware connections only after an interrupted login
-  answers, within one call timeout, so a timed-out or cancelled read no longer
-  leaves a stale API session on the appliance (#1076, refs #1072).
 - Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
   not used" where a platform has no API and names the QuantaStor or ESXi API
   where it has one, SSH shows "partial" when only optional reads failed and
