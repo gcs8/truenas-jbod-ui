@@ -7,14 +7,17 @@ through the real websocket client; nothing contacts a real appliance.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from pydantic import ValidationError
 
-from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig, load_settings
+from app.config import PathConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig, load_settings
 from app.services.truenas_ws import TrueNASAPIBusyError, TrueNASAPIError, TrueNASWebsocketClient
 from tests.fake_truenas_middleware import API_KEY, FakeMiddleware
 
@@ -446,6 +449,224 @@ class InventoryBusyStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("busy", bundle.sources["api"].message.lower())
         self.assertFalse(any("unreachable" in warning for warning in bundle.warnings), bundle.warnings)
         self.assertTrue(any("busy" in warning.lower() for warning in bundle.warnings), bundle.warnings)
+
+
+ROLE_CHILD_SCRIPT = r"""
+import asyncio, json, sys
+from app.config import TrueNASConfig
+from app.services.truenas_ws import TrueNASWebsocketClient
+
+host, platform, dialect, total, calls, api_key = sys.argv[1:7]
+
+async def main():
+    client = TrueNASWebsocketClient(TrueNASConfig(
+        host=host, api_key=api_key, platform=platform, api_dialect=dialect,
+        max_concurrent_calls=int(total),
+    ))
+    print(json.dumps({"event": "ready"}), flush=True)
+    await asyncio.gather(*(client.fetch_disk_smartctl(f"da{index}") for index in range(int(calls))))
+    limiter = client.call_limiter
+    print(json.dumps({"event": "done", "limit": limiter.limit, "peak": getattr(limiter, "peak_active", None)}),
+          flush=True)
+
+asyncio.run(main())
+"""
+
+
+def _role_environment(role: str | None) -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if key != "APP_SERVICE_ROLE"}
+    repository = str(Path(__file__).resolve().parents[1])
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (repository, environment.get("PYTHONPATH", "")) if part
+    )
+    if role is not None:
+        environment["APP_SERVICE_ROLE"] = role
+    return environment
+
+
+class ServiceRoleBudgetSplitTests(unittest.TestCase):
+    """#1072 follow-up: the configured limit is the total across the service processes."""
+
+    def test_split_for_every_total_and_role(self) -> None:
+        from app.config import SERVICE_ROLES, split_max_concurrent_calls
+
+        self.assertEqual(SERVICE_ROLES, ("ui", "history", "admin"))
+        expected = {
+            1: (1, 1, 1), 2: (1, 1, 1), 3: (1, 1, 1), 4: (2, 1, 1), 5: (3, 1, 1),
+            6: (4, 1, 1), 7: (5, 1, 1), 8: (4, 2, 2), 9: (5, 2, 2), 10: (6, 2, 2),
+        }
+        for total in range(1, 11):
+            shares = tuple(split_max_concurrent_calls(total, role) for role in SERVICE_ROLES)
+            with self.subTest(total=total):
+                self.assertEqual(shares, expected[total])
+                self.assertTrue(all(share >= 1 for share in shares))
+                if total >= len(SERVICE_ROLES):
+                    self.assertEqual(sum(shares), total)
+                # No role set: one process owns the whole budget, as before.
+                self.assertEqual(split_max_concurrent_calls(total, None), total)
+
+    def test_unknown_role_and_out_of_range_total_are_rejected(self) -> None:
+        from app.config import split_max_concurrent_calls
+
+        for role in ("UI", "worker", ""):
+            with self.subTest(role=role), self.assertRaises(ValueError):
+                split_max_concurrent_calls(4, role)
+        for total in (0, 11, -1):
+            with self.subTest(total=total), self.assertRaises(ValueError):
+                split_max_concurrent_calls(total, "ui")
+
+    def test_role_comes_from_the_environment(self) -> None:
+        from app.config import ConfigurationError, current_service_role, role_max_concurrent_calls
+
+        for raw, role in (("ui", "ui"), (" admin ", "admin"), ("history", "history"), ("", None)):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"APP_SERVICE_ROLE": raw}):
+                self.assertEqual(current_service_role(), role)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(current_service_role())
+            self.assertEqual(role_max_concurrent_calls(TrueNASConfig(platform="core")), 4)
+            self.assertEqual(role_max_concurrent_calls(TrueNASConfig(platform="scale")), 8)
+        with patch.dict(os.environ, {"APP_SERVICE_ROLE": "admin"}):
+            self.assertEqual(role_max_concurrent_calls(TrueNASConfig(platform="core")), 1)
+            self.assertEqual(role_max_concurrent_calls(TrueNASConfig(platform="scale")), 2)
+        with patch.dict(os.environ, {"APP_SERVICE_ROLE": "worker"}):
+            with self.assertRaises(ConfigurationError) as captured:
+                current_service_role()
+        self.assertIn("APP_SERVICE_ROLE", str(captured.exception))
+        self.assertNotIn("worker", str(captured.exception))
+
+    def test_services_refuse_to_start_with_an_unknown_role(self) -> None:
+        from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN  # noqa: F401 - admin import-time origin
+        import admin_service.main
+        import app.main
+        from app.config import ConfigurationError
+
+        for create_app in (app.main.create_app, admin_service.main.create_app):
+            with self.subTest(service=create_app.__module__), patch.dict(os.environ, {"APP_SERVICE_ROLE": "worker"}):
+                with self.assertRaises(ConfigurationError):
+                    create_app()
+
+    def test_config_bounds_are_unchanged(self) -> None:
+        from app.config import TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT
+
+        field = TrueNASConfig.model_fields["max_concurrent_calls"]
+        bounds = {type(item).__name__: item for item in field.metadata}
+        self.assertEqual((bounds["Ge"].ge, bounds["Le"].le), (1, TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT))
+        self.assertEqual(TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT, 10)
+
+    def test_every_compose_service_that_calls_an_appliance_names_its_role(self) -> None:
+        import yaml
+
+        root = Path(__file__).resolve().parents[1]
+        for compose_name in ("docker-compose.yml", "docker-compose.dev.yml"):
+            services = yaml.safe_load((root / compose_name).read_text(encoding="utf-8"))["services"]
+            for service, role in (("enclosure-ui", "ui"), ("enclosure-history", "history"), ("enclosure-admin", "admin")):
+                with self.subTest(compose=compose_name, service=service):
+                    self.assertEqual(services[service]["environment"].get("APP_SERVICE_ROLE"), role)
+
+
+class ServiceRoleProcessTests(unittest.IsolatedAsyncioTestCase):
+    """Three real service processes share one appliance's budget (#1072)."""
+
+    async def run_roles(self, fake: FakeMiddleware, roles, *, platform: str, dialect: str, total: int):
+        fake.hold = asyncio.Event()
+        calls = total * 2
+        children = [
+            await asyncio.create_subprocess_exec(
+                sys.executable, "-c", ROLE_CHILD_SCRIPT, fake.host, platform, dialect, str(total), str(calls), API_KEY,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=_role_environment(role),
+            )
+            for role in roles
+        ]
+        try:
+            for child in children:
+                line = await asyncio.wait_for(child.stdout.readline(), 30)
+                self.assertEqual(json.loads(line)["event"], "ready", line)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15
+            # Let every child fill whatever budget it has, then hold a while
+            # longer so any process allowed past the total gets there too.
+            while fake.inflight < total and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.75)
+            held_peak = fake.peak_inflight
+        finally:
+            fake.hold.set()
+        outcomes = []
+        for child in children:
+            stdout, stderr = await asyncio.wait_for(child.communicate(), 60)
+            self.assertEqual(child.returncode, 0, stderr.decode(errors="replace")[-2000:])
+            outcomes.append(json.loads(stdout.decode().strip().splitlines()[-1]))
+        await wait_for_closes(fake)
+        return held_peak, outcomes
+
+    async def test_combined_peak_stays_within_the_total(self) -> None:
+        for platform, dialect, total, shares in (("core", "ddp", 4, [2, 1, 1]), ("scale", "jsonrpc", 8, [4, 2, 2])):
+            with self.subTest(platform=platform):
+                async with FakeMiddleware() as fake:
+                    peak, outcomes = await self.run_roles(
+                        fake, ("ui", "history", "admin"), platform=platform, dialect=dialect, total=total,
+                    )
+                self.assertLessEqual(fake.peak_inflight, total)
+                self.assertEqual(peak, total)
+                self.assertEqual([item["limit"] for item in outcomes], shares)
+                self.assertEqual([item["peak"] for item in outcomes], shares)
+                self.assertEqual(fake.method_calls.count("disk.smartctl"), 3 * total * 2)
+                self.assertEqual(fake.sessions, {})
+
+    async def test_a_process_without_a_role_keeps_the_full_total(self) -> None:
+        async with FakeMiddleware() as fake:
+            peak, outcomes = await self.run_roles(fake, (None,), platform="core", dialect="ddp", total=4)
+        self.assertEqual(peak, 4)
+        self.assertEqual(outcomes, [{"event": "done", "limit": 4, "peak": 4}])
+
+
+class MiddlewareCallLimitMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_limit_and_peak_in_flight_are_exported(self) -> None:
+        from prometheus_client import REGISTRY
+
+        async with FakeMiddleware() as fake:
+            fake.call_delay = 0.05
+            with patch.dict(os.environ, {"APP_SERVICE_ROLE": "ui"}):
+                client = TrueNASWebsocketClient(
+                    TrueNASConfig(host=fake.host, api_key=API_KEY, platform="core"), system_id="synthetic-metrics",
+                )
+                await asyncio.wait_for(asyncio.gather(
+                    *(client.fetch_disk_smartctl(f"da{index}") for index in range(6))
+                ), 10)
+            await wait_for_closes(fake)
+        labels = {"role": "ui", "system_id": "synthetic-metrics"}
+        prefix = "truenas_jbod_ui_truenas_middleware"
+        self.assertEqual(REGISTRY.get_sample_value(f"{prefix}_call_limit", labels), 2)
+        self.assertEqual(REGISTRY.get_sample_value(f"{prefix}_call_budget", labels), 4)
+        self.assertEqual(REGISTRY.get_sample_value(f"{prefix}_calls_in_flight", labels), 0)
+        self.assertEqual(REGISTRY.get_sample_value(f"{prefix}_calls_in_flight_peak", labels), 2)
+        self.assertLessEqual(fake.peak_inflight, 2)
+        operations = (Path(__file__).resolve().parents[1] / "wiki" / "Operations-Logging-and-Metrics.md").read_text(
+            encoding="utf-8"
+        )
+        for name in ("call_limit", "call_budget", "calls_in_flight", "calls_in_flight_peak"):
+            self.assertIn(f"`{prefix}_{name}`", operations)
+
+    async def test_registry_clients_label_the_limiter_with_their_system(self) -> None:
+        from app.services.inventory_registry import InventoryRegistry
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        settings = Settings(
+            systems=[SystemConfig(id="synthetic-alpha", truenas=TrueNASConfig(
+                platform="core", host="https://alpha.example.test"))],
+            default_system_id="synthetic-alpha",
+            paths=PathConfig(
+                mapping_file=str(root / "mappings.json"),
+                sas_fabric_alias_file=str(root / "aliases.json"),
+                slot_detail_cache_file=str(root / "slot_detail_cache.json"),
+                profile_file=str(root / "profiles.yaml"),
+                log_file=str(root / "app.log"),
+            ),
+        )
+        service = InventoryRegistry(settings).get_service("synthetic-alpha")
+        self.assertIn("synthetic-alpha", service.truenas_client.call_limiter.system_ids)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,30 @@ heavy read bursts those checks can time out and email a transient
 `Failed to check for alert` message, so the default leaves most of that
 capacity to the appliance. Valid values are 1 to 10.
 
+The limit is the total for the whole app. The main UI, history and Admin
+services run as separate processes, and Compose gives each a fixed share of it
+through `APP_SERVICE_ROLE`, so together they never go over it:
+
+| `max_concurrent_calls` | Main UI | History | Admin |
+| --- | --- | --- | --- |
+| 1, 2 or 3 | 1 | 1 | 1 |
+| 4 (CORE default) | 2 | 1 | 1 |
+| 5 | 3 | 1 | 1 |
+| 6 | 4 | 1 | 1 |
+| 7 | 5 | 1 | 1 |
+| 8 (SCALE default) | 4 | 2 | 2 |
+| 9 | 5 | 2 | 2 |
+| 10 | 6 | 2 | 2 |
+
+History and Admin each get a quarter of the total, at least 1, and the main UI
+gets the rest. No service gets 0, so below 3 the services together can make up
+to 3 calls. History reads inventory through the main UI rather than calling the
+appliance, so its share stays unused. A single process started without
+`APP_SERVICE_ROLE`, such as a source checkout run by hand, keeps the whole
+limit. Each service's share and its peak calls in flight appear in the
+`truenas_jbod_ui_truenas_middleware_*` metrics described in
+[[Operations, logging, and metrics|Operations-Logging-and-Metrics]].
+
 When the middleware answers that it is busy, or a whole inventory read times
 out, the app backs off. It waits 2 seconds, doubling on each further busy
 reply up to 60 seconds, with random jitter. While backing off, the API source
