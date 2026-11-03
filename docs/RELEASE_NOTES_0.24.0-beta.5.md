@@ -16,7 +16,8 @@ each pull request.
 
 - TrueNAS middleware calls now share one limit per appliance, across inventory
   refreshes, SMART grids, slot drawers and LED actions: 4 calls in flight on
-  CORE and 8 on SCALE. When the appliance answers that it is busy, or a whole
+  CORE and 8 on SCALE, in total for the whole app, split between the main UI,
+  history and Admin services. When the appliance answers that it is busy, or a whole
   inventory read times out, the app backs off with jitter and shows the API
   source as busy instead of unreachable. Heavy read bursts no longer starve the
   appliance's own alert checks.
@@ -36,13 +37,17 @@ each pull request.
 
 ## Before you test it
 
-- Upgrading from v0.24.0-beta.4: only the image changes. The Compose files are
-  the same.
+- Upgrading from v0.24.0-beta.4: the shipped Compose files now set
+  `APP_SERVICE_ROLE` (`ui`, `history`, `admin`) on each service. Take the new
+  `docker-compose.yml`, or add those lines to a custom Compose file; without
+  them each service keeps the whole call limit, as in beta.4.
 - Upgrading from v0.23.0 or older, read the v0.24.0-beta.1 to v0.24.0-beta.4
   upgrade notes in `CHANGELOG.md` first; they all still apply.
 - `max_concurrent_calls` (environment `TRUENAS_MAX_CONCURRENT_CALLS`) is new.
   Leave it blank for the defaults, 4 on CORE and 8 on SCALE, or set 1 to 10.
-  The middleware admits 10 calls per connection, so stay below that.
+  The middleware admits 10 calls per connection, so stay below that. It is the
+  total for the whole app: 4 is split 2/1/1 and 8 is split 4/2/2 between the
+  main UI, history and Admin services.
 - API sessions that earlier versions already left behind on a CORE 13
   appliance stay listed until its middleware restarts. This release stops new
   ones; it does not clear old ones.

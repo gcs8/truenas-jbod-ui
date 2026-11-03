@@ -19,7 +19,17 @@ from urllib.parse import urlsplit, urlunsplit
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from app.config import TRUENAS_API_VERSION_PATTERN, TrueNASConfig, effective_max_concurrent_calls
+from prometheus_client import REGISTRY
+from prometheus_client.core import GaugeMetricFamily
+
+from app.config import (
+    TRUENAS_API_VERSION_PATTERN,
+    TrueNASConfig,
+    current_service_role,
+    effective_max_concurrent_calls,
+    split_max_concurrent_calls,
+)
+from app.metrics import METRICS_NAMESPACE
 from app.services.tls_context import build_tls_client_context, resolve_tls_server_name
 
 logger = logging.getLogger(__name__)
@@ -108,9 +118,17 @@ class MiddlewareCallLimiter:
     base_delay_seconds = 2.0
     max_delay_seconds = 60.0
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, *, budget: int | None = None, role: str | None = None) -> None:
         self.limit = limit
+        # The appliance's configured total, of which ``limit`` is this
+        # process's share (#1072), and the service role that chose the share.
+        self.budget = limit if budget is None else budget
+        self.role = role
         self.active = 0
+        # Most calls this process has had in flight at once (#1072).
+        self.peak_active = 0
+        # Configured systems whose clients use this limiter, for metrics.
+        self.system_ids: set[str] = set()
         self._waiters: deque[asyncio.Future[None]] = deque()
         self._failures = 0
         self._cooldown_until = 0.0
@@ -142,7 +160,7 @@ class MiddlewareCallLimiter:
 
     async def _acquire(self) -> None:
         if self.active < self.limit and not self._waiters:
-            self.active += 1
+            self._take()
             return
         waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._waiters.append(waiter)
@@ -159,9 +177,14 @@ class MiddlewareCallLimiter:
                     pass
             raise
 
-    def set_limit(self, limit: int) -> None:
+    def _take(self) -> None:
+        self.active += 1
+        self.peak_active = max(self.peak_active, self.active)
+
+    def set_limit(self, limit: int, *, budget: int | None = None) -> None:
         """The newest configuration wins; queued calls are admitted if it grew."""
         self.limit = limit
+        self.budget = limit if budget is None else budget
         self._admit()
 
     def _release(self) -> None:
@@ -172,7 +195,7 @@ class MiddlewareCallLimiter:
         while self._waiters and self.active < self.limit:
             waiter = self._waiters.popleft()
             if not waiter.done():
-                self.active += 1
+                self._take()
                 waiter.set_result(None)
 
     def note_outcome(self, exc: BaseException | None) -> None:
@@ -211,22 +234,86 @@ class MiddlewareCallLimiter:
 # One limiter per appliance and event loop. Keyed by the normalized endpoint so
 # every client for the same appliance (including the one a config reload
 # builds) shares it; asyncio primitives cannot cross event loops.
+#
+# Each service process (read UI, history, admin) has its own limiters, so a
+# limiter admits only this process's share of the appliance's configured
+# total, chosen by APP_SERVICE_ROLE (see `split_max_concurrent_calls`). With
+# the shares adding up to the total, the processes together stay within it
+# without sharing any state. A process with no role keeps the whole total.
 _LIMITERS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, MiddlewareCallLimiter]] = (
     weakref.WeakKeyDictionary()
 )
 
 
-def middleware_call_limiter(config: TrueNASConfig) -> MiddlewareCallLimiter:
+def middleware_call_limiter(config: TrueNASConfig, *, system_id: str | None = None) -> MiddlewareCallLimiter:
     loop = asyncio.get_running_loop()
     per_loop = _LIMITERS.setdefault(loop, {})
     key = build_websocket_url(config.host)
-    limit = effective_max_concurrent_calls(config)
+    role = current_service_role()
+    budget = effective_max_concurrent_calls(config)
+    limit = split_max_concurrent_calls(budget, role)
     limiter = per_loop.get(key)
     if limiter is None:
-        limiter = per_loop[key] = MiddlewareCallLimiter(limit)
-    elif limiter.limit != limit:
-        limiter.set_limit(limit)
+        limiter = per_loop[key] = MiddlewareCallLimiter(limit, budget=budget, role=role)
+        logger.debug(
+            "TrueNAS middleware call limit %s of %s for service role %s",
+            limit, budget, role or "unset",
+        )
+    elif limiter.limit != limit or limiter.budget != budget or limiter.role != role:
+        limiter.role = role
+        limiter.set_limit(limit, budget=budget)
+        logger.debug(
+            "TrueNAS middleware call limit changed to %s of %s for service role %s",
+            limit, budget, role or "unset",
+        )
+    if system_id:
+        limiter.system_ids.add(system_id)
     return limiter
+
+
+class MiddlewareCallLimitCollector:
+    """Each configured system's middleware call limit and calls in flight (#1072).
+
+    Read from the live limiters at scrape time; a limiter whose event loop has
+    ended reports nothing. A system id stays on its appliance's limiter until
+    the process restarts, so a system renamed or removed by a config reload
+    keeps reporting under its old id until then. Systems that share one
+    appliance endpoint share one limiter and report the same values.
+    """
+
+    _GAUGES = (
+        ("call_limit", "Middleware calls this service process may have in flight against the system's appliance."),
+        ("call_budget", "The appliance's configured max_concurrent_calls, shared by every service process."),
+        ("calls_in_flight", "Middleware calls this service process has in flight against the appliance now."),
+        ("calls_in_flight_peak", "Most middleware calls this service process has had in flight at once."),
+    )
+
+    def collect(self):
+        rows: dict[tuple[str, str], list[int]] = {}
+        for per_loop in list(_LIMITERS.values()):
+            for limiter in list(per_loop.values()):
+                for system_id in sorted(limiter.system_ids):
+                    key = (limiter.role or "none", system_id)
+                    values = [limiter.limit, limiter.budget, limiter.active, limiter.peak_active]
+                    previous = rows.get(key)
+                    if previous is None:
+                        rows[key] = values
+                    else:
+                        # Two event loops in one process: in-flight calls add up.
+                        rows[key] = [
+                            max(previous[0], values[0]), max(previous[1], values[1]),
+                            previous[2] + values[2], max(previous[3], values[3]),
+                        ]
+        for index, (name, documentation) in enumerate(self._GAUGES):
+            family = GaugeMetricFamily(
+                f"{METRICS_NAMESPACE}_truenas_middleware_{name}", documentation, labels=["role", "system_id"],
+            )
+            for (role, system_id), values in sorted(rows.items()):
+                family.add_metric([role, system_id], values[index])
+            yield family
+
+
+REGISTRY.register(MiddlewareCallLimitCollector())
 
 
 def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
@@ -563,8 +650,10 @@ class TrueNASWebsocketClient:
     surface intentionally small: only the methods needed by this app live here.
     """
 
-    def __init__(self, config: TrueNASConfig) -> None:
+    def __init__(self, config: TrueNASConfig, *, system_id: str | None = None) -> None:
         self.config = config
+        # Labels this client's limiter in metrics; never sent to the appliance.
+        self.system_id = system_id
         # JSON-RPC ids must be unique per connection. One counter per client
         # keeps the handshake call and the dispatcher from colliding.
         self._jsonrpc_request_ids = itertools.count(1)
@@ -572,7 +661,7 @@ class TrueNASWebsocketClient:
     @property
     def call_limiter(self) -> MiddlewareCallLimiter:
         """The limiter every client for this appliance shares (#1072)."""
-        return middleware_call_limiter(self.config)
+        return middleware_call_limiter(self.config, system_id=self.system_id)
 
     @property
     def _uses_jsonrpc(self) -> bool:

@@ -25,8 +25,8 @@ from app.config import (
     Settings,
     StorageViewConfig,
     SystemConfig,
-    effective_max_concurrent_calls,
     normalize_value_text,
+    role_max_concurrent_calls,
 )
 from app.models.domain import (
     CacheState,
@@ -6836,7 +6836,7 @@ class InventoryService:
                         # #1072: the appliance's call limit already caps the
                         # batch width; reserving more service permits than it
                         # will ever use would only starve drawers.
-                        appliance_limit = effective_max_concurrent_calls(self.system.truenas)
+                        appliance_limit = role_max_concurrent_calls(self.system.truenas)
                         for _ in range(min(width, len(selected), appliance_limit)):
                             await self._smart_operation_semaphore.acquire()
                             permits += 1

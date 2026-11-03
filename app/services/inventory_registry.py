@@ -110,7 +110,7 @@ class InventoryRegistry:
             if system.truenas.platform == "quantastor":
                 api_client = QuantastorRESTClient(system.truenas)
             else:
-                api_client = TrueNASWebsocketClient(system.truenas)
+                api_client = TrueNASWebsocketClient(system.truenas, system_id=system.id)
             service = InventoryService(
                 settings=self.settings,
                 system=system,

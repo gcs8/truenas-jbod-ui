@@ -56,6 +56,10 @@ class FakeMiddleware:
         self.hang_methods: set[str] = set()
         # When set, the named method drops the connection without a reply.
         self.drop_methods: set[str] = set()
+        # When set, every non-login call stays in flight until it is set.
+        self.hold: asyncio.Event | None = None
+        # (method, params) of every non-login call, in arrival order.
+        self.call_params: list[tuple[str, Any]] = []
         self.connections = 0
         self.closes = 0
         self.clean_closes = 0
@@ -78,6 +82,8 @@ class FakeMiddleware:
 
     async def __aexit__(self, *exc: Any) -> None:
         self.login_gate.set()
+        if self.hold is not None:
+            self.hold.set()
         await self.settle()
         assert self._server is not None
         self._server.close()
@@ -167,6 +173,7 @@ class FakeMiddleware:
                 await self._reply(ws, message, jsonrpc, result=ok)
                 return
             self.method_calls.append(method)
+            self.call_params.append((method, message.get("params")))
             if not app["authenticated"]:
                 await self._reply(ws, message, jsonrpc, error={"error": 13, "reason": "Not authenticated"})
                 return
@@ -178,6 +185,8 @@ class FakeMiddleware:
                 return
             if method in self.hang_methods:
                 await asyncio.Future()
+            if self.hold is not None:
+                await self.hold.wait()
             if self.call_delay:
                 await asyncio.sleep(self.call_delay)
             await self._reply(ws, message, jsonrpc, result=RESULTS.get(method))

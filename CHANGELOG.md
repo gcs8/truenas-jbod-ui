@@ -35,8 +35,9 @@ fixed `v0.24.0-beta.5` and `0.24.0-beta.5` tags and moves `dev` to it;
 ### Highlights
 
 - TrueNAS middleware calls now share one per-appliance limit (4 on CORE, 8 on
-  SCALE) and back off when the appliance is busy, so read bursts no longer
-  starve its own alert checks (#1076).
+  SCALE) for the whole app, split between the main UI, history and Admin
+  services, and back off when the appliance is busy, so read bursts no longer
+  starve its own alert checks (#1076, #1078).
 - An interrupted login no longer leaves a stale API session on a CORE 13
   appliance (#1076).
 - Non-TrueNAS systems are labelled by their own sources: the API and SSH chips
@@ -51,13 +52,19 @@ fixed `v0.24.0-beta.5` and `0.24.0-beta.5` tags and moves `dev` to it;
 - This is a prerelease. `dev` is the only image tag that moves to it;
   `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.4`, read every
   note below; upgrading from `v0.23.0` or older, read the `v0.24.0-beta.1` to
-  `v0.24.0-beta.4` upgrade notes too. The Compose files are unchanged since
-  `v0.24.0-beta.4`.
+  `v0.24.0-beta.4` upgrade notes too.
 - New setting `max_concurrent_calls` (environment
   `TRUENAS_MAX_CONCURRENT_CALLS`) caps the middleware calls kept in flight
   against one appliance. Leave it blank for the defaults, 4 on CORE and 8 on
   SCALE; set 1 to 10 to override. While the appliance is busy the API source
   shows as busy instead of unreachable (#1076).
+- `max_concurrent_calls` is the total for the whole app, split by
+  `APP_SERVICE_ROLE`: the main UI, history and Admin services take fixed shares
+  (4 is 2/1/1, 8 is 4/2/2). The shipped `docker-compose.yml` and
+  `docker-compose.dev.yml` now set `APP_SERVICE_ROLE` on each service; a custom
+  Compose file must add `APP_SERVICE_ROLE: ui`, `history` and `admin` to the
+  matching services, or each service keeps the whole limit as before. An
+  unknown role stops the main UI and Admin at startup (#1078).
 - API sessions that earlier versions already leaked on a CORE 13 appliance
   stay listed under `auth.sessions` until its middleware restarts; this
   release only stops new ones (#1076).
@@ -99,6 +106,13 @@ fixed `v0.24.0-beta.5` and `0.24.0-beta.5` tags and moves `dev` to it;
 - Closed TrueNAS middleware connections only after an interrupted login
   answers, within one call timeout, so a timed-out or cancelled read no longer
   leaves a stale API session on the appliance (#1076, refs #1072).
+- `max_concurrent_calls` is now the total for the whole app instead of a limit
+  that the main UI, history and Admin services each applied on their own, so
+  together they could go over it. Compose sets
+  `APP_SERVICE_ROLE` on each service, and each takes a fixed share (4 is UI 2,
+  history 1, Admin 1; 8 is 4, 2, 2). Each service's share and its peak calls in
+  flight are exported as `truenas_jbod_ui_truenas_middleware_*` metrics
+  (#1078, refs #1072).
 - Labelled non-TrueNAS systems by their own sources: the API chip shows "API:
   not used" where a platform has no API and names the QuantaStor or ESXi API
   where it has one, SSH shows "partial" when only optional reads failed and

@@ -25,12 +25,15 @@ from admin_service.route_support import (
 )
 from admin_service.routes import build_router
 from app import __version__
+from app.config import current_service_role
 from app.metrics import install_metrics, metrics_path
 from app.router_inclusion import include_router_preserving_route_objects
 from app.services.inventory_registry import SystemNotConfiguredError
 
 
 def create_app() -> FastAPI:
+    # A misspelled APP_SERVICE_ROLE stops startup, not every later API call (#1072).
+    current_service_role()
     admin_settings = get_admin_settings()
     validate_admin_public_origin(admin_settings)
     admin_metrics_path = metrics_path()

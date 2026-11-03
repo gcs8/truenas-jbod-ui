@@ -56,9 +56,13 @@ truenas:
 `max_concurrent_calls` (environment: `TRUENAS_MAX_CONCURRENT_CALLS`) bounds how
 many middleware calls the app keeps in flight against one appliance, across
 every feature, with either dialect. The SCALE default is 8, under the
-middleware's 10-call soft limit; valid values are 1 to 10. A busy reply, or an
-inventory read that times out, makes the app back off; the
-[[TrueNAS CORE Setup|TrueNAS-CORE-Setup]] page explains how.
+middleware's 10-call soft limit; valid values are 1 to 10. The limit is the
+total for the whole app: the main UI, history and Admin services each take a
+fixed share of it (the default 8 gives the main UI 4, history 2 and Admin 2),
+so together they stay within it. A busy reply, or an inventory read that times
+out, makes the app back off; the
+[[TrueNAS CORE Setup|TrueNAS-CORE-Setup]] page explains both and lists the
+share for every value.
 
 The deprecated REST API alert that SCALE 25.10 and newer raise is about
 `/api/v2.0`, which this app has never called. It is unrelated to this setting

@@ -245,12 +245,64 @@ class TrueNASConfig(BaseModel):
 
 
 def effective_max_concurrent_calls(config: TrueNASConfig) -> int:
-    """The per-appliance middleware call limit for ``config``."""
+    """The per-appliance middleware call limit for ``config``.
+
+    This is the total for the whole app. Each service process takes only its
+    role's share of it; see `role_max_concurrent_calls`.
+    """
     if config.max_concurrent_calls is not None:
         return config.max_concurrent_calls
     if config.platform == "scale":
         return SCALE_DEFAULT_MAX_CONCURRENT_CALLS
     return CORE_DEFAULT_MAX_CONCURRENT_CALLS
+
+
+# #1072: the read UI, history and admin services run as separate processes, and
+# each keeps its own per-appliance limiter. Compose names each one's role in
+# APP_SERVICE_ROLE so the configured limit is split between them instead of
+# being granted to each in full. No role (a single-process dev run) keeps the
+# whole limit.
+SERVICE_ROLE_ENV = "APP_SERVICE_ROLE"
+SERVICE_ROLES = ("ui", "history", "admin")
+
+
+def split_max_concurrent_calls(total: int, role: str | None) -> int:
+    """One service role's fixed share of an appliance's middleware call limit.
+
+    The UI serves people waiting on a page, so it gets the rest after history
+    and admin each take a quarter of ``total`` (at least one call). The shares
+    add up to ``total`` from 3 upward: 4 is UI 2, history 1, admin 1, and 8 is
+    UI 4, history 2, admin 2. Below 3 no role is ever left with no calls, so
+    each gets 1. ``role=None`` returns ``total`` unchanged.
+    """
+    if type(total) is not int or not 1 <= total <= TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT:
+        raise ValueError(f"total must be a whole number from 1 to {TRUENAS_MIDDLEWARE_SOFT_CALL_LIMIT}")
+    if role is None:
+        return total
+    if role not in SERVICE_ROLES:
+        raise ValueError(f"role must be one of {', '.join(SERVICE_ROLES)}")
+    background = max(1, total // 4)
+    if role == "ui":
+        return max(1, total - 2 * background)
+    return background
+
+
+def current_service_role() -> str | None:
+    """This process's service role from ``APP_SERVICE_ROLE``; blank means none."""
+    raw = os.environ.get(SERVICE_ROLE_ENV, "").strip()
+    if not raw:
+        return None
+    if raw not in SERVICE_ROLES:
+        # The value itself is never echoed, as with every other setting error.
+        raise ConfigurationError([
+            f"{SERVICE_ROLE_ENV} in the environment must be one of {', '.join(SERVICE_ROLES)}, or blank."
+        ])
+    return raw
+
+
+def role_max_concurrent_calls(config: TrueNASConfig) -> int:
+    """This process's share of the appliance's middleware call limit."""
+    return split_max_concurrent_calls(effective_max_concurrent_calls(config), current_service_role())
 
 
 class HANodeConfig(BaseModel):
