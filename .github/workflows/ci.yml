@@ -1059,6 +1059,7 @@ jobs:
           set -euo pipefail
           npx playwright test \
             qa/admin-draft-target-ownership.spec.js \
+            qa/chassis-row-overflow.spec.js \
             qa/connections-clear-selection.spec.js \
             qa/connections-overflow.spec.js \
             qa/offline-snapshot.spec.js \
