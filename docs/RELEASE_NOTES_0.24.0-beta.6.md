@@ -27,6 +27,13 @@ each pull request.
 - On a segmented history deployment, the admin page's removed-system history
   lists and the delete-history row count show the real saved row counts
   instead of 0.
+- The history container no longer runs out of memory while it builds its
+  background indexes after an upgrade or restore of a large v0.22.2 history.
+  Index builds and the startup upgrade sort through temporary files in the
+  history volume with a bounded cache. A build that does not fit on the volume
+  waits and retries every five minutes while collection continues, and
+  `exact_counts=true` overview requests answer from tracked totals while an
+  index builds.
 - The image is built on a digest-pinned `python:3.12-slim` base, with
   pydantic 2.14.3, websockets 17.4 and boto3 1.43.126.
 
@@ -39,6 +46,10 @@ each pull request.
   upgrade notes in `CHANGELOG.md` first; they all still apply.
 - API consumers that check the exact field set of Storage Fabric links must
   accept the new optional `reported_lanes` field.
+- History index builds now write temporary sort files to the history service's
+  `TMPDIR`, which the shipped Compose file sets to the history volume. If a
+  custom Compose file points it at a tmpfs, point it at the history volume
+  instead, or that sort data stays in memory.
 - The pre-release security review in #737 still has open items. They will be
   closed before v0.24.0.
 - To roll back, set `JBOD_UI_IMAGE` to the previous tag or digest and run

@@ -41,6 +41,9 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
   rate (#1086).
 - The admin page shows real saved history row counts on segmented history
   deployments instead of 0 (#1083).
+- The history container no longer runs out of memory while it builds its
+  background indexes after an upgrade or restore of a large v0.22.2 history
+  (#1093).
 - The image is built on a digest-pinned `python:3.12-slim` base, with
   pydantic 2.14.3, websockets 17.4 and boto3 1.43.126 (#1073, #1074).
 
@@ -61,6 +64,14 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
   end's PHY rows are missing or disagree. API consumers that validate the exact
   link field set must accept it. The app runs no new appliance command for it
   (#1086).
+- History index builds and the startup schema upgrade now sort through
+  temporary files in the history service's `TMPDIR` instead of memory. The
+  shipped Compose file already sets it to the history volume, so the default
+  install needs no change. A custom Compose file that points the history
+  service's `TMPDIR` at a tmpfs puts that sort data back in memory; point it at
+  the history volume instead. A build that does not fit on the volume waits,
+  reported as waiting for free disk space, and retries every five minutes
+  while collection continues (#1093).
 
 ### Added
 
@@ -100,9 +111,9 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
   same way. A startup upgrade that fills the volume stops with a message
   naming the volume and the free space needed instead of a traceback. Stored
   row counters are no longer trusted, and a restore recounts them. While an
-  index builds,
-  `exact_counts=true` overview requests answer from the tracked totals, also
-  with segmented history, and say exact counts are deferred (#1092, #1093).
+  index builds, `exact_counts=true` overview requests answer from the tracked
+  totals, also with segmented history, and say exact counts are deferred
+  (#1092, #1093).
 
 ### Internal
 

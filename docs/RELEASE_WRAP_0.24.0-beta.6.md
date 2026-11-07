@@ -13,7 +13,7 @@ Release preparation branch: `release/v0.24.0-beta.6`. It is merged into
 `main` with a merge commit, never squashed, so the validated commit stays
 reachable from the tag, which goes on that `main` merge commit.
 
-Base: `main` at `05869875d69e892df66ff52dead812f6ed5ca9f3`.
+Base: `main` at `a89a864832401e08e45128aebb30903fc52ae25d`.
 
 Validated release-branch commit: pending.
 
