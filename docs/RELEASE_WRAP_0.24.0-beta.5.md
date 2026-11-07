@@ -1,6 +1,7 @@
 # Release wrap: v0.24.0-beta.5
 
-Date: `2026-11-02`
+Preparation date: `2026-11-02`
+Published: `2026-11-03`
 
 ## Scope
 
@@ -10,9 +11,16 @@ v0.24.0-beta.5 is the fifth prerelease of v0.24.0. It is cut from current
 the fixed `v0.24.0-beta.5` and `0.24.0-beta.5` tags and moves `dev` to it;
 `latest` stays on `v0.23.0`.
 
-Release preparation branch: `release/v0.24.0-beta.5`. It is merged into
-`main` with a merge commit, never squashed, so the validated commit stays
-reachable from the tag, which goes on that `main` merge commit.
+Release preparation branch: `release/v0.24.0-beta.5`. The gated runner
+squash-merged release PR #1077 into `main` as
+`78c6efee117881a93d971eea65f74b4bc4b0f4e5`, and the published tag
+`v0.24.0-beta.5` points to that commit. This differs from the planned
+merge-commit flow. The squash commit and validated PR head
+`75df0057c1b4ac187f0d4087a5e1d2ef13c3c1f2` have the identical tree
+`4f3e250579488050842dcd6219073e1aab9695f7`. The diff from runtime-qualified
+`d1e8ea23d0d69f250e7592ce6974c7a5d498cd7c` to the tag changes only this
+wrap. The source-content proof preserves the earlier qualification's scope;
+it does not claim the release-branch commits are ancestors of the squash.
 
 Base: `main` at `615c2d9e4c8ba1ecaddf891372bf852929c85315`, which includes the
 per-appliance middleware call budget split by service role (#1078, for
@@ -54,10 +62,10 @@ Changelog coverage: pass (5 PRs)
 | Restored Linux QA perf harnesses | yes | The live read-only restore of the `0.22.2` `7z` backup at `d1e8ea2` passed the app and history harnesses; the egress-blocked `tar.zst` and `7z` restores passed the history harness | Pass |  |
 | Snapshot/export/offline artifact gate | yes | Redacted Auto and Force ZIP exports from two restored stacks at `d1e8ea2` rendered all 60 slots in Chromium with network blocked: offline badge shown, 0 external requests, 0 console errors, 0 private IPv4 addresses, 0 host paths. The 2 credential-pattern hits are the app's own sign-in field code | Pass |  |
 | Docs/wiki/public-demo gate | yes | At `d1e8ea2`: `check_public_docs.py` passed (26 documents, 197 wiki links, 0 prose patterns); `check_public_screenshots.py` passed; `check_public_demo_artifact.py` found the demo publishable (2,095,850 raw bytes); `validate_release_wrap.py 0.24.0-beta.5 --public-demo-only` passed. Public demo deferred: prerelease. `wiki/` changed in 5 files since `v0.24.0-beta.4` (`Generic-Linux-Setup.md`, `Operations-Logging-and-Metrics.md`, `Profiles-and-Custom-Layouts.md`, `TrueNAS-CORE-Setup.md`, `TrueNAS-SCALE-Setup.md`) | Pass |  |
-| Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked |  |
-| GHCR publish verification | yes | Recorded after the GitHub prerelease publishes `v0.24.0-beta.5`, `0.24.0-beta.5` and `dev` | Blocked |  |
-| Deployment refresh/sniff tests | yes | Recorded after the `dev` image is deployed to a QA host for beta testing | Blocked |  |
-| Post-release reopen | yes | Blocked on the deployment gate | Blocked |  |
+| Docs/wiki/public-demo publication | yes | Deferred: the owner chose to publish the external wiki with the v0.24.0 final release, not for this prerelease | Blocked |  |
+| GHCR publish verification | yes | GitHub prerelease https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.24.0-beta.5 published 2026-11-03, not latest; https://github.com/gcs8/truenas-jbod-ui/actions/runs/41590279473 succeeded at source revision `78c6efee117881a93d971eea65f74b4bc4b0f4e5`. Package API readback confirms `v0.24.0-beta.5`, `0.24.0-beta.5` and `dev` converge on `ghcr.io/gcs8/truenas-jbod-ui@sha256:030b66f331a2bbf02767d5560f0bb26769a951e05b0879edca172d4e2b114f40`. Main CI Preflight https://github.com/gcs8/truenas-jbod-ui/actions/runs/41588569539 succeeded on the same source. GitHub latest remains `v0.23.0` | Pass |  |
+| Deployment refresh/sniff tests | yes | Maintainer-reported result for the maintainer's beta test deployment: updated to beta.5, healthy, 0 restarts, retention totals unchanged, no new console errors or 5xx. This records the completed beta update, not full checklist qualification: validated private deployment receipt, exact Compose contract, pre-update rollback digest, running container image IDs and rollback result were not supplied for this follow-up. No fresh runtime readback was performed; production deployment is outside this prerelease's authorization | Blocked |  |
+| Post-release reopen | yes | Documentation follow-up branch `docs/beta5-wrap-post-publish` starts from `main` at `78c6efee117881a93d971eea65f74b4bc4b0f4e5` and adds `## Unreleased`; app version stays `0.24.0-beta.5`. The checklist's After Release rule prevents marking reopen Pass until deployment evidence and final validation pass; private deployment qualification and owner wiki publication remain outstanding | Blocked |  |
 
 ## Restore evidence
 
@@ -214,7 +222,10 @@ page logged 0 console errors and received 0 HTTP 5xx responses.
 
 ## Hold boundary
 
-This wrap does not authorize a tag while any pre-publish row is `Blocked`. Once
-it passes, it authorizes the `v0.24.0-beta.5` prerelease and its `dev` image
-only. It does not move `latest`, deploy to production, or publish the external
-wiki.
+The tag, GitHub prerelease and GHCR image are published, and the maintainer's
+beta test deployment was reported healthy on beta.5. Release closeout is not
+complete: the private deployment qualification is not established here, the
+external wiki is deferred to the v0.24.0 final release, and the dependent reopen gate
+remains blocked. The public demo was not rebuilt or published for this
+prerelease, as the checklist requires. This follow-up does not authorize
+retagging, moving `latest`, production deployment or wiki publication.
