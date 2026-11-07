@@ -804,6 +804,16 @@ class SegmentedHistoryReader:
                     if row["system_label"]:
                         summary["system_label"] = row["system_label"]
                     summary[key] += int(row["row_count"])
+        # Match the unsegmented summary shape; the admin page reads only
+        # total_rows (#1082). Derived after merging, so cached per-segment
+        # table rows keep their format and still produce current totals.
+        for summary in summaries.values():
+            summary["total_rows"] = (
+                summary["tracked_slots"]
+                + summary["event_count"]
+                + summary["metric_sample_count"]
+                + summary["metric_rollup_count"]
+            )
         return sorted(
             summaries.values(),
             key=lambda summary: (
