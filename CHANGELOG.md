@@ -31,7 +31,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Docs
 
 - Recorded beta.5 publication, image convergence, reported beta deployment and
-  squash-tree evidence while retaining the unverified closeout gates.
+  squash-tree evidence while retaining the unverified closeout gates (#1079).
 
 ## v0.24.0-beta.5 - 2026-11-02
 
