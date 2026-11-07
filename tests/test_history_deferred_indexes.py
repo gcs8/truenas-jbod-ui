@@ -774,6 +774,43 @@ class IndexBuildMemoryTests(unittest.TestCase):
             self.assertGreater(scope, slot)  # adds metric_name
             self.assertEqual(events, 0)  # no slot events in this fixture
 
+    def test_index_size_estimate_counts_retained_rows_not_lifetime_ids(self) -> None:
+        # Retention deletes old rows without renumbering AUTOINCREMENT ids, so
+        # max(rowid) can be far above what the index will hold.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE sqlite_sequence SET seq = 100000000 WHERE name = 'metric_samples'")
+                connection.execute(
+                    """INSERT INTO metric_samples (
+                        observed_at, system_id, enclosure_key, slot, slot_label,
+                        metric_name, value_integer, disk_identity_key
+                    ) VALUES ('2026-01-02T00:00:00+00:00', 'system-1', 'enclosure-1', 1, 'slot',
+                              'temperature_c', 30, 'disk')"""
+                )
+                connection.execute("DELETE FROM metric_samples WHERE id < 100000000")
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 0):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertGreater(
+                    connection.execute("SELECT max(id) FROM metric_samples").fetchone()[0], 100_000_000
+                )
+                estimate = HistoryStore._estimate_index_bytes(
+                    connection, dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
+                )
+            self.assertLess(estimate, 1024)
+            # A volume with only the margin free still admits the build.
+            import shutil
+
+            roomy = shutil._ntuple_diskusage(
+                total=1 << 30, used=0, free=store_module.INDEX_BUILD_FREE_SPACE_MARGIN_BYTES + (1 << 20)
+            )
+            with patch.object(store_module.shutil, "disk_usage", return_value=roomy):
+                for name in store.pending_chronological_indexes():
+                    store.build_chronological_index(name)
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+
 
 class ExactCountsDuringIndexBuildTests(unittest.TestCase):
     """#1092: the UI's exact_counts poll scanned the tables the build was reading."""

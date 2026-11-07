@@ -2115,10 +2115,23 @@ class HistoryStore:
                 sizes.append("9")
             else:
                 sizes.append(f"coalesce(length(CAST({expression} AS BLOB)), 0) + 1")
-        row = connection.execute(
-            f"SELECT coalesce(max(rowid), 0) FROM {table}"
-        ).fetchone()
-        rows = int(row[0]) if row is not None else 0
+        # Retained rows, not max(rowid): AUTOINCREMENT ids count lifetime
+        # inserts, and retention deletes old rows without renumbering. The
+        # trigger-maintained counter is exact and O(1); max(rowid) is only the
+        # upper-bound fallback for a table without a seeded counter.
+        row = None
+        try:
+            row = connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = ?",
+                (table,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row is None:
+            row = connection.execute(
+                f"SELECT coalesce(max(rowid), 0) FROM {table}"
+            ).fetchone()
+        rows = int(row[0]) if row is not None and row[0] is not None else 0
         if rows <= 0:
             return 0
         sampled = connection.execute(
