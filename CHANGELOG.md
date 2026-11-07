@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   both ends of an HBA-to-expander or expander cascade link report toward each
   other, with lane count and negotiated rate, and stays null when either end's
   rows are missing or disagree. It does not claim cable count or width
-  (#PR).
+  (#1086).
 
 ### Fixed
 
