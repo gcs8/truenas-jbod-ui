@@ -2451,8 +2451,13 @@ class HistoryStoreTests(unittest.TestCase):
             def __init__(self, name: str) -> None:
                 self.name = name
 
-            def execute(self, _statement: str) -> None:
+            def execute(self, _statement: str, *_parameters: object) -> "FakeConnection":
                 events.append(f"{self.name}:execute")
+                return self
+
+            def fetchone(self) -> None:
+                # The restore's counter recount (#1093) finds no counter table.
+                return None
 
             def backup(self, _target: object) -> None:
                 events.append(f"{self.name}:backup")
