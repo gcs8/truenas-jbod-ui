@@ -48,6 +48,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `total_rows` like unsegmented ones, so the removed-system history lists and
   the delete-history row count show real counts (#1083).
 
+### Internal
+
+- Added an inactive, unwired SMP REPORT PHY ERROR LOG response decoder and
+  per-phy counter delta helper with strict frame validation, reset and
+  saturation handling; no grant, collector or UI changed (#1084).
+
 ## v0.24.0-beta.5 - 2026-11-02
 
 This prerelease adds the changes merged after `v0.24.0-beta.4`. GHCR gets the
