@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from app.services.storage_writability import host_repair_path
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
@@ -38,6 +39,35 @@ SQLITE_SHARED_DIR_MODE = 0o770
 SQLITE_SHARED_FILE_MODE = 0o660
 SQLITE_TEMP_STORE = "MEMORY"
 SQLITE_CACHE_SIZE_KIB = 16384
+# One-shot bulk work on large tables (#1092): the deferred chronological index
+# builds and the startup schema upgrade. CREATE INDEX sorts every row through
+# SQLite's external sorter, which keeps about one cache_size of keys in memory
+# and spills the rest to temporary files. With temp_store=MEMORY those
+# "files" are heap, so the build's peak grew with the table (about 1 GiB on a
+# restored 0.22.2 history, the history container's default limit). These
+# connections spill to on-disk temporary files instead, in the directory SQLite
+# picks from SQLITE_TMPDIR or TMPDIR (the shipped Compose file points TMPDIR at
+# the history volume), with a bounded page cache.
+BULK_MAINTENANCE_TEMP_STORE = "FILE"
+BULK_MAINTENANCE_CACHE_SIZE_KIB = 16384
+# SQLite's Unix temporary-directory search order after SQLITE_TMPDIR and TMPDIR.
+SQLITE_FALLBACK_TEMP_DIRECTORIES = ("/var/tmp", "/usr/tmp", "/tmp", ".")
+# The free-space pre-flight before a deferred index build (#1093) refuses only a
+# build that provably cannot fit. No size estimate is exact, so the guarantee
+# is the reaction: a build that runs out of space anyway rolls back, waits for
+# free space while collection continues, and is retried. The bound counts, for
+# every retained row, the smallest record SQLite can store for the key: one
+# length byte, one header-size byte and one type byte per key column plus the
+# rowid. Real keys are several times larger; nothing in the file can make
+# them smaller.
+INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES = 2
+MIB = 1024 * 1024
+# Tables whose row counts history_table_counts tracks through triggers.
+HISTORY_COUNTED_TABLES = ("slot_events", "metric_samples", "metric_rollups")
+# How long an index build waits for exact-count scans already running before it
+# starts anyway. New exact-count requests are deferred as soon as it waits.
+INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS = 60.0
+INDEX_BUILD_EXACT_SCAN_POLL_SECONDS = 0.25
 SQLITE_CONNECT_TIMEOUT_SECONDS = 5.0
 SQLITE_WRITE_LOCK_RETRY_ATTEMPTS = 2
 SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS = 0.05
@@ -529,6 +559,34 @@ class HistoryIndexBuildCancelled(RuntimeError):
     """An owned deferred index build stopped; committed sibling indexes remain."""
 
 
+class HistoryIndexBuildSpaceError(RuntimeError):
+    """Not enough free disk space for an index build's temporary files and pages."""
+
+
+class HistoryStartupSpaceError(HistoryStartupError):
+    """The startup schema upgrade ran out of disk space (#1093).
+
+    SQLite rolled the statement back, so the database is intact; the reason
+    names the volume and roughly how much free space the upgrade needs.
+    Restarting cannot help until space is freed, so this is not retried.
+    """
+
+
+def is_disk_full_error(exc: BaseException) -> bool:
+    """True for SQLite's "database or disk is full" (SQLITE_FULL).
+
+    SQLite reports ENOSPC on the database, its WAL or its temporary sort
+    files this way, and max_page_count limits too.
+    """
+
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF == getattr(sqlite3, "SQLITE_FULL", 13):
+        return True
+    return "database or disk is full" in str(exc).lower()
+
+
 class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
@@ -571,6 +629,10 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
+        # Deferred index builds and exact-count scans do not overlap (#1092).
+        self._index_maintenance_condition = threading.Condition()
+        self._index_maintenance_depth = 0
+        self._exact_count_scans = 0
         if self._initialize_enabled:
             with history_write_lock(self.file_path, blocking=False):
                 # Quarantine publishes its durable intent under this same lock.
@@ -1646,6 +1708,10 @@ class HistoryStore:
         try:
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
         except sqlite3.OperationalError as exc:
+            if is_disk_full_error(exc):
+                # SQLite rolled the upgrade statement back; say what to free
+                # instead of a bare traceback (#1093).
+                raise HistoryStartupSpaceError(self._describe_startup_space_failure()) from exc
             if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
                 self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
                 return
@@ -1717,6 +1783,9 @@ class HistoryStore:
 
     def _initialize_schema(self, *, migration_lock_held: bool = False) -> None:
         with closing(self._connect(migration_lock_held=migration_lock_held)) as connection:
+            # The upgrade may build identity or chronological indexes and
+            # backfill large tables; keep its sorter spill on disk (#1092).
+            self._apply_bulk_maintenance_profile(connection)
             existing_objects = connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
             if not existing_objects:
                 # Incremental mode lets retention hand freed pages back to the
@@ -1747,8 +1816,12 @@ class HistoryStore:
             str(row[0])
             for row in connection.execute("SELECT table_name FROM history_table_counts").fetchall()
         }
-        counted: list[str] = []
-        for table_name in ("slot_events", "metric_samples", "metric_rollups"):
+        # A seeded counter is trusted only while its table could hold that
+        # many rows; a restored or edited file can carry any value (#1093).
+        counted = HistoryStore._recount_implausible_table_counts(
+            connection, tuple(name for name in HISTORY_COUNTED_TABLES if name in tracked_tables)
+        )
+        for table_name in HISTORY_COUNTED_TABLES:
             if table_name in tracked_tables:
                 continue
             connection.execute(
@@ -1762,6 +1835,90 @@ class HistoryStore:
             )
             counted.append(table_name)
         return counted
+
+    @staticmethod
+    def _rowid_span(connection: sqlite3.Connection, table_name: str) -> int:
+        """max(rowid) - min(rowid) + 1, or 0 for an empty table, in O(log n).
+
+        Retained rows have distinct rowids inside that range, so no table
+        holds more rows than this. Two separate queries keep SQLite's min/max
+        b-tree shortcut, which a combined SELECT would lose.
+        """
+
+        high = connection.execute(f"SELECT max(rowid) FROM {table_name}").fetchone()[0]
+        if high is None:
+            return 0
+        low = connection.execute(f"SELECT min(rowid) FROM {table_name}").fetchone()[0]
+        return int(high) - int(low) + 1
+
+    @staticmethod
+    def _has_table(connection: sqlite3.Connection, table_name: str) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _recount_implausible_table_counts(
+        connection: sqlite3.Connection, table_names: tuple[str, ...] = HISTORY_COUNTED_TABLES
+    ) -> list[str]:
+        """Recount each tracked counter its table's rowid span rules out (#1093).
+
+        The check costs two b-tree lookups per table; only a counter that is
+        provably wrong pays for a full COUNT. Returns the recounted tables.
+        The caller commits.
+        """
+
+        if not HistoryStore._has_table(connection, "history_table_counts"):
+            return []
+        recounted: list[str] = []
+        for table_name in table_names:
+            row = connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = ?", (table_name,)
+            ).fetchone()
+            if row is None or row[0] is None:
+                continue
+            bound = HistoryStore._rowid_span(connection, table_name)
+            if int(row[0]) <= bound:
+                continue
+            logger.warning(
+                "The stored row count for history table %s (%d) is more than the table can hold "
+                "(at most %d); recounting it.",
+                table_name,
+                int(row[0]),
+                bound,
+            )
+            HistoryStore._recount_table(connection, table_name)
+            recounted.append(table_name)
+        return recounted
+
+    @staticmethod
+    def _recount_table(connection: sqlite3.Connection, table_name: str) -> None:
+        connection.execute(
+            f"""
+            UPDATE history_table_counts
+            SET row_count = (SELECT COUNT(*) FROM {table_name})
+            WHERE table_name = ?
+            """,
+            (table_name,),
+        )
+
+    @staticmethod
+    def _recount_restored_table_counts(connection: sqlite3.Connection) -> None:
+        """Replace a restored file's counters with real counts (#1093).
+
+        A backup is outside input: its counters were never maintained by this
+        service's triggers, and they size index builds. The recount reads each
+        table once, like the copy that precedes it. The caller commits.
+        """
+
+        if not HistoryStore._has_table(connection, "history_table_counts"):
+            return
+        for table_name in HISTORY_COUNTED_TABLES:
+            if HistoryStore._has_table(connection, table_name):
+                HistoryStore._recount_table(connection, table_name)
 
     @staticmethod
     def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
@@ -1949,25 +2106,337 @@ class HistoryStore:
         started = time.monotonic()
         if should_continue is not None and not should_continue():
             raise HistoryIndexBuildCancelled()
-        with closing(self._connect()) as connection:
-            try:
-                if should_continue is not None:
-                    if not should_continue():
-                        raise HistoryIndexBuildCancelled()
-                    connection.set_progress_handler(lambda: int(not should_continue()), 1000)
-                connection.execute(statement)
-                connection.commit()
-            except sqlite3.OperationalError as exc:
-                if (
-                    getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
-                    and should_continue is not None
-                    and not should_continue()
-                ):
-                    raise HistoryIndexBuildCancelled() from exc
-                raise
-            finally:
-                connection.set_progress_handler(None, 0)
+        with self.index_maintenance():
+            # Exact-count scans are refused from here on; let running ones end.
+            self._wait_for_exact_count_scans(should_continue)
+            with closing(self._connect()) as connection:
+                try:
+                    if should_continue is not None:
+                        if not should_continue():
+                            raise HistoryIndexBuildCancelled()
+                        connection.set_progress_handler(lambda: int(not should_continue()), 1000)
+                    # Bounded memory (#1092): sorter spill goes to disk.
+                    self._apply_bulk_maintenance_profile(connection)
+                    self._require_index_build_space(connection, statement)
+                    connection.execute(statement)
+                    connection.commit()
+                except sqlite3.OperationalError as exc:
+                    if (
+                        getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+                        and should_continue is not None
+                        and not should_continue()
+                    ):
+                        raise HistoryIndexBuildCancelled() from exc
+                    if is_disk_full_error(exc):
+                        # The real guarantee (#1093): no estimate is exact, so a
+                        # build that fills the volume is a wait, not damage.
+                        self._release_failed_index_build(connection)
+                        raise HistoryIndexBuildSpaceError(
+                            "The history volume filled up while building a history index."
+                        ) from exc
+                    raise
+                finally:
+                    connection.set_progress_handler(None, 0)
         logger.info("Built history index %s in %.1f seconds.", name, time.monotonic() - started)
+
+    @staticmethod
+    def _apply_bulk_maintenance_profile(connection: sqlite3.Connection) -> None:
+        """On-disk temporary storage and a bounded page cache for one-shot bulk work (#1092)."""
+
+        connection.execute(f"PRAGMA temp_store={BULK_MAINTENANCE_TEMP_STORE}")
+        connection.execute(f"PRAGMA cache_size=-{BULK_MAINTENANCE_CACHE_SIZE_KIB}")
+
+    @contextmanager
+    def index_maintenance(self) -> Iterator[None]:
+        """Mark a deferred index build (or a run of them) as active.
+
+        While it is active, `exact_count_scan` refuses new exact-count scans so
+        the overview answers from tracked counts instead of scanning the tables
+        the build is reading (#1092). It only flips a counter, so the collector
+        can hold it around its whole build loop without blocking.
+        """
+
+        with self._index_maintenance_condition:
+            self._index_maintenance_depth += 1
+        try:
+            yield
+        finally:
+            with self._index_maintenance_condition:
+                self._index_maintenance_depth -= 1
+                self._index_maintenance_condition.notify_all()
+
+    def index_maintenance_active(self) -> bool:
+        with self._index_maintenance_condition:
+            return self._index_maintenance_depth > 0
+
+    @contextmanager
+    def exact_count_scan(self) -> Iterator[bool]:
+        """Admit an exact-count scan unless an index build is active.
+
+        Yields True when the caller may scan. False means an index build owns
+        the tables right now; the caller answers from tracked counts and says
+        that the exact counts were deferred.
+        """
+
+        with self._index_maintenance_condition:
+            if self._index_maintenance_depth > 0:
+                admitted = False
+            else:
+                admitted = True
+                self._exact_count_scans += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._index_maintenance_condition:
+                    self._exact_count_scans -= 1
+                    self._index_maintenance_condition.notify_all()
+
+    def _wait_for_exact_count_scans(self, should_continue: Callable[[], bool] | None) -> None:
+        deadline = time.monotonic() + INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS
+        with self._index_maintenance_condition:
+            while self._exact_count_scans > 0:
+                if should_continue is not None and not should_continue():
+                    raise HistoryIndexBuildCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "An exact history count was still running after %.0f seconds; "
+                        "building the history index anyway.",
+                        INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS,
+                    )
+                    return
+                self._index_maintenance_condition.wait(
+                    min(remaining, INDEX_BUILD_EXACT_SCAN_POLL_SECONDS)
+                )
+
+    @staticmethod
+    def sqlite_temporary_directory() -> Path | None:
+        """The directory SQLite's Unix VFS uses for temporary files, or None.
+
+        Mirrors SQLite's own search: SQLITE_TMPDIR, TMPDIR, then fixed
+        fallbacks; the first existing directory this process can write wins.
+        """
+
+        candidates = [os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR")]
+        candidates.extend(SQLITE_FALLBACK_TEMP_DIRECTORIES)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate)
+            try:
+                if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def _release_failed_index_build(self, connection: sqlite3.Connection) -> None:
+        """Roll back an index build that ran out of space and give the space back.
+
+        SQLite has already rolled the statement back and deleted its
+        temporary files. The uncommitted index pages it wrote stay in the WAL
+        file until a checkpoint truncates it; a best-effort TRUNCATE
+        checkpoint returns them to the volume so collection and backups have
+        room. A busy reader only delays that to the next checkpoint.
+        """
+
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+        except sqlite3.Error:
+            logger.debug("Rollback after a failed history index build failed.", exc_info=True)
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error:
+            logger.debug("Could not truncate the history WAL after a failed index build.", exc_info=True)
+        logger.warning(
+            "A history index build ran out of disk space and was rolled back; the database is "
+            "unchanged. %s It is retried later, and collection continues meanwhile.",
+            self._describe_free_space(),
+        )
+
+    def _describe_free_space(self) -> str:
+        """`<free> MiB free under <dir>` for the database and temporary directories."""
+
+        directories = [self.file_path.absolute().parent]
+        temporary_directory = self.sqlite_temporary_directory()
+        if temporary_directory is not None:
+            directories.append(temporary_directory.absolute())
+        parts: list[str] = []
+        seen: set[Any] = set()
+        for directory in directories:
+            key = self._filesystem_key(directory)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                free = int(shutil.disk_usage(directory).free)
+            except OSError:
+                continue
+            parts.append(f"{free // MIB} MiB free under {host_repair_path(directory)}")
+        return ("Now " + "; ".join(parts) + ".") if parts else ""
+
+    @staticmethod
+    def _filesystem_key(directory: Path) -> tuple[int, ...] | Path:
+        try:
+            return (int(os.stat(directory).st_dev),)
+        except OSError:
+            return directory
+
+    @staticmethod
+    def _index_key_columns(statement: str) -> tuple[str, list[str]]:
+        head, _, columns = statement.partition("(")
+        table = head.split()[-1]
+        terms = [term.strip() for term in columns.rsplit(")", 1)[0].split(",")]
+        return table, terms
+
+    @staticmethod
+    def _index_build_lower_bound_bytes(connection: sqlite3.Connection, statement: str) -> int:
+        """A floor under the bytes one index build writes, from an exact row count.
+
+        Every retained row gets one index record of at least
+        INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES plus one type byte per key
+        column and the rowid, whatever the values are. Nothing is sampled, so
+        the order or width of the rows in a restored file cannot lower it.
+        """
+
+        table, terms = HistoryStore._index_key_columns(statement)
+        # The trigger-maintained counter is stored data a restored file can
+        # set too high or too low (#1093), so the build counts the rows itself:
+        # one bounded-memory pass, cheaper than the sort that reads every row
+        # next. A counter that disagrees is corrected and logged.
+        if HistoryStore._rowid_span(connection, table) <= 0:
+            return 0
+        rows = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if table in HISTORY_COUNTED_TABLES and HistoryStore._has_table(connection, "history_table_counts"):
+            row = connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = ?",
+                (table,),
+            ).fetchone()
+            if row is not None and row[0] is not None and int(row[0]) != rows:
+                logger.warning(
+                    "The stored row count for history table %s (%d) does not match its %d rows; "
+                    "recounting it.",
+                    table,
+                    int(row[0]),
+                    rows,
+                )
+                HistoryStore._recount_table(connection, table)
+                connection.commit()
+        return max(0, rows) * (INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES + len(terms) + 1)
+
+    @staticmethod
+    def _index_build_disk_needs(
+        *, index_bytes: int, freelist_bytes: int, wal_bytes: int, sorter_memory_bytes: int
+    ) -> tuple[int, int]:
+        """(database filesystem, temporary directory) bytes an index build writes.
+
+        Every new index page goes through the WAL first, so the WAL needs the
+        whole index less what the existing WAL file can absorb. Free pages
+        already inside the database file reduce only its growth at the
+        checkpoint, never the WAL (#1093). The sorter writes its keys to
+        temporary files only when they outgrow its in-memory budget, and then
+        writes all of them.
+        """
+
+        index_bytes = max(0, int(index_bytes))
+        wal_growth = max(0, index_bytes - max(0, int(wal_bytes)))
+        file_growth = max(0, index_bytes - max(0, int(freelist_bytes)))
+        temporary = index_bytes if index_bytes > max(0, int(sorter_memory_bytes)) else 0
+        return wal_growth + file_growth, temporary
+
+    def _require_index_build_space(self, connection: sqlite3.Connection, statement: str) -> None:
+        """Refuse a build that provably cannot fit; the collector retries it later.
+
+        Every need here is a lower bound, so a refusal never stops a build
+        that would have fitted. A build that passes and still runs out of
+        space is caught as SQLITE_FULL and handled the same way.
+        """
+
+        index_bytes = self._index_build_lower_bound_bytes(connection, statement)
+        if index_bytes <= 0:
+            return
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        freelist_bytes = int(connection.execute("PRAGMA freelist_count").fetchone()[0]) * page_size
+        try:
+            wal_bytes = int(os.stat(f"{self.file_path}-wal").st_size)
+        except OSError:
+            wal_bytes = 0
+        database_need, temporary_need = self._index_build_disk_needs(
+            index_bytes=index_bytes,
+            freelist_bytes=freelist_bytes,
+            wal_bytes=wal_bytes,
+            sorter_memory_bytes=BULK_MAINTENANCE_CACHE_SIZE_KIB * 1024,
+        )
+        needs: dict[tuple[int, ...] | Path, list[Any]] = {}
+
+        def add(directory: Path, need: int) -> None:
+            entry = needs.setdefault(self._filesystem_key(directory), [directory, 0])
+            entry[1] += need
+
+        add(self.file_path.absolute().parent, database_need)
+        temporary_directory = self.sqlite_temporary_directory()
+        if temporary_directory is not None:
+            add(temporary_directory, temporary_need)
+        for directory, need in needs.values():
+            if need <= 0:
+                continue
+            try:
+                free = int(shutil.disk_usage(directory).free)
+            except OSError:
+                continue
+            if free < need:
+                logger.warning(
+                    "Not building a history index yet: it needs at least %d MiB free under %s "
+                    "for temporary files and index pages, and %d MiB is free. Collection "
+                    "continues and the build is retried.",
+                    -(-need // MIB),
+                    host_repair_path(directory),
+                    free // MIB,
+                )
+                raise HistoryIndexBuildSpaceError(
+                    "Not enough free disk space to build a history index."
+                )
+
+    def _describe_startup_space_failure(self) -> str:
+        """The operator line for a startup schema upgrade that filled the volume (#1093).
+
+        The figure is an upper estimate: no index on a table can be larger
+        than the database file holding it, its WAL copy needs as much again,
+        and SQLite's temporary sort files as much again.
+        """
+
+        try:
+            database_bytes = int(self.file_path.stat().st_size)
+        except OSError:
+            database_bytes = 0
+        needs: dict[tuple[int, ...] | Path, list[Any]] = {}
+        for directory, need in (
+            (self.file_path.absolute().parent, 2 * database_bytes),
+            (self.sqlite_temporary_directory(), database_bytes),
+        ):
+            if directory is None:
+                continue
+            entry = needs.setdefault(self._filesystem_key(directory), [directory, 0])
+            entry[1] += need
+        parts: list[str] = []
+        for directory, need in needs.values():
+            try:
+                free_text = f"{int(shutil.disk_usage(directory).free) // MIB} MiB is free now"
+            except OSError:
+                free_text = "free space could not be read"
+            parts.append(
+                f"up to about {-(-need // MIB)} MiB free on the volume holding "
+                f"{host_repair_path(directory)} ({free_text})"
+            )
+        return (
+            f"The history database {host_repair_path(self.file_path)} ran out of disk space "
+            "while startup was upgrading it and building its indexes. SQLite rolled the "
+            "change back, so the database is unchanged. The upgrade needs "
+            + "; and ".join(parts)
+            + ". Free space on that volume, then restart the history service."
+        )
 
     @staticmethod
     def _ensure_columns(
@@ -2358,6 +2827,9 @@ class HistoryStore:
                 ) as restore_connection:
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
                     source_connection.backup(restore_connection)
+                    # The backup's counters are outside input that sizes
+                    # index builds; replace them with real counts (#1093).
+                    self._recount_restored_table_counts(restore_connection)
                     restore_connection.commit()
 
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
@@ -3855,10 +4327,13 @@ class HistoryStore:
     def estimated_counts(self) -> dict[str, Any]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
+            # No COUNT scan of the hot tables: this answers the default
+            # overview, the collector's metrics and deferred exact counts,
+            # all of which can run while an index build reads them (#1093).
             return {
-                **segmented_reader.counts(),
+                **segmented_reader.tracked_counts(),
                 "estimated": False,
-                "count_mode": "segmented-exact",
+                "count_mode": "segmented-tracked",
             }
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])

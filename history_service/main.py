@@ -8,7 +8,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -542,6 +542,31 @@ class HistorySummary(NamedTuple):
     scopes: list[dict[str, object]]
     size_bytes: int | None
     degraded_reason: str | None
+    counts_deferred_reason: str | None = None
+
+
+EXACT_COUNTS_DEFERRED_REASON = (
+    "Exact counts are deferred while history indexes build; totals come from tracked counts."
+)
+
+
+def _read_exact_counts_unless_deferred() -> tuple[dict[str, object], list[dict[str, object]]] | None:
+    """Exact counts and per-scope activity counts, or None while an index builds.
+
+    The exact path scans the history tables. A deferred index build reads
+    those same tables, so the two do not run together (#1092); the caller
+    answers from tracked counts and says why.
+    """
+    gate = getattr(store, "exact_count_scan", None)
+    admission = gate() if callable(gate) else None
+    if not isinstance(admission, AbstractContextManager):
+        admission = nullcontext(True)
+    with admission as admitted:
+        if admitted is False:
+            return None
+        counts = cast(dict[str, object], store.counts())
+        scopes = store.list_scopes(include_activity_counts=True)
+        return counts, scopes
 
 
 async def read_history_summary(exact_counts: bool, *, degrade_missing_catalog: bool) -> HistorySummary:
@@ -553,19 +578,23 @@ async def read_history_summary(exact_counts: bool, *, degrade_missing_catalog: b
     reason /healthz gives for it (#663). Otherwise, and for every other
     storage failure, the error still reaches the storage-unavailable handler.
     """
+    counts_deferred_reason: str | None = None
     try:
-        counts = cast(
-            dict[str, object],
-            await asyncio.to_thread(store.counts if exact_counts else store.estimated_counts),
-        )
-        scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=exact_counts)
+        exact = await asyncio.to_thread(_read_exact_counts_unless_deferred) if exact_counts else None
+        if exact is not None:
+            counts, scopes = exact
+        else:
+            if exact_counts:
+                counts_deferred_reason = EXACT_COUNTS_DEFERRED_REASON
+            counts = cast(dict[str, object], await asyncio.to_thread(store.estimated_counts))
+            scopes = await asyncio.to_thread(store.list_scopes, include_activity_counts=False)
         size_bytes = await asyncio.to_thread(store.database_size_bytes)
     except SegmentCatalogMissingError:
         if not degrade_missing_catalog:
             raise
         return HistorySummary({}, False, [], None, SEGMENT_CATALOG_MISSING_REASON)
-    counts_exact = exact_counts or counts.get("estimated") is False
-    return HistorySummary(counts, counts_exact, scopes, size_bytes, None)
+    counts_exact = exact is not None or counts.get("estimated") is False
+    return HistorySummary(counts, counts_exact, scopes, size_bytes, None, counts_deferred_reason)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -692,6 +721,10 @@ async def overview(exact_counts: bool = False, *, degrade_missing_catalog: bool 
     if degrade_missing_catalog:
         # Null when stored history was read; otherwise why it shows nothing (#833).
         payload["degraded_reason"] = summary.degraded_reason
+    if exact_counts:
+        # Null when the exact counts were read; otherwise why they were not:
+        # an index build was running, so the totals are the tracked ones (#1092).
+        payload["counts_deferred_reason"] = summary.counts_deferred_reason
     return payload
 
 

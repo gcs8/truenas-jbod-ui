@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -44,7 +45,13 @@ from history_service.domain import (
 )
 from history_service.backup_scheduler.service import read_archive_status
 from history_service.scheduled_backup import read_scheduled_backup_status
-from history_service.store import HistoryIndexBuildCancelled, HistoryStore, SlotStateUpdate, is_database_corruption_error
+from history_service.store import (
+    HistoryIndexBuildCancelled,
+    HistoryIndexBuildSpaceError,
+    HistoryStore,
+    SlotStateUpdate,
+    is_database_corruption_error,
+)
 
 logger = logging.getLogger(__name__)
 STORAGE_VIEW_SCOPE_PREFIX = "storage-view:"
@@ -136,6 +143,16 @@ INDEX_BUILD_RETRY_SECONDS = 60.0
 INDEX_BUILD_QUICK_RETRIES = 3
 INDEX_BUILD_SLOW_RETRY_SECONDS = 300.0
 INDEX_BUILD_DEGRADED_REASON = "History indexes could not be built yet; retrying before collecting."
+# Running out of disk space is not damage (#1093), whether the store's
+# pre-flight refused the build or SQLite hit SQLITE_FULL mid-build and rolled
+# it back: collection continues, so a volume that stays short never stops
+# history, and the build is retried every INDEX_BUILD_SPACE_RETRY_SECONDS
+# until it fits.
+INDEX_BUILD_SPACE_RETRY_SECONDS = INDEX_BUILD_SLOW_RETRY_SECONDS
+INDEX_BUILD_SPACE_DEGRADED_REASON = (
+    "History indexes are waiting for free disk space; collection continues "
+    "and the build is retried."
+)
 INDEX_BUILD_PAUSED_REASON = (
     "History indexes keep failing to build; scheduled collection is paused until they do."
 )
@@ -221,6 +238,10 @@ class HistoryCollector:
         # online restore publishes a new file, so its indexes are checked again.
         self._chronological_indexes_identity: tuple[int, int] | None = None
         self._index_build_failures = 0
+        # Set by a refusal for lack of disk space (#1093); collection goes on
+        # and the run loop retries the build at _index_build_space_retry_at.
+        self._index_build_waiting_for_space = False
+        self._index_build_space_retry_at = 0.0
         set_history_collector_running(HISTORY_METRICS_SERVICE_NAME, False)
 
     async def start(self) -> None:
@@ -657,6 +678,8 @@ class HistoryCollector:
             return "The history database is read-only."
         if self.retention_consecutive_failures >= 2:
             return "History cleanup has failed twice in a row."
+        if self._index_build_failures > 0 and self._index_build_waiting_for_space:
+            return INDEX_BUILD_SPACE_DEGRADED_REASON
         if self._index_build_failures > INDEX_BUILD_QUICK_RETRIES:
             return INDEX_BUILD_PAUSED_REASON
         if self._index_build_failures > 0:
@@ -828,6 +851,7 @@ class HistoryCollector:
             pending = await asyncio.to_thread(reader) if callable(reader) else ()
         except Exception as exc:  # noqa: BLE001 - retried like a failed build.
             self._index_build_failures += 1
+            self._index_build_waiting_for_space = False
             logger.warning(
                 "Could not list the history indexes still to build (%s, attempt %d); it will be retried.",
                 type(exc).__name__,
@@ -839,35 +863,64 @@ class HistoryCollector:
         if not isinstance(pending, tuple) or not pending:
             self._chronological_indexes_identity = identity
             self._index_build_failures = 0
+            self._index_build_waiting_for_space = False
             return True
         if self.collection_pause()[0]:
             return False
-        for position, name in enumerate(pending, start=1):
-            if self._stopping.is_set():
-                return False
-            try:
-                await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
-            except HistoryCollectionAlreadyRunning:
-                return False
-            except HistoryIndexBuildCancelled:
-                # An intentional stop is neither damage nor a retry failure.
-                return False
-            except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
-                self._index_build_failures += 1
-                logger.warning(
-                    "Could not build history index %s (%s, attempt %d); it will be retried.",
-                    name,
-                    type(exc).__name__,
-                    self._index_build_failures,
-                )
-                if is_database_corruption_error(exc):
-                    self._pause_for_damage(exc)
-                return False
+        # Exact-count overview scans stay deferred for the whole run, not just
+        # while each index builds, so none starts in the gap between two (#1092).
+        maintenance = getattr(self.store, "index_maintenance", None)
+        maintenance_context = maintenance() if callable(maintenance) else None
+        if not isinstance(maintenance_context, AbstractContextManager):
+            maintenance_context = nullcontext()
+        with maintenance_context:
+            for position, name in enumerate(pending, start=1):
+                if self._stopping.is_set():
+                    return False
+                try:
+                    await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
+                except HistoryCollectionAlreadyRunning:
+                    return False
+                except HistoryIndexBuildCancelled:
+                    # An intentional stop is neither damage nor a retry failure.
+                    return False
+                except HistoryIndexBuildSpaceError:
+                    # Not damage: keep collecting and retry later (#1093).
+                    # The store logged how much space the build needs.
+                    self._index_build_failures += 1
+                    self._index_build_waiting_for_space = True
+                    self._index_build_space_retry_at = time.monotonic() + INDEX_BUILD_SPACE_RETRY_SECONDS
+                    logger.warning(
+                        "History index %s is waiting for free disk space (attempt %d); collection "
+                        "continues and the build is retried in %.0f seconds.",
+                        name,
+                        self._index_build_failures,
+                        INDEX_BUILD_SPACE_RETRY_SECONDS,
+                    )
+                    return False
+                except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
+                    self._index_build_failures += 1
+                    self._index_build_waiting_for_space = False
+                    logger.warning(
+                        "Could not build history index %s (%s, attempt %d); it will be retried.",
+                        name,
+                        type(exc).__name__,
+                        self._index_build_failures,
+                    )
+                    if is_database_corruption_error(exc):
+                        self._pause_for_damage(exc)
+                    return False
         if self._stopping.is_set():
             return False
         self._chronological_indexes_identity = identity
         self._index_build_failures = 0
+        self._index_build_waiting_for_space = False
         return True
+
+    def _index_build_due(self) -> bool:
+        """False only while a space-refused build waits for its next retry (#1093)."""
+
+        return not self._index_build_waiting_for_space or time.monotonic() >= self._index_build_space_retry_at
 
     def _build_index_blocking(self, name: str, position: int, total: int) -> None:
         if not self._run_lock.acquire(blocking=False):
@@ -899,12 +952,16 @@ class HistoryCollector:
                 self._starting = False
 
         while not self._stopping.is_set():
-            if not await self._build_pending_indexes():
+            # A space-refused build is retried on its own slower schedule while
+            # collection continues (#1093); _index_build_due() says when.
+            if not (self._index_build_due() and await self._build_pending_indexes()):
                 if self._stopping.is_set():
                     break
-                if self._index_build_failures > 0:
+                if self._index_build_failures > 0 and not self._index_build_waiting_for_space:
                     # Never write a scheduled pass to a database that just
-                    # refused an index build (#910); retry the build instead.
+                    # failed an index build (#910); retry the build instead.
+                    # A refusal for lack of disk space is not a failure of the
+                    # database, so collection goes on after one (#1093).
                     retry_in = (
                         INDEX_BUILD_RETRY_SECONDS
                         if self._index_build_failures <= INDEX_BUILD_QUICK_RETRIES
