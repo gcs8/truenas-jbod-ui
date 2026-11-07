@@ -61,7 +61,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   startup upgrade now sort through temporary files in the history volume
   (`TMPDIR`) with a bounded cache, and wait for enough free disk space. While
   an index builds, `exact_counts=true` overview requests answer from the
-  tracked totals and say exact counts are deferred (#1092).
+  tracked totals and say exact counts are deferred (#1092, #1093).
 
 ### Internal
 
