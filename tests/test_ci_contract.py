@@ -1056,5 +1056,103 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         )
 
 
+RENOVATE_CONFIG = ROOT / "renovate.json"
+ROUTINE_GROUP = "routine dependency updates"
+OWN_IMAGE = "ghcr.io/gcs8/truenas-jbod-ui"
+
+
+def renovate_effective(rules: list[dict], package: str, update_type: str, datasource: str) -> dict:
+    """Merge the repository packageRules that apply to one update, in order.
+
+    Renovate applies matching packageRules in order with later rules winning,
+    and appends repository rules after the self-hosted global rules, so the
+    keys the repository sets here are the effective ones for that update.
+    """
+    effective: dict = {}
+    for rule in rules:
+        if package not in rule.get("matchPackageNames", [package]):
+            continue
+        if update_type not in rule.get("matchUpdateTypes", [update_type]):
+            continue
+        if datasource not in rule.get("matchDatasources", [datasource]):
+            continue
+        effective.update({key: value for key, value in rule.items() if not key.startswith("match")})
+    return effective
+
+
+class RenovatePolicyContractTests(unittest.TestCase):
+    """#1073: Renovate's grouped routine PR must only carry updates CI can pass."""
+
+    def setUp(self) -> None:
+        config = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))
+        self.assertNotIn("extends", config, "repository rules layer on the self-hosted global config")
+        self.rules = config["packageRules"]
+        for rule in self.rules:
+            self.assertTrue(rule.get("description"), rule)
+
+    def test_the_projects_own_image_is_never_pinned_or_updated(self) -> None:
+        for update_type in ("pinDigest", "digest", "major", "minor", "patch"):
+            with self.subTest(update_type=update_type):
+                effective = renovate_effective(self.rules, OWN_IMAGE, update_type, "docker")
+                self.assertIs(effective.get("enabled"), False)
+
+        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().split("\0")
+        compose_files = [name for name in tracked if re.fullmatch(r"docker-compose[\w.-]*\.ya?ml", name)]
+        self.assertIn("docker-compose.yml", compose_files)
+        images = []
+        for name in compose_files:
+            services = (yaml.safe_load((ROOT / name).read_text(encoding="utf-8")) or {}).get("services") or {}
+            images.extend(str(service.get("image", "")) for service in services.values())
+        own_images = [image for image in images if OWN_IMAGE in image]
+        self.assertTrue(own_images)
+        for image in own_images:
+            with self.subTest(image=image):
+                # `latest` stays the operator-facing compatibility default; a
+                # digest would freeze every fresh install on an old build.
+                self.assertEqual(image, "${JBOD_UI_IMAGE:-ghcr.io/gcs8/truenas-jbod-ui:latest}")
+
+    def test_python_base_image_stays_on_a_ci_tested_minor(self) -> None:
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        base = re.search(
+            r"^FROM python:(?P<minor>3\.\d+)-slim(?:@sha256:[0-9a-f]{64})?$", dockerfile, re.MULTILINE
+        )
+        if base is None:
+            self.fail("the base image must be python:3.N-slim, optionally digest-pinned")
+        workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+        tested = workflow["jobs"]["python-unittest"]["strategy"]["matrix"]["python-version"]
+        # Every compiled requirement needs a wheel for this minor; CI proves
+        # that only for the matrix minors (zstandard had no cp315 wheel).
+        self.assertIn(base["minor"], tested)
+
+        for update_type in ("major", "minor"):
+            with self.subTest(update_type=update_type):
+                effective = renovate_effective(self.rules, "python", update_type, "docker")
+                self.assertIs(effective.get("dependencyDashboardApproval"), True)
+                self.assertIn("groupName", effective)
+                self.assertIsNone(effective["groupName"])
+        for update_type in ("pinDigest", "digest"):
+            with self.subTest(update_type=update_type):
+                effective = renovate_effective(self.rules, "python", update_type, "docker")
+                self.assertNotIn("enabled", effective)
+                self.assertNotIn("dependencyDashboardApproval", effective)
+                self.assertNotIn("groupName", effective)
+
+    def test_playwright_capture_toolchain_waits_for_dashboard_approval_as_one_group(self) -> None:
+        groups = set()
+        for package, datasource, update_types in (
+            ("mcr.microsoft.com/playwright", "docker", ("pinDigest", "digest", "major", "minor", "patch")),
+            ("@playwright/test", "npm", ("major", "minor", "patch")),
+        ):
+            for update_type in update_types:
+                with self.subTest(package=package, update_type=update_type):
+                    effective = renovate_effective(self.rules, package, update_type, datasource)
+                    self.assertIs(effective.get("dependencyDashboardApproval"), True)
+                    self.assertNotIn(effective.get("groupName"), (None, ROUTINE_GROUP))
+                    groups.add(effective.get("groupName"))
+        # The capture image tag must equal the locked @playwright/test version
+        # (test_screenshot_capture_workflow_is_dispatch_only_pinned_and_read_only).
+        self.assertEqual(len(groups), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
