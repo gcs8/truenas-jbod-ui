@@ -26,6 +26,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Docs
+
+- Recorded beta.5 publication, image convergence, reported beta deployment and
+  squash-tree evidence while retaining the unverified closeout gates.
+
 ## v0.24.0-beta.5 - 2026-11-02
 
 This prerelease adds the changes merged after `v0.24.0-beta.4`. GHCR gets the
