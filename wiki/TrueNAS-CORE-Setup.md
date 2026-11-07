@@ -198,6 +198,23 @@ labels. The event probe reads filtered `/var/log/messages` when permitted and
 falls back to ordered `dmesg` output. Neither source is a persistent hardware
 counter.
 
+## Expander PHY error counters
+
+When the service account may run it, the app reads each SAS expander's PHY
+error log (invalid DWORD, running disparity, loss of DWORD sync and PHY reset
+problem counts) with one read-only `camcontrol smpcmd` request per PHY, sent
+through a disk's pass device behind that expander. It finds the expanders from
+the `mprutil` and `camcontrol devlist -v` reads above, so no other command is
+needed. One anchored sudo rule for `/sbin/camcontrol smpcmd` covers every pass
+device and PHY 00h-FEh; every other request byte, the request and response
+lengths and the arguments are fixed, so it cannot reset a PHY, clear a counter
+or send another SMP function. The admin sudoers preview shows the exact rule.
+
+The admin bootstrap grants it by default with the other read commands. Without
+it, Storage Fabric shows "Expander counters not available (permission not
+granted)" and asks sudo again only every six hours or after an app restart.
+A PHY the app could not read shows as unknown, never as zero.
+
 ## Optional identify LED control
 
 CORE can use these `sesutil` forms when the host and enclosure support them:

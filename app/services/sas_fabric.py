@@ -21,6 +21,18 @@ from app.models.domain import (
     SourceStatus,
     SlotView,
 )
+from app.services.core_expander_counters import (
+    CAPABILITY_DENIED as SMP_CAPABILITY_DENIED,
+    COUNTER_FIELDS as SMP_COUNTER_FIELDS,
+    NO_ANSWER_MESSAGE as SMP_NO_ANSWER_MESSAGE,
+    NO_ROUTE_MESSAGE as SMP_NO_ROUTE_MESSAGE,
+    NOT_READ_MESSAGE as SMP_NOT_READ_MESSAGE,
+    PERMISSION_DENIED_MESSAGE as SMP_PERMISSION_DENIED_MESSAGE,
+    SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX,
+    counter_summary as smp_counter_summary,
+    discover_smp_targets,
+    parse_phy_error_log_output,
+)
 from app.services.parsers import canonicalize_ssh_command, normalize_text, parse_camcontrol_devlist
 from app.services.sas_fabric_parsers import (
     CORE_MPRUTIL_UNIT_SUBCOMMANDS as CORE_MPRUTIL_UNIT_SUBCOMMANDS,
@@ -111,6 +123,9 @@ class SasFabricBuildContext:
     command_failures: list[dict[str, Any]] | None
     aliases: list[SasFabricAlias] | None
     alias_map: dict[str, SasFabricAlias]
+    # CORE expander PHY error counter capability last seen by the collector
+    # (#941): "granted", "permission_denied" or None when not yet known.
+    expander_counter_capability: str | None = None
 
 
 class SasFabricBuilder(Protocol):
@@ -160,6 +175,7 @@ def _build_sas_fabric_context(
     warnings: list[str] | None = None,
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
+    expander_counter_capability: str | None = None,
 ) -> SasFabricBuildContext:
     return SasFabricBuildContext(
         system=system,
@@ -170,6 +186,7 @@ def _build_sas_fabric_context(
         command_failures=command_failures,
         aliases=aliases,
         alias_map=_sas_fabric_alias_map(aliases or []),
+        expander_counter_capability=expander_counter_capability,
     )
 
 
@@ -190,6 +207,7 @@ def build_sas_fabric_snapshot(
     warnings: list[str] | None = None,
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
+    expander_counter_capability: str | None = None,
 ) -> SasFabricSnapshot:
     context = _build_sas_fabric_context(
         system=system,
@@ -199,6 +217,7 @@ def build_sas_fabric_snapshot(
         warnings=warnings,
         command_failures=command_failures,
         aliases=aliases,
+        expander_counter_capability=expander_counter_capability,
     )
     return _select_sas_fabric_builder(context).build(context)
 
@@ -705,6 +724,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         traces=traces,
         snapshot=snapshot,
     ))
+    _attach_expander_phy_error_counters(nodes, normalized_outputs, context.expander_counter_capability)
     for controller in controllers:
         controller_node = nodes.get(str(controller.get("id") or ""))
         if controller_node:
@@ -3128,6 +3148,97 @@ def _add_mpr_infrastructure(
             )
             for expander_id in expander_ids_by_enc_handle.get(enc_handle, []):
                 add_link(links, expander_id, enclosure_id, "expander-enclosure")
+
+
+_SMP_COUNTER_EVIDENCE = "camcontrol smpcmd REPORT PHY ERROR LOG"
+
+
+def _merged_phy_error_log_rows(outputs: dict[str, str]) -> dict[tuple[int, str], dict[int, dict[str, Any]]]:
+    """Counter rows per (unit, expander address); a measured row wins over an unknown one."""
+    merged: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
+    for command, stdout in sorted(outputs.items()):
+        if not command.startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
+            continue
+        parsed = parse_phy_error_log_output(stdout)
+        if parsed.unit is None or parsed.expander_sas_address is None:
+            continue
+        rows = merged.setdefault((parsed.unit, parsed.expander_sas_address), {})
+        for row in parsed.rows:
+            existing = rows.get(row["phy"])
+            if existing is None or existing.get("counter_state") != "measured":
+                rows[row["phy"]] = row
+    return merged
+
+
+def _attach_expander_phy_error_counters(
+    nodes: dict[str, SasFabricNode],
+    outputs: dict[str, str],
+    capability: str | None,
+) -> None:
+    """Attach SMP REPORT PHY ERROR LOG counters to CORE expander PHY rows (#941).
+
+    Counters the app could not read stay None with a reason, never zero. A
+    refused sudo grant reads as "not available (permission not granted)".
+    """
+    expander_nodes = [node for node in nodes.values() if node.kind == "expander"]
+    if not expander_nodes:
+        return
+    routed = {(target.unit, target.expander_sas_address): target for target in discover_smp_targets(outputs)}
+    results = _merged_phy_error_log_rows(outputs)
+    for node in expander_nodes:
+        unit = node.raw.get("unit")
+        key = (unit if isinstance(unit, int) else -1, str(node.raw.get("sas_address") or "").lower())
+        target = routed.get(key)
+        rows = [results[key][phy] for phy in sorted(results.get(key, {}))]
+        states = {row["counter_state"] for row in rows}
+        if "measured" in states:
+            state, message = "available", None
+        elif (rows and states == {SMP_CAPABILITY_DENIED}) or (not rows and capability == SMP_CAPABILITY_DENIED):
+            state, message = "permission_denied", SMP_PERMISSION_DENIED_MESSAGE
+        elif target is None and not rows:
+            state, message = "no_route", SMP_NO_ROUTE_MESSAGE
+        elif rows:
+            state, message = "unavailable", SMP_NO_ANSWER_MESSAGE
+        else:
+            state, message = "not_read", SMP_NOT_READ_MESSAGE
+        by_phy = {row["phy"]: row for row in rows}
+        phys: list[dict[str, Any]] = []
+        for phy_row in node.raw.get("phys") or []:
+            copied = dict(phy_row)
+            try:
+                number = int(str(copied.get("phy")))
+            except ValueError:
+                number = None
+            counters = by_phy.get(number) if number is not None else None
+            if counters is not None:
+                copied.update({field: counters.get(field) for field in SMP_COUNTER_FIELDS})
+                copied["counter_state"] = counters["counter_state"]
+                copied["counter_reason"] = counters["counter_reason"]
+            elif state != "available":
+                copied.update({field: None for field in SMP_COUNTER_FIELDS})
+                copied["counter_state"] = state
+                copied["counter_reason"] = None
+            phys.append(copied)
+        if phys:
+            node.raw["phys"] = phys
+        summary = smp_counter_summary(rows)
+        node.raw["phy_error_counters"] = {
+            "state": state,
+            "message": message,
+            "source": _SMP_COUNTER_EVIDENCE,
+            "device": target.device if target else None,
+            **summary,
+            "rows": rows,
+        }
+        if state == "available":
+            parts = [f"{summary['measured_phys']} PHYs read", f"{summary['phys_with_errors']} with errors"]
+            if summary["unknown_phys"]:
+                parts.append(f"{summary['unknown_phys']} unknown")
+            node.metrics["phy_error_counters"] = ", ".join(parts)
+        else:
+            node.metrics["phy_error_counters"] = message
+        if rows:
+            node.evidence = _dedupe_strings([*node.evidence, _SMP_COUNTER_EVIDENCE])
 
 
 def _scope_mpr_infrastructure(

@@ -103,6 +103,15 @@ from app.services.sas_fabric import (
     build_sas_fabric_snapshot,
     storage_node_legacy_alias_ids,
 )
+from app.services.core_expander_counters import (
+    CAPABILITY_DENIED,
+    CAPABILITY_GRANTED,
+    SMP_CAPABILITY_RETRY_SECONDS,
+    build_phy_error_log_command,
+    discover_smp_targets,
+    parse_phy_error_log_output,
+    smp_output_key,
+)
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
@@ -1371,6 +1380,15 @@ SSH_FAILURE_CONTEXTS_BY_COMMAND: dict[str, dict[str, str]] = {
 # Checked in order, after the exact commands and the mprutil unit pattern.
 SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
     (
+        # The output key of the CORE expander counter read (#941).
+        "smp phy error log ",
+        {
+            "context": "sas_fabric_expander_phy_error_counters",
+            "context_label": "expander PHY error counters",
+            "criticality": "enrichment",
+        },
+    ),
+    (
         "sg_ses join ",
         {
             "context": "storage_fabric_sg_ses_join",
@@ -1414,6 +1432,10 @@ def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
 
 
 class InventoryService:
+    # Class defaults keep partially built services (tests, adapters) readable.
+    _smp_counter_capability: str | None = None
+    _smp_counter_checked_at = 0.0
+
     def __init__(
         self,
         settings: Settings,
@@ -1518,6 +1540,10 @@ class InventoryService:
         # ESXi 7 runs the StorCLI binary, ESXi 8 only `esxcli storcli`. True once
         # this host answered StorCLI reads only in the form the saved commands lack.
         self._esxi_storcli_swapped = False
+        # CORE expander PHY error counters (#941) are a discovered capability.
+        # A refusal is remembered so sudo is not asked again on every refresh.
+        self._smp_counter_capability = None
+        self._smp_counter_checked_at = 0.0
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
@@ -2472,6 +2498,7 @@ class InventoryService:
             warnings=source_bundle.warnings,
             command_failures=source_bundle.ssh_failure_details,
             aliases=aliases,
+            expander_counter_capability=self._smp_counter_capability,
         )
         return fabric.model_copy(
             update={
@@ -4604,6 +4631,7 @@ class InventoryService:
         commands.extend(self._core_zpool_by_device_probe_commands(command_results))
         commands.extend(self._core_mpr_dmesg_probe_commands(command_results))
         commands.extend(self._core_pci_slot_probe_commands(command_results))
+        commands.extend(self._core_expander_counter_probe_commands(command_results))
         if self._should_probe_unifi_gpio_debug(command_results):
             commands.append("cat /sys/kernel/debug/gpio")
         commands.extend(self._esxi_controller_diagnostic_commands(command_results))
@@ -4718,6 +4746,56 @@ class InventoryService:
             return []
         seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
         return build_core_mprutil_unit_commands(adapter_summary, seen_commands)
+
+    @staticmethod
+    def _smp_counter_clock() -> float:
+        return time.monotonic()
+
+    def _record_smp_counter_capability(self, command_results: list[SSHCommandResult]) -> None:
+        """Remember whether sudo ran the expander counter read in these results."""
+        outcomes = {
+            parse_phy_error_log_output(item.stdout).capability
+            for item in command_results
+            if item.ok and smp_output_key(item.command)
+        }
+        if CAPABILITY_GRANTED in outcomes:
+            state = CAPABILITY_GRANTED
+        elif CAPABILITY_DENIED in outcomes:
+            state = CAPABILITY_DENIED
+        else:
+            return
+        self._smp_counter_capability = state
+        self._smp_counter_checked_at = self._smp_counter_clock()
+
+    def _core_expander_counter_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        """Read expander PHY error counters when the account may (#941).
+
+        Targets come from the mprutil and camcontrol reads already in this
+        refresh. An unknown or long-ago refused capability is checked with one
+        sudo call (PHY 0 of the first expander) before any full read; a recent
+        refusal is not retried. A full read of a granted capability renews it.
+        """
+        if self.system.truenas.platform != "core":
+            return []
+        outputs = {
+            canonicalize_ssh_command(item.command): item.stdout
+            for item in command_results
+            if item.ok
+        }
+        targets = discover_smp_targets(outputs)
+        if not targets:
+            return []
+        self._record_smp_counter_capability(command_results)
+        state = self._smp_counter_capability
+        if state == CAPABILITY_GRANTED:
+            return [build_phy_error_log_command(target) for target in targets]
+        recent = self._smp_counter_clock() - self._smp_counter_checked_at < SMP_CAPABILITY_RETRY_SECONDS
+        if state == CAPABILITY_DENIED and recent:
+            return []
+        if any(smp_output_key(item.command) for item in command_results):
+            # The probe ran this refresh but proved nothing (no answer).
+            return []
+        return [build_phy_error_log_command(targets[0], [0])]
 
     def _core_zpool_by_device_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         """Read pool members by device for a saved CORE command list that predates it (#948)."""

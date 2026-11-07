@@ -297,7 +297,7 @@ If the account is missing and Home directory is blank, or its home is not under
 `/mnt`, bootstrap stops before changing anything.
 
 ```bash
-midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/sbin/camcontrol devlist -v","/usr/sbin/sesutil ^locate -u /dev/ses[0-9]+ [0-9]+ on$","/usr/sbin/sesutil ^locate -u /dev/ses[0-9]+ [0-9]+ off$","/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?$","/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?$","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil ^-u [0-9]+ show adapter$","/usr/sbin/mprutil ^-u [0-9]+ show all$","/usr/sbin/mprutil ^-u [0-9]+ show devices$","/usr/sbin/mprutil ^-u [0-9]+ show enclosures$","/usr/sbin/mprutil ^-u [0-9]+ show expanders$","/usr/sbin/mprutil ^-u [0-9]+ show iocfacts$","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core\\.get_jobs \\[\\[\\\"id\\\"\\,\\\"=\\\"\\,[0-9]+\\]\\]$"]}'
+midclt call user.update USER_ID '{"sudo":true,"sudo_nopasswd":true,"sudo_commands":["/usr/sbin/sesutil map","/usr/sbin/sesutil show","/usr/sbin/sesutil ^locate -u /dev/ses[0-9]+ [0-9]+ on$","/usr/sbin/sesutil ^locate -u /dev/ses[0-9]+ [0-9]+ off$","/sbin/camcontrol devlist -v","/usr/local/sbin/smartctl ^-x -j /dev/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?$","/usr/local/sbin/smartctl ^-x /dev/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*)?$","/usr/sbin/mprutil show adapter","/usr/sbin/mprutil show adapters","/usr/sbin/mprutil show all","/usr/sbin/mprutil show devices","/usr/sbin/mprutil show enclosures","/usr/sbin/mprutil show expanders","/usr/sbin/mprutil show iocfacts","/usr/sbin/mprutil ^-u [0-9]+ show adapter$","/usr/sbin/mprutil ^-u [0-9]+ show all$","/usr/sbin/mprutil ^-u [0-9]+ show devices$","/usr/sbin/mprutil ^-u [0-9]+ show enclosures$","/usr/sbin/mprutil ^-u [0-9]+ show expanders$","/usr/sbin/mprutil ^-u [0-9]+ show iocfacts$","/usr/local/sbin/dmidecode -t slot","/usr/bin/tail -n 4000 /var/log/messages","/sbin/camcontrol ^smpcmd pass[0-9]+ -r 12 40[{][}]11[{][}]06[{][}]02[{][}]00[{][}]00[{][}]00[{][}]00[{][}]00[{][}]([0-9a-e][0-9a-f]|f[0-9a-e])[{][}]00[{][}]00 -R 28 -$","/usr/local/bin/midclt call disk.multipath_sync","/usr/local/bin/midclt call disk.sync_all","/usr/local/bin/midclt ^call core[.]get_jobs [[][[]\"id\",\"=\",[0-9]+[]][]]$"]}'
 ```
 
 That enables:
@@ -313,6 +313,10 @@ That enables:
 - on-demand per-slot SMART detail through `smartctl`
 - SAS fabric/topology diagnostics through read-only `mprutil` commands,
   including per-HBA `mprutil -u N show ...` reads
+- SAS expander PHY error counters through one `camcontrol smpcmd` rule that
+  admits only REPORT PHY ERROR LOG for any pass device and PHY 00h-FEh (#941).
+  Without it Storage Fabric says the counters are not available (permission
+  not granted).
 - HBA PCIe slot labels through read-only `dmidecode -t slot` output joined to
   `pciconf -lv` PCI addresses
 - MPR kernel PCI topology hints through filtered `sysctl dev.mpr.N.%location`

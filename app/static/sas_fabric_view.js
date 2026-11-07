@@ -2620,6 +2620,22 @@
     `;
   }
 
+  // CORE expander PHY error counters read over SMP (#941). A counter the app
+  // could not read is unknown, never zero.
+  function expanderPhyErrorText(phy) {
+    const counterState = phy?.counter_state;
+    if (!counterState) return null;
+    if (counterState !== "measured") {
+      return counterState === "permission_denied" ? "Not available (permission not granted)" : "Unknown";
+    }
+    return [
+      ["invalid dword", phy.invalid_dword_count],
+      ["disparity", phy.running_disparity_error_count],
+      ["loss of sync", phy.loss_of_dword_synchronization_count],
+      ["reset problem", phy.phy_reset_problem_count],
+    ].map(([label, value]) => `${label} ${value === 4294967295 ? "saturated" : value ?? "unknown"}`).join(", ");
+  }
+
   function expanderPhyForDevice(expanderNode, mprDevice) {
     const handle = String(mprDevice?.handle || "");
     if (!handle) {
@@ -3023,6 +3039,7 @@
           ["Min speed", formatLinkSpeed(expanderPhy?.min)],
           ["Max speed", formatLinkSpeed(expanderPhy?.max)],
           ["Expander device", expanderPhy?.device],
+          ["PHY errors", linuxSes || storageFabric ? null : expanderPhyErrorText(expanderPhy)],
         ],
         status: stateName,
         nodeId: pathNodeId,
@@ -3043,6 +3060,7 @@
             : expanderNode?.metrics?.linked_phys],
           ["Enclosure", linuxSes ? enclosureNode?.raw?.enclosure_label : mprDevice?.enclosure_handle || enclosureNode?.raw?.enc_handle],
           ["Devices", linuxSes || storageFabric ? null : formatCountMap(expanderNode?.raw?.device_counts)],
+          ["PHY errors", linuxSes || storageFabric ? null : expanderNode?.metrics?.phy_error_counters],
         ],
         hoverFacts: [
           ["Dev handle", expanderNode?.raw?.dev_handle],
@@ -3625,7 +3643,7 @@
           ${kvRow("Status", node.status || "n/a")}
           ${kvRow("Raw ID", node.raw_id || "n/a")}
           ${kvRow("Slots", formatSlots(node.related_slots, 999))}
-          ${metricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts" })}
+          ${metricRows(node.metrics, { pcie_slot: "PCIe slot", pci_address: "PCI address", linked_phys: "Linked PHYs", num_phys: "PHYs", path_counts: "Path counts", phy_error_counters: "PHY error counters" })}
           ${kvRow("Sources", node.evidence)}
         </div>
         <section class="fabric-inspector-section">

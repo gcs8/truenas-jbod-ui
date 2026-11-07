@@ -1462,7 +1462,12 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(source=source, grant=grant):
                     self.assertNotIn("\\", grant)
                     self.assertNotIn(":", grant)
-                    self.assertNotRegex(arguments, r"[{}]", "the comma of an interval is stored as \\,")
+                    # Literal braces in bracket expressions are fine; an
+                    # interval's comma would be stored as \\, (#943).
+                    self.assertNotRegex(
+                        arguments.replace("[{]", "").replace("[}]", ""), r"[{}]",
+                        "the comma of an interval is stored as \\,",
+                    )
                     for expression in re.findall(r"\[\]?[^\]]*\]", arguments):
                         self.assertNotIn(",", expression)
 
@@ -1496,42 +1501,190 @@ class BootstrapSudoGrantContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class CoreExpanderCounterDraftTests(unittest.TestCase):
-    """Source-only policy: no CORE binary, sudo or device is exercised."""
+class CoreExpanderCounterGrantTests(unittest.TestCase):
+    """#941: one sudo rule for the REPORT PHY ERROR LOG command shape, granted by default."""
 
-    def policy(self, argv, **updates):
-        from scripts.core_expander_counter_draft import draft_readonly_policy
+    def grant(self):
+        from app.services.core_expander_counters import SMP_PHY_ERROR_LOG_SUDO_GRANT
 
-        evidence = {
-            "freebsd_release": "13.2",
-            "tool_path": "/sbin/camcontrol",
-            "sudo_version": "1.9.10",
-            "opt_in": True,
-        }
-        evidence.update(updates)
-        return draft_readonly_policy(argv, **evidence)
+        return SMP_PHY_ERROR_LOG_SUDO_GRANT
 
-    def test_default_is_disabled_without_commands_or_grants(self):
-        from scripts.core_expander_counter_draft import draft_readonly_policy
+    def matches(self, command: str) -> bool:
+        # The CORE middleware form, plus the plain sudoers model for the same rule.
+        stored = core_stored_grant_matches(self.grant(), command)
+        self.assertEqual(stored, sudoers_grant_matches(self.grant(), command), command)
+        return stored
 
-        result = draft_readonly_policy(("/sbin/camcontrol", "smpphylist", "pass3"))
-        self.assertEqual(result["state"], "disabled")
-        self.assertIs(result["enabled"], False)
-        self.assertEqual(result["argv"], ())
-        self.assertIsNone(result["candidate_grant"])
-        self.assertIs(result["host_validated"], False)
+    def test_every_core_grant_source_has_exactly_one_smp_rule(self):
+        for source, grants in core_grant_sources().items():
+            with self.subTest(source=source):
+                smp = [grant for grant in grants if grant.startswith("/sbin/camcontrol ") and "smp" in grant]
+                self.assertEqual(smp, [self.grant()])
+                self.assertNotIn("smpphylist", " ".join(grants))
+        for platform in ("scale", "linux", "quantastor", "esxi"):
+            for source in (SUDO_COMMANDS_BY_PLATFORM, SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM):
+                with self.subTest(platform=platform):
+                    self.assertNotIn(self.grant(), source[platform])
 
-    def test_topology_is_not_mislabeled_as_error_counters(self):
-        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
-        result = self.policy(argv)
-        self.assertEqual(result["capability"], "phy_topology_only")
-        self.assertEqual(result["state"], "inactive_draft")
-        self.assertIs(result["enabled"], False)
-        self.assertEqual(result["argv"], argv)
-        self.assertEqual(result["candidate_grant"], "/sbin/camcontrol ^smpphylist pass3$")
+    def test_custom_command_lists_still_receive_the_rule(self):
+        grants = ServiceAccountBootstrapService._resolve_sudo_commands(
+            "core", ["sudo -n /usr/sbin/sesutil map"],
+        )
+        self.assertIn(self.grant(), grants)
 
-    def test_counter_request_has_only_the_exact_report_phy_error_log_bytes(self):
-        from scripts.core_expander_counter_draft import phy_error_log_argv
+    def test_rule_matches_every_phy_on_any_pass_device(self):
+        from app.services.core_expander_counters import phy_error_log_argv
+
+        for device in ("pass0", "pass3", "pass12", "pass4095"):
+            for phy in range(255):
+                with self.subTest(device=device, phy=phy):
+                    self.assertTrue(self.matches(shlex.join(phy_error_log_argv(device, phy))))
+
+    def test_rule_survives_the_core_middleware_unchanged(self):
+        self.assertEqual(middleware_stored_grant(self.grant()), self.grant())
+        self.assertTrue(self.grant().startswith("/sbin/camcontrol ^smpcmd "))
+        self.assertTrue(self.grant().endswith(" -R 28 -$"))
+
+    def test_rule_refuses_every_other_function_length_option_and_shell_form(self):
+        from app.services.core_expander_counters import phy_error_log_argv
+
+        good = phy_error_log_argv("pass3", 0x2A)
+        fmt = good[5]
+        fields = fmt.split("{}")
+
+        def with_field(index: int, value: str) -> str:
+            changed = list(fields)
+            changed[index] = value
+            return "{}".join(changed)
+
+        refused = [
+            # The 255th PHY identifier is outside the admitted range.
+            (*good[:5], with_field(9, "ff"), *good[6:]),
+            # Other camcontrol SMP commands, including PHY control and resets.
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "linkreset"),
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "hardreset"),
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "disable"),
+            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "clearerrlog"),
+            ("/sbin/camcontrol", "smprg", "pass3"),
+            ("/sbin/camcontrol", "smprg", "pass3", "-l"),
+            ("/sbin/camcontrol", "smpphylist", "pass3"),
+            ("/sbin/camcontrol", "smpmaninfo", "pass3"),
+            ("/sbin/camcontrol", "reset", "pass3"),
+            ("/sbin/camcontrol", "smpcmd", "pass3", "-r", "12", "-", "-R", "28", "-"),
+            # Other request or response lengths.
+            (*good[:4], "16", *good[5:]),
+            (*good[:4], "44", *good[5:]),
+            (*good[:7], "32", "-"),
+            (*good[:7], "1024", "-"),
+            (*good[:7], "28", "b4"),
+            (*good[:5], fmt + "{}00", *good[6:]),
+            (*good[:5], "{}".join(fields[:-1]), *good[6:]),
+            # Extra, moved or inserted arguments and options.
+            (*good, "-v"),
+            (*good, "-r", "12", "-"),
+            (*good[:3], "-v", *good[3:]),
+            (*good[:3], "-t", "60", *good[3:]),
+            (*good[:3], "-C", "9", *good[3:]),
+            ("/sbin/camcontrol", "smpcmd", "pass3", *good[6:], *good[3:6]),
+            # Other device names and spellings of the request.
+            (*good[:2], "/dev/pass3", *good[3:]),
+            (*good[:2], "pass", *good[3:]),
+            (*good[:2], "da3", *good[3:]),
+            (*good[:2], "ses0", *good[3:]),
+            (*good[:2], "pass3x", *good[3:]),
+            (*good[:5], fmt.upper(), *good[6:]),
+            (*good[:5], " ".join(fields), *good[6:]),
+            (*good[:5], fmt.replace("{}", "{} "), *good[6:]),
+            ("/sbin/../sbin/camcontrol", *good[1:]),
+            ("/usr/sbin/camcontrol", *good[1:]),
+            # Shell metacharacters never reach a matching argument list.
+            (*good, ";", "reset"),
+            (*good, "&&", "true"),
+            (*good, "|", "sh"),
+            (*good, ">", "/tmp/out"),
+            (*good[:2], "pass3;reboot", *good[3:]),
+            (*good[:2], "$(reboot)", *good[3:]),
+            (*good[:2], "`reboot`", *good[3:]),
+            (*good[:2], "pass3\nreset", *good[3:]),
+        ]
+        # Every fixed request byte, including function, allocated length and
+        # request length, admits only its one value.
+        for index, value in enumerate(fields):
+            if index == 9:
+                continue
+            for other in ("91", "10", "00" if value != "00" else "01", "81", "ff"):
+                if other != value:
+                    refused.append((*good[:5], with_field(index, other), *good[6:]))
+        for argv in refused:
+            with self.subTest(argv=argv):
+                self.assertFalse(self.matches(shlex.join(argv)))
+
+    def test_resplit_arguments_that_match_never_send_another_request(self):
+        """sudo matches argv joined by spaces; model every re-split that still matches.
+
+        Mirrors FreeBSD 13 camcontrol smpcmd(): BSD getopt over "r:R:" stops at
+        the first non-option, `-r len fmt` and `-R len -` take the format as the
+        next argument, a format starting with '-' means stdin, and nothing is
+        sent unless both -r and -R were parsed.
+        """
+        from app.services.core_expander_counters import phy_error_log_argv
+
+        canonical = phy_error_log_argv("pass3", 5)
+        words = canonical[1:]
+        sent = 0
+        for mask in range(1 << (len(words) - 1)):
+            tokens = [words[0]]
+            for index, word in enumerate(words[1:]):
+                if mask & (1 << index):
+                    tokens[-1] = f"{tokens[-1]} {word}"
+                else:
+                    tokens.append(word)
+            argv = (canonical[0], *tokens)
+            self.assertTrue(self.matches(shlex.join(argv)), argv)
+            outcome = self._model_smpcmd(tokens)
+            if outcome is None:
+                continue
+            sent += 1
+            self.assertEqual(outcome, ("format", canonical[5], 12, 28), argv)
+        self.assertGreaterEqual(sent, 1)
+
+    @staticmethod
+    def _strtol(text: str) -> int:
+        match = re.match(r"\s*([0-9]+)", text)
+        return int(match.group(1)) if match else 0
+
+    def _model_smpcmd(self, tokens: list[str]):
+        if tokens[0] != "smpcmd" or re.fullmatch(r"pass[0-9]+", tokens[1]) is None:
+            return None  # unknown command or unusable device: nothing is sent
+        args = tokens[2:]
+        index = 0
+        request = response = None
+        while index < len(args):
+            arg = args[index]
+            if not arg.startswith("-") or arg == "-" or len(arg) < 2 or arg[1] not in "rR":
+                break  # BSD getopt stops at the first non-option
+            if len(arg) > 2:
+                optarg, index = arg[2:], index + 1
+            elif index + 1 < len(args):
+                optarg, index = args[index + 1], index + 2
+            else:
+                return None
+            size = self._strtol(optarg)
+            if size <= 0:
+                return None
+            datastr = args[index] if index < len(args) else None
+            if datastr is not None:
+                index += 1
+            if arg[1] == "r":
+                request = ("stdin" if datastr and datastr.startswith("-") else "format", datastr, size)
+            else:
+                response = size
+        if request is None or response is None:
+            return None  # "need both the request (-r) and response (-R) arguments"
+        return (*request, response)
+
+    def test_argv_builder_has_only_the_exact_report_phy_error_log_bytes(self):
+        from app.services.core_expander_counters import phy_error_log_argv
 
         for phy in (0, 3, 127, 254):
             with self.subTest(phy=phy):
@@ -1540,74 +1693,9 @@ class CoreExpanderCounterDraftTests(unittest.TestCase):
                 self.assertEqual(request, bytes((0x40, 0x11, 6, 2, 0, 0, 0, 0, 0, phy, 0, 0)))
                 self.assertEqual(argv[:5], ("/sbin/camcontrol", "smpcmd", "pass3", "-r", "12"))
                 self.assertEqual(argv[6:], ("-R", "28", "-"))
-                result = self.policy(argv)
-                self.assertEqual(result["capability"], "expander_phy_error_log")
-                self.assertEqual(result["argv"], argv)
-                self.assertIs(result["host_validated"], False)
-                self.assertIs(result["enabled"], False)
-                grant = result["candidate_grant"]
-                self.assertTrue(core_stored_grant_matches(grant, shlex.join(argv)))
-                self.assertNotIn("*", grant)
-                self.assertNotIn("\\", grant)
-                self.assertNotIn(",", grant)
-                self.assertNotIn(":", grant)
-                self.assertFalse(core_stored_grant_matches(
-                    grant, shlex.join(phy_error_log_argv("pass4", phy))))
-                self.assertFalse(core_stored_grant_matches(
-                    grant, shlex.join(phy_error_log_argv("pass3", (phy + 1) % 255))))
-
-    def test_missing_or_unqualified_version_and_tool_evidence_is_refused(self):
-        argv = ("/sbin/camcontrol", "smpphylist", "pass3")
-        for updates in (
-            {"freebsd_release": None}, {"freebsd_release": "13.0"},
-            {"freebsd_release": "14.0"}, {"freebsd_release": "TrueNAS-13"},
-            {"tool_path": None}, {"tool_path": "/usr/local/sbin/smp_rep_phy_err_log"},
-            {"tool_path": "/sbin/../sbin/camcontrol"},
-            {"sudo_version": None}, {"sudo_version": "1.9.9"},
-            {"sudo_version": "1.9.10 garbage"}, {"sudo_version": "1.8.31"},
-            {"opt_in": "yes"},
-        ):
-            with self.subTest(updates=updates), self.assertRaises(ValueError):
-                self.policy(argv, **updates)
-        for version in ("1.9.10p1", "1.9.17"):
-            self.assertEqual(self.policy(argv, sudo_version=version)["state"], "inactive_draft")
-
-    def test_mutations_options_paths_and_unsupported_tools_are_refused(self):
-        from scripts.core_expander_counter_draft import phy_error_log_argv
-
-        good = phy_error_log_argv("pass3", 3)
-        refused = [
-            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "reset"),
-            ("/sbin/camcontrol", "smppc", "pass3", "-p", "3", "-o", "disable"),
-            ("/sbin/camcontrol", "reset", "pass3"),
-            ("/usr/local/sbin/smp_rep_phy_err_log", "--phy=3", "/dev/ses3"),
-            ("/usr/local/sbin/smartctl", "-l", "sasphy,reset", "/dev/da3"),
-            ("/usr/bin/sg_logs", "--select", "/dev/sg3"),
-            ("/sbin/camcontrol", "smpphylist", "pass3", "-l"),
-            ("/sbin/camcontrol", "smpphylist", "/dev/pass3"),
-            ("/sbin/camcontrol", "smpphylist", "pass3/../../etc/master.passwd"),
-            ("/sbin/camcontrol", "smpphylist", "pass3\nreset"),
-            ("/sbin/camcontrol", "smpphylist", "pass３"),
-            ("/sbin/../sbin/camcontrol", *good[1:]),
-            (*good, "-r", "12", "-"),  # stdin-controlled replacement request
-            (*good[:5], "-", *good[6:]),
-            (*good[:5], good[5].replace("11", "91", 1), *good[6:]),
-            (*good[:4], "16", *good[5:]),
-            (*good[:7], "32", "-"),
-            (*good[:5], "40 11 06 02 00 00 00 00 00 03 00 00", *good[6:]),
-            (*good, ";", "reset"),
-            " ".join(good),
-        ]
-        grants = (self.policy(good)["candidate_grant"],
-                  self.policy(("/sbin/camcontrol", "smpphylist", "pass3"))["candidate_grant"])
-        for argv in refused:
-            with self.subTest(argv=argv), self.assertRaises(ValueError):
-                self.policy(argv)
-            if not isinstance(argv, str):
-                self.assertFalse(any(core_stored_grant_matches(grant, shlex.join(argv)) for grant in grants))
 
     def test_builder_rejects_bad_phy_and_device_instead_of_normalizing(self):
-        from scripts.core_expander_counter_draft import phy_error_log_argv
+        from app.services.core_expander_counters import phy_error_log_argv
 
         for phy in (-1, 255, True, "3", None, 3.0):
             with self.subTest(phy=phy), self.assertRaises(ValueError):
@@ -1615,20 +1703,6 @@ class CoreExpanderCounterDraftTests(unittest.TestCase):
         for device in ("pass3 -v", "../pass3", "/dev/pass3", "pass3\x00", "pass３", "ses3"):
             with self.subTest(device=device), self.assertRaises(ValueError):
                 phy_error_log_argv(device, 3)
-
-    def test_draft_does_not_touch_live_policy_or_io(self):
-        from scripts.core_expander_counter_draft import phy_error_log_argv
-
-        before = core_grant_sources()
-        with patch("builtins.open", side_effect=AssertionError("file IO")), \
-                patch("subprocess.run", side_effect=AssertionError("exec")), \
-                patch("socket.create_connection", side_effect=AssertionError("network")):
-            result = self.policy(phy_error_log_argv("pass3", 3))
-        self.assertEqual(result["state"], "inactive_draft")
-        self.assertEqual(core_grant_sources(), before)
-        for grants in before.values():
-            self.assertFalse(any("smpcmd" in grant or "smpphylist" in grant for grant in grants))
-
 
 
 def _phy_error_log_frame(
@@ -1656,12 +1730,12 @@ class CoreExpanderCounterDecoderTests(unittest.TestCase):
     )
 
     def decode(self, frame, phy=5):
-        from scripts.core_expander_counter_draft import decode_phy_error_log_response
+        from app.services.core_expander_counters import decode_phy_error_log_response
 
         return decode_phy_error_log_response(frame, phy=phy)
 
     def assert_frame_error(self, frame, reason, phy=5):
-        from scripts.core_expander_counter_draft import SmpResponseError
+        from app.services.core_expander_counters import SmpResponseError
 
         with self.assertRaises(SmpResponseError) as caught:
             self.decode(frame, phy=phy)
@@ -1673,7 +1747,7 @@ class CoreExpanderCounterDecoderTests(unittest.TestCase):
         return {"phy": phy, **dict(zip(self.counter_fields, counters))}
 
     def deltas(self, previous, current):
-        from scripts.core_expander_counter_draft import phy_counter_deltas
+        from app.services.core_expander_counters import phy_counter_deltas
 
         return phy_counter_deltas(previous, current)
 
@@ -1727,7 +1801,7 @@ class CoreExpanderCounterDecoderTests(unittest.TestCase):
 
     def test_phy_identifier_must_match_the_requested_phy(self):
         self.assert_frame_error(_phy_error_log_frame(phy=6), "phy_identifier", phy=5)
-        from scripts.core_expander_counter_draft import decode_phy_error_log_response
+        from app.services.core_expander_counters import decode_phy_error_log_response
 
         for phy in (-1, 255, True, "5", None, 5.0):
             with self.subTest(phy=phy), self.assertRaises(ValueError):
@@ -1785,7 +1859,7 @@ class CoreExpanderCounterDecoderTests(unittest.TestCase):
         self.assertTrue(all(rows[1][key] is None for key in self.counter_fields))
 
     def test_malformed_samples_raise_a_typed_error(self):
-        from scripts.core_expander_counter_draft import CounterSampleError
+        from app.services.core_expander_counters import CounterSampleError
 
         good = self.row(0, 1, 2, 3, 4)
         malformed = [
@@ -1810,7 +1884,7 @@ class CoreExpanderCounterDecoderTests(unittest.TestCase):
 
     def test_decoded_rows_match_the_linux_sysfs_counter_shape(self):
         from app.models.domain import SasPortView
-        from scripts.core_expander_counter_draft import COUNTER_FIELDS, SYSFS_COUNTER_ATTRIBUTES
+        from app.services.core_expander_counters import COUNTER_FIELDS, SYSFS_COUNTER_ATTRIBUTES
 
         self.assertEqual(COUNTER_FIELDS, self.counter_fields)
         self.assertEqual(set(COUNTER_FIELDS) - set(SasPortView.model_fields), set())
