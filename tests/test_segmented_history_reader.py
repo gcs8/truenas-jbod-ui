@@ -3071,3 +3071,138 @@ class SegmentedHistoryReaderCliTests(unittest.TestCase):
                     """,
                     (sample_id, observed_at, "system-1", "enclosure-1", 1, "slot-1", "temperature", value),
                 )
+
+
+class HistorySystemSummaryLayoutContractTests(unittest.TestCase):
+    """Both storage layouts answer ``list_history_system_summaries`` alike (#1082).
+
+    The admin page reads only ``total_rows`` from these summaries, so a layout
+    that omits a field shows every system as having no history.
+    """
+
+    CUTOFF = "2025-01-02T00:00:00+00:00"
+    SYSTEMS = (
+        ("system-a", "Alpha Shelf"),
+        ("system-b", "Bravo Shelf"),
+        ("system-c", "Charlie Shelf"),  # removed system: sealed history only
+    )
+
+    def _populate(self, path: Path) -> None:
+        HistoryStore(str(path), recover_unreadable_database=False)
+        old, new = "2025-01-01T06:00:00+00:00", "2025-01-03T06:00:00+00:00"
+        rows = {
+            # system_id: (current slots, (old, new) events, samples, rollups)
+            "system-a": (2, (3, 2), (4, 1), (2, 1)),
+            "system-b": (1, (1, 1), (0, 2), (1, 0)),
+            "system-c": (0, (2, 0), (1, 0), (1, 0)),
+        }
+        labels = dict(self.SYSTEMS)
+        with closing(sqlite3.connect(path)) as connection, connection:
+            for system_id, (slots, events, samples, rollups) in rows.items():
+                label = labels[system_id]
+                for slot in range(1, slots + 1):
+                    connection.execute(
+                        """INSERT INTO slot_state_current (
+                            system_id, system_label, enclosure_key, slot, slot_label,
+                            present, identify_active, last_seen_at
+                        ) VALUES (?, ?, 'enclosure-1', ?, ?, 1, 0, ?)""",
+                        (system_id, label, slot, f"slot-{slot}", new),
+                    )
+                for observed_at, count in zip((old, new), events):
+                    connection.executemany(
+                        """INSERT INTO slot_events (
+                            observed_at, system_id, system_label, enclosure_key, slot,
+                            slot_label, event_type, details_json
+                        ) VALUES (?, ?, ?, 'enclosure-1', 1, 'slot-1', 'state', '{}')""",
+                        [(observed_at, system_id, label)] * count,
+                    )
+                for observed_at, count in zip((old, new), samples):
+                    connection.executemany(
+                        """INSERT INTO metric_samples (
+                            observed_at, system_id, system_label, enclosure_key, slot,
+                            slot_label, metric_name, value_integer, disk_identity_key
+                        ) VALUES (?, ?, ?, 'enclosure-1', 1, 'slot-1', 'temperature', 30, 'disk-a')""",
+                        [(observed_at, system_id, label)] * count,
+                    )
+                for bucket_day, count in zip(("2025-01-01", "2025-01-03"), rollups):
+                    connection.executemany(
+                        """INSERT INTO metric_rollups (
+                            bucket_start, bucket_seconds, system_id, system_label,
+                            enclosure_key, slot, slot_label, metric_name, sample_count,
+                            value_sum, value_min, value_max, last_value,
+                            last_observed_at, disk_identity_key
+                        ) VALUES (?, 3600, ?, ?, 'enclosure-1', 1, 'slot-1',
+                                  'temperature', 1, 30, 30, 30, 30, ?, 'disk-a')""",
+                        [
+                            (f"{bucket_day}T{hour:02d}:00:00+00:00", system_id, label,
+                             f"{bucket_day}T{hour:02d}:30:00+00:00")
+                            for hour in range(count)
+                        ],
+                    )
+
+    def _segmented_root(self, root: Path, source: Path) -> tuple[Path, Path, Path]:
+        """Seal pre-cutoff rows into one segment and keep the rest in the hot DB."""
+        from history_service.segment_sealer import HISTORY_TABLE_TIMESTAMPS, seal_history_segment
+
+        sealed = seal_history_segment(
+            source=source, output_directory=root / "segments",
+            segment_id="segment-0001", cutoff=self.CUTOFF, key_id="synthetic-key",
+        )
+        segment = Path(sealed["path"])
+        hot = root / "hot.sqlite3"
+        hot.write_bytes(source.read_bytes())
+        with closing(sqlite3.connect(hot)) as connection, connection:
+            for table_name, column in HISTORY_TABLE_TIMESTAMPS.items():
+                connection.execute(
+                    f"DELETE FROM {table_name} WHERE julianday({column}) < julianday(?)",
+                    (self.CUTOFF,),
+                )
+        catalog = segment.parent / "catalog.json"  # entries name files beside it
+        _write_covering_catalog(catalog, [segment])
+        return hot, segment, catalog
+
+    @staticmethod
+    def _by_system(summaries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        by_system = {summary["system_id"]: summary for summary in summaries}
+        assert len(by_system) == len(summaries), summaries
+        return by_system
+
+    def test_segmented_and_unsegmented_summaries_have_the_same_shape_and_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite3"
+            self._populate(source)
+            hot, segment, catalog = self._segmented_root(root, source)
+            unsegmented = HistoryStore(str(source), initialize=False, recover_unreadable_database=False)
+            segmented = HistoryStore(
+                str(hot), initialize=False, recover_unreadable_database=False,
+                segment_catalog_path=catalog,
+            )
+            # Sanity: the segmented root really splits history across files.
+            with closing(sqlite3.connect(segment)) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0], 6)
+            with closing(sqlite3.connect(hot)) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()[0], 3)
+
+            expected = self._by_system(unsegmented.list_history_system_summaries())
+            self.assertEqual(
+                {system_id: summary["total_rows"] for system_id, summary in expected.items()},
+                {"system-a": 15, "system-b": 6, "system-c": 4},
+            )
+            # The second segmented read reuses the authenticated segment rows.
+            for attempt in ("fresh", "cached"):
+                with self.subTest(attempt=attempt):
+                    actual = self._by_system(segmented.list_history_system_summaries())
+                    self.assertEqual(actual.keys(), expected.keys())
+                    for system_id, summary in expected.items():
+                        self.assertEqual(sorted(actual[system_id]), sorted(summary), system_id)
+                        self.assertEqual(actual[system_id], summary, system_id)
+                    reader = segmented._segment_reader_cache
+                    assert reader is not None
+                    self.assertIn(segment.absolute(), {Path(path).absolute() for path in reader._segment_system_summaries})
+
+            excluded = ["system-a", "system-b"]
+            self.assertEqual(
+                segmented.list_history_system_summaries(excluded),
+                unsegmented.list_history_system_summaries(excluded),
+            )

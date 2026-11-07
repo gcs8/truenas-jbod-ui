@@ -32,6 +32,41 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Recorded beta.5 publication, image convergence, reported beta deployment and
   squash-tree evidence while retaining the unverified closeout gates (#1079).
+### Added
+
+- Added the CORE HBA PHY table to Storage Fabric controller data, and an
+  optional `reported_lanes` field on fabric links. It lists the PHY pairs that
+  both ends of an HBA-to-expander or expander cascade link report toward each
+  other, with lane count and negotiated rate, and stays null when either end's
+  rows are missing or disagree. It does not claim cable count or width
+  (#1086).
+
+### Fixed
+
+- Fixed the first bays of a single-row chassis face that is wider than its
+  bezel, such as a 24-bay 2.5" front at 1600 px. They were clipped past the
+  start edge, where horizontal scrolling could not reach them or a click select
+  them; the overflow now scrolls from the first bay (#1081).
+- Fixed the admin page showing 0 saved history rows for every system on a
+  segmented history deployment. Segmented system summaries now include
+  `total_rows` like unsegmented ones, so the removed-system history lists and
+  the delete-history row count show real counts (#1083).
+
+### Internal
+
+- Added an inactive, unwired SMP REPORT PHY ERROR LOG response decoder and
+  per-phy counter delta helper with strict frame validation, reset and
+  saturation handling; no grant, collector or UI changed (#1084).
+
+### Docs
+
+- Added an upgrade qualification for the admin service: a v0.22.2 install
+  that started it with the documented admin profile command is updated by
+  image pin with the same profiles, and the admin service comes back healthy
+  on the new image with the same config, mappings and history; a deployment
+  that never started it still has no admin container after the update. Basic
+  authentication, the hardened overlay, auto-stop, admin write actions and
+  rollback with admin running stay listed as untested (#1085).
 
 ## v0.24.0-beta.5 - 2026-11-02
 

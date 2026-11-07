@@ -882,6 +882,20 @@ jobs:
             --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
             --candidate-revision "$GITHUB_SHA"
 
+      - name: Keep a running admin service healthy across an image-only upgrade, and dormant where never enabled
+        run: |
+          set -euo pipefail
+          python3 scripts/run_image_upgrade_smoke.py \
+            --scenario admin-during-upgrade \
+            --root "$RUNNER_TEMP/image-upgrade-admin" \
+            --compose-fixture tests/fixtures/compose/v0.22.2.yml \
+            --config-fixture tests/fixtures/ci-smoke-config.yaml \
+            --previous-image "$PREVIOUS_IMAGE" \
+            --previous-version "$PREVIOUS_VERSION" \
+            --candidate-image "$CANDIDATE_IMAGE" \
+            --candidate-version "$(python3 -c 'import app; print(app.__version__)')" \
+            --candidate-revision "$GITHUB_SHA"
+
   admin-browser-cleanroom:
     name: Admin clean-room browser QA
     needs: route
@@ -1059,6 +1073,7 @@ jobs:
           set -euo pipefail
           npx playwright test \
             qa/admin-draft-target-ownership.spec.js \
+            qa/chassis-row-overflow.spec.js \
             qa/connections-clear-selection.spec.js \
             qa/connections-overflow.spec.js \
             qa/offline-snapshot.spec.js \
