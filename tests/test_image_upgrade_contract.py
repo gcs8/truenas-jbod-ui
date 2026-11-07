@@ -2353,6 +2353,342 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 ])
 
 
+class AdminDuringUpgradeScenarioTests(unittest.TestCase):
+    """#463: the admin service across an image-only upgrade. Driver contracts, not Docker evidence."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def matrix_rows(self):
+        guide = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        matrix = guide.split("## What is tested", 1)[1].split("\n## ", 1)[0]
+        rows = {}
+        for line in matrix.splitlines():
+            cells = [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+            if line.startswith("| ") and len(cells) == 3:
+                rows[cells[0]] = cells[1:]
+        return matrix, rows
+
+    def test_admin_during_upgrade_is_dispatched(self):
+        from types import SimpleNamespace
+
+        smoke = self.load_smoke()
+        self.assertIn("admin-during-upgrade", smoke.SCENARIOS)
+        siblings = ("enospc_state", "readonly_state", "unavailable_backup_storage", "interrupted_migration",
+                    "segmented_catalog_upgrade", "upgrade_and_rollback")
+        with contextlib.ExitStack() as stack:
+            for sibling in siblings:
+                stack.enter_context(mock.patch.object(smoke, sibling, return_value=f"routed to {sibling}"))
+            scenario = stack.enter_context(mock.patch.object(smoke, "admin_during_upgrade", return_value="qualified"))
+            args = SimpleNamespace(scenario="admin-during-upgrade")
+            self.assertEqual(smoke.smoke(args), "qualified")
+            scenario.assert_called_once_with(args)
+
+    def test_admin_during_upgrade_runs_as_one_step_of_the_existing_report_only_job(self):
+        workflow = yaml.safe_load((self.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        job = workflow["jobs"]["image-upgrade-scenarios"]
+        runs = [step["run"] for step in job["steps"] if "--scenario admin-during-upgrade" in step.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        for argument in (
+            "set -euo pipefail",
+            '--root "$RUNNER_TEMP/image-upgrade-admin"',
+            "--compose-fixture tests/fixtures/compose/v0.22.2.yml",
+            "--config-fixture tests/fixtures/ci-smoke-config.yaml",
+            '--previous-image "$PREVIOUS_IMAGE"',
+            '--previous-version "$PREVIOUS_VERSION"',
+            '--candidate-image "$CANDIDATE_IMAGE"',
+            '--candidate-revision "$GITHUB_SHA"',
+        ):
+            self.assertIn(argument, runs[0])
+        step = next(step for step in job["steps"] if "--scenario admin-during-upgrade" in step.get("run", ""))
+        self.assertNotIn("continue-on-error", step)
+        # Same job, same runner and budget: no new job, runner or capacity.
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertNotIn("--scenario admin-during-upgrade", str(workflow["jobs"]["image-upgrade-smoke"]))
+        self.assertEqual(sum("admin-during-upgrade" in str(other) for name, other in workflow["jobs"].items()
+                             if name != "image-upgrade-scenarios"), 0)
+
+    def test_support_matrix_moves_only_the_admin_slice_to_tested(self):
+        matrix, rows = self.matrix_rows()
+        flat = " ".join(matrix.split())
+        self.assertIn("--scenario admin-during-upgrade", flat)
+        tested, untested = rows["Services"]
+        self.assertIn("--scenario admin-during-upgrade", tested)
+        self.assertIn("`docker compose --profile admin up -d enclosure-admin`", tested)
+        self.assertIn("--profile history --profile admin", tested)
+        self.assertIn("never started", tested)
+        self.assertNotIn("Admin service during an upgrade", untested)
+        # The untested remainder of the admin slice stays honest, and nothing
+        # else in the row moves.
+        for bound in ("Basic authentication", "hardened overlay", "auto-stop", "rollback with the admin service",
+                      "the published backup scheduler's upgrade path", "NFS, SMB, S3, SFTP and FTP backup targets"):
+            self.assertIn(bound, untested)
+
+    def test_admin_start_and_update_commands_are_the_documented_ones(self):
+        smoke = self.load_smoke()
+        upgrading = (self.ROOT / "wiki" / "Upgrading.md").read_text(encoding="utf-8")
+        deployment_guide = (self.ROOT / "wiki" / "Docker-and-GHCR-Deployment.md").read_text(encoding="utf-8")
+        self.assertIn("docker compose --profile admin up -d enclosure-admin", upgrading)
+        self.assertIn("docker compose --profile admin pull", deployment_guide)
+        self.assertIn("docker compose --profile history --profile admin pull", deployment_guide)
+        self.assertIn("docker compose --profile history --profile admin up -d", deployment_guide)
+        self.assertEqual(smoke.ADMIN_START_PULL, ("--profile", "admin", "pull"))
+        # The documented start, with only the --wait that pull_and_up also adds.
+        self.assertEqual(smoke.ADMIN_START_UP, ("--profile", "admin", "up", "-d", "--wait", "--wait-timeout", "300",
+                                                "enclosure-admin"))
+        self.assertEqual(smoke.ADMIN_PROFILES, ("--profile", "history", "--profile", "admin"))
+        fixture = yaml.safe_load((self.ROOT / "tests/fixtures/compose/v0.22.2.yml").read_text(encoding="utf-8"))
+        admin = fixture["services"]["enclosure-admin"]
+        self.assertEqual(admin["profiles"], ["admin"])
+        self.assertEqual(admin["container_name"], smoke.ADMIN_CONTAINER_NAME)
+        self.assertEqual(smoke.ADMIN_ENVIRONMENT, {"ADMIN_PORT": str(smoke.ADMIN_SMOKE_PORT),
+                                                   "ADMIN_BIND_ADDRESS": "127.0.0.1"})
+        self.assertNotIn(smoke.ADMIN_SMOKE_PORT, (smoke.UI_PORT, smoke.HISTORY_PORT))
+
+    def args(self, root):
+        from types import SimpleNamespace
+        return SimpleNamespace(root=root, compose_fixture=Path("compose-fixture"), config_fixture=Path("config-fixture"),
+                               previous_image="previous", previous_version="1", candidate_image="candidate",
+                               candidate_version="2", candidate_revision="revision", scenario="admin-during-upgrade")
+
+    VIEW = {"systems": [["default", "Default", "core", "http://127.0.0.1:9"]], "default_system_id": "default",
+            "paths": {"config_file": "/app/config/config.yaml", "mapping_file": "/app/data/slot_mappings.json",
+                      "history_db": "/app/history/history.db"}}
+
+    def exercise(self, fault=None):
+        smoke = self.load_smoke()
+        ui = {"mappings": [["shelf-a", 1, "SYNTH-0001", "synthetic upgrade smoke"]]}
+        history = {"counts": {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12}, "integrity": "ok"}
+        identity = {"config_sha256": "config", "mapping_sha256": "mapping", "history_rows": {"slot_events": [3, "h"]}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deployments = []
+
+            def make(*_args, **_kwargs):
+                deployment = mock.Mock(spec=smoke.Deployment)
+                deployment.root = root
+                deployment.files = ()
+                deployment.runtime_environment = {}
+                deployment.exec_python.return_value = history
+                deployments.append(deployment)
+                return deployment
+
+            identities = [identity, identity, dict(identity, config_sha256="rewritten") if fault == "config" else identity]
+            admins = [{"container": "admin-1", "image": "previous-id"},
+                      {"container": "admin-1" if fault == "not-recreated" else "admin-2", "image": "candidate-id"}]
+            views = [self.VIEW, dict(self.VIEW, default_system_id="other") if fault == "view" else self.VIEW]
+            admin_reads = [dict(ui, version="1"),
+                           dict(ui, version="2", mappings=[] if fault == "mappings" else ui["mappings"])]
+            dormant = [None, smoke.SmokeError("admin container exists") if fault == "dormant" else None]
+            with (
+                mock.patch.object(smoke, "Deployment", side_effect=make),
+                mock.patch.object(smoke, "prepare_root") as prepare,
+                mock.patch.object(smoke, "seed_previous_release", return_value=(ui, history, {1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "check_runtime", return_value={"enclosure-ui": {}, "enclosure-history": {}}),
+                mock.patch.object(smoke, "check_admin_dormant", side_effect=dormant) as check_dormant,
+                mock.patch.object(smoke, "check_admin_runtime", side_effect=admins) as admin_runtime,
+                mock.patch.object(smoke, "read_admin_state", side_effect=views),
+                mock.patch.object(smoke, "check_admin_state") as check_state,
+                mock.patch.object(smoke, "read_admin_history", return_value=[{"system_id": "upgrade-smoke"}]),
+                mock.patch.object(smoke, "check_admin_history") as check_history,
+                mock.patch.object(smoke, "admin_exec_python", side_effect=admin_reads),
+                mock.patch.object(smoke, "state_identity", side_effect=identities),
+                mock.patch.object(smoke, "history_api_view",
+                                  return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})),
+                mock.patch.object(smoke, "remove_admin_service") as remove,
+                mock.patch.object(smoke, "print_admin_logs") as logs,
+            ):
+                if fault is None:
+                    result = smoke.admin_during_upgrade(self.args(root))
+                else:
+                    with self.assertRaises(smoke.SmokeError):
+                        smoke.admin_during_upgrade(self.args(root))
+                    result = None
+            return smoke, result, deployments, locals()
+
+    def test_lifecycle_proves_dormancy_then_upgrades_a_running_admin_service(self):
+        smoke, result, deployments, scope = self.exercise()
+        self.assertIn("scenario=admin-during-upgrade", result)
+        for token in ("admin_health=ok", "admin_recreated=ok", "admin_state=unchanged", "admin_mappings=unchanged",
+                      "config_bytes=unchanged", "mapping_bytes=unchanged", "history_rows=unchanged",
+                      "admin_dormant_without_profile=ok"):
+            self.assertIn(token, result)
+        dormant, enabled = deployments
+        # Phase 1: a deployment that never enabled admin, literal update only.
+        dormant.set_image.assert_called_once_with("candidate")
+        dormant.pull_and_up.assert_called_once_with()
+        self.assertEqual(dormant.compose.call_args_list, [mock.call("down", "--volumes", "--remove-orphans")])
+        self.assertEqual(scope["check_dormant"].call_args_list, [mock.call(dormant), mock.call(dormant)])
+        self.assertEqual(dormant.runtime_environment, {})
+        # Phase 2: admin started with the documented command, then the same profiles update.
+        self.assertEqual(enabled.runtime_environment, smoke.ADMIN_ENVIRONMENT)
+        self.assertEqual(enabled.compose.call_args_list, [
+            mock.call(*smoke.ADMIN_START_PULL),
+            mock.call(*smoke.ADMIN_START_UP, timeout=420),
+            mock.call(*smoke.ADMIN_PROFILES, "pull"),
+            mock.call(*smoke.ADMIN_PROFILES, "up", "-d", "--wait", "--wait-timeout", "300", timeout=420),
+        ])
+        enabled.set_image.assert_called_once_with("candidate")
+        enabled.pull_and_up.assert_not_called()
+        self.assertEqual(scope["admin_runtime"].call_args_list, [
+            mock.call(enabled, "previous", "1"), mock.call(enabled, "candidate", "2")])
+        self.assertEqual(scope["check_state"].call_count, 2)
+        scope["check_history"].assert_called_once_with([{"system_id": "upgrade-smoke"}])
+        self.assertEqual(scope["prepare"].call_count, 2)
+        scope["remove"].assert_called_once_with(enabled)
+        scope["logs"].assert_not_called()
+
+    def test_lifecycle_refuses_changed_state_or_an_admin_service_that_was_not_upgraded(self):
+        for fault in ("config", "not-recreated", "view", "mappings"):
+            with self.subTest(fault=fault):
+                smoke, _, deployments, scope = self.exercise(fault)
+                self.assertEqual(len(deployments), 2)
+                # The admin container is always removed, after its logs are kept.
+                scope["remove"].assert_called_once_with(deployments[1])
+                scope["logs"].assert_called_once_with(deployments[1])
+
+    def test_lifecycle_refuses_an_admin_container_on_a_deployment_that_never_enabled_it(self):
+        smoke, _, deployments, scope = self.exercise("dormant")
+        self.assertEqual(len(deployments), 1)
+        deployments[0].pull_and_up.assert_called_once_with()
+        scope["admin_runtime"].assert_not_called()
+
+    def test_admin_runtime_requires_the_expected_image_health_and_version(self):
+        import json
+
+        smoke = self.load_smoke()
+        baseline = {"Id": "admin-id", "Name": "/truenas-jbod-admin", "Image": "image-id", "RestartCount": 0,
+                    "State": {"Status": "running", "Health": {"Status": "healthy"}}}
+        for fault in (None, "restart", "unhealthy", "exited", "other-image", "wrong-version", "health-down",
+                      "two-containers", "renamed"):
+            with self.subTest(fault=fault):
+                state = json.loads(json.dumps(baseline))
+                ps = "admin-id\nother-id" if fault == "two-containers" else "admin-id"
+                if fault == "restart":
+                    state["RestartCount"] = 1
+                if fault == "unhealthy":
+                    state["State"]["Health"]["Status"] = "unhealthy"
+                if fault == "exited":
+                    state["State"]["Status"] = "exited"
+                if fault == "other-image":
+                    state["Image"] = "stale-id"
+                if fault == "renamed":
+                    state["Name"] = "/something-else"
+                live = (200, {"status": "ok", "version": "9" if fault == "wrong-version" else "2"})
+                health = (503, {}) if fault == "health-down" else (200, {"status": "ok"})
+                deployment = mock.Mock(spec=smoke.Deployment)
+                deployment.environment = None
+                deployment.compose.return_value = ps + "\n"
+
+                def fake_run(command, **_kwargs):
+                    if command[:3] == ["docker", "image", "inspect"]:
+                        return "image-id\n"
+                    self.assertEqual(command[:2], ["docker", "inspect"])
+                    return json.dumps(state)
+
+                def fake_get(url, **_kwargs):
+                    self.assertTrue(url.startswith(f"http://127.0.0.1:{smoke.ADMIN_SMOKE_PORT}/"))
+                    return live if url.endswith("/livez") else health
+
+                with mock.patch.object(smoke, "run", side_effect=fake_run), \
+                     mock.patch.object(smoke, "get_json", side_effect=fake_get):
+                    if fault is None:
+                        self.assertEqual(smoke.check_admin_runtime(deployment, "candidate", "2"),
+                                         {"container": "admin-id", "image": "image-id"})
+                        deployment.compose.assert_called_once_with(*smoke.ADMIN_PROFILES, "ps", "-q", "enclosure-admin")
+                    else:
+                        with self.assertRaises(smoke.SmokeError):
+                            smoke.check_admin_runtime(deployment, "candidate", "2")
+
+    def test_admin_dormancy_census_reads_every_project_container_and_the_fixed_name(self):
+        smoke = self.load_smoke()
+        for fault in (None, "admin-service", "admin-name", "missing-history"):
+            with self.subTest(fault=fault):
+                services = {"enclosure-ui", "enclosure-history"}
+                if fault == "admin-service":
+                    services.add("enclosure-admin")
+                if fault == "missing-history":
+                    services.discard("enclosure-history")
+                names = ["truenas-jbod-ui", "truenas-jbod-history"] + (
+                    ["truenas-jbod-admin"] if fault == "admin-name" else [])
+                deployment = mock.Mock(spec=smoke.Deployment)
+                deployment.environment = None
+                deployment.compose.return_value = "ui-id\n"
+                commands = []
+
+                def fake_run(command, **_kwargs):
+                    commands.append(command)
+                    if command[:2] == ["docker", "inspect"]:
+                        return "project\n"
+                    if "--filter" in command:
+                        self.assertIn("label=com.docker.compose.project=project", command)
+                        self.assertIn("--all", command)
+                        return "\n".join(sorted(services)) + "\n"
+                    self.assertIn("--all", command)
+                    return "\n".join(names) + "\n"
+
+                with mock.patch.object(smoke, "run", side_effect=fake_run):
+                    if fault is None:
+                        smoke.check_admin_dormant(deployment)
+                    else:
+                        with self.assertRaises(smoke.SmokeError):
+                            smoke.check_admin_dormant(deployment)
+                self.assertEqual(deployment.compose.call_args_list, [mock.call("ps", "-q", "enclosure-ui")])
+
+    def test_admin_state_and_history_checks_pin_the_expected_config_and_rows(self):
+        smoke = self.load_smoke()
+        smoke.check_admin_state(self.VIEW)
+        for broken in (dict(self.VIEW, systems=[]), dict(self.VIEW, default_system_id="missing"),
+                       dict(self.VIEW, paths=dict(self.VIEW["paths"], mapping_file="/elsewhere.json")),
+                       dict(self.VIEW, systems=[["default", "Default", "core", "https://elsewhere"]])):
+            with self.subTest(broken=broken), self.assertRaises(smoke.SmokeError):
+                smoke.check_admin_state(broken)
+        payload = {"ok": True, "app_version": "2", "default_system_id": "default", "systems": [
+            {"id": "default", "label": "Default", "platform": "core", "truenas_host": "http://127.0.0.1:9",
+             "api_key": "", "ssh_host": None}],
+            "paths": dict(self.VIEW["paths"], tls_dir="/app/config/tls")}
+        with mock.patch.object(smoke, "get_json", return_value=(200, payload)) as get:
+            self.assertEqual(smoke.read_admin_state(), self.VIEW)
+        get.assert_called_once_with(f"http://127.0.0.1:{smoke.ADMIN_SMOKE_PORT}/api/admin/state")
+        with mock.patch.object(smoke, "get_json", return_value=(401, {})), self.assertRaises(smoke.SmokeError):
+            smoke.read_admin_state()
+        row = {"system_id": "upgrade-smoke", "tracked_slots": 3, "event_count": 3, "metric_sample_count": 12}
+        smoke.check_admin_history([{"system_id": "default", "tracked_slots": 1}, row])
+        for broken in ([], [dict(row, event_count=2)], [dict(row, metric_sample_count=11)], [row, row]):
+            with self.subTest(history=broken), self.assertRaises(smoke.SmokeError):
+                smoke.check_admin_history(broken)
+        with mock.patch.object(smoke, "get_json", return_value=(200, {"ok": True, "systems": [row]})) as get:
+            self.assertEqual(smoke.read_admin_history(), [row])
+        get.assert_called_once_with(f"http://127.0.0.1:{smoke.ADMIN_SMOKE_PORT}/api/admin/history/systems")
+
+    def test_state_identity_hashes_host_bytes_and_logical_history_rows(self):
+        smoke = self.load_smoke()
+        deployment = mock.Mock(spec=smoke.Deployment)
+        deployment.exec_python.return_value = {"history_rows": {"slot_events": [3, "digest"]}}
+        root = Path("/nonexistent")
+        with mock.patch.object(smoke, "sha256", side_effect=lambda path: f"sha:{path}") as digest:
+            identity = smoke.state_identity(deployment, root)
+        self.assertEqual(identity, {"config_sha256": f"sha:{root / 'config/config.yaml'}",
+                                    "mapping_sha256": f"sha:{root / 'data/slot_mappings.json'}",
+                                    "history_rows": {"slot_events": [3, "digest"]}})
+        self.assertEqual(digest.call_count, 2)
+        deployment.exec_python.assert_called_once_with("enclosure-history", smoke.READ_CLEAN_HISTORY)
+
+    def test_admin_exec_and_removal_use_the_admin_container_and_profile(self):
+        smoke = self.load_smoke()
+        with mock.patch.object(smoke, "run", return_value='noise\n{"version": "2"}\n') as run:
+            self.assertEqual(smoke.admin_exec_python("admin-id", "print(1)\n"), {"version": "2"})
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "-i", "admin-id", "python", "-"])
+        self.assertEqual(run.call_args.kwargs["input_text"], "print(1)\n")
+        deployment = mock.Mock(spec=smoke.Deployment)
+        smoke.remove_admin_service(deployment)
+        deployment.compose.assert_called_once_with("--profile", "admin", "rm", "--stop", "--force", "enclosure-admin")
+        deployment.compose.side_effect = smoke.SmokeError("synthetic")
+        with mock.patch("sys.stderr"):
+            smoke.remove_admin_service(deployment)  # best effort; the CLI cleanup still runs
+
+
 class UpgradeScenarioContractTests(unittest.TestCase):
     """#399/#463: hardened, interrupted-migration and segmented-catalog upgrades."""
 
