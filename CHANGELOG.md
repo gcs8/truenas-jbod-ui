@@ -28,6 +28,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Added
+
+- Added the CORE HBA PHY table to Storage Fabric controller data, and an
+  optional `reported_lanes` field on fabric links. It lists the PHY pairs that
+  both ends of an HBA-to-expander or expander cascade link report toward each
+  other, with lane count and negotiated rate, and stays null when either end's
+  rows are missing or disagree. It does not claim cable count or width
+  (#1086).
+
 ### Fixed
 
 - Fixed the first bays of a single-row chassis face that is wider than its

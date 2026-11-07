@@ -467,6 +467,35 @@ class SasFabricNode(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class SasFabricReportedLane(BaseModel):
+    """One PHY pair that both link endpoints report toward each other."""
+
+    source_phy: int
+    target_phy: int
+    # Set only when both endpoints report the same negotiated rate.
+    negotiated_rate_gbps: float | None = None
+
+
+class SasFabricReportedLanes(BaseModel):
+    """Lanes both endpoints of one link report, reconciled row for row.
+
+    These are reported PHY pairs, not cable count, physical cable width,
+    active-lane health or topology completeness. A link carries this only when
+    every endpoint row agrees; missing or contradictory rows leave it null.
+    """
+
+    basis: str
+    lane_count: int
+    source_phys: list[int] = Field(default_factory=list)
+    target_phys: list[int] = Field(default_factory=list)
+    lanes: list[SasFabricReportedLane] = Field(default_factory=list)
+    # Set only when every lane reports the same negotiated rate.
+    negotiated_rate_gbps: float | None = None
+    source_sas_address: str | None = None
+    attached_sas_address: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+
+
 class SasFabricLink(BaseModel):
     id: str
     source: str
@@ -476,6 +505,7 @@ class SasFabricLink(BaseModel):
     slot: int | None = None
     related_slots: list[int] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    reported_lanes: SasFabricReportedLanes | None = None
 
 
 class SasFabricTrace(BaseModel):
