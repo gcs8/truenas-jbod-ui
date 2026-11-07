@@ -57,6 +57,12 @@ INDEX_BUILD_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 # (record header, rowid and b-tree cell) added to each sampled key.
 INDEX_BUILD_SIZE_SAMPLE_ROWS = 1024
 INDEX_BUILD_KEY_OVERHEAD_BYTES = 16
+# An index holds a subset of each row's columns, so it cannot outgrow the
+# database file holding those rows; this multiple of the file's pages caps the
+# estimate with evidence a crafted counter or rowid cannot inflate (#1093).
+INDEX_BUILD_MAX_DATABASE_MULTIPLE = 2
+# Tables whose row counts history_table_counts tracks through triggers.
+HISTORY_COUNTED_TABLES = ("slot_events", "metric_samples", "metric_rollups")
 # How long an index build waits for exact-count scans already running before it
 # starts anyway. New exact-count requests are deferred as soon as it waits.
 INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS = 60.0
@@ -1781,8 +1787,12 @@ class HistoryStore:
             str(row[0])
             for row in connection.execute("SELECT table_name FROM history_table_counts").fetchall()
         }
-        counted: list[str] = []
-        for table_name in ("slot_events", "metric_samples", "metric_rollups"):
+        # A seeded counter is trusted only while its table could hold that
+        # many rows; a restored or edited file can carry any value (#1093).
+        counted = HistoryStore._recount_implausible_table_counts(
+            connection, tuple(name for name in HISTORY_COUNTED_TABLES if name in tracked_tables)
+        )
+        for table_name in HISTORY_COUNTED_TABLES:
             if table_name in tracked_tables:
                 continue
             connection.execute(
@@ -1796,6 +1806,90 @@ class HistoryStore:
             )
             counted.append(table_name)
         return counted
+
+    @staticmethod
+    def _rowid_span(connection: sqlite3.Connection, table_name: str) -> int:
+        """max(rowid) - min(rowid) + 1, or 0 for an empty table, in O(log n).
+
+        Retained rows have distinct rowids inside that range, so no table
+        holds more rows than this. Two separate queries keep SQLite's min/max
+        b-tree shortcut, which a combined SELECT would lose.
+        """
+
+        high = connection.execute(f"SELECT max(rowid) FROM {table_name}").fetchone()[0]
+        if high is None:
+            return 0
+        low = connection.execute(f"SELECT min(rowid) FROM {table_name}").fetchone()[0]
+        return int(high) - int(low) + 1
+
+    @staticmethod
+    def _has_table(connection: sqlite3.Connection, table_name: str) -> bool:
+        return (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _recount_implausible_table_counts(
+        connection: sqlite3.Connection, table_names: tuple[str, ...] = HISTORY_COUNTED_TABLES
+    ) -> list[str]:
+        """Recount each tracked counter its table's rowid span rules out (#1093).
+
+        The check costs two b-tree lookups per table; only a counter that is
+        provably wrong pays for a full COUNT. Returns the recounted tables.
+        The caller commits.
+        """
+
+        if not HistoryStore._has_table(connection, "history_table_counts"):
+            return []
+        recounted: list[str] = []
+        for table_name in table_names:
+            row = connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = ?", (table_name,)
+            ).fetchone()
+            if row is None or row[0] is None:
+                continue
+            bound = HistoryStore._rowid_span(connection, table_name)
+            if int(row[0]) <= bound:
+                continue
+            logger.warning(
+                "The stored row count for history table %s (%d) is more than the table can hold "
+                "(at most %d); recounting it.",
+                table_name,
+                int(row[0]),
+                bound,
+            )
+            HistoryStore._recount_table(connection, table_name)
+            recounted.append(table_name)
+        return recounted
+
+    @staticmethod
+    def _recount_table(connection: sqlite3.Connection, table_name: str) -> None:
+        connection.execute(
+            f"""
+            UPDATE history_table_counts
+            SET row_count = (SELECT COUNT(*) FROM {table_name})
+            WHERE table_name = ?
+            """,
+            (table_name,),
+        )
+
+    @staticmethod
+    def _recount_restored_table_counts(connection: sqlite3.Connection) -> None:
+        """Replace a restored file's counters with real counts (#1093).
+
+        A backup is outside input: its counters were never maintained by this
+        service's triggers, and they size index builds. The recount reads each
+        table once, like the copy that precedes it. The caller commits.
+        """
+
+        if not HistoryStore._has_table(connection, "history_table_counts"):
+            return
+        for table_name in HISTORY_COUNTED_TABLES:
+            if HistoryStore._has_table(connection, table_name):
+                HistoryStore._recount_table(connection, table_name)
 
     @staticmethod
     def _backfill_disk_identity_keys_once(connection: sqlite3.Connection) -> None:
@@ -2117,21 +2211,20 @@ class HistoryStore:
                 sizes.append(f"coalesce(length(CAST({expression} AS BLOB)), 0) + 1")
         # Retained rows, not max(rowid): AUTOINCREMENT ids count lifetime
         # inserts, and retention deletes old rows without renumbering. The
-        # trigger-maintained counter is exact and O(1); max(rowid) is only the
-        # upper-bound fallback for a table without a seeded counter.
+        # trigger-maintained counter is exact and O(1), but it is stored data
+        # (#1093): it is clamped to the rowid span, a counter above that span
+        # is recounted, and the result is capped by the file size below.
+        span = HistoryStore._rowid_span(connection, table)
         row = None
-        try:
+        if table in HISTORY_COUNTED_TABLES and HistoryStore._has_table(connection, "history_table_counts"):
+            if HistoryStore._recount_implausible_table_counts(connection, (table,)):
+                connection.commit()
             row = connection.execute(
                 "SELECT row_count FROM history_table_counts WHERE table_name = ?",
                 (table,),
             ).fetchone()
-        except sqlite3.OperationalError:
-            row = None
-        if row is None:
-            row = connection.execute(
-                f"SELECT coalesce(max(rowid), 0) FROM {table}"
-            ).fetchone()
-        rows = int(row[0]) if row is not None and row[0] is not None else 0
+        tracked = int(row[0]) if row is not None and row[0] is not None else span
+        rows = min(tracked, span)
         if rows <= 0:
             return 0
         sampled = connection.execute(
@@ -2140,7 +2233,10 @@ class HistoryStore:
             (INDEX_BUILD_SIZE_SAMPLE_ROWS,),
         ).fetchone()
         average = float(sampled[0] or 0.0) if sampled is not None else 0.0
-        return int(rows * (average + INDEX_BUILD_KEY_OVERHEAD_BYTES))
+        estimate = int(rows * (average + INDEX_BUILD_KEY_OVERHEAD_BYTES))
+        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        return min(estimate, INDEX_BUILD_MAX_DATABASE_MULTIPLE * page_count * page_size)
 
     def _require_index_build_space(self, connection: sqlite3.Connection, statement: str) -> None:
         """Refuse a build that would fill the temporary or database filesystem.
@@ -2580,6 +2676,9 @@ class HistoryStore:
                 ) as restore_connection:
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
                     source_connection.backup(restore_connection)
+                    # The backup's counters are outside input that sizes
+                    # index builds; replace them with real counts (#1093).
+                    self._recount_restored_table_counts(restore_connection)
                     restore_connection.commit()
 
                 os.fchown(temp_fd, ownership_metadata.st_uid, ownership_metadata.st_gid)
@@ -4077,10 +4176,13 @@ class HistoryStore:
     def estimated_counts(self) -> dict[str, Any]:
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
+            # No COUNT scan of the hot tables: this answers the default
+            # overview, the collector's metrics and deferred exact counts,
+            # all of which can run while an index build reads them (#1093).
             return {
-                **segmented_reader.counts(),
+                **segmented_reader.tracked_counts(),
                 "estimated": False,
-                "count_mode": "segmented-exact",
+                "count_mode": "segmented-tracked",
             }
         with closing(self._connect()) as connection:
             tracked_slots = int(connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0])

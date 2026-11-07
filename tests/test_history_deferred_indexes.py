@@ -11,7 +11,8 @@ import asyncio
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -744,7 +745,7 @@ class IndexBuildMemoryTests(unittest.TestCase):
             self.assertIn("free", "\n".join(store_logs.output))
             # The empty slot_events index needs no space; the first sample index is refused.
             self.assertEqual(_indexes(path), {CHRONOLOGICAL_INDEXES[0][0]})
-            self.assertEqual(collector.degraded_reason(), collector_module.INDEX_BUILD_DEGRADED_REASON)
+            self.assertEqual(collector.degraded_reason(), collector_module.INDEX_BUILD_SPACE_DEGRADED_REASON)
             # Space freed: the retry builds everything.
             self.assertTrue(asyncio.run(collector._build_pending_indexes()))
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
@@ -936,6 +937,242 @@ class ExactCountsDuringIndexBuildTests(unittest.TestCase):
                     store.build_chronological_index(name, should_continue=should_continue)
             self.assertFalse(store.index_maintenance_active())
             self.assertEqual(_indexes(store.file_path), set())
+
+
+_HISTORY_COUNT_TABLES = ("slot_events", "metric_samples", "metric_rollups")
+
+
+@contextmanager
+def _history_count_scans() -> Iterator[list[str]]:
+    """Record every COUNT query on a history table, on any connection opened."""
+
+    scans: list[str] = []
+    native_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        connection = native_connect(*args, **kwargs)
+
+        def trace(sql: str) -> None:
+            if "COUNT(" in sql.upper() and any(table in sql for table in _HISTORY_COUNT_TABLES):
+                scans.append(sql)
+
+        connection.set_trace_callback(trace)
+        return connection
+
+    with patch.object(sqlite3, "connect", side_effect=connect):
+        yield scans
+
+
+class SegmentedCountsDuringIndexBuildTests(unittest.TestCase):
+    """#1093 review: the segmented layout's tracked-count fallback still scanned."""
+
+    def _segmented_store(self, directory: str) -> HistoryStore:
+        from tests.test_segmented_history_reader import _populate_history_source, _write_covering_catalog
+
+        root = Path(directory)
+        hot, segment, catalog = root / "hot.sqlite3", root / "segment.sqlite3", root / "catalog.json"
+        _legacy_database(hot, samples=40)
+        _populate_history_source(
+            segment, first_id=1, samples=(("2025-01-01T00:00:00+00:00", "temperature_c"),)
+        )
+        _write_covering_catalog(catalog, [segment])
+        with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+            store = HistoryStore(str(hot), recover_unreadable_database=False, segment_catalog_path=catalog)
+        # Authenticate the catalog before tracing, as a running service has.
+        store._segmented_reader()
+        return store
+
+    def _summary(self, store: HistoryStore, exact_counts: bool):
+        from history_service import main as history_main
+
+        with patch.object(history_main, "store", store):
+            return asyncio.run(
+                history_main.read_history_summary(exact_counts, degrade_missing_catalog=True)
+            )
+
+    def test_refused_exact_counts_scan_no_history_table_in_any_source(self) -> None:
+        from history_service import main as history_main
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._segmented_store(directory)
+            with store.index_maintenance(), _history_count_scans() as scans:
+                summary = self._summary(store, exact_counts=True)
+
+            self.assertEqual(scans, [])
+            self.assertEqual(summary.counts_deferred_reason, history_main.EXACT_COUNTS_DEFERRED_REASON)
+            # 40 hot samples from the tracked counter, 1 recorded for the segment.
+            self.assertEqual(summary.counts["metric_sample_count"], 41)
+            self.assertEqual(summary.counts["count_mode"], "segmented-tracked")
+
+    def test_default_segmented_overview_counts_without_scanning(self) -> None:
+        # The default overview and the collector's metrics poll run during a
+        # build too; neither may scan the hot tables the build reads.
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._segmented_store(directory)
+            with _history_count_scans() as scans:
+                summary = self._summary(store, exact_counts=False)
+                estimated = store.estimated_counts()
+
+            self.assertEqual(scans, [])
+            self.assertEqual(summary.counts["metric_sample_count"], 41)
+            self.assertEqual(estimated["metric_sample_count"], 41)
+            self.assertEqual(estimated["event_count"], 0)
+
+    def test_admitted_exact_counts_still_scan_every_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._segmented_store(directory)
+            with _history_count_scans() as scans:
+                summary = self._summary(store, exact_counts=True)
+
+            self.assertTrue(scans)
+            self.assertTrue(summary.counts_exact)
+            self.assertIsNone(summary.counts_deferred_reason)
+            self.assertEqual(summary.counts["metric_sample_count"], 41)
+
+
+def _table_counter(path: Path, table: str) -> int:
+    with closing(sqlite3.connect(path)) as connection:
+        return int(
+            connection.execute(
+                "SELECT row_count FROM history_table_counts WHERE table_name = ?", (table,)
+            ).fetchone()[0]
+        )
+
+
+def _set_table_counter(path: Path, table: str, value: int) -> None:
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute(
+            "UPDATE history_table_counts SET row_count = ? WHERE table_name = ?", (value, table)
+        )
+
+
+class UntrustedTableCounterTests(unittest.TestCase):
+    """#1093 security review: a derived counter sized index builds unchecked."""
+
+    def test_restore_recounts_an_inflated_counter(self) -> None:
+        # Two retained rows far apart: the inflated counter still fits under
+        # max(rowid) - min(rowid) + 1, so only a recount can expose it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "backup.sqlite3", root / "target.sqlite3"
+            _legacy_database(source, samples=2)
+            with closing(sqlite3.connect(source)) as connection, connection:
+                connection.execute("UPDATE metric_samples SET id = 300001 WHERE id = 2")
+            _set_table_counter(source, "metric_samples", 300_000)
+            store = HistoryStore(str(target), recover_unreadable_database=False)
+
+            store.restore_backup(source)
+
+            self.assertEqual(_table_counter(target, "metric_samples"), 2)
+            self.assertEqual(_table_counter(target, "slot_events"), 0)
+
+    def test_startup_recounts_a_counter_above_its_rowid_span(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            _set_table_counter(path, "metric_samples", 9_000_000_000_000_000_000)
+            _set_table_counter(path, "slot_events", 5)  # an empty table
+
+            with self.assertLogs("history_service.store", "WARNING") as logs:
+                HistoryStore(str(path), recover_unreadable_database=False)
+
+            self.assertEqual(_table_counter(path, "metric_samples"), 40)
+            self.assertEqual(_table_counter(path, "slot_events"), 0)
+            self.assertIn("metric_samples", "\n".join(logs.output))
+
+    def test_index_size_estimate_recounts_a_counter_above_its_rowid_span(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=40)
+            HistoryStore(str(path), recover_unreadable_database=False)
+            _set_table_counter(path, "metric_samples", 9_000_000_000_000_000_000)
+            statement = dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
+
+            with (
+                closing(sqlite3.connect(path)) as connection,
+                self.assertLogs("history_service.store", "WARNING"),
+            ):
+                estimate = HistoryStore._estimate_index_bytes(connection, statement)
+
+            self.assertLess(estimate, 40 * 200)
+            self.assertEqual(_table_counter(path, "metric_samples"), 40)
+
+    def test_index_size_estimate_never_exceeds_the_database_file(self) -> None:
+        # Two rows can stretch the rowid span, and a counter that fits under it
+        # is not recounted; the file's own pages still bound the index.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=2)
+            HistoryStore(str(path), recover_unreadable_database=False)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE metric_samples SET id = ? WHERE id = 2", (1 << 62,))
+            _set_table_counter(path, "metric_samples", 1 << 62)
+            statement = dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
+
+            with closing(sqlite3.connect(path)) as connection:
+                estimate = HistoryStore._estimate_index_bytes(connection, statement)
+                pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
+                page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+
+            self.assertLessEqual(estimate, 2 * pages * page_size)
+
+    def test_a_space_refusal_keeps_collecting_and_retries_the_build_later(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=4_000)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            full = shutil._ntuple_diskusage(total=1 << 30, used=1 << 30, free=0)
+            roomy = shutil._ntuple_diskusage(total=1 << 40, used=0, free=1 << 40)
+            disk = {"usage": full}
+            events: list[str] = []
+            reasons: list[str | None] = []
+            original_build = store.build_chronological_index
+            original_wait_for = asyncio.wait_for
+
+            def build(name: str, **kwargs) -> None:
+                events.append("build")
+                original_build(name, **kwargs)
+
+            def collect(**_kwargs) -> None:
+                events.append("collect")
+                reasons.append(collector.degraded_reason())
+                collects = events.count("collect")
+                if collects == 2:
+                    # Space is freed and the slower retry comes due.
+                    disk["usage"] = roomy
+                    collector._index_build_space_retry_at = 0.0
+                elif collects == 3:
+                    collector._stopping.set()
+
+            async def short_wait(awaitable, timeout):
+                return await original_wait_for(awaitable, min(timeout, 0.001))
+
+            with (
+                patch.object(store_module.shutil, "disk_usage", side_effect=lambda _path: disk["usage"]),
+                patch.object(collector_module.asyncio, "wait_for", side_effect=short_wait),
+                patch.object(store, "build_chronological_index", side_effect=build),
+                patch.object(collector, "run_once", side_effect=collect),
+                self.assertLogs("history_service.collector", "WARNING"),
+                self.assertLogs("history_service.store", "WARNING"),
+            ):
+                asyncio.run(original_wait_for(collector._run_loop(), timeout=30))
+
+            # The empty slot_events index builds, the next is refused, and
+            # collection continues; the build is not retried before it is due.
+            self.assertEqual(
+                events, ["build", "build", "collect", "collect", *["build"] * 4, "collect"]
+            )
+            self.assertEqual(
+                reasons,
+                [collector_module.INDEX_BUILD_SPACE_DEGRADED_REASON] * 2 + [None],
+            )
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
 
 if __name__ == "__main__":

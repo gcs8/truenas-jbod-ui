@@ -59,9 +59,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   The build kept its sort data in memory, so memory grew with the table and
   could pass the default 1 GiB `HISTORY_MEM_LIMIT`. Index builds and the
   startup upgrade now sort through temporary files in the history volume
-  (`TMPDIR`) with a bounded cache, and wait for enough free disk space. While
-  an index builds, `exact_counts=true` overview requests answer from the
-  tracked totals and say exact counts are deferred (#1092, #1093).
+  (`TMPDIR`) with a bounded cache, and wait for enough free disk space while
+  collection continues. The space estimate no longer trusts stored row
+  counters, which a restore now recounts. While an index builds,
+  `exact_counts=true` overview requests answer from the tracked totals, also
+  with segmented history, and say exact counts are deferred (#1092, #1093).
 
 ### Internal
 
