@@ -3203,6 +3203,7 @@ def _attach_expander_phy_error_counters(
             state, message = "not_read", SMP_NOT_READ_MESSAGE
         by_phy = {row["phy"]: row for row in rows}
         phys: list[dict[str, Any]] = []
+        unread = 0
         for phy_row in node.raw.get("phys") or []:
             copied = dict(phy_row)
             try:
@@ -3214,14 +3215,19 @@ def _attach_expander_phy_error_counters(
                 copied.update({field: counters.get(field) for field in SMP_COUNTER_FIELDS})
                 copied["counter_state"] = counters["counter_state"]
                 copied["counter_reason"] = counters["counter_reason"]
-            elif state != "available":
+            else:
+                # A batch can stop early (no answer); the PHYs after it were
+                # not read, so they are unknown rather than missing.
                 copied.update({field: None for field in SMP_COUNTER_FIELDS})
-                copied["counter_state"] = state
-                copied["counter_reason"] = None
+                copied["counter_state"] = "unknown" if state == "available" else state
+                copied["counter_reason"] = "not_read" if state == "available" else None
+                if state == "available":
+                    unread += 1
             phys.append(copied)
         if phys:
             node.raw["phys"] = phys
         summary = smp_counter_summary(rows)
+        summary["unknown_phys"] += unread
         node.raw["phy_error_counters"] = {
             "state": state,
             "message": message,

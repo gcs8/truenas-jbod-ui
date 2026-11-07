@@ -5340,6 +5340,23 @@ class CoreExpanderCounterTests(unittest.TestCase):
         other = self.expander(self.fabric(fabric_outputs, selected=SMP_EXPANDER_B), SMP_EXPANDER_B)
         self.assertEqual(other.raw["phy_error_counters"]["state"], "not_read")
 
+    def test_fabric_marks_phys_after_a_stopped_batch_unknown(self):
+        key_a = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fabric = self.fabric(self.outputs(**{key_a: _smp_output(0, SMP_EXPANDER_A, "pass10", {
+            0: _smp_frame(0, (0, 0, 0, 0)),
+            1: None,
+        })}))
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "available")
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (1, 3))
+        phys = {row["phy"]: row for row in node.raw["phys"]}
+        self.assertEqual(phys["1"]["counter_reason"], "no_response")
+        for phy in ("2", "3"):
+            self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+            self.assertIsNone(phys[phy]["invalid_dword_count"])
+        self.assertEqual(node.metrics["phy_error_counters"], "1 PHYs read, 0 with errors, 3 unknown")
+
     def test_fabric_reports_refused_permission_without_zeros(self):
         message = "Expander counters not available (permission not granted)."
         refused_output = {
