@@ -2,8 +2,10 @@ import asyncio
 import importlib
 import inspect
 import json
+import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -43,7 +45,10 @@ from app.services.sas_diagnostics.scsi import (
     decode_scsi_sense_event,
     decode_scsi_status_value,
 )
+from app.services.mapping_store import MappingStore
+from app.services.profile_registry import ProfileRegistry
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
+from app.services.slot_detail_store import SlotDetailStore
 from app.services.sas_fabric import (
     CORE_DMIDECODE_SLOT_COMMAND,
     CORE_DMIDECODE_SLOT_OPTIONAL_COMMAND,
@@ -5119,3 +5124,995 @@ class SasFabricInventoryProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(commands, [])
+
+
+# --- #941 CORE expander PHY error counters ----------------------------------
+
+SMP_EXPANDER_A = "5000c50000000001"
+SMP_EXPANDER_B = "5000c50000000002"
+SMP_EXPANDERS = f"""
+Num Phys SAS Address      DevHandle Parent EncHandle SAS Level
+4        {SMP_EXPANDER_A} 0009      0001   0002      1
+  0 1 000a 12.0 1.5 12.0 End Device
+  1 2 000b 12.0 1.5 12.0 End Device
+  2       1.5 12.0 No Device
+  3       1.5 12.0 No Device
+2        {SMP_EXPANDER_B} 0019      0001   0012      1
+  0 1 001a 12.0 1.5 12.0 End Device
+""".strip()
+SMP_DEVICES = """
+B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt
+00   12   5000c50000000011 000b    0009      SAS Target    12    0002 1     1
+00   10   5000c50000000010 000a    0009      SAS Target    12    0002 0     1
+00   30   5000c50000000020 001a    0019      SAS Target    12    0012 0     1
+""".strip()
+SMP_DEVLIST = """
+scbus4 on mpr0 bus 0:
+<SYNTHETIC DISK 0001>  at scbus4 target 10 lun 0 (pass10,da10)
+<SYNTHETIC DISK 0002>  at scbus4 target 12 lun 0 (da12,pass12)
+<SYNTHETIC DISK 0003>  at scbus4 target 30 lun 0 (pass30,da30)
+scbus5 on mpr1 bus 0:
+<SYNTHETIC DISK 0004>  at scbus5 target 10 lun 0 (pass99,da99)
+""".strip()
+
+
+def _smp_frame(phy: int, counters=(1, 2, 3, 4), *, result: int = 0) -> bytes:
+    header = bytes((0x41, 0x11, result, 6))
+    body = (7).to_bytes(2, "big") + bytes(3) + bytes((phy,)) + bytes(2)
+    return header + body + b"".join(value.to_bytes(4, "big") for value in counters)
+
+
+def _od(data: bytes) -> str:
+    """Bytes as `od -An -tx1 -v` prints them: 16 per line, leading spaces."""
+    return "\n".join(
+        "".join(f" {byte:02x}" for byte in data[index:index + 16]) for index in range(0, len(data), 16)
+    )
+
+
+def _smp_output(unit: int, address: str, device: str, per_phy: dict, *, end: bool = True) -> str:
+    phys = sorted(per_phy)
+    lines = [f"tnj-smp-phy-error-log:{unit}:{address}:{device}:{phys[0]:02x}-{phys[-1]:02x}"]
+    for phy in phys:
+        lines.append(f"@phy={phy:02x}")
+        value = per_phy[phy]
+        if value is None:
+            lines.append("@no-response")
+            break
+        data = value.encode() if isinstance(value, str) else value
+        if data:
+            lines.append(_od(data))
+    if end:
+        lines.append("@end")
+    return "\n".join(lines) + "\n"
+
+
+_SUDO_REFUSAL = "Sorry, user jbodmap is not allowed to execute '/sbin/camcontrol smpcmd pass10' as root on host.\n"
+
+
+class CoreExpanderCounterTests(unittest.TestCase):
+    def outputs(self, **extra):
+        outputs = {
+            "mprutil -u 0 show expanders": SMP_EXPANDERS,
+            "mprutil -u 0 show devices": SMP_DEVICES,
+            "camcontrol devlist -v": SMP_DEVLIST,
+        }
+        outputs.update(extra)
+        return outputs
+
+    def test_discovery_uses_only_existing_reads_and_the_lowest_routed_target(self):
+        from app.services.core_expander_counters import SmpTarget, discover_smp_targets
+
+        targets = discover_smp_targets(self.outputs())
+        self.assertEqual(targets, [
+            SmpTarget(0, SMP_EXPANDER_A, "pass10", 4),
+            SmpTarget(0, SMP_EXPANDER_B, "pass30", 2),
+        ])
+        # Without CAM's target-to-pass map there is no route, so nothing runs.
+        self.assertEqual(discover_smp_targets(self.outputs(**{"camcontrol devlist -v": ""})), [])
+        # The same target number on another controller is another device.
+        other = SMP_DEVLIST.replace("on mpr0", "on mpr7")
+        self.assertEqual(discover_smp_targets(self.outputs(**{"camcontrol devlist -v": other})), [])
+
+    def test_discovery_refuses_ambiguous_or_malformed_rows(self):
+        from app.services.core_expander_counters import discover_smp_targets, parse_camcontrol_pass_devices
+
+        twice = SMP_DEVLIST + "\nscbus4 on mpr0 bus 0:\n<X> at scbus4 target 10 lun 1 (pass11,da11)"
+        routes = parse_camcontrol_pass_devices(twice)
+        self.assertNotIn(("mpr0", 10), routes)
+        self.assertEqual(routes[("mpr0", 12)], "pass12")
+        self.assertEqual(
+            [target.device for target in discover_smp_targets(self.outputs(**{"camcontrol devlist -v": twice}))],
+            ["pass12", "pass30"],
+        )
+        bad = SMP_EXPANDERS.replace("4        5000", "300      5000")
+        self.assertEqual([t.expander_sas_address for t in discover_smp_targets(self.outputs(**{
+            "mprutil -u 0 show expanders": bad,
+        }))], [SMP_EXPANDER_B])
+
+    def test_command_is_one_sh_line_with_the_granted_shape_and_a_stable_key(self):
+        from app.services.core_expander_counters import SmpTarget, build_phy_error_log_command
+
+        command = build_phy_error_log_command(SmpTarget(0, SMP_EXPANDER_A, "pass10", 4))
+        self.assertNotIn("\n", command)
+        self.assertIn("for p in 00 01 02 03;", command)
+        self.assertIn(
+            '/usr/bin/timeout -k 1 2 sudo -n /sbin/camcontrol smpcmd pass10 -r 12 '
+            '"40{}11{}06{}02{}00{}00{}00{}00{}00{}$p{}00{}00" -R 28 - 2>&1 | /usr/bin/od -An -tx1 -v',
+            command,
+        )
+        self.assertEqual(canonicalize_ssh_command(command), f"smp phy error log 0:{SMP_EXPANDER_A}:pass10:00-03")
+        probe = build_phy_error_log_command(SmpTarget(0, SMP_EXPANDER_A, "pass10", 4), [0])
+        self.assertNotEqual(canonicalize_ssh_command(probe), canonicalize_ssh_command(command))
+        for target in (SmpTarget(0, "not-an-address", "pass10", 4), SmpTarget(0, SMP_EXPANDER_A, "pass10;x", 4)):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                build_phy_error_log_command(target)
+
+    def test_output_parser_decodes_frames_and_never_turns_failures_into_zeros(self):
+        from app.services.core_expander_counters import CAPABILITY_GRANTED, parse_phy_error_log_output
+
+        stdout = _smp_output(0, SMP_EXPANDER_A, "pass10", {
+            0: _smp_frame(0, (5, 0, 1, 0xFFFFFFFF)),
+            1: _smp_frame(1, (0, 0, 0, 0)),
+            2: _smp_frame(2, (0, 0, 0, 0), result=0x10)[:4],
+            3: "camcontrol: error sending command\n",
+        })
+        result = parse_phy_error_log_output(stdout)
+        self.assertEqual((result.unit, result.expander_sas_address), (0, SMP_EXPANDER_A))
+        self.assertEqual(result.capability, CAPABILITY_GRANTED)
+        rows = {row["phy"]: row for row in result.rows}
+        self.assertEqual(rows[0]["counter_state"], "measured")
+        self.assertEqual(rows[0]["phy_reset_problem_count"], 0xFFFFFFFF)
+        self.assertEqual(rows[1]["invalid_dword_count"], 0)
+        self.assertEqual((rows[2]["counter_state"], rows[2]["counter_reason"]), ("unknown", "function_result"))
+        self.assertEqual((rows[3]["counter_state"], rows[3]["counter_reason"]), ("unknown", "command_failed"))
+        for phy in (2, 3):
+            self.assertTrue(all(rows[phy][field] is None for field in (
+                "invalid_dword_count", "running_disparity_error_count",
+                "loss_of_dword_synchronization_count", "phy_reset_problem_count",
+            )))
+
+    def test_output_parser_classifies_refusal_timeouts_and_truncation(self):
+        from app.services.core_expander_counters import CAPABILITY_DENIED, parse_phy_error_log_output
+
+        denied = parse_phy_error_log_output(_smp_output(0, SMP_EXPANDER_A, "pass10", {0: _SUDO_REFUSAL}))
+        self.assertEqual(denied.capability, CAPABILITY_DENIED)
+        self.assertEqual(denied.rows[0]["counter_state"], "permission_denied")
+        password = parse_phy_error_log_output(_smp_output(0, SMP_EXPANDER_A, "pass10", {
+            0: "sudo: a password is required\n",
+        }))
+        self.assertEqual(password.capability, CAPABILITY_DENIED)
+        hung = parse_phy_error_log_output(_smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0), 1: None}))
+        self.assertEqual(hung.capability, "granted")
+        self.assertEqual([row["counter_reason"] for row in hung.rows], [None, "no_response"])
+        cut = parse_phy_error_log_output(_smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0)}, end=False))
+        self.assertEqual(cut.rows[0]["counter_state"], "unknown")
+        self.assertEqual(cut.rows[0]["counter_reason"], "incomplete_output")
+        only_hung = parse_phy_error_log_output(_smp_output(0, SMP_EXPANDER_A, "pass10", {0: None}))
+        self.assertIsNone(only_hung.capability)
+        forged = parse_phy_error_log_output("tnj-smp-phy-error-log:0:zz:pass10:00-00\n@phy=00\n@end\n")
+        self.assertIsNone(forged.unit)
+
+    def snapshot(self, selected):
+        # Storage Fabric keeps the selected enclosure's expanders (and their
+        # verified ancestors) only, so each check selects the expander it reads.
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=False, state=SlotState.empty)
+        return InventorySnapshot(
+            slots=[slot], refresh_interval_seconds=30, selected_system_platform="core",
+            selected_enclosure_id=selected,
+        )
+
+    def fabric(self, outputs, capability=None, selected=SMP_EXPANDER_A):
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core")),
+            snapshot=self.snapshot(selected),
+            ssh_outputs=outputs,
+            expander_counter_capability=capability,
+        )
+
+    def expander(self, fabric, address):
+        return next(node for node in fabric.nodes if node.kind == "expander" and node.raw.get("sas_address") == address)
+
+    def test_fabric_attaches_counters_to_expander_phy_rows(self):
+        key_a = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fabric_outputs = self.outputs(**{key_a: _smp_output(0, SMP_EXPANDER_A, "pass10", {
+            0: _smp_frame(0, (0, 0, 0, 0)),
+            1: _smp_frame(1, (9, 1, 2, 0)),
+            2: _smp_frame(2, result=0x10)[:4],
+            3: _smp_frame(3, (0, 0, 0, 0)),
+        })})
+        fabric = self.fabric(fabric_outputs)
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "available")
+        self.assertIsNone(counters["message"])
+        self.assertEqual(counters["device"], "pass10")
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"], counters["phys_with_errors"]), (3, 1, 1))
+        self.assertEqual(node.metrics["phy_error_counters"], "3 PHYs read, 1 with errors, 1 unknown")
+        self.assertIn("camcontrol smpcmd REPORT PHY ERROR LOG", node.evidence)
+        phys = {row["phy"]: row for row in node.raw["phys"]}
+        self.assertEqual(phys["1"]["invalid_dword_count"], 9)
+        self.assertEqual(phys["1"]["counter_state"], "measured")
+        self.assertIsNone(phys["2"]["invalid_dword_count"])
+        self.assertEqual(phys["2"]["counter_reason"], "function_result")
+        payload = next(item for item in fabric.expanders if item.get("sas_address") == SMP_EXPANDER_A)
+        self.assertEqual(payload["phy_error_counters"]["state"], "available")
+        # The second expander has a route but was not read in this refresh.
+        other = self.expander(self.fabric(fabric_outputs, selected=SMP_EXPANDER_B), SMP_EXPANDER_B)
+        self.assertEqual(other.raw["phy_error_counters"]["state"], "not_read")
+
+    def test_fabric_marks_phys_after_a_stopped_batch_unknown(self):
+        key_a = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fabric = self.fabric(self.outputs(**{key_a: _smp_output(0, SMP_EXPANDER_A, "pass10", {
+            0: _smp_frame(0, (0, 0, 0, 0)),
+            1: None,
+        })}))
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "available")
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (1, 3))
+        phys = {row["phy"]: row for row in node.raw["phys"]}
+        self.assertEqual(phys["1"]["counter_reason"], "no_response")
+        for phy in ("2", "3"):
+            self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+            self.assertIsNone(phys[phy]["invalid_dword_count"])
+        self.assertEqual(node.metrics["phy_error_counters"], "1 PHYs read, 0 with errors, 3 unknown")
+
+    def test_fabric_reports_refused_permission_without_zeros(self):
+        message = "Expander counters not available (permission not granted)."
+        refused_output = {
+            f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-00 ; ...":
+                _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _SUDO_REFUSAL}),
+        }
+        for outputs, capability in ((self.outputs(**refused_output), None), (self.outputs(), "permission_denied")):
+            for address in ((SMP_EXPANDER_A,) if capability is None else (SMP_EXPANDER_A, SMP_EXPANDER_B)):
+                with self.subTest(capability=capability, address=address):
+                    node = self.expander(self.fabric(outputs, capability, selected=address), address)
+                    self.assertEqual(node.raw["phy_error_counters"]["state"], "permission_denied")
+                    self.assertEqual(node.raw["phy_error_counters"]["message"], message)
+                    self.assertEqual(node.metrics["phy_error_counters"], message)
+                    for row in node.raw["phys"]:
+                        self.assertIsNone(row["invalid_dword_count"])
+                        self.assertEqual(row["counter_state"], "permission_denied")
+
+    def test_fabric_names_a_missing_route(self):
+        fabric = self.fabric(self.outputs(**{"camcontrol devlist -v": ""}))
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        self.assertEqual(node.raw["phy_error_counters"]["state"], "no_route")
+        self.assertEqual(
+            node.metrics["phy_error_counters"],
+            "Expander counters not available (no CAM pass device reaches this expander).",
+        )
+
+    def service(self, temp_dir):
+        system = SystemConfig(id="core-smp", label="CORE", truenas=TrueNASConfig(platform="core"))
+        return InventoryService(
+            Settings(), system, AsyncMock(), AsyncMock(), None,
+            MappingStore(str(Path(temp_dir) / "slot_mappings.json")),
+            ProfileRegistry(Settings()),
+            SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
+        )
+
+    @staticmethod
+    def results(*extra):
+        base = [
+            SSHCommandResult(command="sudo -n /usr/sbin/mprutil -u 0 show expanders", ok=True, stdout=SMP_EXPANDERS),
+            SSHCommandResult(command="sudo -n /usr/sbin/mprutil -u 0 show devices", ok=True, stdout=SMP_DEVICES),
+            SSHCommandResult(command="sudo -n /sbin/camcontrol devlist -v", ok=True, stdout=SMP_DEVLIST),
+        ]
+        return [*base, *extra]
+
+    def test_collector_probes_once_then_reads_every_phy_when_granted(self):
+        from app.services.core_expander_counters import SMP_COUNTER_READ_INTERVAL_SECONDS
+
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            probe = service._core_expander_counter_probe_commands(self.results())
+            self.assertEqual(len(probe), 1)
+            self.assertIn("for p in 00;", probe[0])
+            self.assertIn("smpcmd pass10 ", probe[0])
+            answered = SSHCommandResult(command=probe[0], ok=True, stdout=_smp_output(
+                0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0)}))
+            full = service._core_expander_counter_probe_commands(self.results(answered))
+            self.assertEqual(len(full), 2)
+            self.assertIn("for p in 00 01 02 03;", full[0])
+            self.assertIn("for p in 00 01;", full[1])
+            self.assertEqual(service._smp_counter_capability, "granted")
+            # Inside the read interval the next refresh reads nothing; after
+            # it, the refresh goes straight to the full read.
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+            now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), full)
+
+    def test_collector_remembers_a_refusal_and_asks_again_only_after_the_interval(self):
+        from app.services.core_expander_counters import SMP_CAPABILITY_RETRY_SECONDS
+
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            probe = service._core_expander_counter_probe_commands(self.results())
+            refused = SSHCommandResult(command=probe[0], ok=True, stdout=_smp_output(
+                0, SMP_EXPANDER_A, "pass10", {0: _SUDO_REFUSAL}))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(refused)), [])
+            self.assertEqual(service._smp_counter_capability, "permission_denied")
+            now[0] += SMP_CAPABILITY_RETRY_SECONDS - 1
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+            now[0] += 2
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), probe)
+            # An answer-less probe proves nothing and is not retried in the same refresh.
+            silent = SSHCommandResult(command=probe[0], ok=True, stdout=_smp_output(
+                0, SMP_EXPANDER_A, "pass10", {0: None}))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(silent)), [])
+
+    def test_collector_does_nothing_off_core_or_without_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            self.assertEqual(service._core_expander_counter_probe_commands([]), [])
+            service.system = service.system.model_copy(
+                update={"truenas": TrueNASConfig(platform="scale")})
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+
+    @unittest.skipUnless(
+        os.name == "posix" and Path("/usr/bin/timeout").exists() and Path("/usr/bin/od").exists(),
+        "needs a POSIX sh with /usr/bin/timeout and /usr/bin/od",
+    )
+    def test_built_command_runs_in_sh_with_the_exact_granted_argv(self):
+        """Run the real command line under sh with a fake sudo that records argv."""
+        from app.services.core_expander_counters import (
+            SMP_PHY_ERROR_LOG_SUDO_GRANT, SmpTarget, build_phy_error_log_command,
+            parse_phy_error_log_output, phy_error_log_argv,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bin_dir = Path(temp_dir) / "bin"
+            bin_dir.mkdir()
+            log = Path(temp_dir) / "argv.log"
+            fake = bin_dir / "sudo"
+            fake.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys, time\n"
+                "args = sys.argv[1:]\n"
+                f"open({str(log)!r}, 'a').write(repr(args) + '\\n')\n"
+                "mode = os.environ['FAKE_SMP_MODE']\n"
+                "if mode == 'deny':\n"
+                "    sys.stderr.write('Sorry, user x is not allowed to execute this as root on host.\\n'); sys.exit(1)\n"
+                "phy = int(args[6].split('{}')[9], 16)\n"
+                "if mode == 'hang' and phy == 1:\n"
+                "    time.sleep(10)\n"
+                "frame = bytes((0x41, 0x11, 0, 6, 0, 1, 0, 0, 0, phy, 0, 0)) + (phy + 1).to_bytes(4, 'big') * 4\n"
+                "sys.stdout.buffer.write(frame)\n"
+            )
+            fake.chmod(0o755)
+            target = SmpTarget(0, SMP_EXPANDER_A, "pass10", 3)
+            command = build_phy_error_log_command(target)
+
+            def run(mode):
+                log.write_text("")
+                env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE_SMP_MODE": mode}
+                completed = subprocess.run(
+                    ["/bin/sh", "-c", command], capture_output=True, text=True, env=env, timeout=30, check=False,
+                )
+                calls = [eval(line) for line in log.read_text().splitlines()]  # noqa: S307 - our own repr lines
+                return completed, calls
+
+            completed, calls = run("ok")
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(calls, [["-n", *phy_error_log_argv("pass10", phy)] for phy in range(3)])
+            for argv in calls:
+                self.assertIsNotNone(re.fullmatch(
+                    SMP_PHY_ERROR_LOG_SUDO_GRANT.split(" ", 1)[1], " ".join(argv[2:])))
+            result = parse_phy_error_log_output(completed.stdout)
+            self.assertEqual([row["invalid_dword_count"] for row in result.rows], [1, 2, 3])
+            self.assertEqual(result.capability, "granted")
+
+            completed, calls = run("deny")
+            result = parse_phy_error_log_output(completed.stdout)
+            self.assertEqual(result.capability, "permission_denied")
+            self.assertEqual(len(result.rows), 3)
+
+            with patch("app.services.core_expander_counters.SMP_CALL_TIMEOUT_SECONDS", 1):
+                command = build_phy_error_log_command(target)
+            completed, calls = run("hang")
+            result = parse_phy_error_log_output(completed.stdout)
+            self.assertEqual([row["counter_state"] for row in result.rows], ["measured", "unknown"])
+            self.assertEqual(result.rows[1]["counter_reason"], "no_response")
+            self.assertEqual(len(calls), 2, "a call with no answer ends the batch")
+
+
+def _nine_expander_outputs(count: int = 9, num_phys: int = 1) -> dict:
+    """``count`` expanders of ``num_phys`` PHYs on mpr0, each with its own routed end device."""
+    expander_lines = ["Num Phys SAS Address      DevHandle Parent EncHandle SAS Level"]
+    device_lines = ["B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt"]
+    devlist_lines = ["scbus4 on mpr0 bus 0:"]
+    for index in range(count):
+        handle = 0x20 + index * 2
+        address = f"5000c5000000{0xa0 + index:04x}"
+        expander_lines.append(f"{num_phys:<8} {address} {handle:04x}      0001   {0x40 + index:04x}      1")
+        expander_lines.append(f"  0 1 {handle + 1:04x} 12.0 1.5 12.0 End Device")
+        device_lines.append(
+            f"00   {index:<4} 5000c5000000{0xb0 + index:04x} {handle + 1:04x}    {handle:04x}      SAS Target    12    "
+            f"{0x40 + index:04x} 0     1"
+        )
+        devlist_lines.append(f"<SYNTHETIC DISK {index:04d}>  at scbus4 target {index} lun 0 (pass{index},da{index})")
+    return {
+        "mprutil -u 0 show expanders": "\n".join(expander_lines),
+        "mprutil -u 0 show devices": "\n".join(device_lines),
+        "camcontrol devlist -v": "\n".join(devlist_lines),
+    }
+
+
+class CoreExpanderCounterRemediationTests(unittest.TestCase):
+    """Sol's #1088 review: parent contradictions, the read budget, probe order, refusal retry."""
+
+    outputs = CoreExpanderCounterTests.outputs
+    snapshot = CoreExpanderCounterTests.snapshot
+    fabric = CoreExpanderCounterTests.fabric
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    results = staticmethod(CoreExpanderCounterTests.results)
+
+    # Target 10 now names expander B (0019) as its parent while A's PHY table
+    # still lists its handle 000a; target 12 (A's only clean route) is gone.
+    CONTRADICTORY_DEVICES = SMP_DEVICES.replace(
+        "000a    0009", "000a    0019",
+    ).replace(
+        "00   12   5000c50000000011 000b    0009      SAS Target    12    0002 1     1\n", "",
+    )
+
+    def contradictory_results(self, *extra):
+        return [
+            SSHCommandResult(command="sudo -n /usr/sbin/mprutil -u 0 show expanders", ok=True, stdout=SMP_EXPANDERS),
+            SSHCommandResult(
+                command="sudo -n /usr/sbin/mprutil -u 0 show devices", ok=True, stdout=self.CONTRADICTORY_DEVICES,
+            ),
+            SSHCommandResult(command="sudo -n /sbin/camcontrol devlist -v", ok=True, stdout=SMP_DEVLIST),
+            *extra,
+        ]
+
+    def test_contradictory_parent_never_routes_one_expanders_counters_to_another(self):
+        from app.services.core_expander_counters import SmpTarget, discover_smp_targets
+
+        self.assertNotIn("000b", self.CONTRADICTORY_DEVICES)
+        outputs = self.outputs(**{"mprutil -u 0 show devices": self.CONTRADICTORY_DEVICES})
+        # A has no consistent route left; B keeps its own clean target 30.
+        self.assertEqual(discover_smp_targets(outputs), [SmpTarget(0, SMP_EXPANDER_B, "pass30", 2)])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            commands = service._core_expander_counter_probe_commands(self.contradictory_results())
+        self.assertEqual(len(commands), 1)
+        self.assertIn(f"tnj-smp-phy-error-log:0:{SMP_EXPANDER_B}:pass30:", commands[0])
+        self.assertFalse(any(SMP_EXPANDER_A in command or "pass10" in command for command in commands))
+
+        # Even an A-marked read through pass10 (an older plan, or a forged
+        # line) must not publish B-reachable counters on A.
+        forged = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-00 ; ..."
+        fabric_outputs = {
+            **outputs,
+            forged: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (71, 0, 0, 0))}),
+        }
+        node = self.expander(self.fabric(fabric_outputs), SMP_EXPANDER_A)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "no_route")
+        self.assertIsNone(counters["device"])
+        self.assertEqual(counters["rows"], [])
+        self.assertNotIn(71, [row.get("invalid_dword_count") for row in node.raw["phys"]])
+        self.assertFalse(any(row.get("counter_state") == "measured" for row in node.raw["phys"]))
+
+        # The reverse disagreement: the parent names A but B's PHY table lists
+        # the same handle. That device is no route to either expander.
+        reverse = SMP_EXPANDERS.replace("  0 1 001a", "  0 1 000a")
+        self.assertEqual(discover_smp_targets(self.outputs(**{"mprutil -u 0 show expanders": reverse})), [
+            SmpTarget(0, SMP_EXPANDER_A, "pass12", 4),
+            SmpTarget(0, SMP_EXPANDER_B, "pass30", 2),
+        ])
+
+    def test_read_budget_reports_not_read_and_rotates_instead_of_no_route(self):
+        from app.services.core_expander_counters import (
+            NO_ROUTE_MESSAGE, SMP_COUNTER_READ_INTERVAL_SECONDS, SMP_MAX_TARGETS_PER_REFRESH,
+            discover_smp_targets,
+        )
+
+        outputs = _nine_expander_outputs()
+        targets = discover_smp_targets(outputs)
+        self.assertEqual(len(targets), 9, "route discovery is complete; the budget applies to reads")
+        self.assertEqual(targets[8].device, "pass8")
+
+        results = [
+            SSHCommandResult(
+                command=f"sudo -n /usr/sbin/{key}" if key.startswith("mprutil") else f"sudo -n /sbin/{key}",
+                ok=True, stdout=stdout,
+            )
+            for key, stdout in outputs.items()
+        ]
+        read_addresses: list[list[str]] = []
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_clock = lambda: now[0]
+            for refresh in range(3):
+                commands = service._core_expander_counter_probe_commands(list(results))
+                # The second refresh, inside the read interval, reads only the
+                # expander still waiting; the third, after it, starts a new turn.
+                self.assertEqual(len(commands), 1 if refresh == 1 else SMP_MAX_TARGETS_PER_REFRESH)
+                window = [canonicalize_ssh_command(command).split(":")[1] for command in commands]
+                read_addresses.append(window)
+                # Later planning rounds of the same refresh keep the window.
+                answered = [SSHCommandResult(command=command, ok=True, stdout="") for command in commands]
+                self.assertEqual(
+                    service._core_expander_counter_probe_commands([*results, *answered]), [],
+                )
+                now[0] += 1 if refresh == 0 else SMP_COUNTER_READ_INTERVAL_SECONDS
+        all_addresses = [target.expander_sas_address for target in targets]
+        self.assertEqual(read_addresses[0], all_addresses[:8])
+        self.assertEqual(read_addresses[1], [all_addresses[8]], "the ninth expander is read on the next refresh")
+        self.assertEqual(set(read_addresses[0]) | set(read_addresses[1]), set(all_addresses))
+        # The least recently read go first: the ninth waits for the next turn.
+        self.assertEqual(read_addresses[2], all_addresses[:8])
+
+        # The fabric: eight read this refresh, the ninth has a route but waits its turn.
+        fabric_outputs = dict(outputs)
+        for target in targets[:8]:
+            key = f"echo tnj-smp-phy-error-log:{target.identity}:00-00 ; ..."
+            fabric_outputs[key] = _smp_output(0, target.expander_sas_address, target.device, {0: _smp_frame(0)})
+        ninth = targets[8].expander_sas_address
+        node = self.expander(self.fabric(fabric_outputs, "granted", selected=ninth), ninth)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "not_read")
+        self.assertEqual(counters["reason"], "read_budget")
+        self.assertEqual(counters["device"], "pass8")
+        self.assertNotEqual(counters["message"], NO_ROUTE_MESSAGE)
+        self.assertIn("read budget", counters["message"])
+        first = self.expander(self.fabric(fabric_outputs, "granted", selected=targets[0].expander_sas_address),
+                              targets[0].expander_sas_address)
+        self.assertEqual(first.raw["phy_error_counters"]["state"], "available")
+
+    def test_full_read_measurement_wins_over_the_probe_for_the_same_phy(self):
+        probe_key = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-00 ; ..."
+        full_key = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fabric = self.fabric(self.outputs(**{
+            probe_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (1, 0, 0, 0))}),
+            full_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {
+                phy: _smp_frame(phy, (2 if phy == 0 else 0, 0, 0, 0)) for phy in range(4)
+            }),
+        }))
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        phys = {row["phy"]: row for row in node.raw["phys"]}
+        self.assertEqual(phys["0"]["invalid_dword_count"], 2)
+        # A measured probe still beats an unknown full-read row.
+        fabric = self.fabric(self.outputs(**{
+            probe_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (1, 0, 0, 0))}),
+            full_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: "camcontrol: error sending command\n"}),
+        }))
+        phys = {row["phy"]: row for row in self.expander(fabric, SMP_EXPANDER_A).raw["phys"]}
+        self.assertEqual((phys["0"]["counter_state"], phys["0"]["invalid_dword_count"]), ("measured", 1))
+
+    def test_a_forced_refresh_asks_sudo_again_after_a_refusal(self):
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            probe = service._core_expander_counter_probe_commands(self.results())
+            refused = SSHCommandResult(command=probe[0], ok=True, stdout=_smp_output(
+                0, SMP_EXPANDER_A, "pass10", {0: _SUDO_REFUSAL}))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(refused)), [])
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+
+            async def snapshot(force):
+                with patch.object(service, "_resolve_snapshot_cache_key", side_effect=RuntimeError("stop")):
+                    with self.assertRaises(RuntimeError):
+                        await service._get_snapshot_result(force_refresh=force)
+
+            # An ordinary or background refresh keeps the remembered refusal.
+            asyncio.run(snapshot(False))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+            # A user's forced refresh (the Refresh button, ?force=true) retries once.
+            asyncio.run(snapshot(True))
+            self.assertEqual(service._smp_counter_capability, "permission_denied")
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), probe)
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(refused)), [])
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+
+    def test_logged_command_masks_the_expander_address_and_timeout_has_a_kill_after(self):
+        from app.services.core_expander_counters import SmpTarget, build_phy_error_log_command
+        from app.services.ssh_probe import redact_ssh_command
+
+        command = build_phy_error_log_command(SmpTarget(0, SMP_EXPANDER_A, "pass10", 4))
+        self.assertIn("/usr/bin/timeout -k 1 2 sudo -n /sbin/camcontrol smpcmd pass10 ", command)
+        redacted = redact_ssh_command(command)
+        self.assertNotIn(SMP_EXPANDER_A, redacted)
+        self.assertIn("tnj-smp-phy-error-log:0:5000...0001:pass10:00-03", redacted)
+        self.assertNotIn(SMP_EXPANDER_A, redact_ssh_command(f"sudo -n true ; {command}"))
+
+    def test_route_discovery_work_is_linear_in_rows_and_ambiguous_rows_fail_closed(self):
+        """Codex security review: index rows instead of scanning devices per expander."""
+        import app.services.core_expander_counters as counters
+
+        size = 300
+        outputs = _nine_expander_outputs(size)
+        calls = [0]
+        real_hex_int = counters._hex_int
+
+        def counting(value):
+            calls[0] += 1
+            return real_hex_int(value)
+
+        with patch.object(counters, "_hex_int", counting):
+            targets = counters.discover_smp_targets(outputs)
+        self.assertEqual(len(targets), size)
+        # One pass over expanders, their PHY rows and devices; not size * size.
+        self.assertLess(calls[0], 12 * size, calls[0])
+
+        # Two expander rows with one handle, or two device rows with one
+        # handle, cannot name one route.
+        dup_expander = SMP_EXPANDERS.replace("0019      0001", "0009      0001")
+        self.assertEqual(counters.discover_smp_targets(self.outputs(**{
+            "mprutil -u 0 show expanders": dup_expander,
+        })), [])
+        dup_device = SMP_DEVICES.replace("5000c50000000020 001a", "5000c50000000020 000a")
+        self.assertEqual(
+            [(t.expander_sas_address, t.device) for t in counters.discover_smp_targets(self.outputs(**{
+                "mprutil -u 0 show devices": dup_device,
+            }))],
+            [(SMP_EXPANDER_A, "pass12")],
+        )
+
+
+class CoreExpanderCounterRateLimitTests(unittest.TestCase):
+    """Codex security review on #1088: forced refreshes must not hammer the appliance.
+
+    A forced refresh may ask sudo again with one probe call, but full counter
+    reads are rate limited per expander whatever asked for the refresh, and
+    every refresh stays under a hard ceiling of privileged calls.
+    """
+
+    outputs = CoreExpanderCounterTests.outputs
+    snapshot = CoreExpanderCounterTests.snapshot
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    results = staticmethod(CoreExpanderCounterTests.results)
+    READ_AT = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+
+    def fabric(self, outputs, capability=None, selected=SMP_EXPANDER_A, reads=None):
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core")),
+            snapshot=self.snapshot(selected),
+            ssh_outputs=outputs,
+            expander_counter_capability=capability,
+            expander_counter_reads=reads,
+        )
+
+    @staticmethod
+    def base_results(outputs):
+        return [
+            SSHCommandResult(
+                command=f"sudo -n /usr/sbin/{key}" if key.startswith("mprutil") else f"sudo -n /sbin/{key}",
+                ok=True, stdout=stdout,
+            )
+            for key, stdout in outputs.items()
+        ]
+
+    @staticmethod
+    def phys_in(command):
+        return [int(word, 16) for word in re.search(r"for p in ([0-9a-f ]+);", command).group(1).split()]
+
+    def answer(self, command, refuse):
+        unit, address, device, _span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
+        per_phy = {phy: _SUDO_REFUSAL if refuse else _smp_frame(phy) for phy in self.phys_in(command)}
+        return SSHCommandResult(command=command, ok=True, stdout=_smp_output(int(unit), address, device, per_phy))
+
+    def refresh(self, service, base, *, forced=True, refuse=False):
+        """One collection, planned round by round as run_planned_commands does."""
+        if forced:
+            # What the Refresh button and ?force=true call (see the forced refresh test above).
+            service.retry_expander_counter_capability()
+        results = list(base)
+        commands: list[str] = []
+        for _round in range(10):
+            planned = [command for command in service._core_expander_counter_probe_commands(list(results))
+                       if command not in commands]
+            if not planned:
+                break
+            commands.extend(planned)
+            results.extend(self.answer(command, refuse) for command in planned)
+        else:
+            self.fail("the planner never settled")
+        service._record_smp_counter_reads(results)
+        return commands, results
+
+    def calls(self, commands):
+        return sum(len(self.phys_in(command)) for command in commands)
+
+    def test_forced_refreshes_in_a_loop_stay_under_the_call_ceiling_and_the_read_interval(self):
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(9, num_phys=255)
+        targets = counters.discover_smp_targets(outputs)
+        self.assertEqual([target.num_phys for target in targets], [255] * 9)
+        base = self.base_results(outputs)
+        now = [1000.0]
+        reads: dict[str, list[int]] = {}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            for refresh in range(8):
+                commands, _results = self.refresh(service, base)
+                self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH, refresh)
+                # Full reads come in chunks of several PHYs; count expanders, not chunks.
+                read_now = {
+                    canonicalize_ssh_command(command).split(":")[1]
+                    for command in commands if len(self.phys_in(command)) > 1
+                }
+                self.assertLessEqual(len(read_now), counters.SMP_MAX_TARGETS_PER_REFRESH)
+                for address in read_now:
+                    reads.setdefault(address, []).append(refresh)
+                now[0] += 1
+            # Inside the interval each expander is read in full exactly once,
+            # in turn, and then forced refreshes start no read at all.
+            self.assertEqual(sorted(reads), sorted(target.expander_sas_address for target in targets))
+            self.assertTrue(all(len(refreshes) == 1 for refreshes in reads.values()), reads)
+            self.assertEqual(self.refresh(service, base)[0], [])
+            first = sorted(address for address, refreshes in reads.items() if refreshes == [0])
+            self.assertTrue(first)
+            # After the interval the least recently read expanders go first.
+            now[0] = 1000.0 + counters.SMP_COUNTER_READ_INTERVAL_SECONDS
+            commands, _results = self.refresh(service, base)
+            self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH)
+            self.assertEqual(sorted({canonicalize_ssh_command(command).split(":")[1] for command in commands}), first)
+
+    def test_a_forced_refresh_after_a_refusal_makes_exactly_one_probe_call(self):
+        import app.services.core_expander_counters as counters
+
+        base = self.results()
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            probe, _results = self.refresh(service, base, forced=False, refuse=True)
+            self.assertEqual(self.calls(probe), 1)
+            self.assertEqual(service._smp_counter_capability, "permission_denied")
+            for _refresh in range(3):
+                now[0] += 1
+                self.assertEqual(self.refresh(service, base, forced=False, refuse=True)[0], [])
+                self.assertEqual(self.refresh(service, base, refuse=True)[0], probe, "one probe call, no reads")
+            # The operator adds the grant and presses Refresh: one probe, then
+            # the full reads, all under the ceiling.
+            commands, _results = self.refresh(service, base)
+            self.assertEqual(commands[0], probe[0])
+            self.assertEqual([len(self.phys_in(command)) for command in commands], [1, 4, 2])
+            self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH)
+            self.assertEqual(service._smp_counter_capability, "granted")
+            # Pressing Refresh again inside the interval asks for nothing.
+            for _refresh in range(5):
+                now[0] += 60
+                self.assertEqual(self.refresh(service, base)[0], [])
+
+    def test_counters_reused_inside_the_interval_show_their_read_time(self):
+        base = self.results()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_wall_clock = lambda: self.READ_AT
+            commands, _results = self.refresh(service, base)
+            self.assertEqual(len(commands), 3)
+            # A forced refresh inside the interval reads nothing new.
+            commands, results = self.refresh(service, base)
+            self.assertEqual(commands, [])
+            reads = service.expander_counter_reads()
+        outputs = {item.command: item.stdout for item in results}
+        for address in (SMP_EXPANDER_A, SMP_EXPANDER_B):
+            with self.subTest(address=address):
+                node = self.expander(self.fabric(outputs, "granted", selected=address, reads=reads), address)
+                counters = node.raw["phy_error_counters"]
+                self.assertEqual(counters["state"], "available")
+                self.assertEqual(counters["read_at"], "2026-11-07T12:00:00Z")
+                self.assertTrue(node.metrics["phy_error_counters"].endswith(", read at 2026-11-07T12:00:00Z"))
+                self.assertTrue(all(row["counter_state"] == "measured" for row in node.raw["phys"]))
+        # Kept readings are not shown once sudo refuses the read.
+        node = self.expander(self.fabric(outputs, "permission_denied", reads=reads), SMP_EXPANDER_A)
+        self.assertEqual(node.raw["phy_error_counters"]["state"], "permission_denied")
+        self.assertIsNone(node.raw["phy_error_counters"]["read_at"])
+        # A reading in this refresh's own outputs with no kept read time has none.
+        key_a = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fresh = self.outputs(**{key_a: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0)})})
+        node = self.expander(self.fabric(fresh, "granted"), SMP_EXPANDER_A)
+        self.assertIsNone(node.raw["phy_error_counters"]["read_at"])
+        self.assertNotIn("read at", node.metrics["phy_error_counters"])
+
+    def test_rotation_stays_fair_when_refreshes_are_further_apart_than_the_interval(self):
+        """Codex review on be4ecccc: expired read times must still order the rotation."""
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(9, num_phys=4)
+        addresses = [target.expander_sas_address for target in counters.discover_smp_targets(outputs)]
+        base = self.base_results(outputs)
+        now = [1000.0]
+        rounds: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            service._smp_counter_capability = "granted"
+            for _refresh in range(3):
+                commands, _results = self.refresh(service, base, forced=False)
+                rounds.append([canonicalize_ssh_command(command).split(":")[1] for command in commands])
+                # For example source_bundle_cache_ttl_seconds=1800.
+                now[0] += 2 * counters.SMP_COUNTER_READ_INTERVAL_SECONDS
+            # A departed expander's read time is dropped; the rest are kept.
+            service._core_expander_counter_probe_commands(self.base_results(_nine_expander_outputs(8, num_phys=4)))
+            self.assertEqual(set(service._smp_counter_last_read), {(0, address) for address in addresses[:8]})
+        self.assertEqual(rounds[0], addresses[:8])
+        self.assertIn(addresses[8], rounds[1], "the never-read expander goes first on the next refresh")
+        # Commands keep discovery order; the least recently read are chosen.
+        self.assertEqual(rounds[1], [*addresses[:7], addresses[8]])
+        self.assertEqual(rounds[2], addresses[:8], "the expander skipped last time is read next")
+
+
+def _wide_expander_outputs(num_phys: int = 10) -> dict:
+    """Expander A with ``num_phys`` PHY rows, routed through pass10."""
+    expander_lines = [
+        "Num Phys SAS Address      DevHandle Parent EncHandle SAS Level",
+        f"{num_phys:<8} {SMP_EXPANDER_A} 0009      0001   0002      1",
+        "  0 1 000a 12.0 1.5 12.0 End Device",
+        *[f"  {phy}       1.5 12.0 No Device" for phy in range(1, num_phys)],
+    ]
+    return {
+        "mprutil -u 0 show expanders": "\n".join(expander_lines),
+        # Header and the target 10 row of SMP_DEVICES: one end device on PHY 0.
+        "mprutil -u 0 show devices": "\n".join(
+            line for line in SMP_DEVICES.splitlines() if line.startswith(("B____T", "00   10 "))
+        ),
+        "camcontrol devlist -v": SMP_DEVLIST,
+    }
+
+
+class CoreExpanderCounterChunkTests(unittest.TestCase):
+    """Codex P2 on #1088: one expander's PHY reads must fit the SSH command deadline.
+
+    Each expander is read in fixed-size chunks, one SSH command per chunk, so
+    a chunk that runs past the SSH command timeout loses only its own PHYs.
+    """
+
+    snapshot = CoreExpanderCounterTests.snapshot
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    fabric = CoreExpanderCounterRateLimitTests.fabric
+    base_results = staticmethod(CoreExpanderCounterRateLimitTests.base_results)
+    phys_in = staticmethod(CoreExpanderCounterRateLimitTests.phys_in)
+    calls = CoreExpanderCounterRateLimitTests.calls
+    READ_AT = CoreExpanderCounterRateLimitTests.READ_AT
+
+    def refresh(self, service, base, slow_phy=None, offset=0):
+        """One collection; the chunk holding ``slow_phy`` runs past the SSH timeout."""
+        results = list(base)
+        commands: list[str] = []
+        for _round in range(10):
+            planned = [command for command in service._core_expander_counter_probe_commands(list(results))
+                       if command not in commands]
+            if not planned:
+                break
+            commands.extend(planned)
+            for command in planned:
+                phys = self.phys_in(command)
+                if slow_phy in phys:
+                    # What SSHProbe returns when the command deadline expires.
+                    results.append(SSHCommandResult(command=command, ok=False, stderr="Command timed out"))
+                    continue
+                unit, address, device, _span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
+                per_phy = {phy: _smp_frame(phy, (offset + phy + 1, 0, 0, 0)) for phy in phys}
+                results.append(SSHCommandResult(
+                    command=command, ok=True, stdout=_smp_output(int(unit), address, device, per_phy),
+                ))
+        else:
+            self.fail("the planner never settled")
+        service._record_smp_counter_reads(results)
+        return commands, results
+
+    def phy_rows(self, service, results):
+        outputs = {item.command: item.stdout for item in results if item.ok}
+        node = self.expander(
+            self.fabric(outputs, "granted", reads=service.expander_counter_reads()), SMP_EXPANDER_A,
+        )
+        return node, {int(row["phy"]): row for row in node.raw["phys"]}
+
+    def test_chunks_fit_the_ssh_command_deadline(self):
+        import app.services.core_expander_counters as counters
+        from app.config import SSHConfig
+
+        per_call = counters.SMP_CALL_TIMEOUT_SECONDS + counters.SMP_CALL_KILL_AFTER_SECONDS
+        # Worst case of one chunk, every call killed: clearly under the default deadline.
+        self.assertLessEqual(counters.SMP_PHYS_PER_COMMAND * per_call + 3, SSHConfig().timeout_seconds)
+        target = counters.SmpTarget(0, SMP_EXPANDER_A, "pass10", 10)
+        commands = counters.build_phy_error_log_commands(target)
+        self.assertEqual([self.phys_in(command) for command in commands], [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]])
+        self.assertEqual(
+            [canonicalize_ssh_command(command) for command in commands],
+            [f"smp phy error log 0:{SMP_EXPANDER_A}:pass10:{span}" for span in ("00-03", "04-07", "08-09")],
+        )
+        self.assertEqual(sum(counters.smp_output_calls(canonicalize_ssh_command(c)) for c in commands), 10)
+        wide = counters.SmpTarget(0, SMP_EXPANDER_A, "pass10", 255)
+        self.assertEqual(len(counters.build_phy_error_log_commands(wide)), 64)
+        # The hang stop still works inside a chunk: one silent call ends that chunk.
+        self.assertIn("then echo @no-response; break; fi", commands[0])
+
+    def test_a_slow_chunk_loses_only_its_own_phys(self):
+        base = self.base_results(_wide_expander_outputs(10))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_wall_clock = lambda: self.READ_AT
+            commands, results = self.refresh(service, base, slow_phy=5)
+            self.assertEqual(len(commands), 3, "one SSH command per chunk")
+            self.assertEqual(self.calls(commands), 10, "calls, not chunks, count against the ceiling")
+            node, phys = self.phy_rows(service, results)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "available")
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (6, 4))
+        for phy in (0, 1, 2, 3, 8, 9):
+            with self.subTest(phy=phy):
+                self.assertEqual(phys[phy]["counter_state"], "measured")
+                self.assertEqual(phys[phy]["invalid_dword_count"], phy + 1)
+        for phy in (4, 5, 6, 7):
+            with self.subTest(phy=phy):
+                self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+                self.assertIsNone(phys[phy]["invalid_dword_count"])
+        self.assertEqual(counters["read_at"], "2026-11-07T12:00:00Z")
+
+    def test_a_reread_replaces_kept_chunks_and_never_mixes_in_an_older_failed_chunk(self):
+        from app.services.core_expander_counters import SMP_COUNTER_READ_INTERVAL_SECONDS
+
+        base = self.base_results(_wide_expander_outputs(10))
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_clock = lambda: now[0]
+            self.refresh(service, base)
+            # Inside the interval nothing is read; the kept chunks are shown.
+            commands, results = self.refresh(service, base, offset=100)
+            self.assertEqual(commands, [])
+            _node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(10)], list(range(1, 11)))
+            # The next read's last chunk runs past the deadline: its PHYs are
+            # unknown, not the older reading, and the other chunks are new.
+            now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
+            commands, results = self.refresh(service, base, slow_phy=9, offset=100)
+            self.assertEqual(len(commands), 3)
+            node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(8)], list(range(101, 109)))
+            for phy in (8, 9):
+                self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+            self.assertEqual(node.raw["phy_error_counters"]["measured_phys"], 8)
+            # A read whose every chunk failed keeps the previous reading.
+            now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
+            results = list(base)
+            commands = service._core_expander_counter_probe_commands(list(results))
+            self.assertEqual(len(commands), 3)
+            results.extend(SSHCommandResult(command=command, ok=False, stderr="Command timed out") for command in commands)
+            service._record_smp_counter_reads(results)
+            _node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(8)], list(range(101, 109)))
+
+    def test_ssh_round_trips_per_refresh_stay_bounded(self):
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(9, num_phys=255)
+        targets = counters.discover_smp_targets(outputs)
+        base = self.base_results(outputs)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            commands, _results = self.refresh(service, base)
+        self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH)
+        self.assertLessEqual(len(commands), counters.SMP_MAX_COMMANDS_PER_REFRESH)
+        self.assertEqual(len(commands), 1 + 2 * 64, "the probe, then two 255-PHY expanders in 4-PHY chunks")
+        # The command bound holds on its own, whatever the call budget allows.
+        chosen = counters.select_counter_reads(targets, {}, 0.0, counters.SMP_MAX_CALLS_PER_REFRESH, command_budget=64)
+        self.assertEqual(len(chosen), 1)
+        self.assertLessEqual(
+            1 + counters.SMP_MAX_TARGETS_PER_REFRESH
+            + (counters.SMP_MAX_CALLS_PER_REFRESH - 1) // counters.SMP_PHYS_PER_COMMAND,
+            counters.SMP_MAX_COMMANDS_PER_REFRESH,
+        )

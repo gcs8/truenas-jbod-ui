@@ -36,6 +36,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   other, with lane count and negotiated rate, and stays null when either end's
   rows are missing or disagree. It does not claim cable count or width
   (#1086).
+- Added SAS expander PHY error counters to Storage Fabric on TrueNAS CORE. The
+  app reads each expander's PHY error log when the service account may, and
+  says "Expander counters not available (permission not granted)" when it may
+  not; a PHY it could not read shows as unknown, never zero. The admin
+  bootstrap now grants one read-only `camcontrol smpcmd` rule for this by
+  default; re-run bootstrap on an existing CORE account to add it, then press
+  Refresh, which checks the grant with one sudo call. Each expander is read at
+  most once every 15 minutes, Refresh included, and one refresh makes at most
+  512 such calls, four PHYs per SSH command so a command that runs out of time
+  loses only its own PHYs; in between, the last reading is shown with its read
+  time (#1088).
 
 ### Fixed
 
@@ -57,9 +68,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
-- Added an inactive, unwired SMP REPORT PHY ERROR LOG response decoder and
-  per-phy counter delta helper with strict frame validation, reset and
-  saturation handling; no grant, collector or UI changed (#1084).
+- Added an SMP REPORT PHY ERROR LOG response decoder and per-phy counter
+  delta helper with strict frame validation, reset and saturation handling
+  (#1084).
 
 ### Docs
 
