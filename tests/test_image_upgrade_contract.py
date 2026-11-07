@@ -3132,3 +3132,243 @@ class UpgradeScenarioContractTests(unittest.TestCase):
                         self.assertFalse(root.exists())
                         restart = events.index(("restart", *smoke.SERVICES))
                         self.assertEqual(events[restart + 1], ("up", "-d", "--wait", "--wait-timeout", "300"))
+
+
+class CleanHostRestoreDriverTests(unittest.TestCase):
+    """#1089: clean-host driver origin, failure output and root admission. Not Docker evidence."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+    load_smoke = ImageOnlyUpgradeSmokeContractTests.load_smoke
+
+    def argv(self, root):
+        return ["--root", str(root), "--compose-fixture", str(self.ROOT / "tests/fixtures/compose/v0.22.2.yml"),
+                "--config-fixture", str(self.ROOT / "tests/fixtures/ci-smoke-config.yaml"),
+                "--previous-image", "predecessor", "--previous-version", "0.22.2", "--candidate-image", "candidate",
+                "--candidate-version", "current", "--candidate-revision", "a" * 40,
+                "--scenario", "clean-host-restore", "--disposable-clean-host-restore"]
+
+    def orchestrate(self, smoke, root, *, post_fault=None, secrets=None):
+        """The real clean_host_restore over a recording transport; returns (result or error, compose calls)."""
+        import io
+        import shutil
+        from types import SimpleNamespace
+
+        calls = []
+        identity = {"history_rows": {"slot_events": [3, "synthetic-digest"]}}
+
+        class Transport(smoke.CleanHostDeployment):
+            def compose(self, *command, **kwargs):
+                env = self.root / ".env"
+                calls.append((self.root.name, command, env.read_text(encoding="utf-8") if env.exists() else ""))
+                return ""
+
+            def run_python(self, service, script, extra=()):
+                return identity if script == smoke.READ_CLEAN_HISTORY else {"config_sha256": "a", "mapping_sha256": "b"}
+
+            def exec_python(self, service, script):
+                if script == smoke.READ_HISTORY:
+                    return {"integrity": "ok", "counts": {"slot_state_current": 3, "slot_events": 3, "metric_samples": 12}}
+                return self.run_python(service, script)
+
+        def prepare(path, compose, config):
+            path.mkdir()
+            (path / "docker-compose.yml").write_text("synthetic transport only")
+
+        def run(command, **kwargs):
+            if command[:3] == ["sudo", "rm", "-rf"]:
+                shutil.rmtree(command[-1])
+            return ""
+
+        def seed(deployment, args):
+            deployment.set_image(args.previous_image)
+            deployment.compose("up", "-d", "--wait", "--wait-timeout", "300")
+
+        def post(path, body, headers):
+            if post_fault is not None:
+                raise post_fault(path, body, headers)
+            if path.endswith("inspect"):
+                return {"ok": True, "encrypted": True, "encryption_mode": "encrypted",
+                        "inspection_receipt": "single-use", "selected_groups": list(smoke.CLEAN_HOST_GROUPS),
+                        "present_groups": list(smoke.CLEAN_HOST_GROUPS), "absent_groups": []}
+            return {"ok": True, "included_groups": list(smoke.CLEAN_HOST_GROUPS)}
+
+        args = SimpleNamespace(root=root, disposable_clean_host_restore=True,
+                               compose_fixture=self.ROOT / "tests/fixtures/compose/v0.22.2.yml",
+                               config_fixture=self.ROOT / "tests/fixtures/ci-smoke-config.yaml",
+                               previous_image="predecessor", previous_version="0.22.2", candidate_image="candidate",
+                               candidate_version="current", candidate_revision="a" * 40)
+        opener = mock.Mock()
+        opener.open.return_value = io.BytesIO(b"7z\xbc\xaf\x27\x1csynthetic-transport")
+        with mock.patch.object(smoke, "CleanHostDeployment", Transport), \
+             mock.patch.object(smoke, "prepare_root", side_effect=prepare), \
+             mock.patch.object(smoke, "run", side_effect=run), \
+             mock.patch.object(smoke, "seed_previous_release", side_effect=seed), \
+             mock.patch.object(smoke, "check_runtime"), \
+             mock.patch.object(smoke, "history_api_view", return_value=smoke.expected_history_view({1: 4, 2: 4, 3: 4})), \
+             mock.patch.object(smoke, "clean_host_post", side_effect=post), \
+             mock.patch.object(smoke.urllib.request, "build_opener", return_value=opener):
+            try:
+                outcome = smoke.clean_host_restore(args) if secrets is None else smoke.clean_host_restore(args, secrets)
+            except smoke.SmokeError as exc:
+                outcome = exc
+        return outcome, calls
+
+    @staticmethod
+    def env_values(text):
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+    def test_basic_auth_candidate_starts_with_the_documented_loopback_origins(self):
+        from types import SimpleNamespace
+
+        from admin_service.route_support import validate_admin_public_origin
+        from app.http_auth import configured_origin_identity
+
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            outcome, calls = self.orchestrate(smoke, Path(directory) / "jbod-clean-host-origin")
+        self.assertIsInstance(outcome, str)
+        self.assertIn("cleanup=verified", outcome)
+        admin_up = [env for name, command, env in calls
+                    if name == "target" and command[:3] == ("--profile", "admin", "up")]
+        ui_up = [env for name, command, env in calls
+                 if name == "target" and command[:2] == ("up", "-d") and "enclosure-admin" not in command]
+        self.assertEqual(len(admin_up), 1)
+        self.assertTrue(ui_up)
+        for env_text in (*admin_up, *ui_up):
+            env = self.env_values(env_text)
+            self.assertEqual(env["JBOD_UI_IMAGE"], "candidate")
+            self.assertEqual(env["ADMIN_AUTH_MODE"], "basic")
+            # The candidate's own startup checks (admin_service/main.py and
+            # app/main.py) refuse Basic mode without these, as the
+            # documented Basic-auth setup in wiki/Admin-UI-and-System-Setup.md says.
+            validate_admin_public_origin(SimpleNamespace(auth_mode="basic", public_origin=env["ADMIN_PUBLIC_ORIGIN"]))
+            self.assertEqual(configured_origin_identity(env["ADMIN_PUBLIC_ORIGIN"]),
+                             ("http", env["ADMIN_BIND_ADDRESS"], int(env["ADMIN_PORT"])))
+            self.assertEqual(configured_origin_identity(env["APP_PUBLIC_ORIGIN"]),
+                             ("http", "127.0.0.1", int(env["APP_PORT"])))
+            self.assertEqual(int(env["ADMIN_PORT"]), smoke.CLEAN_HOST_ADMIN_PORT)
+            self.assertEqual(int(env["APP_PORT"]), smoke.UI_PORT)
+        # The current Compose file is what carries both values into the containers.
+        services = yaml.safe_load((self.ROOT / "docker-compose.yml").read_text(encoding="utf-8"))["services"]
+        self.assertEqual(services["enclosure-admin"]["environment"]["ADMIN_PUBLIC_ORIGIN"], "${ADMIN_PUBLIC_ORIGIN:-}")
+        self.assertEqual(services["enclosure-ui"]["environment"]["APP_PUBLIC_ORIGIN"], "${APP_PUBLIC_ORIGIN:-}")
+
+    def test_every_basic_auth_driver_environment_sets_both_origins(self):
+        smoke = self.load_smoke()
+        basic = {name: value for name, value in vars(smoke).items()
+                 if isinstance(value, dict) and value.get("ADMIN_AUTH_MODE") == "basic"}
+        self.assertIn("CLEAN_HOST_ENVIRONMENT", basic)
+        for name, environment in basic.items():
+            with self.subTest(constant=name):
+                self.assertEqual(environment["ADMIN_PUBLIC_ORIGIN"],
+                                 f"http://127.0.0.1:{environment['ADMIN_PORT']}")
+                self.assertEqual(environment["APP_PUBLIC_ORIGIN"], f"http://127.0.0.1:{smoke.UI_PORT}")
+        # admin-during-upgrade stays on the published network mode (#1085).
+        self.assertNotIn("ADMIN_AUTH_MODE", smoke.ADMIN_ENVIRONMENT)
+        # Every maintained driver that starts admin with Basic auth names both origins.
+        for script in sorted((self.ROOT / "scripts").glob("*.py")):
+            text = script.read_text(encoding="utf-8")
+            if "ADMIN_AUTH_MODE=basic" in text or '"ADMIN_AUTH_MODE": "basic"' in text:
+                with self.subTest(script=script.name):
+                    self.assertIn("ADMIN_PUBLIC_ORIGIN", text)
+                    self.assertIn("APP_PUBLIC_ORIGIN", text)
+
+    def run_main(self, smoke, argv):
+        import io
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = smoke.main(argv)
+        return code, stderr.getvalue()
+
+    def test_cli_prints_the_smoke_error_message(self):
+        smoke = self.load_smoke()
+        failure = smoke.SmokeError("command failed (1): docker compose up enclosure-admin\nadmin exited (1)")
+        with mock.patch.object(smoke, "clean_host_restore", side_effect=failure), \
+             mock.patch.object(smoke, "cleanup", side_effect=AssertionError("legacy cleanup")):
+            code, stderr = self.run_main(smoke, self.argv(Path("/nonexistent/jbod-clean-host-message")))
+        self.assertEqual(code, 1)
+        self.assertIn("clean-host restore failed; recovery files retained:", stderr)
+        self.assertIn("docker compose up enclosure-admin", stderr)
+        self.assertIn("admin exited (1)", stderr)
+
+    def test_cli_failure_output_redacts_the_key_input_and_admin_credential(self):
+        import base64
+
+        smoke = self.load_smoke()
+        key_input = "synthetic-key-input-for-redaction"
+        encoded = base64.b64encode(key_input.encode()).decode("ascii")
+
+        def fail(args, secrets):
+            secrets.append(key_input)
+            raise smoke.SmokeError(f"import refused: {key_input} {encoded} "
+                                   f"{smoke.CLEAN_HOST_AUTH_PASSWORD} {smoke.CLEAN_HOST_AUTH}")
+
+        with mock.patch.object(smoke, "clean_host_restore", side_effect=fail):
+            code, stderr = self.run_main(smoke, self.argv(Path("/nonexistent/jbod-clean-host-redact")))
+        self.assertEqual(code, 1)
+        self.assertIn("import refused:", stderr)
+        self.assertIn("[redacted]", stderr)
+        credential = smoke.CLEAN_HOST_AUTH.split(" ", 1)[1]
+        for secret in (key_input, encoded, smoke.CLEAN_HOST_AUTH_PASSWORD, credential):
+            self.assertNotIn(secret, stderr)
+
+    def test_failure_message_keeps_the_cause_when_teardown_also_fails(self):
+        smoke = self.load_smoke()
+        try:
+            try:
+                try:
+                    raise ConnectionRefusedError(111, "Connection refused")
+                except OSError as exc:
+                    raise smoke.SmokeError("clean-host admin request failed") from exc
+            finally:
+                raise smoke.SmokeError("clean-host teardown failed; retain recovery files")
+        except smoke.SmokeError as exc:
+            message = smoke.clean_host_failure_message(exc, [])
+        self.assertIn("clean-host teardown failed", message)
+        self.assertIn("clean-host admin request failed", message)
+        self.assertIn("Connection refused", message)
+        self.assertLess(message.index("teardown"), message.index("admin request"))
+
+    def test_real_orchestration_registers_the_key_input_before_it_can_reach_output(self):
+        smoke = self.load_smoke()
+
+        def leak(path, body, headers):
+            return smoke.SmokeError(f"refused {path}: {headers['X-Backup-Passphrase-Base64']} "
+                                    f"{key_file.read_text(encoding='utf-8')} {smoke.CLEAN_HOST_AUTH}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "jbod-clean-host-leak"
+            key_file = root / "recovery" / "operator-key-input"
+            secrets = []
+            outcome, _ = self.orchestrate(smoke, root, post_fault=leak, secrets=secrets)
+            self.assertIsInstance(outcome, smoke.SmokeError)
+            key_input = key_file.read_text(encoding="utf-8")
+            message = smoke.clean_host_failure_message(outcome, secrets)
+        self.assertIn(key_input, secrets)
+        self.assertIn("refused /api/admin/backup/inspect", message)
+        self.assertIn("[redacted]", message)
+        self.assertNotIn(key_input, message)
+        self.assertNotIn(smoke.CLEAN_HOST_AUTH.split(" ", 1)[1], message)
+        self.assertNotIn(smoke.CLEAN_HOST_AUTH_PASSWORD, message)
+
+    def test_invalid_compose_project_root_names_are_refused_before_anything_is_touched(self):
+        smoke = self.load_smoke()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            for name in ("jbod-clean-host-tnj463c-20261107T080838Z", "jbod-clean-host-Run", "jbod-clean-host-run.1",
+                         "jbod-clean-host-run 1", "jbod-clean-host-run+1", "JBOD-clean-host-run"):
+                root = parent / name
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(smoke.SmokeError, "lowercase Compose project name"):
+                        smoke.admit_clean_host_root(root, consent=True)
+                    self.assertFalse(root.exists())
+                    with mock.patch.object(smoke, "run", side_effect=AssertionError("touched Docker or sudo")), \
+                         mock.patch.object(smoke, "cleanup", side_effect=AssertionError("legacy cleanup")):
+                        code, stderr = self.run_main(smoke, self.argv(root))
+                    self.assertEqual(code, 1)
+                    self.assertIn("lowercase Compose project name", stderr)
+                    self.assertFalse(root.exists())
+            self.assertEqual(list(parent.iterdir()), [])
+            admitted = parent / "jbod-clean-host-tnj463c-20261107t080838z-r1_a"
+            smoke.admit_clean_host_root(admitted, consent=True)
+            self.assertTrue(admitted.is_dir())

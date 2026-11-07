@@ -211,7 +211,12 @@ sign-off process. An independent docs-only walkthrough remains unverified.
 After separate runtime admission, use the existing image-smoke arguments with
 `--scenario clean-host-restore --disposable-clean-host-restore` and a new
 `--root "$TMPDIR/jbod-clean-host-<unique-run>"`. The root must be absent,
-below the selected scratch directory and free of symlink ancestors. Use
+below the selected scratch directory and free of symlink ancestors. Its name is
+the Compose project name, so after the prefix use only lowercase letters,
+digits, `-` and `_`; the driver refuses any other name before it creates
+anything. Both the predecessor and the current install use Basic admin
+authentication with the documented `APP_PUBLIC_ORIGIN` and
+`ADMIN_PUBLIC_ORIGIN` set to the loopback ports below. Use
 `tests/fixtures/compose/v0.22.2.yml` and
 `tests/fixtures/ci-smoke-config.yaml` unchanged, the pinned predecessor image
 from CI, and the admitted exact candidate image and OCI revision. The driver
@@ -222,7 +227,9 @@ publication is added by this driver.
 
 Success removes task runtime resources and files. Any scenario failure,
 teardown failure, residual resource or unknown census retains recovery files
-and runtime configuration for diagnosis. Never replace an existing root or
+and runtime configuration for diagnosis. A failure prints the failed check and
+the failure it replaced, with the key input and the synthetic admin credential
+redacted. Never replace an existing root or
 erase retained recovery material merely to retry.
 
 ## Rolling back a release
