@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Repository rules for the self-hosted Renovate run. They are appended after the global packageRules, so they win for the updates they match.",
+    "Pins and digests that CI can prove still land in the grouped routine PR; tests/test_ci_contract.py (RenovatePolicyContractTests) guards these rules."
+  ],
+  "packageRules": [
+    {
+      "description": "This project's own published image. docker-compose.yml keeps ':latest' as the operator-facing compatibility default; a digest pin would freeze fresh installs on an old build, and releases publish the image, not Renovate.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["ghcr.io/gcs8/truenas-jbod-ui"],
+      "enabled": false
+    },
+    {
+      "description": "A Python minor or major bump of the base image changes the interpreter. Every compiled requirement needs a wheel for it (zstandard 0.25.0 had none for 3.15, so the image build needed gcc) and CI tests only the matrix minors. Own PR, opened from the Dependency Dashboard on request; digest pins of the current minor stay routine.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["python"],
+      "matchUpdateTypes": ["major", "minor"],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Screenshot capture toolchain. The capture image tag must equal the locked @playwright/test version, its digest is mirrored in CONTAINER_IMAGE and docs/SCREENSHOT_CAPTURE.md, and a new image needs a qualification capture run (docs/SCREENSHOT_CAPTURE.md). Renovate only edits container.image, so these wait for dashboard approval and a human finishes the PR.",
+      "matchPackageNames": ["mcr.microsoft.com/playwright", "@playwright/test"],
+      "groupName": "playwright capture toolchain",
+      "groupSlug": "playwright-capture",
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
