@@ -44,8 +44,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   default; re-run bootstrap on an existing CORE account to add it, then press
   Refresh, which checks the grant with one sudo call. Each expander is read at
   most once every 15 minutes, Refresh included, and one refresh makes at most
-  512 such calls; in between, the last reading is shown with its read time
-  (#1088).
+  512 such calls, four PHYs per SSH command so a command that runs out of time
+  loses only its own PHYs; in between, the last reading is shown with its read
+  time (#1088).
 
 ### Fixed
 

@@ -108,7 +108,9 @@ from app.services.core_expander_counters import (
     CAPABILITY_GRANTED,
     SMP_CAPABILITY_RETRY_SECONDS,
     SMP_MAX_CALLS_PER_REFRESH,
+    SMP_MAX_COMMANDS_PER_REFRESH,
     build_phy_error_log_command,
+    build_phy_error_log_commands,
     discover_smp_targets,
     parse_phy_error_log_output,
     select_counter_reads,
@@ -1548,11 +1550,12 @@ class InventoryService:
         self._smp_counter_capability = None
         self._smp_counter_checked_at = 0.0
         # Per expander (unit, SAS address): when its last full read was
-        # planned (monotonic), and that read's output with its wall-clock read
-        # time, reused until the expander is due again (#1088 review).
+        # planned (monotonic), and that read's chunk outputs by output key
+        # with their wall-clock read time, reused until the expander is due
+        # again (#1088 review).
         self._smp_counter_last_read: dict[tuple[int, str], float] = {}
         self._smp_counter_planned: dict[str, tuple[int, str]] = {}
-        self._smp_counter_reads: dict[tuple[int, str], tuple[str, str, str]] = {}
+        self._smp_counter_reads: dict[tuple[int, str], dict[str, tuple[str, str]]] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
@@ -4770,26 +4773,29 @@ class InventoryService:
     def _record_smp_counter_reads(self, command_results: list[SSHCommandResult]) -> None:
         """Keep each full read this collection ran, with its read time.
 
-        Called once after a collection. Only reads the planner chose as full
+        Called once after a collection. Only chunks the planner chose for full
         reads are kept, so a one-PHY permission probe never replaces a kept
-        full reading.
+        full reading. A new read replaces an expander's kept chunks with the
+        ones that completed; a chunk that failed (for example past the SSH
+        command deadline) leaves its PHYs unread rather than mixing in an older
+        reading. A read with no completed chunk keeps the previous reading.
         """
         planned = getattr(self, "_smp_counter_planned", None) or {}
         self._smp_counter_planned = {}
         if not planned:
             return
         read_at = self._smp_counter_wall_clock().strftime("%Y-%m-%dT%H:%M:%SZ")
-        reads = dict(getattr(self, "_smp_counter_reads", None) or {})
+        fresh: dict[tuple[int, str], dict[str, tuple[str, str]]] = {}
         for item in command_results:
             key = smp_output_key(item.command)
             if item.ok and key in planned:
-                reads[planned[key]] = (key, item.stdout, read_at)
-        self._smp_counter_reads = reads
+                fresh.setdefault(planned[key], {})[key] = (item.stdout, read_at)
+        self._smp_counter_reads = {**(getattr(self, "_smp_counter_reads", None) or {}), **fresh}
 
     def expander_counter_reads(self) -> dict[str, tuple[str, str]]:
-        """Kept full reads by output key: (stdout, read time) for the fabric view."""
+        """Kept full-read chunks by output key: (stdout, read time) for the fabric view."""
         reads = getattr(self, "_smp_counter_reads", None) or {}
-        return {key: (stdout, read_at) for key, stdout, read_at in reads.values()}
+        return {key: read for chunks in reads.values() for key, read in chunks.items()}
 
     def _record_smp_counter_capability(self, command_results: list[SSHCommandResult]) -> None:
         """Remember whether sudo ran the expander counter read in these results."""
@@ -4825,10 +4831,12 @@ class InventoryService:
         Each expander is read at most once per SMP_COUNTER_READ_INTERVAL_SECONDS,
         forced refresh or not; the interval starts when the read is planned, so
         a read that fails or times out still counts. One refresh reads at most
-        SMP_MAX_TARGETS_PER_REFRESH expanders and SMP_MAX_CALLS_PER_REFRESH PHY
-        calls, the probe included. Later planning rounds of the same refresh
-        see its reads and add nothing; the probe's output alone does not count,
-        since the full reads follow it in that refresh.
+        SMP_MAX_TARGETS_PER_REFRESH expanders, SMP_MAX_CALLS_PER_REFRESH PHY
+        calls and SMP_MAX_COMMANDS_PER_REFRESH SSH commands, the probe
+        included; each expander is read in chunks of SMP_PHYS_PER_COMMAND PHYs,
+        one command each. Later planning rounds of the same refresh see its
+        reads and add nothing; the probe's output alone does not count, since
+        the full reads follow it in that refresh.
         """
         keys = {smp_output_key(item.command) for item in command_results} - {None}
         probe_key = smp_output_key(build_phy_error_log_command(targets[0], [0]))
@@ -4850,13 +4858,14 @@ class InventoryService:
         }
         planned = dict(getattr(self, "_smp_counter_planned", None) or {})
         budget = SMP_MAX_CALLS_PER_REFRESH - sum(smp_output_calls(key) for key in keys)
+        command_budget = SMP_MAX_COMMANDS_PER_REFRESH - len(keys)
         commands: list[str] = []
-        for target in select_counter_reads(targets, last_read, now, budget):
+        for target in select_counter_reads(targets, last_read, now, budget, command_budget):
             expander = (target.unit, target.expander_sas_address)
-            command = build_phy_error_log_command(target)
             last_read[expander] = now
-            planned[smp_output_key(command)] = expander
-            commands.append(command)
+            for command in build_phy_error_log_commands(target):
+                planned[smp_output_key(command)] = expander
+                commands.append(command)
         self._smp_counter_last_read = last_read
         self._smp_counter_planned = planned
         return commands

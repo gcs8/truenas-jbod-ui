@@ -5843,13 +5843,14 @@ class CoreExpanderCounterRateLimitTests(unittest.TestCase):
             for refresh in range(8):
                 commands, _results = self.refresh(service, base)
                 self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH, refresh)
-                self.assertLessEqual(
-                    len([command for command in commands if len(self.phys_in(command)) > 1]),
-                    counters.SMP_MAX_TARGETS_PER_REFRESH,
-                )
-                for command in commands:
-                    if len(self.phys_in(command)) > 1:
-                        reads.setdefault(canonicalize_ssh_command(command).split(":")[1], []).append(refresh)
+                # Full reads come in chunks of several PHYs; count expanders, not chunks.
+                read_now = {
+                    canonicalize_ssh_command(command).split(":")[1]
+                    for command in commands if len(self.phys_in(command)) > 1
+                }
+                self.assertLessEqual(len(read_now), counters.SMP_MAX_TARGETS_PER_REFRESH)
+                for address in read_now:
+                    reads.setdefault(address, []).append(refresh)
                 now[0] += 1
             # Inside the interval each expander is read in full exactly once,
             # in turn, and then forced refreshes start no read at all.
@@ -5862,7 +5863,7 @@ class CoreExpanderCounterRateLimitTests(unittest.TestCase):
             now[0] = 1000.0 + counters.SMP_COUNTER_READ_INTERVAL_SECONDS
             commands, _results = self.refresh(service, base)
             self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH)
-            self.assertEqual(sorted(canonicalize_ssh_command(command).split(":")[1] for command in commands), first)
+            self.assertEqual(sorted({canonicalize_ssh_command(command).split(":")[1] for command in commands}), first)
 
     def test_a_forced_refresh_after_a_refusal_makes_exactly_one_probe_call(self):
         import app.services.core_expander_counters as counters
@@ -5948,3 +5949,170 @@ class CoreExpanderCounterRateLimitTests(unittest.TestCase):
         # Commands keep discovery order; the least recently read are chosen.
         self.assertEqual(rounds[1], [*addresses[:7], addresses[8]])
         self.assertEqual(rounds[2], addresses[:8], "the expander skipped last time is read next")
+
+
+def _wide_expander_outputs(num_phys: int = 10) -> dict:
+    """Expander A with ``num_phys`` PHY rows, routed through pass10."""
+    expander_lines = [
+        "Num Phys SAS Address      DevHandle Parent EncHandle SAS Level",
+        f"{num_phys:<8} {SMP_EXPANDER_A} 0009      0001   0002      1",
+        "  0 1 000a 12.0 1.5 12.0 End Device",
+        *[f"  {phy}       1.5 12.0 No Device" for phy in range(1, num_phys)],
+    ]
+    return {
+        "mprutil -u 0 show expanders": "\n".join(expander_lines),
+        # Header and the target 10 row of SMP_DEVICES: one end device on PHY 0.
+        "mprutil -u 0 show devices": "\n".join(
+            line for line in SMP_DEVICES.splitlines() if line.startswith(("B____T", "00   10 "))
+        ),
+        "camcontrol devlist -v": SMP_DEVLIST,
+    }
+
+
+class CoreExpanderCounterChunkTests(unittest.TestCase):
+    """Codex P2 on #1088: one expander's PHY reads must fit the SSH command deadline.
+
+    Each expander is read in fixed-size chunks, one SSH command per chunk, so
+    a chunk that runs past the SSH command timeout loses only its own PHYs.
+    """
+
+    snapshot = CoreExpanderCounterTests.snapshot
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    fabric = CoreExpanderCounterRateLimitTests.fabric
+    base_results = staticmethod(CoreExpanderCounterRateLimitTests.base_results)
+    phys_in = staticmethod(CoreExpanderCounterRateLimitTests.phys_in)
+    calls = CoreExpanderCounterRateLimitTests.calls
+    READ_AT = CoreExpanderCounterRateLimitTests.READ_AT
+
+    def refresh(self, service, base, slow_phy=None, offset=0):
+        """One collection; the chunk holding ``slow_phy`` runs past the SSH timeout."""
+        results = list(base)
+        commands: list[str] = []
+        for _round in range(10):
+            planned = [command for command in service._core_expander_counter_probe_commands(list(results))
+                       if command not in commands]
+            if not planned:
+                break
+            commands.extend(planned)
+            for command in planned:
+                phys = self.phys_in(command)
+                if slow_phy in phys:
+                    # What SSHProbe returns when the command deadline expires.
+                    results.append(SSHCommandResult(command=command, ok=False, stderr="Command timed out"))
+                    continue
+                unit, address, device, _span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
+                per_phy = {phy: _smp_frame(phy, (offset + phy + 1, 0, 0, 0)) for phy in phys}
+                results.append(SSHCommandResult(
+                    command=command, ok=True, stdout=_smp_output(int(unit), address, device, per_phy),
+                ))
+        else:
+            self.fail("the planner never settled")
+        service._record_smp_counter_reads(results)
+        return commands, results
+
+    def phy_rows(self, service, results):
+        outputs = {item.command: item.stdout for item in results if item.ok}
+        node = self.expander(
+            self.fabric(outputs, "granted", reads=service.expander_counter_reads()), SMP_EXPANDER_A,
+        )
+        return node, {int(row["phy"]): row for row in node.raw["phys"]}
+
+    def test_chunks_fit_the_ssh_command_deadline(self):
+        import app.services.core_expander_counters as counters
+        from app.config import SSHConfig
+
+        per_call = counters.SMP_CALL_TIMEOUT_SECONDS + counters.SMP_CALL_KILL_AFTER_SECONDS
+        # Worst case of one chunk, every call killed: clearly under the default deadline.
+        self.assertLessEqual(counters.SMP_PHYS_PER_COMMAND * per_call + 3, SSHConfig().timeout_seconds)
+        target = counters.SmpTarget(0, SMP_EXPANDER_A, "pass10", 10)
+        commands = counters.build_phy_error_log_commands(target)
+        self.assertEqual([self.phys_in(command) for command in commands], [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]])
+        self.assertEqual(
+            [canonicalize_ssh_command(command) for command in commands],
+            [f"smp phy error log 0:{SMP_EXPANDER_A}:pass10:{span}" for span in ("00-03", "04-07", "08-09")],
+        )
+        self.assertEqual(sum(counters.smp_output_calls(canonicalize_ssh_command(c)) for c in commands), 10)
+        wide = counters.SmpTarget(0, SMP_EXPANDER_A, "pass10", 255)
+        self.assertEqual(len(counters.build_phy_error_log_commands(wide)), 64)
+        # The hang stop still works inside a chunk: one silent call ends that chunk.
+        self.assertIn("then echo @no-response; break; fi", commands[0])
+
+    def test_a_slow_chunk_loses_only_its_own_phys(self):
+        base = self.base_results(_wide_expander_outputs(10))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_wall_clock = lambda: self.READ_AT
+            commands, results = self.refresh(service, base, slow_phy=5)
+            self.assertEqual(len(commands), 3, "one SSH command per chunk")
+            self.assertEqual(self.calls(commands), 10, "calls, not chunks, count against the ceiling")
+            node, phys = self.phy_rows(service, results)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "available")
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (6, 4))
+        for phy in (0, 1, 2, 3, 8, 9):
+            with self.subTest(phy=phy):
+                self.assertEqual(phys[phy]["counter_state"], "measured")
+                self.assertEqual(phys[phy]["invalid_dword_count"], phy + 1)
+        for phy in (4, 5, 6, 7):
+            with self.subTest(phy=phy):
+                self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+                self.assertIsNone(phys[phy]["invalid_dword_count"])
+        self.assertEqual(counters["read_at"], "2026-11-07T12:00:00Z")
+
+    def test_a_reread_replaces_kept_chunks_and_never_mixes_in_an_older_failed_chunk(self):
+        from app.services.core_expander_counters import SMP_COUNTER_READ_INTERVAL_SECONDS
+
+        base = self.base_results(_wide_expander_outputs(10))
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_clock = lambda: now[0]
+            self.refresh(service, base)
+            # Inside the interval nothing is read; the kept chunks are shown.
+            commands, results = self.refresh(service, base, offset=100)
+            self.assertEqual(commands, [])
+            _node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(10)], list(range(1, 11)))
+            # The next read's last chunk runs past the deadline: its PHYs are
+            # unknown, not the older reading, and the other chunks are new.
+            now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
+            commands, results = self.refresh(service, base, slow_phy=9, offset=100)
+            self.assertEqual(len(commands), 3)
+            node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(8)], list(range(101, 109)))
+            for phy in (8, 9):
+                self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+            self.assertEqual(node.raw["phy_error_counters"]["measured_phys"], 8)
+            # A read whose every chunk failed keeps the previous reading.
+            now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
+            results = list(base)
+            commands = service._core_expander_counter_probe_commands(list(results))
+            self.assertEqual(len(commands), 3)
+            results.extend(SSHCommandResult(command=command, ok=False, stderr="Command timed out") for command in commands)
+            service._record_smp_counter_reads(results)
+            _node, phys = self.phy_rows(service, results)
+            self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(8)], list(range(101, 109)))
+
+    def test_ssh_round_trips_per_refresh_stay_bounded(self):
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(9, num_phys=255)
+        targets = counters.discover_smp_targets(outputs)
+        base = self.base_results(outputs)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            commands, _results = self.refresh(service, base)
+        self.assertLessEqual(self.calls(commands), counters.SMP_MAX_CALLS_PER_REFRESH)
+        self.assertLessEqual(len(commands), counters.SMP_MAX_COMMANDS_PER_REFRESH)
+        self.assertEqual(len(commands), 1 + 2 * 64, "the probe, then two 255-PHY expanders in 4-PHY chunks")
+        # The command bound holds on its own, whatever the call budget allows.
+        chosen = counters.select_counter_reads(targets, {}, 0.0, counters.SMP_MAX_CALLS_PER_REFRESH, command_budget=64)
+        self.assertEqual(len(chosen), 1)
+        self.assertLessEqual(
+            1 + counters.SMP_MAX_TARGETS_PER_REFRESH
+            + (counters.SMP_MAX_CALLS_PER_REFRESH - 1) // counters.SMP_PHYS_PER_COMMAND,
+            counters.SMP_MAX_COMMANDS_PER_REFRESH,
+        )

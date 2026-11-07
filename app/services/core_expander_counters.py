@@ -56,8 +56,9 @@ SMP_PHY_ERROR_LOG_SUDO_GRANT = (
 SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX = "smp phy error log "
 SMP_PHY_ERROR_LOG_MARKER = "tnj-smp-phy-error-log"
 # Per call and per refresh bounds. One call that gives no answer at all stops
-# that expander's batch, so a hung expander costs about one timeout. timeout(1)
-# sends SIGTERM (sudo relays it to camcontrol), then SIGKILL after the grace.
+# that chunk (SMP_PHYS_PER_COMMAND PHYs), so a hung expander costs about one
+# timeout per chunk. timeout(1) sends SIGTERM (sudo relays it to camcontrol),
+# then SIGKILL after the grace.
 SMP_CALL_TIMEOUT_SECONDS = 2
 SMP_CALL_KILL_AFTER_SECONDS = 1
 # Route discovery is complete; these budgets only limit what one refresh
@@ -67,6 +68,19 @@ SMP_MAX_TARGETS_PER_REFRESH = 8
 # one-PHY permission probe plus every full read. One full read of the largest
 # expander (255 PHYs) always fits alongside the probe.
 SMP_MAX_CALLS_PER_REFRESH = 512
+# One SSH command reads at most this many PHYs of one expander. The SSH
+# command timeout (SSHConfig.timeout_seconds, 15 s by default) covers a whole
+# command, so a chunk must fit inside it: 4 x (2 s + 1 s kill grace) = 12 s
+# when every call is killed. A chunk that still runs past the deadline loses
+# only its own PHYs (#1088 review). Calls, not chunks, count against
+# SMP_MAX_CALLS_PER_REFRESH.
+SMP_PHYS_PER_COMMAND = 4
+# Hard ceiling on counter SSH commands (round trips) in one refresh: the
+# probe, plus at most one partial chunk per expander on top of the calls
+# divided into full chunks. select_counter_reads() enforces it too.
+SMP_MAX_COMMANDS_PER_REFRESH = (
+    1 + SMP_MAX_TARGETS_PER_REFRESH + (SMP_MAX_CALLS_PER_REFRESH - 1) // SMP_PHYS_PER_COMMAND
+)
 # One expander's counters are read in full at most once per this interval,
 # whatever asked for the refresh (the Refresh button and ?force=true too).
 # They are cumulative error counts, so a reading minutes old is current
@@ -344,14 +358,16 @@ def select_counter_reads(
     last_read: Mapping[tuple[int, str], float],
     now: float,
     call_budget: int,
+    command_budget: int = SMP_MAX_COMMANDS_PER_REFRESH,
 ) -> list[SmpTarget]:
     """The expanders one refresh reads in full.
 
     An expander read less than SMP_COUNTER_READ_INTERVAL_SECONDS ago (by the
     monotonic times in ``last_read``) is not due, whatever asked for the
     refresh. Due expanders go least recently read first (never read first,
-    then discovery order), up to SMP_MAX_TARGETS_PER_REFRESH expanders and
-    ``call_budget`` PHY calls, so every expander gets its turn. The result
+    then discovery order), up to SMP_MAX_TARGETS_PER_REFRESH expanders,
+    ``call_budget`` PHY calls and ``command_budget`` SSH commands (chunks of
+    SMP_PHYS_PER_COMMAND PHYs), so every expander gets its turn. The result
     keeps discovery order.
     """
     order = {target.identity: index for index, target in enumerate(targets)}
@@ -365,14 +381,17 @@ def select_counter_reads(
     ))
     chosen: list[SmpTarget] = []
     calls = 0
+    commands = 0
     for target in due:
         cost = min(target.num_phys, 255)
+        chunks = -(-cost // SMP_PHYS_PER_COMMAND)
         if len(chosen) >= SMP_MAX_TARGETS_PER_REFRESH:
             break
-        if calls + cost > call_budget:
+        if calls + cost > call_budget or commands + chunks > command_budget:
             continue
         chosen.append(target)
         calls += cost
+        commands += chunks
     return sorted(chosen, key=lambda target: order[target.identity])
 
 
@@ -391,7 +410,8 @@ def build_phy_error_log_command(target: SmpTarget, phys: Sequence[int] | None = 
     timeout(1) with a SIGKILL fallback (``-k``; FreeBSD 10.3+ and GNU). Both
     output streams are hex-dumped so the raw frame survives text transport
     and sudo's or camcontrol's message stays with its PHY. A call that prints
-    nothing (timed out) ends the batch for this expander.
+    nothing (timed out) ends this command; full reads are split into chunks
+    by build_phy_error_log_commands().
     """
     device = _pass_device(target.device)
     if not _SAS_ADDRESS.fullmatch(target.expander_sas_address) or type(target.unit) is not int or target.unit < 0:
@@ -415,6 +435,20 @@ def build_phy_error_log_command(target: SmpTarget, phys: Sequence[int] | None = 
         "if [ -z \"$o\" ]; then echo @no-response; break; fi; "
         "printf '%s\\n' \"$o\"; done; echo @end"
     )
+
+
+def build_phy_error_log_commands(target: SmpTarget) -> list[str]:
+    """A full read of ``target``: one command per SMP_PHYS_PER_COMMAND PHYs.
+
+    Each chunk has its own PHY range in its output key, so a chunk that the
+    SSH command deadline cuts off loses only its own PHYs. A call with no
+    answer still ends its chunk; the next chunk starts afresh.
+    """
+    phys = list(range(min(target.num_phys, 255)))
+    return [
+        build_phy_error_log_command(target, phys[start:start + SMP_PHYS_PER_COMMAND])
+        for start in range(0, len(phys), SMP_PHYS_PER_COMMAND)
+    ]
 
 
 def smp_output_key(command_or_identity: str) -> str | None:

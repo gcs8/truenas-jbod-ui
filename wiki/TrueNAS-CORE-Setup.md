@@ -220,7 +220,9 @@ Each expander's counters are read at most once every 15 minutes, whether or
 not you press Refresh. They are cumulative error counts, so in between Storage
 Fabric shows the last reading with its time ("read at ..." in UTC); pressing
 Refresh again does not start a new read. One refresh reads at most eight
-expanders and 512 PHYs, the permission check included. A larger fabric is
+expanders and 512 PHYs, the permission check included. Each SSH command reads
+at most four PHYs, so an expander that answers slowly loses only the PHYs of a
+command that runs past the SSH timeout; those show as unknown. A larger fabric is
 read in turn, least recently read first, and an expander waiting for its turn
 shows "not read this refresh (read budget...)" rather than a missing route. A disk whose `mprutil` parent and
 expander PHY tables disagree is never used as a route, so counters are not
