@@ -2211,20 +2211,28 @@ class HistoryStore:
                 sizes.append(f"coalesce(length(CAST({expression} AS BLOB)), 0) + 1")
         # Retained rows, not max(rowid): AUTOINCREMENT ids count lifetime
         # inserts, and retention deletes old rows without renumbering. The
-        # trigger-maintained counter is exact and O(1), but it is stored data
-        # (#1093): it is clamped to the rowid span, a counter above that span
-        # is recounted, and the result is capped by the file size below.
-        span = HistoryStore._rowid_span(connection, table)
-        row = None
+        # trigger-maintained counter is stored data a restored file can set
+        # too high or too low (#1093), so the build counts the rows itself:
+        # one bounded-memory pass, cheaper than the sort that reads every row
+        # next. A counter that disagrees is corrected and logged.
+        if HistoryStore._rowid_span(connection, table) <= 0:
+            return 0
+        rows = int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         if table in HISTORY_COUNTED_TABLES and HistoryStore._has_table(connection, "history_table_counts"):
-            if HistoryStore._recount_implausible_table_counts(connection, (table,)):
-                connection.commit()
             row = connection.execute(
                 "SELECT row_count FROM history_table_counts WHERE table_name = ?",
                 (table,),
             ).fetchone()
-        tracked = int(row[0]) if row is not None and row[0] is not None else span
-        rows = min(tracked, span)
+            if row is not None and row[0] is not None and int(row[0]) != rows:
+                logger.warning(
+                    "The stored row count for history table %s (%d) does not match its %d rows; "
+                    "recounting it.",
+                    table,
+                    int(row[0]),
+                    rows,
+                )
+                HistoryStore._recount_table(connection, table)
+                connection.commit()
         if rows <= 0:
             return 0
         sampled = connection.execute(

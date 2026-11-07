@@ -1018,6 +1018,20 @@ class SegmentedCountsDuringIndexBuildTests(unittest.TestCase):
             self.assertEqual(estimated["metric_sample_count"], 41)
             self.assertEqual(estimated["event_count"], 0)
 
+    def test_scan_free_counts_still_authenticate_each_segment(self) -> None:
+        # Recorded segment counts are reused only after the guarded connection
+        # re-checks the file, as list_history_system_summaries does.
+        from history_service.segment_reader import HistoryStorageUnavailableError
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._segmented_store(directory)
+            self.assertEqual(store.estimated_counts()["metric_sample_count"], 41)
+            with closing(sqlite3.connect(Path(directory) / "segment.sqlite3")) as connection, connection:
+                connection.execute("DELETE FROM metric_samples")
+
+            with self.assertRaises(HistoryStorageUnavailableError):
+                store.estimated_counts()
+
     def test_admitted_exact_counts_still_scan_every_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = self._segmented_store(directory)
@@ -1097,9 +1111,39 @@ class UntrustedTableCounterTests(unittest.TestCase):
             self.assertLess(estimate, 40 * 200)
             self.assertEqual(_table_counter(path, "metric_samples"), 40)
 
+    def test_index_size_estimate_counts_rows_behind_an_undersized_counter(self) -> None:
+        # A too-low counter fits under every upper bound; sizing from it would
+        # skip the space check entirely, so the build counts the rows it reads.
+        import shutil
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=4_000)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            _set_table_counter(path, "metric_samples", 0)
+            statement = dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
+
+            with (
+                closing(sqlite3.connect(path)) as connection,
+                self.assertLogs("history_service.store", "WARNING"),
+            ):
+                estimate = HistoryStore._estimate_index_bytes(connection, statement)
+            self.assertGreater(estimate, 4_000 * 20)
+            self.assertEqual(_table_counter(path, "metric_samples"), 4_000)
+
+            _set_table_counter(path, "metric_samples", 0)
+            full = shutil._ntuple_diskusage(total=1 << 30, used=1 << 30, free=0)
+            with (
+                patch.object(store_module.shutil, "disk_usage", return_value=full),
+                self.assertLogs("history_service.store", "WARNING"),
+                self.assertRaises(store_module.HistoryIndexBuildSpaceError),
+            ):
+                store.build_chronological_index("idx_metric_samples_scope_chronological")
+
     def test_index_size_estimate_never_exceeds_the_database_file(self) -> None:
-        # Two rows can stretch the rowid span, and a counter that fits under it
-        # is not recounted; the file's own pages still bound the index.
+        # Two rows can stretch the rowid span and the counter; the estimate
+        # stays bounded by the rows counted and by the file's own pages.
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.sqlite3"
             _legacy_database(path, samples=2)

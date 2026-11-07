@@ -719,9 +719,13 @@ class SegmentedHistoryReader:
                         connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                     )
         for path in self._selected_segment_paths(since=None):
-            recorded = self._segment_row_counts.get(path)
-            if recorded is None:
-                with self._query_connection(path) as connection:
+            # Always enter the guarded connection: recorded counts do not
+            # authenticate a segment, so the identity, digest and sidecar
+            # checks still run before they are reused, as in
+            # list_history_system_summaries().
+            with self._query_connection(path) as connection:
+                recorded = self._segment_row_counts.get(path)
+                if recorded is None:
                     recorded = {
                         table_name: int(
                             connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]

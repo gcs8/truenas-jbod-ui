@@ -156,11 +156,11 @@ the shipped Compose file sets to the history volume. Before each deferred build
 the service checks for free space for about one index's keys there and about
 two on the database filesystem; if it is short, it logs the space it needs,
 reports degraded, keeps collecting, and retries the build every five minutes.
-The check is an estimate, not a reservation. It sizes the index from the
-tracked row counts, never more than a table's id range or twice the database
-file, and a counter above its table's id range is recounted. A restore
-recounts the backup's row counters, so an imported file cannot inflate them
-(#1093). While an index builds, `/api/history/overview?exact_counts=true`
+The check is an estimate, not a reservation. It counts the table's rows
+itself, since the build reads them all anyway, caps the estimate at twice the
+database file, and corrects a stored row counter that disagrees. Startup
+recounts a counter above its table's id range, and a restore recounts the
+backup's row counters (#1093). While an index builds, `/api/history/overview?exact_counts=true`
 answers with the tracked totals, no per-scope activity counts, and
 `counts_deferred_reason` set. With segmented history, the default overview and
 the deferred totals read the hot database's tracked counts and the segment row
