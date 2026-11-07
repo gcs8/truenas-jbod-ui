@@ -1542,6 +1542,8 @@ class CoreExpanderCounterGrantTests(unittest.TestCase):
 
     def test_rule_survives_the_core_middleware_unchanged(self):
         self.assertEqual(middleware_stored_grant(self.grant()), self.grant())
+        # The generated wiki policy block embeds it; `](` would read as a link.
+        self.assertNotIn("](", self.grant())
         self.assertTrue(self.grant().startswith("/sbin/camcontrol ^smpcmd "))
         self.assertTrue(self.grant().endswith(" -R 28 -$"))
 

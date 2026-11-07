@@ -43,10 +43,12 @@ CAMCONTROL = "/sbin/camcontrol"
 # same request or leaves camcontrol without its -R option, which it refuses
 # before sending anything (smpcmd() checks both -r and -R first).
 # Things that must move together: CONTRIBUTING.md.
+# The PHY group starts after a digit, not after `]`, so the rule never contains
+# `](`, which Markdown link checks read as a link in the generated docs.
 SMP_PHY_ERROR_LOG_SUDO_GRANT = (
     f"{CAMCONTROL} ^smpcmd pass[0-9]+ -r 12 "
-    "40[{][}]11[{][}]06[{][}]02[{][}]00[{][}]00[{][}]00[{][}]00[{][}]00[{][}]"
-    "([0-9a-e][0-9a-f]|f[0-9a-e])"
+    "40[{][}]11[{][}]06[{][}]02[{][}]00[{][}]00[{][}]00[{][}]00[{][}]00"
+    "([{][}][0-9a-e][0-9a-f]|[{][}]f[0-9a-e])"
     "[{][}]00[{][}]00 -R 28 -$"
 )
 
