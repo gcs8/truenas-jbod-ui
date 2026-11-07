@@ -34,6 +34,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   bezel, such as a 24-bay 2.5" front at 1600 px. They were clipped past the
   start edge, where horizontal scrolling could not reach them or a click select
   them; the overflow now scrolls from the first bay (#1081).
+- Fixed the admin page showing 0 saved history rows for every system on a
+  segmented history deployment. Segmented system summaries now include
+  `total_rows` like unsegmented ones, so the removed-system history lists and
+  the delete-history row count show real counts (#1083).
 
 ## v0.24.0-beta.5 - 2026-11-02
 
