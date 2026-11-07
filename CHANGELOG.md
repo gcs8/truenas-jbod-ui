@@ -54,6 +54,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   per-phy counter delta helper with strict frame validation, reset and
   saturation handling; no grant, collector or UI changed (#1084).
 
+### Docs
+
+- Added an upgrade qualification for the admin service: a v0.22.2 install
+  that started it with the documented admin profile command is updated by
+  image pin with the same profiles, and the admin service comes back healthy
+  on the new image with the same config, mappings and history; a deployment
+  that never started it still has no admin container after the update. Basic
+  authentication, the hardened overlay, auto-stop, admin write actions and
+  rollback with admin running stay listed as untested (#1085).
+
 ## v0.24.0-beta.5 - 2026-11-02
 
 This prerelease adds the changes merged after `v0.24.0-beta.4`. GHCR gets the

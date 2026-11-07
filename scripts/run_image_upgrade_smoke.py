@@ -54,6 +54,18 @@ commands.
   seconds. Explicitly restore the target root and prove the next backup ships
   byte-identically by readback. This is not a supported-storage or
   release-promotion decision.
+* ``admin-during-upgrade``: first, a seeded v0.22.2 deployment that never
+  started the admin service takes the literal image-only update, and no admin
+  container may exist before or after it. Then a fresh seeded v0.22.2
+  deployment starts the admin service with the documented
+  ``docker compose --profile admin up -d enclosure-admin`` and updates with
+  the profiles it uses (``--profile history --profile admin``, ``pull`` then
+  ``up -d``). The admin container must be recreated on the candidate image,
+  healthy with no restarts, its API must report the same systems and
+  config/mapping/history paths, its history view the seeded rows, and
+  ``config.yaml`` and the mapping file must keep their exact bytes and history
+  its rows. Not Basic authentication, the hardened overlay, auto-stop,
+  admin write actions or rollback.
 
 Synthetic data only; it needs a disposable Linux Docker host with ``sudo`` (the
 bind mounts are root-owned on purpose). Every image it pulls is public. CI
@@ -89,7 +101,7 @@ SERVICES = ("enclosure-ui", "enclosure-history")
 SMOKE_SYSTEM = "upgrade-smoke"
 SUCCESS_PREFIX = "image_upgrade_smoke=ok"
 SCENARIOS = ("base", "hardened", "interrupted-migration", "segmented-catalog", "readonly-state", "enospc-state",
-             "clean-host-restore", "unavailable-backup-storage")
+             "clean-host-restore", "unavailable-backup-storage", "admin-during-upgrade")
 # The released config/full artifact name shape (scheduled_backup.py _ARCHIVE_NAME).
 ARCHIVE_ARTIFACT_NAME = re.compile(
     r"jbod-scheduled-backup-(?P<stamp>[0-9]{8}T[0-9]{6}Z)-[0-9a-f]{8}(?:\.7z|\.tar\.zst\.enc)$"
@@ -1771,6 +1783,200 @@ def unavailable_backup_storage(args: argparse.Namespace) -> str:
             "backup_local_kept=ok target_readback=ok history_bytes=unchanged config_bytes=unchanged")
 
 
+ADMIN_SERVICE = "enclosure-admin"
+# container_name of the admin service in every published Compose file.
+ADMIN_CONTAINER_NAME = "truenas-jbod-admin"
+ADMIN_SMOKE_PORT = 18182
+# Loopback only; the published default auth mode (network) is unchanged.
+ADMIN_ENVIRONMENT = {"ADMIN_PORT": str(ADMIN_SMOKE_PORT), "ADMIN_BIND_ADDRESS": "127.0.0.1"}
+# wiki/Upgrading.md "Admin UI" and wiki/Docker-and-GHCR-Deployment.md "Optional
+# Admin service": the documented start, plus the --wait pull_and_up also adds.
+ADMIN_START_PULL = ("--profile", "admin", "pull")
+ADMIN_START_UP = ("--profile", "admin", "up", "-d", "--wait", "--wait-timeout", "300", ADMIN_SERVICE)
+# wiki/Upgrading.md "Move to a new release" with the profiles this install
+# uses, spelled as wiki/Docker-and-GHCR-Deployment.md "Start everything" does.
+ADMIN_PROFILES = ("--profile", "history", "--profile", "admin")
+ADMIN_EXPECTED_PATHS = {
+    "config_file": "/app/config/config.yaml",
+    "mapping_file": "/app/data/slot_mappings.json",
+    "history_db": HISTORY_DB,
+}
+# tests/fixtures/ci-smoke-config.yaml's one synthetic, unreachable system.
+ADMIN_EXPECTED_HOST = "http://127.0.0.1:9"
+
+
+def check_admin_dormant(deployment: Deployment) -> None:
+    """No admin container exists, running or stopped, in this project or by name."""
+    ui = deployment.compose("ps", "-q", "enclosure-ui").strip()
+    expect(bool(ui) and "\n" not in ui, "enclosure-ui must resolve to exactly one container")
+    project = run(["docker", "inspect", "--format", '{{index .Config.Labels "com.docker.compose.project"}}', ui],
+                  env=deployment.environment).strip()
+    expect(bool(project), "enclosure-ui carries no Compose project label")
+    services = set(run(["docker", "container", "ls", "--all", "--filter", f"label=com.docker.compose.project={project}",
+                        "--format", '{{.Label "com.docker.compose.service"}}'], env=deployment.environment).split())
+    expect(services == set(SERVICES),
+           f"a deployment that never enabled admin must run only {sorted(SERVICES)}, found {sorted(services)}")
+    names = set(run(["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+                    env=deployment.environment).split())
+    expect(ADMIN_CONTAINER_NAME not in names, "an admin container exists on a deployment that never enabled it")
+
+
+def check_admin_runtime(deployment: Deployment, image: str, version: str) -> dict:
+    """The admin container runs this image, healthy, never restarted, and reports this version."""
+    image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], env=deployment.environment).strip()
+    container = deployment.compose(*ADMIN_PROFILES, "ps", "-q", ADMIN_SERVICE).strip()
+    expect(bool(container) and "\n" not in container, "enclosure-admin must resolve to exactly one container")
+    state = json.loads(run(["docker", "inspect", "--format", "{{json .}}", container], env=deployment.environment))
+    health = (state["State"].get("Health") or {}).get("Status", "")
+    expect(state["State"]["Status"] == "running" and health == "healthy",
+           f"enclosure-admin is {state['State']['Status']}/{health or 'no health'}")
+    expect(state.get("Name") == f"/{ADMIN_CONTAINER_NAME}", f"enclosure-admin is named {state.get('Name')!r}")
+    expect(state["Image"] == image_id, f"enclosure-admin runs {state['Image']}, expected {image_id}")
+    expect(state["RestartCount"] == 0, f"enclosure-admin restarted {state['RestartCount']} times")
+    status, live = get_json(f"http://127.0.0.1:{ADMIN_SMOKE_PORT}/livez")
+    expect(status == 200 and live.get("version") == version,
+           f"admin /livez reported {status} {live.get('version')!r}, expected {version}")
+    status, payload = get_json(f"http://127.0.0.1:{ADMIN_SMOKE_PORT}/healthz")
+    expect(status == 200 and payload.get("status") == "ok", f"admin /healthz returned {status}")
+    return {"container": state["Id"], "image": image_id}
+
+
+def read_admin_state() -> dict:
+    """The admin API's view of saved config: systems, default system and state paths."""
+    status, payload = get_json(f"http://127.0.0.1:{ADMIN_SMOKE_PORT}/api/admin/state")
+    expect(status == 200 and payload.get("ok") is True, f"admin state API returned {status}")
+    paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+    return {
+        "systems": sorted([system.get("id"), system.get("label"), system.get("platform"), system.get("truenas_host")]
+                          for system in payload.get("systems") or [] if isinstance(system, dict)),
+        "default_system_id": payload.get("default_system_id"),
+        "paths": {name: paths.get(name) for name in ADMIN_EXPECTED_PATHS},
+    }
+
+
+def check_admin_state(view: dict) -> None:
+    expect(view["paths"] == ADMIN_EXPECTED_PATHS, f"admin state reports unexpected state paths: {view['paths']}")
+    expect(bool(view["systems"]), "admin state reports no saved systems")
+    expect(all(system[3] == ADMIN_EXPECTED_HOST for system in view["systems"]),
+           f"admin state does not report the fixture's system: {view['systems']}")
+    expect(view["default_system_id"] in {system[0] for system in view["systems"]},
+           f"admin default system {view['default_system_id']!r} is not a saved system")
+
+
+def read_admin_history() -> list:
+    """The candidate admin API's saved-history summary (v0.22.2 has no such route)."""
+    status, payload = get_json(f"http://127.0.0.1:{ADMIN_SMOKE_PORT}/api/admin/history/systems")
+    expect(status == 200 and payload.get("ok") is True, f"admin history systems API returned {status}")
+    return list(payload.get("systems") or [])
+
+
+def check_admin_history(systems: list) -> None:
+    rows = [row for row in systems if isinstance(row, dict) and row.get("system_id") == SMOKE_SYSTEM]
+    expect(len(rows) == 1, f"admin history view must list {SMOKE_SYSTEM!r} once: {systems}")
+    seeded = {name: rows[0].get(name) for name in ("tracked_slots", "event_count", "metric_sample_count")}
+    expect(seeded == {"tracked_slots": 3, "event_count": 3, "metric_sample_count": 12},
+           f"admin history view does not report the seeded rows: {rows[0]}")
+
+
+def admin_exec_python(container: str, script: str) -> dict:
+    """Run a probe inside the admin container itself, with its own mounts and image."""
+    output = run(["docker", "exec", "-i", container, "python", "-"], input_text=textwrap.dedent(script), timeout=180)
+    return json.loads(output.strip().splitlines()[-1])
+
+
+def state_identity(deployment: Deployment, root: Path) -> dict:
+    """Exact config and mapping bytes plus the seeded history rows' logical identity.
+
+    The history file's bytes are not compared: the candidate's startup adds its
+    chronological indexes, so the rows are the preserved identity.
+    """
+    return {"config_sha256": sha256(root / "config/config.yaml"),
+            "mapping_sha256": sha256(root / "data/slot_mappings.json"),
+            **deployment.exec_python("enclosure-history", READ_CLEAN_HISTORY)}
+
+
+def print_admin_logs(deployment: Deployment) -> None:
+    subprocess.run(["docker", "compose", *deployment.file_args(), "--profile", "admin", "logs", "--tail", "80",
+                    ADMIN_SERVICE], cwd=deployment.root, check=False)
+
+
+def remove_admin_service(deployment: Deployment) -> None:
+    """Remove only the admin container; the CLI cleanup takes the rest down after its diagnostics."""
+    try:
+        deployment.compose("--profile", "admin", "rm", "--stop", "--force", ADMIN_SERVICE)
+    except (SmokeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"admin container removal failed: {type(exc).__name__}", file=sys.stderr)
+
+
+def admin_during_upgrade(args: argparse.Namespace) -> str:
+    """The admin service across an image-only upgrade, and its dormancy where never enabled."""
+    root = args.root.resolve()
+
+    # 1. Never enabled: the literal update must not start the admin profile.
+    prepare_root(root, args.compose_fixture, args.config_fixture)
+    dormant = Deployment(root)
+    seed_previous_release(dormant, args)
+    check_admin_dormant(dormant)
+    dormant.set_image(args.candidate_image)
+    dormant.pull_and_up()
+    check_runtime(dormant, args.candidate_image, args.candidate_version, args.candidate_revision)
+    check_admin_dormant(dormant)
+    dormant.compose("down", "--volumes", "--remove-orphans")
+
+    # 2. A fresh released install whose operator starts the admin service.
+    prepare_root(root, args.compose_fixture, args.config_fixture)
+    deployment = Deployment(root)
+    deployment.runtime_environment.update(ADMIN_ENVIRONMENT)
+    before_ui, before_history, seeded = seed_previous_release(deployment, args)
+    before = state_identity(deployment, root)
+    try:
+        deployment.compose(*ADMIN_START_PULL)
+        deployment.compose(*ADMIN_START_UP, timeout=420)
+        previous_admin = check_admin_runtime(deployment, args.previous_image, args.previous_version)
+        previous_view = read_admin_state()
+        check_admin_state(previous_view)
+        previous_read = admin_exec_python(previous_admin["container"], READ_UI)
+        expect(previous_read["mappings"] == before_ui["mappings"],
+               f"the released admin service reads different mappings: {previous_read}")
+        expect(state_identity(deployment, root) == before,
+               "starting the admin service changed config, mapping or history state")
+
+        # Image-only update with the same profiles: change the pin, pull, up -d.
+        deployment.set_image(args.candidate_image)
+        deployment.compose(*ADMIN_PROFILES, "pull")
+        deployment.compose(*ADMIN_PROFILES, "up", "-d", "--wait", "--wait-timeout", "300", timeout=420)
+        upgraded = check_runtime(deployment, args.candidate_image, args.candidate_version, args.candidate_revision)
+        admin = check_admin_runtime(deployment, args.candidate_image, args.candidate_version)
+        expect(admin["container"] != previous_admin["container"],
+               "the update did not recreate the admin container on the candidate image")
+        view = read_admin_state()
+        check_admin_state(view)
+        expect(view == previous_view, f"admin state changed across the update: {previous_view} -> {view}")
+        check_admin_history(read_admin_history())
+        admin_read = admin_exec_python(admin["container"], READ_UI)
+        expect(admin_read["version"] == args.candidate_version and admin_read["mappings"] == before_ui["mappings"],
+               f"the upgraded admin service reads different mappings or code: {admin_read}")
+        after_history = deployment.exec_python("enclosure-history", READ_HISTORY)
+        expect(after_history["integrity"] == "ok" and after_history["counts"] == before_history["counts"],
+               f"history rows changed across the update: {after_history}")
+        expect(history_api_view((1, 2, 3)) == expected_history_view(seeded),
+               "the upgraded history API does not return the predecessor's records")
+        expect(state_identity(deployment, root) == before,
+               "config bytes, mapping bytes or history rows changed across the update")
+    except SmokeError:
+        print_admin_logs(deployment)
+        raise
+    finally:
+        remove_admin_service(deployment)
+
+    return (f"{SUCCESS_PREFIX} scenario=admin-during-upgrade previous={args.previous_version} "
+            f"candidate={args.candidate_version} revision={args.candidate_revision} "
+            f"services={','.join(sorted([*upgraded, ADMIN_SERVICE]))} restarts=0 "
+            "admin_health=ok admin_recreated=ok admin_state=unchanged admin_history=ok admin_mappings=unchanged "
+            "config_bytes=unchanged mapping_bytes=unchanged history_rows=unchanged "
+            "admin_dormant_without_profile=ok")
+
+
 def smoke(args: argparse.Namespace) -> str:
     if args.scenario == "enospc-state":
         return enospc_state(args)
@@ -1778,6 +1984,8 @@ def smoke(args: argparse.Namespace) -> str:
         return readonly_state(args)
     if args.scenario == "unavailable-backup-storage":
         return unavailable_backup_storage(args)
+    if args.scenario == "admin-during-upgrade":
+        return admin_during_upgrade(args)
     if args.scenario == "interrupted-migration":
         return interrupted_migration(args)
     if args.scenario == "segmented-catalog":
