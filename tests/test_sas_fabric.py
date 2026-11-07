@@ -69,6 +69,7 @@ from app.services.sas_fabric import (
     build_sas_fabric_snapshot,
     discover_mpr_units_from_adapter_summary,
     parse_dmidecode_slots,
+    parse_mpr_adapter_detail,
     parse_mpr_adapter_summary,
     parse_mpr_devices,
     parse_mpr_dmesg_events,
@@ -736,6 +737,285 @@ process.stdout.write(ui.renderTraceMode(data.fabric));
                     self.assertEqual({link_id: link.related_slots for link_id, link in links.items()}, expected_links)
                     self.assertTrue(all(not node.raw["selected_enclosure_candidate"] for node in nodes.values()))
                     self.assertTrue(all(node.raw["fabric_scope"] == "unscoped" for node in nodes.values()))
+
+
+class MprLinkReportedLaneTests(unittest.TestCase):
+    """Reported lanes on parent links come only from reciprocal PHY rows (#937)."""
+
+    # Invented addresses, built at runtime in the sanitized 5000c500... form.
+    ADDRESS_A = f"5000c500{0xa1:08x}"
+    ADDRESS_B = f"5000c500{0xb1:08x}"
+    ADDRESS_C = f"5000c500{0xc1:08x}"
+
+    # HBA phy -> expander A phy. Deliberately not an identity or monotonic map.
+    HBA_TO_A = {0: 11, 1: 10, 2: 9, 3: 8}
+    # Expander A phy -> expander B phy.
+    A_TO_B = {12: 4, 13: 5, 14: 6, 15: 7}
+
+    @staticmethod
+    def _hba_row(phy, device_handle="0009", controller_handle="0001", speed="12.0"):
+        return f"{phy} {controller_handle} {device_handle} N {speed} 3.0 12.0 SAS Initiator"
+
+    @staticmethod
+    def _expander_row(phy, remote, handle, device, speed="12.0"):
+        return f"  {phy} {remote} {handle} {speed} 1.5 12.0 {device}"
+
+    def _hba_rows(self):
+        rows = [self._hba_row(phy) for phy in sorted(self.HBA_TO_A)]
+        rows.extend(f"{phy} 0000 0000 N 0 3.0 12.0 No Device" for phy in range(4, 8))
+        return rows
+
+    def _a_rows(self):
+        rows = [self._expander_row(local, hba, "0001", "SAS Initiator") for hba, local in self.HBA_TO_A.items()]
+        rows.extend(self._expander_row(local, remote, "000a", "Edge Expander") for local, remote in self.A_TO_B.items())
+        return rows
+
+    def _b_rows(self):
+        return [self._expander_row(local, remote, "0009", "Edge Expander") for remote, local in self.A_TO_B.items()]
+
+    def _outputs(self, *, hba_rows=None, a_rows=None, b_rows=None, extra_expanders=()):
+        adapter = "\n".join(["mpr0 Adapter:", "  Board Name: Synthetic 9300-8e", *(self._hba_rows() if hba_rows is None else hba_rows)])
+        expanders = [
+            "Num Phys SAS Address      DevHandle Parent EncHandle SAS Level",
+            f"36 {self.ADDRESS_A} 0009 0001 0002 1",
+            *(self._a_rows() if a_rows is None else a_rows),
+            f"36 {self.ADDRESS_B} 000a 0009 0003 2",
+            *(self._b_rows() if b_rows is None else b_rows),
+        ]
+        for header, rows in extra_expanders:
+            expanders.extend([header, *rows])
+        return {
+            "sudo -n /usr/sbin/mprutil show adapters": "/dev/mpr0 SAS3008 Synthetic 16.00.12.00",
+            "sudo -n /usr/sbin/mprutil -u 0 show adapter": adapter,
+            "sudo -n /usr/sbin/mprutil -u 0 show expanders": "\n".join(expanders),
+        }
+
+    def _fabric(self, outputs=None):
+        slot = SlotView(slot=0, slot_label="00", row_index=0, column_index=0, present=False, state=SlotState.empty)
+        snapshot = InventorySnapshot(
+            slots=[slot], refresh_interval_seconds=30, selected_system_platform="core",
+            selected_enclosure_id=self.ADDRESS_B,
+        )
+        return build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core")),
+            snapshot=snapshot,
+            ssh_outputs=self._outputs() if outputs is None else outputs,
+        )
+
+    def _parent_links(self, fabric):
+        expander_a = f"expander:controller:mpr0:{self.ADDRESS_A}"
+        expander_b = f"expander:controller:mpr0:{self.ADDRESS_B}"
+        links = {(link.source, link.target, link.kind): link for link in fabric.links}
+        return (links[("controller:mpr0", expander_a, "controller-expander")],
+                links[(expander_a, expander_b, "expander-expander")])
+
+    def test_consistent_reciprocal_rows_populate_reported_lanes(self) -> None:
+        hba_link, cascade_link = self._parent_links(self._fabric())
+
+        hba = hba_link.reported_lanes
+        self.assertIsNotNone(hba)
+        self.assertEqual(hba.basis, "reciprocal_reported_phy_rows")
+        self.assertEqual(hba.lane_count, 4)
+        self.assertEqual(hba.source_phys, [0, 1, 2, 3])
+        self.assertEqual(hba.target_phys, [8, 9, 10, 11])
+        self.assertEqual(
+            [(lane.source_phy, lane.target_phy, lane.negotiated_rate_gbps) for lane in hba.lanes],
+            [(0, 11, 12.0), (1, 10, 12.0), (2, 9, 12.0), (3, 8, 12.0)],
+        )
+        self.assertEqual(hba.negotiated_rate_gbps, 12.0)
+        self.assertIsNone(hba.source_sas_address)
+        self.assertEqual(hba.attached_sas_address, self.ADDRESS_A)
+        self.assertEqual(hba.evidence, ["mprutil -u 0 show adapter", "mprutil -u 0 show expanders"])
+
+        cascade = cascade_link.reported_lanes
+        self.assertIsNotNone(cascade)
+        self.assertEqual(cascade.lane_count, 4)
+        self.assertEqual(cascade.source_phys, [12, 13, 14, 15])
+        self.assertEqual(cascade.target_phys, [4, 5, 6, 7])
+        self.assertEqual([(lane.source_phy, lane.target_phy) for lane in cascade.lanes], sorted(self.A_TO_B.items()))
+        self.assertEqual(cascade.negotiated_rate_gbps, 12.0)
+        self.assertEqual(cascade.source_sas_address, self.ADDRESS_A)
+        self.assertEqual(cascade.attached_sas_address, self.ADDRESS_B)
+        self.assertEqual(cascade.evidence, ["mprutil -u 0 show expanders"])
+        # Existing link fields keep their values.
+        self.assertEqual(hba_link.evidence, ["mprutil -u 0 show expanders"])
+        self.assertEqual(cascade_link.evidence, ["mprutil -u 0 show expanders"])
+
+    def test_reported_lanes_do_not_depend_on_row_order(self) -> None:
+        expected = [link.reported_lanes for link in self._parent_links(self._fabric())]
+        reordered = self._fabric(self._outputs(
+            hba_rows=self._hba_rows()[::-1], a_rows=self._a_rows()[::-1], b_rows=self._b_rows()[::-1],
+        ))
+        self.assertEqual([link.reported_lanes for link in self._parent_links(reordered)], expected)
+
+    def test_controller_preserves_parsed_hba_phy_rows(self) -> None:
+        fabric = self._fabric()
+        outputs = self._outputs()
+        parsed = parse_mpr_adapter_detail(outputs["sudo -n /usr/sbin/mprutil -u 0 show adapter"])["phy_rows"]
+        controller = next(node for node in fabric.nodes if node.id == "controller:mpr0")
+        self.assertEqual(len(parsed), 8)
+        self.assertEqual(controller.raw["phy_rows"], parsed)
+        self.assertEqual(fabric.controllers[0]["phy_rows"], parsed)
+        # The pre-existing count metrics are unchanged.
+        self.assertEqual(controller.metrics["phy_count"], 8)
+        self.assertEqual(controller.metrics["linked_phy_count"], 4)
+
+    def test_missing_endpoint_evidence_leaves_reported_lanes_null(self) -> None:
+        outputs = self._outputs()
+        outputs.pop("sudo -n /usr/sbin/mprutil -u 0 show adapter")
+        hba_link, cascade_link = self._parent_links(self._fabric(outputs))
+        self.assertIsNone(hba_link.reported_lanes)
+        self.assertIsNotNone(cascade_link.reported_lanes)
+        self.assertEqual(next(node for node in self._fabric(outputs).nodes if node.id == "controller:mpr0").raw["phy_rows"], [])
+
+        cases = {
+            "no expander rows toward the HBA": dict(a_rows=self._a_rows()[4:]),
+            "no child rows toward the parent": dict(b_rows=[]),
+            "no parent rows toward the child": dict(a_rows=self._a_rows()[:4]),
+            "HBA phys not attached to the expander": dict(hba_rows=[self._hba_row(phy, "0000") for phy in range(4)]),
+        }
+        expected = {
+            "no expander rows toward the HBA": (None, "set"),
+            "no child rows toward the parent": ("set", None),
+            "no parent rows toward the child": ("set", None),
+            "HBA phys not attached to the expander": (None, "set"),
+        }
+        for name, overrides in cases.items():
+            with self.subTest(case=name):
+                links = self._parent_links(self._fabric(self._outputs(**overrides)))
+                for link, state in zip(links, expected[name], strict=True):
+                    if state is None:
+                        self.assertIsNone(link.reported_lanes)
+                    else:
+                        self.assertIsNotNone(link.reported_lanes)
+
+    def test_contradictory_endpoint_evidence_leaves_reported_lanes_null(self) -> None:
+        a_rows = self._a_rows()
+        b_rows = self._b_rows()
+        hba_rows = self._hba_rows()
+        hba_cases = {
+            "expander reports fewer HBA lanes": dict(a_rows=a_rows[1:]),
+            "HBA reports fewer lanes than the expander": dict(hba_rows=hba_rows[1:]),
+            "expander names a different HBA phy": dict(
+                a_rows=[self._expander_row(11, 5, "0001", "SAS Initiator"), *a_rows[1:]]),
+            "expander names one HBA phy twice": dict(
+                a_rows=[self._expander_row(11, 1, "0001", "SAS Initiator"), *a_rows[1:]]),
+            "HBA lane uses another controller handle": dict(
+                hba_rows=[self._hba_row(0, controller_handle="0002"), *hba_rows[1:]]),
+            "duplicate HBA phy row": dict(hba_rows=[*hba_rows, self._hba_row(0, "0000")]),
+            "malformed HBA device handle": dict(hba_rows=[self._hba_row(0, "zz"), *hba_rows[1:]]),
+            "another expander claims an HBA phy": dict(extra_expanders=[(
+                f"36 {self.ADDRESS_C} 000c 0001 0004 1",
+                [self._expander_row(0, 0, "0001", "SAS Initiator")],
+            )]),
+        }
+        cascade_cases = {
+            "child names a different parent phy": dict(
+                b_rows=[self._expander_row(4, 20, "0009", "Edge Expander"), *b_rows[1:]]),
+            "child reports fewer lanes": dict(b_rows=b_rows[1:]),
+            "parent and child pairings disagree": dict(
+                b_rows=[self._expander_row(4, 13, "0009", "Edge Expander"),
+                        self._expander_row(5, 12, "0009", "Edge Expander"), *b_rows[2:]]),
+            "child row is not an expander attachment": dict(
+                b_rows=[self._expander_row(4, 12, "0009", "End Device"), *b_rows[1:]]),
+            "child row lacks a parseable remote phy": dict(b_rows=["  4 0009 12.0 1.5 12.0 Edge Expander", *b_rows[1:]]),
+            "another expander claims a parent phy": dict(extra_expanders=[(
+                f"36 {self.ADDRESS_C} 000c 0009 0004 2",
+                [self._expander_row(0, 12, "0009", "Edge Expander")],
+            )]),
+        }
+        for name, overrides in hba_cases.items():
+            with self.subTest(case=name):
+                hba_link, _ = self._parent_links(self._fabric(self._outputs(**overrides)))
+                self.assertIsNone(hba_link.reported_lanes)
+        for name, overrides in cascade_cases.items():
+            with self.subTest(case=name):
+                fabric = self._fabric(self._outputs(**overrides))
+                _, cascade_link = self._parent_links(fabric)
+                self.assertIsNone(cascade_link.reported_lanes)
+        with self.subTest(case="reused local expander phy"):
+            duplicate = self._fabric(self._outputs(a_rows=[*a_rows, self._expander_row(8, 3, "0001", "SAS Initiator")]))
+            self.assertEqual([link.reported_lanes for link in self._parent_links(duplicate)], [None, None])
+
+    def test_disagreeing_rates_keep_pairing_but_no_guessed_rate(self) -> None:
+        hba_rows = [self._hba_row(0, speed="6.0"), *self._hba_rows()[1:]]
+        hba_link, _ = self._parent_links(self._fabric(self._outputs(hba_rows=hba_rows)))
+        lanes = hba_link.reported_lanes
+        self.assertIsNotNone(lanes)
+        self.assertEqual(lanes.lane_count, 4)
+        self.assertIsNone(lanes.negotiated_rate_gbps)
+        self.assertEqual([lane.negotiated_rate_gbps for lane in lanes.lanes], [None, 12.0, 12.0, 12.0])
+        # A uniform but different rate on every lane is reported as observed.
+        hba_rows = [self._hba_row(phy, speed="6.0") for phy in range(4)]
+        a_rows = [self._expander_row(local, hba, "0001", "SAS Initiator", speed="6") for hba, local in self.HBA_TO_A.items()]
+        hba_link, _ = self._parent_links(self._fabric(self._outputs(hba_rows=hba_rows, a_rows=[*a_rows, *self._a_rows()[4:]])))
+        self.assertEqual(hba_link.reported_lanes.negotiated_rate_gbps, 6.0)
+
+    def test_infrastructure_tolerates_non_text_phy_evidence(self) -> None:
+        malformed_values = ([], {}, 7, None, True, "9" * 5000, "-1")
+        for value in malformed_values:
+            with self.subTest(value=value):
+                parent = {"dev_handle": "0009", "parent": "0001", "sas_level": "1", "sas_address": self.ADDRESS_A,
+                          "enc_handle": "0002", "phys": [{"phy": "8", "remote_phy": value, "dev_handle": "0001",
+                                                          "speed": "12.0", "device": "SAS Initiator"}]}
+                child = {"dev_handle": "000a", "parent": "0009", "sas_level": "2", "sas_address": self.ADDRESS_B,
+                         "enc_handle": "0003", "phys": [{"phy": value, "remote_phy": "12", "dev_handle": value,
+                                                         "speed": value, "device": value}]}
+                adapter = {"phy_rows": [{"phy": value, "controller_handle": value, "device_handle": value, "speed": value}]}
+                links: dict = {}
+                _add_mpr_infrastructure(
+                    nodes={}, links=links, controllers=[{"unit": 0, "id": "controller:mpr0"}],
+                    unit_data={0: {"adapter_detail": adapter, "expanders": [parent, child]}},
+                )
+                self.assertEqual(len(links), 2)
+                self.assertTrue(all(link.reported_lanes is None for link in links.values()))
+
+    def test_existing_fixture_links_gain_only_a_null_reported_lanes_field(self) -> None:
+        enclosure_id = parse_mpr_enclosures(MPR0_ENCLOSURES)[0]["logical_id"]
+        snapshot = InventorySnapshot(
+            slots=[SlotView(
+                slot=0, slot_label="00", row_index=0, column_index=0, present=True,
+                state=SlotState.healthy, device_name="da60",
+                raw_status={"enclosure_id": enclosure_id, "ses_slot_number": 1},
+                multipath=MultipathView(
+                    name="mpath0", device_name="multipath/disk0",
+                    members=[MultipathMember(device_name="da60", state="ACTIVE", controller_label="mpr0")],
+                ),
+            )],
+            refresh_interval_seconds=30, selected_system_platform="core", selected_enclosure_id=enclosure_id,
+        )
+        fabric = build_sas_fabric_snapshot(
+            system=SystemConfig(id="synthetic-core", label="Synthetic CORE", truenas=TrueNASConfig(platform="core")),
+            snapshot=snapshot,
+            ssh_outputs={
+                "sudo -n /usr/sbin/mprutil show adapters": MPR_ADAPTERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show adapter": MPR0_ADAPTER,
+                "sudo -n /usr/sbin/mprutil -u 0 show expanders": MPR0_EXPANDERS,
+                "sudo -n /usr/sbin/mprutil -u 0 show enclosures": MPR0_ENCLOSURES,
+                "sudo -n /usr/sbin/mprutil -u 0 show devices": MPR0_DEVICES,
+            },
+        )
+        payload = fabric.model_dump(mode="json")
+        self.assertTrue(any(link["kind"] == "controller-expander" for link in payload["links"]))
+        for link in payload["links"]:
+            self.assertEqual(
+                set(link),
+                {"id", "source", "target", "kind", "status", "slot", "related_slots", "evidence", "reported_lanes"},
+            )
+            # The fixture's HBA phys name disk handles, not the expander: no lanes.
+            self.assertIsNone(link["reported_lanes"])
+        controller = next(node for node in payload["nodes"] if node["id"] == "controller:mpr0")
+        self.assertEqual(controller["raw"]["phy_rows"], parse_mpr_adapter_detail(MPR0_ADAPTER)["phy_rows"])
+        self.assertEqual(controller["metrics"]["phy_count"], 2)
+
+    def test_reported_lanes_survive_strict_snapshot_round_trip(self) -> None:
+        from app.models.domain import SasFabricSnapshot
+
+        fabric = self._fabric()
+        restored = SasFabricSnapshot.model_validate_json(fabric.model_dump_json(), strict=True)
+        self.assertEqual(restored.model_dump(mode="json"), fabric.model_dump(mode="json"))
+        hba_link = next(link for link in restored.links if link.kind == "controller-expander")
+        self.assertEqual(hba_link.reported_lanes.lane_count, 4)
 
 
 class SasFabricParserTests(unittest.TestCase):

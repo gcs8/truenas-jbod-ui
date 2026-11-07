@@ -14,6 +14,8 @@ from app.models.domain import (
     SasFabricAlias,
     SasFabricLink,
     SasFabricNode,
+    SasFabricReportedLane,
+    SasFabricReportedLanes,
     SasFabricSnapshot,
     SasFabricTrace,
     SourceStatus,
@@ -467,6 +469,9 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             "path_counts": counts,
             "related_slots": related_slots,
             "iocfacts": iocfacts,
+            # The parsed adapter PHY table, kept as reported (#937). None when
+            # no unit data exists for this controller.
+            "phy_rows": [dict(row) for row in detail.get("phy_rows") or []] if parsed_unit else None,
         }
         controllers.append(controller)
         add_node(
@@ -2854,6 +2859,148 @@ def _mpr_expander_parent_context(
     return result
 
 
+_MPR_EXPANDER_ATTACHED_DEVICES = frozenset({"SMP Target", "Edge Expander", "Fanout Expander", "Expander"})
+_MPR_INITIATOR_ATTACHED_DEVICES = frozenset({"SAS Initiator"})
+_MPR_REPORTED_LANE_BASIS = "reciprocal_reported_phy_rows"
+
+
+def _mpr_phy_number(value: Any) -> int | None:
+    # Parser rows carry decimal strings. Anything else is not PHY evidence.
+    if isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 5:
+        return int(value)
+    return None
+
+
+def _mpr_handle(value: Any) -> str | None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{4}", value):
+        return value.lower()
+    return None
+
+
+def _mpr_rate(value: Any) -> float | None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,2})?", value):
+        rate = float(value)
+        return rate if rate > 0 else None
+    return None
+
+
+def _mpr_sas_address(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{16}", value) else None
+
+
+def _mpr_endpoint_rows(rows: Any, *, peer_field: str) -> list[dict[str, Any]] | None:
+    """Normalize one endpoint's PHY rows; None if any local PHY is unusable or reused."""
+    if not isinstance(rows, list):
+        return None
+    normalized: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        phy = _mpr_phy_number(row.get("phy"))
+        if phy is None or phy in seen:
+            return None
+        seen.add(phy)
+        device = row.get("device")
+        normalized.append({
+            "phy": phy,
+            "peer": _mpr_handle(row.get(peer_field)),
+            "remote": _mpr_phy_number(row.get("remote_phy")),
+            "rate": _mpr_rate(row.get("speed")),
+            "device": device.strip() if isinstance(device, str) else None,
+            "controller_handle": _mpr_handle(row.get("controller_handle")),
+        })
+    return normalized
+
+
+class _MprReportedLaneContext:
+    """Reported lanes for admitted MPR parent links, from one unit's PHY rows.
+
+    A lane is published only when both endpoints report it: the child's row
+    names the parent handle and parent PHY, and the parent's row names the child
+    handle (and, for expanders, the child PHY). Any reused local PHY, a PHY
+    another device also claims, a type that contradicts the attachment, or
+    unequal row sets leave the whole link null. Nothing here admits a link.
+    """
+
+    def __init__(self, expanders: list[dict[str, Any]], adapter_detail: Any, unit: int) -> None:
+        self._unit = unit
+        self._expanders = expanders
+        self._rows = [_mpr_endpoint_rows(row.get("phys"), peer_field="dev_handle") for row in expanders]
+        self._handles = [_mpr_handle(row.get("dev_handle")) for row in expanders]
+        adapter_rows = adapter_detail.get("phy_rows") if isinstance(adapter_detail, dict) else None
+        self._adapter_rows = _mpr_endpoint_rows(adapter_rows, peer_field="device_handle")
+        # (attached handle, attached PHY) claims across every expander row in
+        # this unit, including rows of endpoints whose own table is unusable.
+        self._claims: Counter[tuple[str, int]] = Counter()
+        for row in expanders:
+            for phy in row.get("phys") if isinstance(row.get("phys"), list) else []:
+                if not isinstance(phy, dict):
+                    continue
+                peer, remote = _mpr_handle(phy.get("dev_handle")), _mpr_phy_number(phy.get("remote_phy"))
+                if peer is not None and remote is not None:
+                    self._claims[(peer, remote)] += 1
+
+    def parent_link_lanes(self, index: int, *, to_controller: bool) -> SasFabricReportedLanes | None:
+        child = self._expanders[index]
+        child_handle, child_rows = self._handles[index], self._rows[index]
+        parent_handle = _mpr_handle(child.get("parent"))
+        if child_handle is None or parent_handle is None or child_rows is None or child_handle == parent_handle:
+            return None
+        if to_controller:
+            parent_rows, parent_address = self._adapter_rows, None
+            allowed = _MPR_INITIATOR_ATTACHED_DEVICES
+        else:
+            matches = [position for position, handle in enumerate(self._handles) if handle == parent_handle]
+            if len(matches) != 1:
+                return None
+            parent_rows = self._rows[matches[0]]
+            parent_address = _mpr_sas_address(self._expanders[matches[0]].get("sas_address"))
+            allowed = _MPR_EXPANDER_ATTACHED_DEVICES
+        if parent_rows is None:
+            return None
+        toward_parent = [row for row in child_rows if row["peer"] == parent_handle]
+        toward_child = [row for row in parent_rows if row["peer"] == child_handle]
+        if not toward_parent or len(toward_parent) != len(toward_child):
+            return None
+        # parent PHY -> (child PHY, child-reported rate)
+        child_view: dict[int, tuple[int, float | None]] = {}
+        for row in toward_parent:
+            remote = row["remote"]
+            if (remote is None or row["device"] not in allowed or remote in child_view
+                    or self._claims[(parent_handle, remote)] != 1):
+                return None
+            child_view[remote] = (row["phy"], row["rate"])
+        lanes: list[SasFabricReportedLane] = []
+        for row in toward_child:
+            if row["phy"] not in child_view:
+                return None
+            child_phy, child_rate = child_view[row["phy"]]
+            if to_controller:
+                if row["controller_handle"] != parent_handle:
+                    return None
+            elif (row["remote"] != child_phy or row["device"] not in _MPR_EXPANDER_ATTACHED_DEVICES
+                  or self._claims[(child_handle, child_phy)] != 1):
+                return None
+            rate = row["rate"] if row["rate"] is not None and row["rate"] == child_rate else None
+            lanes.append(SasFabricReportedLane(source_phy=row["phy"], target_phy=child_phy, negotiated_rate_gbps=rate))
+        lanes.sort(key=lambda lane: lane.source_phy)
+        rates = {lane.negotiated_rate_gbps for lane in lanes}
+        evidence = [*_mpr_evidence(self._unit, "adapter"), *_mpr_evidence(self._unit, "expanders")] if to_controller \
+            else _mpr_evidence(self._unit, "expanders")
+        return SasFabricReportedLanes(
+            basis=_MPR_REPORTED_LANE_BASIS,
+            lane_count=len(lanes),
+            source_phys=[lane.source_phy for lane in lanes],
+            target_phys=sorted(lane.target_phy for lane in lanes),
+            lanes=lanes,
+            negotiated_rate_gbps=next(iter(rates)) if len(rates) == 1 else None,
+            source_sas_address=parent_address,
+            attached_sas_address=_mpr_sas_address(child.get("sas_address")),
+            evidence=evidence,
+        )
+
+
 def _add_mpr_infrastructure(
     *,
     nodes: dict[str, SasFabricNode],
@@ -2880,7 +3027,8 @@ def _add_mpr_infrastructure(
         expander_ids_by_enc_handle: dict[str, list[str]] = defaultdict(list)
         expanders = payload.get("expanders") or []
         parent_context = _mpr_expander_parent_context(expanders, controller_id)
-        for expander, (parent_id, parent_reason) in zip(expanders, parent_context, strict=True):
+        lane_context = _MprReportedLaneContext(expanders, payload.get("adapter_detail"), unit)
+        for index, (expander, (parent_id, parent_reason)) in enumerate(zip(expanders, parent_context, strict=True)):
             expander_id = f"expander:{controller_id}:{expander.get('sas_address') or expander.get('dev_handle')}"
             expander_key = _identifier_lookup_key(expander.get("sas_address"))
             enc_handle = str(expander.get("enc_handle") or "")
@@ -2916,11 +3064,17 @@ def _add_mpr_infrastructure(
                 ),
             )
             if parent_id:
-                add_link(
+                parent_link = add_link(
                     links, parent_id, expander_id,
                     "controller-expander" if parent_id == controller_id else "expander-expander",
                     evidence=_mpr_evidence(unit, "expanders"),
                 )
+                lanes = lane_context.parent_link_lanes(index, to_controller=parent_id == controller_id)
+                # One admitted parent link per child. A second, different
+                # report for the same link is contradictory, not a choice.
+                if parent_link.reported_lanes is not None and parent_link.reported_lanes != lanes:
+                    lanes = None
+                parent_link.reported_lanes = lanes
             if enc_handle:
                 expander_ids_by_enc_handle[enc_handle].append(expander_id)
 
