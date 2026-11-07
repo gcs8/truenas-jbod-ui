@@ -1166,7 +1166,29 @@ def enospc_state(args: argparse.Namespace) -> str:
 
 CLEAN_HOST_GROUPS = ("config_file", "mapping_file", "history_db")
 CLEAN_HOST_ADMIN_PORT = 18182
-CLEAN_HOST_AUTH = "Basic " + base64.b64encode(b"operator:synthetic-clean-host-auth").decode("ascii")
+CLEAN_HOST_AUTH_USERNAME = "operator"
+CLEAN_HOST_AUTH_PASSWORD = "synthetic-clean-host-auth"  # synthetic, never a real credential
+CLEAN_HOST_AUTH = "Basic " + base64.b64encode(
+    f"{CLEAN_HOST_AUTH_USERNAME}:{CLEAN_HOST_AUTH_PASSWORD}".encode()).decode("ascii")
+# Basic mode needs both browser origins, exactly as the documented Basic-auth
+# setup sets them (wiki/Admin-UI-and-System-Setup.md "Optional authentication"):
+# the current admin service refuses to start without ADMIN_PUBLIC_ORIGIN and
+# the current UI without APP_PUBLIC_ORIGIN (#1089). Loopback, on the ports this
+# driver publishes. v0.22.2's Compose file passes neither, so the predecessor
+# install is unchanged by them.
+CLEAN_HOST_ENVIRONMENT = {
+    "ADMIN_PORT": str(CLEAN_HOST_ADMIN_PORT),
+    "ADMIN_BIND_ADDRESS": "127.0.0.1",
+    "ADMIN_AUTH_MODE": "basic",
+    "ADMIN_AUTH_USERNAME": CLEAN_HOST_AUTH_USERNAME,
+    "ADMIN_AUTH_PASSWORD": CLEAN_HOST_AUTH_PASSWORD,
+    "APP_PUBLIC_ORIGIN": f"http://127.0.0.1:{UI_PORT}",
+    "ADMIN_PUBLIC_ORIGIN": f"http://127.0.0.1:{CLEAN_HOST_ADMIN_PORT}",
+}
+# The root name is the Compose project name: lowercase letters, digits, "-"
+# and "_" only (Compose refuses anything else), behind the fixed prefix.
+CLEAN_HOST_ROOT_NAME = re.compile(r"jbod-clean-host-[a-z0-9_-]*")
+CLEAN_HOST_REDACTED = "[redacted]"
 
 # Read-only probes. History identity is logical, not a promise that SQLite file
 # bytes survive supported snapshot/restore/startup. Config and mappings are exact.
@@ -1195,6 +1217,9 @@ finally:
 
 def admit_clean_host_root(root: Path, *, consent: bool) -> None:
     expect(consent, "clean-host restore needs --disposable-clean-host-restore on an exclusive disposable host")
+    expect(CLEAN_HOST_ROOT_NAME.fullmatch(root.name) is not None,
+           f"clean-host root name {root.name!r} must be jbod-clean-host- followed by a lowercase Compose project "
+           "name (lowercase letters, digits, '-' and '_'); it becomes the Compose project name")
     expect(root.is_absolute() and root == root.resolve() and root.name.startswith("jbod-clean-host-")
            and root.parent.is_dir() and root.is_relative_to(Path(tempfile.gettempdir()).resolve()),
            "clean-host root must be an absent nonsymlink jbod-clean-host-* directory below TMPDIR")
@@ -1261,6 +1286,32 @@ def clean_host_import(archive: Path, passphrase: str) -> None:
            "clean-host import did not restore all required groups")
 
 
+def clean_host_failure_message(exc: BaseException, secrets: list[str]) -> str:
+    """The failure and the causes it chains, with every clean-host secret redacted.
+
+    Follows ``raise ... from`` causes and implicit contexts the way a traceback
+    does, so a teardown failure in ``finally`` keeps the original failure that
+    it replaced. The synthetic key input, its base64 header form and the admin
+    credential are redacted wherever a message carries them.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 4:
+        seen.add(id(current))
+        text = str(current)
+        parts.append(text if isinstance(current, SmokeError) else f"{type(current).__name__}: {text}")
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    message = "\ncaused by: ".join(parts)
+    hidden = {CLEAN_HOST_AUTH_PASSWORD, CLEAN_HOST_AUTH.split(" ", 1)[1]}
+    for secret in secrets:
+        if secret:
+            hidden.update((secret, base64.b64encode(secret.encode()).decode("ascii")))
+    for secret in sorted(hidden, key=len, reverse=True):
+        message = message.replace(secret, CLEAN_HOST_REDACTED)
+    return message
+
+
 def check_clean_host_identity(before: dict, after: dict) -> None:
     expect(before == after, "clean-host restore changed config/mapping bytes or history counts/identity")
 
@@ -1275,8 +1326,12 @@ class CleanHostDeployment(Deployment):
         return ["--project-name", self.project, "-f", "docker-compose.yml"]
 
 
-def clean_host_restore(args: argparse.Namespace) -> str:
-    """One archive-only synthetic recovery cell, not support or human acceptance."""
+def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = None) -> str:
+    """One archive-only synthetic recovery cell, not support or human acceptance.
+
+    ``secrets`` receives the generated key input before any step can fail, so
+    the caller can redact it from failure output.
+    """
     repository = Path(__file__).resolve().parents[1]
     for supplied, expected in ((args.compose_fixture, repository / "tests/fixtures/compose/v0.22.2.yml"),
                                (args.config_fixture, repository / "tests/fixtures/ci-smoke-config.yaml")):
@@ -1292,6 +1347,8 @@ def clean_host_restore(args: argparse.Namespace) -> str:
     recovery = root / "recovery"
     recovery.mkdir(mode=0o700)
     passphrase = os.urandom(32).hex()  # synthetic key input, never a real credential
+    if secrets is not None:
+        secrets.append(passphrase)
     key = recovery / "operator-key-input"
     key.write_text(passphrase, encoding="utf-8")
     key.chmod(0o600)
@@ -1301,9 +1358,7 @@ def clean_host_restore(args: argparse.Namespace) -> str:
     try:
         prepare_root(deployment.root, args.compose_fixture, args.config_fixture)
         deployment.image = args.previous_image
-        deployment.runtime_environment.update({"ADMIN_PORT": str(CLEAN_HOST_ADMIN_PORT),
-            "ADMIN_BIND_ADDRESS": "127.0.0.1", "ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": "operator",
-            "ADMIN_AUTH_PASSWORD": "synthetic-clean-host-auth"})
+        deployment.runtime_environment.update(CLEAN_HOST_ENVIRONMENT)
         seed_previous_release(deployment, args)
         deployment.compose("stop", *SERVICES)
         before = {**deployment.run_python("enclosure-ui", READ_CLEAN_FILES),
@@ -1332,9 +1387,7 @@ def clean_host_restore(args: argparse.Namespace) -> str:
         prepare_root(deployment.root, repository / "docker-compose.yml", bootstrap)
         bootstrap.unlink()
         deployment.image = args.candidate_image
-        deployment.runtime_environment.update({"ADMIN_PORT": str(CLEAN_HOST_ADMIN_PORT),
-            "ADMIN_BIND_ADDRESS": "127.0.0.1", "ADMIN_AUTH_MODE": "basic", "ADMIN_AUTH_USERNAME": "operator",
-            "ADMIN_AUTH_PASSWORD": "synthetic-clean-host-auth"})
+        deployment.runtime_environment.update(CLEAN_HOST_ENVIRONMENT)
         deployment.set_image(args.candidate_image)
         deployment.compose("--profile", "admin", "pull", "enclosure-admin")
         deployment.compose("--profile", "admin", "up", "-d", "--wait", "enclosure-admin")
@@ -2043,11 +2096,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     started = time.monotonic()
     if args.scenario == "clean-host-restore":
+        secrets: list[str] = []
         try:
-            print(clean_host_restore(args))
+            print(clean_host_restore(args, secrets))
             return 0
         except (SmokeError, OSError, subprocess.SubprocessError) as exc:
-            print(f"clean-host restore failed; recovery files retained: {type(exc).__name__}", file=sys.stderr)
+            print("clean-host restore failed; recovery files retained: "
+                  + clean_host_failure_message(exc, secrets), file=sys.stderr)
             return 1
     try:
         print(smoke(args) + f" seconds={int(time.monotonic() - started)}")
