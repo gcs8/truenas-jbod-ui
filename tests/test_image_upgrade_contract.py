@@ -2464,9 +2464,10 @@ class AdminDuringUpgradeScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             deployments = []
+            real_deployment = smoke.Deployment
 
             def make(*_args, **_kwargs):
-                deployment = mock.Mock(spec=smoke.Deployment)
+                deployment = mock.Mock(spec=real_deployment)
                 deployment.root = root
                 deployment.files = ()
                 deployment.runtime_environment = {}
