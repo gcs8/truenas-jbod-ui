@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Fixed the first bays of a single-row chassis face that is wider than its
+  bezel, such as a 24-bay 2.5" front at 1600 px. They were clipped past the
+  start edge, where horizontal scrolling could not reach them or a click select
+  them; the overflow now scrolls from the first bay (#1081).
+
 ## v0.24.0-beta.5 - 2026-11-02
 
 This prerelease adds the changes merged after `v0.24.0-beta.4`. GHCR gets the
