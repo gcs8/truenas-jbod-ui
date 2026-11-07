@@ -1630,6 +1630,219 @@ class CoreExpanderCounterDraftTests(unittest.TestCase):
             self.assertFalse(any("smpcmd" in grant or "smpphylist" in grant for grant in grants))
 
 
+
+def _phy_error_log_frame(
+    phy: int = 5,
+    counters: tuple[int, int, int, int] = (1, 2, 3, 4),
+    *,
+    frame_type: int = 0x41,
+    function: int = 0x11,
+    result: int = 0,
+    response_length: int = 6,
+    change_count: int = 0x0102,
+) -> bytes:
+    """Synthetic SPL-4 Table 336 response, CRC excluded as camcontrol reports it."""
+    header = bytes((frame_type, function, result, response_length))
+    body = change_count.to_bytes(2, "big") + bytes(3) + bytes((phy,)) + bytes(2)
+    return header + body + b"".join(value.to_bytes(4, "big") for value in counters)
+
+
+class CoreExpanderCounterDecoderTests(unittest.TestCase):
+    """Pure decoder/delta draft: synthetic byte frames only, never wired or run."""
+
+    counter_fields = (
+        "invalid_dword_count", "running_disparity_error_count",
+        "loss_of_dword_synchronization_count", "phy_reset_problem_count",
+    )
+
+    def decode(self, frame, phy=5):
+        from scripts.core_expander_counter_draft import decode_phy_error_log_response
+
+        return decode_phy_error_log_response(frame, phy=phy)
+
+    def assert_frame_error(self, frame, reason, phy=5):
+        from scripts.core_expander_counter_draft import SmpResponseError
+
+        with self.assertRaises(SmpResponseError) as caught:
+            self.decode(frame, phy=phy)
+        self.assertIsInstance(caught.exception, ValueError)
+        self.assertEqual(caught.exception.reason, reason)
+        return caught.exception
+
+    def row(self, phy, *counters):
+        return {"phy": phy, **dict(zip(self.counter_fields, counters))}
+
+    def deltas(self, previous, current):
+        from scripts.core_expander_counter_draft import phy_counter_deltas
+
+        return phy_counter_deltas(previous, current)
+
+    def test_valid_frame_decodes_big_endian_counters_in_per_phy_shape(self):
+        frame = _phy_error_log_frame(7, (0x01020304, 0, 0x00A0B0C0, 9))
+        self.assertEqual(len(frame), 28)
+        for value in (frame, bytearray(frame), memoryview(frame)):
+            with self.subTest(kind=type(value).__name__):
+                self.assertEqual(
+                    self.decode(value, phy=7),
+                    self.row(7, 0x01020304, 0, 0x00A0B0C0, 9),
+                )
+
+    def test_measured_zero_is_kept_and_saturation_is_not_wrapped(self):
+        self.assertEqual(self.decode(_phy_error_log_frame(5, (0, 0, 0, 0))), self.row(5, 0, 0, 0, 0))
+        saturated = self.decode(_phy_error_log_frame(5, (0xFFFFFFFF, 1, 0xFFFFFFFF, 0)))
+        self.assertEqual(saturated, self.row(5, 4294967295, 1, 4294967295, 0))
+
+    def test_short_and_long_frames_raise_instead_of_returning_zeros(self):
+        frame = _phy_error_log_frame()
+        for size in (0, 3, 4, 12, 27):
+            with self.subTest(size=size):
+                self.assert_frame_error(frame[:size], "frame_length")
+        # 29 bytes and the CRC-inclusive 32-byte transport frame are both refused.
+        for extra in (b"\x00", bytes(4)):
+            with self.subTest(extra=len(extra)):
+                self.assert_frame_error(frame + extra, "frame_length")
+
+    def test_wrong_frame_type_or_function_code_raises(self):
+        for frame_type in (0x40, 0x00, 0xFF):
+            with self.subTest(frame_type=frame_type):
+                self.assert_frame_error(_phy_error_log_frame(frame_type=frame_type), "frame_type")
+        # 10h is DISCOVER and 91h is PHY CONTROL; neither is accepted as an error log.
+        for function in (0x10, 0x91, 0x00, 0x13):
+            with self.subTest(function=function):
+                self.assert_frame_error(_phy_error_log_frame(function=function), "function")
+
+    def test_non_zero_function_result_raises_even_for_truncated_error_frames(self):
+        for result in (0x01, 0x10, 0x11, 0x16):
+            with self.subTest(result=result):
+                error = self.assert_frame_error(_phy_error_log_frame(result=result), "function_result")
+                self.assertEqual(error.function_result, result)
+                error = self.assert_frame_error(bytes((0x41, 0x11, result, 0)), "function_result")
+                self.assertEqual(error.function_result, result)
+
+    def test_bad_response_length_field_raises(self):
+        # SAS-1.1 zero lengths are not admitted; SAS-2+ reports exactly 06h dwords.
+        for response_length in (0, 5, 7, 0xFF):
+            with self.subTest(response_length=response_length):
+                self.assert_frame_error(_phy_error_log_frame(response_length=response_length), "response_length")
+
+    def test_phy_identifier_must_match_the_requested_phy(self):
+        self.assert_frame_error(_phy_error_log_frame(phy=6), "phy_identifier", phy=5)
+        from scripts.core_expander_counter_draft import decode_phy_error_log_response
+
+        for phy in (-1, 255, True, "5", None, 5.0):
+            with self.subTest(phy=phy), self.assertRaises(ValueError):
+                decode_phy_error_log_response(_phy_error_log_frame(), phy=phy)
+
+    def test_non_byte_inputs_are_rejected(self):
+        frame = _phy_error_log_frame()
+        for value in (frame.hex(), list(frame), None, 28):
+            with self.subTest(kind=type(value).__name__):
+                self.assert_frame_error(value, "frame_type_error")
+
+    def test_normal_delta_counts_increments_per_phy(self):
+        previous = [self.row(1, 10, 20, 30, 40), self.row(0, 0, 0, 0, 0)]
+        current = [self.row(0, 3, 0, 1, 0), self.row(1, 15, 20, 31, 40)]
+        rows = self.deltas(previous, current)
+        self.assertEqual([row["phy"] for row in rows], [0, 1])
+        self.assertEqual({key: rows[1][key] for key in self.counter_fields}, dict(zip(self.counter_fields, (5, 0, 1, 0))))
+        self.assertEqual({key: rows[0][key] for key in self.counter_fields}, dict(zip(self.counter_fields, (3, 0, 1, 0))))
+        for row in rows:
+            self.assertEqual(set(row), {"phy", "counter_states", *self.counter_fields})
+            self.assertEqual(row["counter_states"], dict.fromkeys(self.counter_fields, "delta"))
+
+    def test_decrease_is_a_counter_reset_never_a_negative_delta(self):
+        rows = self.deltas([self.row(2, 100, 5, 0xFFFFFFFF, 7)], [self.row(2, 3, 0, 9, 7)])
+        self.assertEqual({key: rows[0][key] for key in self.counter_fields}, dict(zip(self.counter_fields, (3, 0, 9, 0))))
+        self.assertEqual(
+            rows[0]["counter_states"],
+            dict(zip(self.counter_fields, ("reset", "reset", "reset", "delta"))),
+        )
+        self.assertTrue(all(rows[0][key] >= 0 for key in self.counter_fields))
+
+    def test_saturated_counter_reports_unknown_delta_not_a_number(self):
+        rows = self.deltas(
+            [self.row(4, 0xFFFFFFFF, 10, 0, 0)],
+            [self.row(4, 0xFFFFFFFF, 0xFFFFFFFF, 0, 0)],
+        )
+        self.assertIsNone(rows[0]["invalid_dword_count"])
+        self.assertIsNone(rows[0]["running_disparity_error_count"])
+        self.assertEqual(rows[0]["counter_states"]["invalid_dword_count"], "saturated")
+        self.assertEqual(rows[0]["counter_states"]["running_disparity_error_count"], "saturated")
+        self.assertEqual(rows[0]["loss_of_dword_synchronization_count"], 0)
+
+    def test_missing_values_and_new_phys_have_no_numeric_delta(self):
+        rows = self.deltas(
+            [self.row(0, None, 1, 1, 1), self.row(9, 1, 1, 1, 1)],
+            [self.row(0, 5, None, 1, 1), self.row(3, 0, 0, 0, 0)],
+        )
+        self.assertEqual([row["phy"] for row in rows], [0, 3])
+        self.assertEqual(
+            (rows[0]["invalid_dword_count"], rows[0]["running_disparity_error_count"]), (None, None),
+        )
+        self.assertEqual(rows[0]["counter_states"]["invalid_dword_count"], "no_baseline")
+        self.assertEqual(rows[0]["counter_states"]["running_disparity_error_count"], "unavailable")
+        self.assertEqual(rows[1]["counter_states"], dict.fromkeys(self.counter_fields, "no_baseline"))
+        self.assertTrue(all(rows[1][key] is None for key in self.counter_fields))
+
+    def test_malformed_samples_raise_a_typed_error(self):
+        from scripts.core_expander_counter_draft import CounterSampleError
+
+        good = self.row(0, 1, 2, 3, 4)
+        malformed = [
+            [good, dict(good)],
+            [{**good, "invalid_dword_count": True}],
+            [{**good, "invalid_dword_count": -1}],
+            [{**good, "invalid_dword_count": 0x100000000}],
+            [{**good, "invalid_dword_count": 1.0}],
+            [{**good, "invalid_dword_count": "1"}],
+            [{key: value for key, value in good.items() if key != "phy_reset_problem_count"}],
+            [{**good, "phy": True}],
+            [{**good, "phy": 256}],
+            ["phy 0"],
+            {"phy": 0},
+            None,
+        ]
+        for sample in malformed:
+            for previous, current in ((sample, [good]), ([good], sample)):
+                with self.subTest(sample=sample), self.assertRaises(CounterSampleError) as caught:
+                    self.deltas(previous, current)
+                self.assertIsInstance(caught.exception, ValueError)
+
+    def test_decoded_rows_match_the_linux_sysfs_counter_shape(self):
+        from app.models.domain import SasPortView
+        from scripts.core_expander_counter_draft import COUNTER_FIELDS, SYSFS_COUNTER_ATTRIBUTES
+
+        self.assertEqual(COUNTER_FIELDS, self.counter_fields)
+        self.assertEqual(set(COUNTER_FIELDS) - set(SasPortView.model_fields), set())
+        # Linux scsi_transport_sas exports these sas_phy attributes as "%u\n".
+        self.assertEqual(
+            set(SYSFS_COUNTER_ATTRIBUTES),
+            {"invalid_dword_count", "running_disparity_error_count", "loss_of_dword_sync_count", "phy_reset_problem_count"},
+        )
+        self.assertEqual(tuple(SYSFS_COUNTER_ATTRIBUTES.values()), COUNTER_FIELDS)
+        sysfs_fixture = {
+            "phy_identifier": "5\n", "invalid_dword_count": "12\n", "running_disparity_error_count": "0\n",
+            "loss_of_dword_sync_count": "3\n", "phy_reset_problem_count": "4294967295\n",
+        }
+        sysfs_row = {"phy": int(sysfs_fixture["phy_identifier"])}
+        sysfs_row.update({field: int(sysfs_fixture[attribute]) for attribute, field in SYSFS_COUNTER_ATTRIBUTES.items()})
+        decoded = self.decode(_phy_error_log_frame(5, (12, 0, 3, 0xFFFFFFFF)))
+        self.assertEqual(decoded, sysfs_row)
+        self.assertEqual(SasPortView(port=0, **decoded).model_dump(include=set(decoded) - {"phy"}),
+                         {key: decoded[key] for key in COUNTER_FIELDS})
+        # Either source feeds the same delta helper and yields identical rows.
+        later = self.decode(_phy_error_log_frame(5, (15, 0, 3, 0xFFFFFFFF)))
+        self.assertEqual(self.deltas([sysfs_row], [later]), self.deltas([decoded], [later]))
+
+    def test_decoder_and_delta_perform_no_io(self):
+        frame = _phy_error_log_frame()
+        with patch("builtins.open", side_effect=AssertionError("file IO")), \
+                patch("subprocess.run", side_effect=AssertionError("exec")), \
+                patch("socket.create_connection", side_effect=AssertionError("network")):
+            decoded = self.decode(frame)
+            self.deltas([decoded], [decoded])
+
+
 class BootstrapPolicyAdmissionTests(unittest.TestCase):
     """Policy admission uses only inline synthetic inputs and a recording probe."""
 
