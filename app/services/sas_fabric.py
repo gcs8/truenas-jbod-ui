@@ -2913,6 +2913,15 @@ def _mpr_endpoint_rows(rows: Any, *, peer_field: str) -> list[dict[str, Any]] | 
     return normalized
 
 
+def _mpr_rows_by_peer(rows: list[dict[str, Any]] | None) -> dict[str | None, list[dict[str, Any]]] | None:
+    if rows is None:
+        return None
+    grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[row["peer"]].append(row)
+    return dict(grouped)
+
+
 class _MprReportedLaneContext:
     """Reported lanes for admitted MPR parent links, from one unit's PHY rows.
 
@@ -2926,10 +2935,17 @@ class _MprReportedLaneContext:
     def __init__(self, expanders: list[dict[str, Any]], adapter_detail: Any, unit: int) -> None:
         self._unit = unit
         self._expanders = expanders
-        self._rows = [_mpr_endpoint_rows(row.get("phys"), peer_field="dev_handle") for row in expanders]
+        # Index once so each link costs O(its lanes), not a rescan of the unit.
+        self._rows = [
+            _mpr_rows_by_peer(_mpr_endpoint_rows(row.get("phys"), peer_field="dev_handle")) for row in expanders
+        ]
         self._handles = [_mpr_handle(row.get("dev_handle")) for row in expanders]
+        self._positions_by_handle: dict[str, list[int]] = defaultdict(list)
+        for position, handle in enumerate(self._handles):
+            if handle is not None:
+                self._positions_by_handle[handle].append(position)
         adapter_rows = adapter_detail.get("phy_rows") if isinstance(adapter_detail, dict) else None
-        self._adapter_rows = _mpr_endpoint_rows(adapter_rows, peer_field="device_handle")
+        self._adapter_rows = _mpr_rows_by_peer(_mpr_endpoint_rows(adapter_rows, peer_field="device_handle"))
         # (attached handle, attached PHY) claims across every expander row in
         # this unit, including rows of endpoints whose own table is unusable.
         self._claims: Counter[tuple[str, int]] = Counter()
@@ -2951,7 +2967,7 @@ class _MprReportedLaneContext:
             parent_rows, parent_address = self._adapter_rows, None
             allowed = _MPR_INITIATOR_ATTACHED_DEVICES
         else:
-            matches = [position for position, handle in enumerate(self._handles) if handle == parent_handle]
+            matches = self._positions_by_handle.get(parent_handle, [])
             if len(matches) != 1:
                 return None
             parent_rows = self._rows[matches[0]]
@@ -2959,8 +2975,8 @@ class _MprReportedLaneContext:
             allowed = _MPR_EXPANDER_ATTACHED_DEVICES
         if parent_rows is None:
             return None
-        toward_parent = [row for row in child_rows if row["peer"] == parent_handle]
-        toward_child = [row for row in parent_rows if row["peer"] == child_handle]
+        toward_parent = child_rows.get(parent_handle, [])
+        toward_child = parent_rows.get(child_handle, [])
         if not toward_parent or len(toward_parent) != len(toward_child):
             return None
         # parent PHY -> (child PHY, child-reported rate)
