@@ -81,6 +81,12 @@ SMP_PHYS_PER_COMMAND = 4
 SMP_MAX_COMMANDS_PER_REFRESH = (
     1 + SMP_MAX_TARGETS_PER_REFRESH + (SMP_MAX_CALLS_PER_REFRESH - 1) // SMP_PHYS_PER_COMMAND
 )
+# Output cap for one counter command, enforced by SSHProbe instead of its
+# general 4 MiB limit. A chunk's real answer is a few hundred bytes per PHY
+# (a 28-byte frame or a short error, hex-dumped by od), so 64 KiB is ample,
+# and a whole refresh retains at most 136 x 64 KiB = 8.5 MiB of counter output
+# whatever the server sends (#1088 security review).
+SMP_MAX_OUTPUT_BYTES_PER_COMMAND = 64 * 1024
 # One expander's counters are read in full at most once per this interval,
 # whatever asked for the refresh (the Refresh button and ?force=true too).
 # They are cumulative error counts, so a reading minutes old is current
