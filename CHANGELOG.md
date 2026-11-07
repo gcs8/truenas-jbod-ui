@@ -54,6 +54,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the key input and admin credential redacted. A `--root` name that is not a
   lowercase Compose project name is refused before anything is created
   (#1090).
+- Fixed the history container running out of memory while it built its
+  background indexes after an upgrade or restore of a large v0.22.2 history.
+  The build kept its sort data in memory, so memory grew with the table and
+  could pass the default 1 GiB `HISTORY_MEM_LIMIT`. Index builds and the
+  startup upgrade now sort through temporary files in the history volume
+  (`TMPDIR`) with a bounded cache, and wait for enough free disk space. While
+  an index builds, `exact_counts=true` overview requests answer from the
+  tracked totals and say exact counts are deferred (#1092).
 
 ### Internal
 

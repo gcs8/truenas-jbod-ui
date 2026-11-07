@@ -149,6 +149,15 @@ every 1,000 SQLite VM instructions. SQLite writer-lock waits keep their existing
 five-second timeout. This does not impose a wall-clock bound on stalled storage
 I/O or rollback, and production-scale Docker shutdown timing remains unqualified.
 Compose stop-grace settings are unchanged.
+Index builds, inline or deferred, sort through SQLite temporary files with a
+bounded cache instead of in memory, so their memory no longer grows with the
+table (#1092). The temporary files go to the history service's `TMPDIR`, which
+the shipped Compose file sets to the history volume. Before each deferred build
+the service checks for free space for about one index's keys there and about
+two on the database filesystem; if it is short, it logs the space it needs,
+reports degraded and retries. While an index builds,
+`/api/history/overview?exact_counts=true` answers with the tracked totals, no
+per-scope activity counts, and `counts_deferred_reason` set.
 A 2-million-row synthetic
 database took 14.6 seconds to start without the deferral; production's
 4-million-row database took 58.7 seconds, past the healthcheck.

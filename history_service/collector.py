@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -842,27 +843,34 @@ class HistoryCollector:
             return True
         if self.collection_pause()[0]:
             return False
-        for position, name in enumerate(pending, start=1):
-            if self._stopping.is_set():
-                return False
-            try:
-                await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
-            except HistoryCollectionAlreadyRunning:
-                return False
-            except HistoryIndexBuildCancelled:
-                # An intentional stop is neither damage nor a retry failure.
-                return False
-            except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
-                self._index_build_failures += 1
-                logger.warning(
-                    "Could not build history index %s (%s, attempt %d); it will be retried.",
-                    name,
-                    type(exc).__name__,
-                    self._index_build_failures,
-                )
-                if is_database_corruption_error(exc):
-                    self._pause_for_damage(exc)
-                return False
+        # Exact-count overview scans stay deferred for the whole run, not just
+        # while each index builds, so none starts in the gap between two (#1092).
+        maintenance = getattr(self.store, "index_maintenance", None)
+        maintenance_context = maintenance() if callable(maintenance) else None
+        if not isinstance(maintenance_context, AbstractContextManager):
+            maintenance_context = nullcontext()
+        with maintenance_context:
+            for position, name in enumerate(pending, start=1):
+                if self._stopping.is_set():
+                    return False
+                try:
+                    await asyncio.to_thread(self._build_index_blocking, name, position, len(pending))
+                except HistoryCollectionAlreadyRunning:
+                    return False
+                except HistoryIndexBuildCancelled:
+                    # An intentional stop is neither damage nor a retry failure.
+                    return False
+                except Exception as exc:  # noqa: BLE001 - retried; see INDEX_BUILD_QUICK_RETRIES.
+                    self._index_build_failures += 1
+                    logger.warning(
+                        "Could not build history index %s (%s, attempt %d); it will be retried.",
+                        name,
+                        type(exc).__name__,
+                        self._index_build_failures,
+                    )
+                    if is_database_corruption_error(exc):
+                        self._pause_for_damage(exc)
+                    return False
         if self._stopping.is_set():
             return False
         self._chronological_indexes_identity = identity

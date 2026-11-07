@@ -38,6 +38,29 @@ SQLITE_SHARED_DIR_MODE = 0o770
 SQLITE_SHARED_FILE_MODE = 0o660
 SQLITE_TEMP_STORE = "MEMORY"
 SQLITE_CACHE_SIZE_KIB = 16384
+# One-shot bulk work on large tables (#1092): the deferred chronological index
+# builds and the startup schema upgrade. CREATE INDEX sorts every row through
+# SQLite's external sorter, which keeps about one cache_size of keys in memory
+# and spills the rest to temporary files. With temp_store=MEMORY those
+# "files" are heap, so the build's peak grew with the table (about 1 GiB on a
+# restored 0.22.2 history, the history container's default limit). These
+# connections spill to on-disk temporary files instead, in the directory SQLite
+# picks from SQLITE_TMPDIR or TMPDIR (the shipped Compose file points TMPDIR at
+# the history volume), with a bounded page cache.
+BULK_MAINTENANCE_TEMP_STORE = "FILE"
+BULK_MAINTENANCE_CACHE_SIZE_KIB = 16384
+# SQLite's Unix temporary-directory search order after SQLITE_TMPDIR and TMPDIR.
+SQLITE_FALLBACK_TEMP_DIRECTORIES = ("/var/tmp", "/usr/tmp", "/tmp", ".")
+# Headroom kept free on top of an index build's estimated disk use.
+INDEX_BUILD_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
+# Rows sampled to estimate an index's key size, and the per-key overhead
+# (record header, rowid and b-tree cell) added to each sampled key.
+INDEX_BUILD_SIZE_SAMPLE_ROWS = 1024
+INDEX_BUILD_KEY_OVERHEAD_BYTES = 16
+# How long an index build waits for exact-count scans already running before it
+# starts anyway. New exact-count requests are deferred as soon as it waits.
+INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS = 60.0
+INDEX_BUILD_EXACT_SCAN_POLL_SECONDS = 0.25
 SQLITE_CONNECT_TIMEOUT_SECONDS = 5.0
 SQLITE_WRITE_LOCK_RETRY_ATTEMPTS = 2
 SQLITE_WRITE_LOCK_RETRY_DELAY_SECONDS = 0.05
@@ -529,6 +552,10 @@ class HistoryIndexBuildCancelled(RuntimeError):
     """An owned deferred index build stopped; committed sibling indexes remain."""
 
 
+class HistoryIndexBuildSpaceError(RuntimeError):
+    """Not enough free disk space for an index build's temporary files and pages."""
+
+
 class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
@@ -571,6 +598,10 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
+        # Deferred index builds and exact-count scans do not overlap (#1092).
+        self._index_maintenance_condition = threading.Condition()
+        self._index_maintenance_depth = 0
+        self._exact_count_scans = 0
         if self._initialize_enabled:
             with history_write_lock(self.file_path, blocking=False):
                 # Quarantine publishes its durable intent under this same lock.
@@ -1717,6 +1748,9 @@ class HistoryStore:
 
     def _initialize_schema(self, *, migration_lock_held: bool = False) -> None:
         with closing(self._connect(migration_lock_held=migration_lock_held)) as connection:
+            # The upgrade may build identity or chronological indexes and
+            # backfill large tables; keep its sorter spill on disk (#1092).
+            self._apply_bulk_maintenance_profile(connection)
             existing_objects = connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
             if not existing_objects:
                 # Incremental mode lets retention hand freed pages back to the
@@ -1949,25 +1983,200 @@ class HistoryStore:
         started = time.monotonic()
         if should_continue is not None and not should_continue():
             raise HistoryIndexBuildCancelled()
-        with closing(self._connect()) as connection:
-            try:
-                if should_continue is not None:
-                    if not should_continue():
-                        raise HistoryIndexBuildCancelled()
-                    connection.set_progress_handler(lambda: int(not should_continue()), 1000)
-                connection.execute(statement)
-                connection.commit()
-            except sqlite3.OperationalError as exc:
-                if (
-                    getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
-                    and should_continue is not None
-                    and not should_continue()
-                ):
-                    raise HistoryIndexBuildCancelled() from exc
-                raise
-            finally:
-                connection.set_progress_handler(None, 0)
+        with self.index_maintenance():
+            # Exact-count scans are refused from here on; let running ones end.
+            self._wait_for_exact_count_scans(should_continue)
+            with closing(self._connect()) as connection:
+                try:
+                    if should_continue is not None:
+                        if not should_continue():
+                            raise HistoryIndexBuildCancelled()
+                        connection.set_progress_handler(lambda: int(not should_continue()), 1000)
+                    # Bounded memory (#1092): sorter spill goes to disk.
+                    self._apply_bulk_maintenance_profile(connection)
+                    self._require_index_build_space(connection, statement)
+                    connection.execute(statement)
+                    connection.commit()
+                except sqlite3.OperationalError as exc:
+                    if (
+                        getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT
+                        and should_continue is not None
+                        and not should_continue()
+                    ):
+                        raise HistoryIndexBuildCancelled() from exc
+                    raise
+                finally:
+                    connection.set_progress_handler(None, 0)
         logger.info("Built history index %s in %.1f seconds.", name, time.monotonic() - started)
+
+    @staticmethod
+    def _apply_bulk_maintenance_profile(connection: sqlite3.Connection) -> None:
+        """On-disk temporary storage and a bounded page cache for one-shot bulk work (#1092)."""
+
+        connection.execute(f"PRAGMA temp_store={BULK_MAINTENANCE_TEMP_STORE}")
+        connection.execute(f"PRAGMA cache_size=-{BULK_MAINTENANCE_CACHE_SIZE_KIB}")
+
+    @contextmanager
+    def index_maintenance(self) -> Iterator[None]:
+        """Mark a deferred index build (or a run of them) as active.
+
+        While it is active, `exact_count_scan` refuses new exact-count scans so
+        the overview answers from tracked counts instead of scanning the tables
+        the build is reading (#1092). It only flips a counter, so the collector
+        can hold it around its whole build loop without blocking.
+        """
+
+        with self._index_maintenance_condition:
+            self._index_maintenance_depth += 1
+        try:
+            yield
+        finally:
+            with self._index_maintenance_condition:
+                self._index_maintenance_depth -= 1
+                self._index_maintenance_condition.notify_all()
+
+    def index_maintenance_active(self) -> bool:
+        with self._index_maintenance_condition:
+            return self._index_maintenance_depth > 0
+
+    @contextmanager
+    def exact_count_scan(self) -> Iterator[bool]:
+        """Admit an exact-count scan unless an index build is active.
+
+        Yields True when the caller may scan. False means an index build owns
+        the tables right now; the caller answers from tracked counts and says
+        that the exact counts were deferred.
+        """
+
+        with self._index_maintenance_condition:
+            if self._index_maintenance_depth > 0:
+                admitted = False
+            else:
+                admitted = True
+                self._exact_count_scans += 1
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._index_maintenance_condition:
+                    self._exact_count_scans -= 1
+                    self._index_maintenance_condition.notify_all()
+
+    def _wait_for_exact_count_scans(self, should_continue: Callable[[], bool] | None) -> None:
+        deadline = time.monotonic() + INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS
+        with self._index_maintenance_condition:
+            while self._exact_count_scans > 0:
+                if should_continue is not None and not should_continue():
+                    raise HistoryIndexBuildCancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "An exact history count was still running after %.0f seconds; "
+                        "building the history index anyway.",
+                        INDEX_BUILD_EXACT_SCAN_DRAIN_SECONDS,
+                    )
+                    return
+                self._index_maintenance_condition.wait(
+                    min(remaining, INDEX_BUILD_EXACT_SCAN_POLL_SECONDS)
+                )
+
+    @staticmethod
+    def sqlite_temporary_directory() -> Path | None:
+        """The directory SQLite's Unix VFS uses for temporary files, or None.
+
+        Mirrors SQLite's own search: SQLITE_TMPDIR, TMPDIR, then fixed
+        fallbacks; the first existing directory this process can write wins.
+        """
+
+        candidates = [os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR")]
+        candidates.extend(SQLITE_FALLBACK_TEMP_DIRECTORIES)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(candidate)
+            try:
+                if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
+                    return path
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _estimate_index_bytes(connection: sqlite3.Connection, statement: str) -> int:
+        """Rough size of one index's keys, from a bounded sample of the newest rows."""
+
+        head, _, columns = statement.partition("(")
+        table = head.split()[-1]
+        terms = [term.strip() for term in columns.rsplit(")", 1)[0].split(",")]
+        sizes: list[str] = []
+        for term in terms:
+            expression = term.split()[0]
+            if expression.startswith("julianday(") or expression == "id":
+                sizes.append("9")
+            else:
+                sizes.append(f"coalesce(length(CAST({expression} AS BLOB)), 0) + 1")
+        row = connection.execute(
+            f"SELECT coalesce(max(rowid), 0) FROM {table}"
+        ).fetchone()
+        rows = int(row[0]) if row is not None else 0
+        if rows <= 0:
+            return 0
+        sampled = connection.execute(
+            f"SELECT avg({' + '.join(sizes)}) FROM "
+            f"(SELECT * FROM {table} ORDER BY rowid DESC LIMIT ?)",
+            (INDEX_BUILD_SIZE_SAMPLE_ROWS,),
+        ).fetchone()
+        average = float(sampled[0] or 0.0) if sampled is not None else 0.0
+        return int(rows * (average + INDEX_BUILD_KEY_OVERHEAD_BYTES))
+
+    def _require_index_build_space(self, connection: sqlite3.Connection, statement: str) -> None:
+        """Refuse a build that would fill the temporary or database filesystem.
+
+        The sorter writes about one index worth of keys to temporary files, and
+        the finished index is written through the WAL into the database file, so
+        the database filesystem needs about twice the index (less the free pages
+        already inside the file). One filesystem holding both needs all three.
+        A refusal is retried by the collector and reported as degraded.
+        """
+
+        index_bytes = self._estimate_index_bytes(connection, statement)
+        if index_bytes <= 0:
+            return
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        freelist_bytes = int(connection.execute("PRAGMA freelist_count").fetchone()[0]) * page_size
+        database_need = max(0, 2 * index_bytes - freelist_bytes)
+        database_directory = self.file_path.absolute().parent
+        needs: dict[tuple[int, ...] | Path, list[Any]] = {}
+
+        def add(directory: Path, need: int) -> None:
+            try:
+                key: tuple[int, ...] | Path = (int(os.stat(directory).st_dev),)
+            except OSError:
+                key = directory
+            entry = needs.setdefault(key, [directory, 0])
+            entry[1] += need
+
+        add(database_directory, database_need)
+        temporary_directory = self.sqlite_temporary_directory()
+        if temporary_directory is not None:
+            add(temporary_directory, index_bytes)
+        for directory, need in needs.values():
+            try:
+                free = int(shutil.disk_usage(directory).free)
+            except OSError:
+                continue
+            required = need + INDEX_BUILD_FREE_SPACE_MARGIN_BYTES
+            if free < required:
+                logger.warning(
+                    "Not building a history index yet: it needs about %d MiB free under %s "
+                    "for temporary files and index pages, and %d MiB is free.",
+                    required // (1024 * 1024),
+                    directory,
+                    free // (1024 * 1024),
+                )
+                raise HistoryIndexBuildSpaceError(
+                    "Not enough free disk space to build a history index."
+                )
 
     @staticmethod
     def _ensure_columns(
