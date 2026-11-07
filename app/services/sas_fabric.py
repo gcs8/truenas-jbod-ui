@@ -2928,7 +2928,7 @@ class _MprReportedLaneContext:
     A lane is published only when both endpoints report it: the child's row
     names the parent handle and parent PHY, and the parent's row names the child
     handle (and, for expanders, the child PHY). Any reused local PHY, a PHY
-    another device also claims, a type that contradicts the attachment, or
+    another device also claims (on either endpoint), a type that contradicts the attachment, or
     unequal row sets leave the whole link null. Nothing here admits a link.
     """
 
@@ -2993,7 +2993,9 @@ class _MprReportedLaneContext:
                 return None
             child_phy, child_rate = child_view[row["phy"]]
             if to_controller:
-                if row["controller_handle"] != parent_handle:
+                # Adapter rows are not in _claims, so another expander's claim
+                # on this child PHY is a contradiction, not a second lane.
+                if row["controller_handle"] != parent_handle or self._claims[(child_handle, child_phy)] != 0:
                     return None
             elif (row["remote"] != child_phy or row["device"] not in _MPR_EXPANDER_ATTACHED_DEVICES
                   or self._claims[(child_handle, child_phy)] != 1):

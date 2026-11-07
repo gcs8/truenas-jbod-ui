@@ -908,6 +908,13 @@ class MprLinkReportedLaneTests(unittest.TestCase):
                 f"36 {self.ADDRESS_C} 000c 0001 0004 1",
                 [self._expander_row(0, 0, "0001", "SAS Initiator")],
             )]),
+            # Adapter rows never count as claims, so a valid HBA-linked child phy
+            # has zero; another expander attaching to expander A phy 11 (HBA phy
+            # 0's lane) contradicts the HBA link.
+            "another expander claims the child's HBA-linked phy": dict(extra_expanders=[(
+                f"36 {self.ADDRESS_C} 000c 0009 0004 2",
+                [self._expander_row(0, 11, "0009", "Edge Expander")],
+            )]),
         }
         cascade_cases = {
             "child names a different parent phy": dict(
