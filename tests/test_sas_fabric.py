@@ -5714,3 +5714,36 @@ class CoreExpanderCounterRemediationTests(unittest.TestCase):
         self.assertNotIn(SMP_EXPANDER_A, redacted)
         self.assertIn("tnj-smp-phy-error-log:0:5000...0001:pass10:00-03", redacted)
         self.assertNotIn(SMP_EXPANDER_A, redact_ssh_command(f"sudo -n true ; {command}"))
+
+    def test_route_discovery_work_is_linear_in_rows_and_ambiguous_rows_fail_closed(self):
+        """Codex security review: index rows instead of scanning devices per expander."""
+        import app.services.core_expander_counters as counters
+
+        size = 300
+        outputs = _nine_expander_outputs(size)
+        calls = [0]
+        real_hex_int = counters._hex_int
+
+        def counting(value):
+            calls[0] += 1
+            return real_hex_int(value)
+
+        with patch.object(counters, "_hex_int", counting):
+            targets = counters.discover_smp_targets(outputs)
+        self.assertEqual(len(targets), size)
+        # One pass over expanders, their PHY rows and devices; not size * size.
+        self.assertLess(calls[0], 12 * size, calls[0])
+
+        # Two expander rows with one handle, or two device rows with one
+        # handle, cannot name one route.
+        dup_expander = SMP_EXPANDERS.replace("0019      0001", "0009      0001")
+        self.assertEqual(counters.discover_smp_targets(self.outputs(**{
+            "mprutil -u 0 show expanders": dup_expander,
+        })), [])
+        dup_device = SMP_DEVICES.replace("5000c50000000020 001a", "5000c50000000020 000a")
+        self.assertEqual(
+            [(t.expander_sas_address, t.device) for t in counters.discover_smp_targets(self.outputs(**{
+                "mprutil -u 0 show devices": dup_device,
+            }))],
+            [(SMP_EXPANDER_A, "pass12")],
+        )

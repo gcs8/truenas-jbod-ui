@@ -26,6 +26,7 @@ of the per-PHY SasPortView model; Linux sas_phy sysfs names map onto them.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -226,51 +227,106 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
         if (match := re.fullmatch(r"mprutil -u (?P<unit>\d+) show expanders", command))
     )
     for unit in units:
-        controller = f"mpr{unit}"
-        devices = parse_mpr_devices(outputs.get(f"mprutil -u {unit} show devices", ""))
-        expanders = parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", ""))
-        # Device handle -> the expanders whose PHY table lists it as attached.
-        claimed_by: dict[int, set[int]] = {}
-        for expander in expanders:
-            expander_handle = _hex_int(expander.get("dev_handle"))
-            for phy in expander.get("phys") or []:
-                attached_handle = _hex_int(phy.get("dev_handle"))
-                if expander_handle is not None and attached_handle:
-                    claimed_by.setdefault(attached_handle, set()).add(expander_handle)
-        for expander in expanders:
-            address = str(expander.get("sas_address") or "").lower()
-            handle = _hex_int(expander.get("dev_handle"))
-            try:
-                num_phys = int(str(expander.get("num_phys") or ""))
-            except ValueError:
-                continue
-            if not _SAS_ADDRESS.fullmatch(address) or handle is None or not 1 <= num_phys <= 255:
-                continue
-            attached = {_hex_int(phy.get("dev_handle")) for phy in expander.get("phys") or []} - {None, 0}
-            candidates: list[tuple[int, str]] = []
-            for device in devices:
-                own = str(device.get("sas_address") or "").lower() == address
-                parent = _hex_int(device.get("parent")) or None
-                device_handle = _hex_int(device.get("handle"))
-                child = parent == handle or device_handle in attached
-                # A cascaded expander's own SMP target would answer for itself.
-                if child and not own and "SMP" in str(device.get("device") or "").upper():
-                    continue
-                claims = claimed_by.get(device_handle, set()) if device_handle else set()
-                if child and not own and (
-                    (parent is not None and claims - {parent}) or (parent is None and len(claims) > 1)
-                ):
-                    # Contradictory parent/attachment evidence: fail closed.
-                    continue
-                target_text = str(device.get("target") or "")
-                if not (own or child) or not target_text.isdigit():
-                    continue
-                route = routes.get((controller, int(target_text)))
-                if route:
-                    candidates.append((int(target_text), route))
-            if candidates:
-                targets.append(SmpTarget(unit, address, min(candidates)[1], num_phys))
+        targets.extend(_unit_smp_targets(
+            f"mpr{unit}",
+            unit,
+            parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", "")),
+            parse_mpr_devices(outputs.get(f"mprutil -u {unit} show devices", "")),
+            routes,
+        ))
     targets.sort(key=lambda item: (item.unit, item.expander_sas_address))
+    return targets
+
+
+def _unit_smp_targets(
+    controller: str,
+    unit: int,
+    expanders: Sequence[Mapping[str, Any]],
+    devices: Sequence[Mapping[str, Any]],
+    routes: Mapping[tuple[str, int], str],
+) -> list[SmpTarget]:
+    """Routes for one controller's expanders, with work linear in the rows.
+
+    Rows are indexed once by handle, parent and address, and only the first
+    255 PHY rows of an expander are read, so a large or hostile listing
+    cannot make correlation quadratic. Two expander rows with one handle or
+    address, or two device rows with one handle, cannot name one route and
+    are dropped (fail closed).
+    """
+    expander_rows: list[tuple[Mapping[str, Any], str, int | None, list[int]]] = []
+    for expander in expanders:
+        attached = [
+            handle for phy in list(expander.get("phys") or [])[:255]
+            if (handle := _hex_int(phy.get("dev_handle")))
+        ]
+        expander_rows.append(
+            (expander, str(expander.get("sas_address") or "").lower(), _hex_int(expander.get("dev_handle")), attached)
+        )
+    # Device handle -> the expanders whose PHY table lists it as attached.
+    claimed_by: dict[int, set[int]] = {}
+    for _expander, _address, expander_handle, attached in expander_rows:
+        if expander_handle is not None:
+            for attached_handle in attached:
+                claimed_by.setdefault(attached_handle, set()).add(expander_handle)
+    handle_rows = Counter(handle for _e, _a, handle, _p in expander_rows if handle is not None)
+    address_rows = Counter(address for _e, address, _h, _p in expander_rows)
+
+    rows: list[tuple[str, int | None, int | None, Mapping[str, Any]]] = []
+    for device in devices:
+        rows.append((
+            str(device.get("sas_address") or "").lower(),
+            _hex_int(device.get("parent")) or None,
+            _hex_int(device.get("handle")),
+            device,
+        ))
+    device_handle_rows = Counter(handle for _a, _p, handle, _d in rows if handle is not None)
+    by_address: dict[str, list[int]] = {}
+    by_parent: dict[int, list[int]] = {}
+    by_handle: dict[int, int] = {}
+    for index, (address, parent, handle, _device) in enumerate(rows):
+        by_address.setdefault(address, []).append(index)
+        if parent is not None:
+            by_parent.setdefault(parent, []).append(index)
+        if handle is not None and device_handle_rows[handle] == 1:
+            by_handle[handle] = index
+
+    targets: list[SmpTarget] = []
+    for expander, address, handle, attached in expander_rows:
+        try:
+            num_phys = int(str(expander.get("num_phys") or ""))
+        except ValueError:
+            continue
+        if not _SAS_ADDRESS.fullmatch(address) or handle is None or not 1 <= num_phys <= 255:
+            continue
+        if handle_rows[handle] > 1 or address_rows[address] > 1:
+            continue
+        indexes = {*by_address.get(address, ()), *by_parent.get(handle, ())}
+        indexes.update(by_handle[item] for item in attached if item in by_handle)
+        attached_set = set(attached)
+        candidates: list[tuple[int, str]] = []
+        for index in indexes:
+            device_address, parent, device_handle, device = rows[index]
+            if device_handle is not None and device_handle_rows[device_handle] > 1:
+                continue
+            own = device_address == address
+            child = parent == handle or device_handle in attached_set
+            # A cascaded expander's own SMP target would answer for itself.
+            if child and not own and "SMP" in str(device.get("device") or "").upper():
+                continue
+            claims = claimed_by.get(device_handle, set()) if device_handle else set()
+            if child and not own and (
+                (parent is not None and claims - {parent}) or (parent is None and len(claims) > 1)
+            ):
+                # Contradictory parent/attachment evidence: fail closed.
+                continue
+            target_text = str(device.get("target") or "")
+            if not (own or child) or not target_text.isdigit():
+                continue
+            route = routes.get((controller, int(target_text)))
+            if route:
+                candidates.append((int(target_text), route))
+        if candidates:
+            targets.append(SmpTarget(unit, address, min(candidates)[1], num_phys))
     return targets
 
 

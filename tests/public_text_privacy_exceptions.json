@@ -571,7 +571,7 @@
         "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
       },
       "sas_wwn_identifier": {
-        "sha256:f2a99f1d8e87db1672e1dee757e1107bf47eb65ced4e07f3e2d3278d5b881e62": 51
+        "sha256:e77e43e74f44c45a2ff39bb11344fcdf985c980cca373d621a20b5504ab03610": 53
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
