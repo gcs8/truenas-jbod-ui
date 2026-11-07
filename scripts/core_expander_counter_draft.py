@@ -13,10 +13,20 @@ https://github.com/doug-gilbert/smp_utils/blob/5ff2d5c638896332041804d0bfa952523
 main(): function 0x11, allocated response length 6, request length 2, phy byte 9;
 12 request / 28 response bytes excluding CRC. smp_utils is NOT required or
 admitted by this draft. No installed binary or host transport is verified here.
+
+The response decoder and delta helper below are equally inert: pure functions
+over caller-supplied bytes and rows, with no call site, collector, history or
+UI consumer. Response layout is SPL-4 r10 9.4.3.11 Table 336, cross-checked
+against the smp_utils main() offsets above (change count at 4, phy at 9,
+four big-endian uint32 counters at 12/16/20/24). Rows use the counter keys of
+the existing per-phy SasPortView model; the Linux sas_phy sysfs names are
+mapped onto the same keys (scsi_transport_sas.c sas_phy_linkerror_attr, "%u"):
+https://github.com/torvalds/linux/blob/v6.8/drivers/scsi/scsi_transport_sas.c
 """
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 
 
 CAMCONTROL = "/sbin/camcontrol"
@@ -103,4 +113,154 @@ def draft_readonly_policy(
         argv=command,
         candidate_grant=f"{CAMCONTROL} ^{arguments}$",
     )
+    return result
+
+
+# --- REPORT PHY ERROR LOG response decoding (inert) -------------------------
+
+SMP_FRAME_TYPE_RESPONSE = 0x41
+SMP_FUNCTION_REPORT_PHY_ERROR_LOG = 0x11
+# Response length in dwords after the 4-byte header, excluding CRC (SAS-2+).
+PHY_ERROR_LOG_RESPONSE_LENGTH = 6
+PHY_ERROR_LOG_FRAME_BYTES = 4 + 4 * PHY_ERROR_LOG_RESPONSE_LENGTH  # 28, no CRC
+COUNTER_SATURATED = 0xFFFFFFFF
+
+COUNTER_FIELDS = (
+    "invalid_dword_count",
+    "running_disparity_error_count",
+    "loss_of_dword_synchronization_count",
+    "phy_reset_problem_count",
+)
+_COUNTER_OFFSETS = dict(zip(COUNTER_FIELDS, (12, 16, 20, 24)))
+# Linux /sys/class/sas_phy/<phy>/<attribute> name -> shared per-phy row key.
+SYSFS_COUNTER_ATTRIBUTES = {
+    "invalid_dword_count": "invalid_dword_count",
+    "running_disparity_error_count": "running_disparity_error_count",
+    "loss_of_dword_sync_count": "loss_of_dword_synchronization_count",
+    "phy_reset_problem_count": "phy_reset_problem_count",
+}
+
+
+class SmpResponseError(ValueError):
+    """A REPORT PHY ERROR LOG response that must not be read as counters.
+
+    ``reason`` is one of frame_type_error, frame_length, frame_type, function,
+    function_result, response_length or phy_identifier.
+    """
+
+    def __init__(self, reason: str, message: str, *, function_result: int | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.function_result = function_result
+
+
+class CounterSampleError(ValueError):
+    """A per-phy counter sample that cannot be compared safely."""
+
+
+def decode_phy_error_log_response(frame: object, *, phy: int) -> dict[str, int]:
+    """Decode one CRC-excluded response for the requested phy, or raise.
+
+    Validation order puts the function result before length checks because an
+    expander may return a header-only frame for a failed function; that is
+    reported as its result, never decoded as zeros. Only SAS-2+ frames with
+    RESPONSE LENGTH 06h are admitted; the SAS-1.1 zero-length form is refused.
+    Reserved bytes are ignored and the expander change count is not returned.
+    """
+    if type(phy) is not int or not 0 <= phy <= 254:
+        raise ValueError("A literal requested phy integer from 0 through 254 is required")
+    if not isinstance(frame, (bytes, bytearray, memoryview)):
+        raise SmpResponseError("frame_type_error", "Response must be bytes, not decoded or text data")
+    data = bytes(frame)
+    if len(data) < 4:
+        raise SmpResponseError("frame_length", f"Response has {len(data)} bytes; no SMP header")
+    if data[0] != SMP_FRAME_TYPE_RESPONSE:
+        raise SmpResponseError("frame_type", f"SMP frame type {data[0]:02X}h is not a response (41h)")
+    if data[1] != SMP_FUNCTION_REPORT_PHY_ERROR_LOG:
+        raise SmpResponseError("function", f"Function {data[1]:02X}h is not REPORT PHY ERROR LOG (11h)")
+    if data[2] != 0:
+        raise SmpResponseError(
+            "function_result",
+            f"Function result {data[2]:02X}h is not SMP FUNCTION ACCEPTED",
+            function_result=data[2],
+        )
+    if len(data) != PHY_ERROR_LOG_FRAME_BYTES:
+        raise SmpResponseError(
+            "frame_length",
+            f"Response has {len(data)} bytes; exactly {PHY_ERROR_LOG_FRAME_BYTES} without CRC are required",
+        )
+    if data[3] != PHY_ERROR_LOG_RESPONSE_LENGTH:
+        raise SmpResponseError(
+            "response_length",
+            f"Response length {data[3]:02X}h is not {PHY_ERROR_LOG_RESPONSE_LENGTH:02X}h",
+        )
+    if data[9] != phy:
+        raise SmpResponseError("phy_identifier", f"Response phy {data[9]} does not match requested phy {phy}")
+    row: dict[str, int] = {"phy": phy}
+    for field, offset in _COUNTER_OFFSETS.items():
+        # Saturated counters stay FFFFFFFFh; they never wrap.
+        row[field] = int.from_bytes(data[offset:offset + 4], "big")
+    return row
+
+
+def _counter_sample(sample: object, label: str) -> dict[int, dict[str, int | None]]:
+    if isinstance(sample, (str, bytes, bytearray, Mapping)) or not isinstance(sample, Sequence):
+        raise CounterSampleError(f"{label} sample must be a sequence of per-phy rows")
+    rows: dict[int, dict[str, int | None]] = {}
+    for row in sample:
+        if not isinstance(row, Mapping):
+            raise CounterSampleError(f"{label} sample rows must be mappings")
+        phy = row.get("phy")
+        if type(phy) is not int or not 0 <= phy <= 255:
+            raise CounterSampleError(f"{label} sample has a missing or malformed phy identifier")
+        if phy in rows:
+            raise CounterSampleError(f"{label} sample repeats phy {phy}")
+        counters: dict[str, int | None] = {}
+        for field in COUNTER_FIELDS:
+            if field not in row:
+                raise CounterSampleError(f"{label} phy {phy} omits {field}; use None when unreported")
+            value = row[field]
+            if value is not None and (type(value) is not int or not 0 <= value <= COUNTER_SATURATED):
+                raise CounterSampleError(f"{label} phy {phy} {field} is not an unsigned 32-bit count")
+            counters[field] = value
+        rows[phy] = counters
+    return rows
+
+
+def phy_counter_deltas(previous: object, current: object) -> list[dict[str, object]]:
+    """Return per-phy increments between two samples of one expander.
+
+    Each row keeps the shared per-phy keys, with a numeric increment or None,
+    plus ``counter_states`` per counter:
+    * ``delta``: current >= previous, increment is current - previous;
+    * ``reset``: current < previous, so the counter was cleared; the value is
+      the count since the reset (a lower bound), never a negative number;
+    * ``saturated``: current is FFFFFFFFh, increment unknown (None);
+    * ``unavailable``: current value not reported (None);
+    * ``no_baseline``: previous value or phy not reported (None).
+    Phys present only in ``previous`` are dropped. Rows are ordered by phy.
+    The caller must supply samples from the same expander in time order.
+    """
+    before = _counter_sample(previous, "previous")
+    after = _counter_sample(current, "current")
+    result: list[dict[str, object]] = []
+    for phy in sorted(after):
+        row: dict[str, object] = {"phy": phy}
+        states: dict[str, str] = {}
+        baseline = before.get(phy)
+        for field in COUNTER_FIELDS:
+            now = after[phy][field]
+            then = None if baseline is None else baseline[field]
+            if now is None:
+                states[field], row[field] = "unavailable", None
+            elif now == COUNTER_SATURATED:
+                states[field], row[field] = "saturated", None
+            elif then is None:
+                states[field], row[field] = "no_baseline", None
+            elif now < then:
+                states[field], row[field] = "reset", now
+            else:
+                states[field], row[field] = "delta", now - then
+        row["counter_states"] = states
+        result.append(row)
     return result
