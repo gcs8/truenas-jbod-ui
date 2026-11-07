@@ -5,7 +5,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Mapping, Protocol
 from urllib.parse import quote, unquote
 
 from app.config import SystemConfig
@@ -30,6 +30,7 @@ from app.services.core_expander_counters import (
     PERMISSION_DENIED_MESSAGE as SMP_PERMISSION_DENIED_MESSAGE,
     READ_BUDGET_MESSAGE as SMP_READ_BUDGET_MESSAGE,
     READ_BUDGET_REASON as SMP_READ_BUDGET_REASON,
+    SMP_MAX_CALLS_PER_REFRESH,
     SMP_MAX_TARGETS_PER_REFRESH,
     SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX,
     counter_summary as smp_counter_summary,
@@ -129,6 +130,9 @@ class SasFabricBuildContext:
     # CORE expander PHY error counter capability last seen by the collector
     # (#941): "granted", "permission_denied" or None when not yet known.
     expander_counter_capability: str | None = None
+    # Kept full counter reads by output key: (stdout, UTC read time). Shown
+    # until the expander is due for its next read (#1088 review).
+    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None
 
 
 class SasFabricBuilder(Protocol):
@@ -179,6 +183,7 @@ def _build_sas_fabric_context(
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
+    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None,
 ) -> SasFabricBuildContext:
     return SasFabricBuildContext(
         system=system,
@@ -190,6 +195,7 @@ def _build_sas_fabric_context(
         aliases=aliases,
         alias_map=_sas_fabric_alias_map(aliases or []),
         expander_counter_capability=expander_counter_capability,
+        expander_counter_reads=expander_counter_reads,
     )
 
 
@@ -211,6 +217,7 @@ def build_sas_fabric_snapshot(
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
+    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None,
 ) -> SasFabricSnapshot:
     context = _build_sas_fabric_context(
         system=system,
@@ -221,6 +228,7 @@ def build_sas_fabric_snapshot(
         command_failures=command_failures,
         aliases=aliases,
         expander_counter_capability=expander_counter_capability,
+        expander_counter_reads=expander_counter_reads,
     )
     return _select_sas_fabric_builder(context).build(context)
 
@@ -727,7 +735,9 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         traces=traces,
         snapshot=snapshot,
     ))
-    _attach_expander_phy_error_counters(nodes, normalized_outputs, context.expander_counter_capability)
+    _attach_expander_phy_error_counters(
+        nodes, normalized_outputs, context.expander_counter_capability, context.expander_counter_reads,
+    )
     for controller in controllers:
         controller_node = nodes.get(str(controller.get("id") or ""))
         if controller_node:
@@ -3193,24 +3203,59 @@ def _merged_phy_error_log_rows(
     return merged
 
 
+def _kept_read_times(
+    outputs: dict[str, str],
+    reads: Mapping[str, tuple[str, str]] | None,
+    routed: dict[tuple[int, str], Any],
+) -> dict[tuple[int, str], str]:
+    """Add kept full reads to ``outputs``; return each routed expander's read time.
+
+    A kept read replaces this refresh's output under the same key (the
+    collector keeps exactly what it just read), and counts only for the pass
+    device this refresh's topology routes to that expander.
+    """
+    read_at: dict[tuple[int, str], str] = {}
+    for key, (stdout, at) in (reads or {}).items():
+        if not str(key).startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
+            continue
+        parsed = parse_phy_error_log_output(stdout)
+        if parsed.unit is None or parsed.expander_sas_address is None:
+            continue
+        expander = (parsed.unit, parsed.expander_sas_address)
+        target = routed.get(expander)
+        if target is None or target.device != parsed.device:
+            continue
+        outputs[key] = stdout
+        read_at[expander] = str(at)
+    return read_at
+
+
 def _attach_expander_phy_error_counters(
     nodes: dict[str, SasFabricNode],
     outputs: dict[str, str],
     capability: str | None,
+    reads: Mapping[str, tuple[str, str]] | None = None,
 ) -> None:
     """Attach SMP REPORT PHY ERROR LOG counters to CORE expander PHY rows (#941).
 
     Counters the app could not read stay None with a reason, never zero. A
     refused sudo grant reads as "not available (permission not granted)".
+    Counters kept from an earlier refresh carry their read time; they are not
+    shown once sudo refuses the read.
     """
     expander_nodes = [node for node in nodes.values() if node.kind == "expander"]
     if not expander_nodes:
         return
     routed = {(target.unit, target.expander_sas_address): target for target in discover_smp_targets(outputs)}
+    outputs = dict(outputs)
+    read_at = {} if capability == SMP_CAPABILITY_DENIED else _kept_read_times(outputs, reads, routed)
     results = _merged_phy_error_log_rows(outputs, routed)
-    # More routed expanders than one refresh may read: the unread ones wait
-    # their turn in the rotation; they are not a routing failure.
-    budget_limited = len(routed) > SMP_MAX_TARGETS_PER_REFRESH and bool(results)
+    # More routed expanders or PHYs than one refresh may read: the unread
+    # ones wait their turn in the rotation; they are not a routing failure.
+    budget_limited = bool(results) and (
+        len(routed) > SMP_MAX_TARGETS_PER_REFRESH
+        or sum(min(target.num_phys, 255) for target in routed.values()) > SMP_MAX_CALLS_PER_REFRESH - 1
+    )
     for node in expander_nodes:
         unit = node.raw.get("unit")
         key = (unit if isinstance(unit, int) else -1, str(node.raw.get("sas_address") or "").lower())
@@ -3263,6 +3308,7 @@ def _attach_expander_phy_error_counters(
             "reason": reason,
             "source": _SMP_COUNTER_EVIDENCE,
             "device": target.device if target else None,
+            "read_at": read_at.get(key),
             **summary,
             "rows": rows,
         }
@@ -3270,6 +3316,8 @@ def _attach_expander_phy_error_counters(
             parts = [f"{summary['measured_phys']} PHYs read", f"{summary['phys_with_errors']} with errors"]
             if summary["unknown_phys"]:
                 parts.append(f"{summary['unknown_phys']} unknown")
+            if read_at.get(key):
+                parts.append(f"read at {read_at[key]}")
             node.metrics["phy_error_counters"] = ", ".join(parts)
         else:
             node.metrics["phy_error_counters"] = message

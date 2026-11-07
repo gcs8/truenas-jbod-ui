@@ -60,11 +60,20 @@ SMP_PHY_ERROR_LOG_MARKER = "tnj-smp-phy-error-log"
 # sends SIGTERM (sudo relays it to camcontrol), then SIGKILL after the grace.
 SMP_CALL_TIMEOUT_SECONDS = 2
 SMP_CALL_KILL_AFTER_SECONDS = 1
-# Route discovery is complete; this budget only limits how many expanders one
-# refresh reads. Larger fabrics are read in turn (see read_window()).
+# Route discovery is complete; these budgets only limit what one refresh
+# reads. Larger fabrics are read in turn (see select_counter_reads()).
 SMP_MAX_TARGETS_PER_REFRESH = 8
+# Hard ceiling on sudo camcontrol calls in one refresh, forced or not: the
+# one-PHY permission probe plus every full read. One full read of the largest
+# expander (255 PHYs) always fits alongside the probe.
+SMP_MAX_CALLS_PER_REFRESH = 512
+# One expander's counters are read in full at most once per this interval,
+# whatever asked for the refresh (the Refresh button and ?force=true too).
+# They are cumulative error counts, so a reading minutes old is current
+# enough; inside the interval the last reading is shown with its read time.
+SMP_COUNTER_READ_INTERVAL_SECONDS = 15 * 60
 # A refused capability is asked again only after this long (or after the app
-# restarts), not on every refresh.
+# restarts, or with one probe call on a forced refresh), not on every refresh.
 SMP_CAPABILITY_RETRY_SECONDS = 6 * 60 * 60
 
 PERMISSION_DENIED_MESSAGE = "Expander counters not available (permission not granted)."
@@ -73,7 +82,7 @@ NO_ANSWER_MESSAGE = "Expander counters not available (the expander did not retur
 NOT_READ_MESSAGE = "Expander counters not read yet."
 READ_BUDGET_MESSAGE = (
     f"Expander counters not read this refresh (read budget of {SMP_MAX_TARGETS_PER_REFRESH} expanders "
-    "per refresh; expanders are read in turn)."
+    f"and {SMP_MAX_CALLS_PER_REFRESH} PHY reads per refresh; expanders are read in turn)."
 )
 READ_BUDGET_REASON = "read_budget"
 
@@ -214,7 +223,7 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
     parent leaves two expanders claiming it, is no route at all: the tables
     disagree (a topology change or a reused handle) and the read could reach
     the wrong expander. Every expander with a route is returned; the per
-    refresh read budget is applied by read_window(), not here.
+    refresh read budget is applied by select_counter_reads(), not here.
     """
     # Imported here: the parsers module imports this one for its output key.
     from app.services.sas_fabric_parsers import parse_mpr_devices, parse_mpr_expanders
@@ -330,27 +339,49 @@ def _unit_smp_targets(
     return targets
 
 
-def read_window(targets: Sequence[SmpTarget], offset: int) -> list[SmpTarget]:
-    """The expanders one refresh reads: all of them, or a rotating budget.
+def select_counter_reads(
+    targets: Sequence[SmpTarget],
+    last_read: Mapping[tuple[int, str], float],
+    now: float,
+    call_budget: int,
+) -> list[SmpTarget]:
+    """The expanders one refresh reads in full.
 
-    With more routed expanders than SMP_MAX_TARGETS_PER_REFRESH, the window
-    starts at ``offset`` (mod the target count) in the stable discovery order
-    and wraps, so successive offsets from next_read_offset() reach every
-    expander. The result keeps discovery order.
+    An expander read less than SMP_COUNTER_READ_INTERVAL_SECONDS ago (by the
+    monotonic times in ``last_read``) is not due, whatever asked for the
+    refresh. Due expanders go least recently read first (never read first,
+    then discovery order), up to SMP_MAX_TARGETS_PER_REFRESH expanders and
+    ``call_budget`` PHY calls, so every expander gets its turn. The result
+    keeps discovery order.
     """
-    ordered = list(targets)
-    if len(ordered) <= SMP_MAX_TARGETS_PER_REFRESH:
-        return ordered
-    start = offset % len(ordered)
-    chosen = {(start + step) % len(ordered) for step in range(SMP_MAX_TARGETS_PER_REFRESH)}
-    return [target for index, target in enumerate(ordered) if index in chosen]
+    order = {target.identity: index for index, target in enumerate(targets)}
+    due = [
+        target for target in targets
+        if now - last_read.get((target.unit, target.expander_sas_address), float("-inf"))
+        >= SMP_COUNTER_READ_INTERVAL_SECONDS
+    ]
+    due.sort(key=lambda target: (
+        last_read.get((target.unit, target.expander_sas_address), float("-inf")), order[target.identity],
+    ))
+    chosen: list[SmpTarget] = []
+    calls = 0
+    for target in due:
+        cost = min(target.num_phys, 255)
+        if len(chosen) >= SMP_MAX_TARGETS_PER_REFRESH:
+            break
+        if calls + cost > call_budget:
+            continue
+        chosen.append(target)
+        calls += cost
+    return sorted(chosen, key=lambda target: order[target.identity])
 
 
-def next_read_offset(offset: int, target_count: int) -> int:
-    """Where the next refresh's window starts."""
-    if target_count <= SMP_MAX_TARGETS_PER_REFRESH:
+def smp_output_calls(output_key: str | None) -> int:
+    """How many PHY calls an output key's range stands for (0 for other keys)."""
+    match = re.search(r":([0-9a-f]{2})-([0-9a-f]{2})$", str(output_key or ""))
+    if not match or not str(output_key).startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
         return 0
-    return (offset + SMP_MAX_TARGETS_PER_REFRESH) % target_count
+    return max(0, int(match.group(2), 16) - int(match.group(1), 16)) + 1
 
 
 def build_phy_error_log_command(target: SmpTarget, phys: Sequence[int] | None = None) -> str:

@@ -107,11 +107,13 @@ from app.services.core_expander_counters import (
     CAPABILITY_DENIED,
     CAPABILITY_GRANTED,
     SMP_CAPABILITY_RETRY_SECONDS,
+    SMP_COUNTER_READ_INTERVAL_SECONDS,
+    SMP_MAX_CALLS_PER_REFRESH,
     build_phy_error_log_command,
     discover_smp_targets,
-    next_read_offset,
     parse_phy_error_log_output,
-    read_window,
+    select_counter_reads,
+    smp_output_calls,
     smp_output_key,
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
@@ -1437,7 +1439,6 @@ class InventoryService:
     # Class defaults keep partially built services (tests, adapters) readable.
     _smp_counter_capability: str | None = None
     _smp_counter_checked_at = 0.0
-    _smp_counter_read_offset = 0
 
     def __init__(
         self,
@@ -1547,9 +1548,12 @@ class InventoryService:
         # A refusal is remembered so sudo is not asked again on every refresh.
         self._smp_counter_capability = None
         self._smp_counter_checked_at = 0.0
-        # Start of the next rotating read window when a fabric has more
-        # routed expanders than one refresh may read.
-        self._smp_counter_read_offset = 0
+        # Per expander (unit, SAS address): when its last full read was
+        # planned (monotonic), and that read's output with its wall-clock read
+        # time, reused until the expander is due again (#1088 review).
+        self._smp_counter_last_read: dict[tuple[int, str], float] = {}
+        self._smp_counter_planned: dict[str, tuple[int, str]] = {}
+        self._smp_counter_reads: dict[tuple[int, str], tuple[str, str, str]] = {}
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
@@ -2507,6 +2511,7 @@ class InventoryService:
             command_failures=source_bundle.ssh_failure_details,
             aliases=aliases,
             expander_counter_capability=self._smp_counter_capability,
+            expander_counter_reads=self.expander_counter_reads(),
         )
         return fabric.model_copy(
             update={
@@ -4759,6 +4764,34 @@ class InventoryService:
     def _smp_counter_clock() -> float:
         return time.monotonic()
 
+    @staticmethod
+    def _smp_counter_wall_clock() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _record_smp_counter_reads(self, command_results: list[SSHCommandResult]) -> None:
+        """Keep each full read this collection ran, with its read time.
+
+        Called once after a collection. Only reads the planner chose as full
+        reads are kept, so a one-PHY permission probe never replaces a kept
+        full reading.
+        """
+        planned = getattr(self, "_smp_counter_planned", None) or {}
+        self._smp_counter_planned = {}
+        if not planned:
+            return
+        read_at = self._smp_counter_wall_clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+        reads = dict(getattr(self, "_smp_counter_reads", None) or {})
+        for item in command_results:
+            key = smp_output_key(item.command)
+            if item.ok and key in planned:
+                reads[planned[key]] = (key, item.stdout, read_at)
+        self._smp_counter_reads = reads
+
+    def expander_counter_reads(self) -> dict[str, tuple[str, str]]:
+        """Kept full reads by output key: (stdout, read time) for the fabric view."""
+        reads = getattr(self, "_smp_counter_reads", None) or {}
+        return {key: (stdout, read_at) for key, stdout, read_at in reads.values()}
+
     def _record_smp_counter_capability(self, command_results: list[SSHCommandResult]) -> None:
         """Remember whether sudo ran the expander counter read in these results."""
         outcomes = {
@@ -4788,20 +4821,44 @@ class InventoryService:
             self._smp_counter_checked_at = float("-inf")
 
     def _smp_counter_read_commands(self, targets: list[Any], command_results: list[SSHCommandResult]) -> list[str]:
-        """Full reads for this refresh's window of routed expanders.
+        """Full reads for the expanders due this refresh (#1088 review).
 
-        The window rotates once per refresh. Later planning rounds of the same
-        refresh see the window's outputs and add nothing; the probe's output
-        alone does not count, since the full reads follow it in that refresh.
+        Each expander is read at most once per SMP_COUNTER_READ_INTERVAL_SECONDS,
+        forced refresh or not; the interval starts when the read is planned, so
+        a read that fails or times out still counts. One refresh reads at most
+        SMP_MAX_TARGETS_PER_REFRESH expanders and SMP_MAX_CALLS_PER_REFRESH PHY
+        calls, the probe included. Later planning rounds of the same refresh
+        see its reads and add nothing; the probe's output alone does not count,
+        since the full reads follow it in that refresh.
         """
-        window = read_window(targets, self._smp_counter_read_offset)
-        if len(window) == len(targets):
-            return [build_phy_error_log_command(target) for target in targets]
+        keys = {smp_output_key(item.command) for item in command_results} - {None}
         probe_key = smp_output_key(build_phy_error_log_command(targets[0], [0]))
-        if {smp_output_key(item.command) for item in command_results} - {None, probe_key}:
+        if keys - {probe_key}:
             return []
-        self._smp_counter_read_offset = next_read_offset(self._smp_counter_read_offset, len(targets))
-        return [build_phy_error_log_command(target) for target in window]
+        now = self._smp_counter_clock()
+        current = {(target.unit, target.expander_sas_address) for target in targets}
+        last_read = {
+            expander: planned_at
+            for expander, planned_at in (getattr(self, "_smp_counter_last_read", None) or {}).items()
+            if now - planned_at < SMP_COUNTER_READ_INTERVAL_SECONDS
+        }
+        self._smp_counter_reads = {
+            expander: read
+            for expander, read in (getattr(self, "_smp_counter_reads", None) or {}).items()
+            if expander in current
+        }
+        planned = dict(getattr(self, "_smp_counter_planned", None) or {})
+        budget = SMP_MAX_CALLS_PER_REFRESH - sum(smp_output_calls(key) for key in keys)
+        commands: list[str] = []
+        for target in select_counter_reads(targets, last_read, now, budget):
+            expander = (target.unit, target.expander_sas_address)
+            command = build_phy_error_log_command(target)
+            last_read[expander] = now
+            planned[smp_output_key(command)] = expander
+            commands.append(command)
+        self._smp_counter_last_read = last_read
+        self._smp_counter_planned = planned
+        return commands
 
     def _core_expander_counter_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         """Read expander PHY error counters when the account may (#941).
@@ -4970,6 +5027,7 @@ class InventoryService:
                     sum(1 for result in command_results if not result.ok),
                     time.perf_counter() - ssh_started,
                 )
+            self._record_smp_counter_reads(command_results)
             outputs = {item.command: item.stdout for item in command_results if item.ok}
             failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
             failure_details = self._ssh_failure_details(command_results)
