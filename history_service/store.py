@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from app.services.storage_writability import host_repair_path
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
 from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
@@ -51,16 +52,16 @@ BULK_MAINTENANCE_TEMP_STORE = "FILE"
 BULK_MAINTENANCE_CACHE_SIZE_KIB = 16384
 # SQLite's Unix temporary-directory search order after SQLITE_TMPDIR and TMPDIR.
 SQLITE_FALLBACK_TEMP_DIRECTORIES = ("/var/tmp", "/usr/tmp", "/tmp", ".")
-# Headroom kept free on top of an index build's estimated disk use.
-INDEX_BUILD_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
-# Rows sampled to estimate an index's key size, and the per-key overhead
-# (record header, rowid and b-tree cell) added to each sampled key.
-INDEX_BUILD_SIZE_SAMPLE_ROWS = 1024
-INDEX_BUILD_KEY_OVERHEAD_BYTES = 16
-# An index holds a subset of each row's columns, so it cannot outgrow the
-# database file holding those rows; this multiple of the file's pages caps the
-# estimate with evidence a crafted counter or rowid cannot inflate (#1093).
-INDEX_BUILD_MAX_DATABASE_MULTIPLE = 2
+# The free-space pre-flight before a deferred index build (#1093) refuses only a
+# build that provably cannot fit. No size estimate is exact, so the guarantee
+# is the reaction: a build that runs out of space anyway rolls back, waits for
+# free space while collection continues, and is retried. The bound counts, for
+# every retained row, the smallest record SQLite can store for the key: one
+# length byte, one header-size byte and one type byte per key column plus the
+# rowid. Real keys are several times larger; nothing in the file can make
+# them smaller.
+INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES = 2
+MIB = 1024 * 1024
 # Tables whose row counts history_table_counts tracks through triggers.
 HISTORY_COUNTED_TABLES = ("slot_events", "metric_samples", "metric_rollups")
 # How long an index build waits for exact-count scans already running before it
@@ -560,6 +561,30 @@ class HistoryIndexBuildCancelled(RuntimeError):
 
 class HistoryIndexBuildSpaceError(RuntimeError):
     """Not enough free disk space for an index build's temporary files and pages."""
+
+
+class HistoryStartupSpaceError(HistoryStartupError):
+    """The startup schema upgrade ran out of disk space (#1093).
+
+    SQLite rolled the statement back, so the database is intact; the reason
+    names the volume and roughly how much free space the upgrade needs.
+    Restarting cannot help until space is freed, so this is not retried.
+    """
+
+
+def is_disk_full_error(exc: BaseException) -> bool:
+    """True for SQLite's "database or disk is full" (SQLITE_FULL).
+
+    SQLite reports ENOSPC on the database, its WAL or its temporary sort
+    files this way, and max_page_count limits too.
+    """
+
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF == getattr(sqlite3, "SQLITE_FULL", 13):
+        return True
+    return "database or disk is full" in str(exc).lower()
 
 
 class HistoryBackupSourceReplacedError(RuntimeError):
@@ -1683,6 +1708,10 @@ class HistoryStore:
         try:
             self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
         except sqlite3.OperationalError as exc:
+            if is_disk_full_error(exc):
+                # SQLite rolled the upgrade statement back; say what to free
+                # instead of a bare traceback (#1093).
+                raise HistoryStartupSpaceError(self._describe_startup_space_failure()) from exc
             if self._is_readonly_database_error(exc) and self._attempt_readonly_database_repair(exc):
                 self._initialize_schema_and_permissions(migration_lock_held=migration_lock_held)
                 return
@@ -2098,6 +2127,13 @@ class HistoryStore:
                         and not should_continue()
                     ):
                         raise HistoryIndexBuildCancelled() from exc
+                    if is_disk_full_error(exc):
+                        # The real guarantee (#1093): no estimate is exact, so a
+                        # build that fills the volume is a wait, not damage.
+                        self._release_failed_index_build(connection)
+                        raise HistoryIndexBuildSpaceError(
+                            "The history volume filled up while building a history index."
+                        ) from exc
                     raise
                 finally:
                     connection.set_progress_handler(None, 0)
@@ -2195,24 +2231,79 @@ class HistoryStore:
                 continue
         return None
 
-    @staticmethod
-    def _estimate_index_bytes(connection: sqlite3.Connection, statement: str) -> int:
-        """Rough size of one index's keys, from a bounded sample of the newest rows."""
+    def _release_failed_index_build(self, connection: sqlite3.Connection) -> None:
+        """Roll back an index build that ran out of space and give the space back.
 
+        SQLite has already rolled the statement back and deleted its
+        temporary files. The uncommitted index pages it wrote stay in the WAL
+        file until a checkpoint truncates it; a best-effort TRUNCATE
+        checkpoint returns them to the volume so collection and backups have
+        room. A busy reader only delays that to the next checkpoint.
+        """
+
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+        except sqlite3.Error:
+            logger.debug("Rollback after a failed history index build failed.", exc_info=True)
+        try:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        except sqlite3.Error:
+            logger.debug("Could not truncate the history WAL after a failed index build.", exc_info=True)
+        logger.warning(
+            "A history index build ran out of disk space and was rolled back; the database is "
+            "unchanged. %s It is retried later, and collection continues meanwhile.",
+            self._describe_free_space(),
+        )
+
+    def _describe_free_space(self) -> str:
+        """`<free> MiB free under <dir>` for the database and temporary directories."""
+
+        directories = [self.file_path.absolute().parent]
+        temporary_directory = self.sqlite_temporary_directory()
+        if temporary_directory is not None:
+            directories.append(temporary_directory.absolute())
+        parts: list[str] = []
+        seen: set[Any] = set()
+        for directory in directories:
+            key = self._filesystem_key(directory)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                free = int(shutil.disk_usage(directory).free)
+            except OSError:
+                continue
+            parts.append(f"{free // MIB} MiB free under {host_repair_path(directory)}")
+        return ("Now " + "; ".join(parts) + ".") if parts else ""
+
+    @staticmethod
+    def _filesystem_key(directory: Path) -> tuple[int, ...] | Path:
+        try:
+            return (int(os.stat(directory).st_dev),)
+        except OSError:
+            return directory
+
+    @staticmethod
+    def _index_key_columns(statement: str) -> tuple[str, list[str]]:
         head, _, columns = statement.partition("(")
         table = head.split()[-1]
         terms = [term.strip() for term in columns.rsplit(")", 1)[0].split(",")]
-        sizes: list[str] = []
-        for term in terms:
-            expression = term.split()[0]
-            if expression.startswith("julianday(") or expression == "id":
-                sizes.append("9")
-            else:
-                sizes.append(f"coalesce(length(CAST({expression} AS BLOB)), 0) + 1")
-        # Retained rows, not max(rowid): AUTOINCREMENT ids count lifetime
-        # inserts, and retention deletes old rows without renumbering. The
-        # trigger-maintained counter is stored data a restored file can set
-        # too high or too low (#1093), so the build counts the rows itself:
+        return table, terms
+
+    @staticmethod
+    def _index_build_lower_bound_bytes(connection: sqlite3.Connection, statement: str) -> int:
+        """A floor under the bytes one index build writes, from an exact row count.
+
+        Every retained row gets one index record of at least
+        INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES plus one type byte per key
+        column and the rowid, whatever the values are. Nothing is sampled, so
+        the order or width of the rows in a restored file cannot lower it.
+        """
+
+        table, terms = HistoryStore._index_key_columns(statement)
+        # The trigger-maintained counter is stored data a restored file can
+        # set too high or too low (#1093), so the build counts the rows itself:
         # one bounded-memory pass, cheaper than the sort that reads every row
         # next. A counter that disagrees is corrected and logged.
         if HistoryStore._rowid_span(connection, table) <= 0:
@@ -2233,67 +2324,119 @@ class HistoryStore:
                 )
                 HistoryStore._recount_table(connection, table)
                 connection.commit()
-        if rows <= 0:
-            return 0
-        sampled = connection.execute(
-            f"SELECT avg({' + '.join(sizes)}) FROM "
-            f"(SELECT * FROM {table} ORDER BY rowid DESC LIMIT ?)",
-            (INDEX_BUILD_SIZE_SAMPLE_ROWS,),
-        ).fetchone()
-        average = float(sampled[0] or 0.0) if sampled is not None else 0.0
-        estimate = int(rows * (average + INDEX_BUILD_KEY_OVERHEAD_BYTES))
-        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
-        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
-        return min(estimate, INDEX_BUILD_MAX_DATABASE_MULTIPLE * page_count * page_size)
+        return max(0, rows) * (INDEX_BUILD_MIN_RECORD_OVERHEAD_BYTES + len(terms) + 1)
 
-    def _require_index_build_space(self, connection: sqlite3.Connection, statement: str) -> None:
-        """Refuse a build that would fill the temporary or database filesystem.
+    @staticmethod
+    def _index_build_disk_needs(
+        *, index_bytes: int, freelist_bytes: int, wal_bytes: int, sorter_memory_bytes: int
+    ) -> tuple[int, int]:
+        """(database filesystem, temporary directory) bytes an index build writes.
 
-        The sorter writes about one index worth of keys to temporary files, and
-        the finished index is written through the WAL into the database file, so
-        the database filesystem needs about twice the index (less the free pages
-        already inside the file). One filesystem holding both needs all three.
-        A refusal is retried by the collector and reported as degraded.
+        Every new index page goes through the WAL first, so the WAL needs the
+        whole index less what the existing WAL file can absorb. Free pages
+        already inside the database file reduce only its growth at the
+        checkpoint, never the WAL (#1093). The sorter writes its keys to
+        temporary files only when they outgrow its in-memory budget, and then
+        writes all of them.
         """
 
-        index_bytes = self._estimate_index_bytes(connection, statement)
+        index_bytes = max(0, int(index_bytes))
+        wal_growth = max(0, index_bytes - max(0, int(wal_bytes)))
+        file_growth = max(0, index_bytes - max(0, int(freelist_bytes)))
+        temporary = index_bytes if index_bytes > max(0, int(sorter_memory_bytes)) else 0
+        return wal_growth + file_growth, temporary
+
+    def _require_index_build_space(self, connection: sqlite3.Connection, statement: str) -> None:
+        """Refuse a build that provably cannot fit; the collector retries it later.
+
+        Every need here is a lower bound, so a refusal never stops a build
+        that would have fitted. A build that passes and still runs out of
+        space is caught as SQLITE_FULL and handled the same way.
+        """
+
+        index_bytes = self._index_build_lower_bound_bytes(connection, statement)
         if index_bytes <= 0:
             return
         page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
         freelist_bytes = int(connection.execute("PRAGMA freelist_count").fetchone()[0]) * page_size
-        database_need = max(0, 2 * index_bytes - freelist_bytes)
-        database_directory = self.file_path.absolute().parent
+        try:
+            wal_bytes = int(os.stat(f"{self.file_path}-wal").st_size)
+        except OSError:
+            wal_bytes = 0
+        database_need, temporary_need = self._index_build_disk_needs(
+            index_bytes=index_bytes,
+            freelist_bytes=freelist_bytes,
+            wal_bytes=wal_bytes,
+            sorter_memory_bytes=BULK_MAINTENANCE_CACHE_SIZE_KIB * 1024,
+        )
         needs: dict[tuple[int, ...] | Path, list[Any]] = {}
 
         def add(directory: Path, need: int) -> None:
-            try:
-                key: tuple[int, ...] | Path = (int(os.stat(directory).st_dev),)
-            except OSError:
-                key = directory
-            entry = needs.setdefault(key, [directory, 0])
+            entry = needs.setdefault(self._filesystem_key(directory), [directory, 0])
             entry[1] += need
 
-        add(database_directory, database_need)
+        add(self.file_path.absolute().parent, database_need)
         temporary_directory = self.sqlite_temporary_directory()
         if temporary_directory is not None:
-            add(temporary_directory, index_bytes)
+            add(temporary_directory, temporary_need)
         for directory, need in needs.values():
+            if need <= 0:
+                continue
             try:
                 free = int(shutil.disk_usage(directory).free)
             except OSError:
                 continue
-            required = need + INDEX_BUILD_FREE_SPACE_MARGIN_BYTES
-            if free < required:
+            if free < need:
                 logger.warning(
-                    "Not building a history index yet: it needs about %d MiB free under %s "
-                    "for temporary files and index pages, and %d MiB is free.",
-                    required // (1024 * 1024),
-                    directory,
-                    free // (1024 * 1024),
+                    "Not building a history index yet: it needs at least %d MiB free under %s "
+                    "for temporary files and index pages, and %d MiB is free. Collection "
+                    "continues and the build is retried.",
+                    -(-need // MIB),
+                    host_repair_path(directory),
+                    free // MIB,
                 )
                 raise HistoryIndexBuildSpaceError(
                     "Not enough free disk space to build a history index."
                 )
+
+    def _describe_startup_space_failure(self) -> str:
+        """The operator line for a startup schema upgrade that filled the volume (#1093).
+
+        The figure is an upper estimate: no index on a table can be larger
+        than the database file holding it, its WAL copy needs as much again,
+        and SQLite's temporary sort files as much again.
+        """
+
+        try:
+            database_bytes = int(self.file_path.stat().st_size)
+        except OSError:
+            database_bytes = 0
+        needs: dict[tuple[int, ...] | Path, list[Any]] = {}
+        for directory, need in (
+            (self.file_path.absolute().parent, 2 * database_bytes),
+            (self.sqlite_temporary_directory(), database_bytes),
+        ):
+            if directory is None:
+                continue
+            entry = needs.setdefault(self._filesystem_key(directory), [directory, 0])
+            entry[1] += need
+        parts: list[str] = []
+        for directory, need in needs.values():
+            try:
+                free_text = f"{int(shutil.disk_usage(directory).free) // MIB} MiB is free now"
+            except OSError:
+                free_text = "free space could not be read"
+            parts.append(
+                f"up to about {-(-need // MIB)} MiB free on the volume holding "
+                f"{host_repair_path(directory)} ({free_text})"
+            )
+        return (
+            f"The history database {host_repair_path(self.file_path)} ran out of disk space "
+            "while startup was upgrading it and building its indexes. SQLite rolled the "
+            "change back, so the database is unchanged. The upgrade needs "
+            + "; and ".join(parts)
+            + ". Free space on that volume, then restart the history service."
+        )
 
     @staticmethod
     def _ensure_columns(

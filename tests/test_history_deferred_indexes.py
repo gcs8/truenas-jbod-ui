@@ -750,7 +750,7 @@ class IndexBuildMemoryTests(unittest.TestCase):
             self.assertTrue(asyncio.run(collector._build_pending_indexes()))
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
 
-    def test_index_size_estimate_tracks_the_key_columns(self) -> None:
+    def test_index_size_lower_bound_tracks_the_key_columns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "history.sqlite3"
             _legacy_database(path, samples=4_000)
@@ -760,18 +760,17 @@ class IndexBuildMemoryTests(unittest.TestCase):
             ):
                 HistoryStore(str(path), recover_unreadable_database=False)
                 statements = dict(CHRONOLOGICAL_INDEXES)
-                slot = HistoryStore._estimate_index_bytes(
+                slot = HistoryStore._index_build_lower_bound_bytes(
                     connection, statements["idx_metric_samples_slot_chronological"]
                 )
-                scope = HistoryStore._estimate_index_bytes(
+                scope = HistoryStore._index_build_lower_bound_bytes(
                     connection, statements["idx_metric_samples_scope_chronological"]
                 )
-                events = HistoryStore._estimate_index_bytes(
+                events = HistoryStore._index_build_lower_bound_bytes(
                     connection, statements["idx_slot_events_scope_chronological"]
                 )
-            # 4,000 rows of short keys: tens of bytes each, not kilobytes.
-            self.assertGreater(slot, 4_000 * 20)
-            self.assertLess(slot, 4_000 * 200)
+            # Every one of the 4,000 rows costs at least its record header.
+            self.assertGreaterEqual(slot, 4_000 * 8)
             self.assertGreater(scope, slot)  # adds metric_name
             self.assertEqual(events, 0)  # no slot events in this fixture
 
@@ -797,16 +796,14 @@ class IndexBuildMemoryTests(unittest.TestCase):
                 self.assertGreater(
                     connection.execute("SELECT max(id) FROM metric_samples").fetchone()[0], 100_000_000
                 )
-                estimate = HistoryStore._estimate_index_bytes(
+                estimate = HistoryStore._index_build_lower_bound_bytes(
                     connection, dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
                 )
             self.assertLess(estimate, 1024)
-            # A volume with only the margin free still admits the build.
+            # A volume with only 1 MiB free still admits the build.
             import shutil
 
-            roomy = shutil._ntuple_diskusage(
-                total=1 << 30, used=0, free=store_module.INDEX_BUILD_FREE_SPACE_MARGIN_BYTES + (1 << 20)
-            )
+            roomy = shutil._ntuple_diskusage(total=1 << 30, used=0, free=1 << 20)
             with patch.object(store_module.shutil, "disk_usage", return_value=roomy):
                 for name in store.pending_chronological_indexes():
                     store.build_chronological_index(name)
@@ -1106,7 +1103,7 @@ class UntrustedTableCounterTests(unittest.TestCase):
                 closing(sqlite3.connect(path)) as connection,
                 self.assertLogs("history_service.store", "WARNING"),
             ):
-                estimate = HistoryStore._estimate_index_bytes(connection, statement)
+                estimate = HistoryStore._index_build_lower_bound_bytes(connection, statement)
 
             self.assertLess(estimate, 40 * 200)
             self.assertEqual(_table_counter(path, "metric_samples"), 40)
@@ -1128,8 +1125,8 @@ class UntrustedTableCounterTests(unittest.TestCase):
                 closing(sqlite3.connect(path)) as connection,
                 self.assertLogs("history_service.store", "WARNING"),
             ):
-                estimate = HistoryStore._estimate_index_bytes(connection, statement)
-            self.assertGreater(estimate, 4_000 * 20)
+                estimate = HistoryStore._index_build_lower_bound_bytes(connection, statement)
+            self.assertGreaterEqual(estimate, 4_000 * 8)
             self.assertEqual(_table_counter(path, "metric_samples"), 4_000)
 
             _set_table_counter(path, "metric_samples", 0)
@@ -1154,7 +1151,7 @@ class UntrustedTableCounterTests(unittest.TestCase):
             statement = dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
 
             with closing(sqlite3.connect(path)) as connection:
-                estimate = HistoryStore._estimate_index_bytes(connection, statement)
+                estimate = HistoryStore._index_build_lower_bound_bytes(connection, statement)
                 pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
                 page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
 
@@ -1217,6 +1214,385 @@ class UntrustedTableCounterTests(unittest.TestCase):
                 [collector_module.INDEX_BUILD_SPACE_DEGRADED_REASON] * 2 + [None],
             )
             self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+
+
+def _crafted_backup(path: Path, *, wide_rows: int, tiny_rows: int) -> None:
+    """A restored file whose newest rows are tiny and whose older rows are wide.
+
+    Sizing an index from a sample of the newest rows sees only the tiny ones
+    (#1093 security review), so the real build needs far more space.
+    """
+
+    HistoryStore(str(path), recover_unreadable_database=False)
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for name in CHRONOLOGICAL_NAMES:
+            connection.execute(f"DROP INDEX IF EXISTS {name}")
+        insert = """INSERT INTO metric_samples (
+            observed_at, system_id, enclosure_key, slot, slot_label,
+            metric_name, value_integer, disk_identity_key
+        ) VALUES ('2026-01-01T00:00:00+00:00', ?, ?, ?, 'slot', ?, 30, ?)"""
+        connection.executemany(
+            insert,
+            [
+                (f"s{index:0600d}", "e" * 300, index % 60, "m" * 200, "d" * 200)
+                for index in range(wide_rows)
+            ],
+        )
+        connection.executemany(
+            insert, [("s", "e", index % 60, "m", "d") for index in range(tiny_rows)]
+        )
+
+
+@contextmanager
+def _database_page_limit(extra_pages: int, *, enabled: dict[str, bool] | None = None):
+    """Make bulk-maintenance connections hit SQLITE_FULL once they grow the file.
+
+    `max_page_count` is SQLite's own size limit: past it, a write fails with
+    "database or disk is full" exactly as a full volume does, mid-statement,
+    and SQLite rolls the statement back itself.
+    """
+
+    original = HistoryStore._apply_bulk_maintenance_profile
+    state = enabled if enabled is not None else {"on": True}
+
+    def limited(connection: sqlite3.Connection) -> None:
+        original(connection)
+        if state["on"]:
+            pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            connection.execute(f"PRAGMA max_page_count={pages + extra_pages}")
+
+    with patch.object(HistoryStore, "_apply_bulk_maintenance_profile", staticmethod(limited)):
+        yield state
+
+
+def _all_indexes(path: Path) -> set[str]:
+    with closing(sqlite3.connect(path)) as connection:
+        return {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+        }
+
+
+def _integrity(path: Path) -> str:
+    with closing(sqlite3.connect(path)) as connection:
+        return str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+
+
+class _RaisingCreateIndexConnection(sqlite3.Connection):
+    """Raises a chosen error from CREATE INDEX, as a full temporary directory does."""
+
+    error: BaseException | None = None
+
+    def execute(self, sql, *args, **kwargs):
+        if (
+            _RaisingCreateIndexConnection.error is not None
+            and isinstance(sql, str)
+            and sql.lstrip().upper().startswith("CREATE INDEX")
+        ):
+            raise _RaisingCreateIndexConnection.error
+        return super().execute(sql, *args, **kwargs)
+
+
+class DiskFullDuringIndexBuildTests(unittest.TestCase):
+    """#1093: a full volume during an index build is handled, not predicted.
+
+    No size estimate can be exact, so the guarantee is the reaction: a build
+    that runs out of space rolls back, waits for free space while collection
+    continues, and is retried. The free-space pre-flight only refuses builds
+    that provably cannot fit.
+    """
+
+    def _deferred_store(self, path: Path) -> HistoryStore:
+        with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+            return HistoryStore(str(path), recover_unreadable_database=False)
+
+    def test_disk_full_mid_build_rolls_back_cleanly_and_reports_waiting_for_space(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _crafted_backup(path, wide_rows=600, tiny_rows=1_100)
+            store = self._deferred_store(path)
+            before = _all_indexes(path)
+
+            with (
+                _database_page_limit(2),
+                self.assertLogs("history_service.store", "WARNING") as logs,
+                self.assertRaises(store_module.HistoryIndexBuildSpaceError),
+            ):
+                store.build_chronological_index("idx_metric_samples_scope_chronological")
+
+            self.assertIn("disk", "\n".join(logs.output))
+            self.assertEqual(_all_indexes(path), before)  # no partial index
+            self.assertEqual(_integrity(path), "ok")
+            self.assertIn("idx_metric_samples_scope_chronological", store.pending_chronological_indexes())
+            # The failed build's WAL frames are handed back to the volume.
+            wal = Path(f"{path}-wal")
+            self.assertEqual(wal.stat().st_size if wal.exists() else 0, 0)
+            # Once the volume has room, the same build succeeds.
+            store.build_chronological_index("idx_metric_samples_scope_chronological")
+            self.assertIn("idx_metric_samples_scope_chronological", _all_indexes(path))
+            self.assertEqual(_integrity(path), "ok")
+
+    def test_full_temporary_directory_is_a_space_wait_not_a_failure(self) -> None:
+        # ENOSPC on the sorter's temporary files reaches Python as this error;
+        # an injected one has no sqlite_errorcode, so the message must match.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=400)
+            store = self._deferred_store(path)
+            native_connect = sqlite3.connect
+
+            def connect(*args, **kwargs):
+                kwargs.setdefault("factory", _RaisingCreateIndexConnection)
+                return native_connect(*args, **kwargs)
+
+            name = "idx_metric_samples_slot_chronological"
+            with patch.object(store_module.sqlite3, "connect", side_effect=connect):
+                _RaisingCreateIndexConnection.error = sqlite3.OperationalError("database or disk is full")
+                try:
+                    with (
+                        self.assertLogs("history_service.store", "WARNING"),
+                        self.assertRaises(store_module.HistoryIndexBuildSpaceError),
+                    ):
+                        store.build_chronological_index(name)
+                    # Other I/O failures keep the generic path (#910 pause).
+                    _RaisingCreateIndexConnection.error = sqlite3.OperationalError("disk I/O error")
+                    with self.assertRaises(sqlite3.OperationalError) as raised:
+                        store.build_chronological_index(name)
+                    self.assertNotIsInstance(raised.exception, store_module.HistoryIndexBuildSpaceError)
+                finally:
+                    _RaisingCreateIndexConnection.error = None
+            self.assertEqual(_integrity(path), "ok")
+            self.assertNotIn(name, _indexes(path))
+
+    def test_disk_full_mid_build_keeps_collecting_and_retries_the_build_later(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _crafted_backup(path, wide_rows=600, tiny_rows=1_100)
+            store = self._deferred_store(path)
+            collector = HistoryCollector(
+                HistorySettings(sqlite_path=str(path), startup_grace_seconds=0), store
+            )
+            events: list[str] = []
+            reasons: list[str | None] = []
+            paused: list[bool] = []
+            original_build = store.build_chronological_index
+            original_wait_for = asyncio.wait_for
+            limit = {"on": True}
+
+            def build(name: str, **kwargs) -> None:
+                events.append("build")
+                original_build(name, **kwargs)
+
+            def collect(**_kwargs) -> None:
+                events.append("collect")
+                reasons.append(collector.degraded_reason())
+                paused.append(collector.collection_pause()[0])
+                collects = events.count("collect")
+                if collects == 2:
+                    # Space is freed and the slower retry comes due.
+                    limit["on"] = False
+                    collector._index_build_space_retry_at = 0.0
+                elif collects == 3:
+                    collector._stopping.set()
+
+            async def short_wait(awaitable, timeout):
+                return await original_wait_for(awaitable, min(timeout, 0.001))
+
+            with (
+                _database_page_limit(2, enabled=limit),
+                patch.object(collector_module.asyncio, "wait_for", side_effect=short_wait),
+                patch.object(store, "build_chronological_index", side_effect=build),
+                patch.object(collector, "run_once", side_effect=collect),
+                self.assertLogs("history_service.collector", "WARNING"),
+                self.assertLogs("history_service.store", "WARNING"),
+            ):
+                asyncio.run(original_wait_for(collector._run_loop(), timeout=30))
+
+            # The empty slot_events index fits; the first sample index hits the
+            # full volume, and collection continues while it waits.
+            self.assertEqual(
+                events, ["build", "build", "collect", "collect", *["build"] * 4, "collect"]
+            )
+            self.assertEqual(
+                reasons,
+                [collector_module.INDEX_BUILD_SPACE_DEGRADED_REASON] * 2 + [None],
+            )
+            self.assertEqual(paused, [False, False, False])
+            self.assertEqual(_indexes(path), CHRONOLOGICAL_NAMES)
+            self.assertEqual(_integrity(path), "ok")
+
+
+class IndexBuildSpacePreflightTests(unittest.TestCase):
+    """#1093: the pre-flight refuses only builds that provably cannot fit."""
+
+    def _measured_index_bytes(self, path: Path, statement: str) -> int:
+        with closing(sqlite3.connect(path)) as connection:
+            page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+
+            def used_pages() -> int:
+                pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
+                free = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+                return pages - free
+
+            before = used_pages()
+            connection.execute(statement)
+            connection.commit()
+            return (used_pages() - before) * page_size
+
+    def test_lower_bound_never_exceeds_the_index_sqlite_builds(self) -> None:
+        shapes = {
+            "ordinary": lambda path: _legacy_database(path, samples=3_000),
+            "crafted": lambda path: _crafted_backup(path, wide_rows=300, tiny_rows=1_100),
+            "large-shaped": lambda path: _large_legacy_database(path, samples=5_000),
+        }
+        for shape, create in shapes.items():
+            for name, statement in CHRONOLOGICAL_INDEXES:
+                with self.subTest(shape=shape, index=name), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "history.sqlite3"
+                    create(path)
+                    with closing(sqlite3.connect(path)) as connection:
+                        for index_name in CHRONOLOGICAL_NAMES:
+                            connection.execute(f"DROP INDEX IF EXISTS {index_name}")
+                        connection.commit()
+                        bound = HistoryStore._index_build_lower_bound_bytes(connection, statement)
+                    actual = self._measured_index_bytes(path, statement)
+                    self.assertLessEqual(bound, actual)
+
+    def test_lower_bound_does_not_depend_on_which_rows_are_newest(self) -> None:
+        # The same rows in opposite insertion orders: a sample of the newest
+        # rows sees tiny keys in one file and wide keys in the other.
+        statement = dict(CHRONOLOGICAL_INDEXES)["idx_metric_samples_scope_chronological"]
+        bounds = []
+        for wide_first in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "history.sqlite3"
+                HistoryStore(str(path), recover_unreadable_database=False)
+                rows = [("s" * 500, index % 60) for index in range(1_100)]
+                rows += [("s", index % 60) for index in range(1_100)]
+                if not wide_first:
+                    rows.reverse()
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.executemany(
+                        """INSERT INTO metric_samples (
+                            observed_at, system_id, enclosure_key, slot, slot_label,
+                            metric_name, value_integer, disk_identity_key
+                        ) VALUES ('2026-01-01T00:00:00+00:00', ?, 'e', ?, 'slot', 'm', 30, 'd')""",
+                        rows,
+                    )
+                with closing(sqlite3.connect(path)) as connection:
+                    bounds.append(HistoryStore._index_build_lower_bound_bytes(connection, statement))
+        self.assertEqual(bounds[0], bounds[1])
+        self.assertGreater(bounds[0], 0)
+
+    def test_freelist_pages_reduce_database_growth_but_not_the_wal(self) -> None:
+        mib = 1 << 20
+        needs = HistoryStore._index_build_disk_needs
+        # Free pages inside the file absorb the index's growth, but every new
+        # index page is still written through the WAL first.
+        self.assertEqual(
+            needs(index_bytes=100 * mib, freelist_bytes=1024 * mib, wal_bytes=0, sorter_memory_bytes=16 * mib),
+            (100 * mib, 100 * mib),
+        )
+        self.assertEqual(
+            needs(index_bytes=100 * mib, freelist_bytes=0, wal_bytes=0, sorter_memory_bytes=16 * mib),
+            (200 * mib, 100 * mib),
+        )
+        # An existing WAL file is reused before it grows.
+        self.assertEqual(
+            needs(index_bytes=100 * mib, freelist_bytes=0, wal_bytes=40 * mib, sorter_memory_bytes=16 * mib),
+            (160 * mib, 100 * mib),
+        )
+        # Keys that fit in the sorter's memory never reach a temporary file.
+        self.assertEqual(
+            needs(index_bytes=8 * mib, freelist_bytes=0, wal_bytes=0, sorter_memory_bytes=16 * mib),
+            (16 * mib, 0),
+        )
+
+    def test_preflight_admits_a_build_when_its_lower_bound_fits(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            _legacy_database(path, samples=4_000)
+            with patch.object(store_module, "CHRONOLOGICAL_INDEX_INLINE_MAX_ROWS", 10):
+                store = HistoryStore(str(path), recover_unreadable_database=False)
+            name = "idx_metric_samples_scope_chronological"
+            statement = dict(CHRONOLOGICAL_INDEXES)[name]
+            with closing(sqlite3.connect(path)) as connection:
+                bound = HistoryStore._index_build_lower_bound_bytes(connection, statement)
+            # Database pages, WAL and (on one volume) temporary files together.
+            just_enough = shutil._ntuple_diskusage(total=1 << 30, used=0, free=3 * bound)
+            too_little = shutil._ntuple_diskusage(total=1 << 30, used=0, free=bound // 2)
+
+            with (
+                patch.object(store_module.shutil, "disk_usage", return_value=too_little),
+                self.assertLogs("history_service.store", "WARNING"),
+                self.assertRaises(store_module.HistoryIndexBuildSpaceError),
+            ):
+                store.build_chronological_index(name)
+            with patch.object(store_module.shutil, "disk_usage", return_value=just_enough):
+                store.build_chronological_index(name)
+            self.assertIn(name, _indexes(path))
+
+
+class StartupIndexBuildDiskFullTests(unittest.TestCase):
+    """#1093: a startup index build that fills the volume fails with an operator line."""
+
+    def _without_identity_index(self, path: Path) -> None:
+        _crafted_backup(path, wide_rows=600, tiny_rows=10)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("DROP INDEX idx_metric_samples_disk_identity")
+            connection.commit()
+            # No free pages left inside the file: the first index the
+            # upgrade builds is the one that has to grow it.
+            connection.execute("VACUUM")
+
+    def test_startup_disk_full_names_the_volume_and_the_space_needed(self) -> None:
+        from history_service.startup import HistoryStartupError
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            self._without_identity_index(path)
+
+            with _database_page_limit(2), self.assertRaises(HistoryStartupError) as raised:
+                HistoryStore(str(path), recover_unreadable_database=False)
+
+            reason = raised.exception.reason
+            self.assertIn(str(Path(directory).absolute()), reason)
+            self.assertIn("MiB", reason)
+            self.assertIn("free", reason)
+            self.assertNotIn("Traceback", reason)
+            self.assertIsInstance(raised.exception.__cause__, sqlite3.OperationalError)
+            # SQLite rolled the index back; the file is intact and still usable.
+            self.assertNotIn("idx_metric_samples_disk_identity", _all_indexes(path))
+            self.assertEqual(_integrity(path), "ok")
+            HistoryStore(str(path), recover_unreadable_database=False)
+            self.assertIn("idx_metric_samples_disk_identity", _all_indexes(path))
+
+    def test_startup_disk_full_is_reported_once_without_retrying(self) -> None:
+        from history_service import startup
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            self._without_identity_index(path)
+            sleeps: list[float] = []
+            self.addCleanup(startup._record, None)
+
+            with (
+                _database_page_limit(2),
+                self.assertLogs("history_service.startup", "ERROR") as logs,
+                self.assertRaises(startup.HistoryStartupError) as raised,
+            ):
+                startup.open_history_store_with_retries(
+                    lambda: HistoryStore(str(path), recover_unreadable_database=False),
+                    directory=directory,
+                    sleep=sleeps.append,
+                )
+
+            self.assertEqual(sleeps, [])
+            self.assertEqual(startup.recorded_startup_failure(), raised.exception.reason)
+            self.assertIn(raised.exception.reason, "\n".join(logs.output))
+            self.assertEqual(_integrity(path), "ok")
 
 
 if __name__ == "__main__":

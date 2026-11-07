@@ -143,10 +143,11 @@ INDEX_BUILD_RETRY_SECONDS = 60.0
 INDEX_BUILD_QUICK_RETRIES = 3
 INDEX_BUILD_SLOW_RETRY_SECONDS = 300.0
 INDEX_BUILD_DEGRADED_REASON = "History indexes could not be built yet; retrying before collecting."
-# A refusal for lack of free disk space is not damage (#1093): collection
-# continues, so a volume that stays short (or a size estimate that stays high)
-# never stops history, and the build is retried every
-# INDEX_BUILD_SPACE_RETRY_SECONDS until it fits.
+# Running out of disk space is not damage (#1093), whether the store's
+# pre-flight refused the build or SQLite hit SQLITE_FULL mid-build and rolled
+# it back: collection continues, so a volume that stays short never stops
+# history, and the build is retried every INDEX_BUILD_SPACE_RETRY_SECONDS
+# until it fits.
 INDEX_BUILD_SPACE_RETRY_SECONDS = INDEX_BUILD_SLOW_RETRY_SECONDS
 INDEX_BUILD_SPACE_DEGRADED_REASON = (
     "History indexes are waiting for free disk space; collection continues "

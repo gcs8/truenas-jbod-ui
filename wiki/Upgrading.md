@@ -152,15 +152,19 @@ Compose stop-grace settings are unchanged.
 Index builds, inline or deferred, sort through SQLite temporary files with a
 bounded cache instead of in memory, so their memory no longer grows with the
 table (#1092). The temporary files go to the history service's `TMPDIR`, which
-the shipped Compose file sets to the history volume. Before each deferred build
-the service checks for free space for about one index's keys there and about
-two on the database filesystem; if it is short, it logs the space it needs,
-reports degraded, keeps collecting, and retries the build every five minutes.
-The check is an estimate, not a reservation. It counts the table's rows
-itself, since the build reads them all anyway, caps the estimate at twice the
-database file, and corrects a stored row counter that disagrees. Startup
-recounts a counter above its table's id range, and a restore recounts the
-backup's row counters (#1093). While an index builds, `/api/history/overview?exact_counts=true`
+the shipped Compose file sets to the history volume. If a deferred build fills
+the volume, SQLite rolls it back and deletes its temporary files, the service
+returns the build's WAL space with a checkpoint, logs the free space, reports
+degraded ("waiting for free disk space"), keeps collecting, and retries the
+build every five minutes (#1093). Before each deferred build it also refuses,
+with the same status and retry, a build that cannot fit even if every index
+record had the smallest size SQLite can store. That pre-flight counts the
+table's rows itself and samples nothing, so it never refuses a build that
+would fit. A startup upgrade that fills the volume (for example, an imported
+backup too large for the disk) stops with a message naming the volume and
+roughly how much free space it needs; the database is unchanged, and the
+service starts once space is freed. Startup recounts a stored row counter
+above its table's id range, and a restore recounts the backup's row counters. While an index builds, `/api/history/overview?exact_counts=true`
 answers with the tracked totals, no per-scope activity counts, and
 `counts_deferred_reason` set. With segmented history, the default overview and
 the deferred totals read the hot database's tracked counts and the segment row
