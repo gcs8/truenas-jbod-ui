@@ -3670,6 +3670,8 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-face-style="boot-devices"] .slot-row {
   display: flex;
   justify-content: center;
+  /* safe: overflow spills to the scrollable end, never past the start (#1065). */
+  justify-content: safe center;
 }
 
 .chassis-shell[data-face-style="boot-devices"] .slot-row {
@@ -3679,6 +3681,7 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-face-style="nvme-carrier"] .row-slots,
 .chassis-shell[data-face-style="boot-devices"] .row-slots {
   justify-items: center;
+  justify-items: safe center;
 }
 
 .chassis-shell[data-face-style="boot-devices"] .row-slots {
@@ -3870,6 +3873,11 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-latch-edge="bottom"] .row-slots,
 .chassis-shell[data-latch-edge="top"] .row-slots {
   justify-items: center;
+  /* A bay group wider than its track (a 24-bay single row in a narrow bezel)
+     must overflow toward the end, where the chassis shell can scroll to it.
+     Plain center splits the overflow and strands the first bay past the start
+     edge (#1065). Rows that fit are centred exactly as before. */
+  justify-items: safe center;
 }
 
 .row-group {
