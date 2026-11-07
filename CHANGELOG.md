@@ -28,10 +28,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
-### Docs
-
-- Recorded beta.5 publication, image convergence, reported beta deployment and
-  squash-tree evidence while retaining the unverified closeout gates (#1079).
 ### Added
 
 - Added the CORE HBA PHY table to Storage Fabric controller data, and an
@@ -67,6 +63,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   that never started it still has no admin container after the update. Basic
   authentication, the hardened overlay, auto-stop, admin write actions and
   rollback with admin running stay listed as untested (#1085).
+- Recorded beta.5 publication, image convergence, reported beta deployment and
+  squash-tree evidence while retaining the unverified closeout gates (#1079).
 
 ## v0.24.0-beta.5 - 2026-11-02
 
