@@ -212,8 +212,15 @@ or send another SMP function. The admin sudoers preview shows the exact rule.
 
 The admin bootstrap grants it by default with the other read commands. Without
 it, Storage Fabric shows "Expander counters not available (permission not
-granted)" and asks sudo again only every six hours or after an app restart.
+granted)" and asks sudo again only every six hours, after an app restart, or
+when you press Refresh. After adding the grant, press Refresh once.
 A PHY the app could not read shows as unknown, never as zero.
+
+One refresh reads at most eight expanders. A larger fabric is read in turn,
+and an expander waiting for its turn shows "not read this refresh (read
+budget...)" rather than a missing route. A disk whose `mprutil` parent and
+expander PHY tables disagree is never used as a route, so counters are not
+attributed to the wrong expander while the topology is changing.
 
 ## Optional identify LED control
 

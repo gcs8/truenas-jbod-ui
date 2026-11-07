@@ -5236,7 +5236,7 @@ class CoreExpanderCounterTests(unittest.TestCase):
         self.assertNotIn("\n", command)
         self.assertIn("for p in 00 01 02 03;", command)
         self.assertIn(
-            '/usr/bin/timeout 2 sudo -n /sbin/camcontrol smpcmd pass10 -r 12 '
+            '/usr/bin/timeout -k 1 2 sudo -n /sbin/camcontrol smpcmd pass10 -r 12 '
             '"40{}11{}06{}02{}00{}00{}00{}00{}00{}$p{}00{}00" -R 28 - 2>&1 | /usr/bin/od -An -tx1 -v',
             command,
         )
@@ -5513,3 +5513,204 @@ class CoreExpanderCounterTests(unittest.TestCase):
             self.assertEqual([row["counter_state"] for row in result.rows], ["measured", "unknown"])
             self.assertEqual(result.rows[1]["counter_reason"], "no_response")
             self.assertEqual(len(calls), 2, "a call with no answer ends the batch")
+
+
+def _nine_expander_outputs(count: int = 9) -> dict:
+    """``count`` one-PHY expanders on mpr0, each with its own routed end device."""
+    expander_lines = ["Num Phys SAS Address      DevHandle Parent EncHandle SAS Level"]
+    device_lines = ["B____T    SAS Address      Handle  Parent    Device        Speed Enc  Slot  Wdt"]
+    devlist_lines = ["scbus4 on mpr0 bus 0:"]
+    for index in range(count):
+        handle = 0x20 + index * 2
+        address = f"5000c5000000{0xa0 + index:04x}"
+        expander_lines.append(f"1        {address} {handle:04x}      0001   {0x40 + index:04x}      1")
+        expander_lines.append(f"  0 1 {handle + 1:04x} 12.0 1.5 12.0 End Device")
+        device_lines.append(
+            f"00   {index:<4} 5000c5000000{0xb0 + index:04x} {handle + 1:04x}    {handle:04x}      SAS Target    12    "
+            f"{0x40 + index:04x} 0     1"
+        )
+        devlist_lines.append(f"<SYNTHETIC DISK {index:04d}>  at scbus4 target {index} lun 0 (pass{index},da{index})")
+    return {
+        "mprutil -u 0 show expanders": "\n".join(expander_lines),
+        "mprutil -u 0 show devices": "\n".join(device_lines),
+        "camcontrol devlist -v": "\n".join(devlist_lines),
+    }
+
+
+class CoreExpanderCounterRemediationTests(unittest.TestCase):
+    """Sol's #1088 review: parent contradictions, the read budget, probe order, refusal retry."""
+
+    outputs = CoreExpanderCounterTests.outputs
+    snapshot = CoreExpanderCounterTests.snapshot
+    fabric = CoreExpanderCounterTests.fabric
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    results = staticmethod(CoreExpanderCounterTests.results)
+
+    # Target 10 now names expander B (0019) as its parent while A's PHY table
+    # still lists its handle 000a; target 12 (A's only clean route) is gone.
+    CONTRADICTORY_DEVICES = SMP_DEVICES.replace(
+        "000a    0009", "000a    0019",
+    ).replace(
+        "00   12   5000c50000000011 000b    0009      SAS Target    12    0002 1     1\n", "",
+    )
+
+    def contradictory_results(self, *extra):
+        return [
+            SSHCommandResult(command="sudo -n /usr/sbin/mprutil -u 0 show expanders", ok=True, stdout=SMP_EXPANDERS),
+            SSHCommandResult(
+                command="sudo -n /usr/sbin/mprutil -u 0 show devices", ok=True, stdout=self.CONTRADICTORY_DEVICES,
+            ),
+            SSHCommandResult(command="sudo -n /sbin/camcontrol devlist -v", ok=True, stdout=SMP_DEVLIST),
+            *extra,
+        ]
+
+    def test_contradictory_parent_never_routes_one_expanders_counters_to_another(self):
+        from app.services.core_expander_counters import SmpTarget, discover_smp_targets
+
+        self.assertNotIn("000b", self.CONTRADICTORY_DEVICES)
+        outputs = self.outputs(**{"mprutil -u 0 show devices": self.CONTRADICTORY_DEVICES})
+        # A has no consistent route left; B keeps its own clean target 30.
+        self.assertEqual(discover_smp_targets(outputs), [SmpTarget(0, SMP_EXPANDER_B, "pass30", 2)])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            commands = service._core_expander_counter_probe_commands(self.contradictory_results())
+        self.assertEqual(len(commands), 1)
+        self.assertIn(f"tnj-smp-phy-error-log:0:{SMP_EXPANDER_B}:pass30:", commands[0])
+        self.assertFalse(any(SMP_EXPANDER_A in command or "pass10" in command for command in commands))
+
+        # Even an A-marked read through pass10 (an older plan, or a forged
+        # line) must not publish B-reachable counters on A.
+        forged = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-00 ; ..."
+        fabric_outputs = {
+            **outputs,
+            forged: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (71, 0, 0, 0))}),
+        }
+        node = self.expander(self.fabric(fabric_outputs), SMP_EXPANDER_A)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "no_route")
+        self.assertIsNone(counters["device"])
+        self.assertEqual(counters["rows"], [])
+        self.assertNotIn(71, [row.get("invalid_dword_count") for row in node.raw["phys"]])
+        self.assertFalse(any(row.get("counter_state") == "measured" for row in node.raw["phys"]))
+
+        # The reverse disagreement: the parent names A but B's PHY table lists
+        # the same handle. That device is no route to either expander.
+        reverse = SMP_EXPANDERS.replace("  0 1 001a", "  0 1 000a")
+        self.assertEqual(discover_smp_targets(self.outputs(**{"mprutil -u 0 show expanders": reverse})), [
+            SmpTarget(0, SMP_EXPANDER_A, "pass12", 4),
+            SmpTarget(0, SMP_EXPANDER_B, "pass30", 2),
+        ])
+
+    def test_read_budget_reports_not_read_and_rotates_instead_of_no_route(self):
+        from app.services.core_expander_counters import (
+            NO_ROUTE_MESSAGE, SMP_MAX_TARGETS_PER_REFRESH, discover_smp_targets,
+        )
+
+        outputs = _nine_expander_outputs()
+        targets = discover_smp_targets(outputs)
+        self.assertEqual(len(targets), 9, "route discovery is complete; the budget applies to reads")
+        self.assertEqual(targets[8].device, "pass8")
+
+        results = [
+            SSHCommandResult(
+                command=f"sudo -n /usr/sbin/{key}" if key.startswith("mprutil") else f"sudo -n /sbin/{key}",
+                ok=True, stdout=stdout,
+            )
+            for key, stdout in outputs.items()
+        ]
+        read_addresses: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            for _refresh in range(3):
+                commands = service._core_expander_counter_probe_commands(list(results))
+                self.assertEqual(len(commands), SMP_MAX_TARGETS_PER_REFRESH)
+                window = [canonicalize_ssh_command(command).split(":")[1] for command in commands]
+                read_addresses.append(window)
+                # Later planning rounds of the same refresh keep the window.
+                answered = [SSHCommandResult(command=command, ok=True, stdout="") for command in commands]
+                self.assertEqual(
+                    service._core_expander_counter_probe_commands([*results, *answered]), [],
+                )
+        all_addresses = [target.expander_sas_address for target in targets]
+        self.assertEqual(read_addresses[0], all_addresses[:8])
+        self.assertIn(all_addresses[8], read_addresses[1], "the ninth expander is read on the next refresh")
+        self.assertEqual(set(read_addresses[0]) | set(read_addresses[1]), set(all_addresses))
+        self.assertNotEqual(read_addresses[1], read_addresses[2])
+
+        # The fabric: eight read this refresh, the ninth has a route but waits its turn.
+        fabric_outputs = dict(outputs)
+        for target in targets[:8]:
+            key = f"echo tnj-smp-phy-error-log:{target.identity}:00-00 ; ..."
+            fabric_outputs[key] = _smp_output(0, target.expander_sas_address, target.device, {0: _smp_frame(0)})
+        ninth = targets[8].expander_sas_address
+        node = self.expander(self.fabric(fabric_outputs, "granted", selected=ninth), ninth)
+        counters = node.raw["phy_error_counters"]
+        self.assertEqual(counters["state"], "not_read")
+        self.assertEqual(counters["reason"], "read_budget")
+        self.assertEqual(counters["device"], "pass8")
+        self.assertNotEqual(counters["message"], NO_ROUTE_MESSAGE)
+        self.assertIn("read budget", counters["message"])
+        first = self.expander(self.fabric(fabric_outputs, "granted", selected=targets[0].expander_sas_address),
+                              targets[0].expander_sas_address)
+        self.assertEqual(first.raw["phy_error_counters"]["state"], "available")
+
+    def test_full_read_measurement_wins_over_the_probe_for_the_same_phy(self):
+        probe_key = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-00 ; ..."
+        full_key = f"echo tnj-smp-phy-error-log:0:{SMP_EXPANDER_A}:pass10:00-03 ; ..."
+        fabric = self.fabric(self.outputs(**{
+            probe_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (1, 0, 0, 0))}),
+            full_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {
+                phy: _smp_frame(phy, (2 if phy == 0 else 0, 0, 0, 0)) for phy in range(4)
+            }),
+        }))
+        node = self.expander(fabric, SMP_EXPANDER_A)
+        phys = {row["phy"]: row for row in node.raw["phys"]}
+        self.assertEqual(phys["0"]["invalid_dword_count"], 2)
+        # A measured probe still beats an unknown full-read row.
+        fabric = self.fabric(self.outputs(**{
+            probe_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: _smp_frame(0, (1, 0, 0, 0))}),
+            full_key: _smp_output(0, SMP_EXPANDER_A, "pass10", {0: "camcontrol: error sending command\n"}),
+        }))
+        phys = {row["phy"]: row for row in self.expander(fabric, SMP_EXPANDER_A).raw["phys"]}
+        self.assertEqual((phys["0"]["counter_state"], phys["0"]["invalid_dword_count"]), ("measured", 1))
+
+    def test_a_forced_refresh_asks_sudo_again_after_a_refusal(self):
+        now = [1000.0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            probe = service._core_expander_counter_probe_commands(self.results())
+            refused = SSHCommandResult(command=probe[0], ok=True, stdout=_smp_output(
+                0, SMP_EXPANDER_A, "pass10", {0: _SUDO_REFUSAL}))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(refused)), [])
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+
+            async def snapshot(force):
+                with patch.object(service, "_resolve_snapshot_cache_key", side_effect=RuntimeError("stop")):
+                    with self.assertRaises(RuntimeError):
+                        await service._get_snapshot_result(force_refresh=force)
+
+            # An ordinary or background refresh keeps the remembered refusal.
+            asyncio.run(snapshot(False))
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+            # A user's forced refresh (the Refresh button, ?force=true) retries once.
+            asyncio.run(snapshot(True))
+            self.assertEqual(service._smp_counter_capability, "permission_denied")
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), probe)
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results(refused)), [])
+            self.assertEqual(service._core_expander_counter_probe_commands(self.results()), [])
+
+    def test_logged_command_masks_the_expander_address_and_timeout_has_a_kill_after(self):
+        from app.services.core_expander_counters import SmpTarget, build_phy_error_log_command
+        from app.services.ssh_probe import redact_ssh_command
+
+        command = build_phy_error_log_command(SmpTarget(0, SMP_EXPANDER_A, "pass10", 4))
+        self.assertIn("/usr/bin/timeout -k 1 2 sudo -n /sbin/camcontrol smpcmd pass10 ", command)
+        redacted = redact_ssh_command(command)
+        self.assertNotIn(SMP_EXPANDER_A, redacted)
+        self.assertIn("tnj-smp-phy-error-log:0:5000...0001:pass10:00-03", redacted)
+        self.assertNotIn(SMP_EXPANDER_A, redact_ssh_command(f"sudo -n true ; {command}"))

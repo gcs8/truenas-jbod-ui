@@ -55,8 +55,12 @@ SMP_PHY_ERROR_LOG_SUDO_GRANT = (
 SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX = "smp phy error log "
 SMP_PHY_ERROR_LOG_MARKER = "tnj-smp-phy-error-log"
 # Per call and per refresh bounds. One call that gives no answer at all stops
-# that expander's batch, so a hung expander costs about one timeout.
+# that expander's batch, so a hung expander costs about one timeout. timeout(1)
+# sends SIGTERM (sudo relays it to camcontrol), then SIGKILL after the grace.
 SMP_CALL_TIMEOUT_SECONDS = 2
+SMP_CALL_KILL_AFTER_SECONDS = 1
+# Route discovery is complete; this budget only limits how many expanders one
+# refresh reads. Larger fabrics are read in turn (see read_window()).
 SMP_MAX_TARGETS_PER_REFRESH = 8
 # A refused capability is asked again only after this long (or after the app
 # restarts), not on every refresh.
@@ -66,6 +70,11 @@ PERMISSION_DENIED_MESSAGE = "Expander counters not available (permission not gra
 NO_ROUTE_MESSAGE = "Expander counters not available (no CAM pass device reaches this expander)."
 NO_ANSWER_MESSAGE = "Expander counters not available (the expander did not return a readable error log)."
 NOT_READ_MESSAGE = "Expander counters not read yet."
+READ_BUDGET_MESSAGE = (
+    f"Expander counters not read this refresh (read budget of {SMP_MAX_TARGETS_PER_REFRESH} expanders "
+    "per refresh; expanders are read in turn)."
+)
+READ_BUDGET_REASON = "read_budget"
 
 CAPABILITY_GRANTED = "granted"
 CAPABILITY_DENIED = "permission_denied"
@@ -94,6 +103,7 @@ SYSFS_COUNTER_ATTRIBUTES = {
 
 _PASS_DEVICE = re.compile(r"pass[0-9]+")
 _SAS_ADDRESS = re.compile(r"[0-9a-f]{16}")
+_LOGGED_IDENTITY = re.compile(rf"({SMP_PHY_ERROR_LOG_MARKER}:[0-9]+:)([0-9a-f]{{4}})[0-9a-f]{{8}}([0-9a-f]{{4}})(?=:)")
 _PERMISSION_TEXT = ("a password is required", "is not allowed to execute", "not in the sudoers", "sudo:")
 
 
@@ -177,6 +187,15 @@ def parse_camcontrol_pass_devices(output: str) -> dict[tuple[str, int], str]:
     return routes
 
 
+def mask_smp_identity(text: str) -> str:
+    """Shorten expander SAS addresses in counter-read markers for logs.
+
+    Same first-four...last-four form the snapshot export uses for partial
+    identifiers; the unit, pass device and PHY range stay readable.
+    """
+    return _LOGGED_IDENTITY.sub(r"\1\2...\3", str(text or ""))
+
+
 def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
     """Find each expander the CORE collector saw and a pass device that reaches it.
 
@@ -187,6 +206,14 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
     as attached, or the expander's own row ties the expander to a CAM target;
     CAM maps that target to a pass device. The lowest such target wins so the
     choice is stable between refreshes.
+
+    The kernel sends an end device's SMP request to that device's current
+    parent, so a populated parent is authoritative. A device whose parent names
+    one expander while another expander's PHY table lists it, or whose missing
+    parent leaves two expanders claiming it, is no route at all: the tables
+    disagree (a topology change or a reused handle) and the read could reach
+    the wrong expander. Every expander with a route is returned; the per
+    refresh read budget is applied by read_window(), not here.
     """
     # Imported here: the parsers module imports this one for its output key.
     from app.services.sas_fabric_parsers import parse_mpr_devices, parse_mpr_expanders
@@ -201,7 +228,16 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
     for unit in units:
         controller = f"mpr{unit}"
         devices = parse_mpr_devices(outputs.get(f"mprutil -u {unit} show devices", ""))
-        for expander in parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", "")):
+        expanders = parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", ""))
+        # Device handle -> the expanders whose PHY table lists it as attached.
+        claimed_by: dict[int, set[int]] = {}
+        for expander in expanders:
+            expander_handle = _hex_int(expander.get("dev_handle"))
+            for phy in expander.get("phys") or []:
+                attached_handle = _hex_int(phy.get("dev_handle"))
+                if expander_handle is not None and attached_handle:
+                    claimed_by.setdefault(attached_handle, set()).add(expander_handle)
+        for expander in expanders:
             address = str(expander.get("sas_address") or "").lower()
             handle = _hex_int(expander.get("dev_handle"))
             try:
@@ -214,9 +250,17 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
             candidates: list[tuple[int, str]] = []
             for device in devices:
                 own = str(device.get("sas_address") or "").lower() == address
-                child = _hex_int(device.get("parent")) == handle or _hex_int(device.get("handle")) in attached
+                parent = _hex_int(device.get("parent")) or None
+                device_handle = _hex_int(device.get("handle"))
+                child = parent == handle or device_handle in attached
                 # A cascaded expander's own SMP target would answer for itself.
                 if child and not own and "SMP" in str(device.get("device") or "").upper():
+                    continue
+                claims = claimed_by.get(device_handle, set()) if device_handle else set()
+                if child and not own and (
+                    (parent is not None and claims - {parent}) or (parent is None and len(claims) > 1)
+                ):
+                    # Contradictory parent/attachment evidence: fail closed.
                     continue
                 target_text = str(device.get("target") or "")
                 if not (own or child) or not target_text.isdigit():
@@ -227,16 +271,40 @@ def discover_smp_targets(outputs: Mapping[str, str]) -> list[SmpTarget]:
             if candidates:
                 targets.append(SmpTarget(unit, address, min(candidates)[1], num_phys))
     targets.sort(key=lambda item: (item.unit, item.expander_sas_address))
-    return targets[:SMP_MAX_TARGETS_PER_REFRESH]
+    return targets
+
+
+def read_window(targets: Sequence[SmpTarget], offset: int) -> list[SmpTarget]:
+    """The expanders one refresh reads: all of them, or a rotating budget.
+
+    With more routed expanders than SMP_MAX_TARGETS_PER_REFRESH, the window
+    starts at ``offset`` (mod the target count) in the stable discovery order
+    and wraps, so successive offsets from next_read_offset() reach every
+    expander. The result keeps discovery order.
+    """
+    ordered = list(targets)
+    if len(ordered) <= SMP_MAX_TARGETS_PER_REFRESH:
+        return ordered
+    start = offset % len(ordered)
+    chosen = {(start + step) % len(ordered) for step in range(SMP_MAX_TARGETS_PER_REFRESH)}
+    return [target for index, target in enumerate(ordered) if index in chosen]
+
+
+def next_read_offset(offset: int, target_count: int) -> int:
+    """Where the next refresh's window starts."""
+    if target_count <= SMP_MAX_TARGETS_PER_REFRESH:
+        return 0
+    return (offset + SMP_MAX_TARGETS_PER_REFRESH) % target_count
 
 
 def build_phy_error_log_command(target: SmpTarget, phys: Sequence[int] | None = None) -> str:
     """One POSIX sh command line that reads ``phys`` of ``target`` in order.
 
     Each call is the exact granted argv with a literal PHY, bounded by
-    timeout(1). Both output streams are hex-dumped so the raw frame survives
-    text transport and sudo's or camcontrol's message stays with its PHY. A
-    call that prints nothing (timed out) ends the batch for this expander.
+    timeout(1) with a SIGKILL fallback (``-k``; FreeBSD 10.3+ and GNU). Both
+    output streams are hex-dumped so the raw frame survives text transport
+    and sudo's or camcontrol's message stays with its PHY. A call that prints
+    nothing (timed out) ends the batch for this expander.
     """
     device = _pass_device(target.device)
     if not _SAS_ADDRESS.fullmatch(target.expander_sas_address) or type(target.unit) is not int or target.unit < 0:
@@ -254,7 +322,8 @@ def build_phy_error_log_command(target: SmpTarget, phys: Sequence[int] | None = 
     return (
         f"echo {header} ; "
         f"for p in {phy_words}; do echo \"@phy=$p\"; "
-        f"o=$(/usr/bin/timeout {SMP_CALL_TIMEOUT_SECONDS} sudo -n {CAMCONTROL} smpcmd {device} "
+        f"o=$(/usr/bin/timeout -k {SMP_CALL_KILL_AFTER_SECONDS} {SMP_CALL_TIMEOUT_SECONDS} "
+        f"sudo -n {CAMCONTROL} smpcmd {device} "
         f"-r 12 \"{fmt}\" -R 28 - 2>&1 | /usr/bin/od -An -tx1 -v); "
         "if [ -z \"$o\" ]; then echo @no-response; break; fi; "
         "printf '%s\\n' \"$o\"; done; echo @end"
@@ -387,6 +456,11 @@ class PhyErrorLogResult:
     def expander_sas_address(self) -> str | None:
         parts = (self.target_identity or "").split(":")
         return parts[1] if len(parts) == 3 else None
+
+    @property
+    def device(self) -> str | None:
+        parts = (self.target_identity or "").split(":")
+        return parts[2] if len(parts) == 3 else None
 
     @property
     def capability(self) -> str | None:

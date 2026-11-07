@@ -41,7 +41,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   says "Expander counters not available (permission not granted)" when it may
   not; a PHY it could not read shows as unknown, never zero. The admin
   bootstrap now grants one read-only `camcontrol smpcmd` rule for this by
-  default; re-run bootstrap on an existing CORE account to add it (#1088).
+  default; re-run bootstrap on an existing CORE account to add it, then press
+  Refresh (#1088).
 
 ### Fixed
 

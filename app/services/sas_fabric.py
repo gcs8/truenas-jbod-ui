@@ -28,6 +28,9 @@ from app.services.core_expander_counters import (
     NO_ROUTE_MESSAGE as SMP_NO_ROUTE_MESSAGE,
     NOT_READ_MESSAGE as SMP_NOT_READ_MESSAGE,
     PERMISSION_DENIED_MESSAGE as SMP_PERMISSION_DENIED_MESSAGE,
+    READ_BUDGET_MESSAGE as SMP_READ_BUDGET_MESSAGE,
+    READ_BUDGET_REASON as SMP_READ_BUDGET_REASON,
+    SMP_MAX_TARGETS_PER_REFRESH,
     SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX,
     counter_summary as smp_counter_summary,
     discover_smp_targets,
@@ -3153,19 +3156,39 @@ def _add_mpr_infrastructure(
 _SMP_COUNTER_EVIDENCE = "camcontrol smpcmd REPORT PHY ERROR LOG"
 
 
-def _merged_phy_error_log_rows(outputs: dict[str, str]) -> dict[tuple[int, str], dict[int, dict[str, Any]]]:
-    """Counter rows per (unit, expander address); a measured row wins over an unknown one."""
+def _smp_output_span(command: str) -> int:
+    """How many PHYs an output key's range covers; the one-PHY probe sorts first."""
+    match = re.search(r":([0-9a-f]{2})-([0-9a-f]{2})$", command)
+    return int(match.group(2), 16) - int(match.group(1), 16) if match else -1
+
+
+def _merged_phy_error_log_rows(
+    outputs: dict[str, str],
+    routed: dict[tuple[int, str], Any],
+) -> dict[tuple[int, str], dict[int, dict[str, Any]]]:
+    """Counter rows per (unit, expander address).
+
+    Only an output read through the pass device this refresh's topology routes
+    to that expander counts. A measured row wins over an unknown one, and when
+    both the probe and the full read measured a PHY, the full read wins.
+    """
     merged: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
-    for command, stdout in sorted(outputs.items()):
-        if not command.startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
-            continue
+    smp_outputs = [
+        (command, stdout) for command, stdout in outputs.items()
+        if command.startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX)
+    ]
+    for command, stdout in sorted(smp_outputs, key=lambda item: (_smp_output_span(item[0]), item[0])):
         parsed = parse_phy_error_log_output(stdout)
         if parsed.unit is None or parsed.expander_sas_address is None:
             continue
-        rows = merged.setdefault((parsed.unit, parsed.expander_sas_address), {})
+        key = (parsed.unit, parsed.expander_sas_address)
+        target = routed.get(key)
+        if target is None or target.device != parsed.device:
+            continue
+        rows = merged.setdefault(key, {})
         for row in parsed.rows:
             existing = rows.get(row["phy"])
-            if existing is None or existing.get("counter_state") != "measured":
+            if existing is None or existing.get("counter_state") != "measured" or row["counter_state"] == "measured":
                 rows[row["phy"]] = row
     return merged
 
@@ -3184,13 +3207,17 @@ def _attach_expander_phy_error_counters(
     if not expander_nodes:
         return
     routed = {(target.unit, target.expander_sas_address): target for target in discover_smp_targets(outputs)}
-    results = _merged_phy_error_log_rows(outputs)
+    results = _merged_phy_error_log_rows(outputs, routed)
+    # More routed expanders than one refresh may read: the unread ones wait
+    # their turn in the rotation; they are not a routing failure.
+    budget_limited = len(routed) > SMP_MAX_TARGETS_PER_REFRESH and bool(results)
     for node in expander_nodes:
         unit = node.raw.get("unit")
         key = (unit if isinstance(unit, int) else -1, str(node.raw.get("sas_address") or "").lower())
         target = routed.get(key)
         rows = [results[key][phy] for phy in sorted(results.get(key, {}))]
         states = {row["counter_state"] for row in rows}
+        reason = None
         if "measured" in states:
             state, message = "available", None
         elif (rows and states == {SMP_CAPABILITY_DENIED}) or (not rows and capability == SMP_CAPABILITY_DENIED):
@@ -3199,6 +3226,8 @@ def _attach_expander_phy_error_counters(
             state, message = "no_route", SMP_NO_ROUTE_MESSAGE
         elif rows:
             state, message = "unavailable", SMP_NO_ANSWER_MESSAGE
+        elif budget_limited:
+            state, message, reason = "not_read", SMP_READ_BUDGET_MESSAGE, SMP_READ_BUDGET_REASON
         else:
             state, message = "not_read", SMP_NOT_READ_MESSAGE
         by_phy = {row["phy"]: row for row in rows}
@@ -3220,7 +3249,7 @@ def _attach_expander_phy_error_counters(
                 # not read, so they are unknown rather than missing.
                 copied.update({field: None for field in SMP_COUNTER_FIELDS})
                 copied["counter_state"] = "unknown" if state == "available" else state
-                copied["counter_reason"] = "not_read" if state == "available" else None
+                copied["counter_reason"] = "not_read" if state == "available" else reason
                 if state == "available":
                     unread += 1
             phys.append(copied)
@@ -3231,6 +3260,7 @@ def _attach_expander_phy_error_counters(
         node.raw["phy_error_counters"] = {
             "state": state,
             "message": message,
+            "reason": reason,
             "source": _SMP_COUNTER_EVIDENCE,
             "device": target.device if target else None,
             **summary,

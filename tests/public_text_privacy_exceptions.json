@@ -571,7 +571,7 @@
         "sha256:bd75f1c570c55f6c27e66b877dcd71e9ae3631f51974e5efa245a1cc6df86bdd": 2
       },
       "sas_wwn_identifier": {
-        "sha256:3d10eef04c5e7751347575cf007fcf5727fbd6d52d63152f3402fd76e079dd3d": 50
+        "sha256:f2a99f1d8e87db1672e1dee757e1107bf47eb65ced4e07f3e2d3278d5b881e62": 51
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
@@ -706,5 +706,13 @@
       }
     },
     "reason": "Reviewed operator-documentation example; exact detector counts are pinned."
+  },
+  "tests/js/fabric_expander_phy_errors.test.js": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:a00da8ec716e7466e67b94b4bf08d8325a46d00359d413e2762ceb98f919e3dc": 4
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   }
 }

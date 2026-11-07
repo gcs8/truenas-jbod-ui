@@ -17,6 +17,7 @@ from pathlib import Path
 import paramiko
 
 from app.config import SSHConfig
+from app.services.core_expander_counters import mask_smp_identity
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +127,12 @@ def _known_hosts_lock(path_value: str) -> threading.Lock:
 
 
 def redact_ssh_command(command: str) -> str:
-    """Mask inline credentials while leaving command shape useful for logs."""
+    """Mask inline credentials while leaving command shape useful for logs.
 
+    Expander SAS addresses in the CORE counter-read marker are shortened too.
+    """
+
+    command = mask_smp_identity(command)
     try:
         tokens = shlex.split(command)
     except ValueError:

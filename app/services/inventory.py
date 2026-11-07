@@ -109,7 +109,9 @@ from app.services.core_expander_counters import (
     SMP_CAPABILITY_RETRY_SECONDS,
     build_phy_error_log_command,
     discover_smp_targets,
+    next_read_offset,
     parse_phy_error_log_output,
+    read_window,
     smp_output_key,
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
@@ -1435,6 +1437,7 @@ class InventoryService:
     # Class defaults keep partially built services (tests, adapters) readable.
     _smp_counter_capability: str | None = None
     _smp_counter_checked_at = 0.0
+    _smp_counter_read_offset = 0
 
     def __init__(
         self,
@@ -1544,6 +1547,9 @@ class InventoryService:
         # A refusal is remembered so sudo is not asked again on every refresh.
         self._smp_counter_capability = None
         self._smp_counter_checked_at = 0.0
+        # Start of the next rotating read window when a fabric has more
+        # routed expanders than one refresh may read.
+        self._smp_counter_read_offset = 0
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
@@ -1736,6 +1742,8 @@ class InventoryService:
         self._snapshot_request_sequence += 1
         request_sequence = self._snapshot_request_sequence
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
+        if force_refresh and refresh_sources:
+            self.retry_expander_counter_capability()
         observed_source_publication = SourcePublication(
             sequence=self._source_bundle_published_sequence,
             sg_cache_generation=self._sg_ses_device_cache_generation,
@@ -4767,13 +4775,42 @@ class InventoryService:
         self._smp_counter_capability = state
         self._smp_counter_checked_at = self._smp_counter_clock()
 
+    def retry_expander_counter_capability(self) -> None:
+        """Ask sudo again on the next collection after a remembered refusal.
+
+        A forced source refresh (the Refresh button, ``?force=true``) calls this,
+        so an operator who just added the grant through the admin bootstrap
+        does not wait out SMP_CAPABILITY_RETRY_SECONDS. The admin sidecar runs
+        in another process and cannot reach this cache directly. Background
+        and stale-cache refreshes do not call it.
+        """
+        if self._smp_counter_capability == CAPABILITY_DENIED:
+            self._smp_counter_checked_at = float("-inf")
+
+    def _smp_counter_read_commands(self, targets: list[Any], command_results: list[SSHCommandResult]) -> list[str]:
+        """Full reads for this refresh's window of routed expanders.
+
+        The window rotates once per refresh. Later planning rounds of the same
+        refresh see the window's outputs and add nothing; the probe's output
+        alone does not count, since the full reads follow it in that refresh.
+        """
+        window = read_window(targets, self._smp_counter_read_offset)
+        if len(window) == len(targets):
+            return [build_phy_error_log_command(target) for target in targets]
+        probe_key = smp_output_key(build_phy_error_log_command(targets[0], [0]))
+        if {smp_output_key(item.command) for item in command_results} - {None, probe_key}:
+            return []
+        self._smp_counter_read_offset = next_read_offset(self._smp_counter_read_offset, len(targets))
+        return [build_phy_error_log_command(target) for target in window]
+
     def _core_expander_counter_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         """Read expander PHY error counters when the account may (#941).
 
         Targets come from the mprutil and camcontrol reads already in this
         refresh. An unknown or long-ago refused capability is checked with one
         sudo call (PHY 0 of the first expander) before any full read; a recent
-        refusal is not retried. A full read of a granted capability renews it.
+        refusal is not retried unless a forced refresh asked for it. A full
+        read of a granted capability renews it.
         """
         if self.system.truenas.platform != "core":
             return []
@@ -4788,7 +4825,7 @@ class InventoryService:
         self._record_smp_counter_capability(command_results)
         state = self._smp_counter_capability
         if state == CAPABILITY_GRANTED:
-            return [build_phy_error_log_command(target) for target in targets]
+            return self._smp_counter_read_commands(targets, command_results)
         recent = self._smp_counter_clock() - self._smp_counter_checked_at < SMP_CAPABILITY_RETRY_SECONDS
         if state == CAPABILITY_DENIED and recent:
             return []
