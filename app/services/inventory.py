@@ -107,7 +107,6 @@ from app.services.core_expander_counters import (
     CAPABILITY_DENIED,
     CAPABILITY_GRANTED,
     SMP_CAPABILITY_RETRY_SECONDS,
-    SMP_COUNTER_READ_INTERVAL_SECONDS,
     SMP_MAX_CALLS_PER_REFRESH,
     build_phy_error_log_command,
     discover_smp_targets,
@@ -4837,10 +4836,12 @@ class InventoryService:
             return []
         now = self._smp_counter_clock()
         current = {(target.unit, target.expander_sas_address) for target in targets}
+        # Expired read times still order the rotation (select_counter_reads
+        # applies the interval); only departed expanders are dropped.
         last_read = {
             expander: planned_at
             for expander, planned_at in (getattr(self, "_smp_counter_last_read", None) or {}).items()
-            if now - planned_at < SMP_COUNTER_READ_INTERVAL_SECONDS
+            if expander in current
         }
         self._smp_counter_reads = {
             expander: read

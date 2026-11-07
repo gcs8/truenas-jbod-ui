@@ -5921,3 +5921,30 @@ class CoreExpanderCounterRateLimitTests(unittest.TestCase):
         node = self.expander(self.fabric(fresh, "granted"), SMP_EXPANDER_A)
         self.assertIsNone(node.raw["phy_error_counters"]["read_at"])
         self.assertNotIn("read at", node.metrics["phy_error_counters"])
+
+    def test_rotation_stays_fair_when_refreshes_are_further_apart_than_the_interval(self):
+        """Codex review on be4ecccc: expired read times must still order the rotation."""
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(9, num_phys=4)
+        addresses = [target.expander_sas_address for target in counters.discover_smp_targets(outputs)]
+        base = self.base_results(outputs)
+        now = [1000.0]
+        rounds: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_clock = lambda: now[0]
+            service._smp_counter_capability = "granted"
+            for _refresh in range(3):
+                commands, _results = self.refresh(service, base, forced=False)
+                rounds.append([canonicalize_ssh_command(command).split(":")[1] for command in commands])
+                # For example source_bundle_cache_ttl_seconds=1800.
+                now[0] += 2 * counters.SMP_COUNTER_READ_INTERVAL_SECONDS
+            # A departed expander's read time is dropped; the rest are kept.
+            service._core_expander_counter_probe_commands(self.base_results(_nine_expander_outputs(8, num_phys=4)))
+            self.assertEqual(set(service._smp_counter_last_read), {(0, address) for address in addresses[:8]})
+        self.assertEqual(rounds[0], addresses[:8])
+        self.assertIn(addresses[8], rounds[1], "the never-read expander goes first on the next refresh")
+        # Commands keep discovery order; the least recently read are chosen.
+        self.assertEqual(rounds[1], [*addresses[:7], addresses[8]])
+        self.assertEqual(rounds[2], addresses[:8], "the expander skipped last time is read next")
