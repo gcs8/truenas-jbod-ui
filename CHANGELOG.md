@@ -54,6 +54,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   segmented history deployment. Segmented system summaries now include
   `total_rows` like unsegmented ones, so the removed-system history lists and
   the delete-history row count show real counts (#1083).
+- Fixed the manual clean-host restore driver
+  (`run_image_upgrade_smoke.py --scenario clean-host-restore`). It now sets
+  `ADMIN_PUBLIC_ORIGIN` and `APP_PUBLIC_ORIGIN` for its Basic-auth admin, so
+  the current admin and UI start. A failure prints the check that failed, with
+  the key input and admin credential redacted. A `--root` name that is not a
+  lowercase Compose project name is refused before anything is created
+  (#1090).
 
 ### Internal
 
