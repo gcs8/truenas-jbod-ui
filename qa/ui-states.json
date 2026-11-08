@@ -73,12 +73,14 @@
     },
     {
       "id": "main.heatmap", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-toggle-button", "#heatmap-metric-select", "#heatmap-scale-slider"]
     },
     {
       "id": "main.heatmap.temperature", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-metric-select", "#heatmap-colour-select"]
@@ -86,31 +88,34 @@
     {
       "id": "main.heatmap.relative", "page": "main", "safety": "read", "ci": true,
       "description": "Relative colours stretch from the coolest to the warmest bay by design, so heat-map findings are reported as warnings here.",
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-colour-select"}, {"select": "#heatmap-colour-select", "value": "relative"}, {"wait": 800}],
       "covers": ["#heatmap-colour-select"]
     },
     {
       "id": "main.heatmap.metric", "page": "main", "safety": "read",
-      "reads": [{"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 16}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-metric-select"]
     },
     {
       "id": "main.heatmap.timeline", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"requireVisible": "#heatmap-playback-select"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-playback-select", "#heatmap-timeframe-select", "#heatmap-scrub-slider"]
     },
     {
       "id": "main.heatmap.scale-max", "page": "main", "safety": "read",
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"setRange": "#heatmap-scale-slider", "value": "2"}, {"wait": 600}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-scale-slider"]
     },
     {
       "id": "main.heatmap.select", "page": "main", "safety": "read", "ci": true,
+      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"selectBay": "healthy"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["[data-slot]"]
@@ -278,6 +283,8 @@
     },
     {
       "id": "main.refresh-now", "page": "main", "safety": "read", "appliance_load": true,
+      "follow_up_ms": 30000,
+      "follow_up_why": "Refresh sends a forced inventory read, and the forced storage-view read only once that answers (refreshSnapshot); on a slow appliance the inventory answer can come after the steps' fixed wait (#1128). For 30 s after the steps end, and only until the next navigation, the declared forced reads with budget left stay admitted; nothing else, and a follow-up later than that is a hard failure.",
       "read_requests": [{"method": "GET", "path": "/api/inventory", "force": true, "max": 2}, {"method": "GET", "path": "/api/storage-views", "force": true, "max": 2}, {"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
       "steps": [{"click": "#refresh-button"}, {"wait": 2500}],
       "covers": ["#refresh-button"]

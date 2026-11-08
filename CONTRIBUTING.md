@@ -458,7 +458,11 @@ declare it in `query_classes`. Forced refreshes pass only when a state that
 sends them declares them (`appliance_load` states, `--appliance-load`), or
 when the page declares them as `load_requests` for the target's platform (the
 QuantaStor startup re-check of locate lights): admitted only while the page
-loads, once per load, bound to the target. `--allow app-write-revert,led
+loads, once per load, bound to the target. A refresh state may declare
+`follow_up_ms` (at most 60 s) for the requests its refresh chain sends after
+the steps end: only its declared forced reads with budget left, bound to the
+target, until that time passes or the next page load starts; a later
+follow-up fails the run. `--allow app-write-revert,led
 --write-system ID --led-ledger FILE` admits the declared writes of those
 states, bound to that system, the target enclosure and the captured object
 (the bay, or the enclosure for a rename, whose `object_id` must match the
@@ -466,10 +470,14 @@ target). Each write state reads its store through the app's API
 (`semantic_reads`) before the write and after the revert and fails when they
 differ. Every identify is a lease in the `--led-ledger` file (written and
 fsynced with its directory before the request leaves; `--led-lease-ms`,
-default 20 s, at most 120 s). An independent watchdog
-(`qa/ui-crawl/led-watchdog.js`, started detached before the crawl; no identify
-leaves without its heartbeat) turns the exact bay off when the lease expires or
-the crawler disappears, SIGKILL included. The crawler also clears and verifies
+default 20 s, at most 120 s), timed on the monotonic clock so a wall-clock
+step cannot extend it. An independent watchdog
+(`qa/ui-crawl/led-watchdog.js`, started detached before the crawl) turns the
+exact bay off when the lease expires or the crawler disappears, SIGKILL
+included. Before every identify the crawler checks that the watchdog is alive
+and heartbeating, and a supervisor thread in the crawler
+(`qa/ui-crawl/led-supervisor.js`) keeps checking: if the watchdog stops, the
+crawler turns its lights off itself and the run fails. The crawler also clears and verifies
 on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, at the start of
 the next run, and with `--led-sweep`. Keep the ledger outside the run's `--out`
 and reuse it across runs. Disk sync previews must show and dismiss their

@@ -17,7 +17,12 @@
 // at most 120 s), and an independent watchdog process (qa/ui-crawl/
 // led-watchdog.js, started detached before the crawl) turns the bay off when
 // the lease expires or this process disappears, SIGKILL included; no
-// IDENTIFY leaves without a live watchdog. Lights are also cleared at
+// IDENTIFY leaves without a live, heartbeating watchdog. Lease expiry and
+// heartbeat age use the monotonic clock, so a wall-clock step cannot extend
+// identify time. A supervisor thread in this process (qa/ui-crawl/
+// led-supervisor.js) watches the watchdog after arming: if it stops
+// heartbeating, this process turns its lights off itself and the crawl fails
+// (safety-failed). Lights are also cleared at
 // startup, on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, and by
 //   node scripts/ui_crawl.js --led-sweep --led-ledger FILE --out DIR
 // Exit status (#1119): 0 ok, 1 crawl errors, 2 safety gate failed, 3 a light
@@ -30,6 +35,7 @@ const { loadInventory, validateInventory, expandStates, selectStates } = require
 const controls = require("../qa/ui-crawl/controls");
 const routes = require("../qa/ui-crawl/routes");
 const { LedLedger, sweepLedger } = require("../qa/ui-crawl/ledger");
+const { startLedSupervisor } = require("../qa/ui-crawl/led-supervisor");
 const { chromium } = require("@playwright/test");
 const { EXIT } = require("../qa/ui-crawl/gate");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
@@ -151,6 +157,9 @@ function fixtureTargets() {
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${FIXTURE_ORIGINS["ui-storage-views-error"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", platform: "quantastor", variant: "quantastor", label: "fixture/main-quantastor", url: `${FIXTURE_ORIGINS["ui-quantastor"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", label: "fixture/main", url: `${FIXTURE_ORIGINS.ui}/` },
+    // #1127: a saved storage view selected through the target URL, as
+    // liveTargets() emits it (a later scope, so the `scope: "all"` states run).
+    { page: "main", ready: "main", scopeIndex: 1, system: "fixture", label: "fixture/main-view-boot-doms", url: `${FIXTURE_ORIGINS.ui}/?system_id=demo-system&storage_view_id=boot-doms` },
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", label: "fixture/fabric", url: `${FIXTURE_ORIGINS.ui}/sas-fabric` },
     { page: "history", ready: "history", scopeIndex: 0, label: "fixture/history", url: `${FIXTURE_ORIGINS.history}/` },
     { page: "admin", ready: "admin", scopeIndex: 0, label: "fixture/admin", url: `${FIXTURE_ORIGINS.admin}/` },
@@ -313,11 +322,23 @@ async function main() {
       return EXIT["cleanup-uncertain"];
     }
   }
-  // #1117: the watchdog must be watching before any IDENTIFY can be armed.
+  // #1117: the watchdog must be watching, and this process's supervisor
+  // watching the watchdog, before any IDENTIFY can be armed.
   let watchdog = null;
+  let crawler = null;
+  const ledEvents = [];
   if (ledger && args.allow.includes("led")) {
     try {
       watchdog = await startLedWatchdog({ ledger, outDir, verifyMs: sweepOptions.verifyMs });
+      await startLedSupervisor({
+        ledger, verifyMs: sweepOptions.verifyMs,
+        // The watchdog stopped heartbeating (or a lease overran with it alive):
+        // the supervisor has turned this run's lights off; the crawl stops and fails.
+        onLost: (event) => {
+          ledEvents.push(event);
+          if (crawler && !crawler.finished) crawler.aborted = `identify ${event.type}`;
+        },
+      });
     } catch (error) {
       writeReceipt(outDir, { status: "safety-failed", stage: "led watchdog", exitCode: EXIT["safety-failed"], error: String(error.message).slice(0, 200) });
       console.error(String(error.message));
@@ -363,7 +384,6 @@ async function main() {
   const runProblems = [];
   let context = null;
   let routesHandle = null;
-  let crawler = null;
   browser.on("disconnected", () => {
     if (crawler && !crawler.finished) {
       crawler.aborted = "browser disconnected";
@@ -415,15 +435,21 @@ async function main() {
     if (context) await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
+  if (crawler) crawler.endFollowUp();
   // Whatever the browser did, anything still armed is cleared out of band now.
   const ledCleanup = ledger ? await guards.sweep() : null;
+  // #1117: the supervisor found the watchdog gone (or a lease overrun): a failed crawl.
+  if (ledger && ledger.supervisor) ledEvents.push(...ledger.supervisor.events.filter((event) => !ledEvents.includes(event)));
+  for (const event of ledEvents) runProblems.push(`identify ${event.type}: ${event.detail || event.error || ""}`.trim());
+  // #1128: delayed follow-ups admitted inside a declared follow-up window.
+  stats.followUps = crawler ? crawler.followUpAdmitted || [] : [];
   // Sol #1108: every request a page-load window admitted (a platform's startup refresh).
   stats.pageLoads = crawler ? crawler.loadAdmitted || [] : [];
   const summary = writeReport(outDir, {
     meta: {
       mode: fixture ? "fixture" : "live", label: args.label || null, started, finished: new Date().toISOString(), widths,
       allow: args.allow, writeSystem: args.writeSystem || null, remoteBrowser: Boolean(cdpUrl),
-      ledWatchdog: watchdog ? { pid: watchdog.pid, leaseMs: ledger.leaseMs } : null,
+      ledWatchdog: watchdog ? { pid: watchdog.pid, leaseMs: ledger.leaseMs, supervisor: Boolean(ledger.supervisor) } : null,
       cache: cache ? { hits: cache.hits, misses: cache.misses } : null,
     },
     records: crawler ? crawler.records : [],

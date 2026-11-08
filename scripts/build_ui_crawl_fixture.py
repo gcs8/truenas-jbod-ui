@@ -260,6 +260,11 @@ async def build() -> dict:
         api[f"ui:/api/slots/{slot}/history"] = scope_history.get(slot) or {}
         if str(slot) in smart:
             api[f"ui:/api/slots/{slot}/smart"] = smart[str(slot)]
+    # Saved storage views (#1127): the heat map of a selected non-enclosure view
+    # reads each occupied slot's SMART summary through the storage-view route.
+    for view_id, summaries in (bundle.storage_view_smart_summary_cache or {}).items():
+        for slot_index, summary in (summaries or {}).items():
+            api[f"ui:/api/storage-views/{view_id}/slots/{slot_index}/smart"] = summary
     return {
         "origin": UI_ORIGIN,
         "pages": {

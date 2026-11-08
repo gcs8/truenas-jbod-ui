@@ -5,17 +5,33 @@
 // The request guard is the only place an IDENTIFY can leave the browser. The
 // moment it is admitted, before the request is forwarded, the exact target
 // (origin, bay path, system_id, enclosure_id) is written to a ledger file as
-// a lease: the crawler's PID and an expiry a few seconds ahead (`leaseMs`,
-// capped at MAX_LEASE_MS). The write is fsynced, renamed into place and the
-// parent directory fsynced, so the entry survives host loss.
+// a lease: the crawler's PID, the monotonic time it was armed (`armedMono`,
+// CLOCK_MONOTONIC via process.hrtime, shared by every process on the host,
+// with the kernel boot id it belongs to) and its length (`leaseMs`, capped at
+// MAX_LEASE_MS). The write is fsynced, renamed into place and the parent
+// directory fsynced, so the entry survives host loss.
 //
-// An IDENTIFY is refused unless an independent watchdog process
-// (led-watchdog.js, started detached in its own session by the CLI) is alive
-// and watching this crawler. The watchdog does not depend on the crawler
-// surviving: it turns the exact bay off and verifies it when the lease
-// expires (identify-on time is capped even if the crawler hangs) or the
-// crawler's PID disappears (SIGKILL, crash), and keeps re-checking until the
-// owner is gone and the light has stayed off for a settle period.
+// Lease expiry is judged on the monotonic clock (`leaseExpired`): a wall-clock
+// step backwards, or an edited ISO `expiresAt`, cannot extend it. The
+// wall-clock fields are for people; they can only end a lease early. A lease
+// with no monotonic stamp, from another boot, or longer than the cap is held
+// to the cap or treated as expired.
+//
+// An IDENTIFY is refused unless (checked on every arm):
+//   - an independent watchdog process (led-watchdog.js, started detached in
+//     its own session by the CLI) is alive and heartbeating for this crawler:
+//     its PID exists and is not a zombie, and its monotonic heartbeat from this
+//     boot is fresh (HEARTBEAT_STALE_MS); and
+//   - the crawler's own watchdog supervisor (led-supervisor.js, a worker
+//     thread, so it runs even while the crawler's main thread is stuck) is
+//     running. It watches the watchdog after arming: if the watchdog stops
+//     heartbeating it turns every lease of this crawler off itself and the
+//     crawl fails; it also clears a lease the watchdog let run past its cap.
+// The watchdog does not depend on the crawler surviving: it turns the exact
+// bay off and verifies it when the lease expires (identify-on time is capped
+// even if the crawler hangs) or the crawler's PID disappears (SIGKILL,
+// crash), and keeps re-checking until the owner is gone and the light has
+// stayed off for a settle period.
 //
 // Anything still in the ledger is also cleared out of band (plain HTTP from
 // Node, no browser) by:
@@ -42,14 +58,72 @@ const MIN_LEASE_MS = 500;
 // A watchdog whose heartbeat is older than this is not watching.
 const HEARTBEAT_STALE_MS = 5000;
 
+// Milliseconds on CLOCK_MONOTONIC (process.hrtime): the same clock in every
+// process on this host, never stepped by NTP or an operator, and comparable
+// only within one boot (see bootId).
+function monoNow() {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+// The kernel's id for this boot, or null where there is none (non-Linux).
+let cachedBootId;
+function bootId() {
+  if (cachedBootId === undefined) {
+    try {
+      cachedBootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
+    } catch {
+      cachedBootId = null;
+    }
+  }
+  return cachedBootId;
+}
+
+// A process that exists and is not a zombie. A watchdog SIGKILLed while its
+// parent (the crawler) is stuck stays a zombie until the parent reaps it; it
+// is not watching anything.
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
-    return error.code === "EPERM";
+    if (error.code !== "EPERM") return false;
   }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+    if (state === "Z" || state === "X") return false;
+  } catch {
+    // no procfs (or the process just went): kill(0) answered
+  }
+  return true;
+}
+
+// The identify time a lease may have: its own leaseMs, held to the cap.
+function leaseCapMs(entry) {
+  const ms = Number(entry && entry.leaseMs);
+  return Number.isFinite(ms) && ms > 0 ? Math.min(MAX_LEASE_MS, Math.max(MIN_LEASE_MS, ms)) : MAX_LEASE_MS;
+}
+
+// Has this lease run out? Judged on the monotonic clock; the wall clock can
+// only end it early (a forward step clears sooner, which is safe). Without a
+// monotonic stamp from this boot there is nothing trustworthy: expired.
+function leaseExpired(entry, { mono = monoNow(), wall = Date.now() } = {}) {
+  if (!entry || !Number.isFinite(entry.armedMono) || (entry.bootId ?? null) !== bootId()) return true;
+  const cap = leaseCapMs(entry);
+  const age = mono - entry.armedMono;
+  if (age < 0 || age >= cap) return true;
+  const armedWall = Date.parse(entry.armedAt);
+  return !Number.isFinite(armedWall) || wall - armedWall >= cap;
+}
+
+// A watchdog heartbeat that proves the watchdog is alive and watching
+// `ownerPid` now: written by a live, non-zombie process of this boot, with a
+// monotonic stamp younger than HEARTBEAT_STALE_MS (not from the future).
+function heartbeatFresh(beat, ownerPid, mono = monoNow()) {
+  if (!beat || beat.ownerPid !== ownerPid || !pidAlive(beat.pid)) return false;
+  if ((beat.bootId ?? null) !== bootId() || !Number.isFinite(beat.heartbeatMono)) return false;
+  const age = mono - beat.heartbeatMono;
+  return age >= 0 && age < HEARTBEAT_STALE_MS;
 }
 
 function sleepSync(ms) {
@@ -114,7 +188,7 @@ class LedLedger {
   // seconds) is broken.
   withLock(fn, { timeoutMs = 10_000 } = {}) {
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    const deadline = Date.now() + timeoutMs;
+    const deadline = monoNow() + timeoutMs;
     for (;;) {
       try {
         const fd = fs.openSync(this.lockFile, "wx", 0o600);
@@ -127,7 +201,8 @@ class LedLedger {
         let age = 0;
         try {
           holder = Number(fs.readFileSync(this.lockFile, "utf8"));
-          age = Date.now() - fs.statSync(this.lockFile).mtimeMs;
+          // (mtime is wall-clock; a step either way only breaks an unreadable lock sooner)
+          age = Math.abs(Date.now() - fs.statSync(this.lockFile).mtimeMs);
         } catch {
           continue;
         }
@@ -139,7 +214,7 @@ class LedLedger {
           }
           continue;
         }
-        if (Date.now() > deadline) throw new Error(`LED ledger lock busy (${this.lockFile})`);
+        if (monoNow() > deadline) throw new Error(`LED ledger lock busy (${this.lockFile})`);
         sleepSync(10);
       }
     }
@@ -163,19 +238,24 @@ class LedLedger {
     }
   }
 
-  // A live watchdog that watches `ownerPid` (this process by default).
+  // A live, heartbeating watchdog that watches `ownerPid` (this process by default).
   watchdogAlive(ownerPid = process.pid) {
-    const beat = this.watchdog();
-    if (!beat || beat.ownerPid !== ownerPid || !pidAlive(beat.pid)) return false;
-    return Date.now() - Date.parse(beat.heartbeatAt) < HEARTBEAT_STALE_MS;
+    return heartbeatFresh(this.watchdog(), ownerPid);
   }
 
   // Synchronous on purpose: the lease must be durable before the request
-  // leaves, and only when something independent will honour it.
+  // leaves, and only when something independent will honour it. Checked on
+  // every IDENTIFY: the watchdog is alive and heartbeating now, and this
+  // process's own supervisor (led-supervisor.js) is running to watch it.
   arm(entry) {
     if (!this.watchdogAlive()) throw new Error("no live identify watchdog for this crawler; IDENTIFY refused (#1117)");
+    if (!this.supervisor || !this.supervisor.alive()) throw new Error("no running watchdog supervisor in this crawler; IDENTIFY refused (#1117)");
     const now = Date.now();
-    const lease = { ...entry, ownerPid: process.pid, armedAt: new Date(now).toISOString(), expiresAt: new Date(now + this.leaseMs).toISOString(), leaseMs: this.leaseMs };
+    const lease = {
+      ...entry, ownerPid: process.pid, bootId: bootId(), armedMono: monoNow(), leaseMs: this.leaseMs,
+      // For people only; expiry is judged on armedMono (leaseExpired).
+      armedAt: new Date(now).toISOString(), expiresAt: new Date(now + this.leaseMs).toISOString(),
+    };
     this.withLock(() => {
       const armed = this.read().filter((item) => keyOf(item) !== keyOf(entry));
       armed.push(lease);
@@ -283,7 +363,7 @@ async function clearAndVerify(entry, { fetchImpl = fetch, attempts = 3, verifyMs
     if (!result.cleared && attempt < attempts) await sleep(Math.min(pollMs, 2000) * attempt);
   }
   if (!result.cleared) return result;
-  const deadline = Date.now() + verifyMs;
+  const deadline = monoNow() + verifyMs;
   let seen = null;
   do {
     const read = await readIdentify(entry, { fetchImpl, requestMs });
@@ -293,9 +373,9 @@ async function clearAndVerify(entry, { fetchImpl = fetch, attempts = 3, verifyMs
       result.detail = null;
       return result;
     }
-    if (Date.now() + pollMs > deadline) break;
+    if (monoNow() + pollMs > deadline) break;
     await sleep(pollMs);
-  } while (Date.now() < deadline);
+  } while (monoNow() < deadline);
   result.detail = `off not verified: ${JSON.stringify(seen)}`;
   return result;
 }
@@ -315,5 +395,6 @@ async function sweepLedger(ledger, options = {}) {
 
 module.exports = {
   LedLedger, armedEntry, clearAndVerify, readIdentify, sweepLedger, pidAlive, targetOf, writeDurable,
-  DEFAULT_LEASE_MS, MAX_LEASE_MS, HEARTBEAT_STALE_MS,
+  monoNow, bootId, leaseExpired, leaseCapMs, heartbeatFresh, keyOf,
+  DEFAULT_LEASE_MS, MAX_LEASE_MS, MIN_LEASE_MS, HEARTBEAT_STALE_MS,
 };

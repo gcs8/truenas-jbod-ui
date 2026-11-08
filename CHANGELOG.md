@@ -116,6 +116,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   BMC locator status counts as an appliance query, rename writes are bound to
   the target enclosure, and a QuantaStor page's startup refresh is declared
   instead of failing the crawl (#1108).
+- Identify leases now run on the monotonic clock, and the crawler turns its
+  lights off itself and fails if its watchdog stops; saved storage views'
+  heat-map SMART reads are allowed, and a refresh's delayed follow-up is
+  admitted only within a short declared window (#1108).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

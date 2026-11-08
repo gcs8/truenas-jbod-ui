@@ -335,8 +335,12 @@ test("#1117 when the crawler and its watchdog both die, the startup sweep clears
   child.stdout.on("data", (chunk) => { out += chunk; });
   child.stderr.on("data", (chunk) => { out += chunk; });
   await waitFor(() => out.includes("ARMED"), () => `child never armed: ${out}`);
-  // Host-level loss: the watchdog goes first, then the crawler.
-  process.kill(Number(/WATCHDOG (\d+)/.exec(out)[1]), "SIGKILL");
+  // Host-level loss of both at once: stop both first, so neither the watchdog
+  // nor the crawler's own supervisor (#1117 round 4) can react in between.
+  const watchdogPid = Number(/WATCHDOG (\d+)/.exec(out)[1]);
+  process.kill(watchdogPid, "SIGSTOP");
+  child.kill("SIGSTOP");
+  process.kill(watchdogPid, "SIGKILL");
   child.kill("SIGKILL");
   await new Promise((resolve) => child.on("exit", resolve));
   assert.equal(appliance.lit.has("5"), true, "SIGKILL of both skips every in-process cleanup");

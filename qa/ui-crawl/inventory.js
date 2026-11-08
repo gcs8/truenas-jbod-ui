@@ -140,6 +140,20 @@ function validateLoadRequests(errors, pageId, page, table) {
   }
 }
 
+// #1128: the longest follow-up window a state may declare. Short on purpose:
+// a delayed follow-up after it is a hard failure, not a reason to wait longer.
+const MAX_FOLLOW_UP_MS = 60_000;
+
+function validateFollowUp(errors, id, state) {
+  if (state.follow_up_ms === undefined) return;
+  const ms = state.follow_up_ms;
+  if (!Number.isInteger(ms) || ms < 1 || ms > MAX_FOLLOW_UP_MS) errors.push(`${id}: follow_up_ms must be an integer from 1 to ${MAX_FOLLOW_UP_MS}`);
+  const forced = (state.read_requests || []).some((rule) => rule.force === true);
+  if (state.safety !== "read" || !state.appliance_load || !forced) {
+    errors.push(`${id}: follow_up_ms is only for appliance_load read states whose read_requests declare forced refreshes (the follow-ups they cause)`);
+  }
+}
+
 function validateInventory(inventory, { manifest = undefined } = {}) {
   const errors = [];
   const ids = new Set();
@@ -175,6 +189,7 @@ function validateInventory(inventory, { manifest = undefined } = {}) {
       validateRules(errors, id, "read_requests", state.read_requests, state, pages[state.page], table);
     }
     validateReads(errors, id, state.reads, (pages[state.page] || {}).service || "ui", resolvedManifest, table);
+    validateFollowUp(errors, id, state);
     if (state.safety === "forbidden") {
       if (writes.length) errors.push(`${id}: a forbidden state cannot declare writes`);
       if ((state.steps || []).length && !state.confirm_preview) errors.push(`${id}: forbidden states have no steps unless confirm_preview is set`);
@@ -307,5 +322,5 @@ function summarize(inventory) {
 
 module.exports = {
   INVENTORY_PATH, loadInventory, validateInventory, expandStates, selectStates, substitute, summarize, stepKind, deriveSafety, checkObserved,
-  readsFor, loadRequestsFor, FORCE_PARAMS,
+  readsFor, loadRequestsFor, FORCE_PARAMS, MAX_FOLLOW_UP_MS,
 };

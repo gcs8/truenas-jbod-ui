@@ -22,9 +22,13 @@
 //      the route class, body predicates (a route with `object_keys` must have
 //      them bound to the captured object), the query keys, a per-rule budget,
 //      and the bound scope (`system_id` and `enclosure_id` must equal the
-//      target's). Windows are the state's own (writes, declared reads) and the
+//      target's). Windows are the state's own (writes, declared reads), the
 //      page-load window (a platform's startup refresh, opened only around a
-//      navigation; Sol #1108).
+//      navigation; Sol #1108) and a state's declared follow-up window (#1128):
+//      after a read state with a declared forced refresh ends, only the
+//      forced reads it declared, with the budget they have left, stay
+//      admitted for its `follow_up_ms` (monotonic clock), and only until the
+//      next navigation. A follow-up after that is refused like any other.
 //   6. Everything else aborts and is recorded.
 //
 // The guard never sees credentials: it gets method, URL and the request body.
@@ -84,7 +88,8 @@ function compileRule(rule) {
 
 class RequestGuard {
   // origins: { service: origin } (or an array, then every origin is "ui").
-  constructor({ origins, manifest = null, routes = null }) {
+  // now: a monotonic millisecond clock (follow-up windows); injectable for tests.
+  constructor({ origins, manifest = null, routes = null, now = () => performance.now() }) {
     // Fixture variant origins ("ui-write-sign-in") route like their base service.
     const entries = (Array.isArray(origins) ? origins.map((origin) => ["ui", origin]) : Object.entries(origins || {}))
       .map(([service, origin]) => [String(service).replace(/-.*$/, ""), origin]);
@@ -92,8 +97,10 @@ class RequestGuard {
     if (usable.length === 0) throw new Error("RequestGuard needs at least one origin");
     this.services = new Map(usable.map(([service, origin]) => [new URL(origin).origin, service]));
     this.routes = routes || new RouteTable(manifest || loadManifest());
+    this.now = now;
     this.window = null;
     this.load = null;
+    this.followUp = null;
     this.reads = null;
     this.state = null;
     this.observed = new Map();
@@ -174,6 +181,24 @@ class RequestGuard {
     return closed ? closed.admitted : [];
   }
 
+  // #1128: the declared follow-up window of a finished read state. Only
+  // appliance-load reads (the declared forced refreshes it has budget left
+  // for), bound to the target, until `ms` from now on the monotonic clock or
+  // until closeFollowUp() (the crawler calls it when the next navigation
+  // starts), whichever is first.
+  openFollowUp(stateId, rules, { bind = {}, service = "ui", ms } = {}) {
+    if (!Number.isFinite(ms) || ms <= 0) throw new Error(`${stateId}: a follow-up window needs a positive duration`);
+    this.closeFollowUp();
+    const opened = this.now();
+    this.followUp = { stateId, rules: this.compileWindow(stateId, rules, { service, classes: ["appliance-load"] }), admitted: [], bind: { ...bind }, ms, until: opened + ms };
+  }
+
+  closeFollowUp() {
+    const closed = this.followUp;
+    this.followUp = null;
+    return closed ? closed.admitted.map((entry) => ({ state: closed.stateId, ...entry })) : [];
+  }
+
   serviceFor(url) {
     return this.services.get(url.origin) || null;
   }
@@ -204,6 +229,20 @@ class RequestGuard {
       if (slot && slot.error) {
         this.observe(cls, route, parsed);
         return this.record(verb, url, false, slot.error, null, info);
+      }
+    }
+    // #1128: a finished state's declared follow-up (observed as that state's).
+    if (cls === "appliance-load" && this.followUp && !this.window) {
+      const followUp = this.followUp;
+      const declared = followUp.rules.some((entry) => entry.rule.cls === cls && matchesRule(entry.rule, verb, parsed, body));
+      if (declared) {
+        this.observe(cls, route, parsed, followUp.stateId);
+        if (this.now() > followUp.until) {
+          return this.record(verb, url, false, `follow-up ${route} after the ${followUp.ms} ms follow-up window of ${followUp.stateId}`, null, info);
+        }
+        const late = this.matchWindow(followUp, verb, parsed, body, cls);
+        if (late && late.error) return this.record(verb, url, false, `${late.error} (follow-up window of ${followUp.stateId})`, null, info);
+        return this.record(verb, url, true, `declared follow-up ${cls} for ${followUp.stateId}`, late, info, followUp);
       }
     }
     this.observe(cls, route, parsed);
@@ -250,8 +289,8 @@ class RequestGuard {
     return slot;
   }
 
-  observe(cls, route, parsed) {
-    const key = this.state || "(between states)";
+  observe(cls, route, parsed, stateKey = null) {
+    const key = stateKey || this.state || "(between states)";
     if (!this.observed.has(key)) this.observed.set(key, new Map());
     const seen = this.observed.get(key);
     seen.set(`${cls} ${route}`, (seen.get(`${cls} ${route}`) || 0) + 1);

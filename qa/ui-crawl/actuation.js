@@ -9,7 +9,12 @@
 //
 //   read              steps run with no write window. Declared `read_requests`
 //                     (export download; appliance polls for appliance_load
-//                     states) open a read window bound to the target.
+//                     states) open a read window bound to the target. A state
+//                     with `follow_up_ms` (#1128) then keeps only its declared
+//                     forced reads, with the budget they have left, admitted
+//                     for that long after its steps end (the refresh chain's
+//                     delayed follow-up); the crawler ends that window at the
+//                     next navigation.
 //   app-write-revert  capture -> refuse unless the rules bind to one object
 //                     (bay, enclosure object) and the target has an
 //                     enclosure scope -> semantic store read -> open a window
@@ -47,12 +52,20 @@ async function runRead(driver, state) {
   if (state.appliance_load) classes.add("appliance-load");
   if (reads.length) driver.guard.openReads(state.id, reads, windowOptions(driver, classes));
   let admitted = [];
+  let followUp = null;
   try {
     await driver.runSteps(state.steps || [], driver.vars);
   } finally {
-    if (reads.length) admitted = driver.guard.closeWrites();
+    if (reads.length) {
+      const trailing = state.follow_up_ms ? trailingReads(driver.guard.window) : [];
+      admitted = driver.guard.closeWrites();
+      if (trailing.length) {
+        driver.guard.openFollowUp(state.id, trailing, { ...windowOptions(driver, ["appliance-load"]), ms: state.follow_up_ms });
+        followUp = { ms: state.follow_up_ms, reads: trailing.map((rule) => `${rule.method || "GET"} ${rule.path} x${rule.max}`) };
+      }
+    }
   }
-  return result(state, "done", admitted.length ? { admitted } : {});
+  return result(state, "done", { ...(admitted.length ? { admitted } : {}), ...(followUp ? { followUp } : {}) });
 }
 
 // Declared forced reads with budget left in a closing window.

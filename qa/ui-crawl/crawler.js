@@ -286,6 +286,8 @@ class Crawler {
   // one or the end of the state; it admits nothing but those reads.
   async withLoadWindow(target, fn) {
     this.endLoadWindow();
+    // #1128: a finished state's follow-up window ends when the next page load starts.
+    this.endFollowUp();
     const rules = loadRequestsFor(this.inventory, target.page, target.platform);
     if (rules.length) {
       const service = ((this.inventory.pages || {})[target.page] || {}).service || "ui";
@@ -293,6 +295,12 @@ class Crawler {
       this.loadTarget = target.label;
     }
     return fn();
+  }
+
+  endFollowUp() {
+    if (!this.guard.followUp) return;
+    const admitted = this.guard.closeFollowUp();
+    if (admitted.length) (this.followUpAdmitted = this.followUpAdmitted || []).push(...admitted);
   }
 
   endLoadWindow() {

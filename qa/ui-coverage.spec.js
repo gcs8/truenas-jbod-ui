@@ -130,9 +130,12 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
     // Sol #1108: a QuantaStor page sends a forced startup read; only its declared page-load window admits it.
     { page: "main", ready: "main", variant: "quantastor", platform: "quantastor", label: "fixture/main-quantastor", url: `${origins["ui-quantastor"]}/` },
+    // #1127: a saved storage view selected through the target URL, as a live
+    // crawl reaches it (a later scope: only the `scope: "all"` states run).
+    { page: "main", ready: "main", scopeIndex: 1, label: "fixture/main-view-boot-doms", url: `${origins.ui}/?system_id=demo-system&storage_view_id=boot-doms` },
   ];
   try {
-    for (const target of targets) await crawler.crawlTarget(target, states.filter((state) => state.page === target.page));
+    for (const target of targets) await crawler.crawlTarget(target, states.filter((state) => state.page === target.page && (!target.scopeIndex || state.scope === "all")));
   } finally {
     await routes.drain();
     await context.close();
@@ -160,6 +163,13 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state)));
   }
   expect(misclassified, "a control called a route its state's safety class or read allowlist does not allow; fix the class, the reads or the control").toEqual([]);
+
+  // #1127: on the saved-view target the heat map read each occupied slot's
+  // SMART summary through the storage-view route, admitted by the heat-map
+  // states' own read lists (a blocked one would have failed above).
+  const viewSmart = "read GET /api/storage-views/{view_id}/slots/{slot_index}/smart";
+  expect(["main.heatmap", "main.heatmap.temperature"].filter((id) => !(guard.observed.get(id) || new Map()).has(viewSmart)),
+    "the saved-view fixture target no longer drives the storage-view heat-map SMART read").toEqual([]);
 
   // Sol #1108: the QuantaStor page's startup refresh went out, inside the
   // declared page-load window only (it would be a blocked request otherwise).
