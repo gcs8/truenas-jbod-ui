@@ -162,8 +162,12 @@ I/O or rollback, and production-scale Docker shutdown timing remains unqualified
 Compose stop-grace settings are unchanged.
 Index builds, inline or deferred, sort through SQLite temporary files with a
 bounded cache instead of in memory, so their memory no longer grows with the
-table (#1092). The temporary files go to the history service's `TMPDIR`, which
-the shipped Compose file sets to the history volume. If a deferred build fills
+table (#1092). The temporary files go to a private `.sqlite-tmp` folder on the
+history volume (`./history/.sqlite-tmp`, mode `0700`), which the history
+service creates and empties of stale files at startup whatever `TMPDIR` the
+Compose file sets, so an older or hardened Compose file with a tmpfs `/tmp` no
+longer puts them in memory. An operator-set `SQLITE_TMPDIR` still wins. Backups
+and exports never include the folder (#1094). If a deferred build fills
 the volume, SQLite rolls it back and deletes its temporary files, the service
 returns the build's WAL space with a checkpoint, logs the free space, reports
 degraded ("waiting for free disk space"), keeps collecting, and retries the

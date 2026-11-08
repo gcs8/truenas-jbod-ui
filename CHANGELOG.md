@@ -28,13 +28,32 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- The history service now keeps SQLite's temporary sort and VACUUM files in
+  `./history/.sqlite-tmp` (mode `0700`, created and emptied of stale files at
+  startup), whatever `TMPDIR` the Compose file sets. An older or customised
+  Compose file without `TMPDIR` for the history service, or a hardened one with
+  a tmpfs `/tmp`, no longer needs that line added by hand. Setting
+  `SQLITE_TMPDIR` for the history service still overrides it. Backups and
+  exports never include the folder (#1094, #1095).
+
 ### Fixed
 
-- `scripts/update_immutable_deployment.py --replace-compose` keeps operator
-  overlays named with `--keep-overlay` in the Compose chain, validates the
-  merged chain and refuses overlays that change a shipped service's image,
-  user, command, volumes or networks; health and retention URLs may use an
-  address and port the deployment itself publishes (#1097).
+- Fixed history index builds and startup upgrades spilling their sort files
+  outside the history volume when the history service's Compose entry had no
+  `TMPDIR`: into the container's own filesystem, or, on a read-only container,
+  its tmpfs `/tmp`, which put the sort back in memory and could bring back the
+  #1092 out-of-memory failure. The history service and the
+  segmented-history maintenance scripts now choose the history volume
+  themselves, and the free-space check before an index build looks at that same
+  folder (#1094, #1095).
+- Fixed `scripts/update_immutable_deployment.py --replace-compose` replacing
+  operator overlays: overlays named with `--keep-overlay` now stay in the
+  Compose chain, the merged chain is validated, and an overlay that changes a
+  shipped service's image, user, command, volumes or networks is refused.
+  Health and retention URLs may also use an address and port the deployment
+  itself publishes (#1097).
 
 ## v0.24.0-beta.6 - 2026-11-07
 
