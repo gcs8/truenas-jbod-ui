@@ -369,13 +369,78 @@ CI runs the fixture-only browser specs on every pull request, in the
 `Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
 `qa/chassis-row-overflow.spec.js`, `qa/connections-clear-selection.spec.js`,
 `qa/connections-overflow.spec.js`, `qa/offline-snapshot.spec.js`,
-`qa/saved-view-selection.spec.js`, `qa/ui-scope-safety.spec.js`, and
-`qa/upgrade-notice.spec.js`. They build their own synthetic fixtures and need
-no running stack:
+`qa/saved-view-selection.spec.js`, `qa/ui-coverage.spec.js`,
+`qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
+own synthetic fixtures and need no running stack:
 
 ```bash
-npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
+npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-coverage.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
+
+### UI coverage
+
+Screenshots of default views miss most layout defects: a heading that stacks
+one letter per line only in Heat Map mode, a Disk Path label that breaks inside
+a word, tile text that is unreadable on one heat colour. The UI coverage
+tooling exists to catch those automatically.
+
+- `qa/ui-states.json` is the UI state inventory. Each state names a page, the
+  selector steps that reach it, the controls it renders (`covers`) and a safety
+  class: `read`, `app-write-revert` (app-local writes such as names, notes,
+  display preferences, saved views or page order, with the exact `revert`
+  steps and a `verify` re-read), `led` (identify on, then off, verified off) or
+  `forbidden` (appliance or array writes beyond the identify LED, bootstrap,
+  sudo or account changes, SMART test starts, backup and restore, history purge
+  or adopt, configuration saves that reach appliances). Forbidden states are
+  listed for completeness and never actuated.
+- `qa/ui-coverage.spec.js` (fixture-only CI) scans the templates and browser
+  scripts for interactive controls (buttons, links styled as buttons, selects,
+  inputs, `details`, dialogs, `data-*` click hooks) and fails when one is not
+  named in a state's `covers` or in `ignored_controls` with a reason. It also
+  crawls the `ci: true` states on synthetic fixtures at the `ci` widths and
+  fails on any unexplained layout, contrast, heat-map or console finding.
+- `scripts/ui_crawl.js` is the crawler. For every state and width it saves a
+  full-page PNG, 1280x720 tiles at native resolution, `findings.json` and an
+  `index.html` that lists each state's findings next to its tiles.
+
+Checks the crawler runs on every state and width: text squeezed to fewer than
+about four characters per line or broken inside a word, an empty grid or flex
+track beside a squeezed sibling, page-level horizontal overflow, clipped,
+truncated (without a tooltip) or overlapping controls, axe-core WCAG A/AA
+violations (contrast and every serious or critical rule), heat-map colours
+that turn a small value range into alarm colours, text contrast on heat tiles,
+console and page errors, failed requests, HTTP 400 or above, slow page ready
+and slow requests, and, with `--baseline DIR`, a pixel diff against an earlier
+crawl of the same state.
+
+Coverage tiers:
+
+| Change | UI coverage |
+|---|---|
+| Beta cut or final release | Full crawl of every state on the beta twin at 1600, 1920, 3840 and 390 px (390 best effort), with a cross-family review of the native-resolution tiles |
+| PR that changes visible UI | Every state of the pages it touches, at 1600, 1920 and 3840 px (`--pages` and `--tier pr`) |
+| Change with no visible UI (wiki grammar, backend only) | None beyond the CI spec |
+
+Run it locally against the synthetic fixtures, or against a stack:
+
+```bash
+python scripts/build_ui_crawl_fixture.py --output /tmp/ui-fixture.json
+node scripts/ui_crawl.js --fixture /tmp/ui-fixture.json --out /tmp/ui-crawl --ci
+node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8081 --out /tmp/ui-crawl --tier pr --pages main,fabric
+```
+
+A live crawl is read-only by default: the request guard aborts every write and
+every forced appliance refresh. `--allow app-write-revert,led --write-system ID`
+admits the declared writes of those states on one system, reverts them at once
+and verifies the revert by re-reading. Set `BROWSER_CDP_URL` to use a remote
+browser. Keep live-stack output out of the repository.
+
+Adding a control: give it an `id` or a `data-*` hook, then add the key to the
+`covers` list of the state that renders it, or add a state with its steps and
+safety class. A control that only exists in one configuration (for example
+the write sign-in panel) can be covered by a `fixture_only` state. When a
+crawl finds a real defect that will be fixed separately, add it to
+`known_findings` with the issue number and remove the entry with the fix.
 
 The switching and ESXi suites are live-appliance contracts, not portable fixture
 tests. Run them only against an intentionally configured stack:

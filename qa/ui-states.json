@@ -77,6 +77,12 @@
       "covers": ["#heatmap-toggle-button", "#heatmap-metric-select", "#heatmap-scale-slider"]
     },
     {
+      "id": "main.heatmap.temperature", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
+    },
+    {
       "id": "main.heatmap.metric", "page": "main", "safety": "read",
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 12}, {"wait": 800}],
       "checks": ["heatmap"],
@@ -466,5 +472,13 @@
     {"key": "textarea\"\"@app/static/app.js", "reason": "Off-screen clipboard helper created and removed inside the Copy handler; covered through [data-copy]."}
   ],
   "runtime_controls": [],
-  "known_findings": []
+  "known_findings": [
+    {"state": "main.heatmap*", "type": "text-narrow-wrap", "selector": "#enclosure-panel-title", "issue": 1102},
+    {"state": "fabric.disk*", "type": "text-mid-word-break", "issue": 1102},
+    {"state": "fabric.disk*", "type": "empty-track-squeeze", "issue": 1102},
+    {"state": "main.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
+    {"state": "offline.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
+    {"state": "main.heatmap*", "type": "heat-alarm-healthy-temp", "issue": 1103},
+    {"state": "main.heatmap*", "type": "heat-small-range-spread", "issue": 1103}
+  ]
 }

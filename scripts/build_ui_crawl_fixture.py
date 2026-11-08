@@ -217,6 +217,7 @@ async def build() -> dict:
         "admin:/api/admin/ssh-keys": {"keys": []},
         "admin:/api/admin/history/orphaned": {"orphaned_systems": []},
         "admin:/api/admin/storage-views/live-enclosures": {"enclosures": []},
+        "admin:/api/admin/storage-views/candidates": {"candidates": []},
     }
     smart = {}
     for key, summary in (bundle.smart_summary_cache or {}).items():

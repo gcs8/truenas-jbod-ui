@@ -55,6 +55,7 @@ function parseArgs(argv) {
     else if (flag === "--cdp-env") args.cdpEnv = next();
     else if (flag === "--label") args.label = next();
     else if (flag === "--appliance-load") args.applianceLoad = true;
+    else if (flag === "--scopes") args.scopes = next();
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!args.out) throw new Error("--out is required");
@@ -116,6 +117,8 @@ function fixtureTargets() {
 }
 
 function statesFor(target, states, args, used) {
+  if (args.scopes === "first" && target.scopeIndex > 0) return [];
+  if (args.scopes === "rest" && target.scopeIndex === 0) return [];
   return states.filter((state) => {
     if (state.page !== target.page) return false;
     if (target.scopeIndex > 0 && state.scope !== "all") return false;

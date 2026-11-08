@@ -70,7 +70,12 @@ class Crawler {
     const page = await this.context.newPage();
     page.setDefaultTimeout(60_000);
     const push = (type, severity, text, detail) => this.bucket && this.bucket.push({ type, severity, text: String(text).slice(0, 300), detail });
-    page.on("console", (message) => message.type() === "error" && push("console-error", "error", message.text()));
+    page.on("console", (message) => {
+      if (message.type() !== "error") return;
+      // In fixture mode a missing synthetic answer is a fixture gap, not a product error.
+      if (this.fixtureMode && /Failed to load resource: the server responded with a status of 404/.test(message.text())) return;
+      push("console-error", "error", message.text());
+    });
     page.on("pageerror", (error) => push("page-error", "error", error.message));
     page.on("requestfailed", (request) => {
       const failure = request.failure()?.errorText || "failed";
@@ -156,7 +161,8 @@ class Crawler {
   markKnown(record) {
     for (const width of record.widths) {
       for (const finding of width.findings) {
-        const known = (this.inventory.known_findings || []).find((entry) => (entry.state === record.state || entry.state === record.baseId)
+        const stateMatches = (pattern) => (pattern.endsWith("*") ? record.state.startsWith(pattern.slice(0, -1)) : pattern === record.state || pattern === record.baseId);
+        const known = (this.inventory.known_findings || []).find((entry) => stateMatches(entry.state)
           && entry.type === finding.type && (!entry.selector || String(finding.selector || "").includes(entry.selector)));
         if (known) finding.known = known.issue;
       }

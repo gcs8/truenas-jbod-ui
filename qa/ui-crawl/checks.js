@@ -197,7 +197,9 @@ function pageChecks(options) {
   }
 
   // ---- controls: clipped, truncated, overlapping -------------------------
-  const controls = Array.from(document.querySelectorAll("button, a[href], select, input:not([type=hidden]), textarea, summary, [role=button]"))
+  // With a modal dialog open the page behind it is inert: check the dialog only.
+  const modal = Array.from(document.querySelectorAll("dialog[open]")).find((dialog) => dialog.matches(":modal"));
+  const controls = Array.from((modal || document).querySelectorAll("button, a[href], select, input:not([type=hidden]), textarea, summary, [role=button]"))
     .filter((element) => visible(element) && style(element).pointerEvents !== "none");
   const textish = Array.from(document.querySelectorAll("button, a, label, h1, h2, h3, h4, th, td, dt, dd, span, p, strong, small, summary, li, div"))
     .filter((element) => element.children.length === 0 && (element.textContent || "").trim().length > 1);
@@ -254,7 +256,10 @@ function pageChecks(options) {
       const alpha = Number(tile.style.getPropertyValue("--heatmap-alpha")) || 0.62;
       return { tile, raw, value, rgb, alpha };
     }).filter((record) => Number.isFinite(record.value) && record.rgb.length === 3);
-    const isTemperature = /temp/i.test(metricLabel) || records.some((record) => /°|deg/i.test(record.raw));
+    // Absolute temperature (not a delta from the average): alarm colours need a hot disk.
+    const isTemperature = (/temp/i.test(metricLabel) && !/\bvs\b|delta|average/i.test(metricLabel))
+      || (!metricLabel && records.some((record) => /^\s*\d+(\.\d+)?\s*(°\s*)?C\s*$/.test(record.raw)));
+    const isTemperatureLike = /temp/i.test(metricLabel);
     const alarm = (rgb) => rgb[0] >= 180 && rgb[1] <= 130;
     const values = records.map((record) => record.value);
     const min = Math.min(...values);
@@ -262,7 +267,7 @@ function pageChecks(options) {
     const colours = new Set(records.map((record) => record.rgb.join(",")));
     const spread = records.some((record) => alarm(record.rgb)) && records.some((record) => !alarm(record.rgb));
     Object.assign(heat, { active: records.length, metric: metricLabel, min, max, colours: colours.size, temperature: isTemperature });
-    const smallDelta = isTemperature ? opts.temperatureSmallDeltaC : Math.max(1, Math.abs(max) * opts.relativeSmallDelta);
+    const smallDelta = isTemperatureLike ? opts.temperatureSmallDeltaC : Math.max(1, Math.abs(max) * opts.relativeSmallDelta);
     if (records.length >= 2 && max - min <= smallDelta && spread) {
       push("heat-small-range-spread", "error", records[0].tile.closest(".enclosure-face") || records[0].tile, {
         metric: metricLabel, min, max, range: Number((max - min).toFixed(2)), note: "values within a small delta map to alarm and non-alarm colours",
