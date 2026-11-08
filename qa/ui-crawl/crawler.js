@@ -11,7 +11,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { runState } = require("./actuation");
-const { CrawlDriver, NotApplicable } = require("./driver");
+const { CrawlDriver, NotApplicable, navigate } = require("./driver");
 const { pageChecks, axeFindings } = require("./checks");
 const png = require("./png");
 
@@ -207,7 +207,7 @@ class Crawler {
     this.lastLoad = Date.now();
     const started = Date.now();
     this.debug(`goto ${target.label}`);
-    await this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 });
+    await navigate(this.page, () => this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 }));
     this.debug("width");
     await this.setWidth(this.widths[0]);
     this.debug("ready");
