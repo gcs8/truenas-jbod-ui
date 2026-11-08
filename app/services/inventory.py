@@ -11,7 +11,7 @@ import shlex
 import time
 import threading
 import weakref
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar, copy_context
@@ -499,6 +499,14 @@ SYSTEM_RETENTION_MAX_ENCLOSURES = 32
 # Opening-order scoring is optional page enrichment, not page admission.
 OPENING_ORDER_MAX_WAITERS = 8
 OPENING_ORDER_TIMEOUT_SECONDS = 2.0
+# A user request waits at most this long in total for snapshot or source state
+# held by a running background refresh (#1125). Its own appliance reads keep
+# their per-call timeouts; only the queueing behind background work is bounded.
+SNAPSHOT_REFRESH_WAIT_SECONDS = 5.0
+# A background refresh that has not finished by then is abandoned: its waiters
+# stop, it may never publish, and the next refresh can be scheduled (#1125).
+# Far above a healthy refresh, so a slow appliance is not abandoned routinely.
+BACKGROUND_REFRESH_DEADLINE_SECONDS = 300.0
 SNAPSHOT_NO_ENCLOSURE_KEY = "__service_no_enclosure__"
 # Storage-view bays are numbered from here so they never collide with a real
 # enclosure slot number in the same snapshot.
@@ -1157,6 +1165,13 @@ class SupersededSnapshotRefreshError(SnapshotStateBusyError):
     """A newer topology publication superseded this build and no current value can stand in."""
 
 
+class SnapshotRefreshWaitTimeout(SnapshotStateBusyError):
+    """A user request waited its full bound on a background refresh (#1125)."""
+
+    def __init__(self) -> None:
+        Exception.__init__(self, "The inventory is still refreshing. Try again in a moment.")
+
+
 class SystemRetentionBusyError(Exception):
     """Raised when a system-wide retention check is already running for the system."""
 
@@ -1209,6 +1224,40 @@ _snapshot_build_source_publications: ContextVar[list[SourcePublication] | None] 
     "snapshot_build_source_publications", default=None,
 )
 _snapshot_background_refresh: ContextVar[bool] = ContextVar("snapshot_background_refresh", default=False)
+
+
+@dataclass(slots=True)
+class _BackgroundRefreshTicket:
+    """One background refresh run; set ``abandoned`` once its deadline passed."""
+
+    abandoned: bool = False
+
+
+@dataclass(slots=True)
+class _SnapshotWaitBudget:
+    """Seconds one user request has spent queued behind background work."""
+
+    waited: float = 0.0
+
+
+# Set inside each supervised background refresh worker (#1125). A worker whose
+# ticket is abandoned keeps running until it can stop, but never publishes.
+_background_refresh_ticket: ContextVar[_BackgroundRefreshTicket | None] = ContextVar(
+    "background_refresh_ticket", default=None,
+)
+# Set for a user request's snapshot or source read; absent in background work.
+_snapshot_wait_budget: ContextVar[_SnapshotWaitBudget | None] = ContextVar(
+    "snapshot_wait_budget", default=None,
+)
+
+
+def _background_refresh_abandoned() -> bool:
+    ticket = _background_refresh_ticket.get()
+    return ticket is not None and ticket.abandoned
+
+
+def _in_background_refresh() -> bool:
+    return _snapshot_background_refresh.get() or _background_refresh_ticket.get() is not None
 
 
 async def _await_retained(future: asyncio.Future[RetainedResultT]) -> RetainedResultT:
@@ -1527,6 +1576,12 @@ class InventoryService:
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
         self._source_bundle_refresh_generation = -1
+        # Running background refresh workers and their loop start times,
+        # including abandoned ones that have not stopped yet (#1125).
+        self._background_refresh_workers: dict[asyncio.Task[Any], float] = {}
+        # When the last background refresh was abandoned; cleared by the next
+        # publication. Reads served meanwhile say how old they are.
+        self._background_refresh_abandoned_at: datetime | None = None
         self._smart_refresh_tasks: dict[SmartCacheKey, asyncio.Task[None]] = {}
         self._scale_preferred_ses_host: str | None = None
         self._quantastor_preferred_ses_host: str | None = None
@@ -1712,6 +1767,106 @@ class InventoryService:
         force_source_refresh: bool | None = None,
         minimum_source_publication: SourcePublication | None = None,
     ) -> CacheResult[InventorySnapshot]:
+        arguments = {
+            "force_refresh": force_refresh,
+            "selected_enclosure_id": selected_enclosure_id,
+            "allow_stale_cache": allow_stale_cache,
+            "force_source_refresh": force_source_refresh,
+            "minimum_source_publication": minimum_source_publication,
+        }
+        if _in_background_refresh():
+            # Background work is bounded by its own deadline instead.
+            return await self._load_snapshot_result(**arguments)
+        budget_token = _snapshot_wait_budget.set(_SnapshotWaitBudget())
+        try:
+            result = await self._load_snapshot_result(**arguments)
+        except SnapshotRefreshWaitTimeout:
+            # A reader that accepts a stale view gets the cached one, if any,
+            # rather than the busy answer (#1125). A change dropped the cache
+            # deliberately, so there may be none; the busy answer stands then.
+            cache_key = selected_enclosure_id or self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
+            cached = self._cache.get(cache_key) if allow_stale_cache else None
+            if cached is None:
+                raise
+            self._touch_snapshot_key(cache_key)
+            add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
+            self._observe_inventory_snapshot_request("stale-hit")
+            result = CacheResult(cached, "stale-hit")
+        finally:
+            _snapshot_wait_budget.reset(budget_token)
+        if result.cache_state == "stale-hit":
+            warning = self._refresh_delay_warning(result.value)
+            if warning is not None:
+                stale = result.value
+                result = CacheResult(
+                    stale.model_copy(update={"warnings": [warning, *stale.warnings]}),
+                    result.cache_state,
+                )
+        return result
+
+    def _background_refresh_overdue(self) -> bool:
+        if not self._background_refresh_workers:
+            return False
+        now = asyncio.get_running_loop().time()
+        return any(now - started > SNAPSHOT_REFRESH_WAIT_SECONDS for started in self._background_refresh_workers.values())
+
+    def _refresh_delay_warning(self, snapshot: InventorySnapshot) -> str | None:
+        """Say how old a stale view is when its refresh is overdue or was abandoned (#1125)."""
+        if self._background_refresh_abandoned_at is None and not self._background_refresh_overdue():
+            return None
+        read_at = snapshot.last_updated
+        if read_at.tzinfo is None:
+            read_at = read_at.replace(tzinfo=timezone.utc)
+        read_at_text = read_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if self._background_refresh_abandoned_at is not None:
+            return (
+                f"The last inventory refresh did not finish within {BACKGROUND_REFRESH_DEADLINE_SECONDS:g} "
+                f"seconds and was stopped, so this view shows the inventory read at {read_at_text}."
+            )
+        return (
+            "The inventory refresh is taking longer than usual, so this view shows the inventory "
+            f"read at {read_at_text}."
+        )
+
+    @asynccontextmanager
+    async def _wait_for_snapshot_state(self, lock: asyncio.Lock):
+        """Hold ``lock``; a user request queued behind background work waits a bounded time.
+
+        Background refreshes are bounded by their own deadline instead. A user
+        request waits without a bound only when no background refresh is
+        running, as before, so concurrent user requests still share one build.
+        Each user request's waits share one total of SNAPSHOT_REFRESH_WAIT_SECONDS;
+        its own work between waits is not counted (#1125).
+        """
+        if _in_background_refresh() or not self._background_refresh_workers:
+            async with lock:
+                yield
+            return
+        # A source read outside a snapshot request gets its own bound.
+        budget = _snapshot_wait_budget.get() or _SnapshotWaitBudget()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            async with asyncio.timeout(max(0.0, SNAPSHOT_REFRESH_WAIT_SECONDS - budget.waited)):
+                await lock.acquire()
+        except TimeoutError:
+            logger.debug("A request stopped waiting for a running background inventory refresh.")
+            raise SnapshotRefreshWaitTimeout() from None
+        finally:
+            budget.waited += loop.time() - started
+        try:
+            yield
+        finally:
+            lock.release()
+
+    async def _load_snapshot_result(
+        self,
+        force_refresh: bool = False,
+        selected_enclosure_id: str | None = None,
+        allow_stale_cache: bool = False,
+        force_source_refresh: bool | None = None,
+        minimum_source_publication: SourcePublication | None = None,
+    ) -> CacheResult[InventorySnapshot]:
         self._snapshot_request_sequence += 1
         request_sequence = self._snapshot_request_sequence
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
@@ -1756,7 +1911,7 @@ class InventoryService:
                 # The discovery candidate was built before admission, so it is
                 # fenced from the start of the build that produced it.
                 candidate_fence = discovery_fence[0] if discovery_fence else invalidation_fence
-                async with self._get_snapshot_lock(cache_key):
+                async with self._wait_for_snapshot_state(self._get_snapshot_lock(cache_key)):
                     if (
                         topology_generation != self._snapshot_topology_generation
                         or self._snapshot_invalidated_since(cache_key, candidate_fence)
@@ -1766,6 +1921,7 @@ class InventoryService:
 
                     def discovery_publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
+                                and not _background_refresh_abandoned()
                                 and not self._snapshot_invalidated_since(cache_key, candidate_fence)
                                 and self._snapshot_published_sequence.get(cache_key, -1) <= request_sequence
                                 and self._publication_not_superseded(
@@ -1818,7 +1974,7 @@ class InventoryService:
 
         self._begin_snapshot_activity(cache_key)
         try:
-            async with self._get_snapshot_lock(cache_key):
+            async with self._wait_for_snapshot_state(self._get_snapshot_lock(cache_key)):
                 cached = self._cache.get(cache_key)
                 cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
                 now = utcnow()
@@ -1905,6 +2061,10 @@ class InventoryService:
                         retry_generation = self._source_bundle_generation
                         continue
                     break
+                if _background_refresh_abandoned():
+                    # Neither publish nor learn topology from a refresh past
+                    # its deadline that finished late (#1125).
+                    raise SnapshotStateBusyError()
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and self._snapshot_invalidated_since(cache_key, invalidation_fence):
                     raise SnapshotStateBusyError()
@@ -1973,7 +2133,7 @@ class InventoryService:
             if redirected_publication:
                 self._begin_snapshot_activity(publication_key)
             try:
-                async with self._get_snapshot_lock(publication_key):
+                async with self._wait_for_snapshot_state(self._get_snapshot_lock(publication_key)):
                     publication_topology_changed = topology_generation != self._snapshot_topology_generation
                     if (
                         publication_topology_changed
@@ -1985,6 +2145,7 @@ class InventoryService:
 
                     def publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
+                                and not _background_refresh_abandoned()
                                 and not self._snapshot_invalidated_since(cache_key, invalidation_fence)
                                 and not self._snapshot_invalidated_since(publication_key, invalidation_fence)
                                 and self._snapshot_published_sequence.get(publication_key, -1) <= request_sequence
@@ -2194,6 +2355,9 @@ class InventoryService:
         build_source_publications: list[SourcePublication] | None = None,
         explicit_selection: bool = False,
     ) -> tuple[InventorySnapshot, bool]:
+        if _background_refresh_abandoned():
+            # Past its deadline a refresh may finish late; never publish it (#1125).
+            raise SnapshotStateBusyError()
         if self._snapshot_published_sequence.get(cache_key, -1) > request_sequence:
             current = self._cache.get(cache_key)
             if current is not None and self._snapshot_meets_source_requirement(
@@ -2233,6 +2397,7 @@ class InventoryService:
         self._snapshot_published_sequence[cache_key] = request_sequence
         self._snapshot_source_publications[cache_key] = source_publication
         self._snapshot_publication_generation += 1
+        self._background_refresh_abandoned_at = None
         self._view_order_source_bundle = None
         self._view_order_topology_generation = -1
         self._view_order_cache.clear()
@@ -2341,7 +2506,7 @@ class InventoryService:
         options = self._canonical_enclosure_options
         discovered_snapshot: InventorySnapshot | None = None
         if options is None:
-            async with self._snapshot_discovery_lock:
+            async with self._wait_for_snapshot_state(self._snapshot_discovery_lock):
                 options = self._canonical_enclosure_options
                 while options is None:
                     generation = self._snapshot_topology_generation
@@ -2363,6 +2528,9 @@ class InventoryService:
                         )
                     finally:
                         _snapshot_detail_commits.reset(detail_token)
+                    if _background_refresh_abandoned():
+                        # Learn nothing from a refresh past its deadline (#1125).
+                        raise SnapshotStateBusyError()
                     if generation != self._snapshot_topology_generation:
                         continue
                     discovered_snapshot = candidate
@@ -4152,7 +4320,13 @@ class InventoryService:
             invalidate_source_bundle=invalidate_source_bundle,
         )
 
-    def peek_cached_snapshot(self, *, selected_enclosure_id: str | None = None) -> InventorySnapshot | None:
+    def peek_cached_snapshot(
+        self,
+        *,
+        selected_enclosure_id: str | None = None,
+        exact: bool = False,
+    ) -> InventorySnapshot | None:
+        """Return a cached snapshot without waiting; ``exact`` never substitutes another view."""
         preferred_keys: list[str] = []
         if selected_enclosure_id:
             preferred_keys.append(selected_enclosure_id)
@@ -4162,7 +4336,7 @@ class InventoryService:
             snapshot = self._cache.get(key)
             if snapshot is not None:
                 return snapshot
-        if not self._cache:
+        if exact or not self._cache:
             return None
         return max(self._cache.values(), key=lambda snapshot: snapshot.last_updated)
 
@@ -4220,7 +4394,7 @@ class InventoryService:
             self._schedule_background_source_bundle_refresh()
             return CacheResult(self._source_bundle, "stale-hit")
 
-        async with self._source_bundle_lock:
+        async with self._wait_for_snapshot_state(self._source_bundle_lock):
             if (
                 self._source_bundle is not None
                 and self._source_bundle_published_sequence != observed_source_publication
@@ -4254,9 +4428,10 @@ class InventoryService:
             previous_bundle = self._source_bundle
             generation = self._source_bundle_generation
             bundle = await self._collect_inventory_source_bundle()
-            if generation != self._source_bundle_generation:
+            if generation != self._source_bundle_generation or _background_refresh_abandoned():
                 # Never label a pre-mutation observation fresh. Reject this
                 # attempt; the next caller recollects under the same single flight.
+                # An abandoned refresh's late read is never published (#1125).
                 raise SnapshotStateBusyError()
             if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
                 previous_api = previous_bundle.sources.get("api")
@@ -4273,6 +4448,7 @@ class InventoryService:
                 sg_cache_generation=self._sg_ses_device_cache_generation,
             )
             self._source_bundle = bundle
+            self._background_refresh_abandoned_at = None
             self._source_bundle_until = utcnow() + timedelta(
                 seconds=max(0, int(self.settings.app.source_bundle_cache_ttl_seconds))
             )
@@ -4288,7 +4464,13 @@ class InventoryService:
         if existing is not None and not existing.done():
             return existing
 
-        task = asyncio.create_task(self._background_source_bundle_refresh())
+        def _unregister(abandoned: asyncio.Task[Any]) -> None:
+            if self._source_bundle_refresh_task is abandoned:
+                self._source_bundle_refresh_task = None
+
+        task = self._start_background_refresh(
+            "source", self._background_source_bundle_refresh(), unregister=_unregister,
+        )
         self._source_bundle_refresh_task = task
         self._source_bundle_refresh_generation = self._source_bundle_generation
 
@@ -4304,12 +4486,67 @@ class InventoryService:
         task.add_done_callback(_cleanup)
         return task
 
+    def _start_background_refresh(
+        self,
+        label: str,
+        work: Awaitable[RetainedResultT],
+        *,
+        unregister: Callable[[asyncio.Task[Any]], None],
+    ) -> asyncio.Task[RetainedResultT]:
+        """Start one background refresh with an overall deadline (#1125).
+
+        Past BACKGROUND_REFRESH_DEADLINE_SECONDS the refresh is abandoned: it is
+        cancelled, reported, and ``unregister`` drops it so the next refresh can
+        be scheduled at once, even if this one keeps running until it can stop
+        (a blocked worker thread, a drained write). Its ticket is marked
+        abandoned, so whatever it finishes later is never published. Appliance
+        calls it already sent keep their permits until answered, so a
+        replacement refresh stays within the call budget.
+        """
+        loop = asyncio.get_running_loop()
+        ticket = _BackgroundRefreshTicket()
+        context = copy_context()
+        context.run(_background_refresh_ticket.set, ticket)
+        task = asyncio.create_task(work, context=context)
+        self._background_refresh_workers[task] = loop.time()
+
+        def _abandon() -> None:
+            if task.done():
+                return
+            ticket.abandoned = True
+            task.cancel()
+            self._background_refresh_abandoned_at = utcnow()
+            logger.warning(
+                "Background inventory %s refresh for system %s did not finish within %g seconds; "
+                "abandoned it so the next refresh can start. Its late result will not be used.",
+                label,
+                self.system.id,
+                BACKGROUND_REFRESH_DEADLINE_SECONDS,
+            )
+            unregister(task)
+
+        deadline = loop.call_later(BACKGROUND_REFRESH_DEADLINE_SECONDS, _abandon)
+
+        def _finished(done: asyncio.Task[Any]) -> None:
+            deadline.cancel()
+            self._background_refresh_workers.pop(done, None)
+
+        task.add_done_callback(_finished)
+        return task
+
     async def _background_source_bundle_refresh(self) -> InventorySourceBundle | None:
         try:
             return await self._get_inventory_source_bundle(
                 force_refresh=True,
                 invalidate_sg_ses_device_cache=False,
             )
+        except SnapshotStateBusyError:
+            if not _background_refresh_abandoned():
+                logger.exception("Background inventory source refresh failed")
+            else:
+                # Already reported when it was abandoned (#1125).
+                logger.info("Discarded the late result of an abandoned inventory source refresh.")
+            return None
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background inventory source refresh failed")
             return None
@@ -5138,7 +5375,15 @@ class InventoryService:
         if existing is not None and not existing.done():
             return
 
-        task = asyncio.create_task(self._background_snapshot_refresh(cache_key, default_selection=default_selection))
+        def _unregister(abandoned: asyncio.Task[Any], *, key: str = cache_key) -> None:
+            if self._snapshot_refresh_tasks.get(key) is abandoned:
+                self._snapshot_refresh_tasks.pop(key, None)
+
+        task = self._start_background_refresh(
+            f"snapshot {cache_key}",
+            self._background_snapshot_refresh(cache_key, default_selection=default_selection),
+            unregister=_unregister,
+        )
         self._snapshot_refresh_tasks[cache_key] = task
 
         def _cleanup(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
@@ -5190,6 +5435,12 @@ class InventoryService:
             # value cannot stand in; the next request schedules another
             # refresh. Not an error (#928).
             logger.debug("Background snapshot refresh for %s was superseded.", cache_key)
+        except SnapshotStateBusyError:
+            if not _background_refresh_abandoned():
+                logger.exception("Background snapshot refresh failed for %s", cache_key)
+            else:
+                # Already reported when it was abandoned (#1125).
+                logger.info("Discarded the late result of an abandoned snapshot refresh for %s.", cache_key)
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
         finally:
