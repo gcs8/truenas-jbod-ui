@@ -13,6 +13,17 @@ from tests import test_immutable_deployment as fixtures
 from tests.test_immutable_deployment import FakeRuntime, NEW_IMAGE_ID
 
 
+def setUpModule() -> None:
+    # The helper refuses a deployment under a directory that is not root-owned
+    # or that others can write (#1100); report the system temporary directory
+    # chain as root's, as test_immutable_deployment does.
+    fixtures.SYSTEM_TEMP_AS_ROOT_CHAIN.start()
+
+
+def tearDownModule() -> None:
+    fixtures.SYSTEM_TEMP_AS_ROOT_CHAIN.stop()
+
+
 class ImageUpgradeTests(unittest.TestCase):
     make_root = fixtures.ImmutableDeploymentTests.make_root
     make_spec = fixtures.ImmutableDeploymentTests.make_spec
