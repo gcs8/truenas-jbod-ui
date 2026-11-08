@@ -1064,6 +1064,24 @@ textarea {
   margin-bottom: 12px;
 }
 
+/* The enclosure title keeps its natural width (#1102). The header actions
+   (view toggles, heat-map controls and legends) take the remaining width and
+   wrap inside it; when even 360px is not left beside the title they drop to
+   their own row instead of squeezing the title to one letter per line. */
+.enclosure-panel > .panel-header {
+  flex-wrap: wrap;
+}
+
+.enclosure-panel > .panel-header > .enclosure-title-stack {
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+.enclosure-panel > .panel-header > .panel-header-actions {
+  flex: 1 1 360px;
+  min-width: 0;
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
@@ -2293,6 +2311,9 @@ textarea {
 }
 
 .disk-path-card {
+  /* A button card shrinks to its content; fill the grid column instead so a
+     card with short values does not leave an empty column beside it (#1102). */
+  width: 100%;
   min-width: 0;
   max-width: none;
   display: flex;
@@ -2379,7 +2400,9 @@ button.disk-path-card:hover,
 
 .disk-path-facts span {
   display: grid;
-  grid-template-columns: minmax(42px, 0.54fr) minmax(0, 1fr);
+  /* Labels wrap only between words; the label column is never narrower than
+     its longest word, and values keep wrapping anywhere (#1102). */
+  grid-template-columns: minmax(min-content, 0.54fr) minmax(0, 1fr);
   gap: 6px;
   min-width: 0;
   color: #b7c9d8;
@@ -2392,6 +2415,7 @@ button.disk-path-card:hover,
 .disk-path-facts em {
   color: #7890a7;
   font-style: normal;
+  overflow-wrap: normal;
 }
 
 .fabric-diagnostic-evidence {
