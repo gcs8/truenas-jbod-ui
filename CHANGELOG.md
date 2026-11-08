@@ -26,6 +26,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- `scripts/update_immutable_deployment.py --replace-compose` keeps operator
+  overlays named with `--keep-overlay` in the Compose chain, validates the
+  merged chain and refuses overlays that change a shipped service's image,
+  user, command, volumes or networks; health and retention URLs may use an
+  address and port the deployment itself publishes (#1097).
+
 ## v0.24.0-beta.6 - 2026-11-07
 
 This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
