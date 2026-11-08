@@ -47,6 +47,7 @@ from app.script_json import register_script_json_filters
 from app.services.history_backend import HistoryBackendClient
 from app.services.inventory import (
     SYSTEM_RETENTION_MAX_ENCLOSURES,
+    SnapshotRefreshWaitTimeout,
     SnapshotStateBusyError,
     SystemRetentionBusyError,
     SplitEnclosureError,
@@ -132,6 +133,8 @@ EXCEPTION_RESPONSES: dict[type[Exception], ErrorResponseSpec] = {
     # separate shelves instead of calling the id unknown (#1006).
     SplitEnclosureError: ErrorResponseSpec(status_code=404),
     SnapshotStateBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=1),
+    # A request stopped waiting on a background refresh that is still running (#1125).
+    SnapshotRefreshWaitTimeout: ErrorResponseSpec(status_code=503, retry_after_seconds=2),
     SnapshotExportBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
     SystemRetentionBusyError: ErrorResponseSpec(status_code=503, retry_after_seconds=5),
     SystemRetentionTooLargeError: ErrorResponseSpec(status_code=503),
@@ -802,6 +805,39 @@ async def resolve_layout_slots(
     if not layout_slots:
         raise HTTPException(status_code=503, detail=ENCLOSURE_LAYOUT_UNAVAILABLE_DETAIL)
     return layout_slots
+
+
+async def readback_after_write(
+    service: Any,
+    *,
+    enclosure_id: str | None,
+    force_refresh: bool | None,
+    fallback: Any | None,
+    change: str,
+) -> tuple[Any, str | None]:
+    """Return the snapshot to answer a stored change with, and a warning if it is not current.
+
+    The change is already stored when this runs. If the readback waits on a
+    background refresh past its bound (#1125), answer with the view from
+    before the change and say so, rather than report the stored change as
+    failed. Without such a view, answer a retryable 503 that says it was stored.
+    """
+    options: dict[str, Any] = {} if force_refresh is None else {"force_refresh": force_refresh}
+    try:
+        snapshot = await service.get_snapshot(**options, selected_enclosure_id=enclosure_id)
+    except SnapshotRefreshWaitTimeout as exc:
+        if fallback is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"{change} The inventory is still refreshing, so reload the page in a moment to see it.",
+                headers={"Retry-After": "2"},
+            ) from exc
+        warning = (
+            f"{change} The inventory refresh has not finished, so the bays shown are from before "
+            "this change. Reload the page in a moment to see it."
+        )
+        return fallback.model_copy(update={"warnings": [warning, *fallback.warnings]}), warning
+    return snapshot, None
 
 
 async def ensure_slot_bounds(
