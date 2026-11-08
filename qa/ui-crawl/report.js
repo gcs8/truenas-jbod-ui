@@ -102,6 +102,7 @@ ${sections.join("\n")}
 
 // Merge several crawl directories (one per browser connection) under outDir.
 function mergeReports(outDir, runDirs) {
+  fs.mkdirSync(outDir, { recursive: true });
   const merged = { records: [], actuations: [], guardLog: [], stats: { blocked: [], writes: [], routeErrors: [] }, runs: [] };
   for (const dir of runDirs) {
     const doc = JSON.parse(fs.readFileSync(path.join(dir, "findings.json"), "utf8"));

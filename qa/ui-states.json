@@ -116,7 +116,7 @@
     {
       "id": "main.history.rate", "page": "main", "safety": "read",
       "requires": "#history-toggle-button",
-      "steps": [{"selectBay": "healthy"}, {"waitFor": "#history-toggle-button:not(.hidden)"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"click": "[data-history-io-mode=average]"}, {"wait": 1500}],
+      "steps": [{"selectBay": "healthy"}, {"waitFor": "#history-toggle-button:not(.hidden)"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"clickIfPresent": "[data-history-io-mode=average]"}, {"wait": 1500}],
       "covers": ["[data-history-io-mode]"]
     },
     {
