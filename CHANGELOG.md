@@ -40,6 +40,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed bay tiles and the Rename button announcing names that differ from
+  what they show: a bay is now named by its visible number, disk, pool and
+  heat value, then its health. Disk Path facts are proper term and value
+  pairs, cut-off Connections, Storage Fabric and topology text has its full
+  text on hover and unfolds on keyboard focus, and in a narrow window grouped
+  bays, boot and NVMe cards and UniFi heat values no longer overlap or wrap
+  one letter per line, and the history table scrolls on its own (#1122).
 - Fixed heat-map temperature colours stretching to the coolest and warmest bay
   in view, which showed a 49 C disk beside a 48 C one, or 35 C disks on a cool
   shelf, as red. Temperatures now use absolute bands from each drive's SMART
