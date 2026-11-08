@@ -1662,8 +1662,8 @@
         const slotShare = group.length / totalSlots;
         const slotShareText = slotShare.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
         const internalGapPixels = groupGap * Math.max(group.length - 1, 0);
-        // #1115: a group never shrinks below its bays; the shell scrolls.
-        return `minmax(min-content, calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px))`;
+        // #1115: narrow faces set --group-min so a group keeps its bays' width.
+        return `minmax(var(--group-min, 0px), calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px))`;
       })
       .join(" ");
   }

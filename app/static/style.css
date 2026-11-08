@@ -6895,8 +6895,9 @@ button.fabric-trace-crumb:hover {
     font-size: 0.86rem;
   }
 
-  /* #1114: every face scrolls inside its shell rather than overlapping. */
+  /* #1114, #1115: faces scroll inside the shell; bays never overlap. */
   .chassis-shell {
+    --group-min: min-content;
     overflow-x: auto;
   }
 
