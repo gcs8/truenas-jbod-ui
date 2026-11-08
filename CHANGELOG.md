@@ -48,7 +48,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   success with the earlier bay view and a warning instead of an error. A
   background refresh that runs past 5 minutes is stopped and logged, the next
   one can start, and its late result is never published. The appliance call
-  budget is unchanged (#1125).
+  budget is unchanged (#1125, #1126).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for
