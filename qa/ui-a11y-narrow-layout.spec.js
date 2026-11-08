@@ -587,7 +587,21 @@ test("the UniFi matrix covers every built-in UniFi model face", () => {
 // #1124: each bay's state chip (its ::after) against the bay's text, heat
 // value, LED and handle block. Text is measured by its rendered Range, so a
 // short label beside the chip passes; the value badge, LED and handle by box.
+// placeStateChips() runs on the next animation frame after a render, so
+// measure once two frames pass with nothing moving.
 async function stateChips(page) {
+  const frames = () => page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  let last = "";
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await frames();
+    const chips = await measureStateChips(page);
+    if (JSON.stringify(chips) === last) return chips;
+    last = JSON.stringify(chips);
+  }
+  throw new Error(`state chips did not settle: ${last}`);
+}
+
+async function measureStateChips(page) {
   return page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
     const style = getComputedStyle(tile, "::after");
     const px = (value) => parseFloat(value) || 0;
