@@ -483,7 +483,14 @@
     {"state": "offline.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
     {"state": "main.heatmap*", "type": "heat-alarm-healthy-temp", "issue": 1103},
     {"state": "main.heatmap*", "type": "heat-small-range-spread", "issue": 1103},
+    {"state": "main.*", "type": "text-narrow-wrap", "selector": "#enclosure-panel-title", "issue": 1102},
     {"state": "*", "type": "axe-label-content-name-mismatch", "issue": 1110},
+    {"state": "main.*", "type": "control-overlap", "selector": "storage-view-slot", "issue": 1114},
+    {"state": "main.*", "type": "control-clipped", "selector": "storage-view-slot", "issue": 1114},
+    {"state": "main.*", "type": "text-narrow-wrap", "selector": "storage-view-runtime-card", "issue": 1114},
+    {"state": "main.*", "type": "text-mid-word-break", "selector": "storage-view-runtime-card", "issue": 1114},
+    {"state": "main.*", "type": "control-overlap", "selector": "div.row-group > button.slot-tile", "issue": 1115},
+    {"state": "history.*", "type": "page-horizontal-overflow", "issue": 1116},
     {"state": "fabric.disk*", "type": "axe-definition-list", "issue": 1111},
     {"state": "fabric.disk*", "type": "axe-dlitem", "issue": 1111}
   ]
