@@ -48,15 +48,17 @@ For a controlled, digest-pinned update with an automatic rollback receipt, use
 [immutable GHCR deployment runbook](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md).
 When a reviewed release also replaces the shipped Compose file
 (`--replace-compose`), name your own overlay, such as `compose.override.yaml`,
-with `--keep-overlay` so it stays in the chain. Without
-`--allow-overlay-contract-change` a kept overlay may only tune restart policy,
-resource limits, logging, healthcheck timing, labels, non-sensitive
-environment variables, and restatements of a shipped service's existing port
-bindings, and it must not read any other file. The deployment directory,
-`.env` and every Compose file must be owned by root or the user running the
-helper and not writable by group or others. If the UI or admin service is published only on the host's LAN
-address, its health and retention URLs may use that published address and
-port instead of loopback.
+with `--keep-overlay` so it stays in the chain. A kept overlay may set only
+`restart` (`no`, `always`, `on-failure[:N]` or `unless-stopped`) on services
+the shipped files define, nothing else: environment, ports, labels, logging,
+resource limits and every other setting are refused, and there is no flag to
+allow them. The deployment directory, `.env` and every Compose file must be
+owned by root or the user running the helper and not writable by group or
+others, and every directory from / down to the deployment must be owned by
+root and not writable by group or others, so keep the deployment under a
+directory such as `/opt` or `/srv`, not `/tmp` or a home directory. If the UI
+or admin service is published only on the host's LAN address, its health and
+retention URLs may use that published address and port instead of loopback.
 
 ## History
 

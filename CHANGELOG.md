@@ -50,13 +50,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   folder (#1094, #1095).
 - Fixed `scripts/update_immutable_deployment.py --replace-compose` replacing
   operator overlays: overlays named with `--keep-overlay` now stay in the
-  Compose chain, the merged chain is validated, and an overlay that changes
-  anything but restart policy, resource limits, logging, healthcheck timing,
-  labels, non-sensitive environment, or restatements of a shipped service's
-  port bindings, or that reads another file, is refused; a changed host address
-  or host port, or an added binding, counts as a contract change. The
+  Compose chain, the merged chain is validated, and a kept overlay may set
+  only `restart` on shipped services: any other setting, YAML anchor or merge
+  key, or reference to another file is refused before any Docker command, and
+  the merged model may differ from the shipped files' only in `restart`. The
   deployment directory and every input must be owned by root or the updater and
-  not writable by group or others. Every input is read without following links,
+  not writable by group or others, and every directory from / down to the
+  deployment must be owned by root and not writable by group or others, so a
+  deployment under `/tmp` or another writable directory is refused (#1100,
+  #1101). Every input is read without following links,
   frozen in the private receipt and checked unchanged before each step; under
   `--replace-compose` kept overlays are also rewritten with their frozen bytes
   as new helper-owned files before Compose reads them; and

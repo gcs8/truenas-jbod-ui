@@ -28,6 +28,48 @@ NEW_IMAGE_ID = f"sha256:{'2' * 64}"
 CANDIDATE_TAG = f"{REPOSITORY}:v0.22.0"
 
 
+def reported_as(paths: list[Path], *, uid: int | None = None, without_group_other_write: bool = False) -> Any:
+    """Make `os.fstat` report these inodes as `chown` or `chmod go-w` would have left them.
+
+    Nothing here can really chown without root, so ownership and modes are
+    simulated where the helper reads them: on the descriptor it opened.
+    """
+
+    real_fstat = os.fstat
+    identities = {(path.lstat().st_dev, path.lstat().st_ino) for path in paths}
+
+    def fstat(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if (info.st_dev, info.st_ino) not in identities:
+            return info
+        values = list(info[:10])
+        if uid is not None:
+            values[4] = uid
+        if without_group_other_write:
+            values[0] = info.st_mode & ~(stat.S_IWGRP | stat.S_IWOTH)
+        return os.stat_result(values)
+
+    return mock.patch.object(deployment.os, "fstat", side_effect=fstat)
+
+
+# Tests build deployments in the system temporary directory, which CI's /tmp
+# makes sticky and world-writable and a developer's TMPDIR makes user-owned.
+# The helper refuses both (#1100), so this module reports that directory and
+# its ancestors as a root-owned chain that only root can write, as /opt is on a
+# deployment host. Directories the tests create below it keep their real owner
+# and mode, and the ancestor tests stop this to see the real /tmp.
+SYSTEM_TEMP = Path(tempfile.gettempdir()).resolve()
+SYSTEM_TEMP_AS_ROOT_CHAIN = reported_as([SYSTEM_TEMP, *SYSTEM_TEMP.parents], uid=0, without_group_other_write=True)
+
+
+def setUpModule() -> None:
+    SYSTEM_TEMP_AS_ROOT_CHAIN.start()
+
+
+def tearDownModule() -> None:
+    SYSTEM_TEMP_AS_ROOT_CHAIN.stop()
+
+
 class FakeRuntime:
     def __init__(
         self,
@@ -1440,9 +1482,9 @@ class KeptOverlayTests(unittest.TestCase):
                 {"source": "docker-compose.yml", "live": "compose.yaml"},
                 {"source": None, "live": "compose.override.yaml"},
             ])
-            self.assertIs(receipt["overlay_contract_change_allowed"], False)
-            self.assertEqual(receipt["overlay_contract_changes"], [])
-            self.assertEqual(result["overlay_contract_changes"], [])
+            # Nothing beyond restart can be allowed, so there is nothing to record (#1101).
+            self.assertNotIn("overlay_contract_changes", receipt)
+            self.assertNotIn("overlay_contract_changes", result)
             self.assertEqual(receipt["hashes"]["previous/compose.override.yaml"],
                              receipt["hashes"]["candidate/compose.override.yaml"])
             self.assertEqual(receipt["modes"]["compose.override.yaml"], 0o640)
@@ -1458,56 +1500,31 @@ class KeptOverlayTests(unittest.TestCase):
 
     def test_overlay_that_changes_the_release_contract_is_refused_before_any_change(self) -> None:
         cases = (
-            ("image", "services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n",
-             r"enclosure-ui image"),
-            ("volumes", "services:\n  enclosure-history:\n    volumes: [\"/srv/other:/app/history\"]\n",
-             r"enclosure-history volumes"),
-            ("user", "services:\n  enclosure-ui:\n    user: \"1000:1000\"\n", r"enclosure-ui user"),
-            ("command", "services:\n  enclosure-history:\n    command: [\"sh\", \"-c\", \"true\"]\n",
-             r"enclosure-history command"),
-            ("entrypoint", "services:\n  enclosure-ui:\n    entrypoint: [\"sh\"]\n", r"enclosure-ui entrypoint"),
-            ("networks", "services:\n  enclosure-ui:\n    networks: [other]\nnetworks:\n  other: {}\n",
-             r"enclosure-ui networks, top-level networks"),
-            ("network_mode", "services:\n  enclosure-ui:\n    network_mode: host\n", r"enclosure-ui network_mode"),
+            ("image", "services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n", "line 3"),
+            ("volumes", "services:\n  enclosure-history:\n    volumes: [\"/srv/other:/app/history\"]\n", "line 3"),
+            ("user", "services:\n  enclosure-ui:\n    user: \"1000:1000\"\n", "line 3"),
+            ("command", "services:\n  enclosure-history:\n    command: [\"sh\", \"-c\", \"true\"]\n", "line 3"),
+            ("entrypoint", "services:\n  enclosure-ui:\n    entrypoint: [\"sh\"]\n", "line 3"),
+            ("networks", "services:\n  enclosure-ui:\n    networks: [other]\nnetworks:\n  other: {}\n", "line 3"),
+            ("network_mode", "services:\n  enclosure-ui:\n    network_mode: host\n", "line 3"),
             ("named volume", "volumes:\n  history-data:\n    driver_opts: {type: none, o: bind, device: /srv/x}\n",
-             r"top-level volumes"),
+             "line 1"),
         )
-        for label, overlay, detail in cases:
+        for label, overlay, reason in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
                 root = self.make_root(temp_dir, overlay)
                 before = {name: (root / name).read_bytes() for name in (".env", "compose.yaml", "compose.override.yaml")}
                 runtime = OverlayRuntime(root)
 
-                with self.assertRaisesRegex(
-                    deployment.DeploymentError,
-                    rf"^kept overlay changes the release Compose contract \({detail}\); "
-                    r"pass --allow-overlay-contract-change only after reviewing it$",
-                ) as caught:
+                with self.assertRaisesRegex(deployment.DeploymentError, overlay_refusal(reason)) as caught:
                     self.update(root, runtime)
 
                 self.assertNotIn("/srv", str(caught.exception))
                 self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
                 self.assertEqual({name: (root / name).read_bytes() for name in before}, before)
-                self.assertFalse(any("up" in command for command in runtime.commands))
+                self.assertEqual(runtime.commands, [])
                 self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
                 self.assertEqual(list(root.glob(".jbod-ui-compose-check-*")), [])
-
-    def test_contract_change_needs_the_explicit_flag_and_is_recorded(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = self.make_root(temp_dir, "services:\n  enclosure-ui:\n    user: \"1000:1000\"\n")
-            runtime = OverlayRuntime(root)
-
-            result = self.update(root, runtime, allow_overlay_contract_change=True)
-
-            self.assertEqual(result["status"], "active")
-            receipt = deployment.validate_receipt(root)
-            self.assertIs(receipt["overlay_contract_change_allowed"], True)
-            # The merged chain is still validated and compared; only the refusal
-            # is waived, and the accepted change is listed (#1098).
-            self.assertTrue(runtime.quiet_chains)
-            self.assertEqual(len(runtime.config_chains), 2)
-            self.assertEqual(receipt["overlay_contract_changes"], ["enclosure-ui user"])
-            self.assertEqual(result["overlay_contract_changes"], ["enclosure-ui user"])
 
     def test_invalid_merged_chain_is_refused_before_any_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1592,7 +1609,7 @@ class KeptOverlayTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir, "services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n")
-            with self.assertRaisesRegex(deployment.DeploymentError, "kept overlay changes"):
+            with self.assertRaisesRegex(deployment.DeploymentError, overlay_refusal("line 3")):
                 self.update(root, OverlayRuntime(root), replace_compose=False)
             self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
 
@@ -1624,10 +1641,9 @@ class KeptOverlayTests(unittest.TestCase):
             original = json.loads(receipt_path.read_text(encoding="utf-8"))
             command_count = len(runtime.commands)
             cases = (
-                ("missing flag", lambda receipt: receipt.pop("overlay_contract_change_allowed")),
-                ("non-boolean flag", lambda receipt: receipt.__setitem__("overlay_contract_change_allowed", 0)),
-                ("flag without overlay", lambda receipt: receipt["compose_files"][1].__setitem__(
-                    "source", "docker-compose.override.yml")),
+                ("allowed flag", lambda receipt: receipt.__setitem__("overlay_contract_change_allowed", False)),
+                ("null live name", lambda receipt: receipt["compose_files"][1].__setitem__("live", None)),
+                ("no shipped file", lambda receipt: receipt["compose_files"][0].__setitem__("source", None)),
             )
             for label, mutate in cases:
                 with self.subTest(label=label):
@@ -1651,13 +1667,13 @@ class KeptOverlayTests(unittest.TestCase):
                 deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
             self.assertEqual(len(runtime.commands), command_count)
 
-    def test_cli_keeps_the_ordered_chain_and_forwards_the_contract_flag(self) -> None:
+    def test_cli_keeps_the_ordered_chain(self) -> None:
         argv = [
             "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
             "--expected-image=" + NEW_DIGEST, "--candidate-tag=" + CANDIDATE_TAG, "--replace-compose",
             "--compose", "docker-compose.yml=compose.yaml", "--keep-overlay", "compose.override.yaml",
             "--compose", "docker-compose.nonroot.yml=docker-compose.nonroot.yml",
-            "--service=app", "--health-url=http://127.0.0.1:8080/healthz", "--allow-overlay-contract-change",
+            "--service=app", "--health-url=http://127.0.0.1:8080/healthz",
         ]
         with (
             mock.patch.object(deployment, "_require_linux_docker_host"),
@@ -1671,31 +1687,22 @@ class KeptOverlayTests(unittest.TestCase):
             deployment.ComposeFile(None, "compose.override.yaml"),
             deployment.ComposeFile("docker-compose.nonroot.yml", "docker-compose.nonroot.yml"),
         ))
-        self.assertTrue(spec.allow_overlay_contract_change)
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             deployment._build_parser().parse_args([*argv[:6], "--keep-overlay", "compose.override.yaml",
                                                    "--service=app", "--health-url=http://127.0.0.1/x"])
 
 
-# --- #1098, #1099: allowlisted overlays and fenced, frozen inputs -----------
+# --- #1098, #1099, #1101: a kept overlay may set only `restart` ---------------
 
-# Every key the allowlist admits, on services the shipped base already has.
-ALLOWLISTED_OVERLAY = """\
-services:
-  enclosure-ui:
-    restart: unless-stopped
-    mem_limit: 2g
-    mem_reservation: 512m
-    cpus: 1.5
-    pids_limit: 512
-    logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
-    healthcheck: {interval: 30s, timeout: 5s, retries: 3, start_period: 20s}
-    labels: {com.example.owner: operations}
-    environment: {TZ: UTC, APP_LOG_LEVEL: DEBUG}
-    ports: [{target: 8000, published: "8080", host_ip: 127.0.0.1, protocol: tcp}]
-  enclosure-history:
-    restart: always
-"""
+# Every policy Compose accepts, in the spellings an operator writes, with
+# comments, blank lines, CRLF line ends and wider indentation.
+RESTART_ONLY_OVERLAYS = (
+    RESTART_OVERLAY,
+    "services:\n  enclosure-ui:\n    restart: \"no\"\n  enclosure-history:\n    restart: always\n",
+    "services:\n  enclosure-ui:\n    restart: 'no'\n  enclosure-history:\n    restart: 'on-failure:5'\n",
+    "# operator override\n\nservices:  # only restart\n  enclosure-ui:\n    restart: on-failure  # bounded\n",
+    "services:\r\n    enclosure-history:\r\n        restart: \"unless-stopped\"\r\n",
+)
 # The #1098 bypass: a privileged one-shot dependency that mounts the host.
 PRIVILEGED_DEPENDENCY_OVERLAY = """\
 services:
@@ -1708,136 +1715,282 @@ services:
     volumes: ["/:/host", "/var/run/docker.sock:/var/run/docker.sock"]
     command: ["sh", "-c", "true"]
 """
+UI = "services:\n  enclosure-ui:\n"
+UI_RESTART = UI + "    restart: always\n"
 
 
-class OverlayAllowlistTests(unittest.TestCase):
-    """#1098: a kept overlay may only make allowlisted changes to the merged model."""
+def overlay_refusal(reason: str) -> str:
+    return (
+        rf"^kept overlay compose\.override\.yaml may only set restart on shipped services \({reason}\); "
+        r"remove every other setting from it and make that change in a reviewed Compose release instead$"
+    )
+
+
+class RestartOnlyOverlayTests(unittest.TestCase):
+    """D-TNJ-20261108-OVERLAY-MIN (#1101): a kept overlay may set only `restart`, nothing else."""
 
     make_root = KeptOverlayTests.make_root
     make_spec = KeptOverlayTests.make_spec
     update = KeptOverlayTests.update
 
-    def assert_refused_before_any_pull(self, root: Path, runtime: OverlayRuntime, detail: str,
-                                       **changes: object) -> None:
-        names = (".env", "compose.yaml", "compose.override.yaml")
-        before = {name: (root / name).read_bytes() for name in names}
-        with self.assertRaisesRegex(
-            deployment.DeploymentError,
-            rf"^kept overlay changes the release Compose contract \({detail}\); "
-            r"pass --allow-overlay-contract-change only after reviewing it$",
-        ):
-            self.update(root, runtime, **changes)
-        self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
-        self.assertEqual(list(root.glob(f".{deployment.RECEIPT_DIR_NAME}*")), [])
-        self.assertEqual({name: (root / name).read_bytes() for name in names}, before)
-        self.assertFalse(any("pull" in command or "up" in command for command in runtime.commands))
-        self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
-
-    def test_allowlisted_overlay_settings_are_kept_without_the_flag(self) -> None:
+    def assert_refused_before_any_command(self, overlay: str | bytes, reason: str) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = self.make_root(temp_dir, ALLOWLISTED_OVERLAY)
+            root = self.make_root(temp_dir)
+            (root / "compose.override.yaml").write_bytes(overlay if isinstance(overlay, bytes) else overlay.encode())
+            names = (".env", "compose.yaml", "compose.override.yaml")
+            before = {name: (root / name).read_bytes() for name in names}
             runtime = OverlayRuntime(root)
+            with self.assertRaisesRegex(deployment.DeploymentError, overlay_refusal(reason)) as caught:
+                self.update(root, runtime)
+            # Judged on the raw text before any Docker command, download or receipt.
+            self.assertEqual(runtime.commands, [])
+            self.assertEqual(runtime.downloads, [])
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            self.assertEqual(list(root.glob(f".{deployment.RECEIPT_DIR_NAME}*")), [])
+            self.assertEqual({name: (root / name).read_bytes() for name in names}, before)
+            for secret in ("/srv", "/host", "busybox", "ADMIN_AUTO_STOP_SECONDS"):
+                self.assertNotIn(secret, str(caught.exception))
 
-            result = self.update(root, runtime)
-
-            self.assertEqual(result["status"], "active")
-            self.assertEqual(result["overlay_contract_changes"], [])
-            receipt = deployment.validate_receipt(root)
-            self.assertIs(receipt["overlay_contract_change_allowed"], False)
-            self.assertEqual(receipt["overlay_contract_changes"], [])
-
-    def test_privilege_host_access_and_behaviour_changes_are_refused_without_the_flag(self) -> None:
-        ui = "services:\n  enclosure-ui:\n"
-        cases = (
-            ("privileged", ui + "    privileged: true\n", "enclosure-ui privileged"),
-            ("cap_add", ui + "    cap_add: [SYS_ADMIN]\n", "enclosure-ui cap_add"),
-            ("devices", ui + "    devices: [\"/dev/sda:/dev/sda\"]\n", "enclosure-ui devices"),
-            ("host pid", ui + "    pid: host\n", "enclosure-ui pid"),
-            ("host ipc", ui + "    ipc: host\n", "enclosure-ui ipc"),
-            ("host userns", ui + "    userns_mode: host\n", "enclosure-ui userns_mode"),
-            ("security_opt", ui + "    security_opt: [\"apparmor:unconfined\"]\n", "enclosure-ui security_opt"),
-            ("sysctls", ui + "    sysctls: {net.ipv4.ip_forward: 1}\n", "enclosure-ui sysctls"),
-            ("depends_on on a base service", ui + "    depends_on: [enclosure-history]\n",
-             "enclosure-ui depends_on"),
-            ("profiles", ui + "    profiles: [history]\n", "enclosure-ui profiles"),
-            ("healthcheck test", ui + "    healthcheck: {test: [\"CMD\", \"true\"], interval: 5s}\n",
-             "enclosure-ui healthcheck test"),
-            ("service x- extension", ui + "    x-note: hidden\n", "enclosure-ui x-note"),
-            ("new container port", ui + "    ports: [{target: 22, published: \"2222\", protocol: tcp}]\n",
-             "enclosure-ui ports"),
-            ("compose-owned label", ui + "    labels: {com.docker.compose.project.config_files: /tmp/x.yaml}\n",
-             "enclosure-ui labels com.docker.compose.project.config_files"),
-            ("auth mode", ui + "    environment: {ADMIN_AUTH_MODE: none}\n", "enclosure-ui environment ADMIN_AUTH_MODE"),
-            ("public origin", ui + "    environment: {APP_PUBLIC_ORIGIN: \"http://198.51.100.7\"}\n",
-             "enclosure-ui environment APP_PUBLIC_ORIGIN"),
-            ("bind address", ui + "    environment: {ADMIN_BIND_ADDRESS: 0.0.0.0}\n",
-             "enclosure-ui environment ADMIN_BIND_ADDRESS"),
-            ("allowed hosts", ui + "    environment: {ADMIN_ALLOWED_HOSTS: \"*\"}\n",
-             "enclosure-ui environment ADMIN_ALLOWED_HOSTS"),
-            ("refresh token", ui + "    environment: {HISTORY_REFRESH_TOKEN: synthetic}\n",
-             "enclosure-ui environment HISTORY_REFRESH_TOKEN"),
-            ("TLS verification", ui + "    environment: {TRUENAS_VERIFY_SSL: \"false\"}\n",
-             "enclosure-ui environment TRUENAS_VERIFY_SSL"),
-            ("sudo", ui + "    environment: {SSH_SUDO_PASSWORD_FILE: /run/x}\n",
-             "enclosure-ui environment SSH_SUDO_PASSWORD_FILE"),
-            ("config path", ui + "    environment: {APP_CONFIG_PATH: /tmp/config.yaml}\n",
-             "enclosure-ui environment APP_CONFIG_PATH"),
-            ("loader", ui + "    environment: {LD_PRELOAD: /tmp/x.so}\n", "enclosure-ui environment LD_PRELOAD"),
-            ("python path", ui + "    environment: {PYTHONPATH: /tmp}\n", "enclosure-ui environment PYTHONPATH"),
-            ("proxy headers", ui + "    environment: {FORWARDED_ALLOW_IPS: \"*\"}\n",
-             "enclosure-ui environment FORWARDED_ALLOW_IPS"),
-            ("anchor merge", "x-priv: &priv\n  privileged: true\nservices:\n  enclosure-ui:\n    <<: *priv\n",
-             "enclosure-ui privileged, top-level x-priv"),
-            ("added persistent service", "services:\n  sidecar:\n    image: busybox:latest\n", "added service sidecar"),
-            ("privileged one-shot dependency", PRIVILEGED_DEPENDENCY_OVERLAY,
-             "enclosure-ui depends_on, added service escape"),
-            ("top-level secrets", "secrets:\n  token: {environment: HOME}\n", "top-level secrets"),
-        )
-        for label, overlay, detail in cases:
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+    def test_restart_only_overlays_are_kept(self) -> None:
+        # The motivating case: the operator's override only sets restart.
+        for overlay in RESTART_ONLY_OVERLAYS:
+            with self.subTest(overlay=overlay), tempfile.TemporaryDirectory() as temp_dir:
                 root = self.make_root(temp_dir, overlay)
-                self.assert_refused_before_any_pull(root, OverlayRuntime(root), re.escape(detail))
+                runtime = OverlayRuntime(root)
 
-    def test_contract_changes_with_the_flag_are_listed_in_the_receipt_and_output(self) -> None:
+                result = self.update(root, runtime)
+
+                self.assertEqual(result["status"], "active")
+                self.assertNotIn("overlay_contract_changes", result)
+                receipt = deployment.validate_receipt(root)
+                self.assertNotIn("overlay_contract_change_allowed", receipt)
+                self.assertNotIn("overlay_contract_changes", receipt)
+                self.assertEqual((root / "compose.override.yaml").read_bytes(), overlay.encode())
+                # Also judged on the merged model of the shipped files alone and the whole chain.
+                self.assertEqual([[path.name for path in chain] for chain in runtime.config_chains],
+                                 [["compose.yaml"], ["compose.yaml", "compose.override.yaml"]])
+
+    def test_unquoted_no_passes_the_text_check_and_is_judged_on_the_merged_model(self) -> None:
+        # Compose reads an unquoted `no` as the string "no"; a YAML 1.1 reader
+        # (like this test's fake Compose) reads it as false, which the merged
+        # model check refuses rather than guessing.
+        overlay = "services:\n  enclosure-ui:\n    restart: no\n"
+        self.assertIsNone(deployment._restart_only_problem(overlay.encode()))
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = self.make_root(temp_dir, PRIVILEGED_DEPENDENCY_OVERLAY)
+            root = self.make_root(temp_dir, overlay)
             runtime = OverlayRuntime(root)
+            with self.assertRaisesRegex(deployment.DeploymentError, r"merged Compose model also changes "
+                                                                    r"\(enclosure-ui restart\)"):
+                self.update(root, runtime)
+            self.assertFalse(any("pull" in command for command in runtime.commands))
 
-            result = self.update(root, runtime, allow_overlay_contract_change=True)
+    def test_settings_other_than_restart_are_refused(self) -> None:
+        cases = (
+            # #1101: the environment branch admitted lifecycle and retention controls.
+            ("admin auto-stop disabled", UI_RESTART + "    environment:\n      ADMIN_AUTO_STOP_SECONDS: \"0\"\n",
+             "line 4"),
+            ("auto-stop in list form", UI + "    environment: [\"ADMIN_AUTO_STOP_SECONDS=0\"]\n", "line 3"),
+            ("history retention", "services:\n  enclosure-history:\n    environment:\n"
+             "      HISTORY_RAW_METRIC_RETENTION_DAYS: \"1\"\n      HISTORY_EVENT_RETENTION_DAYS: \"1\"\n", "line 3"),
+            ("formerly allowed TZ", UI + "    environment: {TZ: UTC}\n", "line 3"),
+            ("port restatement", UI + "    ports: [{target: 8000, published: \"8080\", host_ip: 127.0.0.1}]\n",
+             "line 3"),
+            ("port widening", UI + "    ports:\n      - \"0.0.0.0:8080:8000\"\n", "line 3"),
+            ("labels", UI + "    labels: {com.example.owner: operations}\n", "line 3"),
+            ("logging", UI + "    logging: {driver: none}\n", "line 3"),
+            ("memory limit", UI + "    mem_limit: 2g\n", "line 3"),
+            ("cpus", UI + "    cpus: 1.5\n", "line 3"),
+            ("pids limit", UI + "    pids_limit: 512\n", "line 3"),
+            ("deploy resources", UI + "    deploy:\n      resources: {limits: {memory: 1g}}\n", "line 3"),
+            ("healthcheck timing", UI + "    healthcheck: {interval: 30s}\n", "line 3"),
+            ("privileged", UI_RESTART + "    privileged: true\n", "line 4"),
+            ("image", UI + "    image: ghcr.io/example/other:1\n", "line 3"),
+            ("volumes", "services:\n  enclosure-history:\n    volumes: [\"/srv/other:/app/history\"]\n", "line 3"),
+            ("user", UI + "    user: \"1000:1000\"\n", "line 3"),
+            ("profiles", UI + "    profiles: [history]\n", "line 3"),
+            ("service x- key", UI_RESTART + "    x-note: hidden\n", "line 4"),
+            ("top-level x- block", "x-note: hidden\n" + UI_RESTART, "line 1"),
+            ("anchor and merge key", "x-r: &r\n  restart: always\n" + UI + "    <<: *r\n", "line 1"),
+            ("merge key in a service", UI + "    <<: {privileged: true}\n", "line 3"),
+            ("anchored restart", UI + "    restart: &r always\n", "line 3"),
+            ("aliased restart", UI + "    restart: *r\n", "line 3"),
+            ("extends", UI + "    extends: {file: /srv/x.yaml, service: escape}\n", "line 3"),
+            ("include", "include: [/srv/x.yaml]\n" + UI_RESTART, "line 1"),
+            ("env_file", UI + "    env_file: [/srv/x.env]\n", "line 3"),
+            ("build", UI + "    build: {context: /}\n", "line 3"),
+            ("top-level volumes", UI_RESTART + "volumes:\n  history-data: {}\n", "line 4"),
+            ("top-level networks", UI_RESTART + "networks:\n  other: {}\n", "line 4"),
+            ("top-level secrets", "secrets:\n  token: {environment: HOME}\n", "line 1"),
+            ("top-level configs", "configs:\n  extra: {content: x}\n", "line 1"),
+            ("top-level name", "name: other\n" + UI_RESTART, "line 1"),
+            ("top-level version", "version: \"3.9\"\n" + UI_RESTART, "line 1"),
+            ("added service", "services:\n  sidecar:\n    image: busybox:latest\n", "line 3"),
+            ("privileged one-shot dependency", PRIVILEGED_DEPENDENCY_OVERLAY, "line 3"),
+            ("reset tag", UI + "    restart: !reset null\n", "line 3"),
+            ("override tag", UI + "    ports: !override []\n", "line 3"),
+            ("flow mapping", "services: {enclosure-ui: {restart: always}}\n", "line 1"),
+            ("flow service", "services:\n  enclosure-ui: {restart: always}\n", "line 2"),
+            ("unknown policy", UI + "    restart: sometimes\n", "line 3"),
+            ("interpolated policy", UI + "    restart: ${RESTART_POLICY}\n", "line 3"),
+            ("malformed retry count", UI + "    restart: on-failure:x\n", "line 3"),
+            ("value glued to a hash", UI + "    restart: always#x\n", "line 3"),
+            ("quoted key", UI + "    \"restart\": always\n", "line 3"),
+            ("escaped key", "\"\\x69nclude\": [/etc/x.yaml]\n" + UI_RESTART, "line 1"),
+            ("explicit key", "? include\n: [/etc/x.yaml]\n" + UI_RESTART, "line 1"),
+            ("directive", "%YAML 1.2\n---\n" + UI_RESTART, "line 1"),
+            ("document marker", "---\n" + UI_RESTART, "line 1"),
+            ("second document", UI_RESTART + "---\n" + UI_RESTART, "line 4"),
+            ("tab indentation", "services:\n\tenclosure-ui:\n\t\trestart: always\n", "line 2"),
+            ("restart beside the services", "services:\n  enclosure-ui:\n  restart: always\n", "line 3"),
+            ("restart under services", "services:\n  restart: always\n", "line 2"),
+            ("uneven service indentation", UI_RESTART + "   enclosure-history:\n      restart: always\n", "line 4"),
+            ("uneven restart indentation", UI_RESTART + "  enclosure-history:\n      restart: always\n", "line 5"),
+            ("second restart", UI_RESTART + "    restart: \"no\"\n", "line 4"),
+            ("second services key", UI_RESTART + "services:\n", "line 4"),
+            ("restart outside a service", "restart: always\n", "line 1"),
+            ("service without restart", "services:\n  enclosure-ui:\n", "service enclosure-ui sets no restart"),
+            ("service without restart before another", "services:\n  enclosure-ui:\n  enclosure-history:\n"
+             "    restart: always\n", "service enclosure-ui sets no restart"),
+            ("repeated service", UI_RESTART + "  enclosure-ui:\n    restart: \"no\"\n", "line 4"),
+            ("no service", "services:\n", "it sets no restart"),
+            ("empty", "", "it sets no restart"),
+        )
+        for label, overlay, reason in cases:
+            with self.subTest(label=label):
+                self.assert_refused_before_any_command(overlay, re.escape(reason))
 
-            expected = ["enclosure-ui depends_on", "added service escape"]
-            self.assertEqual(result["status"], "active")
-            self.assertEqual(result["overlay_contract_changes"], expected)
-            receipt = deployment.validate_receipt(root)
-            self.assertIs(receipt["overlay_contract_change_allowed"], True)
-            self.assertEqual(receipt["overlay_contract_changes"], expected)
-            # The flag waives the refusal, never the comparison.
-            self.assertEqual([[path.name for path in chain] for chain in runtime.config_chains],
-                             [["compose.yaml"], ["compose.yaml", "compose.override.yaml"]])
+    def test_overlay_that_is_not_plain_ascii_text_is_refused(self) -> None:
+        # YAML parsers treat NEL, LS, PS and a bare carriage return as line
+        # breaks, so they could start a key inside what looks like a comment.
+        for label, data in (
+            ("latin-1", UI_RESTART.encode() + "    # caf\xe9\n".encode("latin-1")),
+            ("UTF-8 letter", UI_RESTART.encode() + "    # caf\xe9\n".encode()),
+            ("NUL byte", UI_RESTART.encode() + b"    # \x00\n"),
+            ("byte order mark", b"\xef\xbb\xbf" + UI_RESTART.encode()),
+            ("next line", UI_RESTART.encode() + "    # x\x85include: [/etc/x.yaml]\n".encode()),
+            ("line separator", UI_RESTART.encode() + "    # x\u2028include: [/etc/x.yaml]\n".encode()),
+            ("paragraph separator", UI_RESTART.encode() + "    # x\u2029include: [/etc/x.yaml]\n".encode()),
+            ("bare carriage return", UI_RESTART.encode() + b"    # x\rinclude: [/etc/x.yaml]\n"),
+        ):
+            with self.subTest(label=label):
+                self.assert_refused_before_any_command(data, "it is not plain ASCII text")
 
-    def test_receipt_contract_change_list_is_revalidated(self) -> None:
+    def test_merged_model_must_differ_from_the_shipped_files_only_in_restart(self) -> None:
+        base = {
+            "name": "jbod-ui",
+            "services": {
+                "enclosure-ui": {"image": "x", "restart": "unless-stopped", "environment": {
+                    "ADMIN_AUTO_STOP_SECONDS": "3600", "TZ": "UTC"}},
+                "enclosure-history": {"image": "x"},
+            },
+            "volumes": {"history-data": {}},
+        }
+
+        def merged(mutate: Callable[[dict[str, Any]], object]) -> list[str]:
+            model = json.loads(json.dumps(base))
+            mutate(model)
+            return deployment._overlay_contract_changes(base, model)
+
+        ui = lambda model: model["services"]["enclosure-ui"]  # noqa: E731
+        history = lambda model: model["services"]["enclosure-history"]  # noqa: E731
+        for policy in ("no", "always", "on-failure", "on-failure:5", "unless-stopped"):
+            with self.subTest(policy=policy):
+                self.assertEqual(merged(lambda model: ui(model).__setitem__("restart", policy)), [])
+                self.assertEqual(merged(lambda model: history(model).__setitem__("restart", policy)), [])
+        cases = (
+            ("auto-stop disabled", lambda model: ui(model)["environment"].__setitem__("ADMIN_AUTO_STOP_SECONDS", "0"),
+             ["enclosure-ui environment"]),
+            ("TZ changed", lambda model: ui(model)["environment"].__setitem__("TZ", "Etc/UTC"),
+             ["enclosure-ui environment"]),
+            ("labels added", lambda model: history(model).__setitem__("labels", {"a": "b"}),
+             ["enclosure-history labels"]),
+            ("unknown policy", lambda model: ui(model).__setitem__("restart", "sometimes"), ["enclosure-ui restart"]),
+            ("non-string policy", lambda model: ui(model).__setitem__("restart", False), ["enclosure-ui restart"]),
+            ("policy removed", lambda model: ui(model).pop("restart"), ["enclosure-ui restart"]),
+            ("added service", lambda model: model["services"].__setitem__("escape", {"image": "busybox"}),
+             ["added service escape"]),
+            ("removed service", lambda model: model["services"].pop("enclosure-history"),
+             ["removed service enclosure-history"]),
+            ("service replaced by a scalar", lambda model: model["services"].__setitem__("enclosure-history", "x"),
+             ["enclosure-history definition"]),
+            ("top-level x- block", lambda model: model.__setitem__("x-r", {"restart": "always"}), ["top-level x-r"]),
+            ("top-level volumes", lambda model: model["volumes"].__setitem__("other", {}), ["top-level volumes"]),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(merged(mutate), expected)
+
+    def test_a_merged_model_change_the_text_check_missed_is_refused_before_any_pull(self) -> None:
+        # Defence in depth: whatever Compose merges, only restart may differ.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root)
+            original_run = runtime.run
+
+            def widening_run(command: list[str], **kwargs: object) -> str:
+                output = original_run(command, **kwargs)  # type: ignore[arg-type]
+                if "--format" in command and any(value.endswith("compose.override.yaml") for value in command):
+                    model = json.loads(output)
+                    model["services"]["enclosure-ui"]["environment"] = {"ADMIN_AUTO_STOP_SECONDS": "0"}
+                    output = json.dumps(model)
+                return output
+
+            with self.assertRaisesRegex(
+                deployment.DeploymentError,
+                r"^kept overlays may only set restart on shipped services, but the merged Compose model also "
+                r"changes \(enclosure-ui environment\); remove those settings from the overlay$",
+            ):
+                deployment.update_deployment(self.make_spec(root), run=widening_run, download=runtime.download,
+                                             probe=runtime.probe)
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            self.assertFalse(any("pull" in command or "up" in command for command in runtime.commands))
+            self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
+
+    def test_there_is_no_way_to_allow_more_than_restart(self) -> None:
+        self.assertNotIn("allow_overlay_contract_change", deployment.DeploymentSpec.__dataclass_fields__)
+        argv = [
+            "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
+            "--expected-image=" + NEW_DIGEST, "--candidate-tag=" + CANDIDATE_TAG, "--replace-compose",
+            "--compose", "docker-compose.yml=compose.yaml", "--keep-overlay", "compose.override.yaml",
+            "--service=app", "--health-url=http://127.0.0.1:8080/healthz", "--allow-overlay-contract-change",
+        ]
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit):
+            deployment._build_parser().parse_args(argv)
+        self.assertIn("unrecognized arguments: --allow-overlay-contract-change", stderr.getvalue())
+
+    def test_receipt_overlay_snapshots_must_still_be_restart_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = self.make_root(temp_dir)
             runtime = OverlayRuntime(root)
             self.update(root, runtime)
-            receipt_path = root / deployment.RECEIPT_DIR_NAME / "receipt.json"
+            receipt_dir = root / deployment.RECEIPT_DIR_NAME
+            receipt_path = receipt_dir / "receipt.json"
             original = json.loads(receipt_path.read_text(encoding="utf-8"))
             command_count = len(runtime.commands)
             for label, mutate in (
-                ("missing", lambda receipt: receipt.pop("overlay_contract_changes")),
-                ("not a list", lambda receipt: receipt.__setitem__("overlay_contract_changes", "none")),
-                ("non-string entry", lambda receipt: receipt.__setitem__("overlay_contract_changes", [1])),
-                ("changes without the flag", lambda receipt: receipt.__setitem__(
-                    "overlay_contract_changes", ["enclosure-ui privileged"])),
+                ("allowed flag", lambda receipt: receipt.__setitem__("overlay_contract_change_allowed", True)),
+                ("listed changes", lambda receipt: receipt.__setitem__("overlay_contract_changes", [])),
             ):
                 with self.subTest(label=label):
                     receipt = json.loads(json.dumps(original))
                     mutate(receipt)
                     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
                     os.chmod(receipt_path, 0o600)
-                    with self.assertRaises(deployment.DeploymentError):
+                    with self.assertRaisesRegex(deployment.DeploymentError, "^receipt key set does not match"):
                         deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
                     self.assertEqual(len(runtime.commands), command_count)
+            # Previous and candidate snapshots replaced together, hashes consistent.
+            widened = UI_RESTART.encode() + b"    environment: {ADMIN_AUTO_STOP_SECONDS: \"0\"}\n"
+            receipt = json.loads(json.dumps(original))
+            for side in ("previous", "candidate"):
+                (receipt_dir / side / "compose.override.yaml").write_bytes(widened)
+                receipt["hashes"][f"{side}/compose.override.yaml"] = deployment._sha256(widened)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            os.chmod(receipt_path, 0o600)
+            with self.assertRaisesRegex(deployment.DeploymentError, overlay_refusal("line 4")):
+                deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+            self.assertEqual(len(runtime.commands), command_count)
 
 
 class InputFenceTests(unittest.TestCase):
@@ -1846,60 +1999,6 @@ class InputFenceTests(unittest.TestCase):
     make_root = KeptOverlayTests.make_root
     make_spec = KeptOverlayTests.make_spec
     update = KeptOverlayTests.update
-
-    def test_overlay_file_references_are_refused_even_with_the_flag(self) -> None:
-        with tempfile.TemporaryDirectory() as outside_dir:
-            outside = Path(outside_dir) / "outside.yaml"
-            outside.write_text("services:\n  escape:\n    image: busybox:latest\n", encoding="utf-8")
-            ui = "services:\n  enclosure-ui:\n"
-            cases = (
-                ("absolute include", f"include:\n  - {outside}\n" + RESTART_OVERLAY, "include"),
-                ("relative include", "include: [./more.yaml]\n" + RESTART_OVERLAY, "include"),
-                ("quoted include", f"\"include\": [\"{outside}\"]\n", "include"),
-                ("extends file", ui + f"    extends: {{file: {outside}, service: escape}}\n", "extends"),
-                ("env_file", ui + f"    env_file: [{outside}]\n", "env_file"),
-                ("label_file", ui + f"    label_file: {outside}\n", "label_file"),
-                ("config file", f"configs:\n  extra:\n    file: {outside}\n", "file"),
-                ("secret file", f"secrets:\n  s: {{'file': {outside}}}\n", "file"),
-                ("build", ui + "    build: {context: /}\n", "build"),
-            )
-            for flag in (False, True):
-                for label, overlay, keyword in cases:
-                    with self.subTest(label=label, flag=flag), tempfile.TemporaryDirectory() as temp_dir:
-                        root = self.make_root(temp_dir, overlay)
-                        runtime = OverlayRuntime(root)
-                        with self.assertRaisesRegex(
-                            deployment.DeploymentError,
-                            rf"^kept overlay compose\.override\.yaml references another file \({keyword}\); ",
-                        ) as caught:
-                            self.update(root, runtime, allow_overlay_contract_change=flag)
-                        self.assertNotIn(outside_dir, str(caught.exception))
-                        self.assertEqual(runtime.commands, [])
-                        self.assertEqual(runtime.downloads, [])
-                        self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
-
-    def test_yaml_that_can_hide_a_key_is_refused(self) -> None:
-        cases = (
-            ("escaped key", "\"\\x69nclude\": [/etc/x.yaml]\n", "escape sequence"),
-            ("binary tag", "!!binary aW5jbHVkZQ==: [/etc/x.yaml]\n", "tag"),
-            ("verbatim tag", "!<tag:yaml.org,2002:str> include: [/etc/x.yaml]\n", "tag"),
-            ("directive", "%TAG !x! tag:yaml.org,2002:\n---\nservices: {}\n", "directive"),
-            ("explicit key", "? include\n: [/etc/x.yaml]\n", "explicit key"),
-            ("alias key", "x-k: &k include\n*k : [/etc/x.yaml]\n", "alias key"),
-            ("not UTF-8", "services:\n  enclosure-ui:\n    labels: {a: \"\xff\"}\n", "encoding"),
-        )
-        for label, overlay, construct in cases:
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
-                root = self.make_root(temp_dir)
-                data = overlay.encode("latin-1") if label == "not UTF-8" else overlay.encode()
-                (root / "compose.override.yaml").write_bytes(data)
-                runtime = OverlayRuntime(root)
-                with self.assertRaisesRegex(
-                    deployment.DeploymentError,
-                    rf"^kept overlay compose\.override\.yaml uses YAML the helper cannot check \({construct}\)",
-                ):
-                    self.update(root, runtime, allow_overlay_contract_change=True)
-                self.assertEqual(runtime.commands, [])
 
     def test_inputs_swapped_after_validation_are_refused_before_receipt_publication(self) -> None:
         for replace_compose, target, (moment, matches) in itertools.product(
@@ -1952,6 +2051,8 @@ class InputFenceTests(unittest.TestCase):
             root.mkdir()
             self.make_root(str(root))
             runtime = OverlayRuntime(root)
+            # A root-owned parent (#1100); only root could make this swap.
+            self.enterContext(owned_by(0, Path(parent)))
             original_run = runtime.run
 
             def renaming_run(command: list[str], **kwargs: object) -> str:
@@ -2094,24 +2195,9 @@ TRUST_REMEDY = (
 
 
 def owned_by(uid: int, *paths: Path) -> Any:
-    """Make `os.fstat` report another owner for these inodes, as `chown` would.
+    """Make `os.fstat` report another owner for these inodes, as `chown` would."""
 
-    Nothing here can really chown without root, so ownership is simulated where
-    the helper reads it: on the descriptor it opened.
-    """
-
-    real_fstat = os.fstat
-    identities = {(path.lstat().st_dev, path.lstat().st_ino) for path in paths}
-
-    def fstat(descriptor: int) -> os.stat_result:
-        info = real_fstat(descriptor)
-        if (info.st_dev, info.st_ino) not in identities:
-            return info
-        values = list(info[:10])
-        values[4] = uid
-        return os.stat_result(values)
-
-    return mock.patch.object(deployment.os, "fstat", side_effect=fstat)
+    return reported_as(list(paths), uid=uid)
 
 
 @unittest.skipUnless(hasattr(os, "geteuid"), "POSIX ownership")
@@ -2298,90 +2384,206 @@ class RetainedInputTrustTests(unittest.TestCase):
                 self.assertEqual(overlay.read_text(encoding="utf-8"), RESTART_OVERLAY)
 
 
-HISTORY_LOOPBACK_BINDING = {"target": 8001, "published": "8081", "host_ip": "127.0.0.1", "protocol": "tcp",
-                            "mode": "ingress"}
+def ancestor_refusal(directory: Path | str, problem: str) -> str:
+    return (
+        rf"^directory {re.escape(str(directory))} above the deployment {problem}; every directory from / down to "
+        r"the deployment must be owned by root and not writable by group or others, so that no other user can "
+        r"rename or replace the deployment path; fix it with chown root:root and chmod go-w, or move the "
+        r"deployment under such a directory \(for example /opt or /srv\), then retry$"
+    )
 
 
-class PortBindingContractTests(unittest.TestCase):
-    """Codex P2 (#1097): a host address or host port change is a contract change."""
+@unittest.skipUnless(hasattr(os, "geteuid"), "POSIX ownership")
+class DeploymentPathTrustTests(unittest.TestCase):
+    """#1100, D-TNJ-20261108-OVERLAY-MIN: every directory above the deployment is root-owned and only root-writable."""
 
     make_root = KeptOverlayTests.make_root
     make_spec = KeptOverlayTests.make_spec
     update = KeptOverlayTests.update
-    assert_refused_before_any_pull = OverlayAllowlistTests.assert_refused_before_any_pull
 
-    def changes(self, before: list[Any], after: list[Any]) -> list[str]:
-        base = {"services": {"enclosure-history": {"image": "x", "ports": before}}}
-        merged = {"services": {"enclosure-history": {"image": "x", "ports": after}}}
-        return deployment._overlay_contract_changes(base, merged)
+    def nested_root(self, outer: str, *names: str, mode: int = 0o755) -> Path:
+        directory = Path(outer)
+        for name in names:
+            directory = directory / name
+            directory.mkdir()
+            os.chmod(directory, mode)
+        root = directory / "deployment"
+        root.mkdir()
+        return self.make_root(str(root))
 
-    def test_rebinding_widening_or_adding_a_binding_is_a_contract_change(self) -> None:
-        binding = HISTORY_LOOPBACK_BINDING
-        cases = (
-            ("loopback to wildcard", [{**binding, "host_ip": "0.0.0.0"}]),
-            ("loopback to IPv6 wildcard", [{**binding, "host_ip": "::"}]),
-            ("loopback to every interface", [{key: value for key, value in binding.items() if key != "host_ip"}]),
-            ("loopback to a LAN address", [{**binding, "host_ip": "192.0.2.10"}]),
-            ("other host port", [{**binding, "published": "18081"}]),
-            ("ephemeral host port", [{key: value for key, value in binding.items() if key != "published"}]),
-            ("added LAN binding", [binding, {**binding, "host_ip": "192.0.2.10", "published": "42070"}]),
-            ("added loopback binding", [binding, {**binding, "published": "18081"}]),
-            ("other protocol", [{**binding, "protocol": "udp"}]),
-            ("unknown key", [{**binding, "name": "web"}]),
-            ("unparseable host address", [{**binding, "host_ip": "localhost"}]),
-        )
-        for label, after in cases:
-            with self.subTest(label=label):
-                self.assertEqual(self.changes([binding], after), ["enclosure-history ports"])
+    def assert_refused_before_any_command(self, root: Path, runtime: FakeRuntime, message: str,
+                                          spec: deployment.DeploymentSpec | None = None) -> None:
+        with self.assertRaisesRegex(deployment.DeploymentError, message):
+            deployment.update_deployment(spec or self.make_spec(root), run=runtime.run, download=runtime.download,
+                                         probe=runtime.probe)
+        self.assertEqual(runtime.commands, [])
+        self.assertEqual(runtime.downloads, [])
+        self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
 
-    def test_restating_or_dropping_a_binding_is_not_a_contract_change(self) -> None:
-        binding = HISTORY_LOOPBACK_BINDING
-        cases = (
-            ("identical", [binding]),
-            ("duplicate restatement", [binding, dict(binding)]),
-            ("mode omitted, port as number", [{"target": 8001, "published": 8081, "host_ip": "127.0.0.1"}]),
-            ("protocol case", [{**binding, "protocol": "TCP"}]),
-            ("dropped", []),
-        )
-        for label, after in cases:
-            with self.subTest(label=label):
-                self.assertEqual(self.changes([binding], after), [])
-        ipv6 = {"target": 8001, "published": "8081", "host_ip": "::1", "protocol": "tcp"}
-        self.assertEqual(self.changes([ipv6], [{**ipv6, "host_ip": "0:0:0:0:0:0:0:1"}]), [])
+    def test_group_or_other_writable_ancestor_is_refused_before_any_command(self) -> None:
+        # Sticky world-writable directories such as /tmp (1777) are refused too.
+        for mode, depth in itertools.product((0o775, 0o757, 0o777, 0o1777, 0o1770), (1, 2)):
+            with self.subTest(mode=oct(mode), depth=depth), tempfile.TemporaryDirectory() as outer:
+                root = self.nested_root(outer, *["level"] * (depth - 1))
+                os.chmod(outer, mode)
+                # Scoped, so a later directory that reuses this inode number is not affected.
+                with owned_by(0, Path(outer), *root.parents[: depth - 1]):
+                    self.assert_refused_before_any_command(
+                        root, OverlayRuntime(root),
+                        ancestor_refusal(Path(outer).resolve(), "is writable by group or others"),
+                    )
 
-    def test_overlay_publishing_history_beyond_loopback_is_refused_without_the_flag(self) -> None:
-        history = "services:\n  enclosure-history:\n    ports: [{target: 8001, published: \"8081\", host_ip: %s}]\n"
-        ui = "services:\n  enclosure-ui:\n    ports: [{target: 8000, published: \"%s\", host_ip: %s}]\n"
-        cases = (
-            ("history on the wildcard", history % "0.0.0.0", "enclosure-history ports"),
-            ("history on a LAN address", history % "192.0.2.10", "enclosure-history ports"),
-            ("added LAN UI binding", ui % ("42069", "192.0.2.10"), "enclosure-ui ports"),
-            ("added loopback UI port", ui % ("18080", "127.0.0.1"), "enclosure-ui ports"),
-        )
-        for label, overlay, detail in cases:
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
-                root = self.make_root(temp_dir, overlay)
-                self.assert_refused_before_any_pull(root, OverlayRuntime(root), re.escape(detail))
-
-    def test_flagged_binding_change_is_listed_and_restatements_need_no_flag(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = self.make_root(
-                temp_dir, "services:\n  enclosure-history:\n    ports: [{target: 8001, published: \"8081\"}]\n",
+    def test_ancestor_owned_by_another_user_or_the_updater_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as outer:
+            root = self.nested_root(outer, "srv")
+            with owned_by(0, Path(outer)), owned_by(FOREIGN_UID, root.parent):
+                self.assert_refused_before_any_command(
+                    root, OverlayRuntime(root), ancestor_refusal(root.parent.resolve(), "is not owned by root"),
+                )
+        if os.geteuid() == 0:
+            return
+        # Only the deployment directory itself may belong to the updater.
+        with tempfile.TemporaryDirectory() as outer:
+            root = self.nested_root(outer)
+            self.assert_refused_before_any_command(
+                root, OverlayRuntime(root), ancestor_refusal(Path(outer).resolve(), "is not owned by root"),
             )
-            result = self.update(root, OverlayRuntime(root), allow_overlay_contract_change=True)
-            self.assertEqual(result["overlay_contract_changes"], ["enclosure-history ports"])
-            self.assertEqual(deployment.validate_receipt(root)["overlay_contract_changes"],
-                             ["enclosure-history ports"])
-        restatement = (
-            RESTART_OVERLAY + "  enclosure-history:\n"
-            "    ports: [{target: 8001, published: \"8081\", host_ip: 127.0.0.1, protocol: tcp}]\n"
-        )
-        for overlay in (RESTART_OVERLAY, restatement):
-            with self.subTest(overlay=overlay), tempfile.TemporaryDirectory() as temp_dir:
-                root = self.make_root(temp_dir, overlay)
-                result = self.update(root, OverlayRuntime(root))
-                self.assertEqual(result["status"], "active")
-                self.assertEqual(result["overlay_contract_changes"], [])
+
+    def test_writable_ancestor_swap_at_activation_never_reaches_compose_up(self) -> None:
+        # The #1100 reproduction: another user who can write the parent renames
+        # the validated deployment at the `up` boundary and installs a look-alike.
+        with tempfile.TemporaryDirectory() as outer:
+            parent = Path(outer) / "writable-parent"
+            parent.mkdir()
+            os.chmod(parent, 0o777)
+            root = parent / "deployment"
+            root.mkdir()
+            self.make_root(str(root))
+            self.enterContext(owned_by(0, Path(outer), parent))
+            runtime = OverlayRuntime(root)
+            original_run = runtime.run
+            seen_at_up: list[bytes] = []
+
+            def ancestor_swap_run(command: list[str], **kwargs: object) -> str:
+                if command[:2] == ["docker", "compose"] and "up" in command and not seen_at_up:
+                    root.rename(parent / "validated-deployment")
+                    root.mkdir(mode=0o700)
+                    for name, data in ((".env", f"JBOD_UI_IMAGE={NEW_DIGEST}\n"), ("compose.yaml", SHIPPED_BASE),
+                                       ("compose.override.yaml", UI + "    privileged: true\n")):
+                        (root / name).write_text(data, encoding="utf-8")
+                        os.chmod(root / name, 0o600)
+                    seen_at_up.append((root / "compose.override.yaml").read_bytes())
+                return original_run(command, **kwargs)  # type: ignore[arg-type]
+
+            with self.assertRaisesRegex(deployment.DeploymentError,
+                                        ancestor_refusal(parent.resolve(), "is writable by group or others")):
+                deployment.update_deployment(self.make_spec(root), run=ancestor_swap_run, download=runtime.download,
+                                             probe=runtime.probe)
+            self.assertEqual(seen_at_up, [])
+            self.assertEqual(runtime.commands, [])
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            self.assertEqual((root / "compose.override.yaml").read_text(encoding="utf-8"), RESTART_OVERLAY)
+
+    def test_ancestor_made_writable_during_the_update_stops_it_before_compose_up(self) -> None:
+        for moment, published in (("candidate image pull", False), ("Compose pull", True)):
+            with self.subTest(moment=moment), tempfile.TemporaryDirectory() as outer:
+                root = self.nested_root(outer, "opt")
+                with owned_by(0, Path(outer), root.parent):
+                    self.loosen_ancestor_during_update(root, moment, published)
+
+    def loosen_ancestor_during_update(self, root: Path, moment: str, published: bool) -> None:
+        """Make the root-owned parent writable at `moment`; only the check before `up` can see it."""
+
+        runtime = OverlayRuntime(root)
+        original_run = runtime.run
+
+        def loosening_run(command: list[str], **kwargs: object) -> str:
+            image_pull = command[:2] == ["docker", "pull"] and moment == "candidate image pull"
+            compose_pull = command[:2] == ["docker", "compose"] and "pull" in command and published
+            if image_pull or compose_pull:
+                os.chmod(root.parent, 0o777)
+            return original_run(command, **kwargs)  # type: ignore[arg-type]
+
+        with self.assertRaises(deployment.DeploymentError) as caught:
+            deployment.update_deployment(self.make_spec(root), run=loosening_run, download=runtime.download,
+                                         probe=runtime.probe)
+        directory = re.escape(str(root.parent.resolve()))
+        self.assertRegex(str(caught.exception), (
+            rf"^activation failed \(directory {directory} above the deployment is writable by group or "
+            rf"others; .*\) and automatic rollback failed \(directory {directory} above the deployment"
+            if published else ancestor_refusal(root.parent.resolve(), "is writable by group or others")
+        ))
+        # Compose never activated anything from the untrusted path.
+        self.assertFalse(any("up" in command for command in runtime.commands))
+        self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
+        if not published:
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            return
+        # Rollback refused too, before touching anything; once the
+        # operator fixes the directory, the recorded rollback completes.
+        self.assertEqual(deployment.validate_receipt(root)["status"], "prepared")
+        os.chmod(root.parent, 0o755)
+        self.assertEqual(deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)["image"],
+                         OLD_DIGEST)
+        self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+
+    def test_verify_and_rollback_refuse_an_untrusted_ancestor_before_any_command(self) -> None:
+        with tempfile.TemporaryDirectory() as outer:
+            root = self.nested_root(outer, "srv")
+            self.enterContext(owned_by(0, Path(outer), root.parent))
+            runtime = OverlayRuntime(root)
+            self.update(root, runtime)
+            receipt = (root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_bytes()
+            os.chmod(root.parent, 0o1777)
+            command_count = len(runtime.commands)
+            refusal = ancestor_refusal(root.parent.resolve(), "is writable by group or others")
+            with self.assertRaisesRegex(deployment.DeploymentError, refusal):
+                deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)
+            with self.assertRaisesRegex(deployment.DeploymentError, refusal):
+                deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+            self.assertEqual(len(runtime.commands), command_count)
+            self.assertEqual((root / deployment.RECEIPT_DIR_NAME / "receipt.json").read_bytes(), receipt)
+
+    def test_deployment_under_the_real_tmp_is_refused(self) -> None:
+        tmp = Path("/tmp")
+        try:
+            info, top = tmp.lstat(), Path("/").lstat()
+        except OSError:
+            self.skipTest("no /tmp")
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o1002 != 0o1002 or (
+            top.st_uid != 0 or stat.S_IMODE(top.st_mode) & 0o022
+        ):
+            self.skipTest("/tmp is not a sticky world-writable directory under a root-owned /")
+        SYSTEM_TEMP_AS_ROOT_CHAIN.stop()
+        self.addCleanup(SYSTEM_TEMP_AS_ROOT_CHAIN.start)
+        with tempfile.TemporaryDirectory(dir=tmp) as temp_dir:
+            root = self.make_root(temp_dir)
+            self.assert_refused_before_any_command(
+                root, OverlayRuntime(root), ancestor_refusal(tmp, "is writable by group or others"),
+            )
+
+    def test_root_owned_ancestors_keep_the_plain_image_only_update_working(self) -> None:
+        # The twin's pattern: no overlays, a deployment under a root-owned /opt.
+        with tempfile.TemporaryDirectory() as outer:
+            opt = Path(outer) / "opt"
+            opt.mkdir()
+            os.chmod(opt, 0o755)
+            root = opt / "truenas-jbod-ui"
+            root.mkdir()
+            ImmutableDeploymentTests.make_root(self, str(root))  # type: ignore[arg-type]
+            self.enterContext(owned_by(0, Path(outer), opt))
+            runtime = FakeRuntime(root)
+            spec = ImmutableDeploymentTests.make_spec(self, root)  # type: ignore[arg-type]
+            self.assertFalse(any(item.is_overlay for item in spec.compose_files))
+
+            result = deployment.update_deployment(spec, run=runtime.run, download=runtime.download,
+                                                  probe=runtime.probe)
+
+            self.assertEqual(result["status"], "active")
+            self.assertEqual(deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)["image"],
+                             NEW_DIGEST)
+            self.assertEqual(deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)["image"],
+                             OLD_DIGEST)
 
 
 class PublishedAddressTests(unittest.TestCase):
@@ -2608,18 +2810,22 @@ class PublishedAddressTests(unittest.TestCase):
         text = " ".join(deployment._build_parser()._subparsers._group_actions[0].choices["update"]  # type: ignore[union-attr]
                         .format_help().split())
         self.assertIn("--keep-overlay", text)
-        self.assertIn("--allow-overlay-contract-change", text)
+        self.assertIn("may set only restart", text)
+        self.assertNotIn("--allow-overlay-contract-change", text)
         self.assertIn("address and port this deployment publishes", text)
 
     def test_runbook_documents_overlays_and_published_addresses(self) -> None:
         runbook = " ".join(Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8").split())
-        for text in ("--keep-overlay compose.override.yaml", "--allow-overlay-contract-change",
-                     "docker compose config", "published port bindings", "0.0.0.0",
-                     "owned by root or the user running the helper", "same host address and host port"):
+        for text in ("--keep-overlay compose.override.yaml", "may set only `restart`", "docker compose config",
+                     "published port bindings", "0.0.0.0", "owned by root or the user running the helper",
+                     "every directory from / down to the deployment", "/tmp"):
             self.assertIn(text, runbook)
         upgrading = " ".join(Path("wiki/Upgrading.md").read_text(encoding="utf-8").split())
-        self.assertIn("--keep-overlay", upgrading)
-        self.assertIn("IMMUTABLE_GHCR_DEPLOYMENT.md", upgrading)
+        for text in ("--keep-overlay", "IMMUTABLE_GHCR_DEPLOYMENT.md", "may set only `restart`",
+                     "every directory from / down to the deployment"):
+            self.assertIn(text, upgrading)
+        for document in (runbook, upgrading):
+            self.assertNotIn("--allow-overlay-contract-change", document)
 
 
 if __name__ == "__main__":

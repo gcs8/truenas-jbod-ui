@@ -73,54 +73,28 @@ _HTTP_URL_PATTERN = re.compile(
 )
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
 PORTS_TEMPLATE = "{{json .NetworkSettings.Ports}}"
-# What a kept operator overlay may change without --allow-overlay-contract-change
-# (#1096, #1098). This is an allowlist, judged on the merged `docker compose
-# config` model against the shipped base's: anything not named here, on any
-# service or at the top level, is a contract change. Services must already
-# exist in the shipped base; added or removed services always count.
-OVERLAY_ALLOWED_SERVICE_KEYS = frozenset({"restart", "mem_limit", "mem_reservation", "cpus", "pids_limit", "logging"})
-# `healthcheck`: timing only, never the test command or `disable`.
-OVERLAY_HEALTHCHECK_TIMING_KEYS = frozenset({"interval", "timeout", "retries", "start_period"})
-# `ports`: only a restatement of a binding the base already publishes, with the
-# same host address, host port, container port and protocol (#1097).
-OVERLAY_PORT_KEYS = frozenset({"mode", "host_ip", "target", "published", "protocol"})
-# `labels`: any label except Docker's and Compose's own, which the helper reads.
-OVERLAY_RESERVED_LABEL_PREFIXES = ("com.docker.",)
-# `environment`: any variable except those that decide authentication, origins,
-# bind addresses and ports, paths and files, TLS, SSH/sudo, the image, backup
-# targets, or how the interpreter and server start. Derived from the variables
-# the app, admin and history services read (see .env.example and the shipped
-# Compose files); matching is by whole name token, case-insensitively.
-OVERLAY_SENSITIVE_ENV_TOKENS = frozenset({
-    "ADDRESS", "ALLOW", "ALLOWED", "AUTH", "BIND", "CA", "CERT", "COMMIT", "DEBUG", "DIR", "FILE", "GID",
-    "HOME", "HOST", "HOSTS", "IMAGE", "IPS", "JSON", "KEY", "MODE", "ORIGIN", "ORIGINS", "PASSPHRASE",
-    "PASSWORD", "PATH", "PERMISSION", "PLAINTEXT", "PORT", "PROXY", "REPO", "ROLE", "SECRET", "SOCKET",
-    "SSH", "SSL", "SUDO", "SYSLOG", "TARGETS", "TLS", "TMPDIR", "TOKEN", "UID", "URI", "URL", "USER",
-    "VERIFY",
-})
-OVERLAY_SENSITIVE_ENV_PREFIXES = (
-    "ADMIN_CONTAINER_", "ADMIN_HOST_PREP_", "BACKUP_", "COMPOSE_", "DOCKER_", "LD_", "PATH_", "PYTHON",
-    "SCHEDULED_BACKUP_", "SQLITE_", "SSH_", "TRUENAS_", "UVICORN_",
+# A kept operator overlay may set only `restart` on services the shipped files
+# already define (#1096, #1101): the one setting an operator override needs to
+# survive a Compose replacement. Host Python has no YAML parser, so the overlay
+# text must match this line grammar exactly, and the merged `docker compose
+# config` model may then differ from the shipped files' only in `restart`.
+# Anything else, including other keys, flow style, anchors, aliases, merge
+# keys, tags, directives, document markers and quoted keys, is refused.
+RESTART_POLICY = r"(?:no|always|unless-stopped|on-failure(?::[0-9]{1,4})?)"
+RESTART_POLICY_PATTERN = re.compile(RESTART_POLICY)
+# Whitespace, then an optional comment; a `#` glued to a value is part of it.
+_OVERLAY_LINE_END = r"(?:[ \t]+(?:#.*)?)?"
+_OVERLAY_SERVICES_LINE = re.compile(rf"services:{_OVERLAY_LINE_END}")
+_OVERLAY_SERVICE_LINE = re.compile(rf"(?P<indent> +)(?P<service>[a-zA-Z0-9][a-zA-Z0-9_.-]*):{_OVERLAY_LINE_END}")
+_OVERLAY_RESTART_LINE = re.compile(
+    rf"(?P<indent> +)restart:[ \t]+(?P<quote>[\"']?){RESTART_POLICY}(?P=quote){_OVERLAY_LINE_END}"
 )
-OVERLAY_SENSITIVE_ENV_NAMES = frozenset({"WEB_CONCURRENCY"})
+_OVERLAY_BLANK_OR_COMMENT_LINE = re.compile(r"[ \t]*(?:#.*)?")
+# Plain ASCII only: YAML parsers also break lines at NEL, LS, PS and a bare
+# carriage return, which could start a key inside what reads as a comment.
+_OVERLAY_UNSAFE_TEXT = re.compile(r"[^\t\n\r\x20-\x7e]|\r(?!\n)")
 MAX_LISTED_CONTRACT_CHANGES = 20
 _CHANGE_PART_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$")
-_CONTRACT_CHANGE_PATTERN = re.compile(r"^[A-Za-z0-9_. -]{1,256}$")
-# A kept overlay must be self-contained (#1099): the helper freezes only the
-# files it is given, so a key that makes Compose read another file is refused,
-# with or without --allow-overlay-contract-change. Host Python has no YAML
-# parser, so the check is lexical and fails closed: it first refuses every
-# YAML construct that could spell a key without its literal text.
-_OVERLAY_OPAQUE_YAML = (
-    ("escape sequence", re.compile(r"\\")),
-    ("directive", re.compile(r"^%", re.MULTILINE)),
-    ("tag", re.compile(r"(?:^|[\s\[{,])!(?!(?:reset|override)(?=[\s\]},]|$))", re.MULTILINE)),
-    ("explicit key", re.compile(r"(?:^|[\s\[{,])\?(?=\s|$)", re.MULTILINE)),
-    ("alias key", re.compile(r"\*[^\s,\[\]{}]+[ \t]*:")),
-)
-_OVERLAY_FILE_REFERENCE = re.compile(
-    r"(?<![A-Za-z0-9_.-])[\"']?(include|extends|env_file|label_file|build|file)[\"']?[ \t]*:"
-)
 
 
 class DeploymentError(RuntimeError):
@@ -198,7 +172,6 @@ class DeploymentSpec:
     replace_compose: bool = False
     inventory_url: str | None = None
     history_health_url: str | None = None
-    allow_overlay_contract_change: bool = False
 
 
 def _sha256(data: bytes) -> str:
@@ -353,6 +326,11 @@ _TRUST_REMEDY = (
     "make it owned by root or the user running this helper and not writable by group or others "
     "(chown, chmod go-w), then retry"
 )
+_ANCESTOR_REMEDY = (
+    "every directory from / down to the deployment must be owned by root and not writable by group or others, "
+    "so that no other user can rename or replace the deployment path; fix it with chown root:root and chmod go-w, "
+    "or move the deployment under such a directory (for example /opt or /srv), then retry"
+)
 
 
 def _trust_problem(uid: int, mode: int) -> str | None:
@@ -365,18 +343,50 @@ def _trust_problem(uid: int, mode: int) -> str | None:
     return None
 
 
-def _require_trusted_inputs(root: Path, identity: tuple[int, int], snapshots: dict[str, InputSnapshot]) -> None:
-    """Refuse inputs that anyone but root or the updater could change (#1097).
+def _open_trusted_directory(root: Path, identity: tuple[int, int]) -> int:
+    """Open the deployment directory from / one component at a time (#1100).
 
-    Compose reads every input by path, after the last check that the bytes are
-    the frozen ones. Only identities that already hold the updater's authority
-    may be able to write the files or the directory that names them; otherwise
-    a lower-privileged local user could swap in an overlay inside that window.
-    Inputs are plain names in the deployment directory, so the directory is the
-    whole parent chain inside it.
+    Every directory above it must be owned by root and not writable by group
+    or others, sticky ones such as /tmp included: write access to any of them
+    lets that identity rename the validated deployment away and put another in
+    its pathname between the last check and Compose reading it. With such a
+    chain only root, which already has Docker authority, can change what the
+    pathname names. The opened directory must be the one validated.
     """
 
-    directory = _open_directory(root, identity)
+    descriptor = os.open("/", _DIRECTORY_FLAGS)
+    try:
+        current = Path("/")
+        for name in root.parts[1:]:
+            info = os.fstat(descriptor)
+            if info.st_uid != 0:
+                problem = "is not owned by root"
+            elif stat.S_IMODE(info.st_mode) & _WRITABLE_BY_OTHERS:
+                problem = "is writable by group or others"
+            else:
+                problem = None
+            if problem:
+                raise UnsafeInput(f"directory {current} above the deployment {problem}; {_ANCESTOR_REMEDY}")
+            try:
+                child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            except OSError:
+                raise DeploymentError(DIRECTORY_CHANGED) from None
+            os.close(descriptor)
+            descriptor = child
+            current = current / name
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) != identity:
+            raise DeploymentError(DIRECTORY_CHANGED)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_trusted_directory(root: Path, identity: tuple[int, int]) -> None:
+    """The deployment path and directory may change only with root or updater authority (#1097, #1100)."""
+
+    directory = _open_trusted_directory(root, identity)
     try:
         info = os.fstat(directory)
     finally:
@@ -384,6 +394,20 @@ def _require_trusted_inputs(root: Path, identity: tuple[int, int], snapshots: di
     problem = _trust_problem(info.st_uid, stat.S_IMODE(info.st_mode))
     if problem:
         raise UnsafeInput(f"deployment directory {problem}; {_TRUST_REMEDY}")
+
+
+def _require_trusted_inputs(root: Path, identity: tuple[int, int], snapshots: dict[str, InputSnapshot]) -> None:
+    """Refuse inputs that anyone but root or the updater could change (#1097).
+
+    Compose reads every input by path, after the last check that the bytes are
+    the frozen ones. Only identities that already hold the updater's authority
+    may be able to write the files or the directory that names them; otherwise
+    a lower-privileged local user could swap in an overlay inside that window.
+    Inputs are plain names in the deployment directory, and every directory
+    above it must be root-owned and only root-writable (#1100).
+    """
+
+    _require_trusted_directory(root, identity)
     for name, snapshot in snapshots.items():
         problem = _trust_problem(snapshot.uid, snapshot.mode)
         if problem:
@@ -496,26 +520,69 @@ def _restore_mode(root: Path, identity: tuple[int, int], name: str, mode: int) -
         os.close(directory)
 
 
-def _require_self_contained_overlay(name: str, data: bytes) -> None:
-    """Refuse a kept overlay that makes Compose read another file (#1099)."""
+def _restart_only_problem(data: bytes) -> str | None:
+    """Why this overlay is not a plain list of services that each set only `restart`."""
 
     try:
-        text = data.decode("utf-8")
+        text = data.decode("ascii")
     except UnicodeDecodeError:
-        text = None
-    if text is None or "\x00" in text:
-        raise DeploymentError(f"kept overlay {name} uses YAML the helper cannot check (encoding); use UTF-8")
-    for construct, pattern in _OVERLAY_OPAQUE_YAML:
-        if pattern.search(text):
-            raise DeploymentError(
-                f"kept overlay {name} uses YAML the helper cannot check ({construct}); "
-                "write it without tags, escapes, directives, explicit keys or alias keys"
-            )
-    match = _OVERLAY_FILE_REFERENCE.search(text)
-    if match:
+        return "it is not plain ASCII text"
+    if _OVERLAY_UNSAFE_TEXT.search(text):
+        return "it is not plain ASCII text"
+    in_services = False
+    service_indent: int | None = None
+    restart_indent: int | None = None
+    current: str | None = None
+    restarted: dict[str, bool] = {}
+    for number, line in enumerate(text.split("\n"), start=1):
+        line = line.removesuffix("\r")
+        if _OVERLAY_BLANK_OR_COMMENT_LINE.fullmatch(line):
+            continue
+        if not in_services:
+            if not _OVERLAY_SERVICES_LINE.fullmatch(line):
+                return f"line {number}"
+            in_services = True
+            continue
+        service = _OVERLAY_SERVICE_LINE.fullmatch(line)
+        if service and service_indent in (None, len(service["indent"])) and service["service"] not in restarted:
+            if current is not None and not restarted[current]:
+                return f"service {current} sets no restart"
+            service_indent, current = len(service["indent"]), service["service"]
+            restarted[current] = False
+            continue
+        restart = _OVERLAY_RESTART_LINE.fullmatch(line)
+        if (
+            restart
+            and current is not None
+            and service_indent is not None
+            and not restarted[current]
+            and len(restart["indent"]) > service_indent
+            and restart_indent in (None, len(restart["indent"]))
+        ):
+            restart_indent = len(restart["indent"])
+            restarted[current] = True
+            continue
+        return f"line {number}"
+    if current is not None and not restarted[current]:
+        return f"service {current} sets no restart"
+    if not restarted:
+        return "it sets no restart"
+    return None
+
+
+def _require_restart_only_overlay(name: str, data: bytes) -> None:
+    """Refuse a kept overlay that sets anything but `restart` (#1101).
+
+    Judged on the raw text before any command, so YAML anchors, merge keys,
+    tags and references to other files (#1099) never reach Compose; the merged
+    model is compared as well once Compose has read the chain.
+    """
+
+    problem = _restart_only_problem(data)
+    if problem:
         raise DeploymentError(
-            f"kept overlay {name} references another file ({match.group(1)}); "
-            "inline the setting in the overlay, because the helper freezes only the files it is given"
+            f"kept overlay {name} may only set restart on shipped services ({problem}); "
+            "remove every other setting from it and make that change in a reviewed Compose release instead"
         )
 
 
@@ -923,8 +990,6 @@ def _validate_spec(spec: DeploymentSpec) -> Path:
         raise DeploymentError("at least one Compose file is required")
     if all(item.is_overlay for item in spec.compose_files):
         raise DeploymentError("at least one shipped Compose file (--compose SOURCE=LIVE) is required")
-    if spec.allow_overlay_contract_change and not any(item.is_overlay for item in spec.compose_files):
-        raise DeploymentError("--allow-overlay-contract-change needs at least one --keep-overlay")
     if not spec.services:
         raise DeploymentError("at least one expected running service is required")
     if not spec.health_urls:
@@ -1076,8 +1141,8 @@ def _contract_refusal(changes: list[str]) -> DeploymentError:
     if len(changes) > MAX_LISTED_CONTRACT_CHANGES:
         detail += f", and {len(changes) - MAX_LISTED_CONTRACT_CHANGES} more"
     return DeploymentError(
-        f"kept overlay changes the release Compose contract ({detail}); "
-        "pass --allow-overlay-contract-change only after reviewing it"
+        f"kept overlays may only set restart on shipped services, but the merged Compose model also changes "
+        f"({detail}); remove those settings from the overlay"
     )
 
 
@@ -1086,114 +1151,16 @@ def _part(value: object, fallback: str) -> str:
     return value if isinstance(value, str) and _CHANGE_PART_PATTERN.fullmatch(value) else fallback
 
 
-def _changed_keys(before: object, after: object) -> list[object] | None:
-    before = {} if before is None else before
-    after = {} if after is None else after
-    if not isinstance(before, dict) or not isinstance(after, dict):
-        return None
-    keys = set(before) | set(after)
-    return sorted(
-        (key for key in keys if (key in before) != (key in after) or before.get(key) != after.get(key)),
-        key=str,
-    )
-
-
-def _sensitive_env_name(name: object) -> bool:
-    if not isinstance(name, str):
-        return True
-    upper = name.upper()
-    if upper in OVERLAY_SENSITIVE_ENV_NAMES or upper.startswith(OVERLAY_SENSITIVE_ENV_PREFIXES):
-        return True
-    return any(token in OVERLAY_SENSITIVE_ENV_TOKENS for token in re.split(r"[^A-Z0-9]+", upper))
-
-
-def _port_binding(entry: object) -> tuple[str, str, str, str] | None:
-    """(container port, protocol, host address, host port) of one published binding.
-
-    The host address is normalised (absent or empty means every interface) so
-    that a restatement compares equal; anything unusual returns None.
-    """
-
-    if not isinstance(entry, dict) or not set(entry) <= OVERLAY_PORT_KEYS:
-        return None
-    host_ip, published = entry.get("host_ip"), entry.get("published")
-    if host_ip is None or host_ip == "":
-        host = ""
-    elif isinstance(host_ip, str):
-        try:
-            host = ipaddress.ip_address(host_ip).compressed
-        except ValueError:
-            return None
-    else:
-        return None
-    protocol = entry.get("protocol", "tcp")
-    if not isinstance(protocol, str) or isinstance(published, bool) or not isinstance(
-        published, (str, int, type(None))
-    ):
-        return None
-    return str(entry.get("target")), protocol.lower(), host, "" if published is None else str(published)
-
-
-def _ports_allowed(before: object, after: object) -> bool:
-    """Only restatements of bindings the base already publishes (#1097).
-
-    A binding is its host address and host port as well as its container port
-    and protocol: an added binding, one widened from loopback to another or the
-    wildcard address, or one moved to another host port is a contract change.
-    Dropping a binding narrows exposure and is not.
-    """
-
-    before = [] if before is None else before
-    after = [] if after is None else after
-    if not isinstance(before, list) or not isinstance(after, list):
-        return False
-    published = {binding for binding in map(_port_binding, before) if binding is not None}
-    for entry in after:
-        if entry in before:
-            continue
-        binding = _port_binding(entry)
-        if binding is None or binding not in published:
-            return False
-    return True
-
-
-def _service_changes(before: JsonObject, after: JsonObject) -> list[str]:
-    changes: list[str] = []
-    for key in sorted(set(before) | set(after), key=str):
-        old, new = before.get(key), after.get(key)
-        if (key in before) == (key in after) and old == new:
-            continue
-        if key in OVERLAY_ALLOWED_SERVICE_KEYS:
-            continue
-        name = _part(key, "a key")
-        if key in {"labels", "environment", "healthcheck"}:
-            keys = _changed_keys(old, new)
-            if keys is None:
-                changes.append(name)
-                continue
-            for item in keys:
-                if key == "labels":
-                    refused = not isinstance(item, str) or item.startswith(OVERLAY_RESERVED_LABEL_PREFIXES)
-                elif key == "environment":
-                    refused = _sensitive_env_name(item)
-                else:
-                    refused = item not in OVERLAY_HEALTHCHECK_TIMING_KEYS
-                if refused:
-                    changes.append(f"{name} {_part(item, 'an entry')}")
-        elif key == "ports":
-            if not _ports_allowed(old, new):
-                changes.append(name)
-        else:
-            changes.append(name)
-    return changes
+def _restart_allowed(before: object, after: object) -> bool:
+    return after == before or (isinstance(after, str) and RESTART_POLICY_PATTERN.fullmatch(after) is not None)
 
 
 def _overlay_contract_changes(base: JsonObject, merged: JsonObject) -> list[str]:
-    """Every difference between the merged models that the allowlist does not admit (#1098).
+    """Every difference between the merged models other than a valid `restart` (#1101).
 
     Both models come from `docker compose config --format json`, so YAML
     anchors, merge keys, `!reset` and `x-` blocks are already resolved and
-    cannot hide a change. Only service, key and variable names are listed.
+    cannot hide a change. Only service and key names are listed, never values.
     """
 
     changes: list[str] = []
@@ -1207,7 +1174,12 @@ def _overlay_contract_changes(base: JsonObject, merged: JsonObject) -> list[str]
             if before != after:
                 changes.append(f"{label} definition")
         else:
-            changes.extend(f"{label} {change}" for change in _service_changes(before, after))
+            for key in sorted(set(before) | set(after), key=str):
+                if key == "restart":
+                    if not _restart_allowed(before.get(key), after.get(key)):
+                        changes.append(f"{label} restart")
+                elif (key in before) != (key in after) or before.get(key) != after.get(key):
+                    changes.append(f"{label} {_part(key, 'a key')}")
     for name in sorted(set(merged_services) - set(base_services), key=str):
         changes.append(f"added service {_part(name, 'a service')}")
     for key in sorted((set(base) | set(merged)) - {"services"}, key=str):
@@ -1216,17 +1188,15 @@ def _overlay_contract_changes(base: JsonObject, merged: JsonObject) -> list[str]
     return changes
 
 
-def _validate_candidate_chain(run: RunCommand, root: Path, staged: Path, spec: DeploymentSpec) -> list[str] | None:
+def _validate_candidate_chain(run: RunCommand, root: Path, staged: Path, spec: DeploymentSpec) -> None:
     """Validate the candidate chain and judge kept overlays on its merged model.
 
     `staged` holds the chain Compose reads: the private receipt copies under
     --replace-compose, or the deployment directory itself in image-only mode,
     where operator-relative files must resolve in place and the frozen inputs
     are proved unchanged right after this and before every later use instead.
-    Returns the contract
-    changes (empty when the overlays stay inside the allowlist), or None when
-    the chain keeps no overlay. Changes are refused unless the operator passed
-    --allow-overlay-contract-change; even then they are listed.
+    Kept overlays may change only `restart` in the merged model (#1101); any
+    other difference is refused, and there is no flag to allow it.
     """
 
     profiles = list(spec.profiles)
@@ -1235,15 +1205,14 @@ def _validate_candidate_chain(run: RunCommand, root: Path, staged: Path, spec: D
     run([*_compose_prefix(staged, spec.project_name, chain_names, profiles), "config", "--quiet"], cwd=root,
         env={"JBOD_UI_IMAGE": spec.expected_image})
     if len(base_names) == len(chain_names):
-        return None
+        return
     base = _compose_model(run, root, _compose_prefix(staged, spec.project_name, base_names, profiles),
                           spec.expected_image)
     merged = _compose_model(run, root, _compose_prefix(staged, spec.project_name, chain_names, profiles),
                             spec.expected_image)
     changes = _overlay_contract_changes(base, merged)
-    if changes and not spec.allow_overlay_contract_change:
+    if changes:
         raise _contract_refusal(changes)
-    return changes
 
 
 def _capture_previous_runtime(
@@ -1285,9 +1254,7 @@ def _receipt_payload(
     previous_services: list[JsonObject],
     hashes: dict[str, str],
     modes: dict[str, int],
-    contract_changes: list[str] | None = None,
 ) -> JsonObject:
-    has_overlay = any(item.is_overlay for item in spec.compose_files)
     return {
         "schema": RECEIPT_SCHEMA,
         "status": "prepared",
@@ -1305,15 +1272,6 @@ def _receipt_payload(
         "hashes": hashes,
         "modes": modes,
         "result": None,
-        **(
-            {
-                "overlay_contract_change_allowed": spec.allow_overlay_contract_change,
-                # Every allowlist difference the operator accepted (#1098).
-                "overlay_contract_changes": list(contract_changes or []),
-            }
-            if has_overlay
-            else {}
-        ),
         **(
             {"retention": {"inventory_url": spec.inventory_url, "before": None, "after": None}}
             if spec.inventory_url is not None
@@ -1436,20 +1394,6 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
         expected_keys.add("replace_compose")
         if type(receipt["replace_compose"]) is not bool:
             raise DeploymentError("receipt replace_compose must be boolean")
-    # Only receipts whose chain keeps an operator overlay record this (#1096).
-    if "overlay_contract_change_allowed" in receipt:
-        expected_keys.add("overlay_contract_change_allowed")
-        if type(receipt["overlay_contract_change_allowed"]) is not bool:
-            raise DeploymentError("receipt overlay_contract_change_allowed must be boolean")
-    if "overlay_contract_changes" in receipt:
-        expected_keys.add("overlay_contract_changes")
-        changes = receipt["overlay_contract_changes"]
-        if not isinstance(changes, list) or not all(
-            isinstance(value, str) and _CONTRACT_CHANGE_PATTERN.fullmatch(value) for value in changes
-        ):
-            raise DeploymentError("receipt overlay_contract_changes must be a list of change names")
-        if changes and receipt.get("overlay_contract_change_allowed") is not True:
-            raise DeploymentError("receipt lists overlay contract changes that were not allowed")
     # Receipts written without --inventory-url carry no retention record.
     if "retention" in receipt:
         expected_keys.add("retention")
@@ -1511,11 +1455,6 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
         lives.add(live)
     if not sources:
         raise DeploymentError("receipt Compose chain has no shipped file")
-    has_overlay = any(item["source"] is None for item in compose_files)
-    if has_overlay != ("overlay_contract_change_allowed" in receipt) or has_overlay != (
-        "overlay_contract_changes" in receipt
-    ):
-        raise DeploymentError("receipt overlay record does not match its Compose chain")
     previous_services = receipt["previous_services"]
     if not isinstance(previous_services, list) or len(previous_services) != len(receipt["services"]):
         raise DeploymentError("receipt previous service cardinality is invalid")
@@ -1666,8 +1605,8 @@ def validate_receipt(root: Path) -> JsonObject:
         if item["source"] is None and hashes[f"previous/{name}"] != hashes[f"candidate/{name}"]:
             raise DeploymentError(f"receipt kept overlay snapshot changed: {name}")
         if item["source"] is None:
-            # Rollback reapplies this overlay, so it must still be self-contained (#1099).
-            _require_self_contained_overlay(name, (receipt_dir / "previous" / name).read_bytes())
+            # Rollback reapplies this overlay, so it must still set only restart (#1099, #1101).
+            _require_restart_only_overlay(name, (receipt_dir / "previous" / name).read_bytes())
     expected_modes = {".env", *compose_names}
     modes = receipt["modes"]
     if set(modes) != expected_modes:
@@ -1758,8 +1697,10 @@ def _restore_previous(
 ) -> JsonObject:
     compose_names = [str(item["live"]) for item in receipt["compose_files"]]
     modes = receipt["modes"]
-    # Automatic rollback stays bound to the directory the update validated.
+    # Automatic rollback stays bound to the directory the update validated,
+    # and changes nothing unless only root or the updater can rename it (#1100).
     identity = identity or _directory_identity(root)
+    _require_trusted_directory(root, identity)
     # Invalidate any old success before mutating a manual rollback.
     receipt["status"] = "prepared"
     receipt["result"] = None
@@ -1845,7 +1786,7 @@ def update_deployment(
     _require_trusted_inputs(root, identity, frozen)
     for item in spec.compose_files:
         if item.is_overlay:
-            _require_self_contained_overlay(item.live, frozen[item.live].data)
+            _require_restart_only_overlay(item.live, frozen[item.live].data)
     changed_after_validation = "deployment input changed after validation"
     previous_image, previous_services = _capture_previous_runtime(spec, root, run)
     # Before any URL is fetched: a non-loopback URL must match a binding the
@@ -1871,10 +1812,10 @@ def update_deployment(
     staging, hashes, modes = _stage_receipt(spec, root, frozen, candidate_files)
     try:
         # The merged chain, new shipped files plus kept overlays, must validate,
-        # and kept overlays must stay inside the allowlist (#1098) unless the
-        # operator allowed the listed changes. Nothing is pulled before this.
+        # and kept overlays may change only `restart` in it (#1101). Nothing is
+        # pulled before this.
         compose_dir = staging / "candidate" if spec.replace_compose else root
-        contract_changes = _validate_candidate_chain(run, root, compose_dir, spec)
+        _validate_candidate_chain(run, root, compose_dir, spec)
         _verify_inputs(root, identity, frozen, changed_after_validation)
         retention_before: dict[str, int] | None = None
         if spec.inventory_url is not None:
@@ -1890,7 +1831,7 @@ def update_deployment(
         candidate_digest = _resolve_digest(run, root, spec.candidate_tag)
         if candidate_digest != spec.expected_image:
             raise DeploymentError("candidate tag does not match the selected workflow receipt")
-        receipt = _receipt_payload(spec, previous_image, previous_services, hashes, modes, contract_changes)
+        receipt = _receipt_payload(spec, previous_image, previous_services, hashes, modes)
         _write_receipt(staging, receipt)
         # The live inputs must still be the validated ones when the receipt is published.
         _verify_inputs(root, identity, frozen, changed_after_validation)
@@ -1948,8 +1889,6 @@ def update_deployment(
         receipt["result"] = result
         _write_receipt(receipt_dir, receipt)
         output: JsonObject = {"status": "active", **result}
-        if "overlay_contract_changes" in receipt:
-            output["overlay_contract_changes"] = receipt["overlay_contract_changes"]
         if spec.inventory_url is not None:
             output["retention"] = receipt["retention"]
     except BaseException as activation_error:
@@ -1984,6 +1923,8 @@ def verify_deployment(
     fetch_health: FetchJson = _default_fetch_history_health,
 ) -> JsonObject:
     root = root.resolve(strict=True)
+    # Verification reads the live chain by path too (#1100).
+    _require_trusted_directory(root, _directory_identity(root))
     receipt = validate_receipt(root)
     if receipt["status"] == "prepared":
         raise DeploymentError("prepared receipt has no terminal deployment state")
@@ -2044,16 +1985,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="one ordered chain file: shipped repository SOURCE file and its LIVE name")
     update.add_argument("--keep-overlay", dest="compose", action="append", type=_parse_overlay, metavar="LIVE",
                         help=(
-                            "one ordered chain file that is an operator overlay: kept byte-for-byte, "
-                            "frozen in the receipt, and refused if it reads another file or changes anything "
-                            "but restart policy, resource limits, logging, healthcheck timing, labels, "
-                            "non-sensitive environment, or ports of a shipped service's published container ports"
+                            "one ordered chain file that is an operator overlay, kept byte-for-byte and frozen "
+                            "in the receipt; it may set only restart (no, always, on-failure[:N] or "
+                            "unless-stopped) on services the shipped files define, and anything else is refused"
                         ))
     update.add_argument("--replace-compose", action="store_true",
                         help="explicitly replace the live --compose files with source-revision files")
-    update.add_argument("--allow-overlay-contract-change", action="store_true",
-                        help=("accept a reviewed --keep-overlay that changes the shipped Compose contract; "
-                              "every change is listed in the receipt and the output"))
     update.add_argument("--profile", action="append", default=[])
     update.add_argument("--service", action="append", required=True)
     update.add_argument("--health-url", action="append", required=True, help=PUBLISHED_URL_HELP)
@@ -2098,7 +2035,6 @@ def main(argv: list[str] | None = None) -> int:
                     replace_compose=args.replace_compose,
                     inventory_url=args.inventory_url,
                     history_health_url=args.history_health_url,
-                    allow_overlay_contract_change=args.allow_overlay_contract_change,
                 )
             )
         elif args.action == "verify":
