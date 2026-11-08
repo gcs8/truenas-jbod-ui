@@ -1724,7 +1724,7 @@ class HistorySqliteTemporaryDirectoryTests(unittest.TestCase):
             target = history / ".sqlite-tmp"
             target.mkdir(mode=0o755)
             target.chmod(0o755)
-            (target / "etilqs_0123456789abcdef").write_bytes(b"stale sort run")
+            (target / "etilqs_stalesortrun").write_bytes(b"stale sort run")
             (target / "operator-notes.txt").write_text("not SQLite's")
             (target / "etilqs_subdirectory").mkdir()
 

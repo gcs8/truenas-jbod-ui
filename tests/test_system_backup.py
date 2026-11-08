@@ -565,7 +565,7 @@ class SystemBackupServiceTests(unittest.TestCase):
         for directory in (catalog_path.parent.parent, catalog_path.parent):
             temporary = directory / ".sqlite-tmp"
             temporary.mkdir(mode=0o700)
-            (temporary / "etilqs_0123456789abcdef").write_bytes(b"stale sort run")
+            (temporary / "etilqs_stalesortrun").write_bytes(b"stale sort run")
             shutil.copyfile(_segment_path, temporary / "segment-stray.sqlite3")
 
         artifact = service.export_bundle_to_file(
