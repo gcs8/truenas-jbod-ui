@@ -40,6 +40,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed a page reload right after an enclosure rename, or a bay-assignment
+  save while the page's own background refresh was still running, answering
+  503 "server is busy". A request that starts after the change now waits for
+  the earlier refresh and is served; only a refresh that began before the
+  change still refuses to publish its older view. The appliance call budget is
+  unchanged: no extra or concurrent appliance reads (#1113, #1121).
 - Fixed bay tiles and the Rename button announcing names that differ from
   what they show: a bay is now named by its visible number, disk, pool and
   heat value, then its health. Disk Path facts are proper term and value
