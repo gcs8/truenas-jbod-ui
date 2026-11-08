@@ -38,6 +38,49 @@ test("every interactive control in the UI sources has an inventory entry", () =>
   expect(report.stale, "qa/ui-states.json names controls that no longer exist in the sources; remove them").toEqual([]);
 });
 
+// A synthetic page with one instance of each defect shape the checks exist
+// for, modelled on #1102 and #1103. Every check must report its case.
+const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
+  body { margin: 0; font: 14px sans-serif; background: #111; color: #ddd; }
+  .head { display: flex; width: 600px; } .head h2 { flex: 0 1 24px; min-width: 0; margin: 0; font-size: 22px; overflow-wrap: anywhere; }
+  .head .controls { flex: 1 0 540px; }
+  .row { display: grid; grid-template-columns: 200px 90px 220px 200px; width: 900px; gap: 8px; }
+  .card { border: 1px solid #555; } .card dl { display: grid; grid-template-columns: 38px 1fr; margin: 0; }
+  .card dt { overflow-wrap: anywhere; } .empty-col { grid-column: 4; }
+  .wide { width: 2400px; height: 4px; }
+  .over { position: relative; height: 40px; } .over button { position: absolute; top: 0; width: 120px; }
+  .over button + button { left: 60px; }
+  .trunc { display: block; width: 80px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .slot-tile { display: inline-block; width: 90px; height: 60px; position: relative; background: #11161a; }
+  .slot-tile span { display: block; color: rgb(149, 163, 179); }
+</style></head><body>
+  <div class="head"><h2 id="title">Demo Enclosure Title</h2><div class="controls"><button>Heat Map</button></div></div>
+  <div class="row"><div class="card">HBA</div><div class="card"><dl><dt>Remote</dt><dd>01</dd><dt>Handle</dt><dd>0043</dd></dl></div><div class="card empty-col">EXPANDER</div></div>
+  <div class="wide"></div>
+  <div class="over"><button>First</button><button>Second</button></div>
+  <span class="trunc">A long truncated label without a tooltip</span>
+  <select id="heatmap-metric-select"><option selected>Temperature</option></select>
+  <button class="slot-tile heatmap-active" style="--heatmap-rgb: 210, 74, 74; --heatmap-alpha: 0.75"><span class="slot-heatmap-value">37 C</span><span>pool-a</span></button>
+  <button class="slot-tile heatmap-active" style="--heatmap-rgb: 47, 110, 187; --heatmap-alpha: 0.5"><span class="slot-heatmap-value">36 C</span><span>pool-a</span></button>
+</body></html>`;
+
+test("the layout and heat-map checks report each synthetic defect shape", async ({ page }) => {
+  await page.route("**/*", (route) => route.fulfill({ contentType: "text/html; charset=utf-8", body: DEFECTS_HTML }));
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  await page.goto("https://defects.synthetic.invalid/");
+  const { pageChecks } = require("./ui-crawl/checks");
+  const result = await page.evaluate(pageChecks, {});
+  const types = new Set(result.findings.map((finding) => finding.type));
+  for (const type of [
+    "text-narrow-wrap", "text-mid-word-break", "empty-track-squeeze", "page-horizontal-overflow", "control-overlap",
+    "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast",
+  ]) {
+    expect(types.has(type), `${type} not reported: ${JSON.stringify(result.findings.map((f) => [f.type, f.selector]))}`).toBe(true);
+  }
+  const midWord = result.findings.find((finding) => finding.type === "text-mid-word-break");
+  expect(midWord.detail.word).toMatch(/Remote|Handle/);
+});
+
 test("the crawler's layout, heat-map and contrast checks pass on the synthetic fixtures", async ({ browser }, testInfo) => {
   test.setTimeout(12 * 60_000);
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-coverage-"));

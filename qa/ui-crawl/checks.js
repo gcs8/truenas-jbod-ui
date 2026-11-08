@@ -117,15 +117,16 @@ function pageChecks(options) {
       rects = rects.concat(Array.from(range.getClientRects()));
     }
     const lines = lineTops(rects);
-    const s = style(element);
-    const breakAll = /break-all|anywhere/.test(`${s.wordBreak} ${s.overflowWrap}`);
     if (lines >= opts.narrowLines && text.length >= 6 && text.length / lines < opts.narrowCharsPerLine) {
       push("text-narrow-wrap", "error", element, { lines, chars: text.length, charsPerLine: Number((text.length / lines).toFixed(1)) });
       squeezed.push(element);
       continue;
     }
-    if (lines < 2 || breakAll) continue;
+    if (lines < 2) continue;
     // A dictionary-like word rendered on two lines was broken inside the word.
+    // This applies even under overflow-wrap:anywhere or word-break:break-all
+    // (that styling is how #1102's labels broke); only words inside a long
+    // token (a path or identifier wider than any label) are exempt.
     for (const node of textNodes) {
       const value = node.textContent;
       const re = /[A-Za-z][a-z]{3,}/g;
@@ -133,6 +134,9 @@ function pageChecks(options) {
       let checked = 0;
       while ((match = re.exec(value)) && checked < 40) {
         checked += 1;
+        const tokenStart = value.lastIndexOf(" ", match.index) + 1;
+        const tokenEnd = value.indexOf(" ", match.index);
+        if ((tokenEnd < 0 ? value.length : tokenEnd) - tokenStart >= 16) continue;
         range.setStart(node, match.index);
         range.setEnd(node, match.index + match[0].length);
         if (lineTops(Array.from(range.getClientRects())) > 1) {
@@ -149,6 +153,7 @@ function pageChecks(options) {
   // ---- empty track beside a squeezed sibling ------------------------------
   const reportedContainers = new Set();
   for (const element of squeezed) {
+    let depth = 0;
     for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
       const s = style(node);
       const isGrid = /grid/.test(s.display);
@@ -168,11 +173,17 @@ function pageChecks(options) {
       }
       gap = Math.max(gap, right - cursor);
       const columnGap = parseFloat(s.columnGap) || 0;
-      if (gap - columnGap >= opts.emptyTrackPx && !reportedContainers.has(node)) {
-        reportedContainers.add(node);
-        push("empty-track-squeeze", "error", node, { emptyPx: Math.round(gap - columnGap), squeezed: describe(element) });
+      if (gap - columnGap >= opts.emptyTrackPx) {
+        if (!reportedContainers.has(node)) {
+          reportedContainers.add(node);
+          push("empty-track-squeeze", "error", node, { emptyPx: Math.round(gap - columnGap), squeezed: describe(element) });
+        }
+        break;
       }
-      break;
+      // No free track here: the squeeze may come from an outer row (a card in
+      // a row of cards), so keep walking a few layout levels up.
+      depth += 1;
+      if (depth >= 5) break;
     }
   }
 
