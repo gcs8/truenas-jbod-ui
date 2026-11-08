@@ -1478,6 +1478,11 @@ class InventoryService:
         self._snapshot_activity: dict[str, int] = {}
         self._snapshot_lru: OrderedDict[str, None] = OrderedDict()
         self._snapshot_invalidated: set[str] = set()
+        # Fences for in-flight builds (#1113): each new invalidation of a key
+        # records the next sequence number; a request fails closed only on an
+        # invalidation newer than the sequence it saw when it began.
+        self._snapshot_invalidation_sequence = 0
+        self._snapshot_invalidated_at: dict[str, int] = {}
         self._snapshot_request_sequence = 0
         self._snapshot_published_sequence: dict[str, int] = {}
         self._snapshot_source_publications: dict[str, SourcePublication] = {}
@@ -1722,6 +1727,7 @@ class InventoryService:
             )
         source_publications: list[SourcePublication] = []
         discovery_detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]] = []
+        discovery_fence: list[int] = []
         source_token = _snapshot_build_source_publications.set(source_publications)
         try:
             cache_key, discovered_snapshot = await self._resolve_snapshot_cache_key(
@@ -1729,10 +1735,16 @@ class InventoryService:
                 force_source_refresh=bool(refresh_sources),
                 request_sequence=request_sequence,
                 detail_commits=discovery_detail_commits,
+                invalidation_fence=discovery_fence,
             )
         finally:
             _snapshot_build_source_publications.reset(source_token)
         topology_generation = self._snapshot_topology_generation
+        # Fail closed only on invalidations made after this request began its
+        # build. A key can stay marked invalid while an older flight or a
+        # cancelled refresh unwinds; that mark alone must not turn a request
+        # admitted after the change into a busy answer (#1113).
+        invalidation_fence = self._snapshot_invalidation_sequence
         observed_snapshot_publication = self._snapshot_published_sequence.get(cache_key, -1)
         self._admit_snapshot_key(cache_key)
         if discovered_snapshot is not None:
@@ -1741,17 +1753,20 @@ class InventoryService:
             cache_state: CacheState = "forced-refresh" if force_refresh else "miss"
             self._begin_snapshot_activity(cache_key)
             try:
+                # The discovery candidate was built before admission, so it is
+                # fenced from the start of the build that produced it.
+                candidate_fence = discovery_fence[0] if discovery_fence else invalidation_fence
                 async with self._get_snapshot_lock(cache_key):
                     if (
                         topology_generation != self._snapshot_topology_generation
-                        or cache_key in self._snapshot_invalidated
+                        or self._snapshot_invalidated_since(cache_key, candidate_fence)
                     ):
                         raise SnapshotStateBusyError()
                     discovery_candidate = discovered_snapshot
 
                     def discovery_publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
-                                and cache_key not in self._snapshot_invalidated
+                                and not self._snapshot_invalidated_since(cache_key, candidate_fence)
                                 and self._snapshot_published_sequence.get(cache_key, -1) <= request_sequence
                                 and self._publication_not_superseded(
                                     request_sequence,
@@ -1776,6 +1791,8 @@ class InventoryService:
                         minimum_source_publication=required_source_publication,
                         build_source_publications=source_publications,
                     )
+                    if published:
+                        self._snapshot_invalidated.discard(cache_key)
             finally:
                 self._finish_snapshot_activity(cache_key)
             if not published:
@@ -1802,11 +1819,6 @@ class InventoryService:
         self._begin_snapshot_activity(cache_key)
         try:
             async with self._get_snapshot_lock(cache_key):
-                if (
-                    topology_generation != self._snapshot_topology_generation
-                    and cache_key in self._snapshot_invalidated
-                ):
-                    raise SnapshotStateBusyError()
                 cached = self._cache.get(cache_key)
                 cache_until = self._cache_until.get(cache_key, datetime.min.replace(tzinfo=timezone.utc))
                 now = utcnow()
@@ -1816,11 +1828,19 @@ class InventoryService:
                     and self._snapshot_meets_source_requirement(cache_key, required_source_publication)
                 ):
                     # Reuse only a publication that meets this waiter's source
-                    # freshness and SG-device invalidation requirements.
+                    # freshness and SG-device invalidation requirements. An
+                    # invalidation drops the cached value, so a value present
+                    # now was published after any invalidation this waiter
+                    # queued behind: serve it rather than answer busy (#1113).
                     self._touch_snapshot_key(cache_key)
                     add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
                     self._observe_inventory_snapshot_request("hit-after-wait")
                     return CacheResult(cached, "hit-after-wait")
+                if (
+                    topology_generation != self._snapshot_topology_generation
+                    and self._snapshot_invalidated_since(cache_key, invalidation_fence)
+                ):
+                    raise SnapshotStateBusyError()
                 if not force_refresh and cached and now < cache_until:
                     self._touch_snapshot_key(cache_key)
                     add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
@@ -1872,7 +1892,7 @@ class InventoryService:
                         and snapshot.selected_enclosure_id == selected_enclosure_id
                         and self._snapshot_has_trusted_topology(snapshot)
                         and topology_generation == self._snapshot_topology_generation
-                        and cache_key not in self._snapshot_invalidated
+                        and not self._snapshot_invalidated_since(cache_key, invalidation_fence)
                         and request_sequence < self._canonical_options_request_sequence
                         and self._canonical_options_background_refresh
                         and current_bundle is not None and source_publications
@@ -1886,7 +1906,7 @@ class InventoryService:
                         continue
                     break
                 topology_changed = topology_generation != self._snapshot_topology_generation
-                if topology_changed and cache_key in self._snapshot_invalidated:
+                if topology_changed and self._snapshot_invalidated_since(cache_key, invalidation_fence):
                     raise SnapshotStateBusyError()
                 self._observe_inventory_snapshot_build(
                     trigger=refresh_trigger,
@@ -1922,7 +1942,7 @@ class InventoryService:
                             default_selection=True,
                             source_publications=source_publications,
                         )
-                    self._snapshot_invalidated.add(cache_key)
+                    self._mark_snapshot_invalidated(cache_key, fence=True)
                     raise UnknownEnclosureError()
                 publication_key = snapshot.selected_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
             # A default refresh can discover a different publication key. Release
@@ -1957,16 +1977,16 @@ class InventoryService:
                     publication_topology_changed = topology_generation != self._snapshot_topology_generation
                     if (
                         publication_topology_changed
-                        or cache_key in self._snapshot_invalidated
-                        or publication_key in self._snapshot_invalidated
+                        or self._snapshot_invalidated_since(cache_key, invalidation_fence)
+                        or self._snapshot_invalidated_since(publication_key, invalidation_fence)
                     ):
                         raise SnapshotStateBusyError()
                     candidate = snapshot
 
                     def publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
-                                and cache_key not in self._snapshot_invalidated
-                                and publication_key not in self._snapshot_invalidated
+                                and not self._snapshot_invalidated_since(cache_key, invalidation_fence)
+                                and not self._snapshot_invalidated_since(publication_key, invalidation_fence)
                                 and self._snapshot_published_sequence.get(publication_key, -1) <= request_sequence
                                 and self._publication_not_superseded(
                                     request_sequence,
@@ -1993,6 +2013,9 @@ class InventoryService:
                         explicit_selection=selected_enclosure_id is not None,
                     )
                     if published:
+                        # This build began after every invalidation it passed,
+                        # so its value is current: keep it through cleanup.
+                        self._snapshot_invalidated.discard(publication_key)
                         self._replace_canonical_options_from_trusted_snapshot(
                             snapshot,
                             request_sequence=request_sequence,
@@ -2025,6 +2048,24 @@ class InventoryService:
     def _snapshot_key_is_active(self, cache_key: str) -> bool:
         task = self._snapshot_refresh_tasks.get(cache_key)
         return bool(self._snapshot_activity.get(cache_key) or (task is not None and not task.done()))
+
+    def _mark_snapshot_invalidated(self, cache_key: str, *, fence: bool) -> None:
+        """Mark a key's state invalid until idle; with ``fence``, also fence in-flight builds.
+
+        The mark drops the key's state once nothing is using it. Only a new
+        invalidation (a mutation, a retirement or a rejected selection) fences
+        builds, by recording a sequence number that every request which began
+        before it fails closed on. A cleanup pass that re-marks a key while
+        another request is active is not a new change, so it must not fence a
+        request that began after the change (#1113).
+        """
+        self._snapshot_invalidated.add(cache_key)
+        if fence:
+            self._snapshot_invalidation_sequence += 1
+            self._snapshot_invalidated_at[cache_key] = self._snapshot_invalidation_sequence
+
+    def _snapshot_invalidated_since(self, cache_key: str, fence: int) -> bool:
+        return self._snapshot_invalidated_at.get(cache_key, -1) > fence
 
     def _begin_snapshot_activity(self, cache_key: str) -> None:
         self._snapshot_activity[cache_key] = self._snapshot_activity.get(cache_key, 0) + 1
@@ -2226,10 +2267,12 @@ class InventoryService:
                 self._led_slot_targets[(scope_key, slot_view.slot)] = slot_view.model_copy(deep=True)
 
     def _remove_snapshot_state_key(self, cache_key: str, *, cancel_task: bool = False) -> bool:
+        # Callers that cancel a refresh are invalidations and fence in-flight
+        # builds; the others are cleanup of a change already recorded (#1113).
         if self._snapshot_activity.get(cache_key):
             self._cache.pop(cache_key, None)
             self._cache_until.pop(cache_key, None)
-            self._snapshot_invalidated.add(cache_key)
+            self._mark_snapshot_invalidated(cache_key, fence=cancel_task)
             return False
         task = self._snapshot_refresh_tasks.get(cache_key)
         if task is not None and not task.done():
@@ -2238,12 +2281,15 @@ class InventoryService:
             self._cache.pop(cache_key, None)
             self._cache_until.pop(cache_key, None)
             task.cancel()
-            self._snapshot_invalidated.add(cache_key)
+            self._mark_snapshot_invalidated(cache_key, fence=True)
 
             def _finish_invalidation(completed: asyncio.Task[None], *, key: str = cache_key) -> None:
                 if self._snapshot_refresh_tasks.get(key) is completed:
                     self._snapshot_refresh_tasks.pop(key, None)
-                self._remove_snapshot_state_key(key)
+                # A request that began after this invalidation may already have
+                # published a current value; never drop it here (#1113).
+                if key in self._snapshot_invalidated or key not in self._cache:
+                    self._remove_snapshot_state_key(key)
 
             task.add_done_callback(_finish_invalidation)
             return False
@@ -2256,6 +2302,8 @@ class InventoryService:
         self._snapshot_published_sequence.pop(cache_key, None)
         self._snapshot_source_publications.pop(cache_key, None)
         self._snapshot_invalidated.discard(cache_key)
+        # Idle: no request that saw this key's fence is still in flight.
+        self._snapshot_invalidated_at.pop(cache_key, None)
         return True
 
     def _admit_snapshot_key(self, cache_key: str) -> None:
@@ -2287,6 +2335,7 @@ class InventoryService:
         force_source_refresh: bool,
         request_sequence: int,
         detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]],
+        invalidation_fence: list[int] | None = None,
     ) -> tuple[str, InventorySnapshot | None]:
         self._learn_canonical_options_from_cache()
         options = self._canonical_enclosure_options
@@ -2296,6 +2345,9 @@ class InventoryService:
                 options = self._canonical_enclosure_options
                 while options is None:
                     generation = self._snapshot_topology_generation
+                    if invalidation_fence is not None:
+                        # The candidate is fenced from the start of its own build.
+                        invalidation_fence[:] = [self._snapshot_invalidation_sequence]
                     # Each retry replaces the rejected candidate's side effects.
                     # Backfill remains local to the build; observation and writes
                     # wait for the same candidate's authoritative publication.
