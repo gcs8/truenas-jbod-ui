@@ -262,7 +262,7 @@
     },
     {
       "id": "main.disk-sync", "page": "main", "safety": "forbidden", "confirm_preview": true,
-      "requires": "#disk-inventory-sync-controls:not(.hidden)",
+      "requires": "#disk-inventory-sync-multipath-button",
       "reason": "Runs a disk sync on the appliance.",
       "steps": [{"click": "#disk-inventory-sync-multipath-button"}],
       "covers": ["#disk-inventory-sync-multipath-button", "#disk-inventory-sync-full-button"]
@@ -483,6 +483,8 @@
     {"state": "main.heatmap*", "type": "text-narrow-wrap", "selector": "#enclosure-panel-title", "issue": 1102},
     {"state": "fabric.disk*", "type": "text-mid-word-break", "issue": 1102},
     {"state": "fabric.disk*", "type": "empty-track-squeeze", "issue": 1102},
+    {"state": "fabric.disk*", "type": "text-narrow-wrap", "issue": 1102},
+    {"state": "main.*", "type": "text-mid-word-break", "selector": "#enclosure-panel-title", "issue": 1102},
     {"state": "main.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
     {"state": "offline.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
     {"state": "main.heatmap*", "type": "heat-alarm-healthy-temp", "issue": 1103},

@@ -242,7 +242,7 @@ class Crawler {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
       record.readyMs = readyMs;
-      if (state.requires && !(await this.page.locator(state.requires).count())) {
+      if (state.requires && !(await this.page.locator(state.requires).filter({ visible: true }).count())) {
         record.status = "not-applicable";
         record.reason = `requires ${state.requires}`;
       } else {
