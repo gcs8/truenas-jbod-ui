@@ -100,4 +100,32 @@ ${sections.join("\n")}
 </body></html>`;
 }
 
-module.exports = { writeReport, summarize, allFindings, renderHtml };
+// Merge several crawl directories (one per browser connection) under outDir.
+function mergeReports(outDir, runDirs) {
+  const merged = { records: [], actuations: [], guardLog: [], stats: { blocked: [], writes: [], routeErrors: [] }, runs: [] };
+  for (const dir of runDirs) {
+    const doc = JSON.parse(fs.readFileSync(path.join(dir, "findings.json"), "utf8"));
+    const prefix = path.relative(outDir, dir);
+    const fix = (file) => (file ? path.join(prefix, file) : file);
+    for (const record of doc.records) {
+      for (const width of record.widths) {
+        width.full = fix(width.full);
+        for (const tile of width.tiles || []) tile.file = fix(tile.file);
+      }
+      record.downloads = (record.downloads || []).map(fix);
+      merged.records.push(record);
+    }
+    merged.actuations.push(...doc.actuations);
+    merged.guardLog.push(...(doc.guard || []));
+    for (const key of Object.keys(merged.stats)) merged.stats[key].push(...((doc.stats || {})[key] || []));
+    merged.runs.push({ dir: prefix, meta: doc.meta, summary: doc.summary });
+  }
+  const starts = merged.runs.map((run) => run.meta.started).filter(Boolean).sort();
+  const ends = merged.runs.map((run) => run.meta.finished).filter(Boolean).sort();
+  return writeReport(outDir, {
+    meta: { mode: "merged", label: `${merged.runs.length} runs`, started: starts[0] || "", finished: ends[ends.length - 1] || "", widths: [...new Set(merged.runs.flatMap((run) => run.meta.widths || []))], runs: merged.runs.map((run) => ({ dir: run.dir, meta: run.meta })) },
+    records: merged.records, actuations: merged.actuations, guardLog: merged.guardLog, stats: merged.stats,
+  });
+}
+
+module.exports = { writeReport, summarize, allFindings, renderHtml, mergeReports };

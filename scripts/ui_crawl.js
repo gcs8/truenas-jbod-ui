@@ -18,7 +18,7 @@ const { loadInventory, validateInventory, expandStates, selectStates } = require
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
 const { Crawler } = require("../qa/ui-crawl/crawler");
-const { writeReport } = require("../qa/ui-crawl/report");
+const { writeReport, mergeReports } = require("../qa/ui-crawl/report");
 
 const FIXTURE_ORIGINS = {
   ui: "https://ui.synthetic.invalid",
@@ -56,9 +56,11 @@ function parseArgs(argv) {
     else if (flag === "--label") args.label = next();
     else if (flag === "--appliance-load") args.applianceLoad = true;
     else if (flag === "--scopes") args.scopes = next();
+    else if (flag === "--merge") args.merge = next().split(",");
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!args.out) throw new Error("--out is required");
+  if (args.merge) return args;
   if (!args.fixture && !args.ui) throw new Error("give --fixture or --ui");
   if (args.allow.includes("forbidden")) throw new Error("forbidden states are never actuated");
   for (const cls of args.allow) if (!["app-write-revert", "led"].includes(cls)) throw new Error(`unknown class ${cls}`);
@@ -138,6 +140,10 @@ function statesFor(target, states, args, used) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.merge) {
+    console.log(JSON.stringify(mergeReports(path.resolve(args.out), args.merge.map((dir) => path.resolve(dir))), null, 1));
+    return 0;
+  }
   const inventory = loadInventory();
   const problems = validateInventory(inventory);
   if (problems.length) throw new Error(`inventory invalid:\n${problems.join("\n")}`);

@@ -74,6 +74,8 @@ class Crawler {
       if (message.type() !== "error") return;
       // In fixture mode a missing synthetic answer is a fixture gap, not a product error.
       if (this.fixtureMode && /Failed to load resource: the server responded with a status of 404/.test(message.text())) return;
+      // Requests the guard aborted are recorded by the guard, not as console errors.
+      if (/net::ERR_BLOCKED_BY_CLIENT/.test(message.text())) return;
       push("console-error", "error", message.text());
     });
     page.on("pageerror", (error) => push("page-error", "error", error.message));
@@ -185,11 +187,17 @@ class Crawler {
     }));
   }
 
+  // One driver per page: it owns the page's dialog and response listeners,
+  // which must not accumulate across states.
   newDriver(target) {
-    return new CrawlDriver({
-      page: this.page, guard: this.guard, selections: this.inventory.selections, ready: READY[target.ready] && ((page) => READY[target.ready](page, this.readyTimeoutMs)),
-      downloadDir: this.downloadDir, log: this.log,
-    });
+    if (!this.driver || this.driver.page !== this.page) {
+      this.driver = new CrawlDriver({ page: this.page, guard: this.guard, selections: this.inventory.selections, downloadDir: this.downloadDir, log: this.log });
+    }
+    this.driver.ready = READY[target.ready] && ((page) => READY[target.ready](page, this.readyTimeoutMs));
+    this.driver.resetState();
+    this.driver.downloads = [];
+    this.driver.dialogTexts = [];
+    return this.driver;
   }
 
   async load(target) {

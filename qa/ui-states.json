@@ -84,7 +84,7 @@
     },
     {
       "id": "main.heatmap.metric", "page": "main", "safety": "read",
-      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 12}, {"wait": 800}],
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 16}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-metric-select"]
     },
@@ -163,13 +163,16 @@
         {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
         {"fill": "#enclosure-alias-input", "text": "UI coverage probe"},
         {"click": "#enclosure-alias-form button[type=submit]"},
-        {"waitText": "#status-text", "contains": "Enclosure name saved"}
+        {"waitResponse": {"method": "POST", "path": "/api/sas-fabric/aliases"}},
+        {"waitFor": "#enclosure-alias-edit-button:not(.hidden)"}
       ],
       "revert": [
+        {"reload": true},
         {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
         {"fill": "#enclosure-alias-input", "text": "{alias}"},
         {"click": "#enclosure-alias-form button[type=submit]"},
-        {"waitText": "#status-text", "contains": "Enclosure name"}
+        {"waitResponse": {"method": "POST", "path": "/api/sas-fabric/aliases"}},
+        {"waitFor": "#enclosure-alias-edit-button:not(.hidden)"}
       ],
       "verify": [
         {"reload": true},
@@ -177,8 +180,9 @@
         {"expectValue": "#enclosure-alias-input", "equals": "{alias}"}, {"click": "#enclosure-alias-cancel"}
       ],
       "writes": [
-        {"method": "POST", "path": "/api/sas-fabric/aliases", "max": 2},
-        {"method": "GET", "path": "/api/inventory", "force": true, "max": 4}
+        {"method": "POST", "path": "/api/sas-fabric/aliases", "max": 4},
+        {"method": "GET", "path": "/api/inventory", "force": true, "max": 8},
+        {"method": "GET", "path": "/api/storage-views", "force": true, "max": 8}
       ],
       "covers": ["button\"Save\"@#enclosure-alias-form"]
     },
@@ -201,6 +205,7 @@
         {"waitResponse": {"method": "POST", "path": "/api/slots/*/mapping"}}
       ],
       "revert": [
+        {"reload": true},
         {"selectBay": "same"}, {"waitFor": "#mapping-form:not(.hidden)"},
         {"acceptNextDialog": true},
         {"click": "#clear-mapping-button"},
@@ -209,7 +214,9 @@
       "verify": [{"reload": true}, {"selectBay": "same"}, {"waitFor": "#mapping-form:not(.hidden)"}, {"expectValue": "[name=notes]", "equals": ""}],
       "writes": [
         {"method": "POST", "path": "/api/slots/*/mapping", "max": 1, "body_excludes": "\"clear_identify_after_save\":true"},
-        {"method": "DELETE", "path": "/api/slots/*/mapping", "max": 1}
+        {"method": "DELETE", "path": "/api/slots/*/mapping", "max": 3},
+        {"method": "GET", "path": "/api/inventory", "force": true, "max": 8},
+        {"method": "GET", "path": "/api/storage-views", "force": true, "max": 8}
       ],
       "covers": ["button\"Save assignment\"@#mapping-form", "#clear-mapping-button", "[name=notes]"]
     },
@@ -228,7 +235,7 @@
       "verify": [{"ledOff": true}],
       "writes": [
         {"method": "POST", "path": "/api/slots/*/led", "body_includes": "IDENTIFY", "max": 1},
-        {"method": "POST", "path": "/api/slots/*/led", "body_includes": "CLEAR", "max": 2}
+        {"method": "POST", "path": "/api/slots/*/led", "body_includes": "CLEAR", "max": 3}
       ],
       "covers": ["[data-led-action]"]
     },

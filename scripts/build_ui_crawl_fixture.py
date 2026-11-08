@@ -39,8 +39,21 @@ def _dump(model) -> object:
     return model.model_dump(mode="json") if hasattr(model, "model_dump") else model
 
 
-def render_main(bundle, *, history_configured: bool = True) -> str:
+WRITE_POLICY = {"enabled": True, "mode": "network", "reason": "", "public_origin": None}
+
+
+def live_snapshot(bundle):
+    """The demo snapshot as a live system: locate lights work (synthetic answers)."""
     snapshot = bundle.primary_snapshot
+    slots = [
+        slot.model_copy(update={"led_supported": True, "mapping_revision": f"synthetic-{slot.slot}", "mapping_clear_revision": f"synthetic-{slot.slot}"})
+        for slot in snapshot.slots
+    ]
+    return snapshot.model_copy(update={"slots": slots})
+
+
+def render_main(bundle, *, history_configured: bool = True) -> str:
+    snapshot = live_snapshot(bundle)
     runtime = bundle.storage_view_runtime
     context = {
         "request": build_fixture_request(),
@@ -68,6 +81,7 @@ def render_main(bundle, *, history_configured: bool = True) -> str:
         "initial_history_panel_open_json": "false",
         "initial_history_io_chart_mode_json": '"total"',
         "admin_launch_url": None,
+        "write_policy_json": json.dumps(WRITE_POLICY),
     }
     return TEMPLATES.env.get_template("index.html").render(context)
 
@@ -81,7 +95,7 @@ def render_fabric(bundle) -> str:
         "systemId": snapshot.selected_system_id,
         "enclosureId": snapshot.selected_enclosure_id,
         "appVersion": __version__,
-        "writePolicy": None,
+        "writePolicy": WRITE_POLICY,
     }
     context = {
         "request": build_fixture_request(),
@@ -205,7 +219,7 @@ async def build() -> dict:
         window_hours=fixture.history_window_hours,
     )
     api = {
-        "ui:/api/inventory": _dump(snapshot),
+        "ui:/api/inventory": _dump(live_snapshot(bundle)),
         "ui:/api/storage-views": _dump(bundle.storage_view_runtime),
         "ui:/api/sas-fabric": _dump(bundle.sas_fabric),
         "ui:/api/history/status": await history.get_status(),
@@ -214,6 +228,7 @@ async def build() -> dict:
         "history:/healthz": {"status": "ok"},
         "admin:/api/admin/state": ADMIN_BOOTSTRAP,
         "admin:/api/admin/backups": {"available": True, "classes": {}, "targets": [], "artifacts": []},
+        "admin:/api/admin/backups/policy": {"policies": {}, "targets": []},
         "admin:/api/admin/ssh-keys": {"keys": []},
         "admin:/api/admin/history/orphaned": {"orphaned_systems": []},
         "admin:/api/admin/storage-views/live-enclosures": {"enclosures": []},

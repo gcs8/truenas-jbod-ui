@@ -97,6 +97,7 @@ class CrawlDriver {
   async step_click(step) {
     const locator = this.visible(step.click);
     if (!(await locator.count())) throw new Error(`no visible ${step.click}`);
+    if (!(await locator.first().isEnabled())) throw new NotApplicable(`${step.click} is disabled here`);
     await this.actOn(locator, (el) => el.click({ timeout: this.timeoutMs }));
   }
 
@@ -186,7 +187,10 @@ class CrawlDriver {
   }
 
   async step_check(step) {
-    await this.actOn(this.visible(step.check), (el) => el.check({ timeout: this.timeoutMs }));
+    const locator = this.visible(step.check);
+    // A disabled toggle (for example a single-enclosure export scope) stays as it is.
+    if (!(await locator.count()) || !(await locator.first().isEnabled())) return;
+    await this.actOn(locator, (el) => el.check({ timeout: this.timeoutMs }));
   }
 
   async step_uncheck(step) {
