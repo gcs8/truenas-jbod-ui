@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -145,6 +146,7 @@ class RefreshDeadlineTests(unittest.IsolatedAsyncioTestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.registry = registry
         self.application = app_main.create_app()
         self.addAsyncCleanup(self.settle)
         # The page has loaded once: the shelf's snapshot and sources are cached.
@@ -448,6 +450,159 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         self.assertEqual(self.service._snapshot_published_sequence[SHELF], published_before)
         # The refresh's own source read only.
         self.assertEqual(self.appliance.reads, 2)
+        self.assert_budget_respected()
+
+    async def test_abandoned_refresh_cannot_commit_late_slot_details_from_a_worker_thread(self) -> None:
+        # The refresh reads a new disk, and its slot-detail save runs in a
+        # real worker thread that is held there until after the deadline.
+        store = self.service.slot_detail_store
+        rows_before = store.load_all()
+        cached_before = self.service._cache[SHELF]
+        plain_bundle = self.appliance.bundle
+
+        def bundle_with_a_new_disk(*, late: bool = False) -> inventory_module.InventorySourceBundle:
+            bundle = plain_bundle(late=late)
+            bundle.raw_data.disks = [
+                {"name": "da0", "serial": "SANITIZED-LATE-DISK", "model": "Synthetic model", "size": 1000000000},
+            ]
+            return bundle
+
+        self.appliance.bundle = bundle_with_a_new_disk
+        save_entries = store.save_entries
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        guard_results: list[bool] = []
+
+        def held_save(entries, *, expected_entries=None, commit_guard=None):
+            entered.set()
+            if not release.wait(8):
+                raise AssertionError("the held save was never released")
+            assert commit_guard is not None
+            with commit_guard() as valid:
+                guard_results.append(valid)
+            return save_entries(entries, expected_entries=expected_entries, commit_guard=commit_guard)
+
+        store.save_entries = held_save
+        self.addCleanup(setattr, store, "save_entries", save_entries)
+        with self.assertLogs(inventory_module.logger, "WARNING"):
+            self.service._schedule_background_snapshot_refresh(SHELF)
+            refresh = self.service._snapshot_refresh_tasks[SHELF]
+            await wait_for_condition(entered.is_set, timeout=ANSWER_CEILING_SECONDS)
+            # The deadline passes while the thread is still saving.
+            await wait_for_condition(
+                lambda: SHELF not in self.service._snapshot_refresh_tasks,
+                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+        self.assertFalse(refresh.done(), "the save thread should still be held")
+
+        release.set()
+        await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), timeout=ANSWER_CEILING_SECONDS)
+        # The commit itself refuses, in the worker thread, after the deadline.
+        self.assertEqual(guard_results, [False])
+        self.assertEqual(store.load_all(), rows_before, "an abandoned refresh saved slot details late")
+        self.assertTrue(self.service._cache[SHELF] is cached_before, "the abandoned refresh was published")
+        self.assertFalse(self.service._background_refresh_workers)
+        self.assertFalse(self.service._snapshot_activity)
+
+
+class StartupPrewarmTests(RefreshDeadlineTests):
+    """Opt-in startup prewarming is background work under the same rules."""
+
+    def cold_service(self) -> inventory_module.InventoryService:
+        # As just after startup: nothing has been read or cached yet.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.service = build_service(directory.name, self.appliance)
+        self.registry.get_service.return_value = self.service
+        return self.service
+
+    async def test_cold_requests_during_a_hung_prewarm_answer_within_the_wait_bound(self) -> None:
+        service = self.cold_service()
+        self.appliance.hang_next = True
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            warm = asyncio.create_task(service.prewarm_cache())
+            await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+            requests = [
+                call_app(
+                    self.application, "GET", "/" if index % 2 else "/api/inventory",
+                    query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
+                )
+                for index in range(24)
+            ]
+            responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=ANSWER_CEILING_SECONDS)
+
+        for status, headers, content in responses:
+            # No snapshot exists yet, so each says so and asks for a retry.
+            self.assertEqual(status, 503, content[:300])
+            self.assertEqual(headers.get("retry-after"), "2")
+            self.assertIn("first inventory read is still running", json.loads(content)["detail"])
+        # Only the prewarm's call reached the appliance.
+        self.assertEqual(self.appliance.reads, 2)
+        self.assert_budget_respected()
+
+        # Once the appliance answers, the prewarm finishes and publishes.
+        self.appliance.answer.set()
+        await asyncio.wait_for(warm, timeout=ANSWER_CEILING_SECONDS)
+        self.assertIn(SHELF, service._cache)
+        self.assertFalse(service._background_refresh_workers)
+        self.assertEqual(self.appliance.limiter.active, 0)
+
+    async def test_prewarm_publishes_then_warms_smart_outside_its_deadline(self) -> None:
+        service = self.cold_service()
+        smart = Mock()
+
+        async def warm_smart(slots, *, selected_enclosure_id=None):
+            # SMART warming is ordinary work, not part of the supervised prewarm.
+            smart(sorted(slots), selected_enclosure_id, bool(service._background_refresh_workers))
+            return []
+
+        with patch.object(service, "get_slot_smart_summaries", new=warm_smart):
+            await asyncio.wait_for(service.prewarm_cache(warm_smart=True), timeout=ANSWER_CEILING_SECONDS)
+        self.assertIn(SHELF, service._cache)
+        self.assertTrue(smart.called)
+        warmed_enclosures = {call.args[1] for call in smart.call_args_list}
+        self.assertIn(SHELF, warmed_enclosures)
+        for call in smart.call_args_list:
+            self.assertTrue(call.args[0], "a warmed enclosure had no bays")
+            self.assertFalse(call.args[2], "SMART warming ran inside the supervised prewarm")
+
+    async def test_prewarm_past_its_deadline_is_abandoned_and_never_publishes(self) -> None:
+        service = self.cold_service()
+        # The prewarm's read cannot stop once started and finishes late.
+        self.appliance.ignore_cancellation = True
+        self.appliance.hang_next = True
+        with self.assertLogs(inventory_module.logger, "WARNING") as logs:
+            warm = asyncio.create_task(service.prewarm_cache())
+            await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+            await wait_for_condition(
+                lambda: service._background_refresh_abandoned_at is not None,
+                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+        self.assertTrue(any("did not finish" in line for line in logs.output), logs.output)
+        self.assertFalse(warm.done(), "the prewarm's read should still be running")
+
+        # A request while the abandoned prewarm still runs is still bounded.
+        status, headers, content = await asyncio.wait_for(
+            call_app(self.application, "GET", "/api/inventory", query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}"),
+            timeout=ANSWER_CEILING_SECONDS,
+        )
+        self.assertEqual(status, 503, content[:300])
+        self.assertIn("retry-after", headers)
+
+        # The read answers late. The prewarm ends quietly and publishes nothing.
+        self.appliance.answer.set()
+        self.assertIsNone(await asyncio.wait_for(warm, timeout=ANSWER_CEILING_SECONDS))
+        self.assertFalse(service._cache)
+        self.assertIsNone(service._source_bundle)
+        self.assertFalse(service._background_refresh_workers)
+        self.assertEqual(self.appliance.limiter.active, 0)
+
+        # The next read is the first to publish.
+        snapshot = await asyncio.wait_for(
+            service.get_snapshot(selected_enclosure_id=SHELF), timeout=ANSWER_CEILING_SECONDS,
+        )
+        self.assertNotIn(LATE_MARKER, snapshot.warnings)
+        self.assertEqual(self.appliance.reads, 3)
         self.assert_budget_respected()
 
 

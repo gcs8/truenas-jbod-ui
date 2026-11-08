@@ -1168,8 +1168,15 @@ class SupersededSnapshotRefreshError(SnapshotStateBusyError):
 class SnapshotRefreshWaitTimeout(SnapshotStateBusyError):
     """A user request waited its full bound on a background refresh (#1125)."""
 
-    def __init__(self) -> None:
-        Exception.__init__(self, "The inventory is still refreshing. Try again in a moment.")
+    def __init__(self, *, first_read: bool = False) -> None:
+        Exception.__init__(
+            self,
+            # Before anything has been read, as while startup prewarming runs.
+            "No inventory snapshot is available yet: the first inventory read is still running. "
+            "Try again in a moment."
+            if first_read
+            else "The inventory is still refreshing. Try again in a moment.",
+        )
 
 
 class SystemRetentionBusyError(Exception):
@@ -1251,9 +1258,17 @@ _snapshot_wait_budget: ContextVar[_SnapshotWaitBudget | None] = ContextVar(
 )
 
 
-def _background_refresh_abandoned() -> bool:
-    ticket = _background_refresh_ticket.get()
+def _ticket_abandoned(ticket: _BackgroundRefreshTicket | None) -> bool:
     return ticket is not None and ticket.abandoned
+
+
+def _background_refresh_abandoned() -> bool:
+    """True in an abandoned refresh's own context, on the event loop.
+
+    A worker thread does not see the ContextVar, so a check that can run in
+    one captures the ticket on the loop and calls `_ticket_abandoned` (#1125).
+    """
+    return _ticket_abandoned(_background_refresh_ticket.get())
 
 
 def _in_background_refresh() -> bool:
@@ -1851,7 +1866,7 @@ class InventoryService:
                 await lock.acquire()
         except TimeoutError:
             logger.debug("A request stopped waiting for a running background inventory refresh.")
-            raise SnapshotRefreshWaitTimeout() from None
+            raise SnapshotRefreshWaitTimeout(first_read=self._source_bundle is None and not self._cache) from None
         finally:
             budget.waited += loop.time() - started
         try:
@@ -1869,6 +1884,9 @@ class InventoryService:
     ) -> CacheResult[InventorySnapshot]:
         self._snapshot_request_sequence += 1
         request_sequence = self._snapshot_request_sequence
+        # Captured here, on the loop: the publication checks below also run in
+        # the slot-detail save's worker thread, which cannot see it (#1125).
+        refresh_ticket = _background_refresh_ticket.get()
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
         observed_source_publication = SourcePublication(
             sequence=self._source_bundle_published_sequence,
@@ -1921,7 +1939,7 @@ class InventoryService:
 
                     def discovery_publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
-                                and not _background_refresh_abandoned()
+                                and not _ticket_abandoned(refresh_ticket)
                                 and not self._snapshot_invalidated_since(cache_key, candidate_fence)
                                 and self._snapshot_published_sequence.get(cache_key, -1) <= request_sequence
                                 and self._publication_not_superseded(
@@ -2145,7 +2163,7 @@ class InventoryService:
 
                     def publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
-                                and not _background_refresh_abandoned()
+                                and not _ticket_abandoned(refresh_ticket)
                                 and not self._snapshot_invalidated_since(cache_key, invalidation_fence)
                                 and not self._snapshot_invalidated_since(publication_key, invalidation_fence)
                                 and self._snapshot_published_sequence.get(publication_key, -1) <= request_sequence
@@ -4341,6 +4359,41 @@ class InventoryService:
         return max(self._cache.values(), key=lambda snapshot: snapshot.last_updated)
 
     async def prewarm_cache(self, *, warm_smart: bool = False) -> None:
+        """Read the inventory once at startup, as supervised background work (#1125).
+
+        The snapshot reads run under the background refresh deadline, so a
+        request queued behind them waits only its bounded time and is told that
+        no inventory has been read yet. A prewarm past its deadline is abandoned
+        like any background refresh and never publishes. Optional SMART warming
+        runs afterwards as ordinary reads.
+        """
+        task = self._start_background_refresh(
+            "startup prewarm", self._prewarm_snapshots(), unregister=lambda _abandoned: None,
+        )
+        try:
+            warmed = await task
+        except (asyncio.CancelledError, SnapshotStateBusyError):
+            current = asyncio.current_task()
+            if not _ticket_abandoned(task.get_context().get(_background_refresh_ticket)) or (
+                current is not None and current.cancelling()
+            ):
+                raise
+            # Already reported when it was abandoned; requests read on demand.
+            logger.info("Discarded the late result of the abandoned startup inventory prewarm for system %s.",
+                        self.system.id)
+            return
+        if not warm_smart:
+            return
+        for enclosure_id, slots in warmed:
+            try:
+                await self.get_slot_smart_summaries(slots, selected_enclosure_id=enclosure_id)
+            except SnapshotStateBusyError:
+                # A refresh is running; SMART warming is optional (#1125).
+                logger.info("Skipped startup SMART warming for system %s while its inventory refreshes.",
+                            self.system.id)
+
+    async def _prewarm_snapshots(self) -> list[tuple[str | None, list[int]]]:
+        """Warm the default and every enclosure's snapshot; return each one's bays."""
         snapshot = await self.get_snapshot(force_refresh=True)
         enclosure_ids: list[str | None] = [None]
         seen_enclosures: set[str] = set()
@@ -4350,15 +4403,14 @@ class InventoryService:
             seen_enclosures.add(enclosure.id)
             enclosure_ids.append(enclosure.id)
 
+        warmed: list[tuple[str | None, list[int]]] = []
         for enclosure_id in enclosure_ids:
             warmed_snapshot = await self.get_snapshot(
                 selected_enclosure_id=enclosure_id,
             )
-            if warm_smart and warmed_snapshot.slots:
-                await self.get_slot_smart_summaries(
-                    [slot.slot for slot in warmed_snapshot.slots],
-                    selected_enclosure_id=enclosure_id,
-                )
+            if warmed_snapshot.slots:
+                warmed.append((enclosure_id, [slot.slot for slot in warmed_snapshot.slots]))
+        return warmed
 
     async def _get_inventory_source_bundle(
         self,
@@ -4513,7 +4565,10 @@ class InventoryService:
         def _abandon() -> None:
             if task.done():
                 return
-            ticket.abandoned = True
+            # Under the lock every final slot-detail commit checks the ticket
+            # in, so a commit is either finished or refused (#1125).
+            with self._smart_persistence_lock:
+                ticket.abandoned = True
             task.cancel()
             self._background_refresh_abandoned_at = utcnow()
             logger.warning(
@@ -5507,6 +5562,9 @@ class InventoryService:
     async def _apply_and_persist_snapshot_slot_details(self, slots: list[SlotView]) -> None:
         store = self.slot_detail_store
         staged_commits = _snapshot_detail_commits.get()
+        # The final commit runs in a worker thread and checks this ticket itself,
+        # so a refresh abandoned while saving never writes its rows (#1125).
+        refresh_ticket = _background_refresh_ticket.get()
         if store is None or not slots:
             if staged_commits is not None:
                 async def observe_if_published(is_current):
@@ -5527,7 +5585,7 @@ class InventoryService:
             return True
 
         def ownership_is_current() -> bool:
-            return publication_is_current() and all(
+            return not _ticket_abandoned(refresh_ticket) and publication_is_current() and all(
                 self._smart_cache_generation_token(key) == generation
                 and self._smart_disk_identities.get(key[:4]) == identities[key[:4]]
                 for key, generation in generations
@@ -5581,7 +5639,9 @@ class InventoryService:
                     generations.append((key, self._smart_cache_generation_token(key)))
                     self._snapshot_detail_owners[key[:4]] = (owner, key[5])
             try:
-                await _drain_inventory_worker(asyncio.get_running_loop().run_in_executor(None, save))
+                await _drain_inventory_worker(
+                    asyncio.get_running_loop().run_in_executor(None, copy_context().run, save),
+                )
                 # A refused write, newer identity owner, invalidation or cancelled
                 # waiter cannot observe this candidate. No rollback is needed.
                 if not ownership_is_current():

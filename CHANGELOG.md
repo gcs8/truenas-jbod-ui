@@ -47,7 +47,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   retryable 503 "still refreshing", and a save that is already stored answers
   success with the earlier bay view and a warning instead of an error. A
   background refresh that runs past 5 minutes is stopped and logged, the next
-  one can start, and its late result is never published. The appliance call
+  one can start, and its late result is never published, including bay details
+  it was still saving to disk. Opt-in startup prewarming follows the same
+  rules: a request before the first inventory read finishes answers a
+  retryable 503 saying no inventory has been read yet. The appliance call
   budget is unchanged (#1125, #1126).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
