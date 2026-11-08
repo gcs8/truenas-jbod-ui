@@ -48,9 +48,11 @@ For a controlled, digest-pinned update with an automatic rollback receipt, use
 [immutable GHCR deployment runbook](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md).
 When a reviewed release also replaces the shipped Compose file
 (`--replace-compose`), name your own overlay, such as `compose.override.yaml`,
-with `--keep-overlay` so it stays in the chain; the helper refuses an overlay
-that changes the image, user, command, volumes or networks of a shipped
-service. If the UI or admin service is published only on the host's LAN
+with `--keep-overlay` so it stays in the chain. Without
+`--allow-overlay-contract-change` a kept overlay may only tune restart policy,
+resource limits, logging, healthcheck timing, labels, non-sensitive
+environment variables, and ports of a shipped service, and it must not read
+any other file. If the UI or admin service is published only on the host's LAN
 address, its health and retention URLs may use that published address and
 port instead of loopback.
 

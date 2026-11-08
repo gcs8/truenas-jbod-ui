@@ -50,10 +50,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   folder (#1094, #1095).
 - Fixed `scripts/update_immutable_deployment.py --replace-compose` replacing
   operator overlays: overlays named with `--keep-overlay` now stay in the
-  Compose chain, the merged chain is validated, and an overlay that changes a
-  shipped service's image, user, command, volumes or networks is refused.
-  Health and retention URLs may also use an address and port the deployment
-  itself publishes (#1097).
+  Compose chain, the merged chain is validated, and an overlay that changes
+  anything but restart policy, resource limits, logging, healthcheck timing,
+  labels, non-sensitive environment, or ports of a shipped service, or that
+  reads another file, is refused. Every input is read without following links,
+  frozen in the private receipt and checked unchanged before each step, and
+  rollback restores and rechecks file modes as well as bytes. Health and
+  retention URLs may also use an address and port the deployment itself
+  publishes (#1097).
 
 ## v0.24.0-beta.6 - 2026-11-07
 
