@@ -36,7 +36,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Compose file without `TMPDIR` for the history service, or a hardened one with
   a tmpfs `/tmp`, no longer needs that line added by hand. Setting
   `SQLITE_TMPDIR` for the history service still overrides it. Backups and
-  exports never include the folder (#1094).
+  exports never include the folder (#1094, #1095).
 
 ### Fixed
 
@@ -47,7 +47,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   #1092 out-of-memory failure. The history service and the
   segmented-history maintenance scripts now choose the history volume
   themselves, and the free-space check before an index build looks at that same
-  folder (#1094).
+  folder (#1094, #1095).
 
 ## v0.24.0-beta.6 - 2026-11-07
 
