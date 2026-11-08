@@ -64,6 +64,7 @@ from history_service.startup import (
 )
 from history_service.startup_migration import open_history_store_after_recovery
 from history_service.segment_reader import HistoryStorageUnavailableError, SegmentCatalogMissingError
+from history_service.sqlite_temp import configure_sqlite_temporary_directory
 from history_service.store import HistoryStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,6 +121,10 @@ def open_history_runtime(
 
     def factory() -> tuple[HistorySettings, HistoryStore]:
         loaded = get_history_settings()
+        # SQLite's sort and VACUUM spill goes to the history volume whatever
+        # TMPDIR the Compose file sets (#1094). This runs before the store
+        # opens the database and before the collector starts any thread.
+        configure_sqlite_temporary_directory(Path(loaded.sqlite_path).parent)
         # Required durable-state migrations complete inside an ordinary
         # `docker compose up -d`, including one interrupted by a restart. The
         # store's own admission runs first, so a database this build must not

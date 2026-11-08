@@ -1595,5 +1595,294 @@ class StartupIndexBuildDiskFullTests(unittest.TestCase):
             self.assertEqual(_integrity(path), "ok")
 
 
+
+# Production startup in a fresh process: importing history_service.main loads
+# the settings and opens the store exactly as uvicorn does. The probe then makes
+# SQLite open a temporary file that stays open (a TEMP table whose pages spill
+# past a tiny cache) and reads where it lives from /proc/self/fd.
+_TEMP_DIRECTORY_CHILD = r"""
+import json
+import os
+import sqlite3
+import sys
+from contextlib import closing
+
+import history_service.main as history_main
+
+with closing(sqlite3.connect(sys.argv[1])) as connection:
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA temp.cache_size=8")
+    connection.execute("CREATE TEMP TABLE spill(value BLOB)")
+    connection.execute(
+        "INSERT INTO spill SELECT randomblob(1024) FROM "
+        "(WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000) SELECT x FROM n)"
+    )
+    directories = set()
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(os.path.join("/proc/self/fd", name))
+        except OSError:
+            continue
+        target = target.removesuffix(" (deleted)")
+        if os.path.basename(target).startswith("etilqs_"):
+            directories.add(os.path.dirname(target))
+reported = history_main.store.sqlite_temporary_directory() if history_main.store is not None else None
+print(json.dumps({
+    "temporary_file_directories": sorted(directories),
+    "reported": None if reported is None else str(reported),
+    "startup_failure": history_main.startup_failure_reason,
+}))
+"""
+
+
+class HistorySqliteTemporaryDirectoryTests(unittest.TestCase):
+    """#1094: history picks its SQLite temporary directory on the history volume."""
+
+    def setUp(self) -> None:
+        import os
+
+        if os.name != "posix" or not Path("/proc/self/fd").is_dir():
+            self.skipTest("needs Linux /proc/self/fd")
+
+    def _start_history(self, root: Path, environment: dict[str, str]) -> dict[str, object]:
+        import json
+        import os
+        import subprocess
+        import sys
+
+        repository = Path(__file__).resolve().parents[1]
+        child_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"TMPDIR", "SQLITE_TMPDIR", "HISTORY_SEGMENT_CATALOG_PATH"}
+        }
+        child_environment.update(
+            {
+                "PYTHONPATH": str(repository),
+                "HISTORY_SQLITE_PATH": str(root / "history" / "history.db"),
+                "RELEASE_CHECK_ENABLED": "false",
+                "METRICS_ENABLED": "false",
+            }
+        )
+        child_environment.update(environment)
+        completed = subprocess.run(
+            [sys.executable, "-c", _TEMP_DIRECTORY_CHILD, str(root / "probe.sqlite3")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=child_environment,
+            cwd=root,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-4000:])
+        report = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertIsNone(report["startup_failure"])
+        self.assertTrue(report["temporary_file_directories"], "the probe opened no SQLite temporary file")
+        return report
+
+    def test_history_startup_uses_the_history_volume_whatever_tmpdir_says(self) -> None:
+        import os
+
+        for case in ("tmpdir-unset", "tmpdir-elsewhere"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                # Stands in for a tmpfs /tmp that an old or hardened Compose file leaves TMPDIR at.
+                elsewhere = root / "memory-backed-tmp"
+                elsewhere.mkdir()
+                environment = {"TMPDIR": str(elsewhere)} if case == "tmpdir-elsewhere" else {}
+
+                report = self._start_history(root, environment)
+
+                expected = root / "history" / ".sqlite-tmp"
+                self.assertEqual(report["temporary_file_directories"], [str(expected)])
+                # The #1093 free-space pre-flight checks the same directory.
+                self.assertEqual(report["reported"], str(expected))
+                metadata = expected.stat(follow_symlinks=False)
+                self.assertTrue(expected.is_dir() and not expected.is_symlink())
+                self.assertEqual(metadata.st_mode & 0o7777, 0o700)
+                self.assertEqual(metadata.st_uid, os.geteuid())
+                self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_operator_sqlite_tmpdir_wins_and_no_directory_is_created(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            chosen = root / "operator-choice"
+            chosen.mkdir()
+            elsewhere = root / "memory-backed-tmp"
+            elsewhere.mkdir()
+
+            report = self._start_history(root, {"SQLITE_TMPDIR": str(chosen), "TMPDIR": str(elsewhere)})
+
+            self.assertEqual(report["temporary_file_directories"], [str(chosen)])
+            self.assertEqual(report["reported"], str(chosen))
+            self.assertFalse((root / "history" / ".sqlite-tmp").exists())
+
+    def test_startup_removes_stale_sqlite_files_and_restores_the_private_mode(self) -> None:
+        from history_service import sqlite_temp
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory)
+            target = history / ".sqlite-tmp"
+            target.mkdir(mode=0o755)
+            target.chmod(0o755)
+            (target / "etilqs_stalesortrun").write_bytes(b"stale sort run")
+            (target / "operator-notes.txt").write_text("not SQLite's")
+            (target / "etilqs_subdirectory").mkdir()
+
+            prepared = sqlite_temp.prepare_sqlite_temporary_directory(history)
+
+            self.assertEqual(prepared, target.absolute())
+            self.assertEqual(target.stat().st_mode & 0o7777, 0o700)
+            self.assertEqual(
+                sorted(path.name for path in target.iterdir()),
+                ["etilqs_subdirectory", "operator-notes.txt"],
+            )
+
+    def test_a_symlinked_or_foreign_directory_is_refused_without_touching_its_target(self) -> None:
+        import os
+
+        from history_service import sqlite_temp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "history"
+            history.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "etilqs_keep").write_bytes(b"not ours")
+            (history / ".sqlite-tmp").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(ValueError):
+                sqlite_temp.prepare_sqlite_temporary_directory(history)
+            self.assertEqual([path.name for path in outside.iterdir()], ["etilqs_keep"])
+
+            (history / ".sqlite-tmp").unlink()
+            (history / ".sqlite-tmp").mkdir(mode=0o700)
+            with (
+                patch.object(sqlite_temp.os, "geteuid", return_value=os.geteuid() + 1),
+                self.assertRaisesRegex(ValueError, "owned by uid"),
+            ):
+                sqlite_temp.prepare_sqlite_temporary_directory(history)
+
+    def test_an_unwritable_history_volume_is_left_untouched_and_does_not_fail_startup(self) -> None:
+        import errno
+        import os
+
+        from history_service import sqlite_temp
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory)
+            before = sorted(os.listdir(history))
+            with (
+                patch.object(sqlite_temp.os, "mkdir", side_effect=OSError(errno.EROFS, "Read-only file system")),
+                self.assertLogs("history_service.sqlite_temp", "WARNING") as logs,
+            ):
+                self.assertIsNone(sqlite_temp.configure_sqlite_temporary_directory(history))
+            self.assertEqual(sorted(os.listdir(history)), before)
+            self.assertIn("Read-only file system", "\n".join(logs.output))
+
+    def test_operator_sqlite_tmpdir_skips_the_history_directory(self) -> None:
+        import os
+
+        from history_service import sqlite_temp
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory)
+            with patch.dict(os.environ, {"SQLITE_TMPDIR": str(history)}):
+                self.assertIsNone(sqlite_temp.configure_sqlite_temporary_directory(history))
+            self.assertFalse((history / ".sqlite-tmp").exists())
+
+    def test_a_refused_maintenance_run_removes_the_directory_it_created(self) -> None:
+        from history_service import sqlite_temp
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory)
+            target = history / ".sqlite-tmp"
+            # Keep this test process's SQLite setting untouched.
+            with patch.object(sqlite_temp, "_apply_process_temporary_directory", return_value=True):
+                with self.assertRaises(ValueError), sqlite_temp.maintenance_sqlite_temporary_directory(history):
+                    self.assertTrue(target.is_dir())
+                    raise ValueError("refused before writing")
+                self.assertFalse(target.exists())
+
+                with sqlite_temp.maintenance_sqlite_temporary_directory(history) as chosen:
+                    self.assertEqual(chosen, target.absolute())
+                self.assertTrue(target.is_dir())
+                # A directory that already existed is never removed.
+                with self.assertRaises(ValueError), sqlite_temp.maintenance_sqlite_temporary_directory(history):
+                    raise ValueError("refused before writing")
+                self.assertTrue(target.is_dir())
+
+    @staticmethod
+    def _load_script(name: str):
+        import importlib.util
+
+        path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"_tnj_1094_{name}", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_segment_scripts_choose_the_directory_before_their_vacuum_and_sort_work(self) -> None:
+        import sys
+
+        from history_service import sqlite_temp
+
+        source = Path("/synthetic/history/history.db")
+        expected = [("temporary-directory", source.parent), ("work", source)]
+
+        def recorder(events: list[tuple[str, object]]):
+            @contextmanager
+            def configure(directory: object) -> Iterator[None]:
+                events.append(("temporary-directory", Path(directory)))
+                yield
+
+            def work(*_args: object, **kwargs: object) -> dict[str, object]:
+                events.append(("work", kwargs["source"]))
+                return {}
+
+            return configure, work
+
+        seal = self._load_script("seal_history_segment")
+        events: list[tuple[str, object]] = []
+        configure, work = recorder(events)
+        argv = ["seal", "--source", str(source), "--output-dir", "/synthetic/history/segments",
+                "--segment-id", "segment-0001", "--cutoff", "2026-01-01T00:00:00+00:00", "--key-id", "k"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(seal, "maintenance_sqlite_temporary_directory", side_effect=configure),
+            patch.object(seal, "seal_history_segment", side_effect=work),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(seal.main(), 0)
+        self.assertEqual(events, expected)
+
+        common = ["--source", str(source), "--segments-dir", "/synthetic/history/segments"]
+        for name, argv, loader in (
+            ("migrate_segmented_history",
+             ["migrate", *common, "--cutoff", "2026-01-01T00:00:00+00:00", "--key-id", "k"],
+             "_load_migration_api"),
+            ("rotate_segmented_history",
+             ["rotate", *common, "--cutoff", "2026-01-01T00:00:00+00:00", "--key-id", "k",
+              "--scheduled-backup-dir", "/synthetic/backups", "--scheduled-backup-status", "/synthetic/status.json"],
+             "_load_rotation_api"),
+        ):
+            module = self._load_script(name)
+            for apply in (True, False):
+                with self.subTest(script=name, apply=apply):
+                    events = []
+                    configure, work = recorder(events)
+                    api = (work, work, work) if loader == "_load_migration_api" else (work, work)
+                    with (
+                        patch.object(sys, "argv", argv + (["--apply"] if apply else [])),
+                        patch.object(module, loader, return_value=api),
+                        patch.object(sqlite_temp, "maintenance_sqlite_temporary_directory", side_effect=configure),
+                        patch("builtins.print"),
+                    ):
+                        self.assertEqual(module.main(), 0)
+                    # A dry run writes nothing to the history directory.
+                    self.assertEqual(events, expected if apply else [("work", source)])
+
+
 if __name__ == "__main__":
     unittest.main()

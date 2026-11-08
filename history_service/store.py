@@ -32,6 +32,7 @@ from history_service.segment_reader import (
     SegmentedHistoryReader,
     metric_sample_identity,
 )
+from history_service.sqlite_temp import effective_sqlite_temporary_directory
 from history_service.startup import HistorySchemaVersionError, HistoryStartupError
 
 logger = logging.getLogger(__name__)
@@ -45,13 +46,11 @@ SQLITE_CACHE_SIZE_KIB = 16384
 # and spills the rest to temporary files. With temp_store=MEMORY those
 # "files" are heap, so the build's peak grew with the table (about 1 GiB on a
 # restored 0.22.2 history, the history container's default limit). These
-# connections spill to on-disk temporary files instead, in the directory SQLite
-# picks from SQLITE_TMPDIR or TMPDIR (the shipped Compose file points TMPDIR at
-# the history volume), with a bounded page cache.
+# connections spill to on-disk temporary files instead, with a bounded page
+# cache, in the private directory history startup chooses on the history volume
+# (history_service.sqlite_temp, #1094) unless the operator set SQLITE_TMPDIR.
 BULK_MAINTENANCE_TEMP_STORE = "FILE"
 BULK_MAINTENANCE_CACHE_SIZE_KIB = 16384
-# SQLite's Unix temporary-directory search order after SQLITE_TMPDIR and TMPDIR.
-SQLITE_FALLBACK_TEMP_DIRECTORIES = ("/var/tmp", "/usr/tmp", "/tmp", ".")
 # The free-space pre-flight before a deferred index build (#1093) refuses only a
 # build that provably cannot fit. No size estimate is exact, so the guarantee
 # is the reaction: a build that runs out of space anyway rolls back, waits for
@@ -2214,22 +2213,11 @@ class HistoryStore:
     def sqlite_temporary_directory() -> Path | None:
         """The directory SQLite's Unix VFS uses for temporary files, or None.
 
-        Mirrors SQLite's own search: SQLITE_TMPDIR, TMPDIR, then fixed
-        fallbacks; the first existing directory this process can write wins.
+        The directory history startup chose on the history volume (#1094),
+        then SQLite's own search; the space checks below use the same answer.
         """
 
-        candidates = [os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR")]
-        candidates.extend(SQLITE_FALLBACK_TEMP_DIRECTORIES)
-        for candidate in candidates:
-            if not candidate:
-                continue
-            path = Path(candidate)
-            try:
-                if path.is_dir() and os.access(path, os.W_OK | os.X_OK):
-                    return path
-            except OSError:
-                continue
-        return None
+        return effective_sqlite_temporary_directory()
 
     def _release_failed_index_build(self, connection: sqlite3.Connection) -> None:
         """Roll back an index build that ran out of space and give the space back.
