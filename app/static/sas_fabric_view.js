@@ -3307,13 +3307,13 @@
               </div>
               ${deviceName ? `<small title="${escapeHtml(deviceName)}">${escapeHtml(compactDeviceLabel(deviceName, 54))}</small>` : ""}
               <dl>
-                ${pathState.source ? `<span><dt>Source</dt><dd>${escapeHtml(pathState.source)}</dd></span>` : ""}
-                ${pathState.path_type ? `<span><dt>Type</dt><dd>${escapeHtml(pathState.path_type)}</dd></span>` : ""}
-                ${pathState.ses_device ? `<span><dt>SES</dt><dd>${escapeHtml(pathState.ses_device)}</dd></span>` : ""}
-                ${pathState.sg_device ? `<span><dt>SG</dt><dd>${escapeHtml(pathState.sg_device)}</dd></span>` : ""}
-                ${pathState.scsi_hctl ? `<span><dt>HCTL</dt><dd>${escapeHtml(pathState.scsi_hctl)}</dd></span>` : ""}
-                ${pathState.transport_protocol ? `<span><dt>Transport</dt><dd>${escapeHtml([pathState.transport_protocol, pathState.target_port_protocol].filter(Boolean).join(" / "))}</dd></span>` : ""}
-                ${pathState.logical_unit_id || pathState.sas_address ? `<span><dt>SAS/LUN</dt><dd>${escapeHtml(pathState.sas_address || pathState.logical_unit_id)}</dd></span>` : ""}
+                ${pathState.source ? `<div><dt>Source</dt><dd>${escapeHtml(pathState.source)}</dd></div>` : ""}
+                ${pathState.path_type ? `<div><dt>Type</dt><dd>${escapeHtml(pathState.path_type)}</dd></div>` : ""}
+                ${pathState.ses_device ? `<div><dt>SES</dt><dd>${escapeHtml(pathState.ses_device)}</dd></div>` : ""}
+                ${pathState.sg_device ? `<div><dt>SG</dt><dd>${escapeHtml(pathState.sg_device)}</dd></div>` : ""}
+                ${pathState.scsi_hctl ? `<div><dt>HCTL</dt><dd>${escapeHtml(pathState.scsi_hctl)}</dd></div>` : ""}
+                ${pathState.transport_protocol ? `<div><dt>Transport</dt><dd>${escapeHtml([pathState.transport_protocol, pathState.target_port_protocol].filter(Boolean).join(" / "))}</dd></div>` : ""}
+                ${pathState.logical_unit_id || pathState.sas_address ? `<div><dt>SAS/LUN</dt><dd>${escapeHtml(pathState.sas_address || pathState.logical_unit_id)}</dd></div>` : ""}
               </dl>
             </div>
           `;
@@ -3800,6 +3800,7 @@
         class="fabric-focus-card${selected ? " is-selected" : ""}${tone ? ` tone-${classToken(tone)}` : ""}"
         data-fabric-mode-target="${escapeHtml(mode || state.mode)}"
         ${refAttr}
+        title="${escapeHtml([title || ref.id, meta].filter(Boolean).join("\n"))}"
       >
         <span>${escapeHtml(label)}</span>
         <strong>${escapeHtml(title || ref.id)}</strong>

@@ -360,22 +360,24 @@ test("search reports how many bays match, offers a clear control, and selects a 
 });
 
 test("bay tiles get a short accessible name and point at the tooltip for the rest", () => {
-  const { slotAccessibleName } = loadFunctions(["slotAccessibleName", "slotLocationLabel", "stateLabel", "formatSlotHealth"], {
+  const { slotAccessibleName, slotNameLead } = loadFunctions(["slotAccessibleName", "slotNameLead", "stateLabel", "formatSlotHealth"], {
     currentPlatform: () => "core",
   });
+  // #1110: the name is the tile's own text (number, device, pool, heat value)
+  // followed by what the tile does not show; these are the trailing facts.
   assert.equal(
     slotAccessibleName({ slot: 5, slot_label: "05", device_name: "da5", pool_name: "tank", health: "ONLINE", state: "healthy" }),
-    "Slot 05, da5, pool tank, online",
+    "online",
   );
-  assert.equal(slotAccessibleName({ slot: 6, slot_label: "06", state: "empty" }), "Slot 06, empty");
-  assert.equal(
-    slotAccessibleName({ slot: 1, slot_label: "Disk 1", physical_location_known: false, device_name: "sda", state: "unmapped" }),
-    "Disk 1, sda, unmapped",
-  );
+  assert.equal(slotAccessibleName({ slot: 6, slot_label: "06", state: "empty" }), "empty");
+  assert.equal(slotAccessibleName({ slot: 4, slot_label: "04", state: "identify", identify_active: true }), "identify, Locate light on");
+  assert.equal(slotNameLead({ slot_label: "05" }), "Slot ");
+  assert.equal(slotNameLead({ slot_label: "Disk 1", physical_location_known: false }), "");
 
   const renderGrid = functionSource("renderGrid");
-  assert.match(renderGrid, /tile\.setAttribute\("aria-label", slotAccessibleName\(slot\)\)/);
+  assert.match(renderGrid, /bayName\(tile, slotAccessibleName\(slot\), slotNameLead\(slot\)\)/);
   assert.match(renderGrid, /tile\.setAttribute\("aria-describedby", "slot-tooltip"\)/);
+  assert.match(functionSource("refreshHeatmapTileOverlays"), /bayName\(tile\)/);
   assert.doesNotMatch(APP_SOURCE, /function slotTooltip\(/, "the multi-line tooltip is no longer an accessible name");
   assert.match(TEMPLATE, /id="slot-tooltip"[^>]*role="tooltip"/);
 });

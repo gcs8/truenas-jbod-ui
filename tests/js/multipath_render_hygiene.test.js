@@ -91,7 +91,8 @@ for (const [label, source] of SOURCES) {
 
     assert.doesNotMatch(html, /\sdata-unsafe=/);
     assert.match(html, /class="topology-pill path-state-[a-z0-9_-]+"/);
-    assert.match(html, /<small>ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A<\/small>/);
+    // #1112: the cut-off detail repeats in an escaped title.
+    assert.match(html, /<small title="ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A">ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A<\/small>/);
   });
 }
 

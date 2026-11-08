@@ -994,9 +994,9 @@
         if (state.selectedSlot === slot.slot_index) {
           tile.classList.add("selected");
         }
-        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
         applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
+        bayName(tile, buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext), "");
         board.appendChild(tile);
       });
 
@@ -1061,10 +1061,6 @@
       } else {
         delete tile.dataset.slotSize;
       }
-      tile.setAttribute(
-        "aria-label",
-        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext)
-      );
       if (liveSlot) {
         tile.setAttribute("aria-describedby", "slot-tooltip");
       }
@@ -1086,6 +1082,8 @@
             <span class="slot-latch" aria-hidden="true"></span>
           `;
       applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
+      if (liveSlot) bayName(tile, slotAccessibleName(liveSlot), slotNameLead(liveSlot));
+      else bayName(tile, buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext), "");
       container.appendChild(tile);
     };
 
@@ -1152,10 +1150,10 @@
       tile.style.top = metrics.top;
       tile.style.width = metrics.width;
       tile.style.minHeight = metrics.minHeight;
-      tile.setAttribute("aria-label", slotAccessibleName(liveSlot));
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
       applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
+      bayName(tile, `${slotLocationLabel(liveSlot)}, ${slotAccessibleName(liveSlot)}`, "");
       board.appendChild(tile);
     });
 
@@ -1607,11 +1605,10 @@
     return breakpoints;
   }
 
-  // The one description of an enclosure's physical bay grid: rows in the order
-  // the chassis draws them (latch edge last), each row split into the profile's
-  // column groups, with the group breakpoints and the flat top-loader grouping
-  // already resolved from `buildChassisGeometry`'s output. Every grid-like bay
-  // surface renders from this so a bay number is always in the same place.
+  // The one description of a bay grid: rows in chassis order (latch edge last),
+  // split into the profile's column groups with breakpoints and the flat
+  // top-loader grouping resolved. Every bay grid renders from this, so a bay
+  // number is always in the same place.
   function buildLayoutGridRows(layoutRows, geometry) {
     return normalizeLayoutRows(layoutRows).map((row) => {
       const groups = splitRowIntoGroups(row, geometry);
@@ -1665,16 +1662,15 @@
         const slotShare = group.length / totalSlots;
         const slotShareText = slotShare.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
         const internalGapPixels = groupGap * Math.max(group.length - 1, 0);
-        return `calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px)`;
+        // #1115: a group never shrinks below its bays; the shell scrolls.
+        return `minmax(min-content, calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px))`;
       })
       .join(" ");
   }
 
-  // Per-model decoration for the UniFi NVR faces (#1068). Everything here is
-  // print, vents, lights and ports on the metal: never a bay. It is drawn as
-  // aria-hidden <div>s without data-slot, so clicks, focus, keyboard walking,
-  // search, summaries, the heat map, Connections and exports, which all read
-  // `.slot-tile[data-slot]`, never see it. Unknown variants draw the plain face.
+  // UniFi NVR face decoration (#1068): print, vents, lights and ports, never a
+  // bay. Drawn as aria-hidden <div>s without data-slot, so everything reading
+  // `.slot-tile[data-slot]` ignores it. Unknown variants draw the plain face.
   function unifiFaceVariantSpec(geometry) {
     if ((geometry?.faceStyle || geometry?.face_style) !== "unifi-drive") {
       return null;
@@ -1724,11 +1720,10 @@
     return Object.prototype.hasOwnProperty.call(specs, variant) ? { variant, ...specs[variant] } : null;
   }
 
-  // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
-  // They come from the layout and the same labels the drawn bays show, so a
-  // strip can never disagree with the bay tiles. The live page reads the live
-  // bays (formatSlotLabel); a saved chassis view passes its own bay labels,
-  // because the live enclosure may use another layout and label base (#1070).
+  // Column strips print bay numbers top to bottom ("1 / 5 / 9 / 13") from the
+  // labels the bays show, so a strip never disagrees with them. A saved
+  // chassis view passes its own labels: the live enclosure may use another
+  // layout and label base (#1070).
   function unifiFaceColumnLabels(layoutRows, rowIndexes = null, slotLabelFor = null) {
     const rows = normalizeLayoutRows(layoutRows);
     const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
@@ -2345,7 +2340,7 @@
     const displayLabel = label || sasFabricDisplayLabel(node) || node.id;
     const displayMeta = meta || sasFabricNodeMeta(node) || formatSasFabricKind(node.kind);
     return `
-      <button type="button" class="${sasFabricItemClasses({ selected, related, status: node.status, extra })}" data-sas-fabric-node="${escapeHtml(node.id)}">
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: node.status, extra })}" data-sas-fabric-node="${escapeHtml(node.id)}" title="${escapeHtml(`${displayLabel}\n${displayMeta}`)}">
         <span class="sas-fabric-item-label">${escapeHtml(displayLabel)}</span>
         <span class="sas-fabric-item-meta">${escapeHtml(displayMeta)}</span>
       </button>
@@ -2359,9 +2354,10 @@
     const related = Boolean(selectedTrace?.node_ids?.includes(path.id)) || sasFabricSelectionTouchesSlots(path.slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slots = sasFabricSortedSlots(path.slots || trace?.slots);
+    const label = sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`;
     return `
-      <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}">
-        <span class="sas-fabric-item-label">${escapeHtml(sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`)}</span>
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}" title="${escapeHtml(label)}">
+        <span class="sas-fabric-item-label">${escapeHtml(label)}</span>
         <span class="sas-fabric-item-meta">${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"} affected`)}</span>
         <span class="sas-fabric-item-slots">${escapeHtml(formatSasFabricSlots(slots, slots.length))}</span>
       </button>
@@ -3012,10 +3008,9 @@
     }
   }
 
-  // The header release note is rendered once by the server. While the first
-  // check is still running or has failed, poll a few times so a boot-time
-  // failure (DNS not ready yet) recovers without a reload. The server retries
-  // failures after 60 s, 5 min, then hourly; these delays trail those.
+  // The server renders the release note once. While its first check runs or
+  // has failed (DNS not ready at boot), poll a few times, trailing the
+  // server's 60 s / 5 min / hourly retries, so it recovers without a reload.
   const RELEASE_NOTE_POLL_DELAYS_MS = [20000, 75000, 320000];
 
   function releaseNoteNeedsRefresh(status) {
@@ -4502,10 +4497,8 @@
     return Boolean(state.smartPrefetchTimerId) || Boolean(state.smartPrefetchRunning);
   }
 
-  // Hovering or arrow-keying across bays used to send one SMART request per bay
-  // even while the batch prefetch for those same bays was queued or already
-  // running. When the batch covers the bay, the tooltip shows "Loading..." and
-  // waits for it instead of racing it with a second request.
+  // A bay covered by a queued or running batch prefetch shows "Loading..." and
+  // waits for it, instead of racing it with a per-bay SMART request.
   function ensureSmartSummaryOnInteraction(slot) {
     if (state.snapshotMode || !slot) {
       return Promise.resolve();
@@ -4769,13 +4762,10 @@
     return host || "n/a";
   }
 
-  // The enclosure reports a bay as a status name and its four SES status bytes,
-  // such as "OK (0x11 0x00 0x00 0x00)". Byte 0 holds the status code in its low
-  // four bits and the predicted-failure (0x40), disabled (0x20) and swap (0x10)
-  // flags above it (SES-3 table 72). Other health text passes through. The text
-  // comes from the appliance and runs on every grid render, so the byte suffix
-  // is found by position and only that short tail is matched, and the shown
-  // value is capped.
+  // SES health reads "OK (0x11 0x00 0x00 0x00)": byte 0 is the status code
+  // (low four bits) plus predicted-failure 0x40, disabled 0x20 and swap 0x10
+  // (SES-3 table 72); other text passes through. Appliance text on every grid
+  // render: match only the positioned byte tail, and cap the shown value.
   function formatSlotHealth(value) {
     if (value === null || value === undefined) {
       return value;
@@ -6232,6 +6222,8 @@
     const heatmapContext = context || buildHeatmapContext();
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       applyHeatmapToTile(tile, heatmapContext, tile.dataset.slot);
+      // #1110: the value is text the bay shows, so its name follows it.
+      if (tile.dataset.detail !== undefined) bayName(tile);
     });
     renderHeatmapControls(heatmapContext);
     scheduleStateChipPlacement();
@@ -6747,21 +6739,29 @@
     return appendHeatmapTooltipLines(lines, slot.slot);
   }
 
-  // Short accessible name for a bay tile: "Slot 05, sda, pool tank, healthy".
-  // The full tooltip stays available through aria-describedby.
+  function slotNameLead(slot) {
+    return slot.physical_location_known === false ? "" : "Slot ";
+  }
+
+  // What a live bay does not show; its tooltip has the rest.
   function slotAccessibleName(slot) {
-    const parts = [slotLocationLabel(slot)];
-    if (slot.device_name) {
-      parts.push(String(slot.device_name));
+    return [
+      slot.health ? formatSlotHealth(slot.health).toLowerCase() : stateLabel(slot).toLowerCase(),
+      slot.identify_active ? "Locate light on" : "",
+    ].filter(Boolean).join(", ");
+  }
+
+  // #1110: a bay's name is its shown text in order (heat value too), then
+  // what it does not show: "Slot 05, sda, tank, 38 C, online".
+  function bayName(tile, detail = tile.dataset.detail, lead = tile.dataset.lead) {
+    Object.assign(tile.dataset, { detail, lead });
+    const shown = [];
+    const walk = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) {
+      const text = walk.currentNode.textContent.trim();
+      if (/\w/.test(text)) shown.push(text);
     }
-    if (slot.pool_name) {
-      parts.push(`${currentPlatform() === "linux" ? "mount" : "pool"} ${slot.pool_name}`);
-    }
-    parts.push(slot.health ? formatSlotHealth(slot.health).toLowerCase() : stateLabel(slot).toLowerCase());
-    if (slot.identify_active) {
-      parts.push("Locate light on");
-    }
-    return parts.join(", ");
+    tile.setAttribute("aria-label", lead + [...shown, detail].filter(Boolean).join(", "));
   }
 
   function searchSummaryText(matched, total, term) {
@@ -6837,7 +6837,7 @@
   function refreshGridTileAriaLabel(slotNumber, label) {
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       if (Number(tile.dataset.slot) === Number(slotNumber)) {
-        tile.setAttribute("aria-label", label);
+        bayName(tile, label);
       }
     });
   }
@@ -7274,11 +7274,10 @@
     return true;
   }
 
-  // #913: the state chip (a bay's ::after, 24px with its border) sits in the
-  // top-right corner, where many bays draw their LED or latch. Pick one spot per
-  // face that clears every bay's parts: corner, beside the latch, under the LED,
-  // mid-sled, the foot, then top-left (above an M.2 card's screw hole). If none
-  // is clear, take the one with fewest overlaps.
+  // #913: the state chip (a bay's 24px ::after) defaults to the top-right
+  // corner, where many bays draw an LED or latch. Pick one spot per face that
+  // clears every bay: corner, beside the latch, under the LED, mid-sled, foot,
+  // top-left; else the spot with fewest overlaps.
   function chooseStateChipSpot(bays, size = 24, inset = 6) {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
     let right = inset;
@@ -7367,10 +7366,9 @@
     }
   }
 
-  // #461: a refresh used to clear the grid and recreate every tile. Renders now
-  // build into a detached container; when the layout is unchanged, existing
-  // tiles are patched in place (an identical refresh creates no tiles and keeps
-  // focus and hover on the same elements). A new layout replaces the grid.
+  // #461: renders build into a detached container. An unchanged layout patches
+  // existing tiles in place (no new tiles; focus and hover stay); a new layout
+  // replaces the grid.
   function commitGridRender(staging) {
     const pairs = [];
     if (!grid.childElementCount || !matchGridStructure(grid, staging, pairs)) {
@@ -7477,11 +7475,11 @@
         tile.classList.add("group-divider-after");
       }
       tile.dataset.slot = String(slot.slot);
-      tile.setAttribute("aria-label", slotAccessibleName(slot));
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
       tile.innerHTML = buildLiveSlotTileMarkup(slot, sharedMount);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
+      bayName(tile, slotAccessibleName(slot), slotNameLead(slot));
       container.appendChild(tile);
     };
 
@@ -9758,7 +9756,7 @@
         return `
           <button type="button" class="topology-pill state-${sasFabricClassToken(member.state)}${selected}" data-topology-slot="${member.slot}">
             <span>${escapeHtml(member.slot_label)}</span>
-            <small>${escapeHtml(member.device_name || member.serial || member.state)}</small>
+            <small title="${escapeHtml(member.device_name || member.serial || member.state)}">${escapeHtml(member.device_name || member.serial || member.state)}</small>
           </button>
         `;
       })
@@ -10019,7 +10017,7 @@
         return `
           <div class="topology-pill path-state-${sasFabricClassToken(stateName)}">
             <span>${escapeHtml(member.device_name)}</span>
-            <small>${escapeHtml(detailParts.join(" / "))}</small>
+            <small title="${escapeHtml(detailParts.join(" / "))}">${escapeHtml(detailParts.join(" / "))}</small>
           </div>
         `;
       })
@@ -10703,11 +10701,9 @@
       comparisonSelect.innerHTML = optionsHtml;
       const currentOptions = Array.from(select.options);
       const desiredOptions = Array.from(comparisonSelect.options);
-      // `selected` is deliberately not compared. Option HTML for the
-      // enclosure/view selector carries no `selected` attribute, so the
-      // detached comparison select auto-selects its first option and would
-      // disagree with the live select on every render. The selection is
-      // carried by `intendedValue` instead.
+      // `selected` is not compared: the option HTML has no `selected`, so the
+      // detached select picks its first option and would always differ. The
+      // selection rides on `intendedValue`.
       const optionsMatch = currentOptions.length === desiredOptions.length
         && currentOptions.every((option, index) => {
           const desired = desiredOptions[index];

@@ -512,6 +512,7 @@ test("a saved chassis view prints its strips from its own bay labels, not the li
       storageViewRuntimeTertiaryLabel: () => "",
       stateLabel: () => "",
       applyHeatmapToTile() {},
+      bayName() {},
       getSmartSummaryEntry: () => null,
       getSelectedProfile: () => ({ row_groups: [] }),
       currentLayoutSlotCount: () => viewSlots.length,

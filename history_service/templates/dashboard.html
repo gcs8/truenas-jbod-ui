@@ -109,7 +109,9 @@
       </section>
 
       <section class="tracked-scopes-section">
-        <h2>Systems and enclosures</h2>
+        <h2 id="tracked-scopes-heading">Systems and enclosures</h2>
+        <!-- #1116: a narrow window scrolls the table, not the whole page. -->
+        <div class="table-scroll" role="region" aria-labelledby="tracked-scopes-heading" tabindex="0">
         <table>
           <thead>
             <tr>
@@ -140,6 +142,7 @@
             {% endfor %}
           </tbody>
         </table>
+        </div>
       </section>
     </main>
     <script id="history-dashboard-bootstrap" type="application/json">
