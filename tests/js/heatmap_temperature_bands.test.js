@@ -264,7 +264,7 @@ test("contrast helpers follow the WCAG relative luminance formula", () => {
 });
 
 test("heat-map text lines use the computed text colour on an opaque surface chip", () => {
-  const textRule = /\.slot-tile\.heatmap-active \.slot-device,[\s\S]*?\{([^}]*)\}/.exec(STYLE_SOURCE);
+  const textRule = /\n\.slot-tile:is\(\.heatmap-active, \.heatmap-missing\) :is\(\.slot-device, [^{]*\{([^}]*)\}/.exec(STYLE_SOURCE);
   assert.ok(textRule, "heat-map text line rule must exist");
   assert.doesNotMatch(textRule[1], /opacity:\s*0\.45/, "faded text lines were the reported contrast defect");
   assert.match(textRule[1], /color:\s*rgb\(var\(--heatmap-text-rgb/);

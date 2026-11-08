@@ -12,7 +12,7 @@ Heat map mode is read-only. It does not add disk controls, LED actions, or admin
 4. For `Temperature`, keep `Colours` on `Bands` to judge absolute temperature, or switch to `Relative` to compare bays.
 5. Adjust `Scale` if relative colors are too flat or too strong.
 
-The metric value appears in the center of each bay. Health, empty, identify, fault, and unknown indicators remain visible. Empty bays and missing values are neutral or hatched. The renderer does not treat them as zero or include them in the color scale.
+The metric value appears in each bay between the bay number and the device labels, so it never covers them. Health, empty, identify, fault, and unknown indicators remain visible. Empty bays and missing values are neutral or hatched. The renderer does not treat them as zero or include them in the color scale.
 
 Serial, GPTID, make, model, pool, vdev, firmware, and device name remain in the standard hover and detail views.
 

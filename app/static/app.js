@@ -6174,8 +6174,7 @@
     return Array.from(rgb).slice(0, 3).map((component, index) => Math.round((component * amount) + (base[index] * (1 - amount))));
   }
 
-  // The value badge's former rgba(5, 8, 12, 0.62) chip made opaque, so a
-  // device line it overlaps in a short bay is hidden instead of ghosted.
+  // The value badge's former rgba(5, 8, 12, 0.62) chip, made opaque.
   function heatmapBadgeRgb(surfaceRgb) {
     return heatmapSurfaceRgb([5, 8, 12], 0.62, surfaceRgb);
   }

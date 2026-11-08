@@ -23,7 +23,30 @@ const BAYS = [
   { temperature: 60, band: "warning", warning: 55, critical: 65 },
 ];
 
-function buildFixture() {
+// Bay shapes the value badge must share with the tile text (#1106): every
+// face style, 2.5- and 3.5-inch, short and tall, each latch edge.
+const SHAPES = [
+  ["generic", "bottom", "3.5", 1, 6],
+  ["generic", "bottom", "2.5", 1, 6],
+  ["front-drive", "right", "3.5", 3, 4],
+  ["front-drive", "top", "3.5", 2, 4],
+  ["front-drive", "top", "2.5", 1, 24],
+  ["rear-drive", "left", "2.5", 2, 12],
+  ["top-loader", "bottom", "3.5", 3, 4],
+  ["top-loader", "bottom", "2.5", 3, 4],
+  ["drawer", "bottom", "3.5", 2, 6],
+  ["unifi-drive", "bottom", "3.5", 2, 4],
+].map(([face, latch, size, rows, columns]) => ({
+  name: `${face} ${size}in ${latch} latch ${rows}x${columns}`,
+  face_style: face,
+  latch_edge: latch,
+  bay_size: size,
+  rows,
+  columns,
+  bays: Array.from({ length: rows * columns }, (_, index) => ({ temperature: 30 + ((index * 7) % 32) })),
+}));
+
+function buildFixtures(layouts) {
   return JSON.parse(execFileSync(process.env.PYTHON || "python3", ["-c", `
 import json
 import sys
@@ -31,45 +54,50 @@ import sys
 import scripts.build_current_source_browser_fixture as builder
 from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
 
-bays = json.loads(sys.argv[1])
-count = len(bays)
-data = builder.build_synthetic_live_snapshot().model_dump(mode="json")
-template = data["slots"][0]
-data["slots"] = [
-    {
-        **template,
-        "slot": index,
-        "slot_label": f"{index:02d}",
-        "column_index": index,
-        "device_name": f"sd{index}",
-        "serial": f"SANITIZED-HEAT-{index:02d}",
-        "gptid": f"synthetic-gptid-{index}",
-        "temperature_c": bay["temperature"],
-        "notes": None,
-    }
-    for index, bay in enumerate(bays)
-]
-layout = [list(range(count))]
-data["layout_rows"] = layout
-data["layout_slot_count"] = count
-data["layout_columns"] = count
-data["selected_profile"] = {
-    **data["selected_profile"],
-    "id": "synthetic-heat-row",
-    "label": "Synthetic heat row",
-    "panel_title": "Synthetic heat row",
-    "rows": 1,
-    "columns": count,
-    "slot_count": count,
-    "slot_layout": layout,
-}
-data["enclosures"][0].update(profile_id="synthetic-heat-row", rows=1, columns=count, slot_count=count, slot_layout=layout)
-data["summary"].update(disk_count=count, mapped_slot_count=count, manual_mapping_count=0)
-snapshot = InventorySnapshot.model_validate(data)
-builder.build_synthetic_live_snapshot = lambda: snapshot
+base = builder.build_synthetic_live_snapshot().model_dump(mode="json")
 runtime = StorageViewRuntimePayload(system_id="synthetic-system", views=[])
-print(json.dumps(dict(html=builder.build_live_fixture_html(runtime), snapshot=snapshot.model_dump(mode="json"))))
-`, JSON.stringify(BAYS)], { cwd: root, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }));
+fixtures = []
+for spec in json.loads(sys.argv[1]):
+    data = json.loads(json.dumps(base))
+    count, columns = len(spec["bays"]), spec["columns"]
+    template = data["slots"][0]
+    data["slots"] = [
+        {
+            **template,
+            "slot": index,
+            "slot_label": f"{index:02d}",
+            "row_index": index // columns,
+            "column_index": index % columns,
+            "device_name": f"sd{index}",
+            "serial": f"SANITIZED-HEAT-{index:02d}",
+            "gptid": f"synthetic-gptid-{index}",
+            "temperature_c": bay["temperature"],
+            "notes": None,
+        }
+        for index, bay in enumerate(spec["bays"])
+    ]
+    layout = [list(range(start, min(count, start + columns))) for start in range(0, count, columns)]
+    data["layout_rows"] = layout
+    data["layout_slot_count"] = count
+    data["layout_columns"] = columns
+    data["selected_profile"] = {
+        **data["selected_profile"],
+        "id": "synthetic-heat-row",
+        "label": "Synthetic heat row",
+        "panel_title": "Synthetic heat row",
+        **{key: spec[key] for key in ("face_style", "latch_edge", "bay_size") if key in spec},
+        "rows": len(layout),
+        "columns": columns,
+        "slot_count": count,
+        "slot_layout": layout,
+    }
+    data["enclosures"][0].update(profile_id="synthetic-heat-row", rows=len(layout), columns=columns, slot_count=count, slot_layout=layout)
+    data["summary"].update(disk_count=count, mapped_slot_count=count, manual_mapping_count=0)
+    snapshot = InventorySnapshot.model_validate(data)
+    builder.build_synthetic_live_snapshot = lambda: snapshot
+    fixtures.append(dict(html=builder.build_live_fixture_html(runtime), snapshot=snapshot.model_dump(mode="json")))
+print(json.dumps(fixtures))
+`, JSON.stringify(layouts)], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 }
 
 function smartSummary(bay) {
@@ -85,42 +113,44 @@ function smartSummary(bay) {
 }
 
 let fixture;
+let shapeFixtures;
 test.beforeAll(() => {
-  fixture = buildFixture();
+  [fixture, ...shapeFixtures] = buildFixtures([{ columns: BAYS.length, bays: BAYS }, ...SHAPES]);
 });
 
 test.use({ serviceWorkers: "block" });
 
-async function openHeatMap(page) {
+async function openHeatMap(page, pageFixture = fixture, bays = BAYS) {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.route("**/*", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     if (url.origin !== "https://synthetic.invalid") throw new Error(`Unexpected external request ${url.origin}`);
-    if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: fixture.html });
+    if (url.pathname === "/") return route.fulfill({ contentType: "text/html", body: pageFixture.html });
     if (url.pathname.startsWith("/static/")) {
       const file = path.join(root, "app", url.pathname);
       return fs.existsSync(file) ? route.fulfill({ path: file }) : route.fulfill({ status: 404, body: "" });
     }
     let data = { ok: true, available: false };
-    if (url.pathname === "/api/inventory") data = fixture.snapshot;
+    if (url.pathname === "/api/inventory") data = pageFixture.snapshot;
     if (url.pathname === "/api/storage-views") data = { system_id: "synthetic-system", views: [] };
     if (url.pathname === "/api/slots/smart-batch") {
       const requested = JSON.parse(request.postData() || "{}").slots || [];
-      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(BAYS[slot]) })) };
+      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bays[slot]) })) };
     }
     const single = /^\/api\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (single) data = smartSummary(BAYS[Number(single[1])]);
+    if (single) data = smartSummary(bays[Number(single[1])]);
     return route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
   await page.goto("https://synthetic.invalid/");
   await page.locator("#auto-refresh-toggle").uncheck();
-  await expect(page.locator("#slot-grid [data-slot]")).toHaveCount(BAYS.length);
+  await expect(page.locator("#slot-grid [data-slot]")).toHaveCount(bays.length);
   await page.locator("#heatmap-toggle-button").click();
   await page.locator("#heatmap-metric-select").selectOption("temperature_c");
   // The drive-rated bay can only reach "warning" once its SMART summary loads.
-  await expect(page.locator('#slot-grid [data-slot="5"]')).toHaveAttribute("data-heatmap-band", "warning");
+  if (bays === BAYS) await expect(page.locator('#slot-grid [data-slot="5"]')).toHaveAttribute("data-heatmap-band", "warning");
+  await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
   return errors;
 }
 
@@ -128,7 +158,9 @@ function bay(page, index) {
   return page.locator(`#slot-grid [data-slot="${index}"]`);
 }
 
-for (const viewport of [{ width: 1600, height: 1000 }, { width: 1920, height: 1080 }]) {
+const VIEWPORTS = [{ width: 1600, height: 1000 }, { width: 1920, height: 1080 }, { width: 3840, height: 2120 }];
+
+for (const viewport of VIEWPORTS) {
   test(`temperature bands are absolute and tile text is readable at ${viewport.width} px`, async ({ page }) => {
     await page.setViewportSize(viewport);
     const errors = await openHeatMap(page);
@@ -200,6 +232,71 @@ for (const viewport of [{ width: 1600, height: 1000 }, { width: 1920, height: 10
     await expect(page.locator("#heatmap-legend-max")).toHaveText("60 C");
     await expect(page.locator("#heatmap-legend-bands")).toBeHidden();
     expect(await colour(0)).not.toBe(await colour(4));
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1106: an opaque value badge must not paint over a text line. Compare the
+// text Ranges themselves with the badge box; computed contrast cannot see
+// a sibling covering the text.
+for (const [index, shape] of SHAPES.entries()) {
+  test(`value badge leaves every tile text line visible on ${shape.name}`, async ({ page }) => {
+    const errors = await openHeatMap(page, shapeFixtures[index], shape.bays);
+    for (const viewport of VIEWPORTS) {
+      await page.setViewportSize(viewport);
+      const tiles = await page.locator("#slot-grid .slot-tile").evaluateAll((elements) => elements.map((tile) => {
+        const box = (rect) => ({ left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom });
+        const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+          && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+        const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1
+          && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+        const badgeElement = tile.querySelector(".slot-heatmap-value");
+        const badge = box(badgeElement.getBoundingClientRect());
+        const tileBox = box(tile.getBoundingClientRect());
+        const lines = [];
+        for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+          if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+          const range = document.createRange();
+          range.selectNodeContents(line);
+          // Clip each Range box to the line's own box: ellipsis hides the rest.
+          const own = line.getBoundingClientRect();
+          const rects = [...range.getClientRects()].map((rect) => ({
+            left: Math.max(rect.left, own.left),
+            right: Math.min(rect.right, own.right),
+            top: rect.top,
+            bottom: rect.bottom,
+          }));
+          lines.push({
+            line: line.className,
+            covered: rects.some((rect) => overlap(rect, badge)),
+            inTile: rects.every((rect) => inside(rect, tileBox)),
+          });
+        }
+        return {
+          slot: tile.dataset.slot,
+          badgeInTile: inside(badge, tileBox),
+          badgeClipped: badgeElement.scrollHeight > badgeElement.clientHeight + 1,
+          lines,
+        };
+      }));
+      expect(tiles).toHaveLength(shape.bays.length);
+      const where = (tile, line = "") => `${shape.name} at ${viewport.width} px, bay ${tile.slot} ${line}`;
+      for (const tile of tiles) {
+        expect(tile.badgeInTile, where(tile, "badge inside the bay")).toBe(true);
+        expect(tile.badgeClipped, where(tile, "badge text clipped")).toBe(false);
+        for (const line of tile.lines) {
+          expect(line.covered, where(tile, `${line.line} covered by the badge`)).toBe(false);
+          expect(line.inTile, where(tile, `${line.line} inside the bay`)).toBe(true);
+        }
+      }
+      // Only single-row top-latched 2.5-inch sleds drop the labels on purpose.
+      const hidesLabels = shape.face_style === "front-drive" && shape.latch_edge === "top" && shape.bay_size === "2.5" && shape.rows === 1;
+      if (!hidesLabels) {
+        for (const tile of tiles) {
+          expect(tile.lines.map((line) => line.line), where(tile)).toEqual(expect.arrayContaining(["slot-device", "slot-pool"]));
+        }
+      }
+    }
     expect(errors).toEqual([]);
   });
 }

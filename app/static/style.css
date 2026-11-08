@@ -4943,13 +4943,13 @@ button.fabric-trace-crumb:hover {
   background: rgba(214, 222, 230, 0.09);
 }
 
-.slot-tile.heatmap-active .slot-number,
-.slot-tile.heatmap-missing .slot-number {
-  z-index: 6;
+.slot-tile.selected .slot-number {
+  background: rgba(91, 183, 255, 0.18);
+  color: #eff8ff;
 }
 
-.slot-tile:is(.heatmap-active, .heatmap-missing) .slot-number,
-.slot-tile.selected:is(.heatmap-active, .heatmap-missing) .slot-number {
+.slot-tile:is(.heatmap-active, .heatmap-missing) .slot-number {
+  z-index: 6;
   background: rgb(var(--heatmap-surface-rgb));
   color: rgb(var(--heatmap-text-rgb));
   box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb), 0.32);
@@ -4963,26 +4963,19 @@ button.fabric-trace-crumb:hover {
   --heatmap-badge-rgb: 23, 26, 30;
 }
 
-.slot-tile.heatmap-active .slot-device,
-.slot-tile.heatmap-active .slot-pool,
-.slot-tile.heatmap-active .slot-tertiary,
-.slot-tile.heatmap-missing .slot-device,
-.slot-tile.heatmap-missing .slot-pool,
-.slot-tile.heatmap-missing .slot-tertiary {
+/* #1106: the labels follow the value badge instead of sitting under it. */
+.slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool, .slot-tertiary) {
   position: relative;
   z-index: 6;
+  order: 1;
   align-self: flex-start;
+  margin: 0;
   width: fit-content;
   padding: 0 3px;
   border-radius: 3px;
   background: rgb(var(--heatmap-surface-rgb));
   color: rgb(var(--heatmap-text-rgb));
   opacity: 1;
-}
-
-.slot-tile.selected .slot-number {
-  background: rgba(91, 183, 255, 0.18);
-  color: #eff8ff;
 }
 
 .slot-device,
@@ -5036,14 +5029,36 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-layout-mode^="top-loader"] .slot-heatmap-value {
-  top: 52%;
-  width: calc(100% - 8px);
   min-height: 24px;
   max-height: 42px;
   padding: 3px 3px;
   border-radius: 5px;
   font-size: 0.75rem;
   line-height: 1.02;
+}
+
+/* In a drive bay the value takes its own row between the number and the
+   labels; a UniFi bay is too short, so it shares the number's row. */
+.slot-number ~ .slot-heatmap-value {
+  position: relative;
+  inset: auto;
+  flex: none;
+  align-self: stretch;
+  width: auto;
+  min-height: 24px;
+  margin: auto -2px;
+  padding: 4px 2px;
+  transform: none;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile:is(.heatmap-active, .heatmap-missing) {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-content: space-between;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile :is(.slot-device, .slot-pool, .slot-tertiary) {
+  grid-column: span 2;
 }
 
 .slot-tertiary {
