@@ -100,6 +100,40 @@ print(json.dumps(fixtures))
 `, JSON.stringify(layouts)], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 }
 
+// #1123: storage-view cards draw the badge on their own text. The public
+// demo's NVMe carrier and SATADOM views, plus the other card templates: the
+// AOC carrier board and embedded boot media.
+const CARD_VIEWS = ["nvme-carrier-x4", "synthetic-aoc-carrier", "boot-doms", "synthetic-boot-media"];
+
+function buildCardFixture() {
+  return JSON.parse(execFileSync(process.env.PYTHON || "python3", ["-c", `
+import json
+
+import scripts.build_current_source_browser_fixture as builder
+from app.config import Settings
+from app.models.domain import StorageViewRuntimePayload
+from app.services.public_demo_fixture import build_public_demo_snapshot_bundle, load_public_demo_fixture
+
+bundle = build_public_demo_snapshot_bundle(fixture=load_public_demo_fixture(), settings=Settings())
+runtime = bundle.storage_view_runtime.model_dump(mode="json")
+views = {view["id"]: view for view in runtime["views"]}
+aoc = json.loads(json.dumps(views["nvme-carrier-x4"]))
+aoc.update(id="synthetic-aoc-carrier", label="Synthetic AOC Carrier", panel_title="Synthetic AOC Carrier",
+           template_id="aoc-slg4-2h8m2-2", slot_layout=[[0, 1]], slot_count=2, slots=aoc["slots"][:2], order=40)
+media = json.loads(json.dumps(views["boot-doms"]))
+media.update(id="synthetic-boot-media", label="Synthetic Boot Media", panel_title="Synthetic Boot Media",
+             template_id="embedded-boot-media-1", slot_layout=[[0]], slot_count=1, slots=media["slots"][:1], order=50)
+runtime["views"] += [aoc, media]
+for view in runtime["views"]:
+    view["matched_count"] = sum(1 for slot in view["slots"] if slot.get("occupied"))
+runtime = StorageViewRuntimePayload.model_validate(runtime)
+snapshot = bundle.primary_snapshot
+builder.build_synthetic_live_snapshot = lambda: snapshot
+print(json.dumps(dict(html=builder.build_live_fixture_html(runtime), snapshot=snapshot.model_dump(mode="json"),
+                      runtime=runtime.model_dump(mode="json"))))
+`], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
+}
+
 function smartSummary(bay) {
   return {
     available: true,
@@ -114,14 +148,20 @@ function smartSummary(bay) {
 
 let fixture;
 let shapeFixtures;
+let cardFixture;
+let liveNvmeFixture;
+// A live enclosure drawn as an NVMe carrier board uses the same cards.
+const LIVE_NVME = { face_style: "nvme-carrier", rows: 4, columns: 1, bays: [41, 40, 39, 38].map((temperature) => ({ temperature })) };
 test.beforeAll(() => {
-  [fixture, ...shapeFixtures] = buildFixtures([{ columns: BAYS.length, bays: BAYS }, ...SHAPES]);
+  [fixture, liveNvmeFixture, ...shapeFixtures] = buildFixtures([{ columns: BAYS.length, bays: BAYS }, LIVE_NVME, ...SHAPES]);
+  cardFixture = buildCardFixture();
 });
 
 test.use({ serviceWorkers: "block" });
 
-async function openHeatMap(page, pageFixture = fixture, bays = BAYS) {
+async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "") {
   const errors = [];
+  const bayAt = (slot) => (bays ? bays[slot] : { temperature: 30 + ((slot * 7) % 32) });
   page.on("pageerror", (error) => errors.push(error.message));
   await page.route("**/*", async (route) => {
     const request = route.request();
@@ -134,23 +174,27 @@ async function openHeatMap(page, pageFixture = fixture, bays = BAYS) {
     }
     let data = { ok: true, available: false };
     if (url.pathname === "/api/inventory") data = pageFixture.snapshot;
-    if (url.pathname === "/api/storage-views") data = { system_id: "synthetic-system", views: [] };
+    if (url.pathname === "/api/storage-views") data = pageFixture.runtime || { system_id: "synthetic-system", views: [] };
+    const viewSmart = /^\/api\/storage-views\/[^/]+\/slots\/(\d+)\/smart$/.exec(url.pathname);
+    if (viewSmart) data = smartSummary(bayAt(Number(viewSmart[1])));
     if (url.pathname === "/api/slots/smart-batch") {
       const requested = JSON.parse(request.postData() || "{}").slots || [];
-      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bays[slot]) })) };
+      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bayAt(slot)) })) };
     }
     const single = /^\/api\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (single) data = smartSummary(bays[Number(single[1])]);
+    if (single) data = smartSummary(bayAt(Number(single[1])));
     return route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
-  await page.goto("https://synthetic.invalid/");
+  await page.goto(`https://synthetic.invalid/${query}`);
   await page.locator("#auto-refresh-toggle").uncheck();
-  await expect(page.locator("#slot-grid [data-slot]")).toHaveCount(bays.length);
+  if (bays) await expect(page.locator("#slot-grid [data-slot]")).toHaveCount(bays.length);
+  else await expect(page.locator("#slot-grid [data-slot]").first()).toBeVisible();
   await page.locator("#heatmap-toggle-button").click();
   await page.locator("#heatmap-metric-select").selectOption("temperature_c");
   // The drive-rated bay can only reach "warning" once its SMART summary loads.
   if (bays === BAYS) await expect(page.locator('#slot-grid [data-slot="5"]')).toHaveAttribute("data-heatmap-band", "warning");
-  await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
+  if (bays) await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
+  else await expect(page.locator("#slot-grid .slot-tile.heatmap-active").first()).toBeVisible();
   return errors;
 }
 
@@ -294,6 +338,72 @@ for (const [index, shape] of SHAPES.entries()) {
       if (!hidesLabels) {
         for (const tile of tiles) {
           expect(tile.lines.map((line) => line.line), where(tile)).toEqual(expect.arrayContaining(["slot-device", "slot-pool"]));
+        }
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1123: the same guarantee for storage-view cards (NVMe carrier boards,
+// SATADOM and embedded boot media), in both colour modes. The primary
+// device line is checked by name: a visible serial line below it is a
+// different field.
+const CARD_LINES = ["slot", "size-chip", "device", "summary", "tertiary"].map((part) => `.storage-view-runtime-card-${part}`).join(", ");
+
+const CARD_CASES = [
+  ...CARD_VIEWS.map((view) => ({ view: `storage view ${view}`, open: (page) => openHeatMap(page, cardFixture, null, `?storage_view_id=${view}`) })),
+  { view: "live nvme-carrier face", open: (page) => openHeatMap(page, liveNvmeFixture, LIVE_NVME.bays) },
+];
+
+for (const { view, open } of CARD_CASES) {
+  test(`value badge leaves every card text line visible on ${view}`, async ({ page }) => {
+    const errors = await open(page);
+    for (const colours of ["bands", "relative"]) {
+      await page.locator("#heatmap-colour-select").selectOption(colours);
+      for (const viewport of VIEWPORTS) {
+        await page.setViewportSize(viewport);
+        expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
+        const tiles = await page.locator("#slot-grid .slot-tile.heatmap-active").evaluateAll((elements, selector) => elements.map((tile) => {
+          const box = (rect) => ({ left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom });
+          const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+            && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+          const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1
+            && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+          const badgeElement = tile.querySelector(".slot-heatmap-value");
+          const badge = box(badgeElement.getBoundingClientRect());
+          const tileBox = box(tile.getBoundingClientRect());
+          const lines = [];
+          for (const line of tile.querySelectorAll(selector)) {
+            if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+            const range = document.createRange();
+            range.selectNodeContents(line);
+            const rects = [...range.getClientRects()].filter((rect) => rect.width > 0).map(box);
+            lines.push({
+              line: line.className.replace("storage-view-runtime-card-", ""),
+              text: line.textContent.trim(),
+              covered: rects.some((rect) => overlap(rect, badge)),
+              inTile: rects.every((rect) => inside(rect, tileBox)),
+            });
+          }
+          return {
+            slot: tile.dataset.slot,
+            badge,
+            badgeInTile: inside(badge, tileBox),
+            badgeClipped: badgeElement.scrollHeight > badgeElement.clientHeight + 1 || badgeElement.scrollWidth > badgeElement.clientWidth + 1,
+            lines,
+          };
+        }), CARD_LINES);
+        expect(tiles.length, `${view} has heat-map cards`).toBeGreaterThan(0);
+        const where = (tile, line = "") => `${view} ${colours} at ${viewport.width} px, card ${tile.slot} ${line}`;
+        for (const tile of tiles) {
+          expect(tile.badgeInTile, where(tile, "badge inside the card")).toBe(true);
+          expect(tile.badgeClipped, where(tile, "badge text clipped")).toBe(false);
+          expect(tile.lines.map((line) => line.line), where(tile, "primary device line shown")).toContain("device");
+          for (const line of tile.lines) {
+            expect(line.covered, where(tile, `${line.line} "${line.text}" covered by the badge ${JSON.stringify(tile.badge)}`)).toBe(false);
+            expect(line.inTile, where(tile, `${line.line} inside the card`)).toBe(true);
+          }
         }
       }
     }

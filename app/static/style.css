@@ -1832,10 +1832,17 @@ textarea {
   white-space: nowrap;
 }
 
-/* #1112: keyboard focus unfolds a card's cut-off lines; hover has a title. */
-:is(.sas-fabric-item, .fabric-focus-card, .topology-pill):focus-visible :is(span, small) {
+/* #1112: keyboard focus or an opened path pill unfolds cut-off lines; hover
+   has a title. */
+:is(.sas-fabric-item, .fabric-focus-card, .topology-pill):focus-visible :is(span, small),
+.topology-pill[aria-expanded="true"] :is(span, small) {
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+:is(.fabric-focus-card, .topology-pill):focus-visible {
+  outline: 2px solid var(--selected);
+  outline-offset: 2px;
 }
 
 .fabric-warning-list:empty {
@@ -4683,10 +4690,11 @@ button.fabric-trace-crumb:hover {
     gap: 4px;
   }
 
+  /* #1124: the right gutter holds the state chip above the LED. */
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
     height: 76px;
     min-height: 76px;
-    padding: 8px 18px 8px 8px;
+    padding: 8px 32px 8px 8px;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-status-led {
@@ -6121,6 +6129,15 @@ button.fabric-trace-crumb:hover {
   color: #f2fbff;
   line-height: 1.05;
   min-width: 0;
+}
+
+/* #1123 */
+.storage-view-runtime-card-head > .slot-heatmap-value {
+  position: static;
+  width: auto;
+  min-height: 0;
+  transform: none;
+  white-space: nowrap;
 }
 
 .storage-view-runtime-card-size-chip {

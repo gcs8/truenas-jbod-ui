@@ -2,11 +2,15 @@
 
 // Accessibility and narrow-layout regressions found by the UI coverage crawl:
 // - #1110 bay tiles and the Rename button: the accessible name contains the
-//   visible text (axe label-content-name-mismatch).
+//   visible text (axe label-content-name-mismatch), punctuation-only and
+//   non-ASCII labels included (Chromium's own accessibility tree).
 // - #1111 Disk Path path-member facts: valid dl > div > dt + dd markup (axe
 //   definition-list, dlitem).
-// - #1112 ellipsized Connections, focus-strip and topology-pill text carries
-//   its full text in a title and unfolds when the control has keyboard focus.
+// - #1112 ellipsized Connections, focus-strip, topology and multipath-path
+//   text carries its full text in a title; each control is a Tab stop with a
+//   focus ring and unfolds while focused; path pills open and close with
+//   Enter and Space.
+// - #1124 a UniFi bay's state chip clears its heat value and text lines.
 // - #1114, #1115, #1109, #1116 and the header part of #1102 at 390 px: no
 //   overlapping controls, no page-wide sideways scroll, chassis faces scroll
 //   inside their own shell, heat values stay on one line.
@@ -37,7 +41,7 @@ from markupsafe import Markup
 import scripts.build_current_source_browser_fixture as builder
 from app import __version__
 from app.config import Settings
-from app.models.domain import InventorySnapshot, StorageViewRuntimePayload
+from app.models.domain import InventorySnapshot, MultipathView, StorageViewRuntimePayload
 from app.services.public_demo_fixture import build_public_demo_snapshot_bundle, load_public_demo_fixture
 
 WRITE_POLICY = {"enabled": True, "mode": "network", "reason": "", "public_origin": None}
@@ -81,6 +85,20 @@ runtime["views"].append(manual)
 demo_runtime = StorageViewRuntimePayload.model_validate(runtime)
 demo = bundle.primary_snapshot
 demo = demo.model_copy(update={"slots": [slot.model_copy(update={"led_supported": True}) for slot in demo.slots]})
+# Bay 03 has two paths; a long controller label makes its path pills cut off.
+multipath = MultipathView(name="synthetic-mpath", device_name="multipath/synthetic-03", mode="ACTIVE/PASSIVE", state="OPTIMAL", members=[
+    {"device_name": "demo-disk-03", "state": state, "controller_label": f"demo-hba-{index} CPU2 SLOT7 PCI-E 4.0 X16 (synthetic riser B) firmware 24.00.00.00-SYNTHETIC"}
+    for index, state in enumerate(("ACTIVE", "PASSIVE"))
+])
+demo = demo.model_copy(update={"slots": [slot.model_copy(update={"multipath": multipath}) if slot.slot == 3 else slot for slot in demo.slots]})
+# Linux mount labels that are punctuation only, or not ASCII (#1110).
+MOUNTS = ["/--", "/", "/数据", "/var", "/._-"]
+mounts = dump(demo)
+mounts["selected_system_platform"] = "linux"
+mounts["systems"][0]["platform"] = "linux"
+for index, label in enumerate(MOUNTS):
+    mounts["slots"][index]["pool_name"] = label
+mounts = InventorySnapshot.model_validate(mounts)
 
 # Long controller facts, so Connections and the focus strip must ellipsize.
 fabric = dump(bundle.sas_fabric)
@@ -149,7 +167,7 @@ history_html = env.get_template("dashboard.html").render(
     url_for=lambda name, path: "/static/" + path,
 )
 
-pages = {"demo": (demo, demo_runtime)}
+pages = {"demo": (demo, demo_runtime), "mounts": (mounts, empty_runtime)}
 for name, snapshot in {
     "grouped": variant("synthetic-grouped-12", "Synthetic Grouped 12 Bay", "front-drive", 1, 12, (4, 4, 4)),
     # A plain UniFi face (no model print) and a UNVR Pro, whose bays 1-3 share
@@ -357,6 +375,71 @@ test("bay tiles and the Rename button name what they show (#1110)", async ({ pag
   expect(errors).toEqual([]);
 });
 
+// Chromium's own accessible name for each match, read from its accessibility
+// tree over CDP rather than recomputed in the test.
+async function chromiumNames(page, selector) {
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    const { root: doc } = await cdp.send("DOM.getDocument", { depth: 0 });
+    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: doc.nodeId, selector });
+    const names = [];
+    for (const nodeId of nodeIds) {
+      const { nodes } = await cdp.send("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false });
+      names.push(nodes[0]?.name?.value ?? null);
+    }
+    return names;
+  } finally {
+    await cdp.detach();
+  }
+}
+
+// The text a bay shows, in order. A missing heat value's "--" placeholder is
+// the one shown text that is not a fact, so it stays out of the name.
+async function shownBayText(page, selector) {
+  return page.locator(selector).evaluateAll((tiles) => tiles.map((tile) => {
+    const shown = [];
+    const walk = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) {
+      const text = walk.currentNode.textContent.trim();
+      const parent = walk.currentNode.parentElement;
+      if (!text || !parent.checkVisibility({ visibilityProperty: true })) continue;
+      if (parent.matches(".heatmap-missing .slot-heatmap-value") && text === "--") continue;
+      shown.push(text);
+    }
+    return { slot: tile.dataset.slot, shown };
+  }));
+}
+
+test("bay names keep punctuation-only and non-ASCII labels (#1110)", async ({ page }) => {
+  const errors = await openMain(page, "mounts", DESKTOP[0]);
+  const mounts = ["/--", "/", "/数据", "/var", "/._-"];
+  const tiles = "#slot-grid .slot-tile[data-slot]";
+  for (const heat of [false, true]) {
+    if (heat) await enableHeatMap(page);
+    const label = heat ? "Heat Map" : "default";
+    for (const [index, mount] of mounts.entries()) {
+      await expect(page.locator(`${tiles}[data-slot="${index}"] .slot-pool`), `${label}: bay ${index} shows its mount`).toHaveText(mount);
+    }
+    const shown = await shownBayText(page, tiles);
+    const names = await chromiumNames(page, tiles);
+    expect(names).toHaveLength(shown.length);
+    for (const [index, bay] of shown.entries()) {
+      // Every shown line, exactly and in order, then the health it does not show.
+      const prefix = `Slot ${bay.shown.join(", ")}, `;
+      expect(names[index].slice(0, prefix.length), `${label}: bay ${bay.slot} Chromium name`).toBe(prefix);
+      expect(names[index].length, `${label}: bay ${bay.slot} name ends with its health`).toBeGreaterThan(prefix.length);
+      await expect(page.locator(tiles).nth(index), `${label}: Playwright agrees`).toHaveAccessibleName(names[index]);
+    }
+    const bySlot = new Map(shown.map((bay, index) => [Number(bay.slot), names[index]]));
+    for (const [slot, mount] of mounts.entries()) {
+      expect(bySlot.get(slot), `${label}: bay ${slot} names mount ${mount}`).toContain(`, ${mount}, `);
+    }
+    await expect(page.locator(`${tiles}[data-slot="0"]`)).toMatchAriaSnapshot(`- button /, \\/--, /`);
+    expect(await axeViolations(page, ["label-content-name-mismatch"]), label).toEqual([]);
+  }
+  expect(errors).toEqual([]);
+});
+
 // ---- #1111 -----------------------------------------------------------------
 
 test("Disk Path path-member facts are dl > div > dt + dd pairs (#1111)", async ({ page }) => {
@@ -380,7 +463,8 @@ test("Disk Path path-member facts are dl > div > dt + dd pairs (#1111)", async (
 // ---- #1112 -----------------------------------------------------------------
 
 // Every ellipsized line names its full text in a title on itself or its
-// control, and shows the whole text while that control has keyboard focus.
+// control. Keyboard users reach each such control with Tab, see a focus
+// ring, and read the whole text while it has focus.
 async function truncatedLines(page, selector) {
   return page.locator(selector).evaluateAll((elements) => elements
     .filter((element) => element.getBoundingClientRect().width > 0 && element.scrollWidth > element.clientWidth + 1
@@ -392,43 +476,90 @@ async function truncatedLines(page, selector) {
     }));
 }
 
-async function expectRevealedOnFocus(page, controlSelector, lineSelector, label) {
+const cutOff = (control, lineSelector) => control.locator(lineSelector).evaluateAll((elements) => elements
+  .filter((element) => element.scrollWidth > element.clientWidth + 1).map((element) => element.textContent.trim()));
+
+// Tab into control `index` from the tab stop before it: the control itself
+// is never focused by the test.
+async function tabInto(page, selector, index, label) {
+  const position = await page.evaluate(({ selector, index }) => {
+    const target = document.querySelectorAll(selector)[index];
+    const stops = Array.from(document.querySelectorAll("button, a[href], input:not([type=hidden]), select, textarea, summary, [tabindex]"))
+      .filter((element) => element.tabIndex >= 0 && !element.disabled && element.checkVisibility({ visibilityProperty: true }));
+    const at = stops.indexOf(target);
+    if (at > 0) stops[at - 1].focus();
+    return at;
+  }, { selector, index });
+  expect(position, `${label}: control ${index} is a tab stop`).toBeGreaterThan(0);
+  await page.keyboard.press("Tab");
+  const focus = await page.evaluate(({ selector, index }) => {
+    const element = document.activeElement;
+    const style = getComputedStyle(element);
+    return {
+      reached: element === document.querySelectorAll(selector)[index],
+      focusVisible: element.matches(":focus-visible"),
+      outline: `${style.outlineStyle} ${style.outlineWidth}`,
+      outlineWidth: parseFloat(style.outlineWidth),
+    };
+  }, { selector, index });
+  expect(focus.reached, `${label}: Tab reaches control ${index}`).toBe(true);
+  expect(focus.focusVisible, `${label}: control ${index} shows keyboard focus`).toBe(true);
+  // Chromium's own two-tone ring ("auto"), or a solid ring at least 2 px wide.
+  expect(focus.outline, `${label}: control ${index} focus ring`).toMatch(/^(auto|solid) /);
+  if (focus.outline.startsWith("solid")) expect(focus.outlineWidth, `${label}: control ${index} focus ring width`).toBeGreaterThanOrEqual(2);
+}
+
+async function expectKeyboardReveal(page, controlSelector, lineSelector, label, { truncates = true, disclosure = false } = {}) {
   const lines = await truncatedLines(page, `${controlSelector} ${lineSelector}`);
-  expect(lines.length, `${label}: the fixture makes at least one line ellipsize`).toBeGreaterThan(0);
+  if (truncates) expect(lines.length, `${label}: the fixture makes at least one line ellipsize`).toBeGreaterThan(0);
   for (const line of lines) {
     expect(line.title || "", `${label}: "${line.text}" has its full text in a title`).toContain(line.text);
   }
   const controls = page.locator(controlSelector);
   const count = await controls.count();
+  expect(count, `${label}: controls rendered`).toBeGreaterThan(0);
+  let checked = 0;
   for (let index = 0; index < count; index += 1) {
     const control = controls.nth(index);
-    const before = await control.locator(lineSelector).evaluateAll((elements) => elements.some((element) => element.scrollWidth > element.clientWidth + 1));
-    if (!before) continue;
-    await control.focus();
-    await page.keyboard.press("Shift");
-    const still = await control.locator(lineSelector).evaluateAll((elements) => elements
-      .filter((element) => element.scrollWidth > element.clientWidth + 1).map((element) => element.textContent.trim()));
-    expect(still, `${label}: focused control ${index} shows its whole text`).toEqual([]);
+    const before = await cutOff(control, lineSelector);
+    // Controls with nothing cut off still need a tab stop and a ring; check the first.
+    if (!before.length && (index > 0 || checked)) continue;
+    await tabInto(page, controlSelector, index, label);
+    expect(await cutOff(control, lineSelector), `${label}: focused control ${index} shows its whole text`).toEqual([]);
+    if (disclosure && before.length) {
+      // A disclosure keeps the text open after focus leaves, and closes again.
+      await expect(control).toHaveAttribute("aria-expanded", "false");
+      await page.keyboard.press("Enter");
+      await expect(control).toHaveAttribute("aria-expanded", "true");
+      await page.keyboard.press("Tab");
+      expect(await cutOff(control, lineSelector), `${label}: opened control ${index} stays open after Tab`).toEqual([]);
+      await page.keyboard.press("Shift+Tab");
+      await page.keyboard.press("Space");
+      await expect(control).toHaveAttribute("aria-expanded", "false");
+      await page.keyboard.press("Tab");
+      expect(await cutOff(control, lineSelector), `${label}: closed control ${index} is cut off again`).toEqual(before);
+    }
+    checked += 1;
   }
+  return checked;
 }
 
 for (const viewport of [NARROW, DESKTOP[0]]) {
-  test(`truncated Connections, focus-strip and topology text can be read in full at ${viewport.width} px (#1112)`, async ({ page }) => {
+  test(`truncated Connections, focus-strip, topology and path text can be read in full from the keyboard at ${viewport.width} px (#1112)`, async ({ page }) => {
     const errors = await openMain(page, "demo", viewport);
     await openConnections(page);
-    await expectRevealedOnFocus(page, "#sas-fabric-panel .sas-fabric-item", ":is(.sas-fabric-item-label, .sas-fabric-item-meta)", "Connections");
+    await expectKeyboardReveal(page, "#sas-fabric-panel .sas-fabric-item", ":is(.sas-fabric-item-label, .sas-fabric-item-meta)", "Connections");
     await page.locator('#slot-grid .slot-tile[data-slot="3"]').click();
-    await expect(page.locator(".topology-pill").first()).toBeVisible();
-    for (const line of await truncatedLines(page, ".topology-pill small")) {
-      expect(line.title || "", `topology pill "${line.text}" has its full text in a title`).toContain(line.text);
-    }
+    await expect(page.locator("#topology-context .topology-pill").first()).toBeVisible();
+    await expectKeyboardReveal(page, "#topology-context .topology-pill", "small", "topology pills", { truncates: false });
+    await expect(page.locator("#multipath-context .topology-pill")).toHaveCount(2);
+    await expectKeyboardReveal(page, "#multipath-context .topology-pill", "small", "multipath pills", { disclosure: true });
+    await capture(page, `multipath-${viewport.width}`, page.locator("#multipath-context"));
 
     const fabricErrors = await routeSynthetic(page, fixture.fabric.html);
     await page.goto(`${ORIGIN}/sas-fabric?mode=lanes`);
     await expect(page.locator("#fabric-focus-strip .fabric-focus-card").first()).toBeVisible();
-    for (const line of await truncatedLines(page, "#fabric-focus-strip .fabric-focus-card small")) {
-      expect(line.title || "", `focus card "${line.text}" has its full text in a title`).toContain(line.text);
-    }
+    await expectKeyboardReveal(page, "#fabric-focus-strip .fabric-focus-card", ":is(span, small)", "focus strip", { truncates: false });
     expect([...errors, ...fabricErrors]).toEqual([]);
   });
 }
@@ -482,10 +613,52 @@ for (const viewport of [NARROW, ...DESKTOP]) {
       const values = await page.locator("#slot-grid .slot-heatmap-value").evaluateAll((badges) => badges.map((badge) => {
         const range = document.createRange();
         range.selectNodeContents(badge);
-        return { text: badge.textContent.trim(), lines: new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top))).size };
+        return {
+          text: badge.textContent.trim(),
+          lines: new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top))).size,
+          clipped: badge.scrollWidth > badge.clientWidth + 1,
+        };
       }));
       expect(values).toHaveLength(bays);
-      for (const value of values) expect(value.lines, `"${value.text}" wraps`).toBe(1);
+      for (const value of values) {
+        expect(value.lines, `"${value.text}" wraps`).toBe(1);
+        expect(value.clipped, `"${value.text}" is cut off`).toBe(false);
+      }
+      // #1124: the state chip (the bay's ::after) clears the value and every
+      // text line, and stays inside the bay.
+      const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
+        const style = getComputedStyle(tile, "::after");
+        const px = (value) => parseFloat(value) || 0;
+        const extra = style.boxSizing === "border-box" ? [0, 0] : [
+          px(style.paddingLeft) + px(style.paddingRight) + px(style.borderLeftWidth) + px(style.borderRightWidth),
+          px(style.paddingTop) + px(style.paddingBottom) + px(style.borderTopWidth) + px(style.borderBottomWidth),
+        ];
+        const width = px(style.width) + extra[0];
+        const height = px(style.height) + extra[1];
+        const shift = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+        const box = tile.getBoundingClientRect();
+        const left = box.left + tile.clientLeft + (style.left !== "auto" ? px(style.left) : tile.clientWidth - px(style.right) - width) + shift.e;
+        const top = box.top + tile.clientTop + (style.top !== "auto" ? px(style.top) : tile.clientHeight - px(style.bottom) - height) + shift.f;
+        const chip = { left, top, right: left + width, bottom: top + height };
+        const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+        const hits = [];
+        const badge = tile.querySelector(".slot-heatmap-value");
+        if (badge && overlap(chip, badge.getBoundingClientRect())) hits.push("value badge");
+        for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary, .slot-heatmap-value")) {
+          if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+          const range = document.createRange();
+          range.selectNodeContents(line);
+          if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
+        }
+        const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
+        return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
+      }));
+      expect(chips).toHaveLength(bays);
+      for (const chip of chips) {
+        expect(chip.content, `bay ${chip.slot} draws a state chip`).not.toBe("none");
+        expect(chip.hits, `bay ${chip.slot} chip ${JSON.stringify(chip.chip)} covers`).toEqual([]);
+        expect(chip.inside, `bay ${chip.slot} chip ${JSON.stringify(chip.chip)} inside the bay`).toBe(true);
+      }
       expectCleanLayout(await layoutReport(page, ".enclosure-panel"), "UniFi heat map");
       await capture(page, `${face}-heatmap-${viewport.width}`, page.locator(".enclosure-panel"));
       expect(errors).toEqual([]);

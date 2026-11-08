@@ -91,6 +91,9 @@ for (const [label, source] of SOURCES) {
 
     assert.doesNotMatch(html, /\sdata-unsafe=/);
     assert.match(html, /class="topology-pill path-state-[a-z0-9_-]+"/);
+    // #1112 review: a path pill is a closed disclosure button by default.
+    assert.match(html, /<button type="button" class="topology-pill [^"]+" data-path-pill="[^"]*" aria-expanded="false">/);
+    assert.doesNotMatch(html, /<div class="topology-pill/);
     // #1112: the cut-off detail repeats in an escaped title.
     assert.match(html, /<small title="ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A">ACTIVE&quot; DATA-UNSAFE=&quot;YES \/ Controller A<\/small>/);
   });

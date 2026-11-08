@@ -293,6 +293,14 @@
   const detailSmartNote = document.getElementById("detail-smart-note");
   const topologyContext = document.getElementById("topology-context");
   const multipathContext = document.getElementById("multipath-context");
+  const openPathPills = new Set();
+  multipathContext?.addEventListener("click", (event) => {
+    const pill = event.target.closest("[data-path-pill]");
+    if (!pill) return;
+    const key = pill.dataset.pathPill;
+    openPathPills[openPathPills.has(key) ? "delete" : "add"](key);
+    pill.setAttribute("aria-expanded", openPathPills.has(key));
+  });
   const secondaryContextTitle = document.getElementById("secondary-context-title");
   const warningList = document.getElementById("warning-list");
   const searchBox = document.getElementById("search-box");
@@ -402,9 +410,8 @@
     return lookup.byNumber.get(slotNumber) || null;
   }
 
-  // A bay prints the number the server labelled it with, so a profile whose
-  // chassis counts from 1 (slot_number_base, the UniFi NVRs in #1068) reads
-  // the same on every tab. A bay missing from the snapshot uses that base.
+  // A bay prints its server label, so a chassis counting from 1
+  // (slot_number_base, UniFi NVRs, #1068) reads the same on every tab.
   function formatSlotLabel(slotNumber) {
     const number = Number(slotNumber);
     if (!Number.isInteger(number)) {
@@ -2390,10 +2397,8 @@
     return `<span class="sas-fabric-bay-chip ${populated ? "is-outside" : "is-empty"}" title="${label}">${label}</span>`;
   }
 
-  // The bay grid is the enclosure, with the affected bays lit: same rows in the
-  // same order, same column groups, same gaps, so a bay number never moves
-  // between the Enclosure tab and the Storage Fabric tab. `limit` only applies
-  // to the flat fallback used when the active view has no layout rows.
+  // The enclosure grid with affected bays lit: same rows, groups and gaps as
+  // the Enclosure tab. `limit` caps only the flat no-layout fallback.
   function renderSasFabricBayChips(slots, limit = 60, expandKey = null) {
     const sorted = sasFabricSortedSlots(slots);
     if (!sorted.length) {
@@ -3008,9 +3013,8 @@
     }
   }
 
-  // The server renders the release note once. While its first check runs or
-  // has failed (DNS not ready at boot), poll a few times, trailing the
-  // server's 60 s / 5 min / hourly retries, so it recovers without a reload.
+  // While the first release check runs or has failed (DNS not ready at boot),
+  // poll a few times, trailing the server 60 s / 5 min / hourly retries.
   const RELEASE_NOTE_POLL_DELAYS_MS = [20000, 75000, 320000];
 
   function releaseNoteNeedsRefresh(status) {
@@ -3103,10 +3107,8 @@
     };
   }
 
-  // Every inventory refresh carries the server's current policy, so a page
-  // that was told "no" once follows the server again instead of staying
-  // locked until a reload. The server cannot see this page's sign-in, so a
-  // signed-in Basic-mode page keeps its own enabled state.
+  // Each refresh carries the server policy, so a page told "no" follows the
+  // server again; a signed-in Basic-mode page keeps its own enabled state.
   function syncWritePolicyFromSnapshot(snapshot) {
     const raw = snapshot?.write_policy;
     if (!raw || typeof raw !== "object") {
@@ -3289,10 +3291,8 @@
     writePolicyNotice.classList.remove("hidden");
   }
 
-  // The configured public origin comes from the bootstrap and from inventory
-  // refreshes; sign-in, sign-out and 401 handling send policies that do not
-  // carry it. Keep the last known origin so wrong-origin guidance can still
-  // name the address to open. A payload that does carry one wins.
+  // The public origin comes from the bootstrap and inventory refreshes; auth
+  // policies omit it, so keep the last known one for wrong-origin guidance.
   function applyWritePolicy(policy) {
     const retainedOrigin = state.writePolicy?.publicOrigin || "";
     const nextPolicy = normalizeWritePolicy(policy);
@@ -3825,9 +3825,8 @@
     return "UNKNOWN";
   }
 
-  // A Linux or ESXi appliance with one array mounts it at the same path on
-  // every bay, so that path cannot tell bays apart (#1066). TrueNAS and
-  // QuantaStor pool names keep their tile line.
+  // One Linux or ESXi array mounts at the same path on every bay, which cannot
+  // tell bays apart (#1066); TrueNAS and QuantaStor pools keep their line.
   function sharedMountPoolName(slots, platform) {
     const key = String(platform || "").toLowerCase();
     if (key !== "linux" && key !== "esxi") return null;
@@ -3867,9 +3866,8 @@
     return Boolean(slotEnclosureId) && Boolean(enclosureId) && slotEnclosureId === enclosureId;
   }
 
-  // A chassis view drawn with a layout whose bay order is unvalidated (#1068)
-  // names a disk only from a saved manual mapping, sent on the view slot. Its
-  // bays never borrow the live bay at the same index, whatever the payload says.
+  // A chassis view with an unvalidated bay order (#1068) names disks only from
+  // saved manual mappings; it never borrows the live bay at the same index.
   function storageViewSlotIsManualOnly(slot) {
     return slot?.manual_mapping_only === true;
   }
@@ -6173,11 +6171,7 @@
     ["rgb", "alpha", "border-alpha", "surface-rgb", "text-rgb", "badge-rgb"]
       .forEach((name) => tile.style.removeProperty(`--heatmap-${name}`));
     if (tile.dataset) delete tile.dataset.heatmapBand;
-    Array.from(tile.children).forEach((child) => {
-      if (child.classList?.contains("slot-heatmap-value")) {
-        child.remove();
-      }
-    });
+    tile.querySelectorAll(".slot-heatmap-value").forEach((badge) => badge.remove());
   }
 
   function applyHeatmapToTile(tile, context, entryKey) {
@@ -6189,18 +6183,21 @@
     const metric = context.metric;
     const badge = document.createElement("span");
     badge.className = "slot-heatmap-value";
+    // #1123: NVMe cards show it in their head row.
+    const host = tile.querySelector(".storage-view-runtime-card--nvme .storage-view-runtime-card-head") || tile;
     if (tile.classList.contains("state-empty") || !record || !Number.isFinite(record.value)) {
       tile.classList.add("heatmap-missing");
       badge.textContent = "--";
+      badge.dataset.placeholder = "";
       badge.title = `${metric.label}: unknown`;
-      tile.appendChild(badge);
+      host.appendChild(badge);
       return;
     }
     const intensity = record.band ? null : heatmapIntensity(record, context);
     if (!record.band && intensity === null) {
       tile.classList.add("heatmap-missing");
       badge.textContent = metric.format(record.value);
-      tile.appendChild(badge);
+      host.appendChild(badge);
       return;
     }
     const rgb = record.band ? record.band.rgb : heatmapRgbForIntensity(intensity);
@@ -6215,7 +6212,7 @@
     }).forEach(([name, value]) => tile.style.setProperty(`--heatmap-${name}`, value.join(", ")));
     badge.textContent = metric.format(record.value);
     badge.title = `${metric.label}: ${metric.format(record.value)}`;
-    tile.appendChild(badge);
+    host.appendChild(badge);
   }
 
   function refreshHeatmapTileOverlays(context = null) {
@@ -6752,14 +6749,15 @@
   }
 
   // #1110: a bay's name is its shown text in order (heat value too), then
-  // what it does not show: "Slot 05, sda, tank, 38 C, online".
+  // what it does not show: "Slot 05, sda, tank, 38 C, online". Every label
+  // counts, "/--" too; only a missing value's "--" placeholder is no fact.
   function bayName(tile, detail = tile.dataset.detail, lead = tile.dataset.lead) {
     Object.assign(tile.dataset, { detail, lead });
     const shown = [];
     const walk = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
     while (walk.nextNode()) {
       const text = walk.currentNode.textContent.trim();
-      if (/[\p{L}\p{N}]/u.test(text)) shown.push(text);
+      if (text && !walk.currentNode.parentElement.hasAttribute("data-placeholder")) shown.push(text);
     }
     tile.setAttribute("aria-label", lead + [...shown, detail].filter(Boolean).join(", "));
   }
@@ -7042,9 +7040,8 @@
     scheduleStateChipPlacement();
   }
 
-  // Every tile kind resolves through the same delegated handlers on the grid:
-  // live bays, live NVMe carriers and saved storage views. Tiles carry no
-  // listeners of their own, so a re-render attaches nothing per bay.
+  // Every tile kind uses the grid delegated handlers; tiles carry no
+  // listeners, so a re-render attaches nothing per bay.
   function delegatedGridSlot(tile) {
     const slotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(slotNumber)) {
@@ -7210,9 +7207,8 @@
     });
   }
 
-  // Walks the live grid and a freshly rendered one together. When rows, groups,
-  // dividers and slot order match, it collects the [current, next] tile pairs;
-  // any other difference means the layout changed and returns false.
+  // Pairs live and fresh tiles when rows, groups, dividers and slot order
+  // match; any other difference returns false (layout changed).
   function matchGridStructure(current, next, pairs) {
     if (current.childElementCount !== next.childElementCount) {
       return false;
@@ -7389,9 +7385,8 @@
     return patched ? "patched" : "unchanged";
   }
 
-  // The renderers hide the tooltip before building. When the hovered or focused
-  // tile survives the commit, no new mouseover/focusin fires on it, so redraw
-  // its tooltip here instead of leaving it empty until the pointer moves away.
+  // Renders hide the tooltip; a hovered or focused tile that survives the
+  // commit gets no new mouseover/focusin, so redraw its tooltip here.
   function restoreReusedTileTooltip(outcome) {
     if (outcome === "replaced" || !Number.isInteger(state.hoveredSlot)) {
       return;
@@ -9868,7 +9863,7 @@
               (section) => `
                 <div class="topology-summary">
                   <div class="topology-label">${escapeHtml(section.label)}</div>
-                  <div class="topology-pill-row">${renderMultipathPills(section.members)}</div>
+                  <div class="topology-pill-row">${renderMultipathPills(section.members, openPathPills)}</div>
                 </div>
               `
             )
@@ -9876,7 +9871,7 @@
         : `
             <div class="topology-summary">
               <div class="topology-label">Member Paths</div>
-              <div class="topology-pill-row">${renderMultipathPills(multipath.members)}</div>
+              <div class="topology-pill-row">${renderMultipathPills(multipath.members, openPathPills)}</div>
             </div>
           `}
     `;
@@ -10002,7 +9997,8 @@
     return `Multipath is degraded: ${fragments.join(", ")}.`;
   }
 
-  function renderMultipathPills(members) {
+  // #1112: a path pill is a button that opens its cut-off detail in full.
+  function renderMultipathPills(members, open = new Set()) {
     if (!members.length) {
       return '<div class="warning-item muted compact">No member-path detail returned.</div>';
     }
@@ -10014,11 +10010,13 @@
         if (member.controller_label) {
           detailParts.push(member.controller_label);
         }
+        const detail = escapeHtml(detailParts.join(" / "));
+        const key = `${member.device_name} ${detailParts.join(" / ")}`;
         return `
-          <div class="topology-pill path-state-${sasFabricClassToken(stateName)}">
+          <button type="button" class="topology-pill path-state-${sasFabricClassToken(stateName)}" data-path-pill="${escapeHtml(key)}" aria-expanded="${open.has(key)}">
             <span>${escapeHtml(member.device_name)}</span>
-            <small title="${escapeHtml(detailParts.join(" / "))}">${escapeHtml(detailParts.join(" / "))}</small>
-          </div>
+            <small title="${detail}">${detail}</small>
+          </button>
         `;
       })
       .join("");
@@ -10245,10 +10243,8 @@
     return { ...counts, populated, total, headline };
   }
 
-  // Where a bay source code means something else on a non-TrueNAS platform.
-  // Linux and ESXi bays are drawn from the enclosure layout and filled over
-  // SSH; a bay number on Linux comes from the UniFi storage tool and on ESXi
-  // from StorCLI (#1066).
+  // Bay source codes off TrueNAS: Linux numbers come from the UniFi storage
+  // tool, ESXi ones from StorCLI (#1066).
   function platformMappingSourceLabel(source, platform) {
     const key = String(platform || "").toLowerCase();
     const apiCodes = ["api", "api-slot", "api-slot-fallback"];
@@ -10323,9 +10319,8 @@
     return null;
   }
 
-  // The snapshot's locate card describes the enclosure. A storage view such
-  // as an NVMe carrier or boot devices, where no slot has a light, says so
-  // instead of repeating it (#950). Chassis views keep the card as reported.
+  // Storage views with no bay lights (NVMe carriers, boot devices) say so
+  // instead of repeating the enclosure locate card (#950).
   function locateCapabilityForView(capability, view) {
     if (!capability || !view || isLiveStyledStorageView(view)) {
       return capability;
@@ -10831,9 +10826,8 @@
     renderCacheTimingChips();
   }
 
-  // The 1 Hz tick only runs while something on screen counts down: a scheduled
-  // auto refresh, or the cache chips shown with UI Timing (#461). Paused, off,
-  // and "Refreshing..." labels are static and are rendered by the state change.
+  // The 1 Hz tick runs only while a scheduled refresh or UI Timing cache chip
+  // counts down (#461); static labels render on state change.
   function timingTickNeeded() {
     if (state.snapshotMode) {
       return false;

@@ -382,8 +382,9 @@ test("bay tiles get a short accessible name and point at the tooltip for the res
   assert.match(TEMPLATE, /id="slot-tooltip"[^>]*role="tooltip"/);
 });
 
-test("a bay's name keeps every shown label, including non-ASCII text, and skips placeholders", () => {
-  // Text nodes in document order, as a TreeWalker over the tile returns them.
+test("a bay's name keeps every shown label, including non-ASCII and punctuation-only text, and skips placeholders", () => {
+  // Text nodes in document order, as a TreeWalker over the tile returns them;
+  // { placeholder } marks the missing-value badge's text.
   const tileWith = (texts) => {
     const attributes = {};
     return {
@@ -403,7 +404,12 @@ test("a bay's name keeps every shown label, including non-ASCII text, and skips 
           currentNode: null,
           nextNode() {
             index += 1;
-            walker.currentNode = index < tile.texts.length ? { textContent: tile.texts[index] } : null;
+            const entry = tile.texts[index];
+            const placeholder = typeof entry === "object";
+            walker.currentNode = index < tile.texts.length ? {
+              textContent: placeholder ? entry.placeholder : entry,
+              parentElement: { hasAttribute: (name) => placeholder && name === "data-placeholder" },
+            } : null;
             return walker.currentNode;
           },
         };
@@ -415,8 +421,16 @@ test("a bay's name keeps every shown label, including non-ASCII text, and skips 
   const linux = tileWith(["  ", "07", "sdh", "/数据", "38 C"]);
   bayName(linux, "online", "Slot ");
   assert.equal(linux.attributes["aria-label"], "Slot 07, sdh, /数据, 38 C, online");
-  // The missing-value badge "--" is not a label.
-  const empty = tileWith(["08", "EMPTY", "Empty", "--"]);
+  // #1110 review: punctuation-only labels such as the mounts /-- and / are
+  // shown text too.
+  const punctuation = tileWith(["00", "sda", "/--", "--"]);
+  bayName(punctuation, "online", "Slot ");
+  assert.equal(punctuation.attributes["aria-label"], "Slot 00, sda, /--, --, online");
+  const root = tileWith(["01", "sdb", "/"]);
+  bayName(root, "online", "Slot ");
+  assert.equal(root.attributes["aria-label"], "Slot 01, sdb, /, online");
+  // The missing-value badge's "--" placeholder is not a label.
+  const empty = tileWith(["08", "EMPTY", "Empty", { placeholder: "--" }]);
   bayName(empty, "empty", "Slot ");
   assert.equal(empty.attributes["aria-label"], "Slot 08, EMPTY, Empty, empty");
   // A later call (heat overlay refresh) reuses the stored detail and lead.
