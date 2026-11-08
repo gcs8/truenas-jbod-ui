@@ -79,7 +79,13 @@
       "id": "main.heatmap.temperature", "page": "main", "safety": "read", "scope": "all", "ci": true,
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"wait": 800}],
       "checks": ["heatmap"],
-      "covers": ["#heatmap-metric-select"]
+      "covers": ["#heatmap-metric-select", "#heatmap-colour-select"]
+    },
+    {
+      "id": "main.heatmap.relative", "page": "main", "safety": "read", "ci": true,
+      "description": "Relative colours stretch from the coolest to the warmest bay by design, so heat-map findings are reported as warnings here.",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-colour-select"}, {"select": "#heatmap-colour-select", "value": "relative"}, {"wait": 800}],
+      "covers": ["#heatmap-colour-select"]
     },
     {
       "id": "main.heatmap.metric", "page": "main", "safety": "read",
