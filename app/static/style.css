@@ -5062,11 +5062,10 @@ button.fabric-trace-crumb:hover {
   position: relative;
   inset: auto;
   flex: none;
-  align-self: stretch;
   width: auto;
   min-height: 24px;
   margin: auto -2px;
-  padding: 4px 2px;
+  padding: 4px 3px;
   transform: none;
 }
 
