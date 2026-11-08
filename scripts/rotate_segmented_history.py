@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -80,41 +81,53 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _history_volume_temporary_files(args: argparse.Namespace):
+    """Keep SQLite's VACUUM and sort spill on the history volume (#1094).
+
+    Only an applying run does that work; a dry run writes nothing.
+    """
+    if not args.apply:
+        return contextlib.nullcontext()
+    from history_service.sqlite_temp import maintenance_sqlite_temporary_directory
+
+    return maintenance_sqlite_temporary_directory(args.source.absolute().parent)
+
+
 def main() -> int:
     args = parse_args()
     recover_pending_rotation, rotate_segmented_history = _load_rotation_api()
-    if args.recover:
-        receipt = recover_pending_rotation(
-            source=args.source,
-            segments_directory=args.segments_dir,
-            apply=args.apply,
-        )
-    else:
-        if any(
-            value is None
-            for value in (
-                args.cutoff,
-                args.key_id,
-                args.scheduled_backup_dir,
-                args.scheduled_backup_status,
+    with _history_volume_temporary_files(args):
+        if args.recover:
+            receipt = recover_pending_rotation(
+                source=args.source,
+                segments_directory=args.segments_dir,
+                apply=args.apply,
             )
-        ):
-            raise SystemExit(
-                "--cutoff, --key-id, --scheduled-backup-dir, and "
-                "--scheduled-backup-status are required unless --recover is used."
+        else:
+            if any(
+                value is None
+                for value in (
+                    args.cutoff,
+                    args.key_id,
+                    args.scheduled_backup_dir,
+                    args.scheduled_backup_status,
+                )
+            ):
+                raise SystemExit(
+                    "--cutoff, --key-id, --scheduled-backup-dir, and "
+                    "--scheduled-backup-status are required unless --recover is used."
+                )
+            receipt = rotate_segmented_history(
+                source=args.source,
+                segments_directory=args.segments_dir,
+                cutoff=args.cutoff,
+                key_id=args.key_id,
+                scheduled_backup_directory=args.scheduled_backup_dir,
+                scheduled_backup_status_path=args.scheduled_backup_status,
+                apply=args.apply,
             )
-        receipt = rotate_segmented_history(
-            source=args.source,
-            segments_directory=args.segments_dir,
-            cutoff=args.cutoff,
-            key_id=args.key_id,
-            scheduled_backup_directory=args.scheduled_backup_dir,
-            scheduled_backup_status_path=args.scheduled_backup_status,
-            apply=args.apply,
-        )
     print(json.dumps(receipt, sort_keys=True))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

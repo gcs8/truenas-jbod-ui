@@ -26,6 +26,29 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Upgrade notes
+
+- The history service now keeps SQLite's temporary sort and VACUUM files in
+  `./history/.sqlite-tmp` (mode `0700`, created and emptied of stale files at
+  startup), whatever `TMPDIR` the Compose file sets. An older or customised
+  Compose file without `TMPDIR` for the history service, or a hardened one with
+  a tmpfs `/tmp`, no longer needs that line added by hand. Setting
+  `SQLITE_TMPDIR` for the history service still overrides it. Backups and
+  exports never include the folder (#1094).
+
+### Fixed
+
+- Fixed history index builds and startup upgrades spilling their sort files
+  outside the history volume when the history service's Compose entry had no
+  `TMPDIR`: into the container's own filesystem, or, on a read-only container,
+  its tmpfs `/tmp`, which put the sort back in memory and could bring back the
+  #1092 out-of-memory failure. The history service and the
+  segmented-history maintenance scripts now choose the history volume
+  themselves, and the free-space check before an index build looks at that same
+  folder (#1094).
+
 ## v0.24.0-beta.6 - 2026-11-07
 
 This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
