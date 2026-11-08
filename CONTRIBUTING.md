@@ -447,18 +447,33 @@ node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8
 ```
 
 A live crawl is read-only by default. The request guard admits only exact
-method + path templates from `qa/ui-routes.json`: `read` and `read-post` routes
-for every state; an unknown route, a forced appliance refresh or any write is
-aborted and fails the run. `--allow app-write-revert,led --write-system ID
---led-ledger FILE` admits the declared writes of those states, bound to that
-system, the target enclosure and the captured bay. Each write state reads its
-store through the app's API (`semantic_reads`) before the write and after the
-revert and fails when they differ. Every identify is recorded in the
-`--led-ledger` file before it leaves the browser; the crawler clears and
-verifies it on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, at
-the start of the next run, and with `--led-sweep`. Keep the ledger outside the
-run's `--out` and reuse it across runs. Disk sync previews must show and
-dismiss their confirmation and send nothing.
+method + path templates from `qa/ui-routes.json`, and reads only from the
+running state's read allowlist: its page's `reads` plus the state's own, each
+an exact manifest template with the query keys it sends. An unknown route, a
+read outside the list, a forced appliance refresh or any write is aborted and
+fails the run. Query booleans are read the way FastAPI reads them (`t`, `y`,
+`on` and so on are true; any value that is not a clean false counts as
+forced), and a backend handler with a `force`/`refresh`/`fresh` flag must
+declare it in `query_classes`. Forced refreshes pass only when a state that
+sends them declares them (`appliance_load` states, `--appliance-load`), or
+when the page declares them as `load_requests` for the target's platform (the
+QuantaStor startup re-check of locate lights): admitted only while the page
+loads, once per load, bound to the target. `--allow app-write-revert,led
+--write-system ID --led-ledger FILE` admits the declared writes of those
+states, bound to that system, the target enclosure and the captured object
+(the bay, or the enclosure for a rename, whose `object_id` must match the
+target). Each write state reads its store through the app's API
+(`semantic_reads`) before the write and after the revert and fails when they
+differ. Every identify is a lease in the `--led-ledger` file (written and
+fsynced with its directory before the request leaves; `--led-lease-ms`,
+default 20 s, at most 120 s). An independent watchdog
+(`qa/ui-crawl/led-watchdog.js`, started detached before the crawl; no identify
+leaves without its heartbeat) turns the exact bay off when the lease expires or
+the crawler disappears, SIGKILL included. The crawler also clears and verifies
+on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, at the start of
+the next run, and with `--led-sweep`. Keep the ledger outside the run's `--out`
+and reuse it across runs. Disk sync previews must show and dismiss their
+confirmation and send nothing.
 
 Exit status is derived from the evidence, never from the absence of a bad row:
 0 ok, 1 states or captures errored, 2 safety gate failed (a revert, verify,
@@ -476,8 +491,11 @@ Adding a control: give it an `id` or a `data-*` hook, then add the key to the
 safety class. A control that only exists in one configuration (for example
 the write sign-in panel) needs a state that reaches that configuration: an
 unsaved form selection, or a `fixture_only` + `ci` state with a `variant`
-fixture page (see `scripts/build_ui_crawl_fixture.py`). Adding a route: add it
-to `qa/ui-routes.json` with its class and reason. When a crawl finds a real
+fixture page (see `scripts/build_ui_crawl_fixture.py`). A control that reads a
+route the page does not already read adds that route (and its query keys) to
+the state's `reads`. Adding a route: add it to `qa/ui-routes.json` with its
+class and reason; a route whose body names an object (an alias) lists it in
+`object_keys`, and its write rules bind it to a captured placeholder. When a crawl finds a real
 defect that will be fixed separately, add it to `known_findings` with the issue
 number and remove the entry with the fix.
 

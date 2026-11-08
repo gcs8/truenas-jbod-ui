@@ -16,9 +16,18 @@ const png = require(path.join(root, "qa/ui-crawl/png"));
 const cli = require(path.join(root, "scripts/ui_crawl"));
 
 const ORIGIN = "http://ui.example.test";
-// The guard reads the reviewed route manifest (qa/ui-routes.json) for classes.
+// The guard reads the reviewed route manifest (qa/ui-routes.json) for classes,
+// and admits reads only from the running state's read allowlist (#1120).
+const TEST_READS = [
+  { method: "GET", path: "/", query: [] },
+  { method: "GET", path: "/api/inventory", query: ["system_id", "enclosure_id", "force"] },
+  { method: "GET", path: "/api/sas-fabric", query: ["system_id", "enclosure_id", "force", "refresh"] },
+  { method: "POST", path: "/api/slots/smart-batch", query: ["system_id", "enclosure_id"] },
+];
 function guard() {
-  return new RequestGuard({ origins: { ui: ORIGIN } });
+  const g = new RequestGuard({ origins: { ui: ORIGIN } });
+  g.beginState("test", { reads: TEST_READS });
+  return g;
 }
 
 test("guard admits reads and aborts foreign origins, writes and forced refreshes", () => {
@@ -253,6 +262,7 @@ test("live routing serves repeated read API answers from the cache and answers o
   let handler = null;
   const context = { route: async (_pattern, callback) => { handler = callback; } };
   const g = new RequestGuard({ origins: { ui: ORIGIN, offline: OFFLINE } });
+  g.beginState("test", { reads: [...TEST_READS, { method: "GET", path: "/copy-{n}", query: [] }] });
   const stats = { blocked: [], writes: [], routeErrors: [] };
   const cache = new ReadCache();
   const local = async (route, info) => {

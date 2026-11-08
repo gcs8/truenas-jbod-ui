@@ -1,18 +1,30 @@
 "use strict";
 
-// Identify-light ledger and out-of-band cleanup (#1117).
+// Identify-light leases and out-of-band cleanup (#1117).
 //
 // The request guard is the only place an IDENTIFY can leave the browser. The
 // moment it is admitted, before the request is forwarded, the exact target
-// (origin, bay path, system_id, enclosure_id) is written to a ledger file and
-// fsynced. The entry is removed only after the light reads back off. Anything
-// still in the ledger is cleared out of band (plain HTTP from Node, no
-// browser) by:
+// (origin, bay path, system_id, enclosure_id) is written to a ledger file as
+// a lease: the crawler's PID and an expiry a few seconds ahead (`leaseMs`,
+// capped at MAX_LEASE_MS). The write is fsynced, renamed into place and the
+// parent directory fsynced, so the entry survives host loss.
+//
+// An IDENTIFY is refused unless an independent watchdog process
+// (led-watchdog.js, started detached in its own session by the CLI) is alive
+// and watching this crawler. The watchdog does not depend on the crawler
+// surviving: it turns the exact bay off and verifies it when the lease
+// expires (identify-on time is capped even if the crawler hangs) or the
+// crawler's PID disappears (SIGKILL, crash), and keeps re-checking until the
+// owner is gone and the light has stayed off for a settle period.
+//
+// Anything still in the ledger is also cleared out of band (plain HTTP from
+// Node, no browser) by:
 //
 //   - the CLI's `finally` and its SIGTERM/SIGINT/SIGHUP handlers,
 //   - a browser disconnect (the crawl stops, then the same cleanup runs),
-//   - the startup sweep of the next run (`--led-ledger`), which covers SIGKILL,
-//     a crashed runtime or a lost host: no crawl starts until it is clear,
+//   - the startup sweep of the next run (`--led-ledger`): no crawl starts
+//     until every lease, expired or not, is clear (host loss of the crawler
+//     and its watchdog together),
 //   - `scripts/ui_crawl.js --led-sweep`, which the restricted runner calls
 //     after every write chunk whatever its exit status.
 //
@@ -24,10 +36,65 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+const DEFAULT_LEASE_MS = 20_000;
+const MAX_LEASE_MS = 120_000;
+const MIN_LEASE_MS = 500;
+// A watchdog whose heartbeat is older than this is not watching.
+const HEARTBEAT_STALE_MS = 5000;
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function fsyncDir(dir) {
+  const fd = fs.openSync(dir, "r");
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Atomic, durable replacement of a small file: data fsync, rename, then the
+// directory entry fsync.
+function writeDurable(file, text) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeSync(fd, text);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  fsyncDir(dir);
+}
+
 class LedLedger {
-  constructor(file) {
+  constructor(file, { leaseMs = DEFAULT_LEASE_MS } = {}) {
     if (!file) throw new Error("LedLedger needs a file");
     this.file = path.resolve(file);
+    this.leaseMs = Math.min(MAX_LEASE_MS, Math.max(MIN_LEASE_MS, Number(leaseMs) || DEFAULT_LEASE_MS));
+  }
+
+  get lockFile() {
+    return `${this.file}.lock`;
+  }
+
+  get watchdogFile() {
+    return `${this.file}.watchdog`;
   }
 
   read() {
@@ -39,30 +106,106 @@ class LedLedger {
   }
 
   write(armed) {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    const fd = fs.openSync(tmp, "w", 0o600);
-    try {
-      fs.writeSync(fd, JSON.stringify({ armed }, null, 1));
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, this.file);
+    writeDurable(this.file, JSON.stringify({ armed }, null, 1));
   }
 
-  // Synchronous on purpose: it must be durable before the request leaves.
+  // The crawler, the watchdog and a sweep all rewrite the ledger; one at a
+  // time. A lock held by a dead process (or an unreadable one older than a few
+  // seconds) is broken.
+  withLock(fn, { timeoutMs = 10_000 } = {}) {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        const fd = fs.openSync(this.lockFile, "wx", 0o600);
+        fs.writeSync(fd, String(process.pid));
+        fs.closeSync(fd);
+        break;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        let holder = NaN;
+        let age = 0;
+        try {
+          holder = Number(fs.readFileSync(this.lockFile, "utf8"));
+          age = Date.now() - fs.statSync(this.lockFile).mtimeMs;
+        } catch {
+          continue;
+        }
+        if ((Number.isInteger(holder) && holder > 0 && !pidAlive(holder)) || (!(holder > 0) && age > 3000)) {
+          try {
+            fs.unlinkSync(this.lockFile);
+          } catch {
+            // someone else broke it
+          }
+          continue;
+        }
+        if (Date.now() > deadline) throw new Error(`LED ledger lock busy (${this.lockFile})`);
+        sleepSync(10);
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      try {
+        fs.unlinkSync(this.lockFile);
+      } catch {
+        // already gone
+      }
+    }
+  }
+
+  // The watchdog's heartbeat, or null.
+  watchdog() {
+    try {
+      return JSON.parse(fs.readFileSync(this.watchdogFile, "utf8"));
+    } catch {
+      return null;
+    }
+  }
+
+  // A live watchdog that watches `ownerPid` (this process by default).
+  watchdogAlive(ownerPid = process.pid) {
+    const beat = this.watchdog();
+    if (!beat || beat.ownerPid !== ownerPid || !pidAlive(beat.pid)) return false;
+    return Date.now() - Date.parse(beat.heartbeatAt) < HEARTBEAT_STALE_MS;
+  }
+
+  // Synchronous on purpose: the lease must be durable before the request
+  // leaves, and only when something independent will honour it.
   arm(entry) {
-    const armed = this.read().filter((item) => keyOf(item) !== keyOf(entry));
-    armed.push({ ...entry, armedAt: new Date().toISOString() });
-    this.write(armed);
+    if (!this.watchdogAlive()) throw new Error("no live identify watchdog for this crawler; IDENTIFY refused (#1117)");
+    const now = Date.now();
+    const lease = { ...entry, ownerPid: process.pid, armedAt: new Date(now).toISOString(), expiresAt: new Date(now + this.leaseMs).toISOString(), leaseMs: this.leaseMs };
+    this.withLock(() => {
+      const armed = this.read().filter((item) => keyOf(item) !== keyOf(entry));
+      armed.push(lease);
+      this.write(armed);
+    });
+    return lease;
   }
 
   disarm(match) {
-    const armed = this.read();
-    const kept = armed.filter((item) => !matches(item, match));
-    if (kept.length !== armed.length) this.write(kept);
-    return armed.length - kept.length;
+    return this.withLock(() => {
+      const armed = this.read();
+      const kept = armed.filter((item) => !matches(item, match));
+      if (kept.length !== armed.length) this.write(kept);
+      return armed.length - kept.length;
+    });
+  }
+
+  // Merge fields into matching entries (the watchdog's own bookkeeping).
+  update(match, fields) {
+    return this.withLock(() => {
+      const armed = this.read();
+      let changed = 0;
+      const next = armed.map((item) => {
+        if (!matches(item, match)) return item;
+        changed += 1;
+        return { ...item, ...fields };
+      });
+      if (changed) this.write(next);
+      return changed;
+    });
   }
 
   entries() {
@@ -72,6 +215,10 @@ class LedLedger {
 
 function keyOf(entry) {
   return `${entry.origin} ${entry.path} ${entry.system_id || ""} ${entry.enclosure_id || ""}`;
+}
+
+function targetOf(entry) {
+  return { origin: entry.origin, path: entry.path, system_id: entry.system_id, enclosure_id: entry.enclosure_id };
 }
 
 function matches(item, match) {
@@ -99,9 +246,26 @@ function scopeQuery(entry) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Read the bay's identify state once: { off: bool } or { error }.
+async function readIdentify(entry, { fetchImpl = fetch, requestMs = 60_000 } = {}) {
+  try {
+    const response = await fetchImpl(`${entry.origin}/api/inventory${scopeQuery(entry)}`, {
+      headers: { Accept: "application/json" }, signal: AbortSignal.timeout(requestMs),
+    });
+    if (!response.ok) return { seen: { status: response.status } };
+    const data = await response.json();
+    const snapshot = data.snapshot || data;
+    const slot = (snapshot.slots || []).find((item) => String(item.slot) === String(entry.slot));
+    if (!slot) return { seen: { missing: true } };
+    return { off: slot.identify_active !== true && slot.state !== "identify", seen: { state: slot.state, identify_active: slot.identify_active } };
+  } catch (error) {
+    return { seen: { error: String(error && error.message ? error.message : error).slice(0, 120) } };
+  }
+}
+
 // Turn one armed light off out of band and verify it reads back off.
 async function clearAndVerify(entry, { fetchImpl = fetch, attempts = 3, verifyMs = 45_000, pollMs = 3000, requestMs = 60_000 } = {}) {
-  const result = { target: { path: entry.path, system_id: entry.system_id, enclosure_id: entry.enclosure_id }, cleared: false, verified: false, detail: null };
+  const result = { target: { path: entry.path, system_id: entry.system_id, enclosure_id: entry.enclosure_id }, slot: entry.slot, cleared: false, verified: false, detail: null };
   for (let attempt = 1; attempt <= attempts && !result.cleared; attempt += 1) {
     try {
       const response = await fetchImpl(`${entry.origin}${entry.path}${scopeQuery(entry)}`, {
@@ -122,25 +286,12 @@ async function clearAndVerify(entry, { fetchImpl = fetch, attempts = 3, verifyMs
   const deadline = Date.now() + verifyMs;
   let seen = null;
   do {
-    try {
-      const response = await fetchImpl(`${entry.origin}/api/inventory${scopeQuery(entry)}`, {
-        headers: { Accept: "application/json" }, signal: AbortSignal.timeout(requestMs),
-      });
-      if (response.ok) {
-        const data = await response.json();
-        const snapshot = data.snapshot || data;
-        const slot = (snapshot.slots || []).find((item) => String(item.slot) === String(entry.slot));
-        seen = slot ? { state: slot.state, identify_active: slot.identify_active } : { missing: true };
-        if (slot && slot.identify_active !== true && slot.state !== "identify") {
-          result.verified = true;
-          result.detail = null;
-          return result;
-        }
-      } else {
-        seen = { status: response.status };
-      }
-    } catch (error) {
-      seen = { error: String(error && error.message ? error.message : error).slice(0, 120) };
+    const read = await readIdentify(entry, { fetchImpl, requestMs });
+    seen = read.seen;
+    if (read.off) {
+      result.verified = true;
+      result.detail = null;
+      return result;
     }
     if (Date.now() + pollMs > deadline) break;
     await sleep(pollMs);
@@ -149,16 +300,20 @@ async function clearAndVerify(entry, { fetchImpl = fetch, attempts = 3, verifyMs
   return result;
 }
 
-// Clear and verify every armed entry; verified ones leave the ledger.
+// Clear and verify every armed entry (expired or not); verified ones leave
+// the ledger.
 async function sweepLedger(ledger, options = {}) {
   const armed = ledger.entries();
   const results = [];
   for (const entry of armed) {
     const outcome = await clearAndVerify(entry, options);
     results.push(outcome);
-    if (outcome.verified) ledger.disarm({ origin: entry.origin, path: entry.path, system_id: entry.system_id, enclosure_id: entry.enclosure_id });
+    if (outcome.verified) ledger.disarm(targetOf(entry));
   }
   return { at: new Date().toISOString(), armed: armed.length, results, ok: results.every((r) => r.verified), remaining: ledger.entries().length };
 }
 
-module.exports = { LedLedger, armedEntry, clearAndVerify, sweepLedger };
+module.exports = {
+  LedLedger, armedEntry, clearAndVerify, readIdentify, sweepLedger, pidAlive, targetOf, writeDurable,
+  DEFAULT_LEASE_MS, MAX_LEASE_MS, HEARTBEAT_STALE_MS,
+};

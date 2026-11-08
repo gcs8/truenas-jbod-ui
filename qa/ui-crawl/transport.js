@@ -92,10 +92,15 @@ async function installRoutes(context, { guard, origins, fixture = null, local = 
         if (cache) cache.clear();
       }
       if (WRITE_CLASSES.has(verdict.cls)) {
+        // #1117: the exact light is leased durably, with a live watchdog
+        // behind it, before IDENTIFY leaves; if that fails it never leaves.
+        if (verdict.cls === "led" && /"action"\s*:\s*"IDENTIFY"/.test(body || "")) {
+          // (A synthetic fixture answers it in-process; nothing physical exists.)
+          if (ledger) ledger.arm(armedEntry(url.href, verdict.state));
+          else if (!fixture) throw new Error("IDENTIFY without an LED ledger and watchdog is refused");
+        }
         stats.writes.push(`${method} ${url.pathname}${url.search}`);
         if (cache) cache.clear();
-        // #1117: record the exact armed light durably before IDENTIFY leaves.
-        if (verdict.cls === "led" && ledger && /"action"\s*:\s*"IDENTIFY"/.test(body || "")) ledger.arm(armedEntry(url.href, verdict.state));
       }
       const info = { method, url, service: serviceFor(url), body: request.postData() };
       if (fixture) return fixture(route, info);
@@ -179,7 +184,9 @@ function fixtureHandler(data, { writes = [] } = {}) {
       }
       return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true }) });
     }
-    if (data.api[key] !== undefined) return route.fulfill({ contentType: "application/json", body: JSON.stringify(data.api[key]) });
+    // A variant's own answer first (the QuantaStor variant's inventory), then the base service's.
+    const answer = data.api[pageKey] !== undefined ? data.api[pageKey] : data.api[key];
+    if (answer !== undefined) return route.fulfill({ contentType: "application/json", body: JSON.stringify(answer) });
     return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ detail: "not in the synthetic fixture" }) });
   };
 }

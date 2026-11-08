@@ -16,7 +16,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const controls = require("./ui-crawl/controls");
-const { loadInventory, validateInventory, expandStates, selectStates, checkObserved } = require("./ui-crawl/inventory");
+const { loadInventory, validateInventory, expandStates, selectStates, checkObserved, readsFor } = require("./ui-crawl/inventory");
 const routes = require("./ui-crawl/routes");
 const { RequestGuard } = require("./ui-crawl/guard");
 const { installRoutes, fixtureHandler } = require("./ui-crawl/transport");
@@ -106,6 +106,7 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     assets: "https://synthetic.invalid",
     "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
     "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
+    "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
   };
   const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
@@ -127,6 +128,8 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "main", ready: "main", variant: "write-sign-in", label: "fixture/main-write-sign-in", url: `${origins["ui-write-sign-in"]}/` },
     { page: "fabric", ready: "fabric", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${origins["ui-write-sign-in"]}/sas-fabric` },
     { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
+    // Sol #1108: a QuantaStor page sends a forced startup read; only its declared page-load window admits it.
+    { page: "main", ready: "main", variant: "quantastor", platform: "quantastor", label: "fixture/main-quantastor", url: `${origins["ui-quantastor"]}/` },
   ];
   try {
     for (const target of targets) await crawler.crawlTarget(target, states.filter((state) => state.page === target.page));
@@ -154,9 +157,15 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
   const misclassified = [];
   for (const [stateId, seen] of guard.observed) {
     const state = byId.get(stateId);
-    if (state) misclassified.push(...checkObserved(state, [...seen.keys()]));
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state)));
   }
-  expect(misclassified, "a control called a route its state's safety class does not allow; fix the class or the control").toEqual([]);
+  expect(misclassified, "a control called a route its state's safety class or read allowlist does not allow; fix the class, the reads or the control").toEqual([]);
+
+  // Sol #1108: the QuantaStor page's startup refresh went out, inside the
+  // declared page-load window only (it would be a blocked request otherwise).
+  const startupLoads = (crawler.loadAdmitted || []).filter((entry) => entry.target === "fixture/main-quantastor");
+  expect(startupLoads.length, "the QuantaStor fixture page sent no startup refresh; the fixture no longer covers the load window").toBeGreaterThan(0);
+  expect((crawler.loadAdmitted || []).filter((entry) => entry.target !== "fixture/main-quantastor"), "a page-load window admitted a request on a non-QuantaStor target").toEqual([]);
 
   // Sol #1108: `covers` must be backed by a rendering. Every inventoried
   // control is visible in at least one executed state, unless it is a

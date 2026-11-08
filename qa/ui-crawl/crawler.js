@@ -13,6 +13,7 @@ const path = require("node:path");
 const { runState } = require("./actuation");
 const { CrawlDriver, NotApplicable, navigate } = require("./driver");
 const { pageChecks, axeFindings } = require("./checks");
+const { readsFor, loadRequestsFor } = require("./inventory");
 const png = require("./png");
 
 const READY = {
@@ -233,6 +234,7 @@ class Crawler {
     const index = (state.steps || []).findIndex((step) => step.forEachOption);
     if (index < 0) return [state];
     const step = state.steps[index];
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state) });
     await this.load(target);
     const driver = this.newDriver(target);
     await driver.runSteps(state.steps.slice(0, index));
@@ -251,6 +253,7 @@ class Crawler {
       this.driver = new CrawlDriver({ page: this.page, guard: this.guard, selections: this.inventory.selections, downloadDir: this.downloadDir, log: this.log });
     }
     this.driver.ready = READY[target.ready] && ((page) => READY[target.ready](page, this.readyTimeoutMs));
+    this.driver.withLoadWindow = (fn) => this.withLoadWindow(target, fn);
     this.driver.bind = this.bindFor(target);
     this.driver.service = (this.inventory.pages[target.page] || {}).service || "ui";
     this.driver.resetState();
@@ -259,8 +262,9 @@ class Crawler {
     return this.driver;
   }
 
-  // #1120: writes are admitted only for the write system and the target's
-  // own enclosure (from its URL). Fixture runs have no live scope.
+  // #1120: bound requests are admitted only for the target's system (the
+  // runner only gives write states the --write-system target) and the
+  // target's own enclosure (from its URL). Fixture runs have no live scope.
   bindFor(target) {
     if (this.fixtureMode) return {};
     let enclosure = null;
@@ -269,7 +273,32 @@ class Crawler {
     } catch {
       enclosure = null;
     }
-    return { system_id: this.writeSystem || target.system || null, enclosure_id: enclosure };
+    return { system_id: target.system || this.writeSystem || null, enclosure_id: enclosure };
+  }
+
+  // Sol #1108: a page load may send requests of its own before any state
+  // window opens (QuantaStor queues a forced inventory read at startup when its
+  // bays are LED-capable, then a forced storage-view read once that answers,
+  // which on a real appliance can be long after the page is ready). They are
+  // admitted only when the page declares them for the target's platform
+  // (qa/ui-states.json load_requests), once per load, bound to the target. The
+  // window opens with each navigation or reload and stays open until the next
+  // one or the end of the state; it admits nothing but those reads.
+  async withLoadWindow(target, fn) {
+    this.endLoadWindow();
+    const rules = loadRequestsFor(this.inventory, target.page, target.platform);
+    if (rules.length) {
+      const service = ((this.inventory.pages || {})[target.page] || {}).service || "ui";
+      this.guard.openLoad(this.guard.state || target.label, rules, { bind: this.bindFor(target), service });
+      this.loadTarget = target.label;
+    }
+    return fn();
+  }
+
+  endLoadWindow() {
+    if (!this.guard.load) return;
+    const admitted = this.guard.closeLoad();
+    if (admitted.length) (this.loadAdmitted = this.loadAdmitted || []).push(...admitted.map((entry) => ({ target: this.loadTarget, state: this.guard.state, ...entry })));
   }
 
   async load(target) {
@@ -278,12 +307,14 @@ class Crawler {
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     this.lastLoad = Date.now();
     const started = Date.now();
-    this.debug(`goto ${target.label}`);
-    await navigate(this.page, () => this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 }));
-    this.debug("width");
-    await this.setWidth(this.widths[0]);
-    this.debug("ready");
-    if (READY[target.ready]) await READY[target.ready](this.page, this.readyTimeoutMs);
+    await this.withLoadWindow(target, async () => {
+      this.debug(`goto ${target.label}`);
+      await navigate(this.page, () => this.page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 300_000 }));
+      this.debug("width");
+      await this.setWidth(this.widths[0]);
+      this.debug("ready");
+      if (READY[target.ready]) await READY[target.ready](this.page, this.readyTimeoutMs);
+    });
     this.debug("loaded");
     return Date.now() - started;
   }
@@ -317,7 +348,7 @@ class Crawler {
     this.bucket = record.findings;
     this.log(`${target.label} ${state.id}: start`);
     let driver = null;
-    this.guard.beginState(state.id);
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state) });
     try {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
@@ -374,6 +405,7 @@ class Crawler {
         // next state reloads anyway
       }
     }
+    this.endLoadWindow();
     this.guard.endState();
     this.bucket = null;
     this.markKnown(record, state);

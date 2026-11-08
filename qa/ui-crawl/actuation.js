@@ -10,9 +10,11 @@
 //   read              steps run with no write window. Declared `read_requests`
 //                     (export download; appliance polls for appliance_load
 //                     states) open a read window bound to the target.
-//   app-write-revert  capture -> semantic store read -> open a window for the
-//                     declared writes, bound to the write system, the target
-//                     enclosure and the captured bay -> steps -> revert
+//   app-write-revert  capture -> refuse unless the rules bind to one object
+//                     (bay, enclosure object) and the target has an
+//                     enclosure scope -> semantic store read -> open a window
+//                     for the declared writes, bound to the write system, the
+//                     target enclosure and the captured object -> steps -> revert
 //                     (always, once anything was written) -> close window ->
 //                     verify by re-reading -> semantic store read again, which
 //                     must equal the first. Any failure is `revert-failed`.
@@ -53,6 +55,17 @@ async function runRead(driver, state) {
   return result(state, "done", admitted.length ? { admitted } : {});
 }
 
+// Declared forced reads with budget left in a closing window.
+function trailingReads(window) {
+  if (!window) return [];
+  return window.rules
+    .filter((entry) => entry.rule.cls === "appliance-load" && entry.used < entry.max)
+    .map((entry) => {
+      const { re, cls, ...rule } = entry.rule;
+      return { ...rule, max: entry.max - entry.used };
+    });
+}
+
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
@@ -74,6 +87,25 @@ async function runReverted(driver, state, options) {
     const reason = await driver.checkPrecondition(state.precondition, vars);
     if (reason) return result(state, "not-applicable", { reason });
   }
+  // #1120: a live write window is bound to the target's system and
+  // enclosure; without an enclosure scope there is nothing exact to bind.
+  const bind = driver.bind || {};
+  if (bind.system_id && !bind.enclosure_id) {
+    return result(state, "precheck-failed", { error: "no enclosure scope to bind the writes to; nothing was written" });
+  }
+  // A captured enclosure object must be the target's own enclosure.
+  if (vars.object_id !== undefined && bind.enclosure_id && String(bind.enclosure_id).split("::", 1)[0] !== String(vars.object_id)) {
+    return result(state, "precheck-failed", { error: "the captured object is not the target enclosure; nothing was written" });
+  }
+  let rules;
+  try {
+    rules = substitute(state.writes, vars);
+    // Compile now: an unbound placeholder or object refuses before any read or write.
+    driver.guard.openWrites(state.id, rules, [], windowOptions(driver, DECLARABLE[state.safety]));
+    driver.guard.closeWrites();
+  } catch (error) {
+    return result(state, "precheck-failed", { error: errorText(error) });
+  }
   const semantic = state.semantic_reads || [];
   let before = null;
   if (semantic.length) {
@@ -85,10 +117,11 @@ async function runReverted(driver, state, options) {
       return result(state, "precheck-failed", { error: `store read before the write failed: ${errorText(error)}` });
     }
   }
-  driver.guard.openWrites(state.id, substitute(state.writes, vars), [], windowOptions(driver, DECLARABLE[state.safety]));
+  driver.guard.openWrites(state.id, rules, [], windowOptions(driver, DECLARABLE[state.safety]));
   let actError = null;
   let revertError = null;
   let admitted = [];
+  let trailing = [];
   let reverted = false;
   try {
     try {
@@ -111,27 +144,39 @@ async function runReverted(driver, state, options) {
       }
     }
   } finally {
+    trailing = trailingReads(driver.guard.window);
     admitted = driver.guard.closeWrites();
   }
   if (admitted.length === 0) {
     return result(state, actError ? "failed" : "no-write", { error: errorText(actError), admitted });
   }
+  // The writes' own follow-up refreshes (a save's forced inventory read, then
+  // the forced storage-view read sent when it answers) can land after the
+  // window closed. Only the declared forced reads, with the budget they have
+  // left, stay admitted while the state verifies; no write is.
+  if (trailing.length) driver.guard.openReads(state.id, trailing, windowOptions(driver, ["appliance-load"]));
   let verifyError = null;
-  try {
-    await driver.runSteps(state.verify, vars);
-  } catch (error) {
-    verifyError = error;
-  }
   let semanticError = null;
-  if (before && !verifyError) {
+  let trailingAdmitted = [];
+  try {
     try {
-      const after = await driver.semanticSnapshot(semantic, vars);
-      const changed = semanticDiff(before, after);
-      if (changed.length) semanticError = new Error(`store differs after the revert: ${changed.join(", ")}`);
+      await driver.runSteps(state.verify, vars);
     } catch (error) {
-      semanticError = new Error(`store read after the revert failed: ${errorText(error)}`);
+      verifyError = error;
     }
+    if (before && !verifyError) {
+      try {
+        const after = await driver.semanticSnapshot(semantic, vars);
+        const changed = semanticDiff(before, after);
+        if (changed.length) semanticError = new Error(`store differs after the revert: ${changed.join(", ")}`);
+      } catch (error) {
+        semanticError = new Error(`store read after the revert failed: ${errorText(error)}`);
+      }
+    }
+  } finally {
+    if (trailing.length) trailingAdmitted = driver.guard.closeWrites();
   }
+  if (trailingAdmitted.length) admitted = [...admitted, ...trailingAdmitted];
   if (!reverted || verifyError || semanticError) {
     return result(state, "revert-failed", {
       error: errorText(revertError || verifyError || semanticError),

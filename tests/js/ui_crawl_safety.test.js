@@ -62,9 +62,18 @@ test("#1120 browser scripts only call /api paths that the manifest knows", () =>
   assert.equal(table.match("ui", "POST", calls[0].path), null);
 });
 
-function manifestGuard(origins = { ui: ORIGIN }) {
+function manifestGuard(origins = { ui: ORIGIN }, reads = null) {
   const { RequestGuard } = req("qa/ui-crawl/guard");
-  return new RequestGuard({ origins });
+  const g = new RequestGuard({ origins });
+  // Reads are admitted per state (#1120 round 3): this test state may read these.
+  g.beginState("test", { reads: reads || [
+    { method: "GET", path: "/api/inventory", query: ["system_id", "enclosure_id", "force"] },
+    { method: "GET", path: "/static/{path:path}", query: [] },
+    { method: "POST", path: "/api/slots/smart-batch", query: [] },
+    { method: "GET", path: "/api/slots/{slot}/smart", query: ["fresh"] },
+    { method: "GET", path: "/api/admin/state", query: [] },
+  ] });
+  return g;
 }
 
 test("#1120 the guard admits exact manifest reads only; unknown routes and destructive GETs are blocked", () => {
@@ -105,8 +114,8 @@ test("#1120 write windows are bound to the write system, enclosure and captured 
   assert.equal(led(5, "system_id=sys-a&enclosure_id=enc-1", "CLEAR").allowed, true);
   assert.equal(g.closeWrites().length, 2);
   // An alias write window does not admit another system's alias.
-  g.openWrites("main.rename.save", [{ method: "POST", path: "/api/sas-fabric/aliases", body_json: { object_kind: "enclosure" }, max: 2 }], [], { bind, classes: ["app-write"] });
-  const alias = (query) => g.admit({ method: "POST", url: `${ORIGIN}/api/sas-fabric/aliases?${query}`, body: '{"object_kind":"enclosure","label":"x"}' });
+  g.openWrites("main.rename.save", [{ method: "POST", path: "/api/sas-fabric/aliases", body_json: { object_kind: "enclosure", object_id: "enc-1" }, max: 2 }], [], { bind, classes: ["app-write"] });
+  const alias = (query) => g.admit({ method: "POST", url: `${ORIGIN}/api/sas-fabric/aliases?${query}`, body: '{"object_id":"enc-1","object_kind":"enclosure","label":"x"}' });
   assert.equal(alias("system_id=other&enclosure_id=enc-1").allowed, false);
   assert.equal(alias("system_id=sys-a&enclosure_id=enc-1").allowed, true);
   g.closeWrites();
@@ -317,7 +326,7 @@ test("#1117 an interrupted crawl clears the exact armed bay on SIGTERM and recor
   assert.deepEqual(JSON.parse(fs.readFileSync(ledger, "utf8")).armed, []);
 });
 
-test("#1117 after SIGKILL the startup sweep clears the light before anything else runs, and fails closed when it cannot", async () => {
+test("#1117 when the crawler and its watchdog both die, the startup sweep clears the light before anything else runs, and fails closed when it cannot", async () => {
   const appliance = await fakeAppliance();
   const dir = tmpDir("sigkill");
   const ledger = path.join(dir, "led-ledger.json");
@@ -326,9 +335,11 @@ test("#1117 after SIGKILL the startup sweep clears the light before anything els
   child.stdout.on("data", (chunk) => { out += chunk; });
   child.stderr.on("data", (chunk) => { out += chunk; });
   await waitFor(() => out.includes("ARMED"), () => `child never armed: ${out}`);
+  // Host-level loss: the watchdog goes first, then the crawler.
+  process.kill(Number(/WATCHDOG (\d+)/.exec(out)[1]), "SIGKILL");
   child.kill("SIGKILL");
   await new Promise((resolve) => child.on("exit", resolve));
-  assert.equal(appliance.lit.has("5"), true, "SIGKILL skips in-process cleanup");
+  assert.equal(appliance.lit.has("5"), true, "SIGKILL of both skips every in-process cleanup");
   assert.equal(JSON.parse(fs.readFileSync(ledger, "utf8")).armed.length, 1);
   const sweep = (args) => new Promise((resolve) => {
     const proc = spawn(process.execPath, [path.join(root, "scripts/ui_crawl.js"), "--led-sweep", "--led-ledger", ledger, "--out", path.join(dir, "sweep"), ...args], { stdio: ["ignore", "pipe", "pipe"] });
@@ -345,7 +356,8 @@ test("#1117 after SIGKILL the startup sweep clears the light before anything els
   // A light that will not read back off keeps its ledger entry and exits 3.
   const stuck = await fakeAppliance({ verifyOn: true });
   const { LedLedger } = req("qa/ui-crawl/ledger");
-  new LedLedger(ledger).arm({ origin: stuck.origin, path: "/api/slots/6/led", slot: "6", system_id: "sys-a", enclosure_id: null });
+  // (Written directly: a left-over entry from a run whose watchdog is gone.)
+  new LedLedger(ledger).write([{ origin: stuck.origin, path: "/api/slots/6/led", slot: "6", system_id: "sys-a", enclosure_id: null }]);
   const failed = await sweep(["--led-verify-ms", "1500"]);
   assert.equal(failed.status, 3, failed.text);
   assert.equal(JSON.parse(fs.readFileSync(ledger, "utf8")).armed.length, 1);

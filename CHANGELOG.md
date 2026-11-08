@@ -92,6 +92,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   binds writes to one system, enclosure and bay, checks reverted stores
   through the app's read API, turns identify lights back off after an
   interruption and exits non-zero on any safety failure (#1108).
+- Hardened the UI crawler further: an independent watchdog turns an identify
+  light off when its lease expires or the crawler is killed, reads are allowed
+  per state, refresh flags are parsed the way the backend parses them, the
+  BMC locator status counts as an appliance query, rename writes are bound to
+  the target enclosure, and a QuantaStor page's startup refresh is declared
+  instead of failing the crawl (#1108).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

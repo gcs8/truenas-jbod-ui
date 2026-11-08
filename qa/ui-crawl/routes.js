@@ -41,6 +41,33 @@ const DECLARABLE = {
   forbidden: new Set(),
 };
 
+// Query booleans exactly as FastAPI/Pydantic 2 read them (bool query fields):
+// case-insensitive; anything else is a 422. FastAPI reads the last of
+// repeated keys. The guard treats every value that is not a clean false as
+// true, so a spelling the backend accepts can never pass as a plain read.
+const QUERY_TRUE = new Set(["1", "on", "t", "true", "y", "yes"]);
+const QUERY_FALSE = new Set(["0", "off", "f", "false", "n", "no"]);
+// Query names that force an appliance poll on some route; a backend handler
+// with a bool parameter of one of these names must declare it in
+// `query_classes` (checkManifest).
+const FORCE_PARAMS = ["force", "refresh", "fresh"];
+
+function parseQueryBool(value) {
+  const text = String(value).toLowerCase();
+  if (QUERY_TRUE.has(text)) return true;
+  if (QUERY_FALSE.has(text)) return false;
+  return null;
+}
+
+// True unless every value of `name` is a clean false (absent is false).
+function queryRaised(url, name) {
+  return url.searchParams.getAll(name).some((value) => parseQueryBool(value) !== false);
+}
+
+function forcesRefresh(url, names = FORCE_PARAMS) {
+  return names.some((name) => queryRaised(url, name));
+}
+
 const DECORATOR_RE = /^([ \t]*)@(\w+)\.(get|post|put|delete|patch|head|options|api_route|websocket)\(\s*(?:("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|([A-Za-z_][\w.]*))/gm;
 
 function loadManifest(file = MANIFEST_PATH) {
@@ -96,9 +123,10 @@ function scanRouteSource(relPath, source, service) {
     const verb = m[3].toUpperCase();
     const literal = m[4] ? m[4].slice(1, -1) : null;
     if (verb === "API_ROUTE") problems.push(`${relPath}:${line + 1}: api_route() is not supported by the route manifest; use one decorator per method`);
+    const boolParams = [...block.matchAll(/\b(\w+)\s*:\s*bool\s*=/g)].map((hit) => hit[1]);
     routes.push({
       service, method: verb, path: literal, pathExpr: literal === null ? m[5] : undefined,
-      file: relPath, line: line + 1, fingerprint: fingerprint(block),
+      file: relPath, line: line + 1, fingerprint: fingerprint(block), boolParams,
     });
   }
   if (/\.add_api_route\(|\.add_route\(/.test(source)) problems.push(`${relPath}: add_api_route/add_route is not scanned; declare routes with decorators`);
@@ -162,6 +190,10 @@ function checkManifest(scanned, manifest) {
     if (entry.fingerprint !== route.fingerprint) {
       problems.push(`route ${key} changed (${route.file}:${route.line}, fingerprint ${route.fingerprint}, reviewed ${entry.fingerprint}); re-review its class and update the fingerprint`);
     }
+    // #1120: a forced-refresh flag must raise the class (no undeclared bypass).
+    for (const name of (route.boolParams || []).filter((param) => FORCE_PARAMS.includes(param))) {
+      if (!(entry.query_classes || {})[name]) problems.push(`route ${key} takes a \`${name}\` flag; declare it in query_classes (appliance-load)`);
+    }
   }
   for (const key of listed.keys()) if (!seen.has(key)) problems.push(`stale manifest route ${key}: not declared in the sources any more`);
   return problems;
@@ -212,8 +244,7 @@ class RouteTable {
     if (!entry) return { entry: null, cls: null };
     let cls = entry.class;
     for (const [name, raised] of Object.entries(entry.query_classes || {})) {
-      const value = url.searchParams.get(name);
-      if (value !== null && ["1", "true", "yes", "on"].includes(value.toLowerCase())) cls = raised;
+      if (queryRaised(url, name)) cls = raised;
     }
     return { entry, cls };
   }
@@ -262,7 +293,7 @@ function checkScriptApiPaths(root, scripts, manifest) {
 }
 
 module.exports = {
-  MANIFEST_PATH, ROUTE_CLASSES, BASE_READ_CLASSES, DECLARABLE,
+  MANIFEST_PATH, ROUTE_CLASSES, BASE_READ_CLASSES, DECLARABLE, FORCE_PARAMS, parseQueryBool, forcesRefresh, queryRaised,
   loadManifest, scanRouteSource, scanRoutes, discoverRouteFiles, checkManifest, RouteTable, templateRegExp,
   scanScriptApiPaths, checkScriptApiPaths, fingerprint, handlerBlock, routeKey,
 };

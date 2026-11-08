@@ -311,15 +311,26 @@ class CrawlDriver {
 
   async step_read(step, vars) {
     const locator = this.page.locator(step.read).first();
-    vars[step.as] = await locator.evaluate((el, property) => {
+    let value = await locator.evaluate((el, property) => {
       if (property) return el[property];
       return "value" in el && el.tagName !== "BUTTON" ? el.value : el.innerText;
     }, step.property || null);
+    // `prefix` strips a value prefix ("enclosure:<id>"; any other value, a
+    // storage view, stays and cannot match the target), `before` keeps the
+    // part before a separator (the persistent "<id>::<path>" base).
+    if (step.prefix && String(value).startsWith(step.prefix)) value = String(value).slice(step.prefix.length);
+    if (step.before) value = String(value).split(step.before, 1)[0];
+    vars[step.as] = value;
   }
 
   async step_reload() {
-    await navigate(this.page, () => this.page.reload({ waitUntil: "domcontentloaded", timeout: 300_000 }));
-    if (this.ready) await this.ready(this.page);
+    // A reload is a page load: its load-time requests (Sol #1108) are judged
+    // in the same page-load window as the first navigation.
+    const reload = async () => {
+      await navigate(this.page, () => this.page.reload({ waitUntil: "domcontentloaded", timeout: 300_000 }));
+      if (this.ready) await this.ready(this.page);
+    };
+    await (this.withLoadWindow ? this.withLoadWindow(reload) : reload());
   }
 
   async step_expectValue(step) {

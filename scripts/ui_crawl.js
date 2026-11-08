@@ -13,19 +13,24 @@
 //
 // Identify cleanup (#1117): a live run that may turn on a locate light needs
 // --led-ledger FILE (keep it outside the run's --out, the same file for every
-// run). Lights left on by an interrupted run are cleared from it at startup,
-// on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, and by
+// run). Every IDENTIFY is a lease in that file (--led-lease-ms, default 20 s,
+// at most 120 s), and an independent watchdog process (qa/ui-crawl/
+// led-watchdog.js, started detached before the crawl) turns the bay off when
+// the lease expires or this process disappears, SIGKILL included; no
+// IDENTIFY leaves without a live watchdog. Lights are also cleared at
+// startup, on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, and by
 //   node scripts/ui_crawl.js --led-sweep --led-ledger FILE --out DIR
 // Exit status (#1119): 0 ok, 1 crawl errors, 2 safety gate failed, 3 a light
 // could not be verified off; 128+n after a signal whose cleanup verified.
 
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
-const { chromium } = require("@playwright/test");
 const { loadInventory, validateInventory, expandStates, selectStates } = require("../qa/ui-crawl/inventory");
 const controls = require("../qa/ui-crawl/controls");
 const routes = require("../qa/ui-crawl/routes");
 const { LedLedger, sweepLedger } = require("../qa/ui-crawl/ledger");
+const { chromium } = require("@playwright/test");
 const { EXIT } = require("../qa/ui-crawl/gate");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
@@ -42,7 +47,11 @@ const FIXTURE_ORIGINS = {
   // Fixture variants for states that need another configuration (Sol #1108).
   "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
   "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
+  // A QuantaStor system with LED-capable bays: the page sends a forced
+  // inventory read at startup (Sol #1108), declared in pages.main.load_requests.
+  "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
 };
+const WATCHDOG_SCRIPT = path.join(__dirname, "..", "qa", "ui-crawl", "led-watchdog.js");
 const REPO_ROOT = path.resolve(__dirname, "..");
 
 function parseArgs(argv) {
@@ -76,6 +85,7 @@ function parseArgs(argv) {
     else if (flag === "--led-ledger") args.ledLedger = next();
     else if (flag === "--led-sweep") args.ledSweep = true;
     else if (flag === "--led-verify-ms") args.ledVerifyMs = Number(next());
+    else if (flag === "--led-lease-ms") args.ledLeaseMs = Number(next());
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!args.out) throw new Error("--out is required");
@@ -107,6 +117,8 @@ async function liveTargets(args) {
   for (const system of chosen) {
     const inventory = await getJson(`${args.ui}/api/inventory?system_id=${encodeURIComponent(system)}`);
     const snapshot = inventory.snapshot || inventory;
+    // The page's load-time requests depend on the platform (Sol #1108).
+    const platform = String(snapshot.selected_system_platform || "core").toLowerCase();
     let views = { views: [] };
     try {
       views = await getJson(`${args.ui}/api/storage-views?system_id=${encodeURIComponent(system)}`);
@@ -119,11 +131,11 @@ async function liveTargets(args) {
     ];
     if (!scopes.length) scopes.push({ kind: "default", id: "default", query: "" });
     scopes.forEach((scope, index) => targets.push({
-      page: "main", ready: "main", system, scopeIndex: index, label: `${system}/main/${scope.kind}-${index}`,
+      page: "main", ready: "main", system, platform, scopeIndex: index, label: `${system}/main/${scope.kind}-${index}`,
       url: `${args.ui}/?system_id=${encodeURIComponent(system)}${scope.query ? `&${scope.query}` : ""}`,
     }));
     (snapshot.enclosures || [{ id: null }]).forEach((enclosure, index) => targets.push({
-      page: "fabric", ready: "fabric", system, scopeIndex: index, label: `${system}/fabric/enc-${index}`,
+      page: "fabric", ready: "fabric", system, platform, scopeIndex: index, label: `${system}/fabric/enc-${index}`,
       url: `${args.ui}/sas-fabric?system_id=${encodeURIComponent(system)}${enclosure.id ? `&enclosure_id=${encodeURIComponent(enclosure.id)}` : ""}`,
     }));
   }
@@ -137,6 +149,7 @@ function fixtureTargets() {
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "write-sign-in", label: "fixture/main-write-sign-in", url: `${FIXTURE_ORIGINS["ui-write-sign-in"]}/` },
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${FIXTURE_ORIGINS["ui-write-sign-in"]}/sas-fabric` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${FIXTURE_ORIGINS["ui-storage-views-error"]}/` },
+    { page: "main", ready: "main", scopeIndex: 0, system: "fixture", platform: "quantastor", variant: "quantastor", label: "fixture/main-quantastor", url: `${FIXTURE_ORIGINS["ui-quantastor"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", label: "fixture/main", url: `${FIXTURE_ORIGINS.ui}/` },
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", label: "fixture/fabric", url: `${FIXTURE_ORIGINS.ui}/sas-fabric` },
     { page: "history", ready: "history", scopeIndex: 0, label: "fixture/history", url: `${FIXTURE_ORIGINS.history}/` },
@@ -229,6 +242,37 @@ function createExitGuards({ ledger, outDir, sweepOptions = {}, log = (line) => p
   };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// #1117: start the independent identify watchdog for this process, detached
+// in its own session (it outlives SIGKILL of this process and of its process
+// group), and wait for its first heartbeat. Throws when it does not start; no
+// IDENTIFY can be armed without it.
+async function startLedWatchdog({ ledger, outDir, pollMs = 1000, settleMs = 15_000, recheckMs = 5000, verifyMs = 45_000, maxLifeMs = 30 * 60_000 }) {
+  fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  const log = fs.openSync(path.join(outDir, "led-watchdog.log"), "a", 0o600);
+  const child = spawn(process.execPath, [
+    WATCHDOG_SCRIPT, "--ledger", ledger.file, "--owner", String(process.pid), "--out", outDir,
+    "--poll-ms", String(pollMs), "--settle-ms", String(settleMs), "--recheck-ms", String(recheckMs),
+    "--verify-ms", String(verifyMs), "--max-life-ms", String(maxLifeMs),
+  ], { detached: true, stdio: ["ignore", log, log] });
+  fs.closeSync(log);
+  child.unref();
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const beat = ledger.watchdog();
+    if (beat && beat.pid === child.pid && ledger.watchdogAlive()) return { pid: child.pid };
+    if (child.exitCode !== null) break;
+    await sleep(50);
+  }
+  try {
+    process.kill(child.pid, "SIGKILL");
+  } catch {
+    // already gone
+  }
+  throw new Error("the identify watchdog did not start; no IDENTIFY will be sent");
+}
+
 // Refuse a live crawl whose inventory or route manifest is not current: an
 // unclassified control or route is a hard failure (#1120).
 function preflightProblems(inventory) {
@@ -251,7 +295,7 @@ async function main() {
     return EXIT[summary.safety] ?? EXIT["safety-failed"];
   }
   const sweepOptions = { verifyMs: args.ledVerifyMs || 45_000, pollMs: Math.min(3000, Math.max(200, Math.floor((args.ledVerifyMs || 45_000) / 10))) };
-  const ledger = args.ledLedger ? new LedLedger(args.ledLedger) : null;
+  const ledger = args.ledLedger ? new LedLedger(args.ledLedger, { leaseMs: args.ledLeaseMs }) : null;
   if (args.ledSweep) {
     const ledCleanup = await sweepLedger(ledger, sweepOptions);
     const code = ledCleanup.ok ? EXIT.ok : EXIT["cleanup-uncertain"];
@@ -267,6 +311,17 @@ async function main() {
       writeReceipt(outDir, { status: "cleanup-uncertain", stage: "startup sweep", exitCode: EXIT["cleanup-uncertain"], ledCleanup: startup });
       console.error("identify cleanup from a previous run could not be verified; nothing was crawled");
       return EXIT["cleanup-uncertain"];
+    }
+  }
+  // #1117: the watchdog must be watching before any IDENTIFY can be armed.
+  let watchdog = null;
+  if (ledger && args.allow.includes("led")) {
+    try {
+      watchdog = await startLedWatchdog({ ledger, outDir, verifyMs: sweepOptions.verifyMs });
+    } catch (error) {
+      writeReceipt(outDir, { status: "safety-failed", stage: "led watchdog", exitCode: EXIT["safety-failed"], error: String(error.message).slice(0, 200) });
+      console.error(String(error.message));
+      return EXIT["safety-failed"];
     }
   }
   const inventory = loadInventory();
@@ -362,10 +417,13 @@ async function main() {
   }
   // Whatever the browser did, anything still armed is cleared out of band now.
   const ledCleanup = ledger ? await guards.sweep() : null;
+  // Sol #1108: every request a page-load window admitted (a platform's startup refresh).
+  stats.pageLoads = crawler ? crawler.loadAdmitted || [] : [];
   const summary = writeReport(outDir, {
     meta: {
       mode: fixture ? "fixture" : "live", label: args.label || null, started, finished: new Date().toISOString(), widths,
       allow: args.allow, writeSystem: args.writeSystem || null, remoteBrowser: Boolean(cdpUrl),
+      ledWatchdog: watchdog ? { pid: watchdog.pid, leaseMs: ledger.leaseMs } : null,
       cache: cache ? { hits: cache.hits, misses: cache.misses } : null,
     },
     records: crawler ? crawler.records : [],
@@ -388,4 +446,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, statesFor, fixtureTargets, createExitGuards, preflightProblems, FIXTURE_ORIGINS };
+module.exports = { parseArgs, statesFor, fixtureTargets, createExitGuards, startLedWatchdog, preflightProblems, FIXTURE_ORIGINS };

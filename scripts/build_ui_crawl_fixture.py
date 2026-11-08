@@ -49,18 +49,25 @@ WRITE_POLICY_BASIC = {
 }
 
 
-def live_snapshot(bundle):
-    """The demo snapshot as a live system: locate lights work (synthetic answers)."""
+def live_snapshot(bundle, *, platform: str | None = None):
+    """The demo snapshot as a live system: locate lights work (synthetic answers).
+
+    ``platform`` overrides the selected system's platform (the QuantaStor
+    variant: its page queues a forced startup read when bays are LED-capable).
+    """
     snapshot = bundle.primary_snapshot
     slots = [
         slot.model_copy(update={"led_supported": True, "mapping_revision": f"synthetic-{slot.slot}", "mapping_clear_revision": f"synthetic-{slot.slot}"})
         for slot in snapshot.slots
     ]
-    return snapshot.model_copy(update={"slots": slots})
+    update = {"slots": slots}
+    if platform:
+        update["selected_system_platform"] = platform
+    return snapshot.model_copy(update=update)
 
 
-def render_main(bundle, *, history_configured: bool = True, write_policy: dict = WRITE_POLICY) -> str:
-    snapshot = live_snapshot(bundle)
+def render_main(bundle, *, history_configured: bool = True, write_policy: dict = WRITE_POLICY, platform: str | None = None) -> str:
+    snapshot = live_snapshot(bundle, platform=platform)
     runtime = bundle.storage_view_runtime
     context = {
         "request": build_fixture_request(),
@@ -229,6 +236,8 @@ async def build() -> dict:
     )
     api = {
         "ui:/api/inventory": _dump(live_snapshot(bundle)),
+        # The QuantaStor variant keeps its platform after its startup refresh.
+        "ui-quantastor:/api/inventory": _dump(live_snapshot(bundle, platform="quantastor")),
         "ui:/api/storage-views": _dump(bundle.storage_view_runtime),
         "ui:/api/sas-fabric": _dump(bundle.sas_fabric),
         "ui:/api/history/status": await history.get_status(),
@@ -261,6 +270,7 @@ async def build() -> dict:
             # the crawler's fixture handler fails its /api/storage-views.
             "ui-write-sign-in:/": render_main(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
+            "ui-quantastor:/": render_main(bundle, platform="quantastor"),
             "history:/": render_history(),
             "admin:/": render_admin(),
             "offline:/": await build_public_demo_html(settings=settings),
