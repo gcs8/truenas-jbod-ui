@@ -66,6 +66,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   retention URLs may also use an address and port the deployment itself
   publishes (#1097).
 
+### Internal
+
+- Added a UI state inventory with safety classes, a CI check that every
+  interactive control has an inventory entry, and a crawler that checks every
+  state for squeezed or broken text, overflow, clipped controls, contrast,
+  heat-map colour sanity and console errors, with native-resolution review
+  tiles (#1108).
+
 ## v0.24.0-beta.6 - 2026-11-07
 
 This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
