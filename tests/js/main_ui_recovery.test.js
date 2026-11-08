@@ -382,6 +382,49 @@ test("bay tiles get a short accessible name and point at the tooltip for the res
   assert.match(TEMPLATE, /id="slot-tooltip"[^>]*role="tooltip"/);
 });
 
+test("a bay's name keeps every shown label, including non-ASCII text, and skips placeholders", () => {
+  // Text nodes in document order, as a TreeWalker over the tile returns them.
+  const tileWith = (texts) => {
+    const attributes = {};
+    return {
+      dataset: {},
+      texts,
+      setAttribute: (name, value) => { attributes[name] = value; },
+      attributes,
+    };
+  };
+  const { bayName } = loadFunctions(["bayName"], {
+    Object,
+    NodeFilter: { SHOW_TEXT: 4 },
+    document: {
+      createTreeWalker: (tile) => {
+        let index = -1;
+        const walker = {
+          currentNode: null,
+          nextNode() {
+            index += 1;
+            walker.currentNode = index < tile.texts.length ? { textContent: tile.texts[index] } : null;
+            return walker.currentNode;
+          },
+        };
+        return walker;
+      },
+    },
+  });
+  // #1110 review: a Linux mount such as /数据 has no ASCII word character.
+  const linux = tileWith(["  ", "07", "sdh", "/数据", "38 C"]);
+  bayName(linux, "online", "Slot ");
+  assert.equal(linux.attributes["aria-label"], "Slot 07, sdh, /数据, 38 C, online");
+  // The missing-value badge "--" is not a label.
+  const empty = tileWith(["08", "EMPTY", "Empty", "--"]);
+  bayName(empty, "empty", "Slot ");
+  assert.equal(empty.attributes["aria-label"], "Slot 08, EMPTY, Empty, empty");
+  // A later call (heat overlay refresh) reuses the stored detail and lead.
+  empty.texts = ["08", "EMPTY", "Empty"];
+  bayName(empty);
+  assert.equal(empty.attributes["aria-label"], "Slot 08, EMPTY, Empty, empty");
+});
+
 test("arrow keys move by row across the bay layout", () => {
   const makeTile = (slot, hidden = false) => ({
     dataset: { slot: String(slot) },

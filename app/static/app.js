@@ -6759,7 +6759,7 @@
     const walk = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
     while (walk.nextNode()) {
       const text = walk.currentNode.textContent.trim();
-      if (/\w/.test(text)) shown.push(text);
+      if (/[\p{L}\p{N}]/u.test(text)) shown.push(text);
     }
     tile.setAttribute("aria-label", lead + [...shown, detail].filter(Boolean).join(", "));
   }
