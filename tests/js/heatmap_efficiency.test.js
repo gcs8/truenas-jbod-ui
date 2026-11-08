@@ -144,7 +144,6 @@ function loadMetricFunctions(context = {}) {
     ANNUALIZED_MIN_POWER_ON_HOURS: 720,
     HEATMAP_MIN_SCALE_SENSITIVITY: 0.5, HEATMAP_MAX_SCALE_SENSITIVITY: 2,
     HEATMAP_DEFAULT_SCALE_SENSITIVITY: 1, HEATMAP_DEFAULT_METRIC: "attention_score",
-    HEATMAP_TEMPERATURE_SCALE_BANDS: "bands", HEATMAP_TEMPERATURE_SCALE_RELATIVE: "relative",
     heatmapSampleCache: new WeakMap(),
     heatmapTimelineActive: () => false,
     escapeHtml: (value) => String(value),

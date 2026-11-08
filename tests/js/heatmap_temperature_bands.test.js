@@ -283,7 +283,7 @@ test("temperature colours default to bands and keep relative min-max as an expli
   assert.match(TEMPLATE_SOURCE, /<option value="relative">/);
   assert.match(TEMPLATE_SOURCE, /id="heatmap-legend-bands"/);
   assert.match(TEMPLATE_SOURCE, /id="heatmap-legend-source"/);
-  assert.match(APP_SOURCE, /temperatureScale:\s*HEATMAP_TEMPERATURE_SCALE_BANDS/);
+  assert.match(APP_SOURCE, /temperatureScale:\s*"bands"/);
 });
 
 // Load the production context builder with the band helpers, as the
@@ -303,7 +303,6 @@ function contextApi(state, entries) {
   ], {
     HEATMAP_MIN_SCALE_SENSITIVITY: 0.5, HEATMAP_MAX_SCALE_SENSITIVITY: 2,
     HEATMAP_DEFAULT_SCALE_SENSITIVITY: 1, HEATMAP_DEFAULT_METRIC: "attention_score",
-    HEATMAP_TEMPERATURE_SCALE_BANDS: "bands", HEATMAP_TEMPERATURE_SCALE_RELATIVE: "relative",
     heatmapTimelineActive: () => false,
     formatMetricBytes: (value) => `${value} B`,
     formatHistoryRateValue: (value) => `${value} B/hr`,
@@ -331,8 +330,9 @@ test("the default temperature context colours 48 C and 49 C in the same band", (
   assert.equal(context.records.get("2").band.id, "critical");
   assert.equal(context.records.get("3").band.id, "warning");
   assert.equal(context.records.get("3").thresholds.source, "drive");
-  assert.equal(context.bandSummary.driveCount, 1);
-  assert.equal(context.bandSummary.defaultCount, 3);
+  assert.equal(context.bandSummary.total, 4);
+  assert.equal(context.bandSummary.distinctCount, 2);
+  assert.equal(context.bandSummary.primaryCount, 3);
   assert.equal(context.bandSummary.primary.profileId, "hdd");
 
   state.heatmap.temperatureScale = "relative";

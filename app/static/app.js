@@ -30,9 +30,6 @@
   const HEATMAP_DEFAULT_SCALE_SENSITIVITY = 1;
   const HEATMAP_HISTORY_MODE_CURRENT = "current";
   const HEATMAP_HISTORY_MODE_TIMELINE = "timeline";
-  // #1103: temperature colours default to bands; min-max is opt-in.
-  const HEATMAP_TEMPERATURE_SCALE_BANDS = "bands";
-  const HEATMAP_TEMPERATURE_SCALE_RELATIVE = "relative";
   const heatmapSampleCache = new WeakMap();
   const ANNUALIZED_MIN_POWER_ON_HOURS = 24 * 30;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
@@ -203,7 +200,7 @@
       timelineCacheKey: null,
       timelineCache: [],
       sensitivity: HEATMAP_DEFAULT_SCALE_SENSITIVITY,
-      temperatureScale: HEATMAP_TEMPERATURE_SCALE_BANDS,
+      temperatureScale: "bands", // #1103: min-max colours are opt-in
       histories: {},
       loading: false,
       error: null,
@@ -5195,7 +5192,7 @@
         id: "temperature_delta_c",
         label: "Temperature vs View Average",
         shortLabel: "Delta",
-        fixedRange: [-10, 10], // #1103: a 1 C spread stays near neutral
+        fixedRange: [-10, 10], // #1103: 1 C stays near neutral
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
         format: (value) => `${value >= 0 ? "+" : ""}${roundHeatmapValue(value)} C`,
@@ -5346,14 +5343,12 @@
   }
 
   function normalizeHeatmapTemperatureScale(value) {
-    return value === HEATMAP_TEMPERATURE_SCALE_RELATIVE
-      ? HEATMAP_TEMPERATURE_SCALE_RELATIVE
-      : HEATMAP_TEMPERATURE_SCALE_BANDS;
+    return value === "relative" ? value : "bands";
   }
 
   function heatmapTemperatureBandsActive(metricId = state.heatmap.metric) {
     return metricId === "temperature_c"
-      && normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale) === HEATMAP_TEMPERATURE_SCALE_BANDS;
+      && normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale) === "bands";
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -6062,8 +6057,8 @@
     return interpolateRgb(amber, red, (clamped - 0.68) / 0.32);
   }
 
-  // #1103: absolute bands; drive SMART ratings win over the documented
-  // defaults (wiki Heat Map Mode). Fixed alphas keep each surface known.
+  // #1103: absolute bands; drive SMART ratings win over the defaults (wiki
+  // Heat Map Mode).
   function heatmapTemperatureBandDefinitions() {
     return [
       { id: "cool", label: "Cool", rgb: [47, 110, 187], alpha: 0.72 },
@@ -6121,27 +6116,23 @@
   }
 
   function heatmapTemperatureThresholdKey(thresholds) {
-    const { cool, warm, warning, critical, source, profileId } = thresholds;
-    return [cool, warm, warning, critical, source, profileId].join("|");
+    return Object.values(thresholds).join("|");
   }
 
   function summarizeHeatmapTemperatureBands(records) {
     const groups = new Map();
-    const counts = { drive: 0, drive_partial: 0, default: 0 };
+    let total = 0;
     let primary = null;
     records.forEach(({ thresholds }) => {
       if (!thresholds) return;
-      counts[thresholds.source] += 1;
+      total += 1;
       const key = heatmapTemperatureThresholdKey(thresholds);
       const group = groups.get(key) || { thresholds, count: 0 };
       group.count += 1;
       groups.set(key, group);
       if (!primary || group.count > primary.count) primary = group;
     });
-    return {
-      driveCount: counts.drive, defaultCount: counts.default, total: counts.drive + counts.drive_partial + counts.default,
-      distinctCount: groups.size, primary: primary?.thresholds || null, primaryCount: primary?.count || 0,
-    };
+    return { total, distinctCount: groups.size, primary: primary?.thresholds || null, primaryCount: primary?.count || 0 };
   }
 
   function heatmapTemperatureSourceLabel(thresholds) {
@@ -6157,7 +6148,7 @@
   // WCAG 2.x relative luminance and contrast ratio.
   function heatmapRelativeLuminance(rgb) {
     const [red, green, blue] = Array.from(rgb).slice(0, 3).map((component) => {
-      const channel = Math.max(0, Math.min(255, Number(component) || 0)) / 255;
+      const channel = component / 255;
       return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
     });
     return Math.min(1, (0.2126 * red) + (0.7152 * green) + (0.0722 * blue));
@@ -6170,8 +6161,7 @@
 
   // A heat colour at `alpha` over the dark bay face (#11161a), or over `base`.
   function heatmapSurfaceRgb(rgb, alpha, base = [17, 22, 26]) {
-    const amount = Math.max(0, Math.min(1, Number(alpha) || 0));
-    return Array.from(rgb).slice(0, 3).map((component, index) => Math.round((component * amount) + (base[index] * (1 - amount))));
+    return Array.from(rgb).slice(0, 3).map((component, index) => Math.round((component * alpha) + (base[index] * (1 - alpha))));
   }
 
   // The value badge's former rgba(5, 8, 12, 0.62) chip, made opaque.
@@ -6181,8 +6171,7 @@
 
   // White or black: one reaches at least 4.58:1 on any surface (WCAG AA).
   function heatmapReadableTextRgb(surfaceRgb) {
-    const light = [255, 255, 255];
-    const dark = [0, 0, 0];
+    const [light, dark] = [[255, 255, 255], [0, 0, 0]];
     return heatmapContrastRatio(light, surfaceRgb) >= heatmapContrastRatio(dark, surfaceRgb) ? light : dark;
   }
 
@@ -6226,7 +6215,7 @@
     }
     const rgb = record.band ? record.band.rgb : heatmapRgbForIntensity(intensity);
     const alpha = record.band ? record.band.alpha : 0.5 + (intensity * 0.25);
-    // #1103: text sits on a chip of this surface in the more contrasting colour.
+    // #1103: tile text sits on chips of this surface.
     const surface = heatmapSurfaceRgb(rgb, alpha);
     if (record.band && tile.dataset) tile.dataset.heatmapBand = record.band.id;
     tile.classList.add("heatmap-active");
@@ -6465,7 +6454,6 @@
       heatmapPlaybackSelect.value = timelineActive ? HEATMAP_HISTORY_MODE_TIMELINE : HEATMAP_HISTORY_MODE_CURRENT;
       heatmapPlaybackSelect.disabled = !supportsTimeline;
     }
-    state.heatmap.temperatureScale = normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale);
     const temperatureBands = heatmapTemperatureBandsActive(metric.id);
     heatmapColourField?.classList.toggle("hidden", !state.heatmap.enabled || metric.id !== "temperature_c");
     if (heatmapColourSelect) {

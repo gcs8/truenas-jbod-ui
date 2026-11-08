@@ -1119,10 +1119,7 @@ textarea {
   width: 92px;
 }
 
-.heatmap-playback-field {
-  width: 112px;
-}
-
+.heatmap-playback-field,
 .heatmap-colour-field {
   width: 112px;
 }
@@ -1186,7 +1183,7 @@ textarea {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
-/* #1103: temperature bands replace the min-max gradient. */
+/* #1103: bands replace the min-max gradient. */
 .heatmap-legend.heatmap-legend-banded {
   max-width: 300px;
 }
@@ -4955,15 +4952,13 @@ button.fabric-trace-crumb:hover {
   box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb), 0.32);
 }
 
-/* #1103: text sits above the overlay on a surface-coloured chip in the
-   colour app.js picks for WCAG AA contrast. */
+/* #1103: app.js sets these for coloured tiles (WCAG AA text). */
 .slot-tile.heatmap-missing {
   --heatmap-surface-rgb: 52, 59, 67;
   --heatmap-text-rgb: 238, 242, 246;
   --heatmap-badge-rgb: 23, 26, 30;
 }
 
-/* #1106: the labels follow the value badge instead of sitting under it. */
 .slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool, .slot-tertiary) {
   position: relative;
   z-index: 6;
@@ -5014,7 +5009,7 @@ button.fabric-trace-crumb:hover {
   transform: translate(-50%, -42%);
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgb(var(--heatmap-badge-rgb, 23, 26, 30));
+  background: rgb(var(--heatmap-badge-rgb));
   color: #f4f7fb;
   font-family: var(--mono);
   font-size: 0.82rem;
@@ -5037,8 +5032,8 @@ button.fabric-trace-crumb:hover {
   line-height: 1.02;
 }
 
-/* In a drive bay the value takes its own row between the number and the
-   labels; a UniFi bay is too short, so it shares the number's row. */
+/* #1106: in a drive bay the value has its own row between the number and
+   the labels (order 1); a short UniFi bay puts it beside the number. */
 .slot-number ~ .slot-heatmap-value {
   position: relative;
   inset: auto;
@@ -5057,7 +5052,7 @@ button.fabric-trace-crumb:hover {
   align-content: space-between;
 }
 
-.chassis-shell[data-face-style="unifi-drive"] .slot-tile :is(.slot-device, .slot-pool, .slot-tertiary) {
+.chassis-shell[data-face-style="unifi-drive"] :is(.slot-device, .slot-pool, .slot-tertiary) {
   grid-column: span 2;
 }
 
