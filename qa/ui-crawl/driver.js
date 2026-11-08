@@ -98,7 +98,7 @@ class CrawlDriver {
         const params = new URLSearchParams(location.search);
         const query = new URLSearchParams();
         for (const key of ["system_id", "enclosure_id"]) if (params.get(key)) query.set(key, params.get(key));
-        const response = await fetch(`/api/inventory?${query}`, { headers: { Accept: "application/json" } });
+        const response = await fetch(`/api/inventory?${query}`, { headers: { Accept: "application/json", "X-UI-Crawl-Fresh": "1" }, cache: "no-store" });
         if (!response.ok) return { error: response.status };
         const data = await response.json();
         const match = ((data.snapshot || data).slots || []).find((item) => Number(item.slot) === slotNumber);
@@ -323,7 +323,7 @@ class CrawlDriver {
         const params = new URLSearchParams(location.search);
         const query = new URLSearchParams();
         for (const key of ["system_id", "enclosure_id"]) if (params.get(key)) query.set(key, params.get(key));
-        const response = await fetch(`/api/inventory?${query}`, { headers: { Accept: "application/json" } });
+        const response = await fetch(`/api/inventory?${query}`, { headers: { Accept: "application/json", "X-UI-Crawl-Fresh": "1" }, cache: "no-store" });
         const data = await response.json();
         const snapshot = data.snapshot || data;
         const match = (snapshot.slots || []).find((item) => Number(item.slot) === slotNumber);

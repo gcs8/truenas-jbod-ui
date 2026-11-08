@@ -283,6 +283,16 @@ test("live routing serves repeated read API answers from the cache and answers o
   await handler(makeRoute("POST", batch, '{"slots":[1]}'));
   assert.equal(fetched.length, 1, "second identical read is served from the cache");
   assert.equal(cache.hits, 1);
+  const fresh = makeRoute("GET", `${ORIGIN}/api/inventory?system_id=a`);
+  const freshAgain = makeRoute("GET", `${ORIGIN}/api/inventory?system_id=a`);
+  for (const r of [fresh, freshAgain]) {
+    const original = r.request;
+    r.request = () => ({ ...original(), headers: () => ({ "x-ui-crawl-fresh": "1" }) });
+  }
+  await handler(fresh);
+  await handler(freshAgain);
+  assert.equal(cache.hits, 1, "verification reads bypass the cache");
+  assert.deepEqual(freshAgain.calls, [["continue"]]);
   const pageRoute = makeRoute("GET", `${ORIGIN}/`);
   await handler(pageRoute);
   assert.deepEqual(pageRoute.calls, [["continue"]], "documents go to the stack");

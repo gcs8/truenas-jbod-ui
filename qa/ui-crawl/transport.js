@@ -91,7 +91,10 @@ async function installRoutes(context, { guard, origins, fixture = null, local = 
       const info = { method, url, service: serviceFor(url), body: request.postData() };
       if (fixture) return fixture(route, info);
       if (local && (await local(route, info))) return undefined;
-      if (cache && cacheable(method, url)) {
+      // Verification reads (LED off, mapping precondition) must see the
+      // server's current answer, never a cached one.
+      const fresh = typeof request.headers === "function" && Boolean(request.headers()["x-ui-crawl-fresh"]);
+      if (cache && !fresh && cacheable(method, url)) {
         const key = cache.key(method, url.href, request.postData());
         const hit = cache.get(key);
         if (hit) {
