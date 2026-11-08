@@ -109,9 +109,11 @@ A kept overlay may set only `restart`, nothing else (#1101). It must be a plain 
 
 ```yaml
 services:
-  enclosure-admin:
-    restart: unless-stopped
+  enclosure-ui:
+    restart: always
 ```
+
+Check what a restart policy does before you keep it. `enclosure-admin` and `enclosure-backup` ship with `restart: "no"`, and the admin service stops itself after `ADMIN_AUTO_STOP_SECONDS` (one hour by default) by exiting cleanly. If an overlay sets `restart: always` or `unless-stopped` on it, Docker starts it again each time it exits, so the auto-stop no longer limits how long the admin API stays reachable. `on-failure` does not restart it after that clean exit. The helper accepts any valid restart policy, so this is the operator's choice.
 
 Every other setting is refused before any Docker command, including `environment` (for example `ADMIN_AUTO_STOP_SECONDS` or history retention settings), `ports`, `labels`, `logging`, resource limits, `healthcheck`, `profiles`, `depends_on`, added services, `x-` keys, top-level sections such as `name`, `version`, `include`, `volumes`, `networks`, `configs` and `secrets`, `extends`, `env_file` and `build`, and YAML forms that could hide a key: flow style (`{...}`), anchors, aliases, merge keys (`<<`), tags such as `!reset`, directives, `---` document markers, quoted keys, tabs used for indentation, and anything but plain ASCII text. The refusal names the overlay and the line, never a value. Make any other change in a reviewed Compose release instead; there is no flag to allow it.
 

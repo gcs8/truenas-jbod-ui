@@ -52,7 +52,8 @@ with `--keep-overlay` so it stays in the chain. A kept overlay may set only
 `restart` (`no`, `always`, `on-failure[:N]` or `unless-stopped`) on services
 the shipped files define, nothing else: environment, ports, labels, logging,
 resource limits and every other setting are refused, and there is no flag to
-allow them. The deployment directory, `.env` and every Compose file must be
+allow them. Setting `restart: always` or `unless-stopped` on the admin service
+undoes its auto-stop, because Docker starts it again after it exits. The deployment directory, `.env` and every Compose file must be
 owned by root or the user running the helper and not writable by group or
 others, and every directory from / down to the deployment must be owned by
 root and not writable by group or others, so keep the deployment under a
