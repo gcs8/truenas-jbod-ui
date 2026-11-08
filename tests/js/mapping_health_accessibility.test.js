@@ -253,5 +253,7 @@ test("heat-map metric names match the wiki and the score context explains itself
     "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.",
   );
   assert.equal(heatmapMetricContextText("bytes_read"), "");
-  assert.match(APP_SOURCE, /Use the drive vendor's warning and critical thresholds when available\./);
+  // #1103: the temperature colours now use those thresholds, so the context
+  // says so instead of asking the operator to apply them by hand.
+  assert.match(APP_SOURCE, /Colours use the drive's SMART thresholds when reported, else the defaults in the legend\./);
 });
