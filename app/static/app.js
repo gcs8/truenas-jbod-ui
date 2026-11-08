@@ -30,6 +30,10 @@
   const HEATMAP_DEFAULT_SCALE_SENSITIVITY = 1;
   const HEATMAP_HISTORY_MODE_CURRENT = "current";
   const HEATMAP_HISTORY_MODE_TIMELINE = "timeline";
+  // #1103: temperature colours default to absolute bands; the observed
+  // min-max stretch stays available as an explicit choice.
+  const HEATMAP_TEMPERATURE_SCALE_BANDS = "bands";
+  const HEATMAP_TEMPERATURE_SCALE_RELATIVE = "relative";
   const heatmapSampleCache = new WeakMap();
   const ANNUALIZED_MIN_POWER_ON_HOURS = 24 * 30;
   const HISTORY_UI_STORAGE_KEY = "truenas-jbod-ui.history-ui.v1";
@@ -200,6 +204,7 @@
       timelineCacheKey: null,
       timelineCache: [],
       sensitivity: HEATMAP_DEFAULT_SCALE_SENSITIVITY,
+      temperatureScale: HEATMAP_TEMPERATURE_SCALE_BANDS,
       histories: {},
       loading: false,
       error: null,
@@ -250,15 +255,20 @@
   const heatmapTimeframeSelect = document.getElementById("heatmap-timeframe-select");
   const heatmapPlaybackField = document.getElementById("heatmap-playback-field");
   const heatmapPlaybackSelect = document.getElementById("heatmap-playback-select");
+  const heatmapColourField = document.getElementById("heatmap-colour-field");
+  const heatmapColourSelect = document.getElementById("heatmap-colour-select");
   const heatmapScrubField = document.getElementById("heatmap-scrub-field");
   const heatmapScrubSlider = document.getElementById("heatmap-scrub-slider");
   const heatmapScrubValue = document.getElementById("heatmap-scrub-value");
   const heatmapScaleSlider = document.getElementById("heatmap-scale-slider");
+  const heatmapScaleField = heatmapScaleSlider?.closest(".heatmap-scale-field") || null;
   const heatmapScaleValue = document.getElementById("heatmap-scale-value");
   const heatmapLegend = document.getElementById("heatmap-legend");
   const heatmapLegendMin = document.getElementById("heatmap-legend-min");
   const heatmapLegendMax = document.getElementById("heatmap-legend-max");
   const heatmapLegendStatus = document.getElementById("heatmap-legend-status");
+  const heatmapLegendBands = document.getElementById("heatmap-legend-bands");
+  const heatmapLegendSource = document.getElementById("heatmap-legend-source");
   const heatmapMetricContext = document.getElementById("heatmap-metric-context");
   const sasFabricToggleButton = document.getElementById("sas-fabric-toggle-button");
   const sasFabricViewLink = document.getElementById("sas-fabric-view-link");
@@ -5186,6 +5196,9 @@
         id: "temperature_delta_c",
         label: "Temperature vs View Average",
         shortLabel: "Delta",
+        // #1103: a fixed +/-10 C span keeps a 1 C spread near neutral instead
+        // of stretching it from blue to red.
+        fixedRange: [-10, 10],
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
         format: (value) => `${value >= 0 ? "+" : ""}${roundHeatmapValue(value)} C`,
@@ -5323,13 +5336,27 @@
     if (metricId === "attention_score") {
       return "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.";
     }
+    if (metricId === "temperature_c" && heatmapTemperatureBandsActive(metricId)) {
+      return "Degrees Celsius. Colours use the drive's SMART thresholds when reported, else the defaults in the legend.";
+    }
     if (metricId === "temperature_c") {
-      return "Degrees Celsius. Use the drive vendor's warning and critical thresholds when available.";
+      return "Degrees Celsius. Relative colours stretch from the coolest to the warmest bay in view; use Bands to judge heat.";
     }
     if (metricId === "temperature_delta_c") {
-      return "Degrees Celsius relative to the current view average. Compare peer bays, then use vendor thresholds before acting.";
+      return "Degrees Celsius relative to the current view average; colours span -10 C to +10 C. Compare peer bays, then use vendor thresholds before acting.";
     }
     return "";
+  }
+
+  function normalizeHeatmapTemperatureScale(value) {
+    return value === HEATMAP_TEMPERATURE_SCALE_RELATIVE
+      ? HEATMAP_TEMPERATURE_SCALE_RELATIVE
+      : HEATMAP_TEMPERATURE_SCALE_BANDS;
+  }
+
+  function heatmapTemperatureBandsActive(metricId = state.heatmap.metric) {
+    return metricId === "temperature_c"
+      && normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale) === HEATMAP_TEMPERATURE_SCALE_BANDS;
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -5956,6 +5983,7 @@
     } else if (metric.id === "temperature_delta_c") {
       evaluation.temperatureAverage = heatmapTemperatureAverage(entries, evaluation);
     }
+    const temperatureBands = heatmapTemperatureBandsActive(metric.id);
     const records = new Map();
     const numericValues = [];
 
@@ -5973,6 +6001,10 @@
         value: hasDiskIdentity && Number.isFinite(numericValue) ? numericValue : null,
         reasons,
       };
+      if (temperatureBands && Number.isFinite(record.value)) {
+        record.thresholds = resolveHeatmapTemperatureThresholds(entry?.smartEntry?.data, entry?.slot);
+        record.band = heatmapTemperatureBand(record.value, record.thresholds);
+      }
       records.set(entry.key, record);
       if (Number.isFinite(record.value)) {
         numericValues.push(record.value);
@@ -5990,6 +6022,8 @@
       min,
       max,
       sensitivity: state.heatmap.sensitivity,
+      temperatureBands,
+      bandSummary: temperatureBands ? summarizeHeatmapTemperatureBands(records) : null,
       valueCount: numericValues.length,
       timelineActive,
       playbackIndex,
@@ -6031,6 +6065,181 @@
     return interpolateRgb(amber, red, (clamped - 0.68) / 0.32);
   }
 
+  // #1103: absolute temperature bands. A drive's own SMART warning/critical
+  // ratings win; otherwise these documented defaults apply (wiki Heat Map
+  // Mode). Every band is drawn at a fixed alpha so its tile surface, and the
+  // text colour chosen for it, are known in advance.
+  function heatmapTemperatureBandDefinitions() {
+    return [
+      { id: "cool", label: "Cool", rgb: [47, 110, 187], alpha: 0.72 },
+      { id: "normal", label: "Normal", rgb: [44, 171, 103], alpha: 0.66 },
+      { id: "warm", label: "Warm", rgb: [215, 182, 43], alpha: 0.72 },
+      { id: "warning", label: "Warning", rgb: [245, 130, 40], alpha: 0.8 },
+      { id: "critical", label: "Critical", rgb: [218, 50, 50], alpha: 0.82 },
+    ];
+  }
+
+  function heatmapTemperatureDefaultProfiles() {
+    return {
+      hdd: { id: "hdd", label: "HDD defaults", cool: 30, warm: 45, warning: 50, critical: 60 },
+      solid_state: { id: "solid_state", label: "SSD/NVMe defaults", cool: 30, warm: 60, warning: 70, critical: 80 },
+    };
+  }
+
+  function heatmapTemperatureProfileId(data, slot) {
+    const transport = String(data?.transport_protocol || slot?.transport_protocol || "").trim().toLowerCase();
+    if (transport === "nvme" || nullableMetricNumber(data?.rotation_rate_rpm) === 0) {
+      return "solid_state";
+    }
+    return /^nvme\d/i.test(String(slot?.device_name || "").trim()) ? "solid_state" : "hdd";
+  }
+
+  function heatmapTemperatureThresholdValue(value) {
+    // Unreported SCSI/ATA limits arrive as 0, 255 or -128; none is a rating.
+    const numeric = nullableMetricNumber(value);
+    return Number.isFinite(numeric) && numeric >= 20 && numeric <= 150 ? numeric : null;
+  }
+
+  function resolveHeatmapTemperatureThresholds(data, slot) {
+    const profile = heatmapTemperatureDefaultProfiles()[heatmapTemperatureProfileId(data, slot)];
+    let warning = heatmapTemperatureThresholdValue(data?.warning_temperature_c);
+    let critical = heatmapTemperatureThresholdValue(data?.critical_temperature_c);
+    if (warning !== null && critical !== null && warning > critical) {
+      // Inconsistent pair: keep the stronger (critical) claim only.
+      warning = null;
+    }
+    const reported = (warning !== null ? 1 : 0) + (critical !== null ? 1 : 0);
+    const warningGap = profile.critical - profile.warning;
+    if (critical === null && warning !== null) {
+      critical = warning + warningGap;
+    } else if (warning === null && critical !== null) {
+      warning = critical - warningGap;
+    } else if (warning === null) {
+      warning = profile.warning;
+      critical = profile.critical;
+    }
+    const warm = warning - (profile.warning - profile.warm);
+    return {
+      cool: Math.min(profile.cool, warm),
+      warm,
+      warning,
+      critical,
+      source: reported === 2 ? "drive" : reported === 1 ? "drive_partial" : "default",
+      profileId: profile.id,
+      profileLabel: profile.label,
+    };
+  }
+
+  function heatmapTemperatureBand(value, thresholds) {
+    const numeric = nullableMetricNumber(value);
+    if (!Number.isFinite(numeric) || !thresholds) {
+      return null;
+    }
+    // Classify the number the tile shows, so "50 C" never reads as warm.
+    const shown = Math.round(numeric);
+    const index = shown >= thresholds.critical ? 4
+      : shown >= thresholds.warning ? 3
+        : shown >= thresholds.warm ? 2
+          : shown >= thresholds.cool ? 1
+            : 0;
+    return heatmapTemperatureBandDefinitions()[index];
+  }
+
+  function heatmapTemperatureThresholdKey(thresholds) {
+    return [thresholds.cool, thresholds.warm, thresholds.warning, thresholds.critical, thresholds.source, thresholds.profileId].join("|");
+  }
+
+  function summarizeHeatmapTemperatureBands(records) {
+    const groups = new Map();
+    let driveCount = 0;
+    let partialCount = 0;
+    let defaultCount = 0;
+    records.forEach((record) => {
+      if (!record?.thresholds) {
+        return;
+      }
+      const source = record.thresholds.source;
+      if (source === "drive") driveCount += 1;
+      else if (source === "drive_partial") partialCount += 1;
+      else defaultCount += 1;
+      const key = heatmapTemperatureThresholdKey(record.thresholds);
+      const group = groups.get(key) || { thresholds: record.thresholds, count: 0 };
+      group.count += 1;
+      groups.set(key, group);
+    });
+    let primary = null;
+    groups.forEach((group) => {
+      if (!primary || group.count > primary.count) {
+        primary = group;
+      }
+    });
+    return {
+      driveCount,
+      partialCount,
+      defaultCount,
+      total: driveCount + partialCount + defaultCount,
+      distinctCount: groups.size,
+      primary: primary ? primary.thresholds : null,
+      primaryCount: primary ? primary.count : 0,
+    };
+  }
+
+  function heatmapTemperatureSourceLabel(thresholds) {
+    if (thresholds?.source === "drive") return "drive SMART thresholds";
+    if (thresholds?.source === "drive_partial") return "one drive SMART threshold, default spacing";
+    return thresholds?.profileLabel || "HDD defaults";
+  }
+
+  function heatmapTemperatureBandRanges(thresholds) {
+    const span = (lower, upperExclusive) => {
+      if (upperExclusive - 1 < lower) return "none";
+      return upperExclusive - 1 === lower ? `${lower} C` : `${lower}-${upperExclusive - 1} C`;
+    };
+    return {
+      cool: `<${thresholds.cool} C`,
+      normal: span(thresholds.cool, thresholds.warm),
+      warm: span(thresholds.warm, thresholds.warning),
+      warning: span(thresholds.warning, thresholds.critical),
+      critical: `${thresholds.critical}+ C`,
+    };
+  }
+
+  // WCAG 2.x relative luminance and contrast ratio.
+  function heatmapRelativeLuminance(rgb) {
+    const [red, green, blue] = Array.from(rgb).slice(0, 3).map((component) => {
+      const channel = Math.max(0, Math.min(255, Number(component) || 0)) / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return Math.min(1, (0.2126 * red) + (0.7152 * green) + (0.0722 * blue));
+  }
+
+  function heatmapContrastRatio(first, second) {
+    const firstLuminance = heatmapRelativeLuminance(first);
+    const secondLuminance = heatmapRelativeLuminance(second);
+    return (Math.max(firstLuminance, secondLuminance) + 0.05) / (Math.min(firstLuminance, secondLuminance) + 0.05);
+  }
+
+  // The colour a heat overlay produces over the dark bay face (#11161a).
+  function heatmapSurfaceRgb(rgb, alpha, base = [17, 22, 26]) {
+    const amount = Math.max(0, Math.min(1, Number(alpha) || 0));
+    return Array.from(rgb).slice(0, 3)
+      .map((component, index) => Math.round((Number(component) * amount) + (Number(base[index]) * (1 - amount))));
+  }
+
+  // The value badge's dark chip (rgba(5, 8, 12, 0.62) before #1103) made
+  // opaque, so a device line it overlaps in a short bay is hidden, not ghosted.
+  function heatmapBadgeRgb(surfaceRgb) {
+    return heatmapSurfaceRgb([5, 8, 12], 0.62, surfaceRgb);
+  }
+
+  // Pure white or black: one of them reaches at least 4.58:1 on any surface,
+  // so every heat colour, relative or banded, clears WCAG AA (4.5:1).
+  function heatmapReadableTextRgb(surfaceRgb) {
+    const light = [255, 255, 255];
+    const dark = [0, 0, 0];
+    return heatmapContrastRatio(light, surfaceRgb) >= heatmapContrastRatio(dark, surfaceRgb) ? light : dark;
+  }
+
   function resetHeatmapTile(tile) {
     if (!tile) {
       return;
@@ -6039,6 +6248,12 @@
     tile.style.removeProperty("--heatmap-rgb");
     tile.style.removeProperty("--heatmap-alpha");
     tile.style.removeProperty("--heatmap-border-alpha");
+    tile.style.removeProperty("--heatmap-surface-rgb");
+    tile.style.removeProperty("--heatmap-text-rgb");
+    tile.style.removeProperty("--heatmap-badge-rgb");
+    if (tile.dataset) {
+      delete tile.dataset.heatmapBand;
+    }
     Array.from(tile.children).forEach((child) => {
       if (child.classList?.contains("slot-heatmap-value")) {
         child.remove();
@@ -6062,18 +6277,38 @@
       tile.appendChild(badge);
       return;
     }
-    const intensity = heatmapIntensity(record, context);
-    if (intensity === null) {
-      tile.classList.add("heatmap-missing");
-      badge.textContent = metric.format(record.value);
-      tile.appendChild(badge);
-      return;
+    let rgb;
+    let alpha;
+    let borderAlpha;
+    if (record.band) {
+      rgb = record.band.rgb;
+      alpha = record.band.alpha;
+      borderAlpha = 0.9;
+      if (tile.dataset) {
+        tile.dataset.heatmapBand = record.band.id;
+      }
+    } else {
+      const intensity = heatmapIntensity(record, context);
+      if (intensity === null) {
+        tile.classList.add("heatmap-missing");
+        badge.textContent = metric.format(record.value);
+        tile.appendChild(badge);
+        return;
+      }
+      rgb = heatmapRgbForIntensity(intensity);
+      alpha = 0.5 + (intensity * 0.25);
+      borderAlpha = 0.58 + (intensity * 0.32);
     }
-    const rgb = heatmapRgbForIntensity(intensity);
+    // #1103: tile text sits on a chip of the computed surface colour, in
+    // whichever of light or dark text contrasts more with it.
+    const surface = heatmapSurfaceRgb(rgb, alpha);
     tile.classList.add("heatmap-active");
     tile.style.setProperty("--heatmap-rgb", rgb.join(", "));
-    tile.style.setProperty("--heatmap-alpha", String(0.5 + (intensity * 0.25)));
-    tile.style.setProperty("--heatmap-border-alpha", String(0.58 + (intensity * 0.32)));
+    tile.style.setProperty("--heatmap-alpha", String(alpha));
+    tile.style.setProperty("--heatmap-border-alpha", String(borderAlpha));
+    tile.style.setProperty("--heatmap-surface-rgb", surface.join(", "));
+    tile.style.setProperty("--heatmap-text-rgb", heatmapReadableTextRgb(surface).join(", "));
+    tile.style.setProperty("--heatmap-badge-rgb", heatmapBadgeRgb(surface).join(", "));
     badge.textContent = metric.format(record.value);
     badge.title = `${metric.label}: ${metric.format(record.value)}`;
     tile.appendChild(badge);
@@ -6116,6 +6351,9 @@
       return [`Heat Map: ${metric.label} unknown`];
     }
     const lines = [`Heat Map: ${metric.label} ${metric.format(record.value)}`];
+    if (record.band && record.thresholds) {
+      lines.push(`Band: ${record.band.label} (${heatmapTemperatureSourceLabel(record.thresholds)}: warning ${record.thresholds.warning} C, critical ${record.thresholds.critical} C)`);
+    }
     if (heatmapContext.timelineActive) {
       lines.push(`Sample: ${formatHeatmapPlaybackLabel(
         heatmapContext.playbackTimestampMs,
@@ -6302,6 +6540,19 @@
       heatmapPlaybackSelect.value = timelineActive ? HEATMAP_HISTORY_MODE_TIMELINE : HEATMAP_HISTORY_MODE_CURRENT;
       heatmapPlaybackSelect.disabled = !supportsTimeline;
     }
+    state.heatmap.temperatureScale = normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale);
+    const temperatureBands = heatmapTemperatureBandsActive(metric.id);
+    if (heatmapColourField) {
+      heatmapColourField.classList.toggle("hidden", !state.heatmap.enabled || metric.id !== "temperature_c");
+    }
+    if (heatmapColourSelect) {
+      heatmapColourSelect.value = state.heatmap.temperatureScale;
+    }
+    if (heatmapScaleField) {
+      // Bands are absolute, so the relative contrast scale does not apply;
+      // Colours takes its place in the control row.
+      heatmapScaleField.classList.toggle("hidden", temperatureBands);
+    }
     if (heatmapScaleSlider) {
       heatmapScaleSlider.value = String(state.heatmap.sensitivity);
     }
@@ -6335,6 +6586,11 @@
       heatmapScrubValue.value = playbackLabel;
       heatmapScrubValue.textContent = playbackLabel;
     }
+    const legendBands = Boolean(heatmapContext.temperatureBands);
+    if (heatmapLegend) {
+      heatmapLegend.classList.toggle("heatmap-legend-banded", legendBands);
+    }
+    renderHeatmapLegendBands(legendBands ? heatmapContext.bandSummary : null);
     if (heatmapLegendMin) {
       setTextIfChanged(heatmapLegendMin, Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low");
     }
@@ -6365,7 +6621,7 @@
         const valueCount = heatmapContext.valueCount || 0;
         const windowLabel = needsHistory ? ` - ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "";
         const timelineLabel = timelineActive ? ` - ${playbackLabel}` : "";
-        const scaleLabel = state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
+        const scaleLabel = !legendBands && state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
           ? ` - scale ${formatHeatmapScaleSensitivity(state.heatmap.sensitivity)}`
           : "";
         legendStatusText = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
@@ -6375,6 +6631,51 @@
       if (heatmapLegendStatus.title !== legendStatusTitle) {
         heatmapLegendStatus.title = legendStatusTitle;
       }
+    }
+  }
+
+  function renderHeatmapLegendBands(summary) {
+    if (heatmapLegendBands) {
+      heatmapLegendBands.classList.toggle("hidden", !summary);
+    }
+    if (heatmapLegendSource) {
+      heatmapLegendSource.classList.toggle("hidden", !summary);
+    }
+    if (!summary) {
+      return;
+    }
+    const thresholds = summary.primary || resolveHeatmapTemperatureThresholds(null, null);
+    const ranges = heatmapTemperatureBandRanges(thresholds);
+    if (heatmapLegendBands) {
+      const key = heatmapTemperatureThresholdKey(thresholds);
+      if (heatmapLegendBands.dataset.bandsKey !== key) {
+        heatmapLegendBands.dataset.bandsKey = key;
+        heatmapLegendBands.replaceChildren(...heatmapTemperatureBandDefinitions().map((band) => {
+          const item = document.createElement("li");
+          item.className = "heatmap-legend-band";
+          item.dataset.band = band.id;
+          const swatch = document.createElement("span");
+          swatch.className = "heatmap-legend-band-swatch";
+          swatch.setAttribute("aria-hidden", "true");
+          swatch.style.setProperty("--heatmap-band-rgb", band.rgb.join(", "));
+          const name = document.createElement("span");
+          name.className = "heatmap-legend-band-name";
+          name.textContent = band.label;
+          const range = document.createElement("span");
+          range.className = "heatmap-legend-band-range";
+          range.textContent = ranges[band.id];
+          item.append(swatch, name, range);
+          return item;
+        }));
+      }
+    }
+    if (heatmapLegendSource) {
+      const sourceLabel = heatmapTemperatureSourceLabel(thresholds);
+      const others = summary.total - summary.primaryCount;
+      const text = summary.distinctCount > 1 && others > 0
+        ? `Bands: ${sourceLabel} (${summary.primaryCount} of ${summary.total} bays). ${others === 1 ? "1 other bay has" : `${others} other bays have`} different bands; hover a bay.`
+        : `Bands: ${sourceLabel}`;
+      setTextIfChanged(heatmapLegendSource, text);
     }
   }
 
@@ -12397,6 +12698,13 @@
       renderGrid();
       renderHeatmapControls();
       ensureHeatmapData();
+    });
+  }
+  if (heatmapColourSelect) {
+    heatmapColourSelect.addEventListener("change", () => {
+      state.heatmap.temperatureScale = normalizeHeatmapTemperatureScale(heatmapColourSelect.value);
+      renderGrid();
+      renderHeatmapControls();
     });
   }
   if (heatmapScrubSlider) {

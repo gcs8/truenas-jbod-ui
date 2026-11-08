@@ -129,10 +129,22 @@ function loadMetricFunctions(context = {}) {
   ];
   // Baseline replay must reach the actual defect, not fail on a missing new helper.
   if (APP_SOURCE.includes("function nullableMetricNumber(")) names.push("nullableMetricNumber");
+  // #1103 temperature bands and tile text contrast helpers.
+  for (const name of [
+    "heatmapTemperatureBandsActive", "normalizeHeatmapTemperatureScale", "resolveHeatmapTemperatureThresholds",
+    "heatmapTemperatureDefaultProfiles", "heatmapTemperatureProfileId", "heatmapTemperatureThresholdValue",
+    "heatmapTemperatureBand", "heatmapTemperatureBandDefinitions", "summarizeHeatmapTemperatureBands",
+    "heatmapTemperatureThresholdKey", "heatmapSurfaceRgb", "heatmapReadableTextRgb", "heatmapContrastRatio",
+    "heatmapBadgeRgb",
+    "heatmapRelativeLuminance",
+  ]) {
+    if (APP_SOURCE.includes(`function ${name}(`)) names.push(name);
+  }
   return loadFunctions(names, {
     ANNUALIZED_MIN_POWER_ON_HOURS: 720,
     HEATMAP_MIN_SCALE_SENSITIVITY: 0.5, HEATMAP_MAX_SCALE_SENSITIVITY: 2,
     HEATMAP_DEFAULT_SCALE_SENSITIVITY: 1, HEATMAP_DEFAULT_METRIC: "attention_score",
+    HEATMAP_TEMPERATURE_SCALE_BANDS: "bands", HEATMAP_TEMPERATURE_SCALE_RELATIVE: "relative",
     heatmapSampleCache: new WeakMap(),
     heatmapTimelineActive: () => false,
     escapeHtml: (value) => String(value),

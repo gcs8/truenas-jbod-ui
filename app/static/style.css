@@ -1123,6 +1123,10 @@ textarea {
   width: 112px;
 }
 
+.heatmap-colour-field {
+  width: 112px;
+}
+
 .heatmap-scrub-field {
   width: 180px;
 }
@@ -1180,6 +1184,57 @@ textarea {
   border-radius: 999px;
   background: linear-gradient(90deg, #2f6ebb, #2cab67 30%, #d7b62b 68%, #d24a4a);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+/* #1103: absolute temperature bands replace the min-max gradient. The cap
+   keeps the legend near its gradient footprint; the bands wrap instead. */
+.heatmap-legend.heatmap-legend-banded {
+  max-width: 300px;
+}
+
+.heatmap-legend.heatmap-legend-banded > #heatmap-legend-min,
+.heatmap-legend.heatmap-legend-banded > .heatmap-legend-bar,
+.heatmap-legend.heatmap-legend-banded > #heatmap-legend-max {
+  display: none;
+}
+
+.heatmap-legend-bands {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.heatmap-legend-band {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.heatmap-legend-band-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: rgb(var(--heatmap-band-rgb, 120, 130, 140));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+}
+
+.heatmap-legend-band-name {
+  color: #dfe7f0;
+}
+
+.heatmap-legend-band-range {
+  font-family: var(--mono);
+  color: #c5d4e6;
+}
+
+.heatmap-legend-source {
+  grid-column: 1 / -1;
+  color: #c5d4e6;
 }
 
 .heatmap-legend-status {
@@ -4902,6 +4957,23 @@ button.fabric-trace-crumb:hover {
   z-index: 6;
 }
 
+.slot-tile.heatmap-active .slot-number,
+.slot-tile.heatmap-missing .slot-number,
+.slot-tile.selected.heatmap-active .slot-number,
+.slot-tile.selected.heatmap-missing .slot-number {
+  background: rgb(var(--heatmap-surface-rgb, 52, 59, 67));
+  color: rgb(var(--heatmap-text-rgb, 238, 242, 246));
+  box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb, 238, 242, 246), 0.32);
+}
+
+/* #1103: tile text sits above the heat overlay on a chip of the computed
+   surface colour, in the text colour app.js picks for WCAG AA contrast. */
+.slot-tile.heatmap-missing {
+  --heatmap-surface-rgb: 52, 59, 67;
+  --heatmap-text-rgb: 238, 242, 246;
+  --heatmap-badge-rgb: 23, 26, 30;
+}
+
 .slot-tile.heatmap-active .slot-device,
 .slot-tile.heatmap-active .slot-pool,
 .slot-tile.heatmap-active .slot-tertiary,
@@ -4909,8 +4981,14 @@ button.fabric-trace-crumb:hover {
 .slot-tile.heatmap-missing .slot-pool,
 .slot-tile.heatmap-missing .slot-tertiary {
   position: relative;
-  z-index: 1;
-  opacity: 0.45;
+  z-index: 6;
+  align-self: flex-start;
+  width: fit-content;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgb(var(--heatmap-surface-rgb, 52, 59, 67));
+  color: rgb(var(--heatmap-text-rgb, 238, 242, 246));
+  opacity: 1;
 }
 
 .slot-tile.selected .slot-number {
@@ -4954,7 +5032,7 @@ button.fabric-trace-crumb:hover {
   transform: translate(-50%, -42%);
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(5, 8, 12, 0.62);
+  background: rgb(var(--heatmap-badge-rgb, 23, 26, 30));
   color: #f4f7fb;
   font-family: var(--mono);
   font-size: 0.82rem;

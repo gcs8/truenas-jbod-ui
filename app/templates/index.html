@@ -399,6 +399,13 @@
                   <option value="timeline">Timeline</option>
                 </select>
               </label>
+              <label class="field heatmap-control-field heatmap-colour-field hidden" id="heatmap-colour-field">
+                <span>Colours</span>
+                <select id="heatmap-colour-select" title="Bands use drive SMART thresholds or documented defaults; Relative stretches from the coolest to the warmest bay in view.">
+                  <option value="bands" selected>Bands</option>
+                  <option value="relative">Relative</option>
+                </select>
+              </label>
               <label class="field heatmap-control-field heatmap-scrub-field hidden" id="heatmap-scrub-field">
                 <span>Sample <output id="heatmap-scrub-value">Live</output></span>
                 <input id="heatmap-scrub-slider" type="range" min="0" max="0" step="1" value="0">
@@ -413,6 +420,8 @@
               <span id="heatmap-legend-min">Low</span>
               <span class="heatmap-legend-bar" aria-hidden="true"></span>
               <span id="heatmap-legend-max">High</span>
+              <ul id="heatmap-legend-bands" class="heatmap-legend-bands hidden" aria-label="Temperature bands"></ul>
+              <span id="heatmap-legend-source" class="heatmap-legend-source hidden"></span>
               <span id="heatmap-legend-status" class="heatmap-legend-status">Ready</span>
             </div>
             <div class="legend">
