@@ -55,8 +55,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   that open and close their full text. The heat-map value no longer hides the
   device name on NVMe carrier cards. In a narrow window grouped bays, boot
   and NVMe cards and UniFi heat values no longer overlap or wrap one letter
-  per line, the UNVR Pro state chip no longer covers the temperature unit,
-  and the history table scrolls on its own (#1122).
+  per line, state chips on every UniFi face (UNVR, UNVR Pro, UNVR-G2,
+  UNVR-G2-Pro, ENVR, ENVR Core) clear the temperature, labels, LED and
+  handle, and the history table scrolls on its own (#1122).
 - Fixed heat-map temperature colours stretching to the coolest and warmest bay
   in view, which showed a 49 C disk beside a 48 C one, or 35 C disks on a cool
   shelf, as red. Temperatures now use absolute bands from each drive's SMART

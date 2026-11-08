@@ -4701,6 +4701,15 @@ button.fabric-trace-crumb:hover {
     right: 6px;
   }
 
+  /* A G2 bay's text ends before the chip, which sits left of the handle. */
+  .chassis-shell[data-face-family="g2"] {
+    --unifi-bay-min: 182px;
+  }
+
+  .chassis-shell[data-face-family="g2"][data-face-variant] .slot-tile {
+    padding-right: 84px;
+  }
+
   .unifi-face-band {
     gap: 6px;
     font-size: 0.75rem;

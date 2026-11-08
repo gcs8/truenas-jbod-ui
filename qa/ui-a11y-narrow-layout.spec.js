@@ -31,6 +31,9 @@ const NARROW = { width: 390, height: 900 };
 const DESKTOP = [{ width: 1600, height: 1000 }, { width: 1920, height: 1080 }, { width: 3840, height: 2160 }];
 const SCREENSHOT_DIR = process.env.UI_A11Y_SCREENSHOT_DIR || "";
 const STORAGE_VIEWS = ["boot-doms", "nvme-carrier-x4", "manual-group"];
+// Plain UniFi plus every built-in UniFi model face, by face variant, with
+// its bay count.
+const UNIFI_FACES = [["unifi-plain", 8], ["unvr", 4], ["unvr-pro", 7], ["unvr-g2", 4], ["unvr-g2-pro", 8], ["envr", 16], ["envr-core", 16]];
 
 const FIXTURE_SCRIPT = `
 import json
@@ -170,13 +173,19 @@ history_html = env.get_template("dashboard.html").render(
 pages = {"demo": (demo, demo_runtime), "mounts": (mounts, empty_runtime)}
 for name, snapshot in {
     "grouped": variant("synthetic-grouped-12", "Synthetic Grouped 12 Bay", "front-drive", 1, 12, (4, 4, 4)),
-    # A plain UniFi face (no model print) and a UNVR Pro, whose bays 1-3 share
-    # the top row with the touchscreen and ports.
+    # A plain UniFi face (no model print).
     "unifi-plain": variant("synthetic-unifi-8", "Synthetic UniFi 8 Bay", "unifi-drive", 2, 4),
-    "unifi": variant("synthetic-unvr-pro", "Synthetic UNVR Pro", "unifi-drive", 2, 4,
-                     layout=[[0, 1, 2, None], [3, 4, 5, 6]], face_variant="unvr-pro", slot_number_base=1),
 }.items():
     pages[name] = (snapshot, empty_runtime)
+# Every built-in UniFi model face (UNVR, UNVR Pro, UNVR-G2, UNVR-G2-Pro, ENVR,
+# ENVR Core) with its shipped rows, bay layout and latch, keyed by variant.
+from app.services.profile_registry import ProfileRegistry
+for profile in ProfileRegistry(Settings()).list_profiles():
+    if profile.face_style == "unifi-drive" and profile.face_variant:
+        pages[profile.face_variant] = (variant(
+            profile.id, profile.label, profile.face_style, profile.rows, profile.columns, bay_size=profile.bay_size,
+            layout=profile.slot_layout, face_variant=profile.face_variant, latch_edge=profile.latch_edge,
+            slot_number_base=profile.slot_number_base), empty_runtime)
 print(json.dumps({
     "main": {name: {"html": main_page(snapshot, runtime), "snapshot": dump(snapshot), "runtime": dump(runtime)}
              for name, (snapshot, runtime) in pages.items()},
@@ -566,6 +575,49 @@ for (const viewport of [NARROW, DESKTOP[0]]) {
 
 // ---- 390 px layout -----------------------------------------------------------
 
+// The UniFi matrix below covers every built-in model face: a new one fails
+// here until it joins UNIFI_FACES.
+test("the UniFi matrix covers every built-in UniFi model face", () => {
+  const models = Object.entries(fixture.main)
+    .filter(([, page]) => page.snapshot.selected_profile?.face_variant)
+    .map(([name, page]) => [name, page.snapshot.slots.length]);
+  expect(Object.fromEntries(models)).toEqual(Object.fromEntries(UNIFI_FACES.filter(([face]) => face !== "unifi-plain")));
+});
+
+// #1124: each bay's state chip (its ::after) against the bay's text, heat
+// value, LED and handle block. Text is measured by its rendered Range, so a
+// short label beside the chip passes; the value badge, LED and handle by box.
+async function stateChips(page) {
+  return page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
+    const style = getComputedStyle(tile, "::after");
+    const px = (value) => parseFloat(value) || 0;
+    const extra = style.boxSizing === "border-box" ? [0, 0] : [
+      px(style.paddingLeft) + px(style.paddingRight) + px(style.borderLeftWidth) + px(style.borderRightWidth),
+      px(style.paddingTop) + px(style.paddingBottom) + px(style.borderTopWidth) + px(style.borderBottomWidth),
+    ];
+    const width = px(style.width) + extra[0];
+    const height = px(style.height) + extra[1];
+    const shift = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+    const box = tile.getBoundingClientRect();
+    const left = box.left + tile.clientLeft + (style.left !== "auto" ? px(style.left) : tile.clientWidth - px(style.right) - width) + shift.e;
+    const top = box.top + tile.clientTop + (style.top !== "auto" ? px(style.top) : tile.clientHeight - px(style.bottom) - height) + shift.f;
+    const chip = { left, top, right: left + width, bottom: top + height };
+    const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const hits = [];
+    for (const part of tile.querySelectorAll(".slot-heatmap-value, .slot-status-led, .slot-latch")) {
+      if (part.checkVisibility({ visibilityProperty: true }) && overlap(chip, part.getBoundingClientRect())) hits.push(part.className);
+    }
+    for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary, .slot-heatmap-value")) {
+      if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
+    }
+    const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
+    return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
+  }));
+}
+
 const MAIN_STATES = [
   { name: "default", setup: async () => {} },
   { name: "heat map", setup: enableHeatMap },
@@ -606,9 +658,20 @@ for (const viewport of [NARROW, ...DESKTOP]) {
     expect(errors).toEqual([]);
   });
 
-  for (const [face, bays] of [["unifi-plain", 8], ["unifi", 7]]) {
-    test(`${face} heat-map temperatures stay on one line at ${viewport.width} px (#1109)`, async ({ page }) => {
+  for (const [face, bays] of UNIFI_FACES) {
+    test(`${face} state chips clear the labels, heat values, LED and handle, and values stay on one line at ${viewport.width} px (#1109, #1124)`, async ({ page }) => {
       const errors = await openMain(page, face, viewport);
+      const expectClearChips = async (label) => {
+        const chips = await stateChips(page);
+        expect(chips, label).toHaveLength(bays);
+        for (const chip of chips) {
+          expect(chip.content, `${label}: bay ${chip.slot} draws a state chip`).not.toBe("none");
+          expect(chip.hits, `${label}: bay ${chip.slot} chip ${JSON.stringify(chip.chip)} covers`).toEqual([]);
+          expect(chip.inside, `${label}: bay ${chip.slot} chip ${JSON.stringify(chip.chip)} inside the bay`).toBe(true);
+        }
+        expectCleanLayout(await layoutReport(page, ".enclosure-panel"), `${face} ${label}`);
+      };
+      await expectClearChips("Heat Map off");
       await enableHeatMap(page);
       const values = await page.locator("#slot-grid .slot-heatmap-value").evaluateAll((badges) => badges.map((badge) => {
         const range = document.createRange();
@@ -624,42 +687,7 @@ for (const viewport of [NARROW, ...DESKTOP]) {
         expect(value.lines, `"${value.text}" wraps`).toBe(1);
         expect(value.clipped, `"${value.text}" is cut off`).toBe(false);
       }
-      // #1124: the state chip (the bay's ::after) clears the value and every
-      // text line, and stays inside the bay.
-      const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
-        const style = getComputedStyle(tile, "::after");
-        const px = (value) => parseFloat(value) || 0;
-        const extra = style.boxSizing === "border-box" ? [0, 0] : [
-          px(style.paddingLeft) + px(style.paddingRight) + px(style.borderLeftWidth) + px(style.borderRightWidth),
-          px(style.paddingTop) + px(style.paddingBottom) + px(style.borderTopWidth) + px(style.borderBottomWidth),
-        ];
-        const width = px(style.width) + extra[0];
-        const height = px(style.height) + extra[1];
-        const shift = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
-        const box = tile.getBoundingClientRect();
-        const left = box.left + tile.clientLeft + (style.left !== "auto" ? px(style.left) : tile.clientWidth - px(style.right) - width) + shift.e;
-        const top = box.top + tile.clientTop + (style.top !== "auto" ? px(style.top) : tile.clientHeight - px(style.bottom) - height) + shift.f;
-        const chip = { left, top, right: left + width, bottom: top + height };
-        const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
-        const hits = [];
-        const badge = tile.querySelector(".slot-heatmap-value");
-        if (badge && overlap(chip, badge.getBoundingClientRect())) hits.push("value badge");
-        for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary, .slot-heatmap-value")) {
-          if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
-          const range = document.createRange();
-          range.selectNodeContents(line);
-          if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
-        }
-        const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
-        return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
-      }));
-      expect(chips).toHaveLength(bays);
-      for (const chip of chips) {
-        expect(chip.content, `bay ${chip.slot} draws a state chip`).not.toBe("none");
-        expect(chip.hits, `bay ${chip.slot} chip ${JSON.stringify(chip.chip)} covers`).toEqual([]);
-        expect(chip.inside, `bay ${chip.slot} chip ${JSON.stringify(chip.chip)} inside the bay`).toBe(true);
-      }
-      expectCleanLayout(await layoutReport(page, ".enclosure-panel"), "UniFi heat map");
+      await expectClearChips("Heat Map");
       await capture(page, `${face}-heatmap-${viewport.width}`, page.locator(".enclosure-panel"));
       expect(errors).toEqual([]);
     });
