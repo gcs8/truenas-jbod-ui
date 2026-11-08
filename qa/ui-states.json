@@ -61,8 +61,7 @@
     },
     {
       "id": "main.select.topology", "page": "main", "safety": "read",
-      "requires": "[data-topology-slot]",
-      "steps": [{"selectBay": "healthy"}, {"wait": 600}, {"clickIfPresent": "[data-topology-slot]:not(.is-selected)"}, {"wait": 600}],
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "[data-topology-slot]"}, {"clickIfPresent": "[data-topology-slot]:not(.is-selected)"}, {"wait": 600}],
       "covers": ["[data-topology-slot]"]
     },
     {
@@ -90,8 +89,7 @@
     },
     {
       "id": "main.heatmap.timeline", "page": "main", "safety": "read",
-      "requires": "#heatmap-playback-field:not(.hidden)",
-      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"requireVisible": "#heatmap-playback-select"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-playback-select", "#heatmap-timeframe-select", "#heatmap-scrub-slider"]
     },
@@ -109,20 +107,17 @@
     },
     {
       "id": "main.history", "page": "main", "safety": "read", "ci": true,
-      "requires": "#history-toggle-button",
-      "steps": [{"selectBay": "healthy"}, {"waitFor": "#history-toggle-button:not(.hidden)"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"wait": 2500}],
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"wait": 2500}],
       "covers": ["#history-toggle-button", "#history-timeframe-select", "#history-close-button", "#history-retry-button", "[data-history-io-mode]"]
     },
     {
       "id": "main.history.rate", "page": "main", "safety": "read",
-      "requires": "#history-toggle-button",
-      "steps": [{"selectBay": "healthy"}, {"waitFor": "#history-toggle-button:not(.hidden)"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"clickIfPresent": "[data-history-io-mode=average]"}, {"wait": 1500}],
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"clickIfPresent": "[data-history-io-mode=average]"}, {"wait": 1500}],
       "covers": ["[data-history-io-mode]"]
     },
     {
       "id": "main.history.window", "page": "main", "safety": "read",
-      "requires": "#history-toggle-button",
-      "steps": [{"selectBay": "healthy"}, {"waitFor": "#history-toggle-button:not(.hidden)"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"select": "#history-timeframe-select", "value": "168"}, {"wait": 2500}],
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"select": "#history-timeframe-select", "value": "168"}, {"wait": 2500}],
       "covers": ["#history-timeframe-select"]
     },
     {
@@ -347,8 +342,7 @@
     },
     {
       "id": "fabric.alias.editor", "page": "fabric", "safety": "read",
-      "requires": "[data-fabric-alias-edit]",
-      "steps": [{"clickIfPresent": "#fabric-map-panel [data-fabric-node]"}, {"wait": 600}, {"click": "[data-fabric-alias-edit]"}, {"wait": 400}],
+      "steps": [{"clickIfPresent": "#fabric-map-panel [data-fabric-node]"}, {"requireVisible": "[data-fabric-alias-edit]"}, {"click": "[data-fabric-alias-edit]"}, {"wait": 400}],
       "covers": ["[data-fabric-alias-edit]", "[data-fabric-alias-input]", "[data-fabric-alias-form]", "button\"Save\"@app/static/sas_fabric_view.js", "[data-fabric-alias-clear]", "[data-fabric-alias-cancel]"]
     },
     {
@@ -488,6 +482,9 @@
     {"state": "main.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
     {"state": "offline.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
     {"state": "main.heatmap*", "type": "heat-alarm-healthy-temp", "issue": 1103},
-    {"state": "main.heatmap*", "type": "heat-small-range-spread", "issue": 1103}
+    {"state": "main.heatmap*", "type": "heat-small-range-spread", "issue": 1103},
+    {"state": "*", "type": "axe-label-content-name-mismatch", "issue": 1110},
+    {"state": "fabric.disk*", "type": "axe-definition-list", "issue": 1111},
+    {"state": "fabric.disk*", "type": "axe-dlitem", "issue": 1111}
   ]
 }

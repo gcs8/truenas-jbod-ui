@@ -168,6 +168,17 @@ class CrawlDriver {
     if (!selected) await this.actOn(locator, (el) => el.click({ timeout: this.timeoutMs }));
   }
 
+  // Applicability that only shows after earlier steps (for example the
+  // history toggle appears once a bay is selected).
+  async step_requireVisible(step) {
+    const locator = this.visible(step.requireVisible);
+    try {
+      await locator.first().waitFor({ state: "visible", timeout: step.timeoutMs || 5000 });
+    } catch {
+      throw new NotApplicable(`${step.requireVisible} is not shown here`);
+    }
+  }
+
   async step_open(step) {
     await this.page.locator(step.open).first().evaluate((el) => { el.open = true; });
   }
@@ -299,7 +310,9 @@ class CrawlDriver {
     const last = replies[replies.length - 1];
     const deadline = Date.now() + 10_000;
     while (last && last.json === null && Date.now() < deadline) await this.page.waitForTimeout(200);
-    if (!last || !last.json || last.json.identify_active !== false) {
+    // Some backends (TrueNAS API, BMC) give no immediate readback
+    // (identify_active null); then the inventory re-read below decides.
+    if (!last || !last.json || last.json.identify_active === true || last.status >= 400) {
       throw new Error(`locate light not confirmed off (reply ${last ? JSON.stringify(last.json) : "missing"})`);
     }
     const slot = Number(vars.slot);

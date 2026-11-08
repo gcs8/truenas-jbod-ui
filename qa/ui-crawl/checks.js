@@ -331,7 +331,7 @@ function axeFindings(results) {
       const data = (node.any || []).concat(node.all || []).map((check) => check.data).find(Boolean) || {};
       out.push({
         type,
-        severity: violation.id === "color-contrast" || violation.impact === "critical" ? "error" : "warn",
+        severity: "error",
         selector: (node.target || []).join(" "),
         text: String(node.html || "").replace(/\s+/g, " ").slice(0, 120),
         detail: violation.id === "color-contrast"

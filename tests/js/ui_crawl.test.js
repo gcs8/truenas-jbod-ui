@@ -306,3 +306,21 @@ test("the notes probe refuses bays with any stored mapping or notes, and fails c
   assert.match(await driverFor({ error: 503 }).checkPrecondition(pre, { slot: "5" }), /could not read/);
   assert.match(await driverFor({ mapping_source: "api" }).checkPrecondition(pre, { slot: "5", detailText: "Bay reported by imported assignment" }), /stored assignment/);
 });
+
+test("serious and critical axe violations are errors, minor ones are dropped", () => {
+  const { axeFindings } = require(path.join(root, "qa/ui-crawl/checks"));
+  const violation = (id, impact) => ({ id, impact, help: id, nodes: [{ target: ["#x"], html: "<input>", any: [], all: [] }] });
+  const out = axeFindings({ violations: [violation("label", "serious"), violation("aria-roles", "critical"), violation("region", "moderate"), violation("color-contrast", "serious")] });
+  assert.deepEqual(out.map((f) => [f.type, f.severity]), [["axe-label", "error"], ["axe-aria-roles", "error"], ["contrast", "error"]]);
+});
+
+test("ledOff accepts a reply without immediate readback when inventory shows the light off, and rejects a lit reply", async () => {
+  const { CrawlDriver } = require(path.join(root, "qa/ui-crawl/driver"));
+  const make = (json, inventory) => {
+    const driver = new CrawlDriver({ page: { on() {}, evaluate: async () => inventory, waitForTimeout: async () => {} }, guard: guard() });
+    driver.responses.push({ method: "POST", url: `${ORIGIN}/api/slots/5/led`, status: 200, json });
+    return driver;
+  };
+  await make({ identify_active: null, confirmed: null }, { state: "healthy", identify_active: false }).step_ledOff({}, { slot: "5" });
+  await assert.rejects(make({ identify_active: true }, { state: "healthy" }).step_ledOff({}, { slot: "5" }), /not confirmed off/);
+});

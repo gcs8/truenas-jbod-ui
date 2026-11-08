@@ -10,7 +10,7 @@ const INVENTORY_PATH = path.join(__dirname, "..", "ui-states.json");
 const STEP_KINDS = new Set([
   "click", "clickIfPresent", "select", "selectIfVisible", "selectBay", "open", "openAll", "fill", "press", "wait",
   "waitFor", "waitText", "waitResponse", "check", "uncheck", "hover", "setRange", "forEachOption", "read",
-  "reload", "expectValue", "acceptNextDialog", "download", "ledOff",
+  "reload", "expectValue", "acceptNextDialog", "download", "ledOff", "requireVisible",
 ]);
 // Steps that can make the page send a write. They are allowed in `steps` of
 // any class (the guard decides), but never in `capture` or `verify`.
