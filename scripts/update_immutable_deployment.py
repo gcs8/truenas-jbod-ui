@@ -81,7 +81,8 @@ PORTS_TEMPLATE = "{{json .NetworkSettings.Ports}}"
 OVERLAY_ALLOWED_SERVICE_KEYS = frozenset({"restart", "mem_limit", "mem_reservation", "cpus", "pids_limit", "logging"})
 # `healthcheck`: timing only, never the test command or `disable`.
 OVERLAY_HEALTHCHECK_TIMING_KEYS = frozenset({"interval", "timeout", "retries", "start_period"})
-# `ports`: only another binding of a container port the base already publishes.
+# `ports`: only a restatement of a binding the base already publishes, with the
+# same host address, host port, container port and protocol (#1097).
 OVERLAY_PORT_KEYS = frozenset({"mode", "host_ip", "target", "published", "protocol"})
 # `labels`: any label except Docker's and Compose's own, which the helper reads.
 OVERLAY_RESERVED_LABEL_PREFIXES = ("com.docker.",)
@@ -339,11 +340,54 @@ class UnsafeInput(DeploymentError):
 
 @dataclass(frozen=True)
 class InputSnapshot:
-    """Exact bytes, mode and inode of one deployment input, read without following links (#1099)."""
+    """Exact bytes, mode, inode and owner of one deployment input, read without following links (#1099)."""
 
     data: bytes
     mode: int
     identity: tuple[int, int]
+    uid: int
+
+
+_WRITABLE_BY_OTHERS = stat.S_IWGRP | stat.S_IWOTH
+_TRUST_REMEDY = (
+    "make it owned by root or the user running this helper and not writable by group or others "
+    "(chown, chmod go-w), then retry"
+)
+
+
+def _trust_problem(uid: int, mode: int) -> str | None:
+    """Why another identity could rewrite this path between a check and Compose reading it."""
+
+    if uid not in {0, _effective_uid()}:
+        return "is owned by another user"
+    if mode & _WRITABLE_BY_OTHERS:
+        return "is writable by group or others"
+    return None
+
+
+def _require_trusted_inputs(root: Path, identity: tuple[int, int], snapshots: dict[str, InputSnapshot]) -> None:
+    """Refuse inputs that anyone but root or the updater could change (#1097).
+
+    Compose reads every input by path, after the last check that the bytes are
+    the frozen ones. Only identities that already hold the updater's authority
+    may be able to write the files or the directory that names them; otherwise
+    a lower-privileged local user could swap in an overlay inside that window.
+    Inputs are plain names in the deployment directory, so the directory is the
+    whole parent chain inside it.
+    """
+
+    directory = _open_directory(root, identity)
+    try:
+        info = os.fstat(directory)
+    finally:
+        os.close(directory)
+    problem = _trust_problem(info.st_uid, stat.S_IMODE(info.st_mode))
+    if problem:
+        raise UnsafeInput(f"deployment directory {problem}; {_TRUST_REMEDY}")
+    for name, snapshot in snapshots.items():
+        problem = _trust_problem(snapshot.uid, snapshot.mode)
+        if problem:
+            raise UnsafeInput(f"deployment input {name} {problem}; {_TRUST_REMEDY}")
 
 
 _NOFOLLOW_READ_FLAGS = (
@@ -413,7 +457,9 @@ def _read_input(root: Path, identity: tuple[int, int], name: str) -> InputSnapsh
         os.close(directory)
     if len(data) > MAX_COMPOSE_BYTES:
         raise UnsafeInput(f"deployment input exceeds the 2 MiB limit: {name}")
-    return InputSnapshot(data=data, mode=stat.S_IMODE(info.st_mode), identity=(info.st_dev, info.st_ino))
+    return InputSnapshot(
+        data=data, mode=stat.S_IMODE(info.st_mode), identity=(info.st_dev, info.st_ino), uid=info.st_uid,
+    )
 
 
 def _verify_inputs(
@@ -422,11 +468,16 @@ def _verify_inputs(
     expected: dict[str, InputSnapshot],
     message: str,
 ) -> None:
-    """Every input must still be the exact file (bytes, mode, inode) recorded."""
+    """Every input must still be the exact file (bytes, mode, inode, owner) recorded.
+
+    The directory and file ownership and modes are rechecked with the bytes
+    (#1097), so no other identity can have gained write access in between.
+    """
 
     for name, snapshot in expected.items():
         if _read_input(root, identity, name) != snapshot:
             raise DeploymentError(f"{message}: {name}")
+    _require_trusted_inputs(root, identity, expected)
 
 
 def _restore_mode(root: Path, identity: tuple[int, int], name: str, mode: int) -> None:
@@ -1056,20 +1107,52 @@ def _sensitive_env_name(name: object) -> bool:
     return any(token in OVERLAY_SENSITIVE_ENV_TOKENS for token in re.split(r"[^A-Z0-9]+", upper))
 
 
+def _port_binding(entry: object) -> tuple[str, str, str, str] | None:
+    """(container port, protocol, host address, host port) of one published binding.
+
+    The host address is normalised (absent or empty means every interface) so
+    that a restatement compares equal; anything unusual returns None.
+    """
+
+    if not isinstance(entry, dict) or not set(entry) <= OVERLAY_PORT_KEYS:
+        return None
+    host_ip, published = entry.get("host_ip"), entry.get("published")
+    if host_ip is None or host_ip == "":
+        host = ""
+    elif isinstance(host_ip, str):
+        try:
+            host = ipaddress.ip_address(host_ip).compressed
+        except ValueError:
+            return None
+    else:
+        return None
+    protocol = entry.get("protocol", "tcp")
+    if not isinstance(protocol, str) or isinstance(published, bool) or not isinstance(
+        published, (str, int, type(None))
+    ):
+        return None
+    return str(entry.get("target")), protocol.lower(), host, "" if published is None else str(published)
+
+
 def _ports_allowed(before: object, after: object) -> bool:
+    """Only restatements of bindings the base already publishes (#1097).
+
+    A binding is its host address and host port as well as its container port
+    and protocol: an added binding, one widened from loopback to another or the
+    wildcard address, or one moved to another host port is a contract change.
+    Dropping a binding narrows exposure and is not.
+    """
+
     before = [] if before is None else before
     after = [] if after is None else after
     if not isinstance(before, list) or not isinstance(after, list):
         return False
-    published = {
-        (entry.get("target"), entry.get("protocol", "tcp")) for entry in before if isinstance(entry, dict)
-    }
+    published = {binding for binding in map(_port_binding, before) if binding is not None}
     for entry in after:
         if entry in before:
             continue
-        if not isinstance(entry, dict) or not set(entry) <= OVERLAY_PORT_KEYS:
-            return False
-        if (entry.get("target"), entry.get("protocol", "tcp")) not in published:
+        binding = _port_binding(entry)
+        if binding is None or binding not in published:
             return False
     return True
 
@@ -1685,7 +1768,9 @@ def _restore_previous(
     restored: dict[str, tuple[bytes, int]] = {}
     for item in receipt["compose_files"]:
         name = str(item["live"])
-        mode = int(modes[name])
+        # Never restore group or other write (#1097): a receipt written before
+        # that was refused may record it, and rollback must still converge.
+        mode = int(modes[name]) & ~_WRITABLE_BY_OTHERS
         previous = (receipt_dir / "previous" / name).read_bytes()
         try:
             current: InputSnapshot | None = _read_input(root, identity, name)
@@ -1693,8 +1778,14 @@ def _restore_previous(
             current = None
         if replace_compose:
             # Replacement restores every recorded file's bytes and mode. A kept
-            # overlay (#1096) is rewritten only when either no longer matches.
-            if item["source"] is not None or current is None or (current.data, current.mode) != (previous, mode):
+            # overlay (#1096) is rewritten only when either no longer matches,
+            # or when another user could change it (#1097).
+            if (
+                item["source"] is not None
+                or current is None
+                or (current.data, current.mode) != (previous, mode)
+                or _trust_problem(current.uid, current.mode) is not None
+            ):
                 _atomic_write_live(root / name, previous, mode)
         elif current is None or current.data != previous:
             raise DeploymentError(f"image-only rollback Compose changed: {name}")
@@ -1703,8 +1794,9 @@ def _restore_previous(
         restored[name] = (previous, mode)
     previous_env = (receipt_dir / "previous" / ".env").read_bytes()
     rollback_env = _replace_image_reference(previous_env, str(receipt["previous_image"]))
-    _atomic_write_live(root / ".env", rollback_env, int(modes[".env"]))
-    restored[".env"] = (rollback_env, int(modes[".env"]))
+    env_mode = int(modes[".env"]) & ~_WRITABLE_BY_OTHERS
+    _atomic_write_live(root / ".env", rollback_env, env_mode)
+    restored[".env"] = (rollback_env, env_mode)
     # Prove the restore, then hold every restored file to it through activation.
     mismatch = "rollback input does not match the receipt"
     expected: dict[str, InputSnapshot] = {}
@@ -1752,6 +1844,9 @@ def update_deployment(
     # are them before each step that lets Compose read them.
     input_names = [".env", *[item.live for item in spec.compose_files]]
     frozen = {name: _read_input(root, identity, name) for name in input_names}
+    # Compose reads them by path later, so only root or the updater may be
+    # able to write them or the directory (#1097).
+    _require_trusted_inputs(root, identity, frozen)
     for item in spec.compose_files:
         if item.is_overlay:
             _require_self_contained_overlay(item.live, frozen[item.live].data)

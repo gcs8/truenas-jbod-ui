@@ -165,6 +165,10 @@ class ImmutableDeploymentTests(unittest.TestCase):
             "services:\n  # previous overlay\n",
             encoding="utf-8",
         )
+        # Explicit, so a 0002 umask cannot make them group-writable (#1097).
+        for name in ("compose.yaml", "docker-compose.nonroot.yml"):
+            os.chmod(root / name, 0o644)
+        os.chmod(root, 0o700)
         return root
 
     def make_spec(self, root: Path, *, expected_image: str = NEW_DIGEST) -> deployment.DeploymentSpec:
@@ -1297,6 +1301,7 @@ services:
     user: "0:0"
     command: ["uvicorn", "history_service.main:app"]
     volumes: ["history-data:/app/history"]
+    ports: [{target: 8001, published: "8081", host_ip: 127.0.0.1, protocol: tcp, mode: ingress}]
 volumes:
   history-data: {}
 """
@@ -1373,8 +1378,10 @@ class KeptOverlayTests(unittest.TestCase):
         os.chmod(root / ".env", 0o600)
         (root / "compose.yaml").write_text(SHIPPED_BASE.replace("services:", "# previous base\nservices:", 1),
                                            encoding="utf-8")
+        os.chmod(root / "compose.yaml", 0o644)
         (root / "compose.override.yaml").write_text(overlay, encoding="utf-8")
         os.chmod(root / "compose.override.yaml", 0o640)
+        os.chmod(root, 0o700)
         return root
 
     def make_spec(self, root: Path, **changes: object) -> deployment.DeploymentSpec:
@@ -1683,7 +1690,7 @@ services:
     healthcheck: {interval: 30s, timeout: 5s, retries: 3, start_period: 20s}
     labels: {com.example.owner: operations}
     environment: {TZ: UTC, APP_LOG_LEVEL: DEBUG}
-    ports: [{target: 8000, published: "42069", host_ip: 192.0.2.10, protocol: tcp, mode: ingress}]
+    ports: [{target: 8000, published: "8080", host_ip: 127.0.0.1, protocol: tcp}]
   enclosure-history:
     restart: always
 """
@@ -1949,7 +1956,7 @@ class InputFenceTests(unittest.TestCase):
                 if command[:2] == ["docker", "pull"] and not (Path(parent) / "moved").exists():
                     # Rename the validated directory away and put a look-alike in its place.
                     root.rename(Path(parent) / "moved")
-                    root.mkdir()
+                    root.mkdir(mode=0o700)
                     for name in (".env", "compose.yaml", "compose.override.yaml"):
                         (root / name).write_bytes((Path(parent) / "moved" / name).read_bytes())
                         os.chmod(root / name, stat.S_IMODE((Path(parent) / "moved" / name).stat().st_mode))
@@ -2075,6 +2082,262 @@ class RollbackModeTests(unittest.TestCase):
                 receipt = deployment.validate_receipt(root)
                 self.assertEqual(receipt["status"], "prepared")
                 self.assertIsNone(receipt["result"])
+
+
+FOREIGN_UID = os.geteuid() + 4242 if hasattr(os, "geteuid") else 4242
+TRUST_REMEDY = (
+    r"; make it owned by root or the user running this helper and not writable by group or others "
+    r"\(chown, chmod go-w\), then retry$"
+)
+
+
+def owned_by(uid: int, *paths: Path) -> Any:
+    """Make `os.fstat` report another owner for these inodes, as `chown` would.
+
+    Nothing here can really chown without root, so ownership is simulated where
+    the helper reads it: on the descriptor it opened.
+    """
+
+    real_fstat = os.fstat
+    identities = {(path.lstat().st_dev, path.lstat().st_ino) for path in paths}
+
+    def fstat(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if (info.st_dev, info.st_ino) not in identities:
+            return info
+        values = list(info[:10])
+        values[4] = uid
+        return os.stat_result(values)
+
+    return mock.patch.object(deployment.os, "fstat", side_effect=fstat)
+
+
+@unittest.skipUnless(hasattr(os, "geteuid"), "POSIX ownership")
+class RetainedInputTrustTests(unittest.TestCase):
+    """Codex P2 (#1097): Compose reads retained inputs by path, so no other identity may write them."""
+
+    make_root = KeptOverlayTests.make_root
+    make_spec = KeptOverlayTests.make_spec
+    update = KeptOverlayTests.update
+
+    def assert_refused_before_any_command(self, root: Path, runtime: OverlayRuntime, message: str,
+                                          **changes: object) -> None:
+        with self.assertRaisesRegex(deployment.DeploymentError, message + TRUST_REMEDY):
+            self.update(root, runtime, **changes)
+        self.assertEqual(runtime.commands, [])
+        self.assertEqual(runtime.downloads, [])
+        self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+
+    def test_group_or_other_writable_input_is_refused_before_any_command(self) -> None:
+        for replace_compose, name, mode in itertools.product(
+            (True, False), ("compose.override.yaml", "compose.yaml"), (0o660, 0o646, 0o664),
+        ):
+            with self.subTest(replace_compose=replace_compose, name=name, mode=oct(mode)), \
+                    tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                os.chmod(root / name, mode)
+                self.assert_refused_before_any_command(
+                    root, OverlayRuntime(root),
+                    rf"^deployment input {re.escape(name)} is writable by group or others",
+                    replace_compose=replace_compose,
+                )
+
+    def test_input_owned_by_another_user_is_refused_before_any_command(self) -> None:
+        for replace_compose, name in itertools.product((True, False), ("compose.override.yaml", ".env")):
+            with self.subTest(replace_compose=replace_compose, name=name), \
+                    tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                with owned_by(FOREIGN_UID, root / name):
+                    self.assert_refused_before_any_command(
+                        root, OverlayRuntime(root),
+                        rf"^deployment input {re.escape(name)} is owned by another user",
+                        replace_compose=replace_compose,
+                    )
+
+    def test_root_owned_inputs_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root)
+            with owned_by(0, root / "compose.override.yaml", root):
+                self.assertEqual(self.update(root, runtime)["status"], "active")
+
+    def test_writable_or_foreign_deployment_directory_is_refused_before_any_command(self) -> None:
+        for mode in (0o770, 0o707, 0o1777):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                os.chmod(root, mode)
+                self.assert_refused_before_any_command(
+                    root, OverlayRuntime(root), r"^deployment directory is writable by group or others",
+                )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            with owned_by(FOREIGN_UID, root):
+                self.assert_refused_before_any_command(
+                    root, OverlayRuntime(root), r"^deployment directory is owned by another user",
+                )
+
+    def test_ownership_and_directory_mode_are_rechecked_with_the_bytes(self) -> None:
+        # The same points as the byte checks: a change after validation stops the
+        # update before the receipt is published, so nothing is activated.
+        for change in ("chown overlay", "chmod directory"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                runtime = OverlayRuntime(root)
+                original_run = runtime.run
+                patcher = owned_by(FOREIGN_UID, root / "compose.override.yaml")
+
+                def changing_run(command: list[str], **kwargs: object) -> str:
+                    if command[:2] == ["docker", "pull"]:
+                        if change == "chown overlay":
+                            patcher.start()
+                        else:
+                            os.chmod(root, 0o775)
+                    return original_run(command, **kwargs)  # type: ignore[arg-type]
+
+                try:
+                    with self.assertRaises(deployment.DeploymentError) as caught:
+                        deployment.update_deployment(self.make_spec(root), run=changing_run,
+                                                     download=runtime.download, probe=runtime.probe)
+                finally:
+                    if change == "chown overlay":
+                        patcher.stop()
+                self.assertRegex(str(caught.exception), r"^deployment (input changed after validation: "
+                                 r"compose\.override\.yaml|directory is writable by group or others; )")
+                self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+                self.assertFalse(any("up" in command for command in runtime.commands))
+
+    def test_rollback_never_restores_a_group_or_other_writable_mode(self) -> None:
+        # A receipt from before this check may record a writable mode; rollback
+        # must still work, so it restores the mode without group or other write.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root)
+            self.update(root, runtime)
+            receipt_path = root / deployment.RECEIPT_DIR_NAME / "receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["modes"]["compose.yaml"] = 0o664
+            receipt["modes"]["compose.override.yaml"] = 0o666
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            os.chmod(receipt_path, 0o600)
+
+            deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+
+            self.assertEqual(stat.S_IMODE((root / "compose.yaml").stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE((root / "compose.override.yaml").stat().st_mode), 0o644)
+            self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+
+    def test_rollback_replaces_or_refuses_a_kept_overlay_another_user_owns(self) -> None:
+        for replace_compose in (True, False):
+            with self.subTest(replace_compose=replace_compose), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                overlay = root / "compose.override.yaml"
+                runtime = OverlayRuntime(root)
+                self.update(root, runtime, replace_compose=replace_compose)
+                inode = overlay.stat().st_ino
+                # Hold the old inode so a rewritten file cannot reuse its number.
+                held = os.open(overlay, os.O_RDONLY)
+                self.addCleanup(os.close, held)
+                with owned_by(FOREIGN_UID, overlay):
+                    if replace_compose:
+                        # Restored from the receipt as a new file the helper owns.
+                        deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+                        self.assertNotEqual(overlay.stat().st_ino, inode)
+                        self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+                    else:
+                        # Image-only rollback never rewrites Compose files, so it refuses.
+                        with self.assertRaisesRegex(
+                            deployment.DeploymentError,
+                            r"^deployment input compose\.override\.yaml is owned by another user" + TRUST_REMEDY,
+                        ):
+                            deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+                        self.assertEqual(deployment.validate_receipt(root)["status"], "prepared")
+                self.assertEqual(overlay.read_text(encoding="utf-8"), RESTART_OVERLAY)
+
+
+HISTORY_LOOPBACK_BINDING = {"target": 8001, "published": "8081", "host_ip": "127.0.0.1", "protocol": "tcp",
+                            "mode": "ingress"}
+
+
+class PortBindingContractTests(unittest.TestCase):
+    """Codex P2 (#1097): a host address or host port change is a contract change."""
+
+    make_root = KeptOverlayTests.make_root
+    make_spec = KeptOverlayTests.make_spec
+    update = KeptOverlayTests.update
+    assert_refused_before_any_pull = OverlayAllowlistTests.assert_refused_before_any_pull
+
+    def changes(self, before: list[Any], after: list[Any]) -> list[str]:
+        base = {"services": {"enclosure-history": {"image": "x", "ports": before}}}
+        merged = {"services": {"enclosure-history": {"image": "x", "ports": after}}}
+        return deployment._overlay_contract_changes(base, merged)
+
+    def test_rebinding_widening_or_adding_a_binding_is_a_contract_change(self) -> None:
+        binding = HISTORY_LOOPBACK_BINDING
+        cases = (
+            ("loopback to wildcard", [{**binding, "host_ip": "0.0.0.0"}]),
+            ("loopback to IPv6 wildcard", [{**binding, "host_ip": "::"}]),
+            ("loopback to every interface", [{key: value for key, value in binding.items() if key != "host_ip"}]),
+            ("loopback to a LAN address", [{**binding, "host_ip": "192.0.2.10"}]),
+            ("other host port", [{**binding, "published": "18081"}]),
+            ("ephemeral host port", [{key: value for key, value in binding.items() if key != "published"}]),
+            ("added LAN binding", [binding, {**binding, "host_ip": "192.0.2.10", "published": "42070"}]),
+            ("added loopback binding", [binding, {**binding, "published": "18081"}]),
+            ("other protocol", [{**binding, "protocol": "udp"}]),
+            ("unknown key", [{**binding, "name": "web"}]),
+            ("unparseable host address", [{**binding, "host_ip": "localhost"}]),
+        )
+        for label, after in cases:
+            with self.subTest(label=label):
+                self.assertEqual(self.changes([binding], after), ["enclosure-history ports"])
+
+    def test_restating_or_dropping_a_binding_is_not_a_contract_change(self) -> None:
+        binding = HISTORY_LOOPBACK_BINDING
+        cases = (
+            ("identical", [binding]),
+            ("duplicate restatement", [binding, dict(binding)]),
+            ("mode omitted, port as number", [{"target": 8001, "published": 8081, "host_ip": "127.0.0.1"}]),
+            ("protocol case", [{**binding, "protocol": "TCP"}]),
+            ("dropped", []),
+        )
+        for label, after in cases:
+            with self.subTest(label=label):
+                self.assertEqual(self.changes([binding], after), [])
+        ipv6 = {"target": 8001, "published": "8081", "host_ip": "::1", "protocol": "tcp"}
+        self.assertEqual(self.changes([ipv6], [{**ipv6, "host_ip": "0:0:0:0:0:0:0:1"}]), [])
+
+    def test_overlay_publishing_history_beyond_loopback_is_refused_without_the_flag(self) -> None:
+        history = "services:\n  enclosure-history:\n    ports: [{target: 8001, published: \"8081\", host_ip: %s}]\n"
+        ui = "services:\n  enclosure-ui:\n    ports: [{target: 8000, published: \"%s\", host_ip: %s}]\n"
+        cases = (
+            ("history on the wildcard", history % "0.0.0.0", "enclosure-history ports"),
+            ("history on a LAN address", history % "192.0.2.10", "enclosure-history ports"),
+            ("added LAN UI binding", ui % ("42069", "192.0.2.10"), "enclosure-ui ports"),
+            ("added loopback UI port", ui % ("18080", "127.0.0.1"), "enclosure-ui ports"),
+        )
+        for label, overlay, detail in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir, overlay)
+                self.assert_refused_before_any_pull(root, OverlayRuntime(root), re.escape(detail))
+
+    def test_flagged_binding_change_is_listed_and_restatements_need_no_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(
+                temp_dir, "services:\n  enclosure-history:\n    ports: [{target: 8001, published: \"8081\"}]\n",
+            )
+            result = self.update(root, OverlayRuntime(root), allow_overlay_contract_change=True)
+            self.assertEqual(result["overlay_contract_changes"], ["enclosure-history ports"])
+            self.assertEqual(deployment.validate_receipt(root)["overlay_contract_changes"],
+                             ["enclosure-history ports"])
+        restatement = (
+            RESTART_OVERLAY + "  enclosure-history:\n"
+            "    ports: [{target: 8001, published: \"8081\", host_ip: 127.0.0.1, protocol: tcp}]\n"
+        )
+        for overlay in (RESTART_OVERLAY, restatement):
+            with self.subTest(overlay=overlay), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir, overlay)
+                result = self.update(root, OverlayRuntime(root))
+                self.assertEqual(result["status"], "active")
+                self.assertEqual(result["overlay_contract_changes"], [])
 
 
 class PublishedAddressTests(unittest.TestCase):
@@ -2307,7 +2570,8 @@ class PublishedAddressTests(unittest.TestCase):
     def test_runbook_documents_overlays_and_published_addresses(self) -> None:
         runbook = " ".join(Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8").split())
         for text in ("--keep-overlay compose.override.yaml", "--allow-overlay-contract-change",
-                     "docker compose config", "published port bindings", "0.0.0.0"):
+                     "docker compose config", "published port bindings", "0.0.0.0",
+                     "owned by root or the user running the helper", "same host address and host port"):
             self.assertIn(text, runbook)
         upgrading = " ".join(Path("wiki/Upgrading.md").read_text(encoding="utf-8").split())
         self.assertIn("--keep-overlay", upgrading)

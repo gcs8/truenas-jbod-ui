@@ -51,8 +51,10 @@ When a reviewed release also replaces the shipped Compose file
 with `--keep-overlay` so it stays in the chain. Without
 `--allow-overlay-contract-change` a kept overlay may only tune restart policy,
 resource limits, logging, healthcheck timing, labels, non-sensitive
-environment variables, and ports of a shipped service, and it must not read
-any other file. If the UI or admin service is published only on the host's LAN
+environment variables, and restatements of a shipped service's existing port
+bindings, and it must not read any other file. The deployment directory,
+`.env` and every Compose file must be owned by root or the user running the
+helper and not writable by group or others. If the UI or admin service is published only on the host's LAN
 address, its health and retention URLs may use that published address and
 port instead of loopback.
 

@@ -52,8 +52,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   operator overlays: overlays named with `--keep-overlay` now stay in the
   Compose chain, the merged chain is validated, and an overlay that changes
   anything but restart policy, resource limits, logging, healthcheck timing,
-  labels, non-sensitive environment, or ports of a shipped service, or that
-  reads another file, is refused. Every input is read without following links,
+  labels, non-sensitive environment, or restatements of a shipped service's
+  port bindings, or that reads another file, is refused; a changed host address
+  or host port, or an added binding, counts as a contract change. The
+  deployment directory and every input must be owned by root or the updater and
+  not writable by group or others. Every input is read without following links,
   frozen in the private receipt and checked unchanged before each step, and
   rollback restores and rechecks file modes as well as bytes. Health and
   retention URLs may also use an address and port the deployment itself
