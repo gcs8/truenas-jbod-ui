@@ -104,6 +104,10 @@ function validateInventory(inventory, { manifest = undefined } = {}) {
     validateSteps(errors, id, "revert", state.revert);
     const writes = state.writes || [];
     if (state.safety === "read" && writes.length) errors.push(`${id}: a read state cannot declare writes`);
+    // The guard admits an appliance poll only when the state declares it.
+    if (state.appliance_load && (state.steps || []).length && !(state.read_requests || []).length) {
+      errors.push(`${id}: an appliance_load state with steps needs read_requests for the polls it sends`);
+    }
     if (SAFETY_CLASSES.includes(state.safety)) {
       validateRules(errors, id, "writes", writes, state, pages[state.page], table);
       validateRules(errors, id, "read_requests", state.read_requests, state, pages[state.page], table);

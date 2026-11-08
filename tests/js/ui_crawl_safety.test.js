@@ -128,6 +128,9 @@ test("#1120 inventory validation rejects writes outside the state's class and un
   assert.match(check({ id: "c", safety: "app-write-revert", ...shape, semantic_reads: [], writes: [{ method: "POST", path: "/api/sas-fabric/aliases", max: 1 }] }), /semantic_reads/);
   assert.match(check({ id: "d", safety: "read", steps: [], read_requests: [{ method: "POST", path: "/api/slots/{slot}/mapping" }] }), /app-write/);
   assert.match(check({ id: "e", safety: "read", fixture_only: true, steps: [] }), /never runs/);
+  // An appliance-load state that presses a control must declare the polls it sends (Codex #1108).
+  assert.match(check({ id: "f", safety: "read", appliance_load: true, steps: [{ click: "#refresh-button" }] }), /appliance_load state with steps needs read_requests/);
+  assert.equal(check({ id: "g", safety: "read", appliance_load: true, steps: [{ click: "#refresh-button" }], read_requests: [{ method: "GET", path: "/api/inventory", force: true, max: 2 }] }), "");
 });
 
 test("#1120 a misclassified control is caught from the routes its state actually called", () => {

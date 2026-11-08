@@ -132,6 +132,7 @@
     },
     {
       "id": "main.connections.refresh", "page": "main", "safety": "read", "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
       "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"click": "#sas-fabric-refresh-button"}, {"wait": 2500}],
       "covers": ["#sas-fabric-refresh-button"]
     },
@@ -255,6 +256,7 @@
     },
     {
       "id": "main.refresh-now", "page": "main", "safety": "read", "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/inventory", "force": true, "max": 2}, {"method": "GET", "path": "/api/storage-views", "force": true, "max": 2}, {"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
       "steps": [{"click": "#refresh-button"}, {"wait": 2500}],
       "covers": ["#refresh-button"]
     },
@@ -353,6 +355,7 @@
     },
     {
       "id": "fabric.refresh", "page": "fabric", "safety": "read", "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/inventory", "force": true, "max": 2}, {"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
       "steps": [{"click": "#fabric-refresh-button"}, {"wait": 2500}],
       "covers": ["#fabric-refresh-button"]
     },
