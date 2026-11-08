@@ -40,6 +40,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed heat-map temperature colours stretching to the coolest and warmest bay
+  in view, which showed a 49 C disk beside a 48 C one, or 35 C disks on a cool
+  shelf, as red. Temperatures now use absolute bands from each drive's SMART
+  warning and critical ratings (now read from smartctl for NVMe, ATA and SCSI
+  drives) or documented HDD and SSD/NVMe defaults, shown in the legend; the
+  relative view is an explicit `Colours` option. `Temperature vs View Avg`
+  uses a fixed -10 to +10 C scale, and the bay's slot, device, pool and serial
+  text now meets WCAG AA contrast on every heat colour (#1105).
 - Fixed history index builds and startup upgrades spilling their sort files
   outside the history volume when the history service's Compose entry had no
   `TMPDIR`: into the container's own filesystem, or, on a read-only container,
