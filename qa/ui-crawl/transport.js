@@ -11,6 +11,8 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { WRITE_CLASSES } = require("./guard");
+const { armedEntry } = require("./ledger");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const STATIC_ROOTS = {
@@ -66,7 +68,7 @@ function cacheable(method, url) {
 // `fixture` answers every admitted request (CI). `local` may answer a request
 // itself (live mode: downloaded offline copies) and returns false to let it
 // continue to the stack through the read cache.
-async function installRoutes(context, { guard, origins, fixture = null, local = null, cache = null, stats }) {
+async function installRoutes(context, { guard, origins, fixture = null, local = null, cache = null, stats, ledger = null }) {
   const inflight = new Set();
   const serviceFor = (url) => Object.entries(origins).find(([, origin]) => origin && new URL(origin).origin === url.origin)?.[0] || null;
   await context.route("**/*", (route) => {
@@ -79,14 +81,21 @@ async function installRoutes(context, { guard, origins, fixture = null, local = 
       } catch {
         return route.abort();
       }
-      const verdict = guard.admit({ method, url: url.href, body: request.postData() });
+      const body = request.postData();
+      const verdict = guard.admit({ method, url: url.href, body });
       if (!verdict.allowed) {
         stats.blocked.push(`${method} ${url.pathname} (${verdict.reason})`);
         return route.abort("blockedbyclient");
       }
-      if (verdict.reason.startsWith("declared write") || verdict.reason.startsWith("declared forced")) {
+      if (verdict.cls === "appliance-load") {
+        (stats.applianceLoads = stats.applianceLoads || []).push(`${method} ${url.pathname}${url.search}`);
+        if (cache) cache.clear();
+      }
+      if (WRITE_CLASSES.has(verdict.cls)) {
         stats.writes.push(`${method} ${url.pathname}${url.search}`);
         if (cache) cache.clear();
+        // #1117: record the exact armed light durably before IDENTIFY leaves.
+        if (verdict.cls === "led" && ledger && /"action"\s*:\s*"IDENTIFY"/.test(body || "")) ledger.arm(armedEntry(url.href, verdict.state));
       }
       const info = { method, url, service: serviceFor(url), body: request.postData() };
       if (fixture) return fixture(route, info);
@@ -110,7 +119,13 @@ async function installRoutes(context, { guard, origins, fixture = null, local = 
       }
       return route.continue();
     })().catch((error) => {
-      stats.routeErrors.push(String(error && error.message ? error.message : error).split("\n")[0].slice(0, 160));
+      let where = "?";
+      try {
+        where = `${route.request().method()} ${new URL(route.request().url()).pathname}`;
+      } catch {
+        // keep "?"
+      }
+      stats.routeErrors.push(`${where}: ${String(error && error.message ? error.message : error).split("\n")[0].slice(0, 160)}`);
       return route.abort().catch(() => {});
     });
     inflight.add(task);
@@ -126,10 +141,19 @@ async function installRoutes(context, { guard, origins, fixture = null, local = 
 
 // Synthetic answers for CI. `data` is scripts/build_ui_crawl_fixture.py output.
 function fixtureHandler(data, { writes = [] } = {}) {
-  return async (route, { method, url, service }) => {
+  return async (route, { method, url, service: rawService }) => {
+    // Fixture variants (ui-write-sign-in, ui-storage-views-error) have their
+    // own documents and otherwise answer like their base service.
+    const service = String(rawService || "ui").replace(/-.*$/, "");
+    const variant = String(rawService || "").includes("-") ? String(rawService).slice(String(rawService).indexOf("-") + 1) : null;
+    const pageKey = `${rawService}:${url.pathname}`;
     const key = `${service}:${url.pathname}`;
-    if (method === "GET" && data.pages[key] !== undefined) {
-      return route.fulfill({ contentType: "text/html; charset=utf-8", body: data.pages[key] });
+    const document = data.pages[pageKey] !== undefined ? data.pages[pageKey] : data.pages[key];
+    if (method === "GET" && document !== undefined) {
+      return route.fulfill({ contentType: "text/html; charset=utf-8", body: document });
+    }
+    if (variant === "storage-views-error" && url.pathname === "/api/storage-views") {
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "synthetic storage-view outage" }) });
     }
     if (url.pathname.startsWith("/static/")) {
       const root = STATIC_ROOTS[service] || STATIC_ROOTS.ui;

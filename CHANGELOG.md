@@ -87,7 +87,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   interactive control has an inventory entry, and a crawler that checks every
   state for squeezed or broken text, overflow, clipped controls, contrast,
   heat-map colour sanity and console errors, with native-resolution review
-  tiles (#1108).
+  tiles (#1108). The crawler admits only reviewed backend routes, binds writes
+  to one system, enclosure and bay, checks reverted stores through the app's
+  read API, always turns identify lights back off (including after an
+  interruption) and exits non-zero on any safety failure (#1117, #1118,
+  #1119, #1120).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

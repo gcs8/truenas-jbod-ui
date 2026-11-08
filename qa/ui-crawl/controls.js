@@ -10,15 +10,27 @@
 //
 // Key forms, in order of preference:
 //   #id                    a static id attribute
-//   [data-hook]            the first data-* attribute that is not styling data
+//   [data-hook=value]      the first data-* hook with a literal value: a finite
+//                          tab/mode/action value is its own control, so a new
+//                          `data-admin-view-button="x"` tab needs its own entry
+//   [data-hook]            the same hook with a dynamic value (repeated
+//                          instances such as bays share one entry)
 //   [name=field]           a form field name
 //   .class                 the first class that is not a generic button class
 //   tag"Text"@#ancestor    last resort: tag, visible text, nearest ancestor id
+//
+// Controls are native control tags, links styled as buttons, and any element
+// with an interactive ARIA role, a non-negative tabindex, an inline handler or
+// contenteditable (a `div role="button"` is a button).
 
 const fs = require("node:fs");
 const path = require("node:path");
 
 const CONTROL_TAGS = new Set(["button", "select", "input", "textarea", "details", "dialog", "a"]);
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "tab", "menuitem", "menuitemcheckbox", "menuitemradio", "checkbox", "radio", "switch",
+  "option", "combobox", "slider", "spinbutton", "textbox", "searchbox", "treeitem", "gridcell",
+]);
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
 // data-* attributes that describe styling or bookkeeping, never a click hook.
 const NON_HOOK_DATA = new Set([
@@ -89,7 +101,10 @@ function textAfter(text, index) {
 function keyFor(tag, attrs, context) {
   if (attrs.id && !isDynamic(attrs.id)) return `#${attrs.id}`;
   const dataNames = Object.keys(attrs).filter((name) => name.startsWith("data-") && !NON_HOOK_DATA.has(name));
-  if (dataNames.length) return `[${dataNames[0]}]`;
+  if (dataNames.length) {
+    const value = attrs[dataNames[0]];
+    return value && !isDynamic(value) && /^[\w.:-]{1,64}$/.test(value) ? `[${dataNames[0]}=${value}]` : `[${dataNames[0]}]`;
+  }
   if (attrs.name && !isDynamic(attrs.name)) return `[name=${attrs.name}]`;
   const classes = String(attrs.class || "")
     .replace(/\$\{[^}]*\}|\{\{[^}]*\}\}/g, " ")
@@ -100,8 +115,16 @@ function keyFor(tag, attrs, context) {
   return `${tag}"${label}"@${context.ancestor || "(root)"}`;
 }
 
+function isSemanticControl(attrs) {
+  const role = String(attrs.role || "").trim().toLowerCase();
+  if (INTERACTIVE_ROLES.has(role)) return true;
+  if ("tabindex" in attrs && !isDynamic(attrs.tabindex) && Number(attrs.tabindex) >= 0) return true;
+  if (Object.keys(attrs).some((name) => /^on[a-z]+$/.test(name))) return true;
+  return "contenteditable" in attrs && String(attrs.contenteditable).toLowerCase() !== "false";
+}
+
 function isControl(tag, attrs) {
-  if (!CONTROL_TAGS.has(tag)) return false;
+  if (!CONTROL_TAGS.has(tag)) return isSemanticControl(attrs);
   if (tag === "input" && String(attrs.type || "").toLowerCase() === "hidden") return false;
   if (tag === "a") {
     // Links that act as controls: buttons styled as links, or links with ids.
@@ -149,7 +172,7 @@ function scanTemplate(relPath, source) {
 function scanScript(relPath, source) {
   const controls = [];
   // 1. HTML tags inside template literals or strings.
-  const tagRe = /<(button|select|input|textarea|details|dialog|a)\b((?:[^>"'`$]|\$(?!\{)|"[^"]*"|'[^']*'|\$\{[^}]*\})*)>/g;
+  const tagRe = /<([a-zA-Z][\w-]*)\b((?:[^>"'`$]|\$(?!\{)|"[^"]*"|'[^']*'|\$\{[^}]*\})*)>/g;
   let m;
   while ((m = tagRe.exec(source))) {
     const tag = m[1].toLowerCase();
@@ -176,14 +199,14 @@ function scanScript(relPath, source) {
     const window = source.slice(createRe.lastIndex, createRe.lastIndex + 1600);
     const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const id = new RegExp(`\\b${escaped}\\.id\\s*=\\s*["'\`]([\\w-]+)["'\`]`).exec(window);
-    const data = new RegExp(`\\b${escaped}\\.dataset\\.([A-Za-z]+)\\s*=`).exec(window)
-      || new RegExp(`\\b${escaped}\\.setAttribute\\(\\s*["'](data-[\\w-]+)["']`).exec(window);
+    const data = new RegExp(`\\b${escaped}\\.dataset\\.([A-Za-z]+)\\s*=\\s*(?:["']([\\w.:-]{1,64})["']\\s*[;\\n])?`).exec(window)
+      || new RegExp(`\\b${escaped}\\.setAttribute\\(\\s*["'](data-[\\w-]+)["']\\s*,\\s*(?:["']([\\w.:-]{1,64})["']\\s*\\))?`).exec(window);
     const cls = new RegExp(`\\b${escaped}\\.className\\s*=\\s*[\`"']([\\w-]+)`).exec(window)
       || new RegExp(`\\b${escaped}\\.classList\\.add\\(\\s*["']([\\w-]+)["']`).exec(window);
     const type = new RegExp(`\\b${escaped}\\.type\\s*=\\s*["']([\\w-]+)["']`).exec(window);
     let key;
     if (id) key = `#${id[1]}`;
-    else if (data) key = `[${data[1].startsWith("data-") ? data[1] : `data-${data[1].replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`}]`;
+    else if (data) key = `[${data[1].startsWith("data-") ? data[1] : `data-${data[1].replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`}${data[2] ? `=${data[2]}` : ""}]`;
     else if (cls && !GENERIC_CLASSES.has(cls[1])) key = `.${cls[1]}`;
     else key = `${tag}"${type ? type[1] : ""}"@${relPath}`;
     if (tag === "input" && type && type[1] === "hidden") continue;

@@ -39,6 +39,51 @@ const READY = {
   },
 };
 
+// Inventory control keys -> what to look for in the DOM (visibility audit).
+function keySpec(key) {
+  let m;
+  if ((m = /^#([\w-]+)$/.exec(key))) return { key, css: `[id="${m[1]}"]` };
+  if ((m = /^\[([\w-]+)=([^\]]+)\]$/.exec(key))) return { key, css: `[${m[1]}="${m[2]}"]` };
+  if ((m = /^\[([\w-]+)\]$/.exec(key))) return { key, css: `[${m[1]}]` };
+  if ((m = /^\.([\w-]+)$/.exec(key))) return { key, css: `.${m[1]}` };
+  if ((m = /^(\w+)"([^"]*)"@(.*)$/.exec(key))) {
+    const scope = m[3].startsWith("#") ? `[id="${m[3].slice(1)}"] ` : "";
+    return { key, css: `${scope}${m[1]}`, text: m[2] };
+  }
+  return { key, css: null };
+}
+
+// Runs in the page: which keys have a visible element right now. A control
+// hidden by design (a file input) counts when its label or an element that
+// names it in aria-controls/for is visible.
+function renderedKeys(specs) {
+  const visible = (node) => {
+    if (!node || !node.getClientRects || node.getClientRects().length === 0) return false;
+    const style = getComputedStyle(node);
+    return style.visibility !== "hidden" && style.display !== "none";
+  };
+  const textOf = (node) => [node.innerText, node.value, node.getAttribute("aria-label"), node.getAttribute("type"), node.textContent]
+    .filter((v) => typeof v === "string").join(" ");
+  const out = [];
+  for (const spec of specs) {
+    if (!spec.css) continue;
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(spec.css));
+    } catch {
+      continue;
+    }
+    const hit = nodes.some((node) => {
+      if (spec.text && !textOf(node).includes(spec.text)) return false;
+      if (visible(node)) return true;
+      if (node.tagName === "DIALOG" || node.tagName === "DETAILS") return false;
+      return Boolean(node.id) && Array.from(document.querySelectorAll(`label[for="${node.id}"]`)).some(visible);
+    });
+    if (hit) out.push(spec.key);
+  }
+  return out;
+}
+
 function safeName(value) {
   return String(value).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 120);
 }
@@ -47,9 +92,14 @@ class Crawler {
   constructor({
     context, cdpFactory, guard, inventory, outDir, widths, allow = [], confirmPreview = false, axeSource = null,
     axeWidths = null, tileSize = [1280, 720], baselineDir = null, budgets = {}, checkOptions = {}, fixtureMode = false,
-    downloads = false, cache = null, log = console.log, settleMs = 700, paceMs = 0,
+    downloads = false, cache = null, log = console.log, settleMs = 700, paceMs = 0, ledger = null, writeSystem = null,
+    renderAudit = false,
   }) {
-    Object.assign(this, { context, cdpFactory, guard, inventory, outDir, widths, allow, confirmPreview, axeSource, tileSize, baselineDir, checkOptions, fixtureMode, cache, log, settleMs, paceMs });
+    Object.assign(this, { context, cdpFactory, guard, inventory, outDir, widths, allow, confirmPreview, axeSource, tileSize, baselineDir, checkOptions, fixtureMode, cache, log, settleMs, paceMs, ledger, writeSystem });
+    this.aborted = null;
+    const keys = new Set();
+    for (const state of inventory.states || []) for (const key of state.covers || []) keys.add(key);
+    this.auditSpecs = renderAudit ? [...keys].sort().map(keySpec) : null;
     this.lastLoad = 0;
     this.readyTimeoutMs = fixtureMode ? 30_000 : 240_000;
     this.axeWidths = axeWidths || [widths[0]];
@@ -151,7 +201,8 @@ class Crawler {
         }));
         findings.push(...axeFindings(axe));
       } catch (error) {
-        findings.push({ type: "check-error", severity: "warn", text: `axe: ${String(error.message).split("\n")[0].slice(0, 200)}` });
+        // A required checker that did not run is not a clean result (Sol #1108).
+        findings.push({ type: "check-error", severity: "error", text: `axe: ${String(error.message).split("\n")[0].slice(0, 200)}` });
       }
     }
     if (!(state.checks || []).includes("heatmap")) {
@@ -160,7 +211,13 @@ class Crawler {
     return { findings, heat: result.heat, document: result.document, viewport: result.viewport, scanned: result.scanned };
   }
 
-  markKnown(record) {
+  markKnown(record, state = {}) {
+    // A fixture variant's deliberate failure (for example the storage-view
+    // outage) is expected there, not a defect.
+    const expected = state.expected_findings || [];
+    for (const finding of [...record.findings, ...record.widths.flatMap((w) => w.findings)]) {
+      if (expected.some((e) => e.type === finding.type && (!e.text || String(finding.text || "").includes(e.text)))) finding.expected = true;
+    }
     for (const width of record.widths) {
       for (const finding of width.findings) {
         const stateMatches = (pattern) => (pattern.endsWith("*") ? record.state.startsWith(pattern.slice(0, -1)) : pattern === record.state || pattern === record.baseId);
@@ -194,10 +251,25 @@ class Crawler {
       this.driver = new CrawlDriver({ page: this.page, guard: this.guard, selections: this.inventory.selections, downloadDir: this.downloadDir, log: this.log });
     }
     this.driver.ready = READY[target.ready] && ((page) => READY[target.ready](page, this.readyTimeoutMs));
+    this.driver.bind = this.bindFor(target);
+    this.driver.service = (this.inventory.pages[target.page] || {}).service || "ui";
     this.driver.resetState();
     this.driver.downloads = [];
     this.driver.dialogTexts = [];
     return this.driver;
+  }
+
+  // #1120: writes are admitted only for the write system and the target's
+  // own enclosure (from its URL). Fixture runs have no live scope.
+  bindFor(target) {
+    if (this.fixtureMode) return {};
+    let enclosure = null;
+    try {
+      enclosure = new URL(target.url).searchParams.get("enclosure_id");
+    } catch {
+      enclosure = null;
+    }
+    return { system_id: this.writeSystem || target.system || null, enclosure_id: enclosure };
   }
 
   async load(target) {
@@ -217,15 +289,22 @@ class Crawler {
   }
 
   async crawlTarget(target, states) {
+    if (this.aborted) return;
     if (!this.page) await this.openPage();
-    for (const base of states) {
+    // A fixture variant page runs only its own states, and a default page none of them.
+    const own = states.filter((state) => (state.variant || null) === (target.variant || null));
+    for (const base of own) {
+      if (this.aborted) return;
       let expanded;
       try {
         expanded = await this.expandOptions(target, base);
       } catch (error) {
         expanded = [base];
       }
-      for (const state of expanded) await this.crawlState(target, state);
+      for (const state of expanded) {
+        if (this.aborted) return;
+        await this.crawlState(target, state);
+      }
     }
   }
 
@@ -238,6 +317,7 @@ class Crawler {
     this.bucket = record.findings;
     this.log(`${target.label} ${state.id}: start`);
     let driver = null;
+    this.guard.beginState(state.id);
     try {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
@@ -251,7 +331,10 @@ class Crawler {
         const outcome = await runState(driver, state, { allow: this.allow, confirmPreview: this.confirmPreview });
         record.status = outcome.status;
         Object.assign(record, { outcome });
-        if (state.safety !== "read" && state.safety !== "forbidden" || outcome.status === "previewed") this.actuations.push({ target: target.label, ...outcome, dialogs: driver.dialogTexts });
+        if (state.safety !== "read" && state.safety !== "forbidden" || outcome.status === "previewed" || outcome.status === "preview-failed") this.actuations.push({ target: target.label, ...outcome, dialogs: driver.dialogTexts });
+        // #1117: a light that read back off leaves the ledger; anything else stays for the out-of-band sweep.
+        if (state.safety === "led" && outcome.verified && this.ledger) this.ledger.disarm({ state: state.id });
+        if (this.auditSpecs && outcome.status === "done") record.rendered = await this.page.evaluate(renderedKeys, this.auditSpecs).catch(() => []);
         if (outcome.status === "revert-failed") record.findings.push({ type: "revert-failed", severity: "error", text: outcome.error });
         if (driver.downloads.length) record.downloads = driver.downloads.map((file) => path.relative(this.outDir, file));
       }
@@ -291,14 +374,15 @@ class Crawler {
         // next state reloads anyway
       }
     }
+    this.guard.endState();
     this.bucket = null;
-    this.markKnown(record);
+    this.markKnown(record, state);
     record.finishedAt = new Date().toISOString();
     this.records.push(record);
-    const counts = record.widths.reduce((sum, w) => sum + w.findings.filter((f) => f.severity === "error" && !f.known).length, 0) + record.findings.filter((f) => f.severity === "error").length;
+    const counts = record.widths.reduce((sum, w) => sum + w.findings.filter((f) => f.severity === "error" && !f.known && !f.expected).length, 0) + record.findings.filter((f) => f.severity === "error" && !f.expected).length;
     this.log(`${target.label} ${state.id}: ${record.status}${record.reason ? ` (${record.reason})` : ""}, ${counts} error findings`);
     return record;
   }
 }
 
-module.exports = { Crawler, READY, safeName };
+module.exports = { Crawler, READY, safeName, keySpec, renderedKeys };

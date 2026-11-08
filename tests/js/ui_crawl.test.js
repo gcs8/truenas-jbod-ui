@@ -16,10 +16,9 @@ const png = require(path.join(root, "qa/ui-crawl/png"));
 const cli = require(path.join(root, "scripts/ui_crawl"));
 
 const ORIGIN = "http://ui.example.test";
-const READ_POSTS = [{ method: "POST", path: "/api/slots/smart-batch" }];
-
+// The guard reads the reviewed route manifest (qa/ui-routes.json) for classes.
 function guard() {
-  return new RequestGuard({ origins: [ORIGIN], readPosts: READ_POSTS });
+  return new RequestGuard({ origins: { ui: ORIGIN } });
 }
 
 test("guard admits reads and aborts foreign origins, writes and forced refreshes", () => {
@@ -39,8 +38,8 @@ test("guard admits reads and aborts foreign origins, writes and forced refreshes
 test("guard admits only declared writes inside the window, within budget", () => {
   const g = guard();
   g.openWrites("led", [
-    { method: "POST", path: "/api/slots/*/led", body_includes: "IDENTIFY", max: 1 },
-    { method: "POST", path: "/api/slots/*/led", body_includes: "CLEAR", max: 2 },
+    { method: "POST", path: "/api/slots/3/led", body_includes: "IDENTIFY", max: 1 },
+    { method: "POST", path: "/api/slots/3/led", body_includes: "CLEAR", max: 2 },
   ]);
   const led = (action) => g.admit({ method: "POST", url: `${ORIGIN}/api/slots/3/led?system_id=a`, body: JSON.stringify({ action }) });
   assert.equal(led("IDENTIFY").allowed, true);
@@ -49,7 +48,8 @@ test("guard admits only declared writes inside the window, within budget", () =>
   assert.equal(led("CLEAR").allowed, true);
   assert.equal(led("CLEAR").allowed, false, "CLEAR budget is two");
   assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/slots/3/mapping`, body: "{}" }).allowed, false, "undeclared write in window");
-  assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/slots/x/y/led`, body: '{"action":"CLEAR"}' }).allowed, false, "glob does not cross /");
+  assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/slots/4/led`, body: '{"action":"CLEAR"}' }).allowed, false, "only the captured bay");
+  assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/slots/x/y/led`, body: '{"action":"CLEAR"}' }).allowed, false, "unknown route");
   assert.equal(g.closeWrites().length, 3);
   assert.equal(led("CLEAR").allowed, false, "window closed");
   assert.throws(() => { g.openWrites("a", []); g.openWrites("b", []); }, /already open/);
@@ -58,7 +58,7 @@ test("guard admits only declared writes inside the window, within budget", () =>
 test("guard honours body_excludes and declared forced refreshes", () => {
   const g = guard();
   g.openWrites("notes", [
-    { method: "POST", path: "/api/slots/*/mapping", body_excludes: "\"clear_identify_after_save\":true", max: 1 },
+    { method: "POST", path: "/api/slots/1/mapping", body_excludes: "\"clear_identify_after_save\":true", max: 1 },
     { method: "GET", path: "/api/inventory", force: true, max: 1 },
   ]);
   assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/slots/1/mapping`, body: '{"notes":"x", "clear_identify_after_save": true}' }).allowed, false);
@@ -100,10 +100,7 @@ function fakeDriver({ failSteps = false, failRevert = 0, failVerify = false, wri
         assert.equal(g.window, null, "verify runs with the write window closed");
         if (failVerify) throw new Error("still on");
       }
-      if (label === "preview") {
-        assert.equal(g.admit({ method: "POST", url: `${ORIGIN}/api/systems/a/disk-inventory-sync` }).allowed, false);
-        driver.dialogsSeen += 1;
-      }
+      if (label === "preview") driver.dialogsSeen += 1;
     },
   };
   return driver;
@@ -116,8 +113,8 @@ function labelled(label) {
 const LED_STATE = {
   id: "main.led", safety: "led", steps: labelled("steps"), revert: labelled("revert"), verify: labelled("verify"),
   writes: [
-    { method: "POST", path: "/api/slots/*/led", body_includes: "IDENTIFY", max: 1 },
-    { method: "POST", path: "/api/slots/*/led", body_includes: "CLEAR", max: 3 },
+    { method: "POST", path: "/api/slots/1/led", body_json: { action: "IDENTIFY" }, max: 1 },
+    { method: "POST", path: "/api/slots/1/led", body_json: { action: "CLEAR" }, max: 3 },
   ],
 };
 
@@ -182,8 +179,8 @@ test("inventory validation rejects unsafe shapes", () => {
   assert.match(check({ id: "a", safety: "read", writes: [{ method: "POST", path: "/x", max: 1 }] }).join(), /read state cannot declare writes/);
   assert.match(check({ id: "b", safety: "forbidden", steps: [{ click: "#x" }] }).join(), /no steps unless confirm_preview/);
   assert.match(check({ id: "c", safety: "app-write-revert", steps: [{ click: "#x" }] }).join(), /needs a non-empty revert/);
-  assert.match(check({ id: "d", safety: "led", steps: [{ click: "#x" }], revert: [{ click: "#y" }], verify: [{ ledOff: true }], writes: [{ method: "POST", path: "/api/slots/*/led", body_includes: "IDENTIFY", max: 1 }] }).join(), /IDENTIFY and CLEAR/);
-  assert.match(check({ id: "e", safety: "app-write-revert", steps: [{ click: "#x" }], revert: [{ click: "#y" }], verify: [{ click: "#save" }], writes: [{ method: "POST", path: "/x", max: 1 }] }).join(), /verify must only read/);
+  assert.match(check({ id: "d", safety: "led", steps: [{ click: "#x" }], revert: [{ click: "#y" }], verify: [{ ledOff: true }], writes: [{ method: "POST", path: "/api/slots/{slot}/led", body_json: { action: "IDENTIFY" }, max: 1 }] }).join(), /IDENTIFY and CLEAR/);
+  assert.match(check({ id: "e", safety: "app-write-revert", steps: [{ click: "#x" }], revert: [{ click: "#y" }], verify: [{ click: "#save" }], writes: [{ method: "POST", path: "/api/sas-fabric/aliases", max: 1 }] }).join(), /verify must only read/);
   assert.match(check({ id: "f", safety: "nope" }).join(), /safety must be one of/);
 });
 
@@ -195,7 +192,7 @@ test("control scanner keys template and script controls", () => {
   const script = "const b = document.createElement(\"button\");\n b.dataset.fooAction = 'x';\n" +
     "el.innerHTML = `<button type=\"button\" data-row-key=\"${k}\">Row</button>`;\n" +
     "document.addEventListener('click', (e) => e.target.closest('[data-pick-id]'));";
-  assert.deepEqual(controls.scanScript("s.js", script).map((c) => c.key).sort(), ["[data-foo-action]", "[data-pick-id]", "[data-row-key]"]);
+  assert.deepEqual(controls.scanScript("s.js", script).map((c) => c.key).sort(), ["[data-foo-action=x]", "[data-pick-id]", "[data-row-key]"]);
 });
 
 test("coverage report finds uncovered and stale keys", () => {
@@ -235,7 +232,8 @@ test("png round trip, crop, tiles and diff", () => {
 test("CLI refuses forbidden and live writes without a write system", () => {
   assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "forbidden"]), /never actuated/);
   assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led"]), /--write-system/);
-  const args = cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a"]);
+  assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a"]), /--led-ledger/);
+  const args = cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a", "--led-ledger", "ledger.json"]);
   const states = [
     { id: "r", page: "main", safety: "read" },
     { id: "all", page: "main", safety: "read", scope: "all" },
@@ -254,7 +252,7 @@ test("live routing serves repeated read API answers from the cache and answers o
   const OFFLINE = "https://offline.synthetic.invalid";
   let handler = null;
   const context = { route: async (_pattern, callback) => { handler = callback; } };
-  const g = new RequestGuard({ origins: [ORIGIN, OFFLINE], readPosts: READ_POSTS });
+  const g = new RequestGuard({ origins: { ui: ORIGIN, offline: OFFLINE } });
   const stats = { blocked: [], writes: [], routeErrors: [] };
   const cache = new ReadCache();
   const local = async (route, info) => {

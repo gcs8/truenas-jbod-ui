@@ -1,10 +1,13 @@
 "use strict";
 
 // UI coverage (#ui-coverage): every interactive control must be in the state
-// inventory (qa/ui-states.json), and a representative subset of states is
+// inventory (qa/ui-states.json), every backend route in the reviewed route
+// manifest (qa/ui-routes.json), and a representative subset of states is
 // crawled on synthetic fixtures with the automatic layout, heat-map and
-// contrast checks. Complete production templates and assets; only HTTP and the
-// data are synthetic. No stack, no appliance. See CONTRIBUTING.md, UI coverage.
+// contrast checks. The crawl also proves that each state only called routes
+// its safety class allows, and that every inventoried control actually
+// rendered somewhere. Complete production templates and assets; only HTTP and
+// the data are synthetic. No stack, no appliance. See CONTRIBUTING.md, UI coverage.
 
 const { test, expect } = require("@playwright/test");
 const { execFileSync } = require("node:child_process");
@@ -13,11 +16,12 @@ const os = require("node:os");
 const path = require("node:path");
 
 const controls = require("./ui-crawl/controls");
-const { loadInventory, validateInventory, expandStates, selectStates } = require("./ui-crawl/inventory");
+const { loadInventory, validateInventory, expandStates, selectStates, checkObserved } = require("./ui-crawl/inventory");
+const routes = require("./ui-crawl/routes");
 const { RequestGuard } = require("./ui-crawl/guard");
 const { installRoutes, fixtureHandler } = require("./ui-crawl/transport");
 const { Crawler } = require("./ui-crawl/crawler");
-const { writeReport, allFindings } = require("./ui-crawl/report");
+const { writeReport, allFindings, unexplainedErrors } = require("./ui-crawl/report");
 
 const root = path.resolve(__dirname, "..");
 const inventory = loadInventory();
@@ -36,6 +40,13 @@ test("every interactive control in the UI sources has an inventory entry", () =>
     : "";
   expect(report.uncovered.length, message).toBe(0);
   expect(report.stale, "qa/ui-states.json names controls that no longer exist in the sources; remove them").toEqual([]);
+});
+
+test("every backend route has a reviewed safety class and every browser API call matches one", () => {
+  const manifest = routes.loadManifest();
+  expect(routes.discoverRouteFiles(root), "a Python file declares routes but is not in qa/ui-routes.json `sources`").toEqual(Object.keys(manifest.sources).sort());
+  expect(routes.checkManifest(routes.scanRoutes(root, manifest), manifest), "Review the route's class in qa/ui-routes.json (see qa/ui-crawl/routes.js) and update its fingerprint").toEqual([]);
+  expect(routes.checkScriptApiPaths(root, controls.UI_SOURCES.scripts, manifest)).toEqual([]);
 });
 
 // A synthetic page with one instance of each defect shape the checks exist
@@ -82,7 +93,7 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
 });
 
 test("the crawler's layout, heat-map and contrast checks pass on the synthetic fixtures", async ({ browser }, testInfo) => {
-  test.setTimeout(12 * 60_000);
+  test.setTimeout(16 * 60_000);
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-coverage-"));
   const fixturePath = path.join(tempDir, "fixture.json");
   execFileSync(process.env.PYTHON || "python3", ["scripts/build_ui_crawl_fixture.py", "--output", fixturePath], { cwd: root, stdio: "inherit" });
@@ -93,16 +104,18 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     admin: "https://admin.synthetic.invalid",
     offline: "https://offline.synthetic.invalid",
     assets: "https://synthetic.invalid",
+    "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
+    "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
   };
-  const guard = new RequestGuard({ origins: Object.values(origins), readPosts: inventory.read_posts });
+  const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
   const outDir = testInfo.outputPath("ui-crawl");
   const context = await browser.newContext({ viewport: null, serviceWorkers: "block" });
   const routes = await installRoutes(context, { guard, origins, stats, fixture: fixtureHandler(fixture) });
-  const states = selectStates(expandStates(inventory), { ciOnly: true });
+  const states = selectStates(expandStates(inventory), { ciOnly: true, includeFixtureOnly: true });
   const crawler = new Crawler({
     context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir, widths: inventory.widths.ci,
-    axeSource: fs.readFileSync(require.resolve("axe-core/axe.min.js"), "utf8"), fixtureMode: true, settleMs: 400,
+    axeSource: fs.readFileSync(require.resolve("axe-core/axe.min.js"), "utf8"), fixtureMode: true, settleMs: 400, renderAudit: true,
     log: (line) => process.stdout.write(`${line}\n`),
   });
   const targets = [
@@ -111,6 +124,9 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "history", ready: "history", label: "fixture/history", url: `${origins.history}/` },
     { page: "admin", ready: "admin", label: "fixture/admin", url: `${origins.admin}/` },
     { page: "offline", ready: "main", label: "fixture/offline", url: `${origins.offline}/` },
+    { page: "main", ready: "main", variant: "write-sign-in", label: "fixture/main-write-sign-in", url: `${origins["ui-write-sign-in"]}/` },
+    { page: "fabric", ready: "fabric", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${origins["ui-write-sign-in"]}/sas-fabric` },
+    { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
   ];
   try {
     for (const target of targets) await crawler.crawlTarget(target, states.filter((state) => state.page === target.page));
@@ -127,10 +143,33 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
 
   const broken = crawler.records.filter((record) => !["done", "not-applicable"].includes(record.status));
   expect(broken.map((record) => `${record.target} ${record.state}: ${record.status} ${JSON.stringify(record.findings)}`)).toEqual([]);
-  expect(stats.blocked, "the fixture pages made requests outside the synthetic origins").toEqual([]);
+  expect(stats.blocked, "the fixture pages made requests the guard refused (unknown route, or a class the state may not use)").toEqual([]);
   expect(crawler.records.filter((record) => record.status === "done").length).toBeGreaterThan(20);
+  // Every selected state ran on a page that has it (a variant state needs its variant target).
+  const ran = new Set(crawler.records.map((record) => record.state));
+  expect(states.filter((state) => !ran.has(state.id)).map((state) => state.id), "selected states that no target ran").toEqual([]);
 
-  const unexplained = allFindings(crawler.records).filter((finding) => finding.severity === "error" && !finding.known);
+  // #1120: the safety class each state really has, from the routes it called.
+  const byId = new Map(states.map((state) => [state.id, state]));
+  const misclassified = [];
+  for (const [stateId, seen] of guard.observed) {
+    const state = byId.get(stateId);
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()]));
+  }
+  expect(misclassified, "a control called a route its state's safety class does not allow; fix the class or the control").toEqual([]);
+
+  // Sol #1108: `covers` must be backed by a rendering. Every inventoried
+  // control is visible in at least one executed state, unless it is a
+  // reviewed render gap.
+  const rendered = new Set(crawler.records.flatMap((record) => record.rendered || []));
+  const gaps = new Map((inventory.render_gaps || []).map((gap) => [gap.key, gap]));
+  const claimed = [...new Set(inventory.states.flatMap((state) => state.covers || []))].sort();
+  const unrendered = claimed.filter((key) => !rendered.has(key) && !gaps.has(key));
+  expect(unrendered, "controls named in `covers` that no CI state rendered: add a state (or fixture variant) that shows them, or a reviewed `render_gaps` entry").toEqual([]);
+  const staleGaps = [...gaps.keys()].filter((key) => rendered.has(key) || !claimed.includes(key));
+  expect(staleGaps, "render_gaps entries that now render, or that no state covers; remove them").toEqual([]);
+
+  const unexplained = unexplainedErrors(crawler.records);
   const lines = unexplained.map((f) => `${f.state} @${f.width}px ${f.type} ${f.selector || ""} ${f.text || ""} ${JSON.stringify(f.detail || {})}`);
   expect(lines, `Layout/contrast/console findings. Open ${outDir}/index.html for tiles. Fix the defect, or if it is a known `
     + "issue add it to known_findings in qa/ui-states.json with the issue number.").toEqual([]);

@@ -40,6 +40,13 @@ def _dump(model) -> object:
 
 
 WRITE_POLICY = {"enabled": True, "mode": "network", "reason": "", "public_origin": None}
+# Variant: write sign-in configured (Basic), so the sign-in panels render.
+WRITE_POLICY_BASIC = {
+    "enabled": False,
+    "mode": "basic",
+    "reason": "Sign in to make changes.",
+    "public_origin": None,
+}
 
 
 def live_snapshot(bundle):
@@ -52,7 +59,7 @@ def live_snapshot(bundle):
     return snapshot.model_copy(update={"slots": slots})
 
 
-def render_main(bundle, *, history_configured: bool = True) -> str:
+def render_main(bundle, *, history_configured: bool = True, write_policy: dict = WRITE_POLICY) -> str:
     snapshot = live_snapshot(bundle)
     runtime = bundle.storage_view_runtime
     context = {
@@ -81,12 +88,12 @@ def render_main(bundle, *, history_configured: bool = True) -> str:
         "initial_history_panel_open_json": "false",
         "initial_history_io_chart_mode_json": '"total"',
         "admin_launch_url": None,
-        "write_policy_json": json.dumps(WRITE_POLICY),
+        "write_policy_json": json.dumps(write_policy),
     }
     return TEMPLATES.env.get_template("index.html").render(context)
 
 
-def render_fabric(bundle) -> str:
+def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY) -> str:
     snapshot = bundle.primary_snapshot
     fabric = bundle.sas_fabric
     bootstrap = {
@@ -95,7 +102,7 @@ def render_fabric(bundle) -> str:
         "systemId": snapshot.selected_system_id,
         "enclosureId": snapshot.selected_enclosure_id,
         "appVersion": __version__,
-        "writePolicy": WRITE_POLICY,
+        "writePolicy": write_policy,
     }
     context = {
         "request": build_fixture_request(),
@@ -145,7 +152,9 @@ ADMIN_BOOTSTRAP = {
     ],
     "setup_platform_defaults": {"core": {"ssh_commands": ["synthetic-read-only-command"]}},
     "default_system_id": "synthetic-system",
-    "admin": {},
+    # A public origin other than the fixture's own shows the "open at the
+    # configured address" link (rendered only, never followed).
+    "admin": {"public_origin": "https://admin-public.synthetic.invalid"},
     "storage_view_templates": [
         {"id": "synthetic-manual", "label": "Synthetic manual", "kind": "manual", "slot_count": 2, "rows": 1, "columns": 2},
     ],
@@ -225,6 +234,7 @@ async def build() -> dict:
         "ui:/api/history/status": await history.get_status(),
         "ui:/api/release-status": {"status": "disabled"},
         "ui:/api/system-locator": {"available": False, "supported": False},
+        "ui:/api/mappings/export": {"schema_version": 1, "mappings": []},
         "history:/healthz": {"status": "ok"},
         "admin:/api/admin/state": ADMIN_BOOTSTRAP,
         "admin:/api/admin/backups": {"available": True, "classes": {}, "targets": [], "artifacts": []},
@@ -246,6 +256,11 @@ async def build() -> dict:
         "pages": {
             "ui:/": render_main(bundle),
             "ui:/sas-fabric": render_fabric(bundle),
+            # Fixture variants (qa/ui-states.json `variant`): the write
+            # sign-in panels; the storage-view outage variant reuses ui:/ and
+            # the crawler's fixture handler fails its /api/storage-views.
+            "ui-write-sign-in:/": render_main(bundle, write_policy=WRITE_POLICY_BASIC),
+            "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
             "history:/": render_history(),
             "admin:/": render_admin(),
             "offline:/": await build_public_demo_html(settings=settings),

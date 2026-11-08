@@ -31,6 +31,14 @@ async function navigate(page, action, { attempts = 4, maxWaitMs = 10_000 } = {})
   return response;
 }
 
+function stripKeys(value, ignore) {
+  if (Array.isArray(value)) return value.map((item) => stripKeys(item, ignore));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).filter(([key]) => !ignore.has(key)).map(([key, item]) => [key, stripKeys(item, ignore)]));
+  }
+  return value === undefined ? null : value;
+}
+
 class CrawlDriver {
   constructor({ page, guard, selections = {}, ready, timeoutMs = 20_000, downloadDir = null, log = () => {} }) {
     this.page = page;
@@ -47,6 +55,9 @@ class CrawlDriver {
     this.dialogTexts = [];
     this.acceptNextDialog = false;
     this.downloads = [];
+    // Scope of the target page: writes are bound to it (#1120).
+    this.bind = {};
+    this.service = "ui";
     page.on("dialog", async (dialog) => {
       this.dialogsSeen += 1;
       this.dialogTexts.push(`${dialog.type()}: ${dialog.message().slice(0, 160)}`);
@@ -77,6 +88,38 @@ class CrawlDriver {
 
   pause(ms) {
     return this.page.waitForTimeout(ms);
+  }
+
+  // Let a click's asynchronous handlers send whatever they will send.
+  settle(ms = 600) {
+    return this.page.waitForTimeout(ms);
+  }
+
+  // #1118: the app's own read API for the stores a state writes, read fresh
+  // (never from the harness cache) in the target's scope. The values must be
+  // equal before the write and after the revert.
+  async semanticSnapshot(reads) {
+    const out = {};
+    for (const read of reads) {
+      const answer = await this.page.evaluate(async ({ path, bind }) => {
+        const params = new URLSearchParams(location.search);
+        const query = new URLSearchParams();
+        for (const key of ["system_id", "enclosure_id"]) {
+          const value = bind[key] || params.get(key);
+          if (value) query.set(key, value);
+        }
+        try {
+          const response = await fetch(`${path}${query.toString() ? `?${query}` : ""}`, { headers: { Accept: "application/json", "X-UI-Crawl-Fresh": "1" }, cache: "no-store" });
+          if (!response.ok) return { error: `${response.status}` };
+          return { json: await response.json() };
+        } catch (error) {
+          return { error: String(error) };
+        }
+      }, { path: read.path, bind: this.bind || {} });
+      if (!answer || answer.error) throw new Error(`${read.path} answered ${answer ? answer.error : "nothing"}`);
+      out[read.path] = stripKeys(read.pick ? answer.json[read.pick] : answer.json, new Set(read.ignore || []));
+    }
+    return out;
   }
 
   visible(selector) {
@@ -336,4 +379,4 @@ class CrawlDriver {
   }
 }
 
-module.exports = { CrawlDriver, NotApplicable, navigate };
+module.exports = { CrawlDriver, NotApplicable, navigate, stripKeys };

@@ -10,11 +10,23 @@
 //   node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8081 --out "$TMP/crawl"
 // A remote browser is used when the environment variable named by --cdp-env
 // (default BROWSER_CDP_URL) is set; its value is never printed.
+//
+// Identify cleanup (#1117): a live run that may turn on a locate light needs
+// --led-ledger FILE (keep it outside the run's --out, the same file for every
+// run). Lights left on by an interrupted run are cleared from it at startup,
+// on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, and by
+//   node scripts/ui_crawl.js --led-sweep --led-ledger FILE --out DIR
+// Exit status (#1119): 0 ok, 1 crawl errors, 2 safety gate failed, 3 a light
+// could not be verified off; 128+n after a signal whose cleanup verified.
 
 const fs = require("node:fs");
 const path = require("node:path");
 const { chromium } = require("@playwright/test");
 const { loadInventory, validateInventory, expandStates, selectStates } = require("../qa/ui-crawl/inventory");
+const controls = require("../qa/ui-crawl/controls");
+const routes = require("../qa/ui-crawl/routes");
+const { LedLedger, sweepLedger } = require("../qa/ui-crawl/ledger");
+const { EXIT } = require("../qa/ui-crawl/gate");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
 const { Crawler } = require("../qa/ui-crawl/crawler");
@@ -27,7 +39,11 @@ const FIXTURE_ORIGINS = {
   offline: "https://offline.synthetic.invalid",
   // build_current_source_browser_fixture renders static URLs on this host.
   assets: "https://synthetic.invalid",
+  // Fixture variants for states that need another configuration (Sol #1108).
+  "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
+  "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
 };
+const REPO_ROOT = path.resolve(__dirname, "..");
 
 function parseArgs(argv) {
   const args = { pages: null, states: null, widths: null, systems: null, allow: [], paceMs: null, cdpEnv: "BROWSER_CDP_URL", axe: true };
@@ -57,14 +73,22 @@ function parseArgs(argv) {
     else if (flag === "--appliance-load") args.applianceLoad = true;
     else if (flag === "--scopes") args.scopes = next();
     else if (flag === "--merge") args.merge = next().split(",");
+    else if (flag === "--led-ledger") args.ledLedger = next();
+    else if (flag === "--led-sweep") args.ledSweep = true;
+    else if (flag === "--led-verify-ms") args.ledVerifyMs = Number(next());
     else throw new Error(`unknown argument ${flag}`);
   }
   if (!args.out) throw new Error("--out is required");
   if (args.merge) return args;
+  if (args.ledSweep) {
+    if (!args.ledLedger) throw new Error("--led-sweep needs --led-ledger");
+    return args;
+  }
   if (!args.fixture && !args.ui) throw new Error("give --fixture or --ui");
   if (args.allow.includes("forbidden")) throw new Error("forbidden states are never actuated");
   for (const cls of args.allow) if (!["app-write-revert", "led"].includes(cls)) throw new Error(`unknown class ${cls}`);
   if (args.allow.length && !args.fixture && !args.writeSystem) throw new Error("--allow on a live stack needs --write-system");
+  if (args.allow.includes("led") && !args.fixture && !args.ledLedger) throw new Error("--allow led on a live stack needs --led-ledger (crash-safe identify cleanup)");
   return args;
 }
 
@@ -110,6 +134,9 @@ async function liveTargets(args) {
 
 function fixtureTargets() {
   return [
+    { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "write-sign-in", label: "fixture/main-write-sign-in", url: `${FIXTURE_ORIGINS["ui-write-sign-in"]}/` },
+    { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${FIXTURE_ORIGINS["ui-write-sign-in"]}/sas-fabric` },
+    { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${FIXTURE_ORIGINS["ui-storage-views-error"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", label: "fixture/main", url: `${FIXTURE_ORIGINS.ui}/` },
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", label: "fixture/fabric", url: `${FIXTURE_ORIGINS.ui}/sas-fabric` },
     { page: "history", ready: "history", scopeIndex: 0, label: "fixture/history", url: `${FIXTURE_ORIGINS.history}/` },
@@ -125,6 +152,7 @@ function statesFor(target, states, args, used) {
     if (state.page !== target.page) return false;
     if (target.scopeIndex > 0 && state.scope !== "all") return false;
     if (state.appliance_load && !args.fixture && !args.applianceLoad) return false;
+    if ((state.variant || null) !== (target.variant || null)) return false;
     if (state.heavy) {
       if (!args.downloads || used.heavy) return false;
       used.heavy = true;
@@ -138,22 +166,121 @@ function statesFor(target, states, args, used) {
   });
 }
 
+function writeReceipt(outDir, receipt) {
+  try {
+    fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(outDir, "receipt.json"), JSON.stringify({ ...receipt, at: new Date().toISOString() }, null, 1));
+  } catch {
+    // The exit status still carries the result.
+  }
+}
+
+// #1117: identify cleanup on every exit path the process itself sees. The
+// startup sweep of the next run covers the ones it cannot (SIGKILL, crash).
+function createExitGuards({ ledger, outDir, sweepOptions = {}, log = (line) => process.stderr.write(`${line}\n`) }) {
+  let cleanup = null;
+  const sweep = () => {
+    if (!cleanup) {
+      cleanup = (async () => {
+        if (!ledger) return null;
+        try {
+          if (!ledger.entries().length) return { ok: true, armed: 0, results: [] };
+          log("identify cleanup: clearing armed locate lights out of band");
+          return await sweepLedger(ledger, sweepOptions);
+        } catch (error) {
+          return { ok: false, error: String(error && error.message ? error.message : error).slice(0, 200) };
+        }
+      })();
+    }
+    return cleanup;
+  };
+  const onSignal = (signal, number) => {
+    let handled = false;
+    return async () => {
+      if (handled) return;
+      handled = true;
+      const ledCleanup = await sweep();
+      const code = ledCleanup && ledCleanup.ok === false ? EXIT["cleanup-uncertain"] : 128 + number;
+      writeReceipt(outDir, { status: "interrupted", signal, exitCode: code, ledCleanup });
+      process.exit(code);
+    };
+  };
+  const onFatal = async (error) => {
+    const ledCleanup = await sweep();
+    const code = ledCleanup && ledCleanup.ok === false ? EXIT["cleanup-uncertain"] : 1;
+    writeReceipt(outDir, { status: "crashed", error: String(error && error.message ? error.message : error).replace(/wss?:\/\/\S+/g, "<cdp-url>").slice(0, 300), exitCode: code, ledCleanup });
+    process.exit(code);
+  };
+  return {
+    sweep,
+    install() {
+      process.on("SIGTERM", onSignal("SIGTERM", 15));
+      process.on("SIGINT", onSignal("SIGINT", 2));
+      process.on("SIGHUP", onSignal("SIGHUP", 1));
+      process.on("uncaughtException", onFatal);
+      process.on("unhandledRejection", onFatal);
+      return this;
+    },
+  };
+}
+
+// Refuse a live crawl whose inventory or route manifest is not current: an
+// unclassified control or route is a hard failure (#1120).
+function preflightProblems(inventory) {
+  const problems = [];
+  const report = controls.coverageReport(controls.scanSources(REPO_ROOT), inventory);
+  for (const control of report.uncovered) problems.push(`unclassified control ${control.key} (${control.file}:${control.line})`);
+  for (const key of report.stale) problems.push(`stale inventory key ${key}`);
+  const manifest = routes.loadManifest();
+  problems.push(...routes.checkManifest(routes.scanRoutes(REPO_ROOT, manifest), manifest));
+  problems.push(...routes.checkScriptApiPaths(REPO_ROOT, controls.UI_SOURCES.scripts, manifest));
+  return problems;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const outDir = path.resolve(args.out);
   if (args.merge) {
-    console.log(JSON.stringify(mergeReports(path.resolve(args.out), args.merge.map((dir) => path.resolve(dir))), null, 1));
-    return 0;
+    const { summary, problems } = mergeReports(outDir, args.merge.map((dir) => path.resolve(dir)));
+    console.log(JSON.stringify({ ...summary, problems }, null, 1));
+    return EXIT[summary.safety] ?? EXIT["safety-failed"];
+  }
+  const sweepOptions = { verifyMs: args.ledVerifyMs || 45_000, pollMs: Math.min(3000, Math.max(200, Math.floor((args.ledVerifyMs || 45_000) / 10))) };
+  const ledger = args.ledLedger ? new LedLedger(args.ledLedger) : null;
+  if (args.ledSweep) {
+    const ledCleanup = await sweepLedger(ledger, sweepOptions);
+    const code = ledCleanup.ok ? EXIT.ok : EXIT["cleanup-uncertain"];
+    writeReceipt(outDir, { status: ledCleanup.ok ? "ok" : "cleanup-uncertain", mode: "led-sweep", exitCode: code, ledCleanup });
+    console.log(JSON.stringify(ledCleanup, null, 1));
+    return code;
+  }
+  const guards = createExitGuards({ ledger, outDir, sweepOptions }).install();
+  // Startup sweep: no crawl starts while a previous run's light may be on.
+  if (ledger) {
+    const startup = await guards.sweep();
+    if (startup && startup.ok === false) {
+      writeReceipt(outDir, { status: "cleanup-uncertain", stage: "startup sweep", exitCode: EXIT["cleanup-uncertain"], ledCleanup: startup });
+      console.error("identify cleanup from a previous run could not be verified; nothing was crawled");
+      return EXIT["cleanup-uncertain"];
+    }
   }
   const inventory = loadInventory();
   const problems = validateInventory(inventory);
   if (problems.length) throw new Error(`inventory invalid:\n${problems.join("\n")}`);
+  if (!args.fixture) {
+    const preflight = preflightProblems(inventory);
+    if (preflight.length) {
+      writeReceipt(outDir, { status: "safety-failed", stage: "preflight", exitCode: EXIT["safety-failed"], failures: preflight });
+      console.error(`refusing a live crawl:\n${preflight.join("\n")}`);
+      return EXIT["safety-failed"];
+    }
+  }
   const widths = args.widths || inventory.widths[args.ci ? "ci" : args.tier || "release"];
-  let states = selectStates(expandStates(inventory), { pages: args.pages, ciOnly: args.ci, ids: args.states, includeFixtureOnly: false });
-  const outDir = path.resolve(args.out);
+  const states = selectStates(expandStates(inventory), { pages: args.pages, ciOnly: args.ci, ids: args.states, includeFixtureOnly: Boolean(args.fixture) });
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
   const fixture = args.fixture ? JSON.parse(fs.readFileSync(args.fixture, "utf8")) : null;
   const origins = fixture ? { ...FIXTURE_ORIGINS } : { ui: args.ui, history: args.history || null, admin: args.admin || null, offline: FIXTURE_ORIGINS.offline };
-  const guard = new RequestGuard({ origins: Object.values(origins).filter(Boolean), readPosts: inventory.read_posts });
+  const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
   const cache = fixture ? null : new ReadCache();
   const offlinePages = {};
@@ -172,14 +299,21 @@ async function main() {
   const started = new Date().toISOString();
   const browser = cdpUrl
     ? await chromium.connectOverCDP(cdpUrl, { timeout: 120_000 })
-    : await chromium.launch({ channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || undefined });
+    : await chromium.launch({ channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || undefined, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
+  const runProblems = [];
   let context = null;
-  let routes = null;
+  let routesHandle = null;
   let crawler = null;
+  browser.on("disconnected", () => {
+    if (crawler && !crawler.finished) {
+      crawler.aborted = "browser disconnected";
+      runProblems.push("the browser disconnected during the crawl");
+    }
+  });
   try {
     context = await browser.newContext({ viewport: null, acceptDownloads: true, serviceWorkers: "block" });
-    routes = await installRoutes(context, {
-      guard, origins, cache, stats,
+    routesHandle = await installRoutes(context, {
+      guard, origins, cache, stats, ledger,
       fixture: handler,
       local: handler ? null : liveOffline,
     });
@@ -195,7 +329,7 @@ async function main() {
       allow: args.allow, confirmPreview: Boolean(args.confirmPreview), downloads: Boolean(args.downloads),
       axeSource: args.axe && axePath ? fs.readFileSync(axePath, "utf8") : null,
       baselineDir: args.baseline ? path.resolve(args.baseline) : null, fixtureMode: Boolean(fixture), cache,
-      paceMs: args.paceMs ?? (fixture ? 0 : 1500),
+      paceMs: args.paceMs ?? (fixture ? 0 : 1500), ledger, writeSystem: args.writeSystem || null,
     });
     const targets = fixture ? fixtureTargets() : await liveTargets(args);
     const used = {};
@@ -212,11 +346,17 @@ async function main() {
         await crawler.crawlTarget(target, statesFor(target, states, args, used));
       }
     }
+    if (crawler.aborted) runProblems.push(`crawl aborted: ${crawler.aborted}`);
+  } catch (error) {
+    runProblems.push(`crawl stopped: ${String(error && error.message ? error.message : error).replace(/wss?:\/\/\S+/g, "<cdp-url>").split("\n")[0].slice(0, 200)}`);
   } finally {
-    if (routes) await routes.drain();
+    if (crawler) crawler.finished = true;
+    if (routesHandle) await routesHandle.drain();
     if (context) await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
+  // Whatever the browser did, anything still armed is cleared out of band now.
+  const ledCleanup = ledger ? await guards.sweep() : null;
   const summary = writeReport(outDir, {
     meta: {
       mode: fixture ? "fixture" : "live", label: args.label || null, started, finished: new Date().toISOString(), widths,
@@ -227,10 +367,13 @@ async function main() {
     actuations: crawler ? crawler.actuations : [],
     guardLog: guard.log,
     stats,
+    ledCleanup,
+    problems: runProblems,
   });
+  const code = EXIT[summary.safety];
+  writeReceipt(outDir, { status: summary.safety, exitCode: code, ledCleanup, problems: runProblems });
   console.log(JSON.stringify(summary, null, 1));
-  const revertFailed = (crawler ? crawler.actuations : []).some((a) => a.status === "revert-failed");
-  return revertFailed ? 2 : 0;
+  return code;
 }
 
 if (require.main === module) {
@@ -240,4 +383,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, statesFor, fixtureTargets, FIXTURE_ORIGINS };
+module.exports = { parseArgs, statesFor, fixtureTargets, createExitGuards, preflightProblems, FIXTURE_ORIGINS };

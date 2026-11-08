@@ -394,12 +394,28 @@ tooling exists to catch those automatically.
   sudo or account changes, SMART test starts, backup and restore, history purge
   or adopt, configuration saves that reach appliances). Forbidden states are
   listed for completeness and never actuated.
+- `qa/ui-routes.json` is the reviewed backend route manifest. Every FastAPI
+  route of the main UI, history and admin services is listed with a class
+  (`read`, `read-post`, `read-heavy`, `appliance-load`, `app-write`, `led`,
+  `forbidden`, `internal`; see `qa/ui-crawl/routes.js`), a one-line reason and
+  a fingerprint of its handler source. A new, removed or edited route fails CI
+  until its class is re-reviewed and its fingerprint updated (the failure
+  prints the new value), and so does a browser script that calls an `/api/`
+  path no route matches.
 - `qa/ui-coverage.spec.js` (fixture-only CI) scans the templates and browser
   scripts for interactive controls (buttons, links styled as buttons, selects,
-  inputs, `details`, dialogs, `data-*` click hooks) and fails when one is not
-  named in a state's `covers` or in `ignored_controls` with a reason. It also
-  crawls the `ci: true` states on synthetic fixtures at the `ci` widths and
-  fails on any unexplained layout, contrast, heat-map or console finding.
+  inputs, `details`, dialogs, elements with an interactive `role`, `tabindex`
+  or inline handler, and `data-*` click hooks) and fails when one is not named
+  in a state's `covers` or in `ignored_controls` with a reason. A hook with a
+  literal value is keyed by that value (`[data-admin-view-button=backups]`), so
+  a new tab or mode that reuses a hook still needs its own entry; dynamic
+  values (bays) share one key. The spec also crawls the `ci: true` states on
+  synthetic fixtures (including fixture variants for configurations such as
+  write sign-in) at the `ci` widths and fails on any unexplained layout,
+  contrast, heat-map or console finding, on an accessibility checker that did
+  not run, on a request the guard refused, on a state that called a route its
+  safety class does not allow, and on a `covers` key that no executed state
+  rendered (unless listed in `render_gaps` with a reason).
 - `scripts/ui_crawl.js` is the crawler. For every state and width it saves a
   full-page PNG, 1280x720 tiles at native resolution, `findings.json` and an
   `index.html` that lists each state's findings next to its tiles.
@@ -430,18 +446,40 @@ node scripts/ui_crawl.js --fixture /tmp/ui-fixture.json --out /tmp/ui-crawl --ci
 node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8081 --out /tmp/ui-crawl --tier pr --pages main,fabric
 ```
 
-A live crawl is read-only by default: the request guard aborts every write and
-every forced appliance refresh. `--allow app-write-revert,led --write-system ID`
-admits the declared writes of those states on one system, reverts them at once
-and verifies the revert by re-reading. Set `BROWSER_CDP_URL` to use a remote
+A live crawl is read-only by default. The request guard admits only exact
+method + path templates from `qa/ui-routes.json`: `read` and `read-post` routes
+for every state; an unknown route, a forced appliance refresh or any write is
+aborted and fails the run. `--allow app-write-revert,led --write-system ID
+--led-ledger FILE` admits the declared writes of those states, bound to that
+system, the target enclosure and the captured bay. Each write state reads its
+store through the app's API (`semantic_reads`) before the write and after the
+revert and fails when they differ. Every identify is recorded in the
+`--led-ledger` file before it leaves the browser; the crawler clears and
+verifies it on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, at
+the start of the next run, and with `--led-sweep`. Keep the ledger outside the
+run's `--out` and reuse it across runs. Disk sync previews must show and
+dismiss their confirmation and send nothing.
+
+Exit status is derived from the evidence, never from the absence of a bad row:
+0 ok, 1 states or captures errored, 2 safety gate failed (a revert, verify,
+semantic store check or preview failed, a request was blocked, an admitted
+write is unaccounted for, or a merged report is missing or malformed), 3 an
+identify light could not be verified off. `findings.json` carries the same
+result under `safety`, and `receipt.json` is written on every exit path.
+The index groups repeated findings (same type and element pattern) into one
+row with a count and example tiles, with severity, known/new and type filters;
+`findings.json` keeps every raw finding. Set `BROWSER_CDP_URL` to use a remote
 browser. Keep live-stack output out of the repository.
 
 Adding a control: give it an `id` or a `data-*` hook, then add the key to the
 `covers` list of the state that renders it, or add a state with its steps and
 safety class. A control that only exists in one configuration (for example
-the write sign-in panel) can be covered by a `fixture_only` state. When a
-crawl finds a real defect that will be fixed separately, add it to
-`known_findings` with the issue number and remove the entry with the fix.
+the write sign-in panel) needs a state that reaches that configuration: an
+unsaved form selection, or a `fixture_only` + `ci` state with a `variant`
+fixture page (see `scripts/build_ui_crawl_fixture.py`). Adding a route: add it
+to `qa/ui-routes.json` with its class and reason. When a crawl finds a real
+defect that will be fixed separately, add it to `known_findings` with the issue
+number and remove the entry with the fix.
 
 The switching and ESXi suites are live-appliance contracts, not portable fixture
 tests. Run them only against an intentionally configured stack:
