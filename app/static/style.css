@@ -4694,7 +4694,7 @@ button.fabric-trace-crumb:hover {
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
     height: 76px;
     min-height: 76px;
-    padding: 8px 32px 8px 8px;
+    padding: 8px 36px 8px 8px;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-status-led {
