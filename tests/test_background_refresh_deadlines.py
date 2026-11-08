@@ -408,6 +408,8 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         # The refresh is rebuilding the shelf (it holds the shelf's state) in
         # work that cannot stop once started, and it outlives its deadline.
         release = asyncio.Event()
+        # Release it even if an assertion fails, or the loop could not close.
+        self.addCleanup(release.set)
         building = asyncio.Event()
         build_snapshot = self.service._build_snapshot
 
