@@ -36,9 +36,9 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
 
 - The first bays of a single-row chassis face wider than its bezel, such as a
   24-bay 2.5" front at 1600 px, can be scrolled to and selected again (#1081).
-- Storage Fabric keeps the CORE HBA PHY table and shows, per HBA-to-expander or
-  expander cascade link, the PHY pairs both ends report, with lane count and
-  rate (#1086).
+- Storage Fabric keeps the CORE HBA PHY table and exposes lane pairs in the
+  API: per HBA-to-expander or expander cascade link, the PHY pairs both ends
+  report, with lane count and rate. The page does not draw lanes (#1086).
 - The admin page shows real saved history row counts on segmented history
   deployments instead of 0 (#1083).
 - The history container no longer runs out of memory while it builds its

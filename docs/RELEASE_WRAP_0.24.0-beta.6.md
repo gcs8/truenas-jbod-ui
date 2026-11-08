@@ -162,8 +162,12 @@ On the live read-only restored stack in the same image:
   live restores and every live check. For the CORE appliance the call budget
   was 4, split UI 2, Admin 1 (history reads through the UI); each service's
   `calls_in_flight_peak` stayed at its own limit and the most calls seen in
-  flight at once across services was 3. No middleware busy or backoff lines
-  were logged.
+  flight at once across services was 3. The UI and Admin logged no
+  middleware busy-backoff line ("middleware is busy; backing off" or "is
+  busy; the app is backing off"), and no service logged `ETOOMANYREFS`. The
+  Admin call limiter did refuse some of its own platform reads while it held
+  its single CORE call, and the history collector logged its retry backoffs
+  after failed collection passes; neither is a middleware busy reply.
 - Before the first live phase and after the last one, read-only snapshots of
   the CORE appliance's alerts, alert mails and API sessions were taken through
   the twin's saved key. The QA window added no "Failed to check for alert"
