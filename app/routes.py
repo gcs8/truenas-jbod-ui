@@ -84,6 +84,7 @@ from app.route_support import (
     resolve_read_ui_write_policy,
     runtime_warnings_for,
     known_hosts_warnings_for,
+    readback_after_write,
     templates,
     upgrade_notice_data_dir,
 )
@@ -738,6 +739,8 @@ def build_router() -> APIRouter:
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # The view before this change, in case the readback cannot finish (#1125).
+        before_change = service.peek_cached_snapshot(selected_enclosure_id=enclosure_id, exact=True)
         led_warning = None
         led_changed = False
         if payload.clear_identify_after_save:
@@ -763,13 +766,19 @@ def build_router() -> APIRouter:
             enclosure_id=mapping.enclosure_id,
             invalidate_source_bundle=led_changed,
         )
-        snapshot = await service.get_snapshot(force_refresh=True, selected_enclosure_id=enclosure_id)
+        snapshot, readback_warning = await readback_after_write(
+            service,
+            enclosure_id=enclosure_id,
+            force_refresh=True,
+            fallback=before_change,
+            change="Saved the bay assignment.",
+        )
         return JSONResponse(
             {
                 "ok": True,
                 "mapping": mapping.model_dump(mode="json"),
                 "snapshot": snapshot.model_dump(mode="json"),
-                "warning": led_warning,
+                "warning": " ".join(filter(None, [led_warning, readback_warning])) or None,
             }
         )
 
@@ -802,13 +811,23 @@ def build_router() -> APIRouter:
             return _storage_unwritable_response(exc)
         except TrueNASAPIError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        before_change = service.peek_cached_snapshot(selected_enclosure_id=enclosure_id, exact=True)
         if cleared:
             service.invalidate_physical_enclosure_snapshot_cache(
                 reason="route.clear_mapping",
                 enclosure_id=enclosure_id,
             )
-        snapshot = await service.get_snapshot(force_refresh=cleared, selected_enclosure_id=enclosure_id)
-        return JSONResponse({"ok": cleared, "snapshot": snapshot.model_dump(mode="json")})
+        snapshot, readback_warning = await readback_after_write(
+            service,
+            enclosure_id=enclosure_id,
+            force_refresh=cleared,
+            fallback=before_change,
+            change="Cleared the bay assignment." if cleared else "The bay assignment was already clear.",
+        )
+        response: dict[str, Any] = {"ok": cleared, "snapshot": snapshot.model_dump(mode="json")}
+        if readback_warning:
+            response["warning"] = readback_warning
+        return JSONResponse(response)
 
     @router.get("/api/mappings/export", response_model=MappingBundle)
     async def export_mappings(
@@ -878,15 +897,23 @@ def build_router() -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError:
             return JSONResponse(status_code=422, content={"detail": INVALID_MAPPING_BUNDLE_DETAIL})
+        before_change = service.peek_cached_snapshot(selected_enclosure_id=enclosure_id, exact=True)
         service.invalidate_snapshot_cache(reason="route.import_mappings")
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
-        return JSONResponse(
-            {
-                "ok": True,
-                **result,
-                "snapshot": snapshot.model_dump(mode="json"),
-            }
+        snapshot, readback_warning = await readback_after_write(
+            service,
+            enclosure_id=enclosure_id,
+            force_refresh=None,
+            fallback=before_change,
+            change="Restored the bay assignments.",
         )
+        response = {
+            "ok": True,
+            **result,
+            "snapshot": snapshot.model_dump(mode="json"),
+        }
+        if readback_warning:
+            response["warning"] = readback_warning
+        return JSONResponse(response)
 
     @router.get("/api/slots/{slot}/smart", response_model=SmartSummaryView)
     async def get_slot_smart_summary(
