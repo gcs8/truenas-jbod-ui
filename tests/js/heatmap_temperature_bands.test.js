@@ -269,11 +269,12 @@ test("heat-map text lines use the computed text colour on an opaque surface chip
   assert.doesNotMatch(textRule[1], /opacity:\s*0\.45/, "faded text lines were the reported contrast defect");
   assert.match(textRule[1], /color:\s*rgb\(var\(--heatmap-text-rgb/);
   assert.match(textRule[1], /background(?:-color)?:\s*rgb\(var\(--heatmap-surface-rgb/);
+  // Custom properties are set as `--heatmap-${name}`.
   const applySource = functionSource("applyHeatmapToTile");
-  assert.match(applySource, /--heatmap-text-rgb/);
-  assert.match(applySource, /--heatmap-surface-rgb/);
-  assert.match(applySource, /--heatmap-badge-rgb/);
-  assert.match(functionSource("resetHeatmapTile"), /--heatmap-text-rgb/);
+  for (const name of ["text-rgb", "surface-rgb", "badge-rgb"]) {
+    assert.match(applySource, new RegExp(`"${name}"`));
+    assert.match(functionSource("resetHeatmapTile"), new RegExp(`"${name}"`));
+  }
 });
 
 test("temperature colours default to bands and keep relative min-max as an explicit option", () => {

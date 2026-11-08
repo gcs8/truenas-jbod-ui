@@ -1186,15 +1186,12 @@ textarea {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
-/* #1103: absolute temperature bands replace the min-max gradient. The cap
-   keeps the legend near its gradient footprint; the bands wrap instead. */
+/* #1103: temperature bands replace the min-max gradient. */
 .heatmap-legend.heatmap-legend-banded {
   max-width: 300px;
 }
 
-.heatmap-legend.heatmap-legend-banded > #heatmap-legend-min,
-.heatmap-legend.heatmap-legend-banded > .heatmap-legend-bar,
-.heatmap-legend.heatmap-legend-banded > #heatmap-legend-max {
+.heatmap-legend-banded > :is(#heatmap-legend-min, .heatmap-legend-bar, #heatmap-legend-max) {
   display: none;
 }
 
@@ -1206,30 +1203,24 @@ textarea {
   margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.heatmap-legend-band {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-}
-
-.heatmap-legend-band-swatch {
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  background: rgb(var(--heatmap-band-rgb, 120, 130, 140));
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
-}
-
-.heatmap-legend-band-name {
   color: #dfe7f0;
 }
 
-.heatmap-legend-band-range {
-  font-family: var(--mono);
-  color: #c5d4e6;
+.heatmap-legend-bands li {
+  white-space: nowrap;
+}
+
+.heatmap-legend-bands span {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 3px;
+  background: rgb(var(--heatmap-band-rgb));
+}
+
+.heatmap-legend-bands b {
+  font: 400 1em var(--mono);
 }
 
 .heatmap-legend-source {
@@ -4957,17 +4948,15 @@ button.fabric-trace-crumb:hover {
   z-index: 6;
 }
 
-.slot-tile.heatmap-active .slot-number,
-.slot-tile.heatmap-missing .slot-number,
-.slot-tile.selected.heatmap-active .slot-number,
-.slot-tile.selected.heatmap-missing .slot-number {
-  background: rgb(var(--heatmap-surface-rgb, 52, 59, 67));
-  color: rgb(var(--heatmap-text-rgb, 238, 242, 246));
-  box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb, 238, 242, 246), 0.32);
+.slot-tile:is(.heatmap-active, .heatmap-missing) .slot-number,
+.slot-tile.selected:is(.heatmap-active, .heatmap-missing) .slot-number {
+  background: rgb(var(--heatmap-surface-rgb));
+  color: rgb(var(--heatmap-text-rgb));
+  box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb), 0.32);
 }
 
-/* #1103: tile text sits above the heat overlay on a chip of the computed
-   surface colour, in the text colour app.js picks for WCAG AA contrast. */
+/* #1103: text sits above the overlay on a surface-coloured chip in the
+   colour app.js picks for WCAG AA contrast. */
 .slot-tile.heatmap-missing {
   --heatmap-surface-rgb: 52, 59, 67;
   --heatmap-text-rgb: 238, 242, 246;
@@ -4986,8 +4975,8 @@ button.fabric-trace-crumb:hover {
   width: fit-content;
   padding: 0 3px;
   border-radius: 3px;
-  background: rgb(var(--heatmap-surface-rgb, 52, 59, 67));
-  color: rgb(var(--heatmap-text-rgb, 238, 242, 246));
+  background: rgb(var(--heatmap-surface-rgb));
+  color: rgb(var(--heatmap-text-rgb));
   opacity: 1;
 }
 
