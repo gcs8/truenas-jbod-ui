@@ -43,6 +43,24 @@ Keep your existing Compose files. Do not use `down` for a normal update, and
 do not download a replacement Compose file. The full steps are in
 [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment#update]].
 
+For a controlled, digest-pinned update with an automatic rollback receipt, use
+`scripts/update_immutable_deployment.py` from the
+[immutable GHCR deployment runbook](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md).
+When a reviewed release also replaces the shipped Compose file
+(`--replace-compose`), name your own overlay, such as `compose.override.yaml`,
+with `--keep-overlay` so it stays in the chain. A kept overlay may set only
+`restart` (`no`, `always`, `on-failure[:N]` or `unless-stopped`) on services
+the shipped files define, nothing else: environment, ports, labels, logging,
+resource limits and every other setting are refused, and there is no flag to
+allow them. Setting `restart: always` or `unless-stopped` on the admin service
+undoes its auto-stop, because Docker starts it again after it exits. The deployment directory, `.env` and every Compose file must be
+owned by root or the user running the helper and not writable by group or
+others, and every directory from / down to the deployment must be owned by
+root and not writable by group or others, so keep the deployment under a
+directory such as `/opt` or `/srv`, not `/tmp` or a home directory. If the UI
+or admin service is published only on the host's LAN address, its health and
+retention URLs may use that published address and port instead of loopback.
+
 ## History
 
 A normal upgrade needs nothing: the history service migrates its database when

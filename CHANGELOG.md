@@ -48,6 +48,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   segmented-history maintenance scripts now choose the history volume
   themselves, and the free-space check before an index build looks at that same
   folder (#1094, #1095).
+- Fixed `scripts/update_immutable_deployment.py --replace-compose` replacing
+  operator overlays: overlays named with `--keep-overlay` now stay in the
+  Compose chain, the merged chain is validated, and a kept overlay may set
+  only `restart` on shipped services: any other setting, YAML anchor or merge
+  key, or reference to another file is refused before any Docker command, and
+  the merged model may differ from the shipped files' only in `restart`. The
+  deployment directory and every input must be owned by root or the updater and
+  not writable by group or others, and every directory from / down to the
+  deployment must be owned by root and not writable by group or others, so a
+  deployment under `/tmp` or another writable directory is refused (#1100,
+  #1101). Every input is read without following links,
+  frozen in the private receipt and checked unchanged before each step; under
+  `--replace-compose` kept overlays are also rewritten with their frozen bytes
+  as new helper-owned files before Compose reads them; and
+  rollback restores and rechecks file modes as well as bytes. Health and
+  retention URLs may also use an address and port the deployment itself
+  publishes (#1097).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

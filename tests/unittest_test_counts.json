@@ -52,7 +52,7 @@
     "test_history_schema_version_gate": 17,
     "test_history_service": 341,
     "test_image_upgrade_contract": 121,
-    "test_immutable_deployment": 42,
+    "test_immutable_deployment": 92,
     "test_inventory": 607,
     "test_inventory_registry_routes": 15,
     "test_jbod_runner_trial": 15,
