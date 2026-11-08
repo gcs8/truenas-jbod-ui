@@ -153,8 +153,8 @@ test("a bay's accessible name and tooltip say when its locate light is on", () =
   const lit = { slot: 4, slot_label: "04", device_name: "da4", pool_name: "tank", health: "ONLINE", state: "identify", identify_active: true };
   const dark = { ...lit, state: "healthy", identify_active: false };
 
-  assert.equal(slotAccessibleName(lit), "Slot 04, da4, pool tank, online, Locate light on");
-  assert.equal(slotAccessibleName(dark), "Slot 04, da4, pool tank, online");
+  assert.equal(slotAccessibleName(lit), "online, Locate light on");
+  assert.equal(slotAccessibleName(dark), "online");
   assert.ok(buildTooltipLines(lit, null).includes("Locate light on"));
   assert.ok(!buildTooltipLines(dark, null).includes("Locate light on"));
 

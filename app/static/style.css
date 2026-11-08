@@ -1064,10 +1064,8 @@ textarea {
   margin-bottom: 12px;
 }
 
-/* The enclosure title keeps its natural width (#1102). The header actions
-   (view toggles, heat-map controls and legends) take the remaining width and
-   wrap inside it; when even 360px is not left beside the title they drop to
-   their own row instead of squeezing the title to one letter per line. */
+/* The title keeps its natural width (#1102). Header actions wrap in the rest,
+   and drop to their own row when under 360px is left beside the title. */
 .enclosure-panel > .panel-header {
   flex-wrap: wrap;
 }
@@ -1832,6 +1830,19 @@ textarea {
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* #1112: keyboard focus or an opened path pill unfolds cut-off lines; hover
+   has a title. */
+:is(.sas-fabric-item, .fabric-focus-card, .topology-pill):focus-visible :is(span, small),
+.topology-pill[aria-expanded="true"] :is(span, small) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+:is(.fabric-focus-card, .topology-pill):focus-visible {
+  outline: 2px solid var(--selected);
+  outline-offset: 2px;
 }
 
 .fabric-warning-list:empty {
@@ -3242,7 +3253,7 @@ button.fabric-trace-crumb:hover {
   margin: 0;
 }
 
-.fabric-path-member-card dl span {
+.fabric-path-member-card dl div {
   display: grid;
   gap: 2px;
   min-width: 0;
@@ -3612,10 +3623,8 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="drawer"] {
-  /* Top-down view of vertically mounted drives: each bay is a tall, narrow
-     tray, so the face owns its proportions instead of the drive-scale ones.
-     Trays keep a minimum width and the drawer scrolls inside its bezel when
-     the window cannot fit all fourteen columns. */
+  /* Top-down drawer of tall, narrow trays: the face owns its proportions.
+     Trays keep a minimum width; the drawer scrolls inside its bezel. */
   --slot-bay-width: 118px;
   --slot-bay-aspect: 0.46 / 1;
   --slot-grid-gap: 12px;
@@ -3685,6 +3694,7 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="boot-devices"] {
+  --slot-track-min-width: 240px;
   --chassis-min-height: 390px;
   --slot-grid-gap: 12px;
   margin-top: 10px;
@@ -3940,10 +3950,8 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-latch-edge="bottom"] .row-slots,
 .chassis-shell[data-latch-edge="top"] .row-slots {
   justify-items: center;
-  /* A bay group wider than its track (a 24-bay single row in a narrow bezel)
-     must overflow toward the end, where the chassis shell can scroll to it.
-     Plain center splits the overflow and strands the first bay past the start
-     edge (#1065). Rows that fit are centred exactly as before. */
+  /* A bay group wider than its track overflows toward the end, where the shell
+     scrolls; plain center would strand the first bay past the start (#1065). */
   justify-items: safe center;
 }
 
@@ -3958,7 +3966,8 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-face-style="generic"] .row-group,
 .chassis-shell[data-face-style="front-drive"] .row-group,
 .chassis-shell[data-face-style="rear-drive"] .row-group,
-.chassis-shell[data-face-style="top-loader"] .row-group {
+.chassis-shell[data-face-style="top-loader"] .row-group,
+.chassis-shell[data-face-style="boot-devices"] .row-group {
   grid-template-columns: repeat(var(--group-columns, 1), minmax(var(--slot-track-min-width), 1fr));
 }
 
@@ -4067,10 +4076,9 @@ button.fabric-trace-crumb:hover {
   cursor: pointer;
   text-align: left;
   color: var(--text);
-  /* Selected, peer and Connections rings (#925). An inset outline survives the
-     state and face rules that replace box-shadow, and leaves ::after to the
-     state chip. It paints under the tray face, so it sits in the gap between
-     the tile edge and the face; :focus-visible below replaces it. */
+  /* Selected, peer and Connections rings (#925): an inset outline survives the
+     rules that replace box-shadow and leaves ::after to the state chip. It sits
+     between tile edge and tray face; :focus-visible replaces it. */
   outline: var(--bay-ring-width, 0px) solid var(--bay-ring-color, transparent);
   outline-offset: var(--bay-ring-offset, -5px);
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
@@ -4662,29 +4670,44 @@ button.fabric-trace-crumb:hover {
 @media (max-width: 640px) {
   /* Bays keep a readable width on a phone; the face scrolls sideways, like
      the other chassis faces, instead of squeezing the tray labels. */
-  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] {
+  .chassis-shell[data-face-style="unifi-drive"] {
     --unifi-bay-min: 76px;
     --unifi-decor-min: 34px;
     padding: 10px 8px 8px;
     overflow-x: auto;
   }
 
-  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-grid {
+  .chassis-shell[data-face-style="unifi-drive"] .slot-grid {
     min-width: max-content;
+  }
+
+  /* #1109: the value beside a UniFi bay number stays on one line. */
+  .chassis-shell[data-face-style="unifi-drive"] .slot-heatmap-value {
+    white-space: nowrap;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
     gap: 4px;
   }
 
+  /* #1124: the right gutter holds the state chip above the LED. */
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
     height: 76px;
     min-height: 76px;
-    padding: 8px 18px 8px 8px;
+    padding: 8px 36px 8px 8px;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-status-led {
     right: 6px;
+  }
+
+  /* A G2 bay's text ends before the chip, which sits left of the handle. */
+  .chassis-shell[data-face-family="g2"] {
+    --unifi-bay-min: 182px;
+  }
+
+  .chassis-shell[data-face-family="g2"][data-face-variant] .slot-tile {
+    padding-right: 84px;
   }
 
   .unifi-face-band {
@@ -4827,10 +4850,8 @@ button.fabric-trace-crumb:hover {
   --bay-dim-filter: saturate(0.34) brightness(0.64);
 }
 
-/* A dimmed bay filters its tray face, chip and labels, not the tile: a filter
-   on the tile would grey the LED dot inside it too, and no rule on the dot can
-   undo that. The dot keeps its colour, so a fault or locate light still reads
-   (#925). */
+/* A dimmed bay filters its face, chip and labels, not the tile, so the LED
+   dot keeps its colour and a fault or locate light still reads (#925). */
 .slot-tile:is(.peer-dimmed, .fabric-dimmed)::before,
 .slot-tile:is(.peer-dimmed, .fabric-dimmed)::after,
 .slot-tile:is(.peer-dimmed, .fabric-dimmed) > :not(.slot-status-led) {
@@ -6119,6 +6140,15 @@ button.fabric-trace-crumb:hover {
   min-width: 0;
 }
 
+/* #1123 */
+.storage-view-runtime-card-head > .slot-heatmap-value {
+  position: static;
+  width: auto;
+  min-height: 0;
+  transform: none;
+  white-space: nowrap;
+}
+
 .storage-view-runtime-card-size-chip {
   display: inline-flex;
   align-items: center;
@@ -6889,6 +6919,16 @@ button.fabric-trace-crumb:hover {
     margin: 0 0 10px;
     color: var(--muted);
     font-size: 0.86rem;
+  }
+
+  /* #1114, #1115: faces scroll inside the shell; bays never overlap. */
+  .chassis-shell {
+    --group-min: min-content;
+    overflow-x: auto;
+  }
+
+  .nvme-carrier-canvas {
+    min-width: 820px;
   }
 
   .fabric-lane-board,
