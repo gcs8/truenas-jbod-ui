@@ -40,6 +40,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed page reloads and bay-assignment saves waiting with no limit when the
+  app's own background inventory refresh never finished. A request now waits
+  at most 5 seconds behind it: a read that accepts an older view gets the
+  cached one with a warning naming when it was read, other reads answer a
+  retryable 503 "still refreshing", and a save that is already stored answers
+  success with the earlier bay view and a warning instead of an error. A
+  background refresh that runs past 5 minutes is stopped and logged, the next
+  one can start, and its late result is never published, including bay details
+  it was still saving to disk. Opt-in startup prewarming follows the same
+  rules: a request before the first inventory read finishes answers a
+  retryable 503 saying no inventory has been read yet. The appliance call
+  budget is unchanged (#1125, #1126).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for
