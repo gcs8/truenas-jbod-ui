@@ -40,6 +40,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed the enclosure title on the main page and in offline snapshots
+  stacking one letter per line when Heat Map is on: the title keeps its width
+  and the heat-map controls wrap beside it or move to their own row. On
+  Storage Fabric > Disk Path every card now fills its column, so the SAS LINK
+  card no longer leaves an empty column or breaks labels such as Remote,
+  Handle and Parent mid-word (#1104).
 - Fixed history index builds and startup upgrades spilling their sort files
   outside the history volume when the history service's Compose entry had no
   `TMPDIR`: into the container's own filesystem, or, on a read-only container,
