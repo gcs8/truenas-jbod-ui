@@ -149,7 +149,7 @@ function scanTemplate(relPath, source) {
 function scanScript(relPath, source) {
   const controls = [];
   // 1. HTML tags inside template literals or strings.
-  const tagRe = /<(button|select|input|textarea|details|dialog|a)\b((?:[^>"'`]|"[^"]*"|'[^']*'|\$\{[^}]*\})*)>/g;
+  const tagRe = /<(button|select|input|textarea|details|dialog|a)\b((?:[^>"'`$]|\$(?!\{)|"[^"]*"|'[^']*'|\$\{[^}]*\})*)>/g;
   let m;
   while ((m = tagRe.exec(source))) {
     const tag = m[1].toLowerCase();
@@ -174,7 +174,7 @@ function scanScript(relPath, source) {
     const variable = m[1];
     const tag = m[2];
     const window = source.slice(createRe.lastIndex, createRe.lastIndex + 1600);
-    const escaped = variable.replace(/[$]/g, "\\$");
+    const escaped = variable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const id = new RegExp(`\\b${escaped}\\.id\\s*=\\s*["'\`]([\\w-]+)["'\`]`).exec(window);
     const data = new RegExp(`\\b${escaped}\\.dataset\\.([A-Za-z]+)\\s*=`).exec(window)
       || new RegExp(`\\b${escaped}\\.setAttribute\\(\\s*["'](data-[\\w-]+)["']`).exec(window);
