@@ -40,6 +40,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Fixed heat-map temperature colours stretching to the coolest and warmest bay
+  in view, which showed a 49 C disk beside a 48 C one, or 35 C disks on a cool
+  shelf, as red. Temperatures now use absolute bands from each drive's SMART
+  warning and critical ratings (now read from smartctl for NVMe, ATA and SCSI
+  drives) or documented HDD and SSD/NVMe defaults, shown in the legend; the
+  relative view is an explicit `Colours` option. `Temperature vs View Avg`
+  uses a fixed -10 to +10 C scale, and the bay's slot, device, pool and serial
+  text now meets WCAG AA contrast on every heat colour. The value sits in its
+  own row, so it no longer covers the device name in short bays (#1105).
 - Fixed the enclosure title on the main page and in offline snapshots
   stacking one letter per line when Heat Map is on: the title keeps its width
   and the heat-map controls wrap beside it or move to their own row. On

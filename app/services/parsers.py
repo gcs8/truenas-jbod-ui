@@ -3763,6 +3763,38 @@ def _extract_smartctl_sata_phy_text(output: str) -> list[dict[str, Any]] | None:
     return rows.rows()
 
 
+def _smartctl_threshold_celsius(value: Any) -> int | None:
+    # smartctl omits unknown limits, but SCSI reports 0/255 and ATA SCT -128
+    # for "not available"; none of those is a drive rating (#1103).
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 20 <= value <= 150 else None
+
+
+def _extract_smartctl_temperature_thresholds(
+    payload: dict[str, Any],
+    temperature: dict[str, Any],
+) -> tuple[int | None, int | None]:
+    """Return the drive's own (warning, critical) temperature ratings.
+
+    smartctl JSON reports them per transport: NVMe WCTEMP/CCTEMP as
+    ``nvme_composite_temperature_threshold`` (mirrored as ``op_limit_max`` and
+    ``critical_limit_max``), ATA SCT/device statistics as the recommended
+    ``op_limit_max`` and absolute ``limit_max``, and SCSI as ``drive_trip``.
+    """
+    nvme_thresholds = payload.get("nvme_composite_temperature_threshold")
+    if not isinstance(nvme_thresholds, dict):
+        nvme_thresholds = {}
+    warning = _smartctl_threshold_celsius(nvme_thresholds.get("warning"))
+    if warning is None:
+        warning = _smartctl_threshold_celsius(temperature.get("op_limit_max"))
+    critical = _smartctl_threshold_celsius(nvme_thresholds.get("critical"))
+    for field_name in ("critical_limit_max", "limit_max", "drive_trip"):
+        if critical is None:
+            critical = _smartctl_threshold_celsius(temperature.get(field_name))
+    return warning, critical
+
+
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
     try:
         payload = json.loads(output)
@@ -3824,8 +3856,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
     power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
     power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
-    warning_temperature_c = None
-    critical_temperature_c = None
+    warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(payload, temperature)
     sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
     traffic_and_wear = _extract_smartctl_traffic_and_wear(
         payload,

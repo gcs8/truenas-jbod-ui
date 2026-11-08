@@ -3113,6 +3113,70 @@ Logical Unit id:      0x00e04c2020202000error: designator length
         self.assertEqual(subsystems["nvme0"]["address"], "10000:01:00.0")
         self.assertEqual(subsystems["nvme0"]["transport"], "pcie")
 
+    # #1103: the heat map anchors temperature colours to the drive's own
+    # thresholds, so the smartctl JSON fields that carry them must reach the
+    # summary instead of being dropped.
+    def test_parse_smartctl_summary_reads_ata_sct_temperature_limits(self) -> None:
+        output = json.dumps({
+            "device": {"type": "sat", "protocol": "ATA"},
+            "temperature": {
+                "current": 34,
+                "op_limit_min": 0,
+                "op_limit_max": 60,
+                "limit_min": -40,
+                "limit_max": 70,
+            },
+        })
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["temperature_c"], 34)
+        self.assertEqual(parsed["warning_temperature_c"], 60)
+        self.assertEqual(parsed["critical_temperature_c"], 70)
+
+    def test_parse_smartctl_summary_reads_scsi_drive_trip_as_critical(self) -> None:
+        output = json.dumps({
+            "device": {"type": "scsi", "protocol": "SCSI"},
+            "temperature": {"current": 36, "drive_trip": 65},
+        })
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertIsNone(parsed["warning_temperature_c"])
+        self.assertEqual(parsed["critical_temperature_c"], 65)
+
+    def test_parse_smartctl_summary_reads_nvme_composite_thresholds(self) -> None:
+        output = json.dumps({
+            "device": {"type": "nvme", "protocol": "NVMe"},
+            "nvme_composite_temperature_threshold": {"warning": 83, "critical": 87},
+            "temperature": {"current": 41, "op_limit_max": 80, "critical_limit_max": 85},
+        })
+
+        parsed = parse_smartctl_summary(output)
+
+        self.assertEqual(parsed["warning_temperature_c"], 83)
+        self.assertEqual(parsed["critical_temperature_c"], 87)
+
+        fallback = parse_smartctl_summary(json.dumps({
+            "device": {"type": "nvme", "protocol": "NVMe"},
+            "temperature": {"current": 41, "op_limit_max": 80, "critical_limit_max": 85},
+        }))
+        self.assertEqual(fallback["warning_temperature_c"], 80)
+        self.assertEqual(fallback["critical_temperature_c"], 85)
+
+    def test_parse_smartctl_summary_ignores_unreported_temperature_limits(self) -> None:
+        for temperature in (
+            {"current": 30, "drive_trip": 0},
+            {"current": 30, "drive_trip": 255},
+            {"current": 30, "op_limit_max": -128, "limit_max": True},
+            {"current": 30, "op_limit_max": "60", "limit_max": 70.5},
+        ):
+            with self.subTest(temperature=temperature):
+                parsed = parse_smartctl_summary(json.dumps({"temperature": temperature}))
+                self.assertEqual(parsed["temperature_c"], 30)
+                self.assertIsNone(parsed["warning_temperature_c"])
+                self.assertIsNone(parsed["critical_temperature_c"])
+
     def test_parse_smartctl_summary_handles_invalid_json(self) -> None:
         parsed = parse_smartctl_summary("not-json")
 

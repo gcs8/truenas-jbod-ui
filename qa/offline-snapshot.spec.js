@@ -660,7 +660,7 @@ test("offline snapshot exposes mapping health without color-only cues", async ({
   await expect(page.locator("#heatmap-metric-context")).toContainText("hotter than its neighbours, SMART errors, and heavy writes");
   await page.locator("#heatmap-metric-select").selectOption("temperature_c");
   await expect(page.locator("#heatmap-metric-context")).toContainText("Degrees Celsius");
-  await expect(page.locator("#heatmap-metric-context")).toContainText("vendor's warning and critical thresholds");
+  await expect(page.locator("#heatmap-metric-context")).toContainText("SMART thresholds when reported");
 
   await page.emulateMedia({ forcedColors: "active" });
   const forcedColorCue = await page.locator("#slot-grid .slot-tile").first().evaluate((tile) => {
