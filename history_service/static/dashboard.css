@@ -110,6 +110,11 @@ tr:last-child td {
   border-bottom: 0;
 }
 
+.table-scroll {
+  overflow-x: auto;
+  border-radius: 16px;
+}
+
 code {
   color: var(--accent);
   font-family: Consolas, monospace;
