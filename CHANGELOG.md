@@ -26,7 +26,52 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.6 - 2026-11-07
+
+This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
+fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- The first bays of a single-row chassis face wider than its bezel, such as a
+  24-bay 2.5" front at 1600 px, can be scrolled to and selected again (#1081).
+- Storage Fabric keeps the CORE HBA PHY table and exposes lane pairs in the
+  API: per HBA-to-expander or expander cascade link, the PHY pairs both ends
+  report, with lane count and rate. The page does not draw lanes (#1086).
+- The admin page shows real saved history row counts on segmented history
+  deployments instead of 0 (#1083).
+- The history container no longer runs out of memory while it builds its
+  background indexes after an upgrade or restore of a large v0.22.2 history
+  (#1093).
+- The image is built on a digest-pinned `python:3.12-slim` base, with
+  pydantic 2.14.3, websockets 17.4 and boto3 1.43.126 (#1073, #1074).
+
+### Upgrade notes
+
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.5`, no operator
+  action is expected: Compose files, settings, environment variables and data
+  formats are unchanged. Upgrading from `v0.23.0` or older, read the
+  `v0.24.0-beta.1` to `v0.24.0-beta.5` upgrade notes too.
+- The image now builds `FROM` a digest-pinned `python:3.12-slim`, and the
+  bundled Python packages moved to pydantic 2.14.3, websockets 17.4 and boto3
+  1.43.126. Rebuilds of this tag use the same base image. Renovate keeps
+  Python minor/major base bumps and the screenshot toolchain out of its routine
+  group, and never pins this project's own image in `docker-compose.yml`
+  (#1073, #1074, #1080).
+- Storage Fabric links gain an optional `reported_lanes` field, null when either
+  end's PHY rows are missing or disagree. API consumers that validate the exact
+  link field set must accept it. The app runs no new appliance command for it
+  (#1086).
+- History index builds and the startup schema upgrade now sort through
+  temporary files in the history service's `TMPDIR` instead of memory. The
+  shipped Compose file already sets it to the history volume, so the default
+  install needs no change. A custom Compose file that points the history
+  service's `TMPDIR` at a tmpfs puts that sort data back in memory; point it at
+  the history volume instead. A build that does not fit on the volume waits,
+  reported as waiting for free disk space, and retries every five minutes
+  while collection continues (#1093).
 
 ### Added
 
@@ -66,9 +111,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   same way. A startup upgrade that fills the volume stops with a message
   naming the volume and the free space needed instead of a traceback. Stored
   row counters are no longer trusted, and a restore recounts them. While an
-  index builds,
-  `exact_counts=true` overview requests answer from the tracked totals, also
-  with segmented history, and say exact counts are deferred (#1092, #1093).
+  index builds, `exact_counts=true` overview requests answer from the tracked
+  totals, also with segmented history, and say exact counts are deferred
+  (#1092, #1093).
 
 ### Internal
 
