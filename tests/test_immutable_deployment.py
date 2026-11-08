@@ -1423,7 +1423,9 @@ class KeptOverlayTests(unittest.TestCase):
                 f"https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/{'c' * 40}/docker-compose.yml",
             ])
             self.assertEqual((root / "compose.yaml").read_text(encoding="utf-8"), SHIPPED_BASE)
-            self.assertEqual((overlay_path.read_bytes(), overlay_path.stat().st_ino), overlay_before)
+            # Same bytes and mode, rebound to a new inode the helper owns (#1097).
+            self.assertEqual(overlay_path.read_bytes(), overlay_before[0])
+            self.assertNotEqual(overlay_path.stat().st_ino, overlay_before[1])
             self.assertEqual(stat.S_IMODE(overlay_path.stat().st_mode), 0o640)
             # The merged candidate chain (new base + kept overlay) passed `config -q`
             # before anything changed, and the overlay was compared with the base alone.
@@ -2206,6 +2208,47 @@ class RetainedInputTrustTests(unittest.TestCase):
                 self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
                 self.assertFalse(any("up" in command for command in runtime.commands))
 
+    def test_a_writable_descriptor_opened_before_the_checks_never_reaches_compose(self) -> None:
+        # chown and chmod do not revoke a descriptor that is already open, so
+        # under --replace-compose a kept overlay is rebound to a new inode
+        # holding the frozen bytes before Compose reads it, in the update and in
+        # rollback. (Image-only mode keeps file identity by contract.)
+        drifted = b"services:\n  enclosure-ui:\n    privileged: true\n"
+        replace_compose = True
+        for phase in ("update", "rollback"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                overlay = root / "compose.override.yaml"
+                frozen = overlay.read_bytes()
+                runtime = OverlayRuntime(root)
+                if phase == "rollback":
+                    self.update(root, runtime, replace_compose=replace_compose)
+                stale = os.open(overlay, os.O_WRONLY)
+                self.addCleanup(os.close, stale)
+                original_run = runtime.run
+                seen_at_up: list[bytes] = []
+
+                def writing_run(command: list[str], **kwargs: object) -> str:
+                    if command[:2] == ["docker", "compose"] and "up" in command:
+                        # After the last check, the old writer rewrites "the overlay".
+                        os.ftruncate(stale, 0)
+                        os.pwrite(stale, drifted, 0)
+                        seen_at_up.append(overlay.read_bytes())
+                    return original_run(command, **kwargs)  # type: ignore[arg-type]
+
+                if phase == "update":
+                    result = deployment.update_deployment(
+                        self.make_spec(root, replace_compose=replace_compose), run=writing_run,
+                        download=runtime.download, probe=runtime.probe,
+                    )
+                    self.assertEqual(result["status"], "active")
+                else:
+                    deployment.rollback_deployment(root, run=writing_run, probe=runtime.probe)
+                    self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+                self.assertEqual(seen_at_up, [frozen])
+                self.assertEqual(overlay.read_bytes(), frozen)
+                self.assertEqual(stat.S_IMODE(overlay.stat().st_mode), 0o640)
+
     def test_rollback_never_restores_a_group_or_other_writable_mode(self) -> None:
         # A receipt from before this check may record a writable mode; rollback
         # must still work, so it restores the mode without group or other write.
@@ -2226,7 +2269,7 @@ class RetainedInputTrustTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE((root / "compose.override.yaml").stat().st_mode), 0o644)
             self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
 
-    def test_rollback_replaces_or_refuses_a_kept_overlay_another_user_owns(self) -> None:
+    def test_rollback_rebinds_or_refuses_a_kept_overlay_another_user_owns(self) -> None:
         for replace_compose in (True, False):
             with self.subTest(replace_compose=replace_compose), tempfile.TemporaryDirectory() as temp_dir:
                 root = self.make_root(temp_dir)
@@ -2244,12 +2287,13 @@ class RetainedInputTrustTests(unittest.TestCase):
                         self.assertNotEqual(overlay.stat().st_ino, inode)
                         self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
                     else:
-                        # Image-only rollback never rewrites Compose files, so it refuses.
+                        # Image-only rollback keeps Compose file identity, so it refuses.
                         with self.assertRaisesRegex(
                             deployment.DeploymentError,
                             r"^deployment input compose\.override\.yaml is owned by another user" + TRUST_REMEDY,
                         ):
                             deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+                        self.assertEqual(overlay.stat().st_ino, inode)
                         self.assertEqual(deployment.validate_receipt(root)["status"], "prepared")
                 self.assertEqual(overlay.read_text(encoding="utf-8"), RESTART_OVERLAY)
 

@@ -57,7 +57,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   or host port, or an added binding, counts as a contract change. The
   deployment directory and every input must be owned by root or the updater and
   not writable by group or others. Every input is read without following links,
-  frozen in the private receipt and checked unchanged before each step, and
+  frozen in the private receipt and checked unchanged before each step; under
+  `--replace-compose` kept overlays are also rewritten with their frozen bytes
+  as new helper-owned files before Compose reads them; and
   rollback restores and rechecks file modes as well as bytes. Health and
   retention URLs may also use an address and port the deployment itself
   publishes (#1097).

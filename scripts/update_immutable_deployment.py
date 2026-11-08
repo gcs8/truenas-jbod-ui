@@ -1777,19 +1777,15 @@ def _restore_previous(
         except UnsafeInput:
             current = None
         if replace_compose:
-            # Replacement restores every recorded file's bytes and mode. A kept
-            # overlay (#1096) is rewritten only when either no longer matches,
-            # or when another user could change it (#1097).
-            if (
-                item["source"] is not None
-                or current is None
-                or (current.data, current.mode) != (previous, mode)
-                or _trust_problem(current.uid, current.mode) is not None
-            ):
-                _atomic_write_live(root / name, previous, mode)
+            # Replacement writes every recorded file, kept overlays (#1096)
+            # included, as a new file the helper owns with the recorded bytes
+            # and mode, so no descriptor another user opened earlier reaches
+            # what Compose reads (#1097).
+            _atomic_write_live(root / name, previous, mode)
         elif current is None or current.data != previous:
             raise DeploymentError(f"image-only rollback Compose changed: {name}")
         elif current.mode != mode:
+            # Image-only mode keeps the operator's files and their identity.
             _restore_mode(root, identity, name, mode)
         restored[name] = (previous, mode)
     previous_env = (receipt_dir / "previous" / ".env").read_bytes()
@@ -1904,13 +1900,16 @@ def update_deployment(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     try:
-        # Kept overlays stay the frozen file; written files must be exactly the
-        # receipt's candidate bytes and modes. Both are checked again before
-        # Compose pulls, before it activates, and once activation has converged.
+        # `.env`, replaced shipped files and, under --replace-compose, kept
+        # overlays (with their frozen bytes) are rewritten from the receipt's
+        # candidate copies as new files the helper owns (#1097): chown and chmod
+        # do not revoke a descriptor opened before the ownership check, and such
+        # a descriptor now reaches only the replaced inode. Image-only mode keeps
+        # the operator's Compose files and their identity. Every input must be
+        # exactly the receipt's bytes and modes before Compose pulls, before it
+        # activates, and once activation has converged.
         expected = dict(frozen)
-        written = [".env", *[
-            item.live for item in spec.compose_files if spec.replace_compose and not item.is_overlay
-        ]]
+        written = [".env", *[item.live for item in spec.compose_files if spec.replace_compose]]
         _verify_inputs(root, identity, frozen, changed_after_validation)
         for name in written:
             data = (receipt_dir / "candidate" / name).read_bytes()
