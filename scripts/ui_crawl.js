@@ -160,10 +160,13 @@ async function main() {
   const handler = fixture
     ? fixtureHandler(fixture)
     : null;
+  // Live mode answers only the synthetic offline origin locally (downloaded
+  // copies); everything else continues to the stack through the read cache.
   const liveOffline = async (route, info) => {
-    if (info.service === "offline" && offlinePages[info.url.pathname]) return route.fulfill({ contentType: "text/html; charset=utf-8", body: offlinePages[info.url.pathname] });
-    if (info.service === "offline") return route.fulfill({ status: 404, body: "" });
-    return null;
+    if (info.service !== "offline") return false;
+    const body = offlinePages[info.url.pathname];
+    await (body ? route.fulfill({ contentType: "text/html; charset=utf-8", body }) : route.fulfill({ status: 404, body: "" }));
+    return true;
   };
   const cdpUrl = process.env[args.cdpEnv] || "";
   const started = new Date().toISOString();
@@ -177,11 +180,8 @@ async function main() {
     context = await browser.newContext({ viewport: null, acceptDownloads: true, serviceWorkers: "block" });
     routes = await installRoutes(context, {
       guard, origins, cache, stats,
-      fixture: handler || (async (route, info) => {
-        const answered = await liveOffline(route, info);
-        if (answered === null) return route.continue();
-        return answered;
-      }),
+      fixture: handler,
+      local: handler ? null : liveOffline,
     });
     const axePath = (() => {
       try {

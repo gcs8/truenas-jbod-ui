@@ -63,7 +63,10 @@ function cacheable(method, url) {
 }
 
 // origins: { ui: "http://host:port", history: ..., admin: ..., offline: ... }
-async function installRoutes(context, { guard, origins, fixture = null, cache = null, stats }) {
+// `fixture` answers every admitted request (CI). `local` may answer a request
+// itself (live mode: downloaded offline copies) and returns false to let it
+// continue to the stack through the read cache.
+async function installRoutes(context, { guard, origins, fixture = null, local = null, cache = null, stats }) {
   const inflight = new Set();
   const serviceFor = (url) => Object.entries(origins).find(([, origin]) => origin && new URL(origin).origin === url.origin)?.[0] || null;
   await context.route("**/*", (route) => {
@@ -85,7 +88,9 @@ async function installRoutes(context, { guard, origins, fixture = null, cache = 
         stats.writes.push(`${method} ${url.pathname}${url.search}`);
         if (cache) cache.clear();
       }
-      if (fixture) return fixture(route, { method, url, service: serviceFor(url), body: request.postData() });
+      const info = { method, url, service: serviceFor(url), body: request.postData() };
+      if (fixture) return fixture(route, info);
+      if (local && (await local(route, info))) return undefined;
       if (cache && cacheable(method, url)) {
         const key = cache.key(method, url.href, request.postData());
         const hit = cache.get(key);

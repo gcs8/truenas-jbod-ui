@@ -87,10 +87,29 @@ class CrawlDriver {
     return (await this.visible(selector).count()) > 0;
   }
 
+  // Fail closed: the notes probe runs only on a bay with no stored mapping of
+  // any kind (saved or imported) and no notes, because its revert deletes the
+  // mapping it created.
   async checkPrecondition(precondition, vars) {
-    if (precondition.noManualMapping && /saved assignment/i.test(String(vars.detailText || ""))) {
-      return "the bay already has a saved assignment; the revert could not restore it exactly";
-    }
+    if (!precondition.noManualMapping) return null;
+    if (/assignment/i.test(String(vars.detailText || ""))) return "the bay shows a stored assignment";
+    const slot = await this.page.evaluate(async (slotNumber) => {
+      try {
+        const params = new URLSearchParams(location.search);
+        const query = new URLSearchParams();
+        for (const key of ["system_id", "enclosure_id"]) if (params.get(key)) query.set(key, params.get(key));
+        const response = await fetch(`/api/inventory?${query}`, { headers: { Accept: "application/json" } });
+        if (!response.ok) return { error: response.status };
+        const data = await response.json();
+        const match = ((data.snapshot || data).slots || []).find((item) => Number(item.slot) === slotNumber);
+        return match ? { mapping_source: match.mapping_source || null, notes: match.notes || null } : { error: "slot not found" };
+      } catch (error) {
+        return { error: String(error) };
+      }
+    }, Number(vars.slot));
+    if (!slot || slot.error) return `could not read the bay's mapping (${slot ? slot.error : "no answer"})`;
+    if (["manual", "manual_mapping", "import"].includes(String(slot.mapping_source))) return `the bay has a stored mapping (${slot.mapping_source})`;
+    if (slot.notes) return "the bay already has notes";
     return null;
   }
 

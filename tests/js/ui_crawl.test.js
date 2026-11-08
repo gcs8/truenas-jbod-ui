@@ -248,3 +248,61 @@ test("CLI refuses forbidden and live writes without a write system", () => {
   assert.deepEqual(ids({ page: "main", system: "sys-b", scopeIndex: 0 }), ["r", "all"]);
   assert.deepEqual(ids({ page: "main", system: "sys-a", scopeIndex: 1 }), ["all"]);
 });
+
+test("live routing serves repeated read API answers from the cache and answers only the offline origin locally", async () => {
+  const { installRoutes, ReadCache } = require(path.join(root, "qa/ui-crawl/transport"));
+  const OFFLINE = "https://offline.synthetic.invalid";
+  let handler = null;
+  const context = { route: async (_pattern, callback) => { handler = callback; } };
+  const g = new RequestGuard({ origins: [ORIGIN, OFFLINE], readPosts: READ_POSTS });
+  const stats = { blocked: [], writes: [], routeErrors: [] };
+  const cache = new ReadCache();
+  const local = async (route, info) => {
+    if (info.service !== "offline") return false;
+    await route.fulfill({ status: 200, body: "" });
+    return true;
+  };
+  await installRoutes(context, { guard: g, origins: { ui: ORIGIN, offline: OFFLINE }, cache, stats, local });
+  const fetched = [];
+  const makeRoute = (method, url, body = null) => {
+    const calls = [];
+    return {
+      calls,
+      request: () => ({ method: () => method, url: () => url, postData: () => body }),
+      fetch: async () => {
+        fetched.push(url);
+        return { body: async () => Buffer.from("{}"), headers: () => ({}), status: () => 200 };
+      },
+      fulfill: async (options) => { calls.push(["fulfill", options.status]); },
+      continue: async () => { calls.push(["continue"]); },
+      abort: async () => { calls.push(["abort"]); },
+    };
+  };
+  const batch = `${ORIGIN}/api/slots/smart-batch?system_id=a`;
+  await handler(makeRoute("POST", batch, '{"slots":[1]}'));
+  await handler(makeRoute("POST", batch, '{"slots":[1]}'));
+  assert.equal(fetched.length, 1, "second identical read is served from the cache");
+  assert.equal(cache.hits, 1);
+  const pageRoute = makeRoute("GET", `${ORIGIN}/`);
+  await handler(pageRoute);
+  assert.deepEqual(pageRoute.calls, [["continue"]], "documents go to the stack");
+  const offline = makeRoute("GET", `${OFFLINE}/copy-0`);
+  await handler(offline);
+  assert.deepEqual(offline.calls, [["fulfill", 200]]);
+  const write = makeRoute("POST", `${ORIGIN}/api/slots/1/led`, '{"action":"IDENTIFY"}');
+  await handler(write);
+  assert.deepEqual(write.calls, [["abort"]]);
+  assert.equal(stats.blocked.length, 1);
+});
+
+test("the notes probe refuses bays with any stored mapping or notes, and fails closed", async () => {
+  const { CrawlDriver } = require(path.join(root, "qa/ui-crawl/driver"));
+  const driverFor = (answer) => new CrawlDriver({ page: { on() {}, evaluate: async () => answer }, guard: guard() });
+  const pre = { noManualMapping: true };
+  assert.equal(await driverFor({ mapping_source: "enclosure-sysfs", notes: null }).checkPrecondition(pre, { slot: "5" }), null);
+  assert.match(await driverFor({ mapping_source: "import", notes: null }).checkPrecondition(pre, { slot: "5" }), /stored mapping \(import\)/);
+  assert.match(await driverFor({ mapping_source: "manual_mapping", notes: null }).checkPrecondition(pre, { slot: "5" }), /stored mapping/);
+  assert.match(await driverFor({ mapping_source: "api-slot", notes: "spare" }).checkPrecondition(pre, { slot: "5" }), /notes/);
+  assert.match(await driverFor({ error: 503 }).checkPrecondition(pre, { slot: "5" }), /could not read/);
+  assert.match(await driverFor({ mapping_source: "api" }).checkPrecondition(pre, { slot: "5", detailText: "Bay reported by imported assignment" }), /stored assignment/);
+});
