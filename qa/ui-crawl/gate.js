@@ -9,8 +9,8 @@
 //                              request was blocked, every admitted write
 //                              belongs to an actuation, identify cleanup (if
 //                              any) verified off, and no state errored.
-//   exit 1  crawl-errors       safety held, but states or captures errored
-//                              (coverage is incomplete; review before use).
+//   exit 1  crawl-errors       safety held, but states, captures or checkers
+//                              errored (coverage is incomplete; review first).
 //   exit 2  safety-failed      a revert, verify, semantic store check or
 //                              preview failed; a request was blocked (an
 //                              unknown route, a write outside its window or
@@ -37,7 +37,14 @@ function evaluateGate({ actuations = [], stats = {}, records = [], ledCleanup = 
   }
   failures.push(...problems);
   const cleanupFailed = ledCleanup && ledCleanup.ok === false;
-  const crawlErrors = records.filter((record) => record.status === "error").map((record) => `${record.target} ${record.state}: error`);
+  // A state that errored, or whose capture or checker failed, left no evidence.
+  const EXECUTION_FAILURES = new Set(["state-error", "capture-error", "check-error"]);
+  const crawlErrors = [];
+  for (const record of records) {
+    const failed = [...(record.findings || []), ...(record.widths || []).flatMap((width) => width.findings || [])]
+      .filter((finding) => EXECUTION_FAILURES.has(finding.type));
+    if (record.status === "error" || failed.length) crawlErrors.push(`${record.target} ${record.state}: ${record.status === "error" ? "error" : [...new Set(failed.map((f) => f.type))].join(", ")}`);
+  }
   let status = "ok";
   if (crawlErrors.length) status = "crawl-errors";
   if (failures.length) status = "safety-failed";

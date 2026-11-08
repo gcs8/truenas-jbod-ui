@@ -178,10 +178,13 @@ function writeReceipt(outDir, receipt) {
 // #1117: identify cleanup on every exit path the process itself sees. The
 // startup sweep of the next run covers the ones it cannot (SIGKILL, crash).
 function createExitGuards({ ledger, outDir, sweepOptions = {}, log = (line) => process.stderr.write(`${line}\n`) }) {
-  let cleanup = null;
+  // Only an in-progress sweep is shared (a signal during the final cleanup);
+  // every later call reads the ledger again, so a light armed after the
+  // startup sweep is still cleared.
+  let inflight = null;
   const sweep = () => {
-    if (!cleanup) {
-      cleanup = (async () => {
+    if (!inflight) {
+      inflight = (async () => {
         if (!ledger) return null;
         try {
           if (!ledger.entries().length) return { ok: true, armed: 0, results: [] };
@@ -190,9 +193,11 @@ function createExitGuards({ ledger, outDir, sweepOptions = {}, log = (line) => p
         } catch (error) {
           return { ok: false, error: String(error && error.message ? error.message : error).slice(0, 200) };
         }
-      })();
+      })().finally(() => {
+        inflight = null;
+      });
     }
-    return cleanup;
+    return inflight;
   };
   const onSignal = (signal, number) => {
     let handled = false;

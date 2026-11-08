@@ -13,9 +13,12 @@ const { LedLedger, armedEntry } = require(path.join(root, "qa/ui-crawl/ledger"))
 
 const [origin, ledgerPath, outDir] = process.argv.slice(2);
 const ledger = new LedLedger(ledgerPath);
-createExitGuards({ ledger, outDir, sweepOptions: { verifyMs: 3000, pollMs: 200 } }).install();
+const guards = createExitGuards({ ledger, outDir, sweepOptions: { verifyMs: 3000, pollMs: 200 } }).install();
 
 (async () => {
+  // Like the CLI: a startup sweep on the (empty) ledger runs first. Cleanup at
+  // exit must still see the light armed after it (Codex #1108 P1).
+  await guards.sweep();
   const url = `${origin}/api/slots/5/led?system_id=sys-a&enclosure_id=enc-1`;
   ledger.arm(armedEntry(url, "main.led"));
   await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "IDENTIFY" }) });

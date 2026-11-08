@@ -215,6 +215,11 @@ test("#1119 the gate fails closed on every unsafe outcome", () => {
   assert.equal(evaluateGate({ stats: { writes: ["POST /api/sas-fabric/aliases"] } }).exitCode, 2, "unexpected write");
   assert.equal(evaluateGate({ problems: ["report missing"] }).exitCode, 2);
   assert.equal(evaluateGate({ records: [{ status: "error" }] }).exitCode, 1);
+  // A state that ran but whose capture or checker failed has no evidence (Codex #1108 P2).
+  const captured = (type) => [{ target: "t", state: "s", status: "done", findings: [], widths: [{ width: 1600, findings: [{ type, severity: "error" }] }] }];
+  assert.equal(evaluateGate({ records: captured("capture-error") }).exitCode, 1);
+  assert.equal(evaluateGate({ records: captured("check-error") }).exitCode, 1);
+  assert.equal(evaluateGate({ records: captured("contrast") }).exitCode, 0, "product findings are the report's business, not the exit status");
   assert.equal(evaluateGate({ ledCleanup: { ok: false } }).exitCode, 3);
 });
 
