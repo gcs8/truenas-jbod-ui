@@ -12,7 +12,7 @@ import threading
 import unittest
 import urllib.error
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from unittest import mock
 
 from scripts import update_immutable_deployment as deployment
@@ -36,8 +36,11 @@ class FakeRuntime:
         health: str = "healthy",
         label_config_files: tuple[str, ...] | None = None,
         require_staged_env: bool = False,
+        ports: dict[str, object] | None = None,
     ) -> None:
         self.root = root
+        # Synthetic `docker inspect` .NetworkSettings.Ports per container (#1096).
+        self.ports = ports or {}
         self.tag_digest = tag_digest
         self.fail_activation = fail_activation
         self.health = health
@@ -119,6 +122,9 @@ class FakeRuntime:
             container = command[-1]
             service = container.removeprefix("container-")
             template = command[-2]
+            if template == "{{json .NetworkSettings.Ports}}":
+                bindings = self.ports.get(container, {})
+                return json.dumps(bindings(self) if callable(bindings) else bindings)
             if template == "{{.Image}}":
                 return self.active_image_id
             if template == "{{.State.Status}}":
@@ -1143,6 +1149,17 @@ class ImmutableDeploymentTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(deployment.DeploymentError, "history health URL must use an explicit loopback"):
                 deployment.update_deployment(spec, run=runtime.run)
+            # #1096: an IP literal is refused once read-only inspection shows the
+            # deployment does not publish it, still before any pull or write.
+            self.assertFalse(any(command[:2] == ("docker", "pull") for command in runtime.commands))
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            # A host name is refused before any command.
+            hostname = deployment.DeploymentSpec(
+                **{**spec.__dict__, "history_health_url": "http://history.example.test:8081/healthz"},
+            )
+            runtime = FakeRuntime(root)
+            with self.assertRaisesRegex(deployment.DeploymentError, "history health URL must use an explicit loopback"):
+                deployment.update_deployment(hostname, run=runtime.run)
             self.assertEqual(runtime.commands, [])
 
     def test_receipt_durable_state_record_is_revalidated_before_runtime_calls(self) -> None:
@@ -1154,7 +1171,10 @@ class ImmutableDeploymentTests(unittest.TestCase):
             original = json.loads(receipt_path.read_text(encoding="utf-8"))
             command_count = len(runtime.commands)
             cases = (
-                ("remote URL", lambda record: record.__setitem__("history_health_url", "http://192.0.2.10:8081/healthz")),
+                # #1096: an unpublished IP literal is refused at runtime instead;
+                # see test_receipt_with_unpublished_address_is_refused_before_any_probe.
+                ("remote host name", lambda record: record.__setitem__(
+                    "history_health_url", "http://history.example.test:8081/healthz")),
                 ("unknown state", lambda record: record.__setitem__("state", "repaired")),
                 ("integer flag", lambda record: record.__setitem__("history_collection_paused", 0)),
                 ("extra key", lambda record: record.__setitem__("detail", "SYNTH")),
@@ -1256,6 +1276,610 @@ class ImmutableDeploymentTests(unittest.TestCase):
         self.assertIn("scripts/update_immutable_deployment.py rollback", runbook)
         self.assertNotIn(". ./image-update-receipt.env", runbook)
         self.assertNotIn("image-update-receipt.env", runbook)
+
+
+# --- #1096: kept operator overlays and published health addresses -----------
+
+SHIPPED_BASE = """\
+services:
+  enclosure-ui:
+    image: ${JBOD_UI_IMAGE}
+    user: "0:0"
+    volumes: ["./config:/app/config:ro"]
+  enclosure-history:
+    image: ${JBOD_UI_IMAGE}
+    user: "0:0"
+    command: ["uvicorn", "history_service.main:app"]
+    volumes: ["history-data:/app/history"]
+volumes:
+  history-data: {}
+"""
+# The one-setting operator override from the issue: restart policy only.
+RESTART_OVERLAY = "services:\n  enclosure-ui:\n    restart: unless-stopped\n"
+PUBLISHED_UI = {"8000/tcp": [{"HostIp": "192.0.2.10", "HostPort": "42069"}]}
+LOOPBACK_HISTORY = {"8001/tcp": [{"HostIp": "127.0.0.1", "HostPort": "42070"}]}
+
+
+class OverlayRuntime(FakeRuntime):
+    """FakeRuntime whose `config --format json` merges the -f chain it is given.
+
+    The merge is a shallow per-service key replacement, enough to tell whether
+    a kept overlay changes a contract key of the shipped base.
+    """
+
+    def __init__(self, root: Path, **kwargs: object) -> None:
+        kwargs.setdefault("label_config_files", (str(root / "compose.yaml"), str(root / "compose.override.yaml")))
+        super().__init__(root, **kwargs)  # type: ignore[arg-type]
+        self.config_chains: list[list[Path]] = []
+        self.quiet_chains: list[list[bytes]] = []
+        self.fail_quiet_with_overlay = False
+
+    def run(self, command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+        if command[:2] == ["docker", "compose"] and "config" in command:
+            paths = [Path(command[index + 1]) for index, value in enumerate(command) if value == "-f"]
+            if "--format" in command:
+                import yaml
+
+                self.commands.append(tuple(command))
+                self.config_chains.append(paths)
+                merged: dict[str, Any] = {"services": {}, "volumes": {}, "networks": {}}
+                for path in paths:
+                    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                    for name, service in (document.get("services") or {}).items():
+                        merged["services"].setdefault(name, {}).update(service or {})
+                    for key in ("volumes", "networks"):
+                        merged[key].update(document.get(key) or {})
+                for service in merged["services"].values():
+                    if service.get("image") == "${JBOD_UI_IMAGE}":
+                        service["image"] = (env or {}).get("JBOD_UI_IMAGE", "unset")
+                return json.dumps(merged)
+            self.quiet_chains.append([path.read_bytes() for path in paths])
+            if self.fail_quiet_with_overlay and any(path.name == "compose.override.yaml" for path in paths) and (
+                any(path.parent != self.root for path in paths)
+            ):
+                self.commands.append(tuple(command))
+                raise deployment.DeploymentError("command failed with exit 15: docker compose --project-name")
+        return super().run(command, cwd=cwd, env=env)
+
+    def download(self, url: str) -> bytes:
+        self.downloads.append(url)
+        return SHIPPED_BASE.encode()
+
+
+class KeptOverlayTests(unittest.TestCase):
+    """#1096: --replace-compose replaces the shipped base and keeps named overlays."""
+
+    def make_root(self, directory: str, overlay: str = RESTART_OVERLAY) -> Path:
+        root = Path(directory)
+        (root / ".env").write_text("JBOD_UI_IMAGE=ghcr.io/gcs8/truenas-jbod-ui:latest\n", encoding="utf-8")
+        os.chmod(root / ".env", 0o600)
+        (root / "compose.yaml").write_text(SHIPPED_BASE.replace("services:", "# previous base\nservices:", 1),
+                                           encoding="utf-8")
+        (root / "compose.override.yaml").write_text(overlay, encoding="utf-8")
+        os.chmod(root / "compose.override.yaml", 0o640)
+        return root
+
+    def make_spec(self, root: Path, **changes: object) -> deployment.DeploymentSpec:
+        values: dict[str, object] = {
+            "root": root,
+            "project_name": "jbod-ui",
+            "source_revision": "c" * 40,
+            "expected_image": NEW_DIGEST,
+            "candidate_tag": CANDIDATE_TAG,
+            "compose_files": (
+                deployment.ComposeFile("docker-compose.yml", "compose.yaml"),
+                deployment.ComposeFile(None, "compose.override.yaml"),
+            ),
+            "profiles": ("history",),
+            "services": ("enclosure-ui", "enclosure-history"),
+            "health_urls": ("http://127.0.0.1:8080/healthz",),
+            "replace_compose": True,
+        }
+        values.update(changes)
+        return deployment.DeploymentSpec(**values)  # type: ignore[arg-type]
+
+    def update(self, root: Path, runtime: OverlayRuntime, **changes: object) -> dict[str, object]:
+        return deployment.update_deployment(
+            self.make_spec(root, **changes), run=runtime.run, download=runtime.download, probe=runtime.probe,
+        )
+
+    def test_replace_compose_keeps_and_validates_the_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            overlay_path = root / "compose.override.yaml"
+            overlay_before = (overlay_path.read_bytes(), overlay_path.stat().st_ino)
+            runtime = OverlayRuntime(root)
+
+            result = self.update(root, runtime)
+
+            self.assertEqual(result["status"], "active")
+            # Only the shipped base is downloaded and replaced.
+            self.assertEqual(runtime.downloads, [
+                f"https://raw.githubusercontent.com/gcs8/truenas-jbod-ui/{'c' * 40}/docker-compose.yml",
+            ])
+            self.assertEqual((root / "compose.yaml").read_text(encoding="utf-8"), SHIPPED_BASE)
+            self.assertEqual((overlay_path.read_bytes(), overlay_path.stat().st_ino), overlay_before)
+            self.assertEqual(stat.S_IMODE(overlay_path.stat().st_mode), 0o640)
+            # The merged candidate chain (new base + kept overlay) passed `config -q`
+            # before anything changed, and the overlay was compared with the base alone.
+            self.assertIn([SHIPPED_BASE.encode(), RESTART_OVERLAY.encode()], runtime.quiet_chains)
+            self.assertEqual(
+                [[path.name for path in chain] for chain in runtime.config_chains],
+                [["compose.yaml"], ["compose.yaml", "compose.override.yaml"]],
+            )
+            self.assertTrue(all(path.parent != root for chain in runtime.config_chains for path in chain))
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["compose_files"], [
+                {"source": "docker-compose.yml", "live": "compose.yaml"},
+                {"source": None, "live": "compose.override.yaml"},
+            ])
+            self.assertIs(receipt["overlay_contract_change_allowed"], False)
+            self.assertEqual(receipt["hashes"]["previous/compose.override.yaml"],
+                             receipt["hashes"]["candidate/compose.override.yaml"])
+            self.assertEqual(receipt["modes"]["compose.override.yaml"], 0o640)
+            receipt_dir = root / deployment.RECEIPT_DIR_NAME
+            self.assertEqual((receipt_dir / "previous" / "compose.override.yaml").read_text(), RESTART_OVERLAY)
+            # The running containers record the full chain, overlay included.
+            self.assertEqual(
+                [row["config_files"] for row in result["services"]],
+                [[str(root / "compose.yaml"), str(root / "compose.override.yaml")]] * 2,
+            )
+            self.assertEqual(deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)["image"],
+                             NEW_DIGEST)
+
+    def test_overlay_that_changes_the_release_contract_is_refused_before_any_change(self) -> None:
+        cases = (
+            ("image", "services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n",
+             r"enclosure-ui image"),
+            ("volumes", "services:\n  enclosure-history:\n    volumes: [\"/srv/other:/app/history\"]\n",
+             r"enclosure-history volumes"),
+            ("user", "services:\n  enclosure-ui:\n    user: \"1000:1000\"\n", r"enclosure-ui user"),
+            ("command", "services:\n  enclosure-history:\n    command: [\"sh\", \"-c\", \"true\"]\n",
+             r"enclosure-history command"),
+            ("entrypoint", "services:\n  enclosure-ui:\n    entrypoint: [\"sh\"]\n", r"enclosure-ui entrypoint"),
+            ("networks", "services:\n  enclosure-ui:\n    networks: [other]\nnetworks:\n  other: {}\n",
+             r"enclosure-ui networks"),
+            ("network_mode", "services:\n  enclosure-ui:\n    network_mode: host\n", r"enclosure-ui network_mode"),
+            ("named volume", "volumes:\n  history-data:\n    driver_opts: {type: none, o: bind, device: /srv/x}\n",
+             r"top-level volumes"),
+        )
+        for label, overlay, detail in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir, overlay)
+                before = {name: (root / name).read_bytes() for name in (".env", "compose.yaml", "compose.override.yaml")}
+                runtime = OverlayRuntime(root)
+
+                with self.assertRaisesRegex(
+                    deployment.DeploymentError,
+                    rf"^kept overlay changes the release Compose contract \({detail}\); "
+                    r"pass --allow-overlay-contract-change only after reviewing it$",
+                ) as caught:
+                    self.update(root, runtime)
+
+                self.assertNotIn("/srv", str(caught.exception))
+                self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+                self.assertEqual({name: (root / name).read_bytes() for name in before}, before)
+                self.assertFalse(any("up" in command for command in runtime.commands))
+                self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
+                self.assertEqual(list(root.glob(".jbod-ui-compose-check-*")), [])
+
+    def test_contract_change_needs_the_explicit_flag_and_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir, "services:\n  enclosure-ui:\n    user: \"1000:1000\"\n")
+            runtime = OverlayRuntime(root)
+
+            result = self.update(root, runtime, allow_overlay_contract_change=True)
+
+            self.assertEqual(result["status"], "active")
+            receipt = deployment.validate_receipt(root)
+            self.assertIs(receipt["overlay_contract_change_allowed"], True)
+            # The merged chain is still validated; only the comparison is waived.
+            self.assertTrue(runtime.quiet_chains)
+            self.assertEqual(runtime.config_chains, [])
+
+    def test_invalid_merged_chain_is_refused_before_any_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            before = (root / "compose.yaml").read_bytes()
+            runtime = OverlayRuntime(root)
+            runtime.fail_quiet_with_overlay = True
+
+            with self.assertRaisesRegex(deployment.DeploymentError, "command failed"):
+                self.update(root, runtime)
+
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+            self.assertEqual((root / "compose.yaml").read_bytes(), before)
+
+    def test_automatic_and_manual_rollback_restore_base_and_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            previous = {name: (root / name).read_bytes() for name in ("compose.yaml", "compose.override.yaml")}
+            runtime = OverlayRuntime(root, fail_activation=True)
+
+            with self.assertRaisesRegex(deployment.DeploymentError, "automatic rollback completed"):
+                self.update(root, runtime)
+
+            self.assertEqual({name: (root / name).read_bytes() for name in previous}, previous)
+            self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+            self.assertEqual(runtime.active_image_id, OLD_IMAGE_ID)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            previous = {name: (root / name).read_bytes() for name in ("compose.yaml", "compose.override.yaml")}
+            runtime = OverlayRuntime(root)
+            self.update(root, runtime)
+            # A later operator edit to the kept overlay is restored from the receipt.
+            (root / "compose.override.yaml").write_text("services: {}\n", encoding="utf-8")
+
+            result = deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+
+            self.assertEqual(result["image"], OLD_DIGEST)
+            self.assertEqual({name: (root / name).read_bytes() for name in previous}, previous)
+            self.assertEqual(stat.S_IMODE((root / "compose.override.yaml").stat().st_mode), 0o640)
+            self.assertIn(f"JBOD_UI_IMAGE={OLD_DIGEST}", (root / ".env").read_text())
+
+    def test_running_chain_must_include_the_overlay_before_and_after(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root, label_config_files=(str(root / "compose.yaml"),))
+            with self.assertRaisesRegex(deployment.DeploymentError, "container Compose chain does not match"):
+                self.update(root, runtime)
+            self.assertEqual(runtime.downloads, [])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root)
+            full_chain = runtime.label_config_files
+            original_run = runtime.run
+
+            def drops_overlay_after_activation(command: list[str], **kwargs: object) -> str:
+                # The candidate containers come up without the overlay in their chain.
+                runtime.label_config_files = (
+                    (str(root / "compose.yaml"),) if runtime.active_image_id == NEW_IMAGE_ID else full_chain
+                )
+                return original_run(command, **kwargs)  # type: ignore[arg-type]
+
+            with self.assertRaisesRegex(deployment.DeploymentError, r"Compose chain does not match.*rollback completed"):
+                deployment.update_deployment(self.make_spec(root), run=drops_overlay_after_activation,
+                                             download=runtime.download, probe=runtime.probe)
+            self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+
+    def test_image_only_mode_keeps_and_checks_the_overlay_without_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            before = {name: (root / name).read_bytes() for name in ("compose.yaml", "compose.override.yaml")}
+            runtime = OverlayRuntime(root)
+
+            self.update(root, runtime, replace_compose=False)
+
+            self.assertEqual(runtime.downloads, [])
+            self.assertEqual({name: (root / name).read_bytes() for name in before}, before)
+            self.assertEqual([[path for path in chain] for chain in runtime.config_chains], [
+                [root / "compose.yaml"], [root / "compose.yaml", root / "compose.override.yaml"],
+            ])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir, "services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n")
+            with self.assertRaisesRegex(deployment.DeploymentError, "kept overlay changes"):
+                self.update(root, OverlayRuntime(root), replace_compose=False)
+            self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+
+    def test_chain_entries_are_validated_before_any_command(self) -> None:
+        cases = (
+            ("missing overlay", (deployment.ComposeFile("docker-compose.yml", "compose.yaml"),
+                                 deployment.ComposeFile(None, "absent.yaml")), "missing or unsafe"),
+            ("overlays only", (deployment.ComposeFile(None, "compose.override.yaml"),), "shipped Compose file"),
+            ("duplicate live", (deployment.ComposeFile("docker-compose.yml", "compose.yaml"),
+                                deployment.ComposeFile(None, "compose.yaml")), "unique"),
+            ("unsafe overlay name", (deployment.ComposeFile("docker-compose.yml", "compose.yaml"),
+                                     deployment.ComposeFile(None, "../compose.override.yaml")), "live Compose"),
+        )
+        for label, chain, message in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                runtime = OverlayRuntime(root)
+                with self.assertRaisesRegex(deployment.DeploymentError, message):
+                    self.update(root, runtime, compose_files=chain)
+                self.assertEqual(runtime.commands, [])
+
+    def test_receipt_overlay_records_are_revalidated_before_runtime_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = OverlayRuntime(root)
+            self.update(root, runtime)
+            receipt_dir = root / deployment.RECEIPT_DIR_NAME
+            receipt_path = receipt_dir / "receipt.json"
+            original = json.loads(receipt_path.read_text(encoding="utf-8"))
+            command_count = len(runtime.commands)
+            cases = (
+                ("missing flag", lambda receipt: receipt.pop("overlay_contract_change_allowed")),
+                ("non-boolean flag", lambda receipt: receipt.__setitem__("overlay_contract_change_allowed", 0)),
+                ("flag without overlay", lambda receipt: receipt["compose_files"][1].__setitem__(
+                    "source", "docker-compose.override.yml")),
+            )
+            for label, mutate in cases:
+                with self.subTest(label=label):
+                    receipt = json.loads(json.dumps(original))
+                    mutate(receipt)
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                    os.chmod(receipt_path, 0o600)
+                    with self.assertRaises(deployment.DeploymentError):
+                        deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)
+                    self.assertEqual(len(runtime.commands), command_count)
+            # A kept overlay's candidate must be its previous bytes, even when the
+            # receipt hash is consistent with a substituted candidate file.
+            substituted = b"services:\n  enclosure-ui:\n    image: ghcr.io/example/other:1\n"
+            candidate = receipt_dir / "candidate" / "compose.override.yaml"
+            candidate.write_bytes(substituted)
+            receipt = json.loads(json.dumps(original))
+            receipt["hashes"]["candidate/compose.override.yaml"] = deployment._sha256(substituted)
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            os.chmod(receipt_path, 0o600)
+            with self.assertRaisesRegex(deployment.DeploymentError, "kept overlay"):
+                deployment.rollback_deployment(root, run=runtime.run, probe=runtime.probe)
+            self.assertEqual(len(runtime.commands), command_count)
+
+    def test_cli_keeps_the_ordered_chain_and_forwards_the_contract_flag(self) -> None:
+        argv = [
+            "update", "/srv/jbod", "--project-name=jbod", "--source-revision=" + "0" * 40,
+            "--expected-image=" + NEW_DIGEST, "--candidate-tag=" + CANDIDATE_TAG, "--replace-compose",
+            "--compose", "docker-compose.yml=compose.yaml", "--keep-overlay", "compose.override.yaml",
+            "--compose", "docker-compose.nonroot.yml=docker-compose.nonroot.yml",
+            "--service=app", "--health-url=http://127.0.0.1:8080/healthz", "--allow-overlay-contract-change",
+        ]
+        with (
+            mock.patch.object(deployment, "_require_linux_docker_host"),
+            mock.patch.object(deployment, "update_deployment", return_value={"status": "active"}) as update,
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            self.assertEqual(deployment.main(argv), 0)
+        spec = update.call_args.args[0]
+        self.assertEqual(spec.compose_files, (
+            deployment.ComposeFile("docker-compose.yml", "compose.yaml"),
+            deployment.ComposeFile(None, "compose.override.yaml"),
+            deployment.ComposeFile("docker-compose.nonroot.yml", "docker-compose.nonroot.yml"),
+        ))
+        self.assertTrue(spec.allow_overlay_contract_change)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            deployment._build_parser().parse_args([*argv[:6], "--keep-overlay", "compose.override.yaml",
+                                                   "--service=app", "--health-url=http://127.0.0.1/x"])
+
+
+class PublishedAddressTests(unittest.TestCase):
+    """#1096: health and retention URLs may use an address the deployment publishes."""
+
+    make_root = ImmutableDeploymentTests.make_root
+    make_spec = ImmutableDeploymentTests.make_spec
+    UI = "http://192.0.2.10:42069"
+
+    def published_runtime(self, root: Path, **kwargs: object) -> FakeRuntime:
+        return FakeRuntime(root, ports={
+            "container-enclosure-ui": PUBLISHED_UI, "container-enclosure-history": LOOPBACK_HISTORY,
+        }, **kwargs)  # type: ignore[arg-type]
+
+    def spec(self, root: Path, **changes: object) -> deployment.DeploymentSpec:
+        return deployment.DeploymentSpec(**{
+            **self.make_spec(root).__dict__,
+            "health_urls": (f"{self.UI}/livez", "http://127.0.0.1:42070/healthz"),
+            **changes,
+        })
+
+    def test_published_address_urls_are_accepted_for_health_and_retention(self) -> None:
+        totals = {"summary": {key: 0 for key in deployment.RETENTION_KEYS}}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = self.published_runtime(root)
+            fetched: list[str] = []
+
+            def fetch_json(url: str) -> object:
+                fetched.append(url)
+                return totals
+
+            result = deployment.update_deployment(
+                self.spec(root, inventory_url=f"{self.UI}/api/inventory"),
+                run=runtime.run, download=runtime.download, probe=runtime.probe, fetch_json=fetch_json,
+            )
+
+            self.assertEqual(result["status"], "active")
+            self.assertEqual(runtime.probes, [f"{self.UI}/livez", "http://127.0.0.1:42070/healthz"])
+            self.assertEqual(fetched, [f"{self.UI}/api/inventory?retention_scope=system"] * 2)
+            receipt = deployment.validate_receipt(root)
+            self.assertEqual(receipt["retention"]["inventory_url"], f"{self.UI}/api/inventory")
+            runtime.probes.clear()
+            deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe)
+            self.assertEqual(runtime.probes, [f"{self.UI}/livez", "http://127.0.0.1:42070/healthz"])
+
+    def test_unpublished_hosts_and_ports_are_refused_before_any_change(self) -> None:
+        cases = (
+            ("arbitrary LAN host", {"health_urls": ("http://192.0.2.99:42069/livez",)}, "health URL"),
+            ("published host, other port", {"health_urls": ("http://192.0.2.10:42071/livez",)}, "health URL"),
+            ("loopback-published port on a LAN host", {"health_urls": ("http://192.0.2.10:42070/healthz",)},
+             "health URL"),
+            ("inventory on an unpublished host", {"inventory_url": "http://192.0.2.99:42069/api/inventory"},
+             "inventory URL"),
+            ("history on an unpublished host", {"history_health_url": "http://192.0.2.99:42070/healthz"},
+             "history health URL"),
+            ("other loopback address", {"health_urls": ("http://127.0.0.2:42069/livez",)}, "health URL"),
+        )
+        for label, changes, name in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                env_before = (root / ".env").read_bytes()
+                runtime = self.published_runtime(root)
+
+                def fetch(url: str) -> object:
+                    raise AssertionError("an unpublished URL must not be fetched")
+
+                with self.assertRaisesRegex(
+                    deployment.DeploymentError,
+                    rf"^{name} must use an explicit loopback HTTP endpoint or an address and port "
+                    r"this deployment publishes$",
+                ):
+                    deployment.update_deployment(self.spec(root, **changes), run=runtime.run,
+                                                 download=runtime.download, probe=runtime.probe,
+                                                 fetch_json=fetch, fetch_health=fetch)
+                self.assertEqual(runtime.probes, [])
+                self.assertFalse(any(command[:2] == ("docker", "pull") for command in runtime.commands))
+                self.assertFalse((root / deployment.RECEIPT_DIR_NAME).exists())
+                self.assertEqual((root / ".env").read_bytes(), env_before)
+
+    def test_wildcard_bindings_do_not_admit_any_host(self) -> None:
+        for host_ip in ("0.0.0.0", "::", ""):
+            with self.subTest(host_ip=host_ip), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                runtime = FakeRuntime(root, ports={
+                    "container-enclosure-ui": {"8000/tcp": [{"HostIp": host_ip, "HostPort": "42069"}]},
+                })
+                with self.assertRaisesRegex(deployment.DeploymentError, "this deployment publishes"):
+                    deployment.update_deployment(self.spec(root), run=runtime.run, download=runtime.download,
+                                                 probe=runtime.probe)
+                self.assertEqual(runtime.probes, [])
+
+    def test_ipv6_published_address_is_matched_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root, ports={
+                "container-enclosure-ui": {"8000/tcp": [{"HostIp": "2001:db8::10", "HostPort": "42069"}],
+                                           "8000/udp": [{"HostIp": "2001:db8::11", "HostPort": "42069"}]},
+            })
+            deployment.update_deployment(self.spec(root, health_urls=("http://[2001:db8:0::10]:42069/livez",)),
+                                         run=runtime.run, download=runtime.download, probe=runtime.probe)
+            self.assertEqual(runtime.probes, ["http://[2001:db8:0::10]:42069/livez"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root, ports={
+                "container-enclosure-ui": {"8000/udp": [{"HostIp": "2001:db8::11", "HostPort": "42069"}]},
+            })
+            # A UDP binding is not an HTTP endpoint.
+            with self.assertRaisesRegex(deployment.DeploymentError, "this deployment publishes"):
+                deployment.update_deployment(self.spec(root, health_urls=("http://[2001:db8::11]:42069/livez",)),
+                                             run=runtime.run, download=runtime.download, probe=runtime.probe)
+
+    def test_malformed_urls_are_refused_before_any_command(self) -> None:
+        for url in (
+            "http://ui.example.test:42069/livez",
+            "https://192.0.2.10:42069/livez",
+            "http://192.0.2.10/livez",
+            "http://192.0.2.10:42069",
+            "http://user@192.0.2.10:42069/livez",
+            "http://192.0.2.10:0/livez",
+            "http://192.0.2.10:65536/livez",
+            "http://999.0.2.10:42069/livez",
+            "http://[2001:db8::zz]:42069/livez",
+            "http://192.0.2.10:42069/live z",
+        ):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as temp_dir:
+                root = self.make_root(temp_dir)
+                runtime = self.published_runtime(root)
+                with self.assertRaisesRegex(deployment.DeploymentError, "must use an explicit loopback"):
+                    deployment.update_deployment(self.spec(root, health_urls=(url,)), run=runtime.run)
+                self.assertEqual(runtime.commands, [])
+
+    def test_loopback_only_urls_do_not_inspect_published_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root)
+            deployment.update_deployment(self.make_spec(root), run=runtime.run, download=runtime.download,
+                                         probe=runtime.probe)
+            self.assertFalse(any("{{json .NetworkSettings.Ports}}" in command for command in runtime.commands))
+            self.assertEqual(runtime.probes, ["http://127.0.0.1:8080/healthz", "http://127.0.0.1:8081/healthz"])
+
+    def test_candidate_must_publish_the_address_too(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = FakeRuntime(root, ports={
+                # The candidate image comes up published somewhere else.
+                "container-enclosure-ui": lambda fake: PUBLISHED_UI if fake.active_image_id == OLD_IMAGE_ID else {
+                    "8000/tcp": [{"HostIp": "192.0.2.20", "HostPort": "42069"}]},
+            })
+            with self.assertRaisesRegex(deployment.DeploymentError,
+                                        r"^activation failed \(health URL must use .*\); automatic rollback completed$"):
+                deployment.update_deployment(self.spec(root, health_urls=(f"{self.UI}/livez",)), run=runtime.run,
+                                             download=runtime.download, probe=runtime.probe)
+            # Only the restored predecessor was probed.
+            self.assertEqual(runtime.probes, [f"{self.UI}/livez"])
+            self.assertEqual(deployment.validate_receipt(root)["status"], "rolled_back")
+
+    def test_receipt_with_unpublished_address_is_refused_before_any_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.make_root(temp_dir)
+            runtime = self.published_runtime(root)
+            history = "http://127.0.0.1:42070/healthz"
+            deployment.update_deployment(
+                self.spec(root, history_health_url=history), run=runtime.run, download=runtime.download,
+                probe=runtime.probe, fetch_health=lambda url: {"collector": {
+                    "history_recovery_required": False, "history_collection_paused": False}},
+            )
+            receipt_path = root / deployment.RECEIPT_DIR_NAME / "receipt.json"
+            original = json.loads(receipt_path.read_text(encoding="utf-8"))
+            for label, mutate in (
+                ("health", lambda receipt: receipt.__setitem__("health_urls", ["http://192.0.2.99:42069/livez"])),
+                ("history", lambda receipt: receipt["durable_state"].__setitem__(
+                    "history_health_url", "http://192.0.2.99:42070/healthz")),
+            ):
+                with self.subTest(label=label):
+                    receipt = json.loads(json.dumps(original))
+                    mutate(receipt)
+                    if label == "health":
+                        receipt["result"]["health_urls"] = receipt["health_urls"]
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                    os.chmod(receipt_path, 0o600)
+                    runtime.probes.clear()
+
+                    def fetch(url: str) -> object:
+                        raise AssertionError("an unpublished URL must not be fetched")
+
+                    with self.assertRaisesRegex(deployment.DeploymentError, "this deployment publishes"):
+                        deployment.verify_deployment(root, run=runtime.run, probe=runtime.probe, fetch_health=fetch)
+                    if label == "health":
+                        self.assertEqual(runtime.probes, [])
+
+    def test_default_http_readers_connect_directly_without_environment_proxies(self) -> None:
+        body = json.dumps({"summary": {}}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        # A proxy that refuses every connection: a reader that honoured it would fail.
+        proxy = "http://127.0.0.1:9"
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/healthz"
+            with mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy, "no_proxy": "",
+                                              "NO_PROXY": ""}):
+                with mock.patch.object(deployment.time, "sleep", side_effect=AssertionError("retried")):
+                    deployment._default_probe(url)
+                self.assertEqual(deployment._default_fetch_json(url), {"summary": {}})
+                self.assertEqual(deployment._default_fetch_history_health(url), {"summary": {}})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_cli_help_describes_published_addresses(self) -> None:
+        text = " ".join(deployment._build_parser()._subparsers._group_actions[0].choices["update"]  # type: ignore[union-attr]
+                        .format_help().split())
+        self.assertIn("--keep-overlay", text)
+        self.assertIn("--allow-overlay-contract-change", text)
+        self.assertIn("address and port this deployment publishes", text)
+
+    def test_runbook_documents_overlays_and_published_addresses(self) -> None:
+        runbook = " ".join(Path("docs/IMMUTABLE_GHCR_DEPLOYMENT.md").read_text(encoding="utf-8").split())
+        for text in ("--keep-overlay compose.override.yaml", "--allow-overlay-contract-change",
+                     "docker compose config", "published port bindings", "0.0.0.0"):
+            self.assertIn(text, runbook)
+        upgrading = " ".join(Path("wiki/Upgrading.md").read_text(encoding="utf-8").split())
+        self.assertIn("--keep-overlay", upgrading)
+        self.assertIn("IMMUTABLE_GHCR_DEPLOYMENT.md", upgrading)
 
 
 if __name__ == "__main__":

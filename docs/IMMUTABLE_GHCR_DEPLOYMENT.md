@@ -63,11 +63,11 @@ python3 scripts/update_immutable_deployment.py update . \
 
 Adjust the arguments to match the running deployment exactly:
 
-- list every active tracked Compose file with one ordered `--compose SOURCE=LIVE` argument;
+- list every active tracked Compose file with one ordered `--compose SOURCE=LIVE` argument, and every operator overlay you keep with `--keep-overlay LIVE` in its place in the chain;
 - pass the live `com.docker.compose.project` value with `--project-name`;
 - list every active profile with `--profile`;
 - list every expected running app service with `--service`;
-- list each enabled loopback health endpoint with `--health-url`.
+- list each enabled health endpoint with `--health-url`, on loopback or on an address the deployment publishes (see [Health URLs on a published address](#health-urls-on-a-published-address)).
 
 For example, add `docker-compose.secrets.yml=docker-compose.secrets.yml` when the secrets overlay is active. Add `--profile admin`, `--service enclosure-admin`, and its loopback health URL only when admin is expected to be running through the update. The helper stops before mutation if the declared service set differs from Compose's running service set.
 
@@ -77,13 +77,48 @@ The helper then performs one bounded transaction. It:
 2. records each service's container image ID, immutable GHCR digest, health, and restart count;
 3. requires all declared app services to share one rollback digest;
 4. pulls the moving candidate tag and requires its sole GHCR `RepoDigest` to equal the full immutable image from the workflow receipt;
-5. validates the existing Compose chain with the candidate image pin; only `--replace-compose` downloads and validates replacement sources from the selected revision;
+5. validates the existing Compose chain with the candidate image pin; only `--replace-compose` downloads and validates replacement sources from the selected revision, merged with any kept overlays;
 6. writes a private `0700` `.jbod-ui-image-update` directory containing a strict `0600` JSON receipt plus hashed previous and candidate Compose and `.env` bytes;
 7. activates the digest without rewriting live Compose files by default, then requires the exact service set, image IDs, health, zero restart counts, and health URLs to converge.
 
 The receipt records `replace_compose` and hashes both Compose snapshots. In image-only mode the snapshots are identical, and rollback refuses later Compose drift rather than overwriting operator edits. Old receipts without the mode field retain their original replacement semantics.
 
-Use `--replace-compose` only for a separately reviewed Compose migration. It replaces every declared file, including overlays, so compare local customizations and retain configured auth, origins, network choices, and optional services before authorizing it. It is not a data migration or a permission-repair tool.
+Use `--replace-compose` only for a separately reviewed Compose migration. It replaces every `--compose` file with its source-revision file, so compare local customizations and retain configured auth, origins, network choices, and optional services before authorizing it. It is not a data migration or a permission-repair tool.
+
+### Keep operator overlays
+
+An operator's own overlay, such as a `compose.override.yaml` that only sets `restart: unless-stopped` on the admin service, has no file in the release to replace it with. Name it with `--keep-overlay` in its place in the ordered chain, so `--replace-compose` replaces only the shipped base:
+
+```bash
+python3 scripts/update_immutable_deployment.py update . \
+  --project-name truenas-jbod-ui \
+  --source-revision "$release_revision" \
+  --expected-image "$expected_image" \
+  --candidate-tag "$candidate_tag" \
+  --replace-compose \
+  --compose docker-compose.yml=compose.yaml \
+  --keep-overlay compose.override.yaml \
+  --profile history \
+  --service enclosure-ui \
+  --service enclosure-history \
+  --health-url http://127.0.0.1:8080/healthz \
+  --health-url http://127.0.0.1:8081/healthz
+```
+
+The running containers' recorded Compose chain must still equal the whole ordered chain, overlays included, before and after the update. A kept overlay is never rewritten by the update. Before anything changes, the helper:
+
+- validates the merged chain, new shipped files plus kept overlays, with `docker compose config --quiet` in a private staging directory next to the deployment (relative files that Compose must read, such as an overlay's `env_file`, are not copied there, so an overlay that needs one fails this validation);
+- compares the merged model from `docker compose config --format json` of the shipped files alone with that of the whole chain, and refuses an overlay that changes the `image`, `user`, `command`, `entrypoint`, `volumes`, `volumes_from`, `networks` or `network_mode` of any shipped service, or the top-level `volumes` or `networks`. The refusal names only the service and key. Restart policy, ports, limits and environment remain the operator's.
+
+Pass `--allow-overlay-contract-change` only after reviewing such an overlay; the merged chain is still validated, and the receipt records `overlay_contract_change_allowed`. In image-only mode the same overlay check applies, and every file is kept anyway.
+
+The receipt stores each kept overlay as a chain entry with a `null` source, with identical hashed previous and candidate snapshots and its file mode. Rollback in replacement mode restores the shipped base and rewrites a kept overlay from its recorded bytes only when it has changed since; image-only rollback still refuses Compose drift.
+
+### Health URLs on a published address
+
+Some installs publish the UI and admin service only on the host's LAN address, so nothing answers on loopback. `--health-url`, `--inventory-url` and `--history-health-url` therefore also accept an explicit IP address and port that the deployment itself publishes, for example `--health-url http://192.0.2.10:8080/healthz` when the UI is published on `192.0.2.10:8080`.
+
+The helper reads the published port bindings of each declared service's running container with `docker inspect` (`.NetworkSettings.Ports`) and accepts only an exact TCP binding match, before any URL is fetched, again for the candidate containers after activation, and on `verify` and `rollback`. Any other host or port is refused, and host names other than `localhost` are always refused. A wildcard binding such as `0.0.0.0` or `::` admits no address; use loopback for it. IPv6 addresses go in brackets. Loopback URLs need no published binding and add no inspection. The URLs stay plain HTTP with an explicit port, redirects are refused, timeouts are unchanged, and the requests ignore any environment proxy so they reach the named address itself.
 
 Add `--inventory-url http://127.0.0.1:8080/api/inventory` to also check disk
 retention (#400). The helper reads only the four aggregate integers in the
@@ -160,7 +195,7 @@ Keep `.env` pinned to the full `name@sha256` value. Record the helper's source r
 
 ### Rollback To The Previous Digest
 
-Any failure after receipt publication triggers automatic rollback. The helper preserves Compose in image-only mode, or restores prior Compose in replacement mode, pins `.env` to the recorded previous digest, recreates the exact recorded profiles and services, and verifies image IDs, health, restart counts, and health URLs before reporting rollback complete.
+Any failure after receipt publication triggers automatic rollback. The helper preserves Compose in image-only mode, or restores prior Compose, including kept overlays, in replacement mode, pins `.env` to the recorded previous digest, recreates the exact recorded profiles and services, and verifies image IDs, health, restart counts, and health URLs before reporting rollback complete.
 
 You can request the same receipt-validated rollback later:
 

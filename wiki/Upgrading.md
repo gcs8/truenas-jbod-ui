@@ -43,6 +43,17 @@ Keep your existing Compose files. Do not use `down` for a normal update, and
 do not download a replacement Compose file. The full steps are in
 [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment#update]].
 
+For a controlled, digest-pinned update with an automatic rollback receipt, use
+`scripts/update_immutable_deployment.py` from the
+[immutable GHCR deployment runbook](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md).
+When a reviewed release also replaces the shipped Compose file
+(`--replace-compose`), name your own overlay, such as `compose.override.yaml`,
+with `--keep-overlay` so it stays in the chain; the helper refuses an overlay
+that changes the image, user, command, volumes or networks of a shipped
+service. If the UI or admin service is published only on the host's LAN
+address, its health and retention URLs may use that published address and
+port instead of loopback.
+
 ## History
 
 A normal upgrade needs nothing: the history service migrates its database when

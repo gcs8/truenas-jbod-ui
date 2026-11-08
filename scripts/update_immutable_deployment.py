@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Union
 
 
 REPOSITORY = "ghcr.io/gcs8/truenas-jbod-ui"
@@ -63,6 +64,28 @@ DURABLE_STATE_FLAGS = ("history_recovery_required", "history_collection_paused")
 DURABLE_STATES = ("intact", "recovery_required", "collection_paused", "unknown")
 MAX_HISTORY_HEALTH_BYTES = 1024 * 1024
 DURABLE_STATE_EXIT_CODE = 3
+# Health, inventory and history URLs (#1096): loopback, or an exact IP address
+# and port that a declared service's running container publishes. Host names
+# are never accepted, because their resolution is not the deployment's own.
+_HTTP_URL_PATTERN = re.compile(
+    r"http://(?P<host>localhost|[0-9.]+|\[[0-9A-Fa-f:.]+\]):(?P<port>[0-9]{1,5})/[^\s]*"
+)
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+PORTS_TEMPLATE = "{{json .NetworkSettings.Ports}}"
+# Keys a kept operator overlay may not change for any service of the shipped
+# base, or at the top level, without --allow-overlay-contract-change (#1096).
+# They decide which image runs, as whom, with which data and on which network.
+OVERLAY_CONTRACT_SERVICE_KEYS = (
+    "image",
+    "user",
+    "command",
+    "entrypoint",
+    "volumes",
+    "volumes_from",
+    "networks",
+    "network_mode",
+)
+OVERLAY_CONTRACT_TOP_LEVEL_KEYS = ("volumes", "networks")
 
 
 class DeploymentError(RuntimeError):
@@ -111,8 +134,19 @@ class RetentionScopeTooLarge(DeploymentError):
 
 @dataclass(frozen=True)
 class ComposeFile:
-    source: str
+    """One ordered Compose chain entry.
+
+    `source` names the shipped repository file that `--replace-compose`
+    downloads. None marks an operator overlay that is kept byte-for-byte
+    (`--keep-overlay`, #1096).
+    """
+
+    source: str | None
     live: str
+
+    @property
+    def is_overlay(self) -> bool:
+        return self.source is None
 
 
 @dataclass(frozen=True)
@@ -129,6 +163,7 @@ class DeploymentSpec:
     replace_compose: bool = False
     inventory_url: str | None = None
     history_health_url: str | None = None
+    allow_overlay_contract_change: bool = False
 
 
 def _sha256(data: bytes) -> str:
@@ -321,7 +356,8 @@ def _default_probe(url: str) -> None:
         ) -> None:
             return None
 
-    opener = urllib.request.build_opener(NoRedirectHandler())
+    # Connect to the validated address itself, never through an environment proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
     last_error: Exception | None = None
     for _ in range(30):
         try:
@@ -344,7 +380,7 @@ def _default_fetch_json(url: str) -> object:
         def redirect_request(self, *args: object, **kwargs: object) -> None:
             return None
 
-    opener = urllib.request.build_opener(NoRedirectHandler())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
     try:
         with opener.open(url, timeout=120) as response:
             if response.geturl() != url or not 200 <= response.status < 300:
@@ -398,7 +434,7 @@ def _default_fetch_history_health(url: str) -> object:
         def redirect_request(self, *args: object, **kwargs: object) -> None:
             return None
 
-    opener = urllib.request.build_opener(NoRedirectHandler())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
     try:
         with opener.open(url, timeout=10) as response:
             if response.geturl() != url or not 200 <= response.status < 300:
@@ -543,10 +579,113 @@ def _validate_name(value: str, *, label: str, pattern: re.Pattern[str] = NAME_PA
         raise DeploymentError(f"invalid {label}: {value!r}")
 
 
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+
+
+def _url_refusal(label: str) -> DeploymentError:
+    # Never echo the URL: its path or query may carry a credential.
+    return DeploymentError(
+        f"{label} must use an explicit loopback HTTP endpoint or an address and port this deployment publishes"
+    )
+
+
+def _parse_health_url(value: object, *, label: str) -> tuple[IPAddress | None, int]:
+    """Return (None, port) for loopback, or the IP literal that must be published.
+
+    HTTP only, with an explicit port and path. Host names other than
+    `localhost` are refused outright; any IP literal other than 127.0.0.1 is
+    accepted only after it matches a published binding (#1096).
+    """
+
+    match = _HTTP_URL_PATTERN.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        raise _url_refusal(label)
+    port = int(match.group("port"))
+    if not 1 <= port <= 65535:
+        raise _url_refusal(label)
+    host = match.group("host")
+    if host in LOOPBACK_HOSTS:
+        return None, port
+    bracketed = host.startswith("[")
+    try:
+        address = ipaddress.ip_address(host[1:-1] if bracketed else host)
+    except ValueError:
+        raise _url_refusal(label) from None
+    if bracketed != (address.version == 6) or address.is_unspecified:
+        raise _url_refusal(label)
+    return address, port
+
+
 def _validate_health_url(value: str, *, label: str = "health URL") -> None:
-    match = re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):([0-9]{1,5})/[^\s]*", value)
-    if not match or not 1 <= int(match.group(1)) <= 65535:
-        raise DeploymentError(f"{label} must use an explicit loopback HTTP endpoint")
+    _parse_health_url(value, label=label)
+
+
+def _published_endpoints(run: RunCommand, root: Path, containers: list[str]) -> set[tuple[IPAddress, int]]:
+    """Exact TCP host bindings the given running containers publish.
+
+    Wildcard bindings (0.0.0.0, ::, or empty) admit no address: they are
+    reachable on loopback, which is always accepted. Malformed entries are
+    skipped, so they can only narrow what is accepted.
+    """
+
+    endpoints: set[tuple[IPAddress, int]] = set()
+    for container in containers:
+        output = run(["docker", "inspect", "--format", PORTS_TEMPLATE, container], cwd=root).strip()
+        try:
+            ports = json.loads(output) if output else None
+        except (ValueError, RecursionError) as exc:
+            raise DeploymentError("Docker returned invalid published port JSON") from exc
+        if ports is None:
+            continue
+        if not isinstance(ports, dict):
+            raise DeploymentError("Docker published port metadata must be a JSON object")
+        for key, bindings in ports.items():
+            if not isinstance(key, str) or not key.endswith("/tcp") or not isinstance(bindings, list):
+                continue
+            for binding in bindings:
+                if not isinstance(binding, dict):
+                    continue
+                host_ip, host_port = binding.get("HostIp"), binding.get("HostPort")
+                if not isinstance(host_ip, str) or not isinstance(host_port, str) or not host_port.isdigit():
+                    continue
+                try:
+                    address = ipaddress.ip_address(host_ip)
+                except ValueError:
+                    continue
+                if address.is_unspecified or not 1 <= int(host_port) <= 65535:
+                    continue
+                endpoints.add((address, int(host_port)))
+    return endpoints
+
+
+def _require_published_urls(
+    run: RunCommand,
+    root: Path,
+    containers: list[str],
+    urls: list[tuple[str, str]],
+) -> None:
+    """Refuse any non-loopback URL whose address and port no container publishes."""
+
+    pending = []
+    for label, url in urls:
+        address, port = _parse_health_url(url, label=label)
+        if address is not None:
+            pending.append((label, address, port))
+    if not pending:
+        return
+    endpoints = _published_endpoints(run, root, containers)
+    for label, address, port in pending:
+        if (address, port) not in endpoints:
+            raise _url_refusal(label)
+
+
+def _spec_urls(spec: DeploymentSpec) -> list[tuple[str, str]]:
+    urls = [("health URL", url) for url in spec.health_urls]
+    if spec.inventory_url is not None:
+        urls.append(("inventory URL", spec.inventory_url))
+    if spec.history_health_url is not None:
+        urls.append(("history health URL", spec.history_health_url))
+    return urls
 
 
 def _validate_spec(spec: DeploymentSpec) -> Path:
@@ -562,6 +701,10 @@ def _validate_spec(spec: DeploymentSpec) -> Path:
     _validate_name(spec.project_name, label="project name", pattern=PROJECT_PATTERN)
     if not spec.compose_files:
         raise DeploymentError("at least one Compose file is required")
+    if all(item.is_overlay for item in spec.compose_files):
+        raise DeploymentError("at least one shipped Compose file (--compose SOURCE=LIVE) is required")
+    if spec.allow_overlay_contract_change and not any(item.is_overlay for item in spec.compose_files):
+        raise DeploymentError("--allow-overlay-contract-change needs at least one --keep-overlay")
     if not spec.services:
         raise DeploymentError("at least one expected running service is required")
     if not spec.health_urls:
@@ -569,11 +712,13 @@ def _validate_spec(spec: DeploymentSpec) -> Path:
     sources: set[str] = set()
     live_names: set[str] = set()
     for item in spec.compose_files:
-        _validate_name(item.source, label="Compose source", pattern=SOURCE_PATTERN)
+        if item.source is not None:
+            _validate_name(item.source, label="Compose source", pattern=SOURCE_PATTERN)
         _validate_name(item.live, label="live Compose filename")
         if item.source in sources or item.live in live_names:
             raise DeploymentError("Compose source and live filenames must be unique")
-        sources.add(item.source)
+        if item.source is not None:
+            sources.add(item.source)
         live_names.add(item.live)
         live = root / item.live
         if live.is_symlink() or not live.is_file():
@@ -693,6 +838,61 @@ def _replace_image_reference(data: bytes, image: str) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
+def _compose_model(run: RunCommand, root: Path, prefix: list[str], image: str) -> JsonObject:
+    """Read the merged Compose model; it stays in memory and is never printed."""
+
+    output = run([*prefix, "config", "--format", "json"], cwd=root, env={"JBOD_UI_IMAGE": image})
+    try:
+        model = json.loads(output)
+    except (ValueError, RecursionError) as exc:
+        raise DeploymentError("Compose returned an invalid configuration model") from exc
+    if not isinstance(model, dict) or not isinstance(model.get("services"), dict):
+        raise DeploymentError("Compose configuration model has no services object")
+    return model
+
+
+def _contract_refusal(detail: str) -> DeploymentError:
+    return DeploymentError(
+        f"kept overlay changes the release Compose contract ({detail}); "
+        "pass --allow-overlay-contract-change only after reviewing it"
+    )
+
+
+def _check_overlay_contract(
+    run: RunCommand,
+    root: Path,
+    spec: DeploymentSpec,
+    chain_names: list[str],
+    base_names: list[str],
+) -> None:
+    """Refuse kept overlays that change what the shipped base runs (#1096).
+
+    Compares the merged model of the shipped files alone with the merged model
+    of the whole chain. An overlay may tune restart policy, ports, limits or
+    environment, but not the image, identity, command, data or network wiring
+    of any base service, nor the top-level volume and network definitions.
+    Only service names and key names reach the error.
+    """
+
+    profiles = list(spec.profiles)
+    base = _compose_model(run, root, _compose_prefix(root, spec.project_name, base_names, profiles),
+                          spec.expected_image)
+    merged = _compose_model(run, root, _compose_prefix(root, spec.project_name, chain_names, profiles),
+                            spec.expected_image)
+    for name in sorted(base["services"]):
+        label = name if isinstance(name, str) and SERVICE_PATTERN.fullmatch(name) else "a base service"
+        before = base["services"][name]
+        after = merged["services"].get(name)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise _contract_refusal(f"{label} definition")
+        for key in OVERLAY_CONTRACT_SERVICE_KEYS:
+            if before.get(key) != after.get(key):
+                raise _contract_refusal(f"{label} {key}")
+    for key in OVERLAY_CONTRACT_TOP_LEVEL_KEYS:
+        if base.get(key) != merged.get(key):
+            raise _contract_refusal(f"top-level {key}")
+
+
 def _capture_previous_runtime(
     spec: DeploymentSpec,
     root: Path,
@@ -750,6 +950,11 @@ def _receipt_payload(
         "hashes": hashes,
         "modes": modes,
         "result": None,
+        **(
+            {"overlay_contract_change_allowed": spec.allow_overlay_contract_change}
+            if any(item.is_overlay for item in spec.compose_files)
+            else {}
+        ),
         **(
             {"retention": {"inventory_url": spec.inventory_url, "before": None, "after": None}}
             if spec.inventory_url is not None
@@ -879,6 +1084,11 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
         expected_keys.add("replace_compose")
         if type(receipt["replace_compose"]) is not bool:
             raise DeploymentError("receipt replace_compose must be boolean")
+    # Only receipts whose chain keeps an operator overlay record this (#1096).
+    if "overlay_contract_change_allowed" in receipt:
+        expected_keys.add("overlay_contract_change_allowed")
+        if type(receipt["overlay_contract_change_allowed"]) is not bool:
+            raise DeploymentError("receipt overlay_contract_change_allowed must be boolean")
     # Receipts written without --inventory-url carry no retention record.
     if "retention" in receipt:
         expected_keys.add("retention")
@@ -928,14 +1138,21 @@ def _validate_receipt_shape(receipt: object) -> JsonObject:
             raise DeploymentError("receipt Compose entry is invalid")
         source = item["source"]
         live = item["live"]
-        if not isinstance(source, str) or not SOURCE_PATTERN.fullmatch(source):
+        # A null source is a kept operator overlay (#1096).
+        if source is not None and (not isinstance(source, str) or not SOURCE_PATTERN.fullmatch(source)):
             raise DeploymentError("receipt Compose source is invalid")
         if not isinstance(live, str) or not NAME_PATTERN.fullmatch(live):
             raise DeploymentError("receipt live Compose filename is invalid")
         if source in sources or live in lives:
             raise DeploymentError("receipt Compose chain contains duplicates")
-        sources.add(source)
+        if source is not None:
+            sources.add(source)
         lives.add(live)
+    if not sources:
+        raise DeploymentError("receipt Compose chain has no shipped file")
+    has_overlay = any(item["source"] is None for item in compose_files)
+    if has_overlay != ("overlay_contract_change_allowed" in receipt):
+        raise DeploymentError("receipt overlay record does not match its Compose chain")
     previous_services = receipt["previous_services"]
     if not isinstance(previous_services, list) or len(previous_services) != len(receipt["services"]):
         raise DeploymentError("receipt previous service cardinality is invalid")
@@ -1081,6 +1298,10 @@ def validate_receipt(root: Path) -> JsonObject:
             raise DeploymentError("receipt file hash is invalid")
         if _sha256((receipt_dir / relative).read_bytes()) != digest:
             raise DeploymentError("receipt file hash verification failed")
+    for item in receipt["compose_files"]:
+        name = str(item["live"])
+        if item["source"] is None and hashes[f"previous/{name}"] != hashes[f"candidate/{name}"]:
+            raise DeploymentError(f"receipt kept overlay snapshot changed: {name}")
     expected_modes = {".env", *compose_names}
     modes = receipt["modes"]
     if set(modes) != expected_modes:
@@ -1144,6 +1365,13 @@ def _verify_runtime(
         if not starting:
             break
         time.sleep(min(2, remaining))
+    # A non-loopback URL must still be one the running containers publish (#1096).
+    _require_published_urls(
+        run,
+        root,
+        [str(row["container"]) for row in runtime_rows],
+        [("health URL", str(url)) for url in receipt["health_urls"]],
+    )
     for url in receipt["health_urls"]:
         probe(str(url))
     # HTTP readiness must not hide a restart, replacement, or image/state drift.
@@ -1167,11 +1395,18 @@ def _restore_previous(
     receipt["status"] = "prepared"
     receipt["result"] = None
     _write_receipt(receipt_dir, receipt)
-    for name in compose_names:
+    replace_compose = receipt.get("replace_compose", True)
+    for item in receipt["compose_files"]:
+        name = str(item["live"])
+        path = root / name
         previous = (receipt_dir / "previous" / name).read_bytes()
-        if receipt.get("replace_compose", True):
-            _atomic_write_live(root / name, previous, int(modes[name]))
-        elif (root / name).is_symlink() or (root / name).read_bytes() != previous:
+        current = None if path.is_symlink() or not path.is_file() else path.read_bytes()
+        if replace_compose:
+            # Replacement restores every recorded file. A kept overlay (#1096)
+            # is rewritten only when it no longer matches its recorded bytes.
+            if item["source"] is not None or current != previous:
+                _atomic_write_live(path, previous, int(modes[name]))
+        elif current != previous:
             raise DeploymentError(f"image-only rollback Compose changed: {name}")
     previous_env = (receipt_dir / "previous" / ".env").read_bytes()
     rollback_env = _replace_image_reference(previous_env, str(receipt["previous_image"]))
@@ -1207,6 +1442,9 @@ def update_deployment(
     if receipt_dir.exists() or receipt_dir.is_symlink():
         raise DeploymentError("deployment receipt already exists; archive it before another update")
     previous_image, previous_services = _capture_previous_runtime(spec, root, run)
+    # Before any URL is fetched: a non-loopback URL must match a binding the
+    # current containers publish (#1096). Arbitrary hosts are refused here.
+    _require_published_urls(run, root, [str(row["container"]) for row in previous_services], _spec_urls(spec))
     retention_before: dict[str, int] | None = None
     if spec.inventory_url is not None:
         # Only a predecessor that answers normally but predates the totals may
@@ -1223,7 +1461,8 @@ def update_deployment(
         raise DeploymentError("candidate tag does not match the selected workflow receipt")
     candidate_files: dict[str, bytes] = {}
     for item in spec.compose_files:
-        if not spec.replace_compose:
+        if not spec.replace_compose or item.is_overlay:
+            # Image-only mode and kept overlays (#1096) keep the live bytes.
             candidate_files[item.live] = (root / item.live).read_bytes()
             continue
         url = (
@@ -1234,6 +1473,9 @@ def update_deployment(
         if not data or len(data) > MAX_COMPOSE_BYTES:
             raise DeploymentError(f"candidate Compose download is empty or too large: {item.source}")
         candidate_files[item.live] = data
+    chain_names = [item.live for item in spec.compose_files]
+    base_names = [item.live for item in spec.compose_files if not item.is_overlay]
+    check_overlays = len(base_names) != len(chain_names) and not spec.allow_overlay_contract_change
     if spec.replace_compose:
         staging = Path(tempfile.mkdtemp(prefix=".jbod-ui-compose-check-", dir=root))
         os.chmod(staging, 0o700)
@@ -1241,20 +1483,18 @@ def update_deployment(
             _write_private_file(staging / ".env", (root / ".env").read_bytes())
             for item in spec.compose_files:
                 _write_private_file(staging / item.live, candidate_files[item.live])
-            candidate_prefix = _compose_prefix(
-                staging,
-                spec.project_name,
-                [item.live for item in spec.compose_files],
-                list(spec.profiles),
-            )
+            candidate_prefix = _compose_prefix(staging, spec.project_name, chain_names, list(spec.profiles))
+            # The merged chain, new shipped files plus kept overlays, must validate.
             run([*candidate_prefix, "config", "--quiet"], cwd=root, env={"JBOD_UI_IMAGE": spec.expected_image})
+            if check_overlays:
+                _check_overlay_contract(run, staging, spec, chain_names, base_names)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
     else:
-        candidate_prefix = _compose_prefix(
-            root, spec.project_name, [item.live for item in spec.compose_files], list(spec.profiles),
-        )
+        candidate_prefix = _compose_prefix(root, spec.project_name, chain_names, list(spec.profiles))
         run([*candidate_prefix, "config", "--quiet"], cwd=root, env={"JBOD_UI_IMAGE": spec.expected_image})
+        if check_overlays:
+            _check_overlay_contract(run, root, spec, chain_names, base_names)
     receipt_dir, receipt = _prepare_receipt(
         spec,
         root,
@@ -1264,6 +1504,8 @@ def update_deployment(
     )
     try:
         for item in spec.compose_files if spec.replace_compose else ():
+            if item.is_overlay:
+                continue
             _atomic_write_live(
                 root / item.live,
                 (receipt_dir / "candidate" / item.live).read_bytes(),
@@ -1283,6 +1525,13 @@ def update_deployment(
         run([*prefix, "pull", *spec.services], cwd=root)
         run([*prefix, "up", "-d", *spec.services], cwd=root)
         result = _verify_runtime(root, receipt, spec.expected_image, run=run, probe=probe)
+        # The candidate must publish every non-loopback address it is read on.
+        _require_published_urls(
+            run,
+            root,
+            [str(row["container"]) for row in result["services"]],
+            [entry for entry in _spec_urls(spec) if entry[0] != "health URL"],
+        )
         if spec.inventory_url is not None:
             retention_after = _retention_totals(fetch_json, spec.inventory_url)
             receipt["retention"]["before"] = retention_before
@@ -1334,6 +1583,9 @@ def verify_deployment(
     result = _verify_runtime(root, receipt, image, run=run, probe=probe)
     if "durable_state" in receipt:
         url = str(receipt["durable_state"]["history_health_url"])
+        _require_published_urls(
+            run, root, [str(row["container"]) for row in result["services"]], [("history health URL", url)],
+        )
         result = {**result, "durable_state": _read_durable_state(fetch_health, url)}
         if result["durable_state"]["state"] != "intact":
             raise DurableStateNotAccepted(result)
@@ -1358,6 +1610,16 @@ def _parse_compose(value: str) -> ComposeFile:
     return ComposeFile(source=source, live=live)
 
 
+def _parse_overlay(value: str) -> ComposeFile:
+    return ComposeFile(source=None, live=value)
+
+
+PUBLISHED_URL_HELP = (
+    "explicit HTTP URL with a port, on loopback or on an address and port this deployment publishes "
+    "(an exact IP binding of a declared service's running container; host names are refused)"
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -1367,16 +1629,28 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument("--source-revision", required=True)
     update.add_argument("--expected-image", required=True)
     update.add_argument("--candidate-tag", required=True)
-    update.add_argument("--compose", action="append", type=_parse_compose, required=True)
+    # --compose and --keep-overlay share one destination so the chain keeps
+    # its command-line order, which must equal the containers' recorded chain.
+    update.add_argument("--compose", dest="compose", action="append", type=_parse_compose, required=True,
+                        metavar="SOURCE=LIVE",
+                        help="one ordered chain file: shipped repository SOURCE file and its LIVE name")
+    update.add_argument("--keep-overlay", dest="compose", action="append", type=_parse_overlay, metavar="LIVE",
+                        help=(
+                            "one ordered chain file that is an operator overlay: kept byte-for-byte, "
+                            "backed up in the receipt, and refused if it changes the image, user, command, "
+                            "entrypoint, volumes or networks of a shipped service"
+                        ))
     update.add_argument("--replace-compose", action="store_true",
-                        help="explicitly replace live Compose with source-revision files")
+                        help="explicitly replace the live --compose files with source-revision files")
+    update.add_argument("--allow-overlay-contract-change", action="store_true",
+                        help="accept a reviewed --keep-overlay that changes the shipped Compose contract")
     update.add_argument("--profile", action="append", default=[])
     update.add_argument("--service", action="append", required=True)
-    update.add_argument("--health-url", action="append", required=True)
+    update.add_argument("--health-url", action="append", required=True, help=PUBLISHED_URL_HELP)
     update.add_argument(
         "--inventory-url",
         help=(
-            "loopback main-UI /api/inventory URL; when given, activation also requires every "
+            "main-UI /api/inventory URL (" + PUBLISHED_URL_HELP + "); when given, activation also requires every "
             "source disk to be shown by some enclosure or storage view of the system "
             "(aggregate totals only) or rolls back"
         ),
@@ -1384,7 +1658,7 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument(
         "--history-health-url",
         help=(
-            "loopback history /healthz URL; when given, update and verify also read its "
+            "history /healthz URL (" + PUBLISHED_URL_HELP + "); when given, update and verify also read its "
             "history_recovery_required and history_collection_paused flags and exit with status "
             f"{DURABLE_STATE_EXIT_CODE} unless durable history state is intact, without rolling back"
         ),
@@ -1414,6 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
                     replace_compose=args.replace_compose,
                     inventory_url=args.inventory_url,
                     history_health_url=args.history_health_url,
+                    allow_overlay_contract_change=args.allow_overlay_contract_change,
                 )
             )
         elif args.action == "verify":
