@@ -289,7 +289,9 @@ async function capture(page, locator, name) {
   await locator.screenshot({ path: path.join(SCREENSHOT_DIR, `${name}.png`) });
 }
 
-for (const width of [390, ...DESKTOP_WIDTHS]) {
+// Desktop widths only: the UI is a desktop operator application, and phone or
+// tablet rendering is not a tested product capability (CONTRIBUTING.md).
+for (const width of DESKTOP_WIDTHS) {
   test(`enclosure title stays on one line in Heat Map mode at ${width} px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1200 });
     const errors = await openMainPage(page);
