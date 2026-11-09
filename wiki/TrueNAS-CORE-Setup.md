@@ -198,6 +198,48 @@ labels. The event probe reads filtered `/var/log/messages` when permitted and
 falls back to ordered `dmesg` output. Neither source is a persistent hardware
 counter.
 
+## Expander PHY error counters
+
+When the service account may run it, the app reads each SAS expander's PHY
+error log (invalid DWORD, running disparity, loss of DWORD sync and PHY reset
+problem counts) with one read-only `camcontrol smpcmd` request per PHY, sent
+through a disk's pass device behind that expander. It finds the expanders from
+the `mprutil` and `camcontrol devlist -v` reads above, so no other command is
+needed. One anchored sudo rule for `/sbin/camcontrol smpcmd` covers every pass
+device and PHY 00h-FEh; every other request byte, the request and response
+lengths and the arguments are fixed, so it cannot reset a PHY, clear a counter
+or send another SMP function. The admin sudoers preview shows the exact rule.
+
+The admin bootstrap grants it by default with the other read commands. Without
+it, Storage Fabric shows "Expander counters not available (permission not
+granted)" and asks sudo again only every six hours, after an app restart, or
+with one sudo call when you press Refresh. After adding the grant, press
+Refresh once. A PHY the app could not read shows as unknown, never as zero.
+
+Each expander's counters are read at most once every 15 minutes, whether or
+not you press Refresh. They are cumulative error counts, so in between Storage
+Fabric shows the last reading with its time ("read at ..." in UTC); pressing
+Refresh again does not start a new read. One refresh reads at most eight
+expanders and 512 PHYs, the permission check included. Each SSH command reads
+at most four PHYs, and an expander's commands run one after another: the first
+one that gets no answer (each call is stopped after about 3 seconds) or runs
+past the SSH timeout ends that expander's read for this refresh, so a hung
+expander costs about one timeout. Storage Fabric then shows "read stopped at
+PHY N (no answer)" next to the PHYs read before it, or "the expander did not
+answer" when none were; the unread PHYs show as unknown, and the next try waits
+for the 15 minutes. Counter reads stop sending new commands about a minute
+into a refresh, so slow expanders cannot hold up the rest of the inventory;
+what was read is shown and the remaining PHYs say "read stopped at PHY N
+(refresh time budget)". If the first expander does not answer the permission
+check, the next refresh checks with another expander. An answer that is larger than four PHYs can print, or that
+names another expander or PHY, is discarded and shown as an error. The app keeps
+only the decoded readings between refreshes, for at most 64 expanders and
+4,096 PHYs, dropping the least recently read first. A larger fabric is
+read in turn, least recently read first, and an expander waiting for its turn
+shows "not read this refresh (read budget...)" rather than a missing route. A disk whose `mprutil` parent and
+expander PHY tables disagree is never used as a route, so counters are not
+attributed to the wrong expander while the topology is changing.
+
 ## Optional identify LED control
 
 CORE can use these `sesutil` forms when the host and enclosure support them:

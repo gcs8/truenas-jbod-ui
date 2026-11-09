@@ -17,6 +17,7 @@ from pathlib import Path
 import paramiko
 
 from app.config import SSHConfig
+from app.services.core_expander_counters import SMP_MAX_OUTPUT_BYTES_PER_COMMAND, mask_smp_identity, smp_output_key
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +127,12 @@ def _known_hosts_lock(path_value: str) -> threading.Lock:
 
 
 def redact_ssh_command(command: str) -> str:
-    """Mask inline credentials while leaving command shape useful for logs."""
+    """Mask inline credentials while leaving command shape useful for logs.
 
+    Expander SAS addresses in the CORE counter-read marker are shortened too.
+    """
+
+    command = mask_smp_identity(command)
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -868,6 +873,11 @@ class SSHProbe:
                 stdin.close()
             output_bytes = bytearray()
             error_bytes = bytearray()
+            # Expander counter reads run as many small chunk commands per
+            # refresh; each gets a small cap so their total stays bounded.
+            output_limit = MAX_SSH_OUTPUT_BYTES
+            if smp_output_key(command):
+                output_limit = min(output_limit, SMP_MAX_OUTPUT_BYTES_PER_COMMAND)
             while True:
                 _cancel.check()
                 deadline.check()
@@ -877,12 +887,12 @@ class SSHProbe:
                     (channel.recv_stderr_ready, channel.recv_stderr, error_bytes),
                 ):
                     if ready():
-                        remaining = MAX_SSH_OUTPUT_BYTES - len(output_bytes) - len(error_bytes)
+                        remaining = output_limit - len(output_bytes) - len(error_bytes)
                         buffer.extend(receive(min(32768, remaining + 1)))
                         received = True
-                        if len(output_bytes) + len(error_bytes) > MAX_SSH_OUTPUT_BYTES:
+                        if len(output_bytes) + len(error_bytes) > output_limit:
                             return self._failure_result(
-                                command, f"SSH command output exceeded the {MAX_SSH_OUTPUT_BYTES}-byte limit.",
+                                command, f"SSH command output exceeded the {output_limit}-byte limit.",
                             )
                 # Exit status can precede the last data/EOF. Conversely, EOF
                 # without status must keep the original deadline, not wait().

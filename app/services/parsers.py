@@ -11,6 +11,7 @@ from typing import Any
 
 from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
 from app.config import normalize_value_text
+from app.services.core_expander_counters import smp_output_key
 from app.services.profile_registry import (
     DELL_MD1280_PROFILE_ID,
     SCALE_SSG_FRONT_24_PROFILE_ID,
@@ -4371,6 +4372,9 @@ def canonicalize_ssh_command(command: str) -> str:
     wrappers and reduce the command to the subcommand shape we care about.
     """
 
+    smp_key = smp_output_key(command)
+    if smp_key:
+        return smp_key
     try:
         tokens = shlex.split(command)
     except ValueError:
