@@ -75,6 +75,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   rules: a request before the first inventory read finishes answers a
   retryable 503 saying no inventory has been read yet. The appliance call
   budget is unchanged (#1125, #1126).
+- Fixed Refresh failing with "The inventory is still refreshing" when it was
+  pressed while the app's own background refresh took longer than 5 seconds.
+  A Refresh (a forced inventory, SAS fabric or storage-view read) now waits for
+  the running refresh, up to that refresh's 5-minute deadline, then shows a
+  view read after it was pressed. It starts no appliance read while the other
+  one runs. A refresh that misses its deadline still shows an error, and page
+  loads, other reads and saves keep the 5-second wait (#1139, #1140).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for

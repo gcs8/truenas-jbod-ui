@@ -220,23 +220,40 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
                         query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
                         body={"expected_revision": revision, "serial": f"SANITIZED-SN-{slot:04d}"},
                     ))
+            # The user's Refresh presses (forced reads) join the running
+            # refresh instead of answering busy (#1139); the rest stay bounded.
+            refreshes = [asyncio.ensure_future(request) for request in requests[2::4]]
+            bounded = [request for index, request in enumerate(requests) if index % 4 != 2]
             loop = asyncio.get_running_loop()
             started = loop.time()
-            responses = await asyncio.wait_for(asyncio.gather(*requests), timeout=ANSWER_CEILING_SECONDS)
+            responses = await asyncio.wait_for(asyncio.gather(*bounded), timeout=ANSWER_CEILING_SECONDS)
             elapsed = loop.time() - started
 
-        self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
-        for status, headers, content in responses:
-            # Nothing cached can stand in, so each answers a clear, retryable busy.
-            self.assertEqual(status, 503, content[:300])
-            self.assertIn("retry-after", headers)
-            self.assertIn("still refreshing", json.loads(content)["detail"])
-        # A save whose own pre-write read cannot finish is refused before
-        # writing, so it leaves no assignment behind.
-        for slot in range(6):
-            self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, slot))
-        # Only the hung call reached the appliance; nothing was added behind it.
-        self.assertEqual(self.appliance.reads, 2)
+            self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            for status, headers, content in responses:
+                # Nothing cached can stand in, so each answers a clear, retryable busy.
+                self.assertEqual(status, 503, content[:300])
+                self.assertIn("retry-after", headers)
+                self.assertIn("still refreshing", json.loads(content)["detail"])
+            # A save whose own pre-write read cannot finish is refused before
+            # writing, so it leaves no assignment behind.
+            for slot in range(6):
+                self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, slot))
+            # Only the hung call reached the appliance; nothing was added behind
+            # it, and no joined Refresh started a call of its own meanwhile.
+            self.assertEqual(self.appliance.reads, 2)
+            self.assertEqual(len(self.appliance.calls), 2)
+            self.assertFalse(any(refresh.done() for refresh in refreshes), "a Refresh did not join the running refresh")
+
+            # Once the appliance answers, every joined Refresh gets a fresh view.
+            self.appliance.answer.set()
+            refreshed = await asyncio.wait_for(asyncio.gather(*refreshes), timeout=ANSWER_CEILING_SECONDS)
+        for status, _headers, content in refreshed:
+            self.assertEqual(status, 200, content[:300])
+        # Concurrent forced reads still take turns, at most one read each, as
+        # before #1126; joining adds none and the budget holds.
+        self.assertLessEqual(self.appliance.reads, 2 + len(refreshes))
+        self.assertEqual(self.appliance.limiter.active, 0)
         self.assert_budget_respected()
 
     async def test_bay_assignment_save_answers_within_the_bound(self) -> None:
@@ -325,6 +342,133 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
         warnings = json.loads(content)["warnings"]
         self.assertTrue(any("inventory refresh" in warning and "read at" in warning for warning in warnings), warnings)
         self.assertEqual(self.appliance.reads, 2)
+
+
+class UserRefreshDuringARunningRefreshTests(RefreshDeadlineTests):
+    """A Refresh pressed while the page's own refresh runs joins it (#1139).
+
+    The running refresh is longer than the user wait bound. Before #1139 the
+    forced read answered 503 "still refreshing" at that bound and the page
+    showed "Refresh failed".
+    """
+
+    async def assert_refresh_joins_the_running_refresh(self, path: str) -> None:
+        published_before = self.service._snapshot_published_sequence[SHELF]
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            pressed_at = datetime.now(timezone.utc)
+            refresh = asyncio.ensure_future(call_app(
+                self.application, "GET", path, query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&force=true",
+            ))
+            # Well past the user wait bound, the Refresh is still waiting for
+            # the running refresh rather than answering busy.
+            await asyncio.sleep(USER_WAIT_SECONDS * 3)
+            self.assertFalse(refresh.done(), refresh.result()[2][:300] if refresh.done() else "")
+            # It started no appliance call of its own while that one runs.
+            self.assertEqual(len(self.appliance.calls), 2)
+
+            # A bay-assignment save meanwhile keeps the short bound.
+            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            status, _headers, content = await asyncio.wait_for(call_app(
+                self.application,
+                "POST",
+                "/api/slots/0/mapping",
+                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
+                body={"expected_revision": revision, "serial": "SANITIZED-SN-0200"},
+            ), timeout=ANSWER_CEILING_SECONDS)
+            self.assertIn(status, (200, 503), content[:300])
+            self.assertFalse(refresh.done(), refresh.result()[2][:300] if refresh.done() else "")
+
+            # The running refresh finishes; the Refresh answers with a view read
+            # after it was pressed, and no error.
+            self.appliance.answer.set()
+            status, headers, content = await asyncio.wait_for(refresh, timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 200, content[:300])
+        self.assertNotIn("retry-after", headers)
+        self.assertNotEqual(json.loads(content).get("ok"), False, content[:300])
+        current = self.service._cache[SHELF]
+        self.assertGreater(self.service._snapshot_published_sequence[SHELF], published_before)
+        self.assertGreaterEqual(current.last_updated.replace(tzinfo=current.last_updated.tzinfo or timezone.utc), pressed_at)
+        self.assertNotIn(LATE_MARKER, current.warnings)
+        # The running refresh's read, then one read for this Refresh: no
+        # concurrent second read, and the call budget held throughout.
+        await self.settle()
+        self.assertEqual(self.appliance.reads, 3)
+        self.assertEqual(self.appliance.limiter.active, 0)
+        self.assert_budget_respected()
+
+    async def test_inventory_refresh_joins_a_refresh_longer_than_the_wait_bound(self) -> None:
+        await self.assert_refresh_joins_the_running_refresh("/api/inventory")
+
+    async def test_sas_fabric_refresh_joins_a_refresh_longer_than_the_wait_bound(self) -> None:
+        await self.assert_refresh_joins_the_running_refresh("/api/sas-fabric")
+
+    async def test_storage_view_refresh_joins_a_refresh_longer_than_the_wait_bound(self) -> None:
+        await self.assert_refresh_joins_the_running_refresh("/api/storage-views")
+
+    async def test_refresh_still_fails_when_the_running_refresh_misses_its_deadline(self) -> None:
+        # The running refresh's read cannot stop and outlives the deadline.
+        self.appliance.ignore_cancellation = True
+        loop = asyncio.get_running_loop()
+        with self.assertLogs(inventory_module.logger, "WARNING") as logs:
+            await self.start_hung_page_refresh()
+            started = loop.time()
+            status, headers, content = await asyncio.wait_for(call_app(
+                self.application, "GET", "/api/inventory",
+                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&force=true",
+            ), timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS)
+            elapsed = loop.time() - started
+        self.assertTrue(any("did not finish" in line for line in logs.output), logs.output)
+        # A real failure is still reported, retryably, once the deadline passes.
+        self.assertEqual(status, 503, content[:300])
+        self.assertIn("retry-after", headers)
+        self.assertLess(elapsed, REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS)
+        self.assertEqual(len(self.appliance.calls), 2)
+        self.assert_budget_respected()
+
+    async def test_refresh_does_not_wait_on_a_refresh_already_past_its_deadline(self) -> None:
+        # Joining is bounded by the running refresh's own deadline. One that
+        # was abandoned but cannot stop yet is not waited on past the short
+        # bound, even if the configured deadline is now much longer.
+        self.appliance.ignore_cancellation = True
+        with self.assertLogs(inventory_module.logger, "WARNING"):
+            await self.start_hung_page_refresh()
+            await wait_for_condition(
+                lambda: self.service._background_refresh_abandoned_at is not None,
+                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+        self.assertTrue(self.service._background_refresh_workers, "the abandoned read should still be running")
+        loop = asyncio.get_running_loop()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            started = loop.time()
+            status, headers, _content = await asyncio.wait_for(call_app(
+                self.application, "GET", "/api/inventory",
+                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&force=true",
+            ), timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 503)
+        self.assertIn("retry-after", headers)
+        self.assertLess(loop.time() - started, ANSWER_CEILING_SECONDS)
+        self.assertEqual(len(self.appliance.calls), 2)
+
+    async def test_refresh_joins_for_at_most_one_refresh_deadline_in_total(self) -> None:
+        # However late the running refresh's own deadline, a Refresh waits at
+        # most BACKGROUND_REFRESH_DEADLINE_SECONDS from its first wait, so
+        # successive refreshes cannot keep it waiting.
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        status, headers, _content = await asyncio.wait_for(call_app(
+            self.application, "GET", "/api/inventory",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&force=true",
+        ), timeout=ANSWER_CEILING_SECONDS)
+        elapsed = loop.time() - started
+        self.assertEqual(status, 503)
+        self.assertIn("retry-after", headers)
+        # Joined past the short bound, then stopped at the total cap.
+        self.assertGreaterEqual(elapsed, USER_WAIT_SECONDS)
+        self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+        self.assertEqual(len(self.appliance.calls), 2)
 
 
 class AbandonedRefreshTests(RefreshDeadlineTests):

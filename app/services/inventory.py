@@ -1258,6 +1258,9 @@ class _BackgroundRefreshTicket:
     """One background refresh run; set ``abandoned`` once its deadline passed."""
 
     abandoned: bool = False
+    # Loop times when the run started and when it is abandoned (#1139).
+    started: float = 0.0
+    deadline: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1265,6 +1268,9 @@ class _SnapshotWaitBudget:
     """Seconds one user request has spent queued behind background work."""
 
     waited: float = 0.0
+    # A user Refresh joins a running refresh instead of answering busy at
+    # SNAPSHOT_REFRESH_WAIT_SECONDS (#1139); set at its first such wait.
+    join_until: float | None = None
 
 
 # Set inside each supervised background refresh worker (#1125). A worker whose
@@ -1276,6 +1282,23 @@ _background_refresh_ticket: ContextVar[_BackgroundRefreshTicket | None] = Contex
 _snapshot_wait_budget: ContextVar[_SnapshotWaitBudget | None] = ContextVar(
     "snapshot_wait_budget", default=None,
 )
+# Set by the routes that serve a user's Refresh (a forced read, #1139).
+_user_refresh: ContextVar[bool] = ContextVar("user_refresh", default=False)
+
+
+@contextmanager
+def user_refresh(enabled: bool = True):
+    """Mark reads in this block as a user's Refresh (#1139).
+
+    A Refresh that finds a background refresh running waits for it, up to that
+    refresh's own deadline, instead of answering busy after the short user
+    wait bound. Other reads and saves keep the short bound.
+    """
+    token = _user_refresh.set(enabled)
+    try:
+        yield
+    finally:
+        _user_refresh.reset(token)
 
 
 def _ticket_abandoned(ticket: _BackgroundRefreshTicket | None) -> bool:
@@ -1638,9 +1661,9 @@ class InventoryService:
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
         self._source_bundle_refresh_generation = -1
-        # Running background refresh workers and their loop start times,
-        # including abandoned ones that have not stopped yet (#1125).
-        self._background_refresh_workers: dict[asyncio.Task[Any], float] = {}
+        # Running background refresh workers and their tickets (start time and
+        # deadline), including abandoned ones that have not stopped yet (#1125).
+        self._background_refresh_workers: dict[asyncio.Task[Any], _BackgroundRefreshTicket] = {}
         # When the last background refresh was abandoned; cleared by the next
         # publication. Reads served meanwhile say how old they are.
         self._background_refresh_abandoned_at: datetime | None = None
@@ -1870,7 +1893,9 @@ class InventoryService:
         if not self._background_refresh_workers:
             return False
         now = asyncio.get_running_loop().time()
-        return any(now - started > SNAPSHOT_REFRESH_WAIT_SECONDS for started in self._background_refresh_workers.values())
+        return any(
+            now - ticket.started > SNAPSHOT_REFRESH_WAIT_SECONDS for ticket in self._background_refresh_workers.values()
+        )
 
     def _refresh_delay_warning(self, snapshot: InventorySnapshot) -> str | None:
         """Say how old a stale view is when its refresh is overdue or was abandoned (#1125)."""
@@ -1899,6 +1924,12 @@ class InventoryService:
         running, as before, so concurrent user requests still share one build.
         Each user request's waits share one total of SNAPSHOT_REFRESH_WAIT_SECONDS;
         its own work between waits is not counted (#1125).
+
+        A user's Refresh joins the running refresh instead: it may wait until
+        that refresh's deadline, and at most BACKGROUND_REFRESH_DEADLINE_SECONDS
+        in total from its first such wait (#1139). It then reuses what the
+        running refresh published when that meets its freshness requirement.
+        An abandoned refresh is not waited on beyond the short bound.
         """
         if _in_background_refresh() or not self._background_refresh_workers:
             async with lock:
@@ -1908,8 +1939,17 @@ class InventoryService:
         budget = _snapshot_wait_budget.get() or _SnapshotWaitBudget()
         loop = asyncio.get_running_loop()
         started = loop.time()
+        wait_seconds = SNAPSHOT_REFRESH_WAIT_SECONDS - budget.waited
+        if _user_refresh.get():
+            if budget.join_until is None:
+                budget.join_until = started + BACKGROUND_REFRESH_DEADLINE_SECONDS
+            running_deadlines = [
+                ticket.deadline for ticket in self._background_refresh_workers.values() if not ticket.abandoned
+            ]
+            if running_deadlines:
+                wait_seconds = max(wait_seconds, min(max(running_deadlines), budget.join_until) - started)
         try:
-            async with asyncio.timeout(max(0.0, SNAPSHOT_REFRESH_WAIT_SECONDS - budget.waited)):
+            async with asyncio.timeout(max(0.0, wait_seconds)):
                 await lock.acquire()
         except TimeoutError:
             logger.debug("A request stopped waiting for a running background inventory refresh.")
@@ -4607,11 +4647,15 @@ class InventoryService:
         replacement refresh stays within the call budget.
         """
         loop = asyncio.get_running_loop()
-        ticket = _BackgroundRefreshTicket()
+        now = loop.time()
+        ticket = _BackgroundRefreshTicket(started=now, deadline=now + BACKGROUND_REFRESH_DEADLINE_SECONDS)
         context = copy_context()
         context.run(_background_refresh_ticket.set, ticket)
+        # A Refresh that scheduled this work does not make the work itself a
+        # Refresh; the ticket above already marks it as background.
+        context.run(_user_refresh.set, False)
         task = asyncio.create_task(work, context=context)
-        self._background_refresh_workers[task] = loop.time()
+        self._background_refresh_workers[task] = ticket
 
         def _abandon() -> None:
             if task.done():
@@ -4631,7 +4675,7 @@ class InventoryService:
             )
             unregister(task)
 
-        deadline = loop.call_later(BACKGROUND_REFRESH_DEADLINE_SECONDS, _abandon)
+        deadline = loop.call_at(ticket.deadline, _abandon)
 
         def _finished(done: asyncio.Task[Any]) -> None:
             deadline.cancel()
