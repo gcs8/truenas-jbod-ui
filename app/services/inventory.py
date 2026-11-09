@@ -1281,6 +1281,9 @@ class _SnapshotWaitBudget:
     # A user Refresh joins a running refresh instead of answering busy at
     # SNAPSHOT_REFRESH_WAIT_SECONDS (#1139); set at its first such wait.
     join_until: float | None = None
+    # Set by shared_wait_budget(): every snapshot read in the block draws on
+    # this one budget instead of starting its own (#1144).
+    shared: bool = False
 
 
 # Set inside each supervised background refresh worker (#1125). A worker whose
@@ -1311,6 +1314,27 @@ def user_refresh(enabled: bool = True):
         yield
     finally:
         _user_refresh.reset(token)
+
+
+@contextmanager
+def shared_wait_budget():
+    """Let every snapshot read in this block share one user wait bound (#1144).
+
+    A request that reads several views, such as an export of several
+    enclosures, otherwise waits up to SNAPSHOT_REFRESH_WAIT_SECONDS for each
+    of them behind a running background refresh. Inside this block their
+    waits draw on one total, so the request answers after one bound at most;
+    a read whose share is spent stops waiting at once.
+    """
+    if _snapshot_wait_budget.get() is not None:
+        # Already inside a request's budget; keep that one.
+        yield
+        return
+    token = _snapshot_wait_budget.set(_SnapshotWaitBudget(shared=True))
+    try:
+        yield
+    finally:
+        _snapshot_wait_budget.reset(token)
 
 
 def _ticket_abandoned(ticket: _BackgroundRefreshTicket | None) -> bool:
@@ -1856,6 +1880,30 @@ class InventoryService:
         )
         return result.value
 
+    async def get_current_or_cached_snapshot(
+        self,
+        selected_enclosure_id: str | None = None,
+    ) -> tuple[InventorySnapshot, str | None]:
+        """A current snapshot, or the cached one while a refresh runs (#1144).
+
+        For reads that want current data but must not dead-end on a running
+        background refresh, such as the snapshot export and its size estimate.
+        The read is the strict one: an expired view is rebuilt as before. Only
+        when that read waits its user bound behind a running refresh is the
+        cached view served instead, even if it has expired, with a warning
+        that says when it was read. With no cached view the retryable busy
+        answer stands. Returns the snapshot and, for that fallback, its
+        warning (also the first of the snapshot's warnings); otherwise None.
+        """
+        result = await self._get_snapshot_result(
+            selected_enclosure_id=selected_enclosure_id,
+            stale_on_busy=True,
+        )
+        if result.cache_state != "stale-hit":
+            return result.value, None
+        # _get_snapshot_result always prepends a note to a waited fallback.
+        return result.value, result.value.warnings[0]
+
     async def _get_snapshot_result(
         self,
         force_refresh: bool = False,
@@ -1863,6 +1911,7 @@ class InventoryService:
         allow_stale_cache: bool = False,
         force_source_refresh: bool | None = None,
         minimum_source_publication: SourcePublication | None = None,
+        stale_on_busy: bool = False,
     ) -> CacheResult[InventorySnapshot]:
         arguments = {
             "force_refresh": force_refresh,
@@ -1874,25 +1923,39 @@ class InventoryService:
         if _in_background_refresh():
             # Background work is bounded by its own deadline instead.
             return await self._load_snapshot_result(**arguments)
-        budget_token = _snapshot_wait_budget.set(_SnapshotWaitBudget())
+        # A shared budget (shared_wait_budget) spans every read of the request.
+        outer_budget = _snapshot_wait_budget.get()
+        budget_token = (
+            None if outer_budget is not None and outer_budget.shared
+            else _snapshot_wait_budget.set(_SnapshotWaitBudget())
+        )
+        waited_fallback = False
         try:
             result = await self._load_snapshot_result(**arguments)
         except SnapshotRefreshWaitTimeout:
             # A reader that accepts a stale view gets the cached one, if any,
-            # rather than the busy answer (#1125). A change dropped the cache
-            # deliberately, so there may be none; the busy answer stands then.
+            # rather than the busy answer (#1125); so does a strict read that
+            # only must not dead-end on the running refresh (#1144). A change
+            # dropped the cache deliberately, so there may be none; the busy
+            # answer stands then.
             cache_key = selected_enclosure_id or self._canonical_default_enclosure_id or SNAPSHOT_NO_ENCLOSURE_KEY
-            cached = self._cache.get(cache_key) if allow_stale_cache else None
+            cached = (
+                self._cache.get(cache_key)
+                if allow_stale_cache or (stale_on_busy and not force_refresh)
+                else None
+            )
             if cached is None:
                 raise
             self._touch_snapshot_key(cache_key)
             add_perf_metadata(snapshot_cache="stale-hit", snapshot_cache_key=cache_key)
             self._observe_inventory_snapshot_request("stale-hit")
             result = CacheResult(cached, "stale-hit")
+            waited_fallback = True
         finally:
-            _snapshot_wait_budget.reset(budget_token)
+            if budget_token is not None:
+                _snapshot_wait_budget.reset(budget_token)
         if result.cache_state == "stale-hit":
-            warning = self._refresh_delay_warning(result.value)
+            warning = self._refresh_delay_warning(result.value, waited=waited_fallback)
             if warning is not None:
                 stale = result.value
                 result = CacheResult(
@@ -1909,9 +1972,14 @@ class InventoryService:
             now - ticket.started > SNAPSHOT_REFRESH_WAIT_SECONDS for ticket in self._background_refresh_workers.values()
         )
 
-    def _refresh_delay_warning(self, snapshot: InventorySnapshot) -> str | None:
-        """Say how old a stale view is when its refresh is overdue or was abandoned (#1125)."""
-        if self._background_refresh_abandoned_at is None and not self._background_refresh_overdue():
+    def _refresh_delay_warning(self, snapshot: InventorySnapshot, *, waited: bool = False) -> str | None:
+        """Say how old a stale view is when its refresh is overdue or was abandoned (#1125).
+
+        ``waited``: the view is served because this request waited its bound
+        on a running refresh, so the refresh is overdue for this reader even
+        if the worker it queued behind started later (#1144).
+        """
+        if not waited and self._background_refresh_abandoned_at is None and not self._background_refresh_overdue():
             return None
         read_at = snapshot.last_updated
         if read_at.tzinfo is None:

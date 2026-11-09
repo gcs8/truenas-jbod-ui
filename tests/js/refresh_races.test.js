@@ -239,6 +239,8 @@ test("storage-view refresh updates the live selector before the completed main r
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
+    // Busy-read retries (#1144) are covered in refreshing_read_retry.test.js.
+    retryBusyRead: (read) => read(),
     renderSelectors() { events.push(state.storageViewsRuntimeLoading ? "loading-selectors" : "complete-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
