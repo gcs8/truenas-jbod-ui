@@ -107,7 +107,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   "The inventory is still refreshing", and the page now tries it again up to
   three times after the server's Retry-After, saying so in the status line or
   the dialog. A Refresh, a save and a locate-light press are not retried
-  automatically (#1144).
+  automatically (#1144, #1147).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for
