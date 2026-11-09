@@ -25,7 +25,8 @@
 // (safety-failed). Lights are also cleared at
 // startup, on SIGTERM/SIGINT/SIGHUP, after a browser disconnect, at exit, and by
 //   node scripts/ui_crawl.js --led-sweep --led-ledger FILE --out DIR
-// Exit status (#1119): 0 ok, 1 crawl errors, 2 safety gate failed, 3 a light
+// Exit status (#1119): 0 ok, 1 crawl errors, 2 safety gate failed (a live
+// discovery failure or a live crawl that ran no state included), 3 a light
 // could not be verified off; 128+n after a signal whose cleanup verified.
 
 const { spawn } = require("node:child_process");
@@ -38,6 +39,7 @@ const { LedLedger, sweepLedger } = require("../qa/ui-crawl/ledger");
 const { startLedSupervisor } = require("../qa/ui-crawl/led-supervisor");
 const { chromium } = require("@playwright/test");
 const { EXIT } = require("../qa/ui-crawl/gate");
+const { BUSY_RETRY, busyRetryWaitMs } = require("../qa/ui-crawl/driver");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
 const { reachProblems } = require("../qa/ui-crawl/reach");
@@ -117,29 +119,47 @@ function parseArgs(argv) {
   return args;
 }
 
-async function getJson(url) {
-  const response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(300_000) });
-  if (!response.ok) throw new Error(`${response.status} for ${new URL(url).pathname}`);
-  return response.json();
+// Codex PRRT_kwDOSAqK-M61Jv7a: every discovery read checks its HTTP status.
+// A busy or other 5xx answer is retried with navigate()'s bounded busy policy
+// (BUSY_RETRY, Retry-After); a final 5xx or any other non-2xx answer fails
+// discovery, so a busy stack can never yield an empty, successful crawl.
+async function discoveryFetch(url, { accept = "application/json", sleep: wait = sleep } = {}) {
+  const where = new URL(url).pathname;
+  for (let attempt = 1; ; attempt += 1) {
+    const response = await fetch(url, { headers: { Accept: accept }, signal: AbortSignal.timeout(300_000) });
+    if (response.ok) return response;
+    const retryable = response.status >= 500 && response.status <= 599;
+    if (!retryable || attempt >= BUSY_RETRY.attempts) {
+      throw new Error(`GET ${where} answered ${response.status}${retryable ? ` after ${attempt} attempts` : ""}`);
+    }
+    await response.body?.cancel().catch(() => {});
+    await wait(busyRetryWaitMs(response.headers.get("retry-after"), attempt));
+  }
 }
 
-async function liveTargets(args) {
-  const html = await (await fetch(`${args.ui}/`, { signal: AbortSignal.timeout(300_000) })).text();
+// Live targets from the stack itself. Throws (the crawl fails, nothing is
+// crawled) when a discovery read fails, the main page lists no systems, or a
+// requested system is not among them. `options.sleep` is for tests.
+async function liveTargets(args, options = {}) {
+  const getJson = async (url) => (await discoveryFetch(url, options)).json();
+  const html = await (await discoveryFetch(`${args.ui}/`, { ...options, accept: "text/html" })).text();
   const select = /<select[^>]*id="system-select"[^>]*>([\s\S]*?)<\/select>/.exec(html);
   const systems = select ? [...select[1].matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]) : [];
-  const chosen = args.systems ? systems.filter((id) => args.systems.includes(id)) : systems;
+  if (!systems.length) throw new Error(`the main page lists no systems (${select ? "its system-select has no options" : "it has no system-select"})`);
+  const requested = args.systems ? args.systems.filter(Boolean) : null;
+  if (requested && !requested.length) throw new Error("--systems names no system");
+  const missing = requested ? requested.filter((id) => !systems.includes(id)) : [];
+  if (missing.length) throw new Error(`requested system${missing.length > 1 ? "s" : ""} not on the main page: ${missing.join(", ")}`);
+  const chosen = requested ? systems.filter((id) => requested.includes(id)) : systems;
   const targets = [];
   for (const system of chosen) {
     const inventory = await getJson(`${args.ui}/api/inventory?system_id=${encodeURIComponent(system)}`);
     const snapshot = inventory.snapshot || inventory;
     // The page's load-time requests depend on the platform (Sol #1108).
     const platform = String(snapshot.selected_system_platform || "core").toLowerCase();
-    let views = { views: [] };
-    try {
-      views = await getJson(`${args.ui}/api/storage-views?system_id=${encodeURIComponent(system)}`);
-    } catch {
-      // no views
-    }
+    // A storage-view error fails discovery too; it no longer drops this
+    // system's view targets silently (PRRT_kwDOSAqK-M61Jv7a).
+    const views = await getJson(`${args.ui}/api/storage-views?system_id=${encodeURIComponent(system)}`);
     const scopes = [
       ...(snapshot.enclosures || []).map((e) => ({ kind: "enc", id: e.id, query: `enclosure_id=${encodeURIComponent(e.id)}` })),
       // SVBIND: a view target binds the enclosure its view is bound to (null: none).
@@ -158,7 +178,20 @@ async function liveTargets(args) {
   }
   if (args.history) targets.push({ page: "history", ready: "history", scopeIndex: 0, label: "history", url: `${args.history}/` });
   if (args.admin) targets.push({ page: "admin", ready: "admin", scopeIndex: 0, label: "admin", url: `${args.admin}/` });
+  if (!targets.length) throw new Error("discovery produced no targets");
   return targets;
+}
+
+// Codex PRRT_kwDOSAqK-M61Jv7a: a live crawl that exercised nothing is a
+// failure, never a success: no target, no state selected for any target
+// (filters included; there is no deliberately empty selection), or, after the
+// crawl (`records`), no state that ran (all not applicable or not allowed).
+const NOT_EXECUTED = new Set(["not-applicable", "skipped"]);
+function liveCoverageProblems({ plan, records } = {}) {
+  if (!plan || !plan.length) return ["live discovery found no targets; nothing was crawled"];
+  if (!plan.some((entry) => entry.states.length)) return [`no state selected for any of the ${plan.length} discovered targets (check --pages, --states, --scopes and --systems); nothing was crawled`];
+  if (records && !records.some((record) => !NOT_EXECUTED.has(record.status))) return [`the live crawl executed no state (${records.length} not applicable or not allowed); nothing was exercised`];
+  return [];
 }
 
 function fixtureTargets() {
@@ -396,6 +429,35 @@ async function main() {
   };
   const cdpUrl = process.env[args.cdpEnv] || "";
   const started = new Date().toISOString();
+  // Targets and their states are settled before any browser starts. A live
+  // discovery failure, or a plan with nothing to run, fails the crawl here
+  // with a report and receipt (PRRT_kwDOSAqK-M61Jv7a).
+  const used = {};
+  const planFor = (targets) => targets.map((target) => ({ target, states: statesFor(target, states, args, used) }));
+  let plan;
+  if (fixture) {
+    plan = planFor(fixtureTargets());
+  } else {
+    let problem = null;
+    try {
+      plan = planFor(await liveTargets(args));
+      problem = liveCoverageProblems({ plan })[0] || null;
+    } catch (error) {
+      problem = `live target discovery failed: ${String(error && error.message ? error.message : error).split("\n")[0].slice(0, 300)}; nothing was crawled`;
+    }
+    if (problem) {
+      const ledCleanup = ledger ? await guards.sweep() : null;
+      const summary = writeReport(outDir, {
+        meta: { mode: "live", label: args.label || null, started, finished: new Date().toISOString(), widths, allow: args.allow, writeSystem: args.writeSystem || null, remoteBrowser: Boolean(cdpUrl), stage: "discovery" },
+        records: [], guardLog: guard.log, stats, ledCleanup, problems: [problem],
+      });
+      const code = EXIT[summary.safety];
+      writeReceipt(outDir, { status: summary.safety, stage: "discovery", exitCode: code, ledCleanup, problems: [problem] });
+      console.log(JSON.stringify(summary, null, 1));
+      console.error(problem);
+      return code;
+    }
+  }
   const browser = cdpUrl
     ? await chromium.connectOverCDP(cdpUrl, { timeout: 120_000 })
     : await chromium.launch({ channel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || undefined, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
@@ -429,10 +491,7 @@ async function main() {
       baselineDir: args.baseline ? path.resolve(args.baseline) : null, fixtureMode: Boolean(fixture), cache,
       paceMs: args.paceMs ?? (fixture ? 0 : 1500), ledger, writeSystem: args.writeSystem || null,
     });
-    const targets = fixture ? fixtureTargets() : await liveTargets(args);
-    const used = {};
-    for (const target of targets) {
-      const chosen = statesFor(target, states, args, used);
+    for (const { target, states: chosen } of plan) {
       if (chosen.length) await crawler.crawlTarget(target, chosen);
     }
     // Offline copies the crawl downloaded are crawled like the public demo.
@@ -445,6 +504,7 @@ async function main() {
       }
     }
     if (crawler.aborted) runProblems.push(`crawl aborted: ${crawler.aborted}`);
+    if (!fixture) runProblems.push(...liveCoverageProblems({ plan, records: crawler.records }));
   } catch (error) {
     runProblems.push(`crawl stopped: ${String(error && error.message ? error.message : error).replace(/wss?:\/\/\S+/g, "<cdp-url>").split("\n")[0].slice(0, 200)}`);
   } finally {
@@ -490,4 +550,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, statesFor, fixtureTargets, liveTargets, createExitGuards, startLedWatchdog, preflightProblems, FIXTURE_ORIGINS };
+module.exports = { parseArgs, statesFor, fixtureTargets, liveTargets, liveCoverageProblems, discoveryFetch, createExitGuards, startLedWatchdog, preflightProblems, FIXTURE_ORIGINS };

@@ -17,16 +17,23 @@ function pathGlob(pattern) {
   return new RegExp(`^${String(pattern).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]+")}$`);
 }
 
+// The bounded busy-retry policy, shared with live target discovery
+// (scripts/ui_crawl.js, Codex PRRT_kwDOSAqK-M61Jv7a).
+const BUSY_RETRY = Object.freeze({ attempts: 4, maxWaitMs: 10_000 });
+function busyRetryWaitMs(retryAfterHeader, attempt, maxWaitMs = BUSY_RETRY.maxWaitMs) {
+  const retryAfter = Number(retryAfterHeader) || 3;
+  return Math.min(maxWaitMs, retryAfter * 1000 * attempt);
+}
+
 // Navigate or reload, retrying a document that answers 503 "busy" (the app
 // sends Retry-After while a refresh holds the snapshot). Each retry is
 // recorded by the crawler as an http-error finding, so busy pages stay visible.
-async function navigate(page, action, { attempts = 4, maxWaitMs = 10_000 } = {}) {
+async function navigate(page, action, { attempts = BUSY_RETRY.attempts, maxWaitMs = BUSY_RETRY.maxWaitMs } = {}) {
   let response = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     response = await action();
     if (!response || response.status() !== 503 || attempt === attempts) return response;
-    const retryAfter = Number(response.headers()["retry-after"]) || 3;
-    await page.waitForTimeout(Math.min(maxWaitMs, retryAfter * 1000 * attempt));
+    await page.waitForTimeout(busyRetryWaitMs(response.headers()["retry-after"], attempt, maxWaitMs));
   }
   return response;
 }
@@ -390,4 +397,4 @@ class CrawlDriver {
   }
 }
 
-module.exports = { CrawlDriver, NotApplicable, navigate, stripKeys };
+module.exports = { CrawlDriver, NotApplicable, navigate, stripKeys, BUSY_RETRY, busyRetryWaitMs };

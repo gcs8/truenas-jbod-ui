@@ -15,7 +15,10 @@
 //                              preview failed; a request was blocked (an
 //                              unknown route, a write outside its window or
 //                              scope); an admitted write is unaccounted for;
-//                              or a report could not be read or merged.
+//                              a report could not be read or merged; or a
+//                              live crawl's target discovery failed or it
+//                              selected or executed no state (nothing was
+//                              exercised, so nothing was shown safe).
 //   exit 3  cleanup-uncertain  an identify light could not be verified off.
 
 const SAFE_ACTUATION = new Set(["done", "no-write", "not-applicable", "skipped", "listed", "previewed"]);

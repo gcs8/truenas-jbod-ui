@@ -423,7 +423,8 @@ class Crawler {
           entry.size = shot.size;
           entry.tiles = shot.tiles.map((tile) => ({ ...tile, file: path.relative(this.outDir, path.join(dir, tile.name)) }));
           entry.diff = this.baselineDiff(path.join("states", relDir, String(width)), shot.image);
-          if (entry.diff && entry.diff.changedFraction > 0.02) entry.findings.push({ type: "visual-diff", severity: "info", text: `changed ${Math.round(entry.diff.changedFraction * 100)}% vs baseline`, detail: entry.diff });
+          const visual = visualDiffFinding(entry.diff);
+          if (visual) entry.findings.push(visual);
         } catch (error) {
           entry.findings.push({ type: "capture-error", severity: "error", text: String(error.message || error).split("\n")[0].slice(0, 300) });
         }
@@ -447,6 +448,24 @@ class Crawler {
   }
 }
 
+// The visual-diff finding for a baseline comparison, or null. A screenshot
+// whose size changed is always a finding naming both sizes (Codex
+// PRRT_kwDOSAqK-M61JfVj: png.diff compares only the common area, so a page
+// that lost its bottom half read 0% changed). Same-size images keep the
+// changed-pixel threshold.
+const VISUAL_DIFF_THRESHOLD = 0.02;
+function visualDiffFinding(diff) {
+  if (!diff || typeof diff.changedFraction !== "number") return null;
+  const changed = `${Math.round(diff.changedFraction * 100)}%`;
+  if (diff.sizeChanged) {
+    const [bw, bh] = diff.before || [];
+    const [aw, ah] = diff.after || [];
+    return { type: "visual-diff", severity: "info", text: `size changed ${bw}x${bh} -> ${aw}x${ah} vs baseline (common area changed ${changed})`, detail: diff };
+  }
+  if (diff.changedFraction > VISUAL_DIFF_THRESHOLD) return { type: "visual-diff", severity: "info", text: `changed ${changed} vs baseline`, detail: diff };
+  return null;
+}
+
 // D-TNJ-20261109-CRAWLER-SVBIND: the enclosure a storage view is bound to, as
 // the app derives it: its runtime backing_enclosure_id. The backend builds it
 // from the snapshot the view runtime was resolved against (inventory.py,
@@ -460,4 +479,4 @@ function viewBoundEnclosure(view) {
   return typeof id === "string" && id ? id : null;
 }
 
-module.exports = { Crawler, READY, safeName, keySpec, renderedKeys, viewBoundEnclosure };
+module.exports = { Crawler, READY, safeName, keySpec, renderedKeys, viewBoundEnclosure, visualDiffFinding };
