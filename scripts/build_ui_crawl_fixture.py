@@ -30,6 +30,8 @@ from app.services.public_demo_fixture import (  # noqa: E402
     build_public_demo_snapshot_bundle,
     load_public_demo_fixture,
 )
+from app.services.sas_fabric import _diagnostic_metric_summary  # noqa: E402
+from app.services.sas_fabric_parsers import parse_mpr_dmesg_events  # noqa: E402
 from scripts.build_current_source_browser_fixture import TEMPLATES, build_fixture_request  # noqa: E402
 
 UI_ORIGIN = "https://ui.synthetic.invalid"
@@ -100,9 +102,36 @@ def render_main(bundle, *, history_configured: bool = True, write_policy: dict =
     return TEMPLATES.env.get_template("index.html").render(context)
 
 
+# Codex #1108: synthetic mpr kernel events, decoded by the app's own parser,
+# so the Disk Path view renders its fault-evidence panels and event tables
+# (fabric.diagnostics) in CI. Invented device/target numbers only.
+SYNTHETIC_MPR_DMESG = "\n".join(
+    line
+    for index in range(4)
+    for line in (
+        f"mpr0: Controller reported scsi ioc terminated tgt {180 + index} SMID {140 + index} loginfo 31120302",
+        f"(da{60 + index}:mpr0:0:{180 + index}:0): WRITE(16). CDB: 8a 00 00 00 00 01 75 5d d9 60 00 00 00 f8 00 00",
+        f"(da{60 + index}:mpr0:0:{180 + index}:0): CAM status: CCB request completed with an error",
+        f"(da{60 + index}:mpr0:0:{180 + index}:0): SCSI sense: ABORTED COMMAND asc:4b,4 (NAK received)",
+        f"(da{60 + index}:mpr0:0:{180 + index}:0): Retrying command (per sense data)",
+    )
+)
+
+
+def fabric_with_diagnostics(fabric) -> dict:
+    """The demo fabric with synthetic kernel diagnostics on each controller."""
+    data = _dump(fabric)
+    events = parse_mpr_dmesg_events(SYNTHETIC_MPR_DMESG)
+    summary = _diagnostic_metric_summary(events["by_controller"]["mpr0"])
+    for node in data.get("nodes") or []:
+        if node.get("kind") == "controller":
+            node["metrics"] = {**(node.get("metrics") or {}), "kernel_diagnostics": summary}
+    return data
+
+
 def render_fabric(bundle, *, write_policy: dict = WRITE_POLICY) -> str:
     snapshot = bundle.primary_snapshot
-    fabric = bundle.sas_fabric
+    fabric = fabric_with_diagnostics(bundle.sas_fabric)
     bootstrap = {
         "snapshot": _dump(snapshot),
         "fabric": _dump(fabric),
@@ -135,6 +164,11 @@ ADMIN_BOOTSTRAP = {
             "label": "Synthetic System",
             "platform": "core",
             "truenas_host": "nas.example.test",
+            # Codex #1108: verification on with a saved CA bundle, so loading
+            # this system into the form re-checks the bundle
+            # (GET /api/admin/tls/saved-status), as a live system can.
+            "verify_ssl": True,
+            "tls_ca_bundle_path": "/app/data/tls/synthetic-ca.pem",
             "api_user": "synthetic",
             "api_password_configured": True,
             "ssh_enabled": True,
@@ -239,7 +273,7 @@ async def build() -> dict:
         # The QuantaStor variant keeps its platform after its startup refresh.
         "ui-quantastor:/api/inventory": _dump(live_snapshot(bundle, platform="quantastor")),
         "ui:/api/storage-views": _dump(bundle.storage_view_runtime),
-        "ui:/api/sas-fabric": _dump(bundle.sas_fabric),
+        "ui:/api/sas-fabric": fabric_with_diagnostics(bundle.sas_fabric),
         "ui:/api/history/status": await history.get_status(),
         "ui:/api/release-status": {"status": "disabled"},
         "ui:/api/system-locator": {"available": False, "supported": False},
@@ -252,6 +286,16 @@ async def build() -> dict:
         "admin:/api/admin/history/orphaned": {"orphaned_systems": []},
         "admin:/api/admin/storage-views/live-enclosures": {"enclosures": []},
         "admin:/api/admin/storage-views/candidates": {"candidates": []},
+        "admin:/api/admin/tls/saved-status": {
+            "ok": True,
+            "system_id": "synthetic-system",
+            "validation": {
+                "validated": True,
+                "host": "nas.example.test",
+                "bundle_path": "/app/data/tls/synthetic-ca.pem",
+                "detail": "Synthetic fixture: the saved bundle verifies this host.",
+            },
+        },
     }
     smart = {}
     for key, summary in (bundle.smart_summary_cache or {}).items():

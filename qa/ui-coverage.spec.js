@@ -171,6 +171,18 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
   expect(["main.heatmap", "main.heatmap.temperature"].filter((id) => !(guard.observed.get(id) || new Map()).has(viewSmart)),
     "the saved-view fixture target no longer drives the storage-view heat-map SMART read").toEqual([]);
 
+  // Codex #1108: loading the synthetic system (verify_ssl + saved CA) into
+  // the admin form re-checks its saved bundle, admitted by the loading
+  // state's own declaration (a blocked one would have failed above).
+  const savedStatus = "appliance-load GET /api/admin/tls/saved-status";
+  expect((guard.observed.get("admin.system-form") || new Map()).get(savedStatus),
+    "the admin fixture no longer sends the saved-certificate check when a system loads").toBe(1);
+
+  // Codex #1108: fabric.diagnostics switches to Disk Path and the fixture
+  // carries diagnostics, so the state runs instead of being skipped.
+  const diagnostics = crawler.records.filter((record) => record.state === "fabric.diagnostics" && record.target === "fixture/fabric");
+  expect(diagnostics.map((record) => record.status), "fabric.diagnostics did not render the Disk Path evidence").toEqual(["done"]);
+
   // Sol #1108: the QuantaStor page's startup refresh went out, inside the
   // declared page-load window only (it would be a blocked request otherwise).
   const startupLoads = (crawler.loadAdmitted || []).filter((entry) => entry.target === "fixture/main-quantastor");

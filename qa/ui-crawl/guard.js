@@ -29,6 +29,9 @@
 //      forced reads it declared, with the budget they have left, stay
 //      admitted for its `follow_up_ms` (monotonic clock), and only until the
 //      next navigation. A follow-up after that is refused like any other.
+//      A request whose page-load rule has spent its budget is not refused by
+//      that alone: the state's own window and the follow-up window are tried
+//      next, each with its own budget and binding (Codex #1108).
 //   6. Everything else aborts and is recorded.
 //
 // The guard never sees credentials: it gets method, URL and the request body.
@@ -219,6 +222,11 @@ class RequestGuard {
     const cls = BASE_READ_CLASSES.has(routeClass) && forcesRefresh(parsed) ? "appliance-load" : routeClass;
     const route = `${entry.method} ${entry.path}`;
     const info = { cls, route, service };
+    // Codex #1108: a page-load rule whose budget is spent does not refuse the
+    // request by itself; the running state's declared requests and the
+    // follow-up window still get their say (each with its own budget and
+    // binding), and the request is refused only if none admits it.
+    let loadSpent = null;
     if (cls === "appliance-load" && this.load) {
       const slot = this.matchWindow(this.load, verb, parsed, body, cls);
       if (slot && !slot.error) {
@@ -226,7 +234,9 @@ class RequestGuard {
         this.observe("page-load", route, parsed);
         return this.record(verb, url, true, `declared page-load ${cls} for ${this.load.stateId}`, slot, info, this.load);
       }
-      if (slot && slot.error) {
+      if (slot && slot.exhausted) {
+        loadSpent = slot.error;
+      } else if (slot && slot.error) {
         this.observe(cls, route, parsed);
         return this.record(verb, url, false, slot.error, null, info);
       }
@@ -253,6 +263,7 @@ class RequestGuard {
     const slot = this.matchWindow(this.window, verb, parsed, body, cls);
     if (slot && slot.error) return this.record(verb, url, false, slot.error, null, info);
     if (slot) return this.record(verb, url, true, `declared ${cls} for ${this.window.stateId}`, slot, info, this.window);
+    if (loadSpent) return this.record(verb, url, false, `${loadSpent}; no state or follow-up window admits it`, null, info);
     const where = this.window ? `undeclared ${cls} route during ${this.window.stateId}` : `${cls} route outside a declaring state`;
     return this.record(verb, url, false, where, null, info);
   }
@@ -284,7 +295,7 @@ class RequestGuard {
       }
     }
     const slot = candidates.find((entry) => entry.used < entry.max);
-    if (!slot) return { error: `budget exhausted for ${verb} ${parsed.pathname} in ${window.stateId}` };
+    if (!slot) return { error: `budget exhausted for ${verb} ${parsed.pathname} in ${window.stateId}`, exhausted: true };
     slot.used += 1;
     return slot;
   }

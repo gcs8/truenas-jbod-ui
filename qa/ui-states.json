@@ -378,9 +378,9 @@
       "covers": [".disk-path-card-details"]
     },
     {
-      "id": "fabric.diagnostics", "page": "fabric", "safety": "read",
-      "requires": "[data-fabric-evidence-key]",
-      "steps": [{"openAll": "details[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-diagnostic-table-key]"}, {"wait": 600}],
+      "id": "fabric.diagnostics", "page": "fabric", "safety": "read", "ci": true,
+      "description": "Disk Path fault evidence and its event tables. The evidence renders only in Disk Path, so the state switches there first and is not applicable only when no evidence shows after the switch.",
+      "steps": [{"click": "#fabric-mode-disk"}, {"wait": 800}, {"requireVisible": "[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-diagnostic-table-key]"}, {"wait": 600}],
       "covers": ["[data-fabric-evidence-key]", "[data-fabric-diagnostic-table-key]", "[data-fabric-diagnostic-page]", "[data-fabric-diagnostic-page=prev]", "[data-fabric-diagnostic-page=next]", "[data-fabric-diagnostic-filter-key]", "[data-fabric-diagnostic-type-key]", "[data-fabric-diagnostic-severity-key]", "[data-fabric-diagnostic-confidence-key]"]
     },
     {
@@ -418,14 +418,14 @@
     {
       "id": "admin.system-form", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"openAll": "details"}, {"wait": 400}],
       "covers": ["#setup-system-label", "#setup-system-id", "#setup-platform", "#setup-profile", "#setup-make-default", "#setup-truenas-host", "#setup-verify-ssl", "#setup-tls-ca-bundle-path", "#setup-tls-server-name", "[data-tls-server-name]", "#setup-enclosure-filter", "#setup-api-key", "#setup-api-user", "#setup-api-password", "#setup-bmc-enabled", "#setup-bmc-host", "#setup-bmc-username", "#setup-bmc-password", "#setup-bmc-verify-ssl", "#setup-bmc-timeout-seconds", "#setup-ssh-enabled", "#setup-ha-enabled", "#setup-ssh-host", "#setup-ssh-user", "#setup-ssh-port", "#setup-ssh-key-mode", "#setup-ssh-key-path", "#setup-ssh-password", "#setup-ssh-sudo-password", "#setup-ssh-strict-host-key", "#setup-ssh-existing-key", "#setup-generate-key-name", "#setup-bootstrap-details", "#setup-bootstrap-enabled", "#setup-bootstrap-host", "#setup-bootstrap-user", "#setup-bootstrap-password", "#setup-bootstrap-key-path", "#setup-bootstrap-service-home", "#setup-bootstrap-install-sudo", "#setup-ssh-commands-details", "#setup-ssh-commands", "#setup-load-recommended-button", "#setup-tls-ca-file", "#setup-tls-ca-pick-button"]
     },
     {
       "id": "admin.system-form.quantastor-ha", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: QuantaStor with SSH and HA on reveals the HA node rows. Nothing is saved.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "quantastor"}, {"check": "#setup-ssh-enabled"}, {"check": "#setup-ha-enabled"}, {"requireVisible": "[data-ha-node-host]"}, {"wait": 400}],
       "covers": ["#setup-platform", "#setup-ha-enabled", "[data-ha-node-system-id=0]", "[data-ha-node-label=0]", "[data-ha-node-host=0]", "[data-ha-node-system-id=1]", "[data-ha-node-label=1]", "[data-ha-node-host=1]", "[data-ha-node-system-id=2]", "[data-ha-node-label=2]", "[data-ha-node-host=2]"]
@@ -433,7 +433,7 @@
     {
       "id": "admin.system-form.esxi", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: ESXi with SSH on reveals the StorCLI host-preparation panel. Nothing is uploaded or installed.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "esxi"}, {"check": "#setup-ssh-enabled"}, {"requireVisible": "#setup-esxi-host-prep-pick-button"}, {"wait": 400}],
       "covers": ["#setup-platform", "#setup-esxi-host-prep-file", "#setup-esxi-host-prep-pick-button", "#setup-esxi-host-prep-package-select"]
@@ -441,7 +441,7 @@
     {
       "id": "admin.system-form.ssh-key", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved form edit: each SSH key source reveals its own fields. Generating or refreshing keys is never pressed here.",
       "matrix": {"mode": ["reuse", "generate", "manual", "none"]},
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"check": "#setup-ssh-enabled"}, {"select": "#setup-ssh-key-mode", "value": "{mode}"}, {"wait": 400}],
@@ -450,7 +450,7 @@
     {
       "id": "admin.storage-views.binding", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Unsaved draft edit: each storage-view binding mode reveals its own fields. Nothing is saved.",
       "matrix": {"binding": ["auto", "pool", "serial", "hybrid"]},
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"clickIfPresent": "[data-storage-view-id]"}, {"wait": 600}, {"selectIfVisible": "#setup-storage-view-binding-mode", "value": "{binding}"}, {"wait": 400}],
@@ -459,7 +459,7 @@
     {
       "id": "admin.storage-views", "page": "admin", "safety": "read", "ci": true,
       "appliance_load": true,
-      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}],
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
       "description": "Storage-view and page-order editing in the setup draft. Nothing is saved until Save System, which is forbidden.",
       "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"clickIfPresent": "[data-storage-view-id]"}, {"wait": 600}],
       "covers": ["#setup-view-order-reset-button", "[data-view-order-action]", "[data-view-order-action=up]", "[data-view-order-action=down]", "#setup-storage-view-template", "#setup-storage-view-add-button", "#setup-storage-view-label", "#setup-storage-view-id", "#setup-storage-view-template-select", "#setup-storage-view-profile", "#setup-storage-view-binding-mode", "#setup-storage-view-target-system", "#setup-storage-view-order", "#setup-storage-view-enabled", "#setup-storage-view-show-main", "#setup-storage-view-collapsed", "#setup-storage-view-enclosure-ids", "#setup-storage-view-pool-names", "#setup-storage-view-serials", "#setup-storage-view-pcie-addresses", "#setup-storage-view-device-names", "#setup-storage-view-slot-labels", "#setup-storage-view-slot-sizes", "#setup-storage-view-move-up-button", "#setup-storage-view-move-down-button", "#setup-storage-view-duplicate-button", "#setup-storage-view-remove-button", "[data-storage-view-id]", "[data-storage-view-candidate-id]", "#setup-storage-view-candidates-add-all-button"]
@@ -588,15 +588,6 @@
     {"key": "[data-path-key]", "reason": "Same as [data-bundle-type]."},
     {"key": "[data-export-enclosure-id]", "reason": "Per-enclosure export choices appear only on systems with more than one enclosure; the fixture has one."},
     {"key": "[data-fabric-breadcrumb]", "reason": "Trace breadcrumbs need a multi-hop trace the public demo fabric does not have."},
-    {"key": "[data-fabric-evidence-key]", "reason": "SAS diagnostics evidence needs collected diagnostic tables the public demo fixture does not carry; fabric.diagnostics runs on live crawls."},
-    {"key": "[data-fabric-diagnostic-table-key]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-page]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-page=prev]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-page=next]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-filter-key]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-type-key]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-severity-key]", "reason": "Same as [data-fabric-evidence-key]."},
-    {"key": "[data-fabric-diagnostic-confidence-key]", "reason": "Same as [data-fabric-evidence-key]."},
     {"key": "[data-runtime-action]", "reason": "Container controls need the admin runtime API, which the synthetic fixture does not answer (and their actions are forbidden)."},
     {"key": "[data-runtime-behavior-key]", "reason": "Runtime behaviour editor needs the admin runtime API, which the synthetic fixture does not answer."},
     {"key": "[data-sas-fabric-expand-slots]", "reason": "Shown only for Connections nodes with more bays than the collapsed row holds; the public demo fabric has none."},
