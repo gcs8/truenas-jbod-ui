@@ -18,7 +18,7 @@ from app import routes as app_routes
 
 
 class ReleaseStatusTests(unittest.TestCase):
-    def test_v0240_beta6_release_metadata_is_aligned(self) -> None:
+    def test_v0240_beta7_release_metadata_is_aligned(self) -> None:
         repository = Path(__file__).resolve().parents[1]
         package = json.loads((repository / "package.json").read_text(encoding="utf-8"))
         package_lock = json.loads((repository / "package-lock.json").read_text(encoding="utf-8"))
@@ -26,15 +26,17 @@ class ReleaseStatusTests(unittest.TestCase):
         roadmap = (repository / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
         wiki_home = (repository / "wiki" / "Home.md").read_text(encoding="utf-8")
         release_notes = (repository / "docs" / "RELEASE_NOTES_0.23.0.md").read_text(encoding="utf-8")
-        beta_notes = (repository / "docs" / "RELEASE_NOTES_0.24.0-beta.6.md").read_text(encoding="utf-8")
+        beta_notes = (repository / "docs" / "RELEASE_NOTES_0.24.0-beta.7.md").read_text(encoding="utf-8")
 
         from app import __version__
 
-        self.assertEqual(__version__, "0.24.0-beta.6")
-        self.assertEqual(package["version"], "0.24.0-beta.6")
-        self.assertEqual(package_lock["version"], "0.24.0-beta.6")
-        self.assertEqual(package_lock["packages"][""]["version"], "0.24.0-beta.6")
-        self.assertIn("# Release Notes - v0.24.0-beta.6", beta_notes)
+        self.assertEqual(__version__, "0.24.0-beta.7")
+        self.assertEqual(package["version"], "0.24.0-beta.7")
+        self.assertEqual(package_lock["version"], "0.24.0-beta.7")
+        self.assertEqual(package_lock["packages"][""]["version"], "0.24.0-beta.7")
+        self.assertIn("# Release Notes - v0.24.0-beta.7", beta_notes)
+        self.assertIn("## v0.24.0-beta.7 - 2026-11-09", changelog)
+        self.assertLess(changelog.index("## v0.24.0-beta.7"), changelog.index("## v0.24.0-beta.6"))
         self.assertIn("## v0.24.0-beta.6 - 2026-11-07", changelog)
         self.assertLess(changelog.index("## v0.24.0-beta.6"), changelog.index("## v0.24.0-beta.5"))
         self.assertIn("## v0.24.0-beta.5 - 2026-11-02", changelog)
