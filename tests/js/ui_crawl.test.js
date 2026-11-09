@@ -242,7 +242,12 @@ test("CLI refuses forbidden and live writes without a write system", () => {
   assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "forbidden"]), /never actuated/);
   assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led"]), /--write-system/);
   assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a"]), /--led-ledger/);
-  const args = cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a", "--led-ledger", "ledger.json"]);
+  // #1130/#1131: live write and LED actuation are refused until fixed; fixture runs keep them.
+  assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "led", "--write-system", "sys-a", "--led-ledger", "ledger.json"]), /live led actuation is disabled until #1131 is fixed/);
+  assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "app-write-revert", "--write-system", "sys-a"]), /live app-write-revert actuation is disabled until #1130 is fixed/);
+  assert.throws(() => cli.parseArgs(["--ui", ORIGIN, "--out", "x", "--allow", "app-write-revert,led", "--write-system", "sys-a", "--led-ledger", "l.json"]), /#1130 and #1131 are fixed/);
+  assert.deepEqual(cli.parseArgs(["--fixture", "f.json", "--out", "x", "--allow", "app-write-revert,led"]).allow, ["app-write-revert", "led"]);
+  const args = { ...cli.parseArgs(["--ui", ORIGIN, "--out", "x"]), allow: ["led"], writeSystem: "sys-a", ledLedger: "ledger.json" };
   const states = [
     { id: "r", page: "main", safety: "read" },
     { id: "all", page: "main", safety: "read", scope: "all" },

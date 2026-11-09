@@ -59,6 +59,10 @@ const FIXTURE_ORIGINS = {
 };
 const WATCHDOG_SCRIPT = path.join(__dirname, "..", "qa", "ui-crawl", "led-watchdog.js");
 const REPO_ROOT = path.resolve(__dirname, "..");
+// Live actuation stays off until these are fixed: a signal during a committed
+// write can skip its revert (#1130), and a delayed IDENTIFY can relight an LED
+// after cleanup drops its lease (#1131). Fixture crawls still exercise both.
+const LIVE_ACTUATION_DISABLED = Object.freeze({ "app-write-revert": "#1130", led: "#1131" });
 
 function parseArgs(argv) {
   const args = { pages: null, states: null, widths: null, systems: null, allow: [], paceMs: null, cdpEnv: "BROWSER_CDP_URL", axe: true };
@@ -105,6 +109,10 @@ function parseArgs(argv) {
   for (const cls of args.allow) if (!["app-write-revert", "led"].includes(cls)) throw new Error(`unknown class ${cls}`);
   if (args.allow.length && !args.fixture && !args.writeSystem) throw new Error("--allow on a live stack needs --write-system");
   if (args.allow.includes("led") && !args.fixture && !args.ledLedger) throw new Error("--allow led on a live stack needs --led-ledger (crash-safe identify cleanup)");
+  const disabled = args.fixture ? [] : args.allow.filter((cls) => LIVE_ACTUATION_DISABLED[cls]);
+  if (disabled.length) {
+    throw new Error(`live ${disabled.join(" and ")} actuation is disabled until ${disabled.map((cls) => LIVE_ACTUATION_DISABLED[cls]).join(" and ")} ${disabled.length > 1 ? "are" : "is"} fixed; run the live crawl read-only (drop --allow) or use --fixture`);
+  }
   return args;
 }
 

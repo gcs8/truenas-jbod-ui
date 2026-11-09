@@ -462,7 +462,12 @@ loads, once per load, bound to the target. A refresh state may declare
 `follow_up_ms` (at most 60 s) for the requests its refresh chain sends after
 the steps end: only its declared forced reads with budget left, bound to the
 target, until that time passes or the next page load starts; a later
-follow-up fails the run. `--allow app-write-revert,led
+follow-up fails the run. Live write and identify actuation is currently
+refused: `scripts/ui_crawl.js` rejects `--allow app-write-revert` and
+`--allow led` against a live stack until #1130 (a signal during a committed
+write can skip its revert) and #1131 (a delayed identify can relight a light
+after cleanup) are fixed. Fixture crawls still run those states. Once
+re-enabled, `--allow app-write-revert,led
 --write-system ID --led-ledger FILE` admits the declared writes of those
 states, bound to that system, the target enclosure and the captured object
 (the bay, or the enclosure for a rename, whose `object_id` must match the
