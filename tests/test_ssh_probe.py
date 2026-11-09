@@ -631,6 +631,35 @@ class SSHProbeTests(unittest.TestCase):
         self.assertTrue(stdout.closed)
         self.assertTrue(stderr.closed)
 
+    def test_expander_counter_commands_have_a_small_output_cap(self) -> None:
+        """Codex security P2 on #1088: chunked counter reads must not retain 4 MiB each."""
+        from app.services import core_expander_counters as counters
+
+        target = counters.SmpTarget(0, f"{1:016x}", "pass10", 4)
+        command = counters.build_phy_error_log_commands(target)[0]
+        cap = counters.SMP_MAX_OUTPUT_BYTES_PER_COMMAND
+        # The whole refresh's counter output stays small, whatever the server sends.
+        self.assertLessEqual(counters.SMP_MAX_COMMANDS_PER_REFRESH * cap, 16 * 1024 * 1024)
+        probe = SSHProbe(
+            SSHConfig(enabled=True, host="synthetic.example.test", user="operator", strict_host_key_checking=False)
+        )
+
+        def run(command_text: str, size: int):
+            client = MagicMock()
+            client.exec_command.return_value = _memory_streams(b"0" * size)
+            return probe._run_single_command(client, command_text)
+
+        oversized = run(command, cap + 1)
+        self.assertFalse(oversized.ok)
+        self.assertEqual(oversized.stdout, "")
+        self.assertIn(f"{cap}-byte limit", oversized.stderr)
+        self.assertTrue(run(command, cap).ok)
+        # Other commands keep the general limit.
+        self.assertTrue(run("synthetic command", cap + 1).ok)
+        # A real chunk's worst legitimate answer (a long error text per PHY,
+        # hex-dumped by od) fits with room to spare.
+        self.assertLess(4 * 3 * 2048, cap)
+
     @patch("app.services.ssh_probe.paramiko.SSHClient")
     def test_run_planned_commands_reuses_one_connection_for_dynamic_batches(
         self,

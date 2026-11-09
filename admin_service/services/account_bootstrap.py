@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives import serialization
 
 from app.config import Settings, SSHConfig, _derive_runtime_layout_paths, normalize_text
 from app.models.domain import SystemSetupBootstrapRequest
+from app.services.core_expander_counters import SMP_PHY_ERROR_LOG_SUDO_GRANT
 from app.services.ssh_key_manager import SSHKeyManager
 from app.services.ssh_probe import SSHProbe, redact_ssh_command
 
@@ -73,6 +74,12 @@ CORE_DMIDECODE_SUDO_COMMANDS = (
 )
 CORE_MESSAGES_SUDO_COMMANDS = (
     "/usr/bin/tail -n 4000 /var/log/messages",
+)
+# Expander PHY error counters (#941): one read-only rule for the whole command
+# shape, built at run time per pass device and PHY. Discovery reuses the mprutil
+# and camcontrol devlist reads above, so no smpphylist grant is needed.
+CORE_SMP_PHY_ERROR_LOG_SUDO_COMMANDS = (
+    SMP_PHY_ERROR_LOG_SUDO_GRANT,
 )
 # Device-specific probes the collection path builds at run time from discovered
 # devices. They never appear in an operator's saved command list, so the bootstrap
@@ -147,6 +154,7 @@ SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
+        *CORE_SMP_PHY_ERROR_LOG_SUDO_COMMANDS,
         *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
@@ -173,6 +181,7 @@ SUPPLEMENTAL_SUDO_COMMANDS_BY_PLATFORM: dict[str, tuple[str, ...]] = {
         *CORE_MPRUTIL_SUDO_COMMANDS,
         *CORE_DMIDECODE_SUDO_COMMANDS,
         *CORE_MESSAGES_SUDO_COMMANDS,
+        *CORE_SMP_PHY_ERROR_LOG_SUDO_COMMANDS,
         *CORE_MIDCLT_DISK_SYNC_SUDO_COMMANDS,
     ),
     "scale": (
