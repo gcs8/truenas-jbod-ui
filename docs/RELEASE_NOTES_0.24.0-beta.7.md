@@ -21,11 +21,19 @@ each pull request.
   as red. Tile text meets WCAG AA contrast on every heat colour, the heat value
   no longer covers the device name, and the enclosure title no longer stacks
   one letter per line when Heat Map is on.
-- A page reload right after a rename, or a bay-assignment save, while the
-  app's own background inventory refresh is running is now served instead of
-  answering 503 "server is busy". A request waits at most 5 seconds behind a
-  refresh, and a background refresh that runs past 5 minutes is stopped and its
-  late result discarded. The appliance call budget is unchanged.
+- A page reload right after a rename, a Refresh, or a bay-assignment save
+  while the app's own background inventory refresh is running is now served
+  instead of answering 503 "server is busy". Page loads and other reads wait
+  at most 5 seconds behind a refresh; Refresh and saves join the running
+  refresh, up to its 5-minute deadline, and start no second appliance read. A
+  background refresh that runs past 5 minutes is stopped and its late result
+  discarded. The appliance call budget is unchanged.
+- A bay-assignment save or clear made against a disk that has since left the
+  bay is refused with "The disk in this bay changed" instead of storing the old
+  disk's serial and notes on the bay, and the page reloads the bay to show the
+  new disk. Restoring bay assignments from a backup file names bays that now
+  hold a different disk in its preview, and refuses a confirmed preview with
+  "Bays changed since the preview" if a bay it writes got another disk since.
 - Storage Fabric on TrueNAS CORE shows SAS expander PHY error counters
   (invalid DWORD, running disparity, loss of DWORD sync, PHY reset problem)
   when the service account has the new read-only `camcontrol smpcmd` sudo rule.
@@ -56,6 +64,10 @@ each pull request.
   `SQLITE_TMPDIR` still overrides the history volume folder.
 - Health checks that validate the exact `/healthz` field set of the history
   service must accept the new informational `segment_conversion` field.
+- Scripts that save or clear bay assignments, or restore them from a backup
+  file, through the API should expect a 409 `mapping_disk_changed` or
+  `mapping_import_bays_changed` answer when the bay's disk changed; nothing is
+  written, and the bay or preview should be read again.
 - Upgrading from v0.23.0 or older, read the v0.24.0-beta.1 to v0.24.0-beta.6
   upgrade notes in `CHANGELOG.md` first; they all still apply.
 - The pre-release security review in #737 still has open items. They will be

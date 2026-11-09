@@ -37,9 +37,11 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
 - Heat-map colours use absolute temperature bands from each drive's SMART
   ratings or documented defaults instead of stretching across the bays in
   view, and tile text stays readable on every heat colour (#1104, #1105).
-- A page reload or bay-assignment save during the app's own background
-  refresh is served instead of answering 503 busy, and every wait behind a
-  refresh is bounded, with a deadline on the refresh itself (#1121, #1126).
+- A page reload, Refresh or bay-assignment save during the app's own
+  background refresh is served instead of answering 503 busy, every wait
+  behind a refresh is bounded, with a deadline on the refresh itself, and a
+  save made against a disk that has since left the bay is refused instead of
+  stored (#1121, #1126, #1140, #1142).
 - Storage Fabric on TrueNAS CORE shows SAS expander PHY error counters when
   the service account has the new read-only sudo rule (#1088).
 - Bays, Disk Path facts and cut-off path text have accessible names and full
@@ -77,6 +79,15 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
   a tmpfs `/tmp`, no longer needs that line added by hand. Setting
   `SQLITE_TMPDIR` for the history service still overrides it. Backups and
   exports never include the folder (#1094, #1095).
+- A bay-assignment save or clear made against a disk that has since left the
+  bay now answers 409 "The disk in this bay changed" (`mapping_disk_changed`)
+  and stores nothing; the page reloads the bay to show the new disk. Restoring
+  bay assignments from a backup file previews any bay that now holds a
+  different disk, and confirming a preview after a bay it writes got another
+  disk answers 409 "Bays changed since the preview"
+  (`mapping_import_bays_changed`) and writes nothing; preview it again. Scripts
+  that call these endpoints should treat these 409 answers like the existing
+  revision conflict (#1141, #1142).
 - Operators who update with `scripts/update_immutable_deployment.py`: the
   deployment directory, `.env` and every Compose file must now be owned by
   root or the user running the helper and not writable by group or others, and
