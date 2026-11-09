@@ -33,6 +33,7 @@ from app.services.mapping_store import (
     MappingScopeConflict,
     MappingStorageUnwritable,
     MappingStore,
+    bind_mapping_revision,
 )
 from app.services.profile_registry import ProfileRegistry
 from app.services.sas_fabric_alias_store import SasFabricAliasStorageUnwritable
@@ -135,7 +136,11 @@ class MappingImportRouteTests(unittest.TestCase):
             )
             registry = Mock()
             registry.get_service.return_value = service
-            revision = service.mapping_store.save_revision(system.id, top_id, 7)
+            # The editor's revision binds the (empty) bay's disk (#1141).
+            revision = bind_mapping_revision(
+                service.mapping_store.save_revision(system.id, top_id, 7),
+                service._slot_disk_binding(snapshot_for(top_id).slots[0]),
+            )
             payload = MappingRequest(
                 expected_revision=revision,
                 serial="SYNTHETIC",

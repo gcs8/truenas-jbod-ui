@@ -74,7 +74,17 @@ from app.services.combined_shelf_ids import (
     combined_mapping_warnings,
     combined_reference_warnings,
 )
-from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
+from app.services.mapping_store import (
+    MAPPING_REVISION_BINDING_LENGTH,
+    MappingImportBaysChanged,
+    MappingImportDigestMismatch,
+    MappingRevisionConflict,
+    MappingSlotDiskChanged,
+    MappingSlotDiskChangedBeforeClear,
+    MappingStore,
+    bind_mapping_revision,
+    resolve_physical_mapping_scope,
+)
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
@@ -1258,6 +1268,9 @@ class _BackgroundRefreshTicket:
     """One background refresh run; set ``abandoned`` once its deadline passed."""
 
     abandoned: bool = False
+    # Loop times when the run started and when it is abandoned (#1139).
+    started: float = 0.0
+    deadline: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1265,6 +1278,9 @@ class _SnapshotWaitBudget:
     """Seconds one user request has spent queued behind background work."""
 
     waited: float = 0.0
+    # A user Refresh joins a running refresh instead of answering busy at
+    # SNAPSHOT_REFRESH_WAIT_SECONDS (#1139); set at its first such wait.
+    join_until: float | None = None
 
 
 # Set inside each supervised background refresh worker (#1125). A worker whose
@@ -1276,6 +1292,25 @@ _background_refresh_ticket: ContextVar[_BackgroundRefreshTicket | None] = Contex
 _snapshot_wait_budget: ContextVar[_SnapshotWaitBudget | None] = ContextVar(
     "snapshot_wait_budget", default=None,
 )
+# Set by the routes that serve a user's Refresh (a forced read, #1139), and by
+# a bay-assignment save's or clear's pre-write read (#1141).
+_user_refresh: ContextVar[bool] = ContextVar("user_refresh", default=False)
+
+
+@contextmanager
+def user_refresh(enabled: bool = True):
+    """Mark reads in this block as a user's Refresh (#1139).
+
+    A Refresh that finds a background refresh running waits for it, up to that
+    refresh's own deadline, instead of answering busy after the short user
+    wait bound. A bay-assignment save's or clear's pre-write read joins the
+    same way (#1141). Other reads keep the short bound.
+    """
+    token = _user_refresh.set(enabled)
+    try:
+        yield
+    finally:
+        _user_refresh.reset(token)
 
 
 def _ticket_abandoned(ticket: _BackgroundRefreshTicket | None) -> bool:
@@ -1638,9 +1673,9 @@ class InventoryService:
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
         self._source_bundle_refresh_generation = -1
-        # Running background refresh workers and their loop start times,
-        # including abandoned ones that have not stopped yet (#1125).
-        self._background_refresh_workers: dict[asyncio.Task[Any], float] = {}
+        # Running background refresh workers and their tickets (start time and
+        # deadline), including abandoned ones that have not stopped yet (#1125).
+        self._background_refresh_workers: dict[asyncio.Task[Any], _BackgroundRefreshTicket] = {}
         # When the last background refresh was abandoned; cleared by the next
         # publication. Reads served meanwhile say how old they are.
         self._background_refresh_abandoned_at: datetime | None = None
@@ -1870,7 +1905,9 @@ class InventoryService:
         if not self._background_refresh_workers:
             return False
         now = asyncio.get_running_loop().time()
-        return any(now - started > SNAPSHOT_REFRESH_WAIT_SECONDS for started in self._background_refresh_workers.values())
+        return any(
+            now - ticket.started > SNAPSHOT_REFRESH_WAIT_SECONDS for ticket in self._background_refresh_workers.values()
+        )
 
     def _refresh_delay_warning(self, snapshot: InventorySnapshot) -> str | None:
         """Say how old a stale view is when its refresh is overdue or was abandoned (#1125)."""
@@ -1899,6 +1936,13 @@ class InventoryService:
         running, as before, so concurrent user requests still share one build.
         Each user request's waits share one total of SNAPSHOT_REFRESH_WAIT_SECONDS;
         its own work between waits is not counted (#1125).
+
+        A user's Refresh, and a bay-assignment write's pre-write read (#1141),
+        join the running refresh instead: they may wait until that refresh's
+        deadline, and at most BACKGROUND_REFRESH_DEADLINE_SECONDS in total from
+        the first such wait (#1139). It then reuses what the
+        running refresh published when that meets its freshness requirement.
+        An abandoned refresh is not waited on beyond the short bound.
         """
         if _in_background_refresh() or not self._background_refresh_workers:
             async with lock:
@@ -1908,8 +1952,17 @@ class InventoryService:
         budget = _snapshot_wait_budget.get() or _SnapshotWaitBudget()
         loop = asyncio.get_running_loop()
         started = loop.time()
+        wait_seconds = SNAPSHOT_REFRESH_WAIT_SECONDS - budget.waited
+        if _user_refresh.get():
+            if budget.join_until is None:
+                budget.join_until = started + BACKGROUND_REFRESH_DEADLINE_SECONDS
+            running_deadlines = [
+                ticket.deadline for ticket in self._background_refresh_workers.values() if not ticket.abandoned
+            ]
+            if running_deadlines:
+                wait_seconds = max(wait_seconds, min(max(running_deadlines), budget.join_until) - started)
         try:
-            async with asyncio.timeout(max(0.0, SNAPSHOT_REFRESH_WAIT_SECONDS - budget.waited)):
+            async with asyncio.timeout(max(0.0, wait_seconds)):
                 await lock.acquire()
         except TimeoutError:
             logger.debug("A request stopped waiting for a running background inventory refresh.")
@@ -4607,11 +4660,15 @@ class InventoryService:
         replacement refresh stays within the call budget.
         """
         loop = asyncio.get_running_loop()
-        ticket = _BackgroundRefreshTicket()
+        now = loop.time()
+        ticket = _BackgroundRefreshTicket(started=now, deadline=now + BACKGROUND_REFRESH_DEADLINE_SECONDS)
         context = copy_context()
         context.run(_background_refresh_ticket.set, ticket)
+        # A Refresh that scheduled this work does not make the work itself a
+        # Refresh; the ticket above already marks it as background.
+        context.run(_user_refresh.set, False)
         task = asyncio.create_task(work, context=context)
-        self._background_refresh_workers[task] = loop.time()
+        self._background_refresh_workers[task] = ticket
 
         def _abandon() -> None:
             if task.done():
@@ -4631,7 +4688,7 @@ class InventoryService:
             )
             unregister(task)
 
-        deadline = loop.call_later(BACKGROUND_REFRESH_DEADLINE_SECONDS, _abandon)
+        deadline = loop.call_at(ticket.deadline, _abandon)
 
         def _finished(done: asyncio.Task[Any]) -> None:
             deadline.cancel()
@@ -6727,6 +6784,66 @@ class InventoryService:
             reason=None,
         )
 
+    @staticmethod
+    def _slot_disk_binding(slot_view: SlotView | None) -> str:
+        """Digest of the disk in a bay, bound into its editor revisions (#1141).
+
+        The identity is the first strong identifier the bay shows (serial,
+        logical unit id, then persistent id), the same set that decides whether
+        an occupied bay's disk is known. An empty or missing bay binds as empty;
+        an occupied bay without a strong identifier binds as unknown, so a swap
+        between two such disks cannot be told apart. The reusable device name
+        and the bay's SAS address are not part of it.
+        """
+        if slot_view is None or not slot_view.present or slot_view.state == SlotState.empty:
+            identity: list[str | None] = ["empty"]
+        else:
+            identity = ["occupied", None, None]
+            for field_name in STRONG_SLOT_IDENTITY_FIELDS:
+                value = normalize_text(getattr(slot_view, field_name))
+                if value:
+                    identity = ["occupied", field_name, value.casefold()]
+                    break
+        digest = hashlib.sha256(
+            json.dumps(["mapping-slot-disk-v1", *identity], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return digest[:MAPPING_REVISION_BINDING_LENGTH]
+
+    @staticmethod
+    def _refuse_if_slot_disk_changed(
+        expected_revision: str | None,
+        conflict: MappingRevisionConflict,
+        binding: str,
+        changed: type[MappingSlotDiskChanged],
+    ) -> None:
+        """Name a disk change when it alone made the write's revision stale (#1141).
+
+        The store compared the editor's revision with its own current digest
+        bound to the disk the pre-write read found. When the store part still
+        matches, only the disk differs.
+        """
+        split = len(conflict.current_revision) - MAPPING_REVISION_BINDING_LENGTH
+        if (
+            expected_revision is not None
+            and len(expected_revision) == len(conflict.current_revision)
+            and expected_revision[:split] == conflict.current_revision[:split]
+            and expected_revision[split:] != binding
+        ):
+            raise changed(conflict.current_revision) from conflict
+
+    async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
+        """Read the current view a bay-assignment write is checked against.
+
+        The read is strict: an expired view is not good enough to decide whether
+        the bay can take an assignment and which enclosure it belongs to. If the
+        page's own refresh is running, the read joins it like a user Refresh
+        (#1141), bounded by that refresh's deadline and the same total cap, and
+        reuses what it publishes. A refresh past its deadline still answers the
+        retryable busy error before anything is written.
+        """
+        with user_refresh():
+            return await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+
     async def save_mapping(
         self,
         slot: int,
@@ -6736,7 +6853,7 @@ class InventoryService:
         expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> ManualMapping:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if slot_view is not None and not slot_view.mapping_supported:
             raise TrueNASAPIError(
@@ -6752,7 +6869,17 @@ class InventoryService:
             enclosure_id=enclosure_id,
             **payload,
         )
-        saved = self.mapping_store.save_mapping(mapping, expected_revision=expected_revision)
+        # The editor's revision is bound to the disk it showed; the bay's disk
+        # as the pre-write read found it is bound here, so a write prepared
+        # against another disk is refused before anything is stored (#1141).
+        binding = self._slot_disk_binding(slot_view)
+        try:
+            saved = self.mapping_store.save_mapping(
+                mapping, expected_revision=expected_revision, revision_binding=binding,
+            )
+        except MappingRevisionConflict as conflict:
+            self._refuse_if_slot_disk_changed(expected_revision, conflict, binding, MappingSlotDiskChanged)
+            raise
         if invalidate_snapshot:
             self.invalidate_physical_enclosure_snapshot_cache(
                 reason="save_mapping",
@@ -6768,7 +6895,7 @@ class InventoryService:
         expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> bool:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if slot_view is not None and not slot_view.mapping_supported:
             raise TrueNASAPIError(
@@ -6778,12 +6905,20 @@ class InventoryService:
         enclosure_id = resolve_physical_mapping_scope(
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
-        cleared = self.mapping_store.clear_mapping(
-            self.system.id,
-            enclosure_id,
-            slot,
-            expected_revision=expected_revision,
-        )
+        binding = self._slot_disk_binding(slot_view)
+        try:
+            cleared = self.mapping_store.clear_mapping(
+                self.system.id,
+                enclosure_id,
+                slot,
+                expected_revision=expected_revision,
+                revision_binding=binding,
+            )
+        except MappingRevisionConflict as conflict:
+            self._refuse_if_slot_disk_changed(
+                expected_revision, conflict, binding, MappingSlotDiskChangedBeforeClear,
+            )
+            raise
         if cleared and invalidate_snapshot:
             self.invalidate_physical_enclosure_snapshot_cache(
                 reason="clear_mapping",
@@ -8009,6 +8144,89 @@ class InventoryService:
         ):
             raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
 
+    @staticmethod
+    def _mapping_import_written_bays(preview: dict[str, Any]) -> list[tuple[str | None, int]]:
+        """The bays a restore writes: assignments it adds, changes or removes."""
+        return sorted(
+            {
+                (entry["enclosure_id"], entry["slot"])
+                for kind in ("additions", "updates", "removals")
+                for entry in preview[kind]
+            },
+            key=lambda bay: (bay[0] or "", bay[1]),
+        )
+
+    async def _read_mapping_import_bays(
+        self,
+        bays: list[tuple[str | None, int]],
+        selected_enclosure_id: str | None,
+    ) -> dict[tuple[str | None, int], SlotView | None]:
+        """The bays a restore writes, as the strict pre-write read finds them (#1141).
+
+        The read is the one a save makes, joined to a running refresh. A bay
+        outside the selected view (another drawer of the same shelf, or another
+        enclosure in an unscoped restore) is read from its own enclosure's view
+        when that enclosure is known; a bay no view shows reads as absent.
+        """
+        if not bays:
+            return {}
+        views: dict[tuple[str | None, int], SlotView] = {}
+
+        def collect(snapshot: InventorySnapshot) -> None:
+            for slot_view in snapshot.slots:
+                views.setdefault((resolve_physical_mapping_scope(slot_view.enclosure_id), slot_view.slot), slot_view)
+
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
+        collect(snapshot)
+        known = {option.id for option in snapshot.enclosures}
+        read = {selected_enclosure_id, snapshot.selected_enclosure_id}
+        for enclosure_id in sorted({bay[0] for bay in bays if bay not in views and bay[0] is not None}):
+            if enclosure_id in known and enclosure_id not in read:
+                read.add(enclosure_id)
+                collect(await self._get_pre_write_snapshot(enclosure_id))
+        return {bay: views.get(bay) for bay in bays}
+
+    def _mapping_import_bays_binding(
+        self,
+        bay_views: dict[tuple[str | None, int], SlotView | None],
+    ) -> str:
+        """Digest of the disks in the bays a restore writes, bound into its import digest."""
+        identity = [
+            [bay[0], bay[1], self._slot_disk_binding(bay_views[bay])]
+            for bay in sorted(bay_views, key=lambda item: (item[0] or "", item[1]))
+        ]
+        digest = hashlib.sha256(
+            json.dumps(["mapping-import-bays-v1", identity], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return digest[:MAPPING_REVISION_BINDING_LENGTH]
+
+    @staticmethod
+    def _mapping_import_disk_warning(
+        bay: tuple[str | None, int],
+        mapping: ManualMapping,
+        slot_view: SlotView | None,
+    ) -> dict[str, Any] | None:
+        """Name a bay whose current disk is not the one the backup row names.
+
+        The backup row names its disk by serial, or else by persistent id. A
+        bay that shows no value for that identifier cannot be compared.
+        """
+        for field_name in ("serial", "gptid"):
+            backup = normalize_text(getattr(mapping, field_name))
+            if backup:
+                break
+        else:
+            return None
+        if slot_view is None:
+            return None
+        if not slot_view.present or slot_view.state == SlotState.empty:
+            current = None
+        else:
+            current = normalize_text(getattr(slot_view, field_name))
+            if not current or current.casefold() == backup.casefold():
+                return None
+        return {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+
     async def preview_mapping_bundle(
         self,
         bundle: MappingBundle,
@@ -8022,8 +8240,34 @@ class InventoryService:
             mapping_enclosure_id,
             rewritten,
         )
+        # Record the disk in every bay the restore writes and bind them into
+        # the digest the confirmation returns, so a confirmation after any of
+        # those disks changed is refused (#1141). Name the bays whose disk is
+        # not the one the backup row names; restoring onto them stays the
+        # user's choice.
+        bays = self._mapping_import_written_bays(preview)
+        bay_views = await self._read_mapping_import_bays(bays, selected_enclosure_id)
+        incoming = {
+            (resolve_physical_mapping_scope(mapping.enclosure_id), mapping.slot): mapping
+            for mapping in rewritten
+        }
+        written = {
+            (entry["enclosure_id"], entry["slot"])
+            for kind in ("additions", "updates")
+            for entry in preview[kind]
+        }
+        disk_warnings = [
+            warning
+            for bay in bays
+            if bay in written and bay in incoming
+            and (warning := self._mapping_import_disk_warning(bay, incoming[bay], bay_views[bay])) is not None
+        ]
         return {
             **preview,
+            "import_digest": bind_mapping_revision(
+                preview["import_digest"], self._mapping_import_bays_binding(bay_views),
+            ),
+            "disk_warnings": disk_warnings,
             "system_id": self.system.id,
             "enclosure_id": mapping_enclosure_id,
         }
@@ -8040,13 +8284,41 @@ class InventoryService:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        result = self.mapping_store.apply_mapping_import(
+        preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
             mapping_enclosure_id,
             rewritten,
-            expected_revision=expected_revision,
-            import_digest=import_digest,
         )
+        if preview["revision"] != expected_revision:
+            # Already stale: refuse before reading the bays.
+            raise MappingRevisionConflict(preview["revision"])
+        # The confirmation is bound to the disks its preview saw in the bays it
+        # writes. Read them as a save does, strict and joined to a running
+        # refresh, and refuse before writing if any of them changed (#1141).
+        bay_views = await self._read_mapping_import_bays(
+            self._mapping_import_written_bays(preview), selected_enclosure_id,
+        )
+        binding = self._mapping_import_bays_binding(bay_views)
+        try:
+            result = self.mapping_store.apply_mapping_import(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+                expected_revision=expected_revision,
+                import_digest=import_digest,
+                import_digest_binding=binding,
+            )
+        except MappingImportDigestMismatch as mismatch:
+            split = len(mismatch.current_import_digest) - MAPPING_REVISION_BINDING_LENGTH
+            if (
+                len(import_digest) == len(mismatch.current_import_digest)
+                and import_digest[:split] == mismatch.current_import_digest[:split]
+                and import_digest[split:] != binding
+            ):
+                # The bundle and the stored assignments match the preview;
+                # only the disks in the bays differ.
+                raise MappingImportBaysChanged(mismatch.current_revision) from mismatch
+            raise
         if invalidate_snapshot:
             self.invalidate_snapshot_cache(reason="import_mapping_bundle")
         return {
@@ -8350,15 +8622,19 @@ class InventoryService:
             targets,
             loaded_entries=loaded_entries,
         )
+        # Each bay's revisions also bind the disk in it, so an editor opened
+        # on one disk cannot save or clear after another took its place (#1141).
         return [
             slot.model_copy(
                 update={
-                    "mapping_revision": save_revisions[
-                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
-                    ],
-                    "mapping_clear_revision": clear_revisions[
-                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
-                    ],
+                    "mapping_revision": bind_mapping_revision(
+                        save_revisions[(resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)],
+                        self._slot_disk_binding(slot),
+                    ),
+                    "mapping_clear_revision": bind_mapping_revision(
+                        clear_revisions[(resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)],
+                        self._slot_disk_binding(slot),
+                    ),
                 }
             )
             for slot in slots

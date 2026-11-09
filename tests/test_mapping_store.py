@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from tests.mapping_fixtures import write_v1_mappings
 from app.models.domain import ManualMapping, SlotView
 from app.services.mapping_store import (
+    MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingScopeConflict,
     MappingStore,
@@ -1034,6 +1035,99 @@ class MappingStoreImportTests(unittest.TestCase):
                 0,
                 expected_revision=clear_revision,
             ))
+
+    def test_bound_save_and_clear_revisions_check_the_binding_under_the_store_lock(self) -> None:
+        # A caller can bind the bay's disk identity into a revision (#1141).
+        # The bound revision only matches when both the saved assignments and
+        # the binding the caller passes at write time are unchanged.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            disk_a = "a" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            disk_b = "b" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            save_revision = store.save_revision("system-a", "enc-a", 0)
+            bound_save = mapping_store_module.bind_mapping_revision(save_revision, disk_a)
+            self.assertEqual(len(bound_save), len(save_revision))
+            self.assertTrue(bound_save.endswith(disk_a))
+            self.assertNotEqual(bound_save, save_revision)
+
+            with self.assertRaises(MappingRevisionConflict) as raised:
+                store.save_mapping(
+                    ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, notes="disk A"),
+                    expected_revision=bound_save,
+                    revision_binding=disk_b,
+                )
+            self.assertEqual(
+                raised.exception.current_revision,
+                mapping_store_module.bind_mapping_revision(save_revision, disk_b),
+            )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+            # An unbound store revision does not satisfy a bound write either.
+            with self.assertRaises(MappingRevisionConflict):
+                store.save_mapping(
+                    ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, notes="disk A"),
+                    expected_revision=save_revision,
+                    revision_binding=disk_a,
+                )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+            store.save_mapping(
+                ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, notes="disk A"),
+                expected_revision=bound_save,
+                revision_binding=disk_a,
+            )
+            bound_clear = mapping_store_module.bind_mapping_revision(
+                store.clear_revision("system-a", "enc-a", 0), disk_a,
+            )
+            with self.assertRaises(MappingRevisionConflict):
+                store.clear_mapping(
+                    "system-a", "enc-a", 0, expected_revision=bound_clear, revision_binding=disk_b,
+                )
+            self.assertEqual(store.get_mapping("system-a", "enc-a", 0).notes, "disk A")
+            self.assertTrue(store.clear_mapping(
+                "system-a", "enc-a", 0, expected_revision=bound_clear, revision_binding=disk_a,
+            ))
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+    def test_bound_import_digest_checks_the_binding_under_the_store_lock(self) -> None:
+        # The inventory binds the disks in the bays an import writes into the
+        # preview's import digest (#1141). The bound digest only matches when
+        # the bundle, the stored assignments and that binding are unchanged.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            bays_a = "a" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            bays_b = "b" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            incoming = [ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, serial="SANITIZED-A")]
+            preview = store.preview_replace_mappings("system-a", "enc-a", incoming)
+            bound = mapping_store_module.bind_mapping_revision(preview["import_digest"], bays_a)
+            self.assertEqual(len(bound), len(preview["import_digest"]))
+            self.assertTrue(bound.endswith(bays_a))
+
+            with self.assertRaises(MappingImportDigestMismatch) as raised:
+                store.apply_mapping_import(
+                    "system-a", "enc-a", incoming,
+                    expected_revision=preview["revision"], import_digest=bound, import_digest_binding=bays_b,
+                )
+            self.assertEqual(
+                raised.exception.current_import_digest,
+                mapping_store_module.bind_mapping_revision(preview["import_digest"], bays_b),
+            )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+            # The unbound store digest does not satisfy a bound import either.
+            with self.assertRaises(MappingImportDigestMismatch):
+                store.apply_mapping_import(
+                    "system-a", "enc-a", incoming,
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                    import_digest_binding=bays_a,
+                )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+            result = store.apply_mapping_import(
+                "system-a", "enc-a", incoming,
+                expected_revision=preview["revision"], import_digest=bound, import_digest_binding=bays_a,
+            )
+            self.assertEqual(result["saved_count"], 1)
+            self.assertEqual(store.get_mapping("system-a", "enc-a", 0).serial, "SANITIZED-A")
 
     def test_fallback_clear_rejects_concurrent_change_elsewhere_in_exact_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3656,8 +3750,18 @@ class MappingRevisionBatchTests(unittest.TestCase):
                      patch.object(store, "_classify_row", wraps=store._classify_row) as classifications:
                     result = InventoryService._attach_mapping_revisions(service, slots)
                 self.assertEqual(len(result), count)
-                self.assertEqual([s.mapping_revision for s in result], list(expected_save.values()))
-                self.assertEqual([s.mapping_clear_revision for s in result], list(expected_clear.values()))
+                # Each slot's store revisions, bound to the disk in that bay (#1141).
+                bindings = [InventoryService._slot_disk_binding(slot) for slot in slots]
+                self.assertEqual(
+                    [s.mapping_revision for s in result],
+                    [mapping_store_module.bind_mapping_revision(revision, binding)
+                     for revision, binding in zip(expected_save.values(), bindings)],
+                )
+                self.assertEqual(
+                    [s.mapping_clear_revision for s in result],
+                    [mapping_store_module.bind_mapping_revision(revision, binding)
+                     for revision, binding in zip(expected_clear.values(), bindings)],
+                )
                 self.assertEqual(store.file_path.read_bytes(), before)
                 self.assertLessEqual(reads.call_count, 2)
                 self.assertLessEqual(classifications.call_count, 2 * len(rows))

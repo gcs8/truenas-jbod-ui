@@ -11036,6 +11036,7 @@
       const failure = new Error(payload?.detail || `Request failed with ${response.status}`);
       failure.status = response.status;
       failure.detail = payload?.detail ?? null;
+      failure.code = typeof payload?.error === "string" ? payload.error : null;
       throw failure;
     }
     return payload;
@@ -11601,6 +11602,19 @@
     }
   }
 
+  // The server refused a bay-assignment save or clear because another disk
+  // now sits in the bay (#1141). The draft belongs to the old disk: drop it,
+  // reload the view so the bay shows the new disk, and say why.
+  async function reloadAfterMappingDiskChange(error) {
+    const message = error.detail || error.message;
+    state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
+    state.mappingFormDirty = false;
+    await refreshSnapshot(false, "mapping-disk-changed");
+    setStatus(message, "error");
+  }
+
   async function saveMapping(event) {
     if (state.snapshotMode) {
       setStatus("Mapping changes are disabled in an offline snapshot export.", "error");
@@ -11662,6 +11676,10 @@
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
+      if (Number(error?.status) === 409 && error?.code === "mapping_disk_changed") {
+        await reloadAfterMappingDiskChange(error);
+        return;
+      }
       handleWriteRejection(error);
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
     } finally {
@@ -11725,6 +11743,10 @@
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
+      if (Number(error?.status) === 409 && error?.code === "mapping_disk_changed") {
+        await reloadAfterMappingDiskChange(error);
+        return;
+      }
       handleWriteRejection(error);
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
     } finally {
@@ -11787,12 +11809,25 @@
     const updates = preview?.updates || [];
     const removals = preview?.removals || [];
     const unchanged = preview?.unchanged || [];
+    // Bays whose disk is not the one the backup names (#1141).
+    const diskWarnings = preview?.disk_warnings || [];
+    const formatDiskWarning = (entry) => {
+      const label = fieldLabel(entry.field);
+      const now = entry.current === null || entry.current === undefined
+        ? "bay now empty"
+        : `bay now ${label} ${formatValue(entry.current)}`;
+      return `backup ${label} ${formatValue(entry.backup)}, ${now}`;
+    };
     return [
       "Restore these bay assignments?",
       `Add (${additions.length}): ${formatEntries(additions, (entry) => formatRecord(entry.incoming))}`,
       `Update (${updates.length}): ${formatEntries(updates, (entry) => formatChanges(entry.changes))}`,
       `Remove (${removals.length}): ${formatEntries(removals, (entry) => formatRecord(entry.current))}`,
       `Unchanged (${unchanged.length}): ${formatEntries(unchanged, () => "")}`,
+      ...(diskWarnings.length ? [
+        `This bay now holds a different disk (${diskWarnings.length}): ${formatEntries(diskWarnings, formatDiskWarning)}`,
+        "Confirming restores the backup's assignments to these bays anyway.",
+      ] : []),
       "If the inventory changes before you confirm, the restore is canceled.",
     ].join("\n");
   }
@@ -11857,6 +11892,13 @@
       setStatus(`Restored ${result.imported} bay assignment${result.imported === 1 ? "" : "s"}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
+      if (Number(error?.status) === 409 && error?.code === "mapping_import_bays_changed") {
+        // A bay the restore writes holds another disk than at its preview
+        // (#1141): show the current bays, then ask for a new preview.
+        await refreshSnapshot(false, "mapping-import-bays-changed");
+        setStatus(error.detail || error.message, "error");
+        return;
+      }
       handleWriteRejection(error);
       setStatus(`Restore failed: ${error.message || error}`, "error");
     } finally {

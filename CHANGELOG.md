@@ -125,6 +125,29 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
   rules: a request before the first inventory read finishes answers a
   retryable 503 saying no inventory has been read yet. The appliance call
   budget is unchanged (#1125, #1126).
+- Fixed Refresh failing with "The inventory is still refreshing" when it was
+  pressed while the app's own background refresh took longer than 5 seconds.
+  A Refresh (a forced inventory, SAS fabric or storage-view read) now waits for
+  the running refresh, up to that refresh's 5-minute deadline, then shows a
+  view read after it was pressed. It starts no appliance read while the other
+  one runs. A refresh that misses its deadline still shows an error, and page
+  loads and other reads keep the 5-second wait (#1139, #1140).
+- Fixed a bay-assignment save or clear failing with 503 "The inventory is
+  still refreshing" when the shelf's cached view had expired and the app's own
+  background refresh took longer than 5 seconds. The save now waits for the
+  running refresh like Refresh does, up to that refresh's 5-minute deadline,
+  checks the bay against the view it published and then stores the assignment.
+  It starts no appliance read while the other one runs. A refresh that misses
+  its deadline still answers a retryable 503 before anything is written, and a
+  save based on a view another save replaced is still refused. A save or clear
+  made against a disk that has since left the bay, found by that read or by an
+  earlier one, is now refused with 409 "The disk in this bay changed" and
+  stores nothing, where it used to store the old disk's serial and notes on
+  the bay or clear them; the page then reloads the bay to show the new disk.
+  Restoring bay assignments from a backup file is bound the same way: the
+  preview names any bay that now holds a different disk than the backup, and
+  confirming a preview after a bay it writes got another disk is refused with
+  409 "Bays changed since the preview" and writes nothing (#1141, #1142).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for

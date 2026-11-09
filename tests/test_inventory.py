@@ -65,7 +65,12 @@ from app.services.inventory import (
     parse_size_to_bytes,
     resolve_persistent_id,
 )
-from app.services.mapping_store import MappingRevisionConflict, MappingScopeConflict, MappingStore
+from app.services.mapping_store import (
+    MappingRevisionConflict,
+    MappingScopeConflict,
+    MappingStore,
+    bind_mapping_revision,
+)
 from app.services.parsers import (
     LinuxScsiDevice,
     ParsedSSHData,
@@ -8955,13 +8960,15 @@ Consumers:
 
             revised = service._attach_mapping_revisions([slot])[0]
 
+            # The store's revisions, bound to the (empty) bay's disk (#1141).
+            binding = service._slot_disk_binding(slot)
             self.assertEqual(
                 revised.mapping_revision,
-                service.mapping_store.save_revision(system.id, "enc-a", 1),
+                bind_mapping_revision(service.mapping_store.save_revision(system.id, "enc-a", 1), binding),
             )
             self.assertEqual(
                 revised.mapping_clear_revision,
-                service.mapping_store.clear_revision(system.id, "enc-a", 1),
+                bind_mapping_revision(service.mapping_store.clear_revision(system.id, "enc-a", 1), binding),
             )
 
 
@@ -12083,7 +12090,10 @@ class InventoryServiceSmartSummaryTests(unittest.IsolatedAsyncioTestCase):
         for slot in snapshot.slots:
             self.assertEqual(
                 getattr(slot, "mapping_revision", None),
-                service.mapping_store.save_revision(system.id, slot.enclosure_id, slot.slot),
+                bind_mapping_revision(
+                    service.mapping_store.save_revision(system.id, slot.enclosure_id, slot.slot),
+                    service._slot_disk_binding(slot),
+                ),
             )
         self.assertEqual(
             [option.id for option in snapshot.enclosures],
@@ -19150,7 +19160,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["imported"], 1)
             self.assertEqual(result["previous_revision"], preview["revision"])
             self.assertNotEqual(result["revision"], preview["revision"])
-            self.assertEqual(service.get_snapshot.await_count, 0)
+            # The preview and the confirmation each read the bays the restore
+            # writes, as a save does (#1141); neither forces a refresh.
+            self.assertEqual(service.get_snapshot.await_count, 2)
+            for call in service.get_snapshot.await_args_list:
+                self.assertFalse(call.kwargs.get("force_refresh", False))
             self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
     async def test_preview_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_preview(self) -> None:
@@ -19410,7 +19424,10 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 refresh_interval_seconds=30,
             )
             service.get_snapshot = AsyncMock(return_value=snapshot)
-            revision = service.mapping_store.clear_revision(system.id, "enc-a", 0)
+            revision = bind_mapping_revision(
+                service.mapping_store.clear_revision(system.id, "enc-a", 0),
+                service._slot_disk_binding(snapshot.slots[0]),
+            )
 
             cleared = await service.clear_mapping(
                 0,
@@ -19466,7 +19483,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                     selected_enclosure_id
                 )
             )
-            first_revision = service.mapping_store.save_revision(system.id, top_id, 7)
+            def bound(revision: str) -> str:
+                # The editor's revision binds the bay's disk; this bay is empty (#1141).
+                return bind_mapping_revision(revision, service._slot_disk_binding(snapshot_for(None).slots[0]))
+
+            first_revision = bound(service.mapping_store.save_revision(system.id, top_id, 7))
             saved = await service.save_mapping(
                 7,
                 {"serial": "FIRST"},
@@ -19476,13 +19497,13 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(saved.enclosure_id, physical_id)
 
-            stale_save = service.mapping_store.save_revision(system.id, top_id, 7)
-            stale_clear = service.mapping_store.clear_revision(system.id, top_id, 7)
+            stale_save = bound(service.mapping_store.save_revision(system.id, top_id, 7))
+            stale_clear = bound(service.mapping_store.clear_revision(system.id, top_id, 7))
             updated = await service.save_mapping(
                 7,
                 {"serial": "SECOND"},
                 selected_enclosure_id=bottom_id,
-                expected_revision=service.mapping_store.save_revision(system.id, bottom_id, 7),
+                expected_revision=bound(service.mapping_store.save_revision(system.id, bottom_id, 7)),
                 invalidate_snapshot=False,
             )
             self.assertEqual(updated.enclosure_id, physical_id)
@@ -19534,7 +19555,7 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final_export.enclosure_id, physical_id)
             self.assertEqual(final_export.mappings[0].serial, "IMPORTED")
 
-            clear_revision = service.mapping_store.clear_revision(system.id, bottom_id, 7)
+            clear_revision = bound(service.mapping_store.clear_revision(system.id, bottom_id, 7))
             self.assertTrue(await service.clear_mapping(
                 7,
                 selected_enclosure_id=top_id,
@@ -21854,14 +21875,16 @@ class MappingCorrelationCostTests(unittest.TestCase):
             store.save_mapping(ManualMapping(system_id=service.system.id,
                                              enclosure_id="synthetic-shelf", slot=0,
                                              serial="SYNTHETIC-1"),
-                               expected_revision=first.slots[0].mapping_revision)
+                               expected_revision=first.slots[0].mapping_revision,
+                               revision_binding=service._slot_disk_binding(first.slots[0]))
             second = self.snapshot(service)
             self.assertEqual(first.slots[0].serial, "SYNTHETIC-0")
             self.assertEqual(second.slots[0].serial, "SYNTHETIC-1")
             self.assertNotEqual(first.slots[0].mapping_revision, second.slots[0].mapping_revision)
             with self.assertRaises(MappingRevisionConflict):
                 store.clear_mapping(service.system.id, "synthetic-shelf", 0,
-                                    expected_revision=first.slots[0].mapping_clear_revision)
+                                    expected_revision=first.slots[0].mapping_clear_revision,
+                                    revision_binding=service._slot_disk_binding(first.slots[0]))
 
 
 class ReviewRegressionTests(unittest.TestCase):

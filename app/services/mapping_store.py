@@ -50,12 +50,48 @@ def resolve_physical_mapping_scope(enclosure_id: str | None) -> str | None:
     return enclosure_id
 
 
+# A save or clear revision can carry a caller's binding in its last
+# MAPPING_REVISION_BINDING_LENGTH hex digits (#1141): the inventory binds the
+# identity of the disk in the bay, so an editor opened on one disk cannot write
+# after another disk took its place. The rest of the revision is the store's own
+# digest, so a bound revision still changes with every assignment change.
+MAPPING_REVISION_BINDING_LENGTH = 16
+
+
+def bind_mapping_revision(revision: str, binding: str | None) -> str:
+    """Return `revision` with its tail replaced by `binding` (unchanged when None)."""
+    if binding is None:
+        return revision
+    if len(binding) != MAPPING_REVISION_BINDING_LENGTH or len(revision) <= len(binding):
+        raise ValueError("Invalid mapping revision binding.")
+    return revision[: len(revision) - len(binding)] + binding
+
+
 class MappingRevisionConflict(RuntimeError):
     public_detail = "Mapping scope revision changed before this write."
+    error_code = "mapping_revision_conflict"
 
     def __init__(self, current_revision: str) -> None:
         super().__init__(self.public_detail)
         self.current_revision = current_revision
+
+
+class MappingSlotDiskChanged(MappingRevisionConflict):
+    """The bay holds another disk than the one the write was prepared against (#1141)."""
+
+    public_detail = "The disk in this bay changed. Reload to see it, then save again."
+    error_code = "mapping_disk_changed"
+
+
+class MappingSlotDiskChangedBeforeClear(MappingSlotDiskChanged):
+    public_detail = "The disk in this bay changed. Reload to see it, then clear again."
+
+
+class MappingImportBaysChanged(MappingRevisionConflict):
+    """A bay the confirmed restore writes holds another disk than at its preview (#1141)."""
+
+    public_detail = "Bays changed since the preview. Preview the import again."
+    error_code = "mapping_import_bays_changed"
 
 
 class MappingImportDigestMismatch(RuntimeError):
@@ -1212,16 +1248,20 @@ class MappingStore:
         mapping: ManualMapping,
         *,
         expected_revision: str | None = None,
+        revision_binding: str | None = None,
     ) -> ManualMapping:
         with self._lock:
             state = self._load_state()
             mapping = self._canonical_mapping(mapping)
             if expected_revision is not None:
-                current_revision = self._save_revision_from_state(
-                    state,
-                    mapping.system_id,
-                    mapping.enclosure_id,
-                    mapping.slot,
+                current_revision = bind_mapping_revision(
+                    self._save_revision_from_state(
+                        state,
+                        mapping.system_id,
+                        mapping.enclosure_id,
+                        mapping.slot,
+                    ),
+                    revision_binding,
                 )
                 if current_revision != expected_revision:
                     raise MappingRevisionConflict(current_revision)
@@ -1250,13 +1290,17 @@ class MappingStore:
         slot: int,
         *,
         expected_revision: str | None = None,
+        revision_binding: str | None = None,
     ) -> bool:
         with self._lock:
             state = self._load_state()
             enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             if expected_revision is not None:
-                current_revision = self._clear_revision_from_state(
-                    state, system_id, enclosure_id, slot
+                current_revision = bind_mapping_revision(
+                    self._clear_revision_from_state(
+                        state, system_id, enclosure_id, slot
+                    ),
+                    revision_binding,
                 )
                 if current_revision != expected_revision:
                     raise MappingRevisionConflict(current_revision)
@@ -1315,6 +1359,7 @@ class MappingStore:
         *,
         expected_revision: str,
         import_digest: str,
+        import_digest_binding: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             state = self._load_state()
@@ -1324,9 +1369,14 @@ class MappingStore:
             )
             if preview["revision"] != expected_revision:
                 raise MappingRevisionConflict(preview["revision"])
-            if preview["import_digest"] != import_digest:
+            # The caller can bind the disks in the bays the restore writes into
+            # the digest, as a save binds the bay's disk (#1141).
+            current_import_digest = bind_mapping_revision(
+                preview["import_digest"], import_digest_binding
+            )
+            if current_import_digest != import_digest:
                 raise MappingImportDigestMismatch(
-                    preview["revision"], preview["import_digest"]
+                    preview["revision"], current_import_digest
                 )
             current = {
                 identity: mapping

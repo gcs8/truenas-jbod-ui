@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from app.config import SSHConfig, Settings, SystemConfig, TrueNASConfig
 from app.models.domain import SlotState
 from app.services.inventory import LINUX_ENCLOSURE_SYSFS_MAP_COMMAND, InventoryService
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import MappingStore, bind_mapping_revision
 from app.services.parsers import (
     ParsedSSHData,
     parse_sg_ses_aes,
@@ -844,14 +844,21 @@ class PlatformParityFixtureTests(unittest.IsolatedAsyncioTestCase):
             assert bottom_snap.selected_profile is not None
             self.assertEqual(bottom_snap.selected_profile.id, "dell-md1280-drawer-bottom-42")
             self.assertEqual({slot.enclosure_id for slot in bottom_snap.slots}, {full.id})
+            # The physical scope's revisions, bound to each bay's disk (#1141).
             self.assertTrue(all(
                 slot.mapping_revision
-                == service.mapping_store.save_revision(system.id, full.id, slot.slot)
+                == bind_mapping_revision(
+                    service.mapping_store.save_revision(system.id, full.id, slot.slot),
+                    service._slot_disk_binding(slot),
+                )
                 for slot in bottom_snap.slots
             ))
             self.assertTrue(all(
                 slot.mapping_clear_revision
-                == service.mapping_store.clear_revision(system.id, full.id, slot.slot)
+                == bind_mapping_revision(
+                    service.mapping_store.clear_revision(system.id, full.id, slot.slot),
+                    service._slot_disk_binding(slot),
+                )
                 for slot in bottom_snap.slots
             ))
 

@@ -96,7 +96,7 @@ from app.services.history_backend import (
     HistoryBackendPolicyError,
 )
 from app.services.history_status import project_public_collector_status
-from app.services.inventory import DiskInventorySyncBusy, LedSessionBusyError, SplitEnclosureError
+from app.services.inventory import DiskInventorySyncBusy, LedSessionBusyError, SplitEnclosureError, user_refresh
 from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
@@ -259,12 +259,13 @@ def build_router() -> APIRouter:
         return service
 
     def mapping_revision_conflict_response(exc: MappingRevisionConflict) -> JSONResponse:
+        # A subclass names the cause, such as another disk in the bay (#1141).
         return JSONResponse(
             status_code=409,
             content={
                 "ok": False,
-                "error": "mapping_revision_conflict",
-                "detail": MappingRevisionConflict.public_detail,
+                "error": exc.error_code,
+                "detail": exc.public_detail,
                 "current_revision": exc.current_revision,
             },
         )
@@ -503,11 +504,14 @@ def build_router() -> APIRouter:
                 selected_enclosure_id=enclosure_id,
             )
         else:
-            snapshot = await service.get_snapshot(
-                force_refresh=force,
-                selected_enclosure_id=enclosure_id,
-                allow_stale_cache=not force,
-            )
+            # A forced read is the user's Refresh: it joins a running
+            # background refresh rather than answering busy (#1139).
+            with user_refresh(force):
+                snapshot = await service.get_snapshot(
+                    force_refresh=force,
+                    selected_enclosure_id=enclosure_id,
+                    allow_stale_cache=not force,
+                )
             retention = None
         payload = snapshot.model_dump(mode="json")
         if retention is not None:
@@ -546,10 +550,11 @@ def build_router() -> APIRouter:
             force_refresh=force,
             sas_fabric=True,
         )
-        return await service.get_sas_fabric_snapshot(
-            force_refresh=force,
-            selected_enclosure_id=enclosure_id,
-        )
+        with user_refresh(force):
+            return await service.get_sas_fabric_snapshot(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+            )
 
     @router.post(
         "/api/sas-fabric/aliases",
@@ -590,10 +595,11 @@ def build_router() -> APIRouter:
             enclosure_id=enclosure_id,
             force_refresh=force,
         )
-        return await service.get_storage_view_runtime(
-            force_refresh=force,
-            selected_enclosure_id=enclosure_id,
-        )
+        with user_refresh(force):
+            return await service.get_storage_view_runtime(
+                force_refresh=force,
+                selected_enclosure_id=enclosure_id,
+            )
 
     @router.post(
         "/api/slots/{slot}/led",
