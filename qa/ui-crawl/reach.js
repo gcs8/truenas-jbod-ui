@@ -330,7 +330,10 @@ function enclosingSpan(spans, offset, length) {
   return null;
 }
 
-const CALL_RE = (name) => new RegExp(`(?<![\\w$.])${name.replace(/[$]/g, "\\$")}\\s*\\(`, "g");
+// Escape every regular-expression metacharacter, backslash included, before a
+// scanned name goes into a RegExp source.
+const escapeRegExp = (text) => String(text).replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&");
+const CALL_RE = (name) => new RegExp(`(?<![\\w$.])${escapeRegExp(name)}\\s*\\(`, "g");
 
 function calledNames(code, names) {
   return names.filter((name) => CALL_RE(name).test(code));
@@ -518,7 +521,7 @@ function siteMethods(lexed, at, span, helperNames) {
     const variable = assign[1];
     const methods = new Set();
     const body = code.slice(floor, span ? span.end : code.length);
-    for (const call of body.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\(\\s*${variable.replace(/[$]/g, "\\$")}\\b`, "g"))) {
+    for (const call of body.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\(\\s*${escapeRegExp(variable)}\\b`, "g"))) {
       const open = floor + call.index + call[0].lastIndexOf("(");
       const found = methodsIn(text, open, matchingClose(code, open));
       (found.length ? found : ["GET"]).forEach((method) => methods.add(method));
@@ -822,4 +825,5 @@ function scopeKindFor(pageId, url, pages = PAGES) {
 module.exports = {
   REACH_PATH, PAGES, BIND_QUERY_KEYS, BIND_IF_SENT_KEYS, BIND_PATH_PARAMS, GENERATED_CLASSES,
   lexScript, functionSpans, extractCalls, matchRoutes, normalizeApiPath, pageScripts, buildReach, renderReach, loadReach, reachProblems, reachRules, reachRulesAnyScope, scopeKindFor,
+  escapeRegExp,
 };

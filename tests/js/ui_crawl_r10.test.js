@@ -265,3 +265,14 @@ test("SVBIND: a write state on a storage-view target is still refused before any
   assert.match(outcome.error, /storage-view target/);
   assert.equal(calls.length, 1, "only the (empty) capture ran; no step, no write");
 });
+
+test("reach scanner escapes every regular-expression metacharacter in scanned names (CodeQL js/incomplete-sanitization)", () => {
+  const { escapeRegExp } = req("qa/ui-crawl/reach.js");
+  for (const raw of ["fetch$", "a.b", "x\\y", "q(r)*+?", "[s]{2}|^t$/"]) {
+    const re = new RegExp(`^${escapeRegExp(raw)}$`);
+    assert.ok(re.test(raw), `matches itself: ${raw}`);
+  }
+  assert.ok(!new RegExp(`^${escapeRegExp("a.b")}$`).test("axb"), "a dot is literal");
+  assert.ok(!new RegExp(`^${escapeRegExp("x\\d")}$`).test("x1"), "a backslash is literal");
+  assert.equal(escapeRegExp("loadInventory"), "loadInventory", "plain identifiers are unchanged");
+});
