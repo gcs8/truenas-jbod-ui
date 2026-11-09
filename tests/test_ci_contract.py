@@ -1033,8 +1033,11 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "qa/chassis-row-overflow.spec.js",
             "qa/connections-clear-selection.spec.js",
             "qa/connections-overflow.spec.js",
+            "qa/header-and-disk-path-layout.spec.js",
+            "qa/heatmap-temperature-bands.spec.js",
             "qa/offline-snapshot.spec.js",
             "qa/saved-view-selection.spec.js",
+            "qa/ui-a11y-narrow-layout.spec.js",
             "qa/ui-scope-safety.spec.js",
             "qa/upgrade-notice.spec.js",
         ):

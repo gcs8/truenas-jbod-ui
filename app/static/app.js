@@ -200,6 +200,7 @@
       timelineCacheKey: null,
       timelineCache: [],
       sensitivity: HEATMAP_DEFAULT_SCALE_SENSITIVITY,
+      temperatureScale: "bands", // #1103: min-max colours are opt-in
       histories: {},
       loading: false,
       error: null,
@@ -250,15 +251,20 @@
   const heatmapTimeframeSelect = document.getElementById("heatmap-timeframe-select");
   const heatmapPlaybackField = document.getElementById("heatmap-playback-field");
   const heatmapPlaybackSelect = document.getElementById("heatmap-playback-select");
+  const heatmapColourField = document.getElementById("heatmap-colour-field");
+  const heatmapColourSelect = document.getElementById("heatmap-colour-select");
   const heatmapScrubField = document.getElementById("heatmap-scrub-field");
   const heatmapScrubSlider = document.getElementById("heatmap-scrub-slider");
   const heatmapScrubValue = document.getElementById("heatmap-scrub-value");
   const heatmapScaleSlider = document.getElementById("heatmap-scale-slider");
+  const heatmapScaleField = heatmapScaleSlider?.closest(".heatmap-scale-field") || null;
   const heatmapScaleValue = document.getElementById("heatmap-scale-value");
   const heatmapLegend = document.getElementById("heatmap-legend");
   const heatmapLegendMin = document.getElementById("heatmap-legend-min");
   const heatmapLegendMax = document.getElementById("heatmap-legend-max");
   const heatmapLegendStatus = document.getElementById("heatmap-legend-status");
+  const heatmapLegendBands = document.getElementById("heatmap-legend-bands");
+  const heatmapLegendSource = document.getElementById("heatmap-legend-source");
   const heatmapMetricContext = document.getElementById("heatmap-metric-context");
   const sasFabricToggleButton = document.getElementById("sas-fabric-toggle-button");
   const sasFabricViewLink = document.getElementById("sas-fabric-view-link");
@@ -287,6 +293,14 @@
   const detailSmartNote = document.getElementById("detail-smart-note");
   const topologyContext = document.getElementById("topology-context");
   const multipathContext = document.getElementById("multipath-context");
+  const openPathPills = new Set();
+  multipathContext?.addEventListener("click", (event) => {
+    const pill = event.target.closest("[data-path-pill]");
+    if (!pill) return;
+    const key = pill.dataset.pathPill;
+    openPathPills[openPathPills.has(key) ? "delete" : "add"](key);
+    pill.setAttribute("aria-expanded", openPathPills.has(key));
+  });
   const secondaryContextTitle = document.getElementById("secondary-context-title");
   const warningList = document.getElementById("warning-list");
   const searchBox = document.getElementById("search-box");
@@ -396,9 +410,8 @@
     return lookup.byNumber.get(slotNumber) || null;
   }
 
-  // A bay prints the number the server labelled it with, so a profile whose
-  // chassis counts from 1 (slot_number_base, the UniFi NVRs in #1068) reads
-  // the same on every tab. A bay missing from the snapshot uses that base.
+  // A bay prints its server label, so a chassis counting from 1
+  // (slot_number_base, UniFi NVRs, #1068) reads the same on every tab.
   function formatSlotLabel(slotNumber) {
     const number = Number(slotNumber);
     if (!Number.isInteger(number)) {
@@ -988,9 +1001,9 @@
         if (state.selectedSlot === slot.slot_index) {
           tile.classList.add("selected");
         }
-        tile.setAttribute("aria-label", buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext));
         tile.innerHTML = buildNvmeRuntimeTileMarkup(slot, selectedView);
         applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
+        bayName(tile, buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext), "");
         board.appendChild(tile);
       });
 
@@ -1055,10 +1068,6 @@
       } else {
         delete tile.dataset.slotSize;
       }
-      tile.setAttribute(
-        "aria-label",
-        liveSlot ? slotAccessibleName(liveSlot) : buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext)
-      );
       if (liveSlot) {
         tile.setAttribute("aria-describedby", "slot-tooltip");
       }
@@ -1080,6 +1089,8 @@
             <span class="slot-latch" aria-hidden="true"></span>
           `;
       applyHeatmapToTile(tile, heatmapContext, slot.slot_index);
+      if (liveSlot) bayName(tile, slotAccessibleName(liveSlot), slotNameLead(liveSlot));
+      else bayName(tile, buildStorageViewRuntimeTooltip(slot, selectedView, heatmapContext), "");
       container.appendChild(tile);
     };
 
@@ -1146,10 +1157,10 @@
       tile.style.top = metrics.top;
       tile.style.width = metrics.width;
       tile.style.minHeight = metrics.minHeight;
-      tile.setAttribute("aria-label", slotAccessibleName(liveSlot));
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.innerHTML = buildNvmeRuntimeTileMarkup(displaySlot, { kind: "nvme_carrier" });
       applyHeatmapToTile(tile, heatmapContext, liveSlot.slot);
+      bayName(tile, `${slotLocationLabel(liveSlot)}, ${slotAccessibleName(liveSlot)}`, "");
       board.appendChild(tile);
     });
 
@@ -1601,11 +1612,10 @@
     return breakpoints;
   }
 
-  // The one description of an enclosure's physical bay grid: rows in the order
-  // the chassis draws them (latch edge last), each row split into the profile's
-  // column groups, with the group breakpoints and the flat top-loader grouping
-  // already resolved from `buildChassisGeometry`'s output. Every grid-like bay
-  // surface renders from this so a bay number is always in the same place.
+  // The one description of a bay grid: rows in chassis order (latch edge last),
+  // split into the profile's column groups with breakpoints and the flat
+  // top-loader grouping resolved. Every bay grid renders from this, so a bay
+  // number is always in the same place.
   function buildLayoutGridRows(layoutRows, geometry) {
     return normalizeLayoutRows(layoutRows).map((row) => {
       const groups = splitRowIntoGroups(row, geometry);
@@ -1659,16 +1669,15 @@
         const slotShare = group.length / totalSlots;
         const slotShareText = slotShare.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
         const internalGapPixels = groupGap * Math.max(group.length - 1, 0);
-        return `calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px)`;
+        // #1115: narrow faces set --group-min so a group keeps its bays' width.
+        return `minmax(var(--group-min, 0px), calc((100% - ${totalGapPixels}px) * ${slotShareText} + ${internalGapPixels}px))`;
       })
       .join(" ");
   }
 
-  // Per-model decoration for the UniFi NVR faces (#1068). Everything here is
-  // print, vents, lights and ports on the metal: never a bay. It is drawn as
-  // aria-hidden <div>s without data-slot, so clicks, focus, keyboard walking,
-  // search, summaries, the heat map, Connections and exports, which all read
-  // `.slot-tile[data-slot]`, never see it. Unknown variants draw the plain face.
+  // UniFi NVR face decoration (#1068): print, vents, lights and ports, never a
+  // bay. Drawn as aria-hidden <div>s without data-slot, so everything reading
+  // `.slot-tile[data-slot]` ignores it. Unknown variants draw the plain face.
   function unifiFaceVariantSpec(geometry) {
     if ((geometry?.faceStyle || geometry?.face_style) !== "unifi-drive") {
       return null;
@@ -1718,11 +1727,10 @@
     return Object.prototype.hasOwnProperty.call(specs, variant) ? { variant, ...specs[variant] } : null;
   }
 
-  // The chassis prints each column's bay numbers top to bottom ("1 / 5 / 9 / 13").
-  // They come from the layout and the same labels the drawn bays show, so a
-  // strip can never disagree with the bay tiles. The live page reads the live
-  // bays (formatSlotLabel); a saved chassis view passes its own bay labels,
-  // because the live enclosure may use another layout and label base (#1070).
+  // Column strips print bay numbers top to bottom ("1 / 5 / 9 / 13") from the
+  // labels the bays show, so a strip never disagrees with them. A saved
+  // chassis view passes its own labels: the live enclosure may use another
+  // layout and label base (#1070).
   function unifiFaceColumnLabels(layoutRows, rowIndexes = null, slotLabelFor = null) {
     const rows = normalizeLayoutRows(layoutRows);
     const picked = rowIndexes ? rowIndexes.map((index) => rows[index] || []) : rows;
@@ -2339,7 +2347,7 @@
     const displayLabel = label || sasFabricDisplayLabel(node) || node.id;
     const displayMeta = meta || sasFabricNodeMeta(node) || formatSasFabricKind(node.kind);
     return `
-      <button type="button" class="${sasFabricItemClasses({ selected, related, status: node.status, extra })}" data-sas-fabric-node="${escapeHtml(node.id)}">
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: node.status, extra })}" data-sas-fabric-node="${escapeHtml(node.id)}" title="${escapeHtml(`${displayLabel}\n${displayMeta}`)}">
         <span class="sas-fabric-item-label">${escapeHtml(displayLabel)}</span>
         <span class="sas-fabric-item-meta">${escapeHtml(displayMeta)}</span>
       </button>
@@ -2353,9 +2361,10 @@
     const related = Boolean(selectedTrace?.node_ids?.includes(path.id)) || sasFabricSelectionTouchesSlots(path.slots);
     const stateName = path.state || trace?.metrics?.state || "unknown";
     const slots = sasFabricSortedSlots(path.slots || trace?.slots);
+    const label = sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`;
     return `
-      <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}">
-        <span class="sas-fabric-item-label">${escapeHtml(sasFabricDisplayLabel(path) || `${path.controller || "path"} ${stateName}`)}</span>
+      <button type="button" class="${sasFabricItemClasses({ selected, related, status: stateName, extra: "sas-fabric-path-card" })}" data-sas-fabric-trace="${escapeHtml(path.id)}" title="${escapeHtml(label)}">
+        <span class="sas-fabric-item-label">${escapeHtml(label)}</span>
         <span class="sas-fabric-item-meta">${escapeHtml(`${path.count || slots.length || 0} bay${(path.count || slots.length) === 1 ? "" : "s"} affected`)}</span>
         <span class="sas-fabric-item-slots">${escapeHtml(formatSasFabricSlots(slots, slots.length))}</span>
       </button>
@@ -2388,10 +2397,8 @@
     return `<span class="sas-fabric-bay-chip ${populated ? "is-outside" : "is-empty"}" title="${label}">${label}</span>`;
   }
 
-  // The bay grid is the enclosure, with the affected bays lit: same rows in the
-  // same order, same column groups, same gaps, so a bay number never moves
-  // between the Enclosure tab and the Storage Fabric tab. `limit` only applies
-  // to the flat fallback used when the active view has no layout rows.
+  // The enclosure grid with affected bays lit: same rows, groups and gaps as
+  // the Enclosure tab. `limit` caps only the flat no-layout fallback.
   function renderSasFabricBayChips(slots, limit = 60, expandKey = null) {
     const sorted = sasFabricSortedSlots(slots);
     if (!sorted.length) {
@@ -3006,10 +3013,8 @@
     }
   }
 
-  // The header release note is rendered once by the server. While the first
-  // check is still running or has failed, poll a few times so a boot-time
-  // failure (DNS not ready yet) recovers without a reload. The server retries
-  // failures after 60 s, 5 min, then hourly; these delays trail those.
+  // While the first release check runs or has failed (DNS not ready at boot),
+  // poll a few times, trailing the server 60 s / 5 min / hourly retries.
   const RELEASE_NOTE_POLL_DELAYS_MS = [20000, 75000, 320000];
 
   function releaseNoteNeedsRefresh(status) {
@@ -3102,10 +3107,8 @@
     };
   }
 
-  // Every inventory refresh carries the server's current policy, so a page
-  // that was told "no" once follows the server again instead of staying
-  // locked until a reload. The server cannot see this page's sign-in, so a
-  // signed-in Basic-mode page keeps its own enabled state.
+  // Each refresh carries the server policy, so a page told "no" follows the
+  // server again; a signed-in Basic-mode page keeps its own enabled state.
   function syncWritePolicyFromSnapshot(snapshot) {
     const raw = snapshot?.write_policy;
     if (!raw || typeof raw !== "object") {
@@ -3288,10 +3291,8 @@
     writePolicyNotice.classList.remove("hidden");
   }
 
-  // The configured public origin comes from the bootstrap and from inventory
-  // refreshes; sign-in, sign-out and 401 handling send policies that do not
-  // carry it. Keep the last known origin so wrong-origin guidance can still
-  // name the address to open. A payload that does carry one wins.
+  // The public origin comes from the bootstrap and inventory refreshes; auth
+  // policies omit it, so keep the last known one for wrong-origin guidance.
   function applyWritePolicy(policy) {
     const retainedOrigin = state.writePolicy?.publicOrigin || "";
     const nextPolicy = normalizeWritePolicy(policy);
@@ -3824,9 +3825,8 @@
     return "UNKNOWN";
   }
 
-  // A Linux or ESXi appliance with one array mounts it at the same path on
-  // every bay, so that path cannot tell bays apart (#1066). TrueNAS and
-  // QuantaStor pool names keep their tile line.
+  // One Linux or ESXi array mounts at the same path on every bay, which cannot
+  // tell bays apart (#1066); TrueNAS and QuantaStor pools keep their line.
   function sharedMountPoolName(slots, platform) {
     const key = String(platform || "").toLowerCase();
     if (key !== "linux" && key !== "esxi") return null;
@@ -3866,9 +3866,8 @@
     return Boolean(slotEnclosureId) && Boolean(enclosureId) && slotEnclosureId === enclosureId;
   }
 
-  // A chassis view drawn with a layout whose bay order is unvalidated (#1068)
-  // names a disk only from a saved manual mapping, sent on the view slot. Its
-  // bays never borrow the live bay at the same index, whatever the payload says.
+  // A chassis view with an unvalidated bay order (#1068) names disks only from
+  // saved manual mappings; it never borrows the live bay at the same index.
   function storageViewSlotIsManualOnly(slot) {
     return slot?.manual_mapping_only === true;
   }
@@ -4496,10 +4495,8 @@
     return Boolean(state.smartPrefetchTimerId) || Boolean(state.smartPrefetchRunning);
   }
 
-  // Hovering or arrow-keying across bays used to send one SMART request per bay
-  // even while the batch prefetch for those same bays was queued or already
-  // running. When the batch covers the bay, the tooltip shows "Loading..." and
-  // waits for it instead of racing it with a second request.
+  // A bay covered by a queued or running batch prefetch shows "Loading..." and
+  // waits for it, instead of racing it with a per-bay SMART request.
   function ensureSmartSummaryOnInteraction(slot) {
     if (state.snapshotMode || !slot) {
       return Promise.resolve();
@@ -4763,13 +4760,10 @@
     return host || "n/a";
   }
 
-  // The enclosure reports a bay as a status name and its four SES status bytes,
-  // such as "OK (0x11 0x00 0x00 0x00)". Byte 0 holds the status code in its low
-  // four bits and the predicted-failure (0x40), disabled (0x20) and swap (0x10)
-  // flags above it (SES-3 table 72). Other health text passes through. The text
-  // comes from the appliance and runs on every grid render, so the byte suffix
-  // is found by position and only that short tail is matched, and the shown
-  // value is capped.
+  // SES health reads "OK (0x11 0x00 0x00 0x00)": byte 0 is the status code
+  // (low four bits) plus predicted-failure 0x40, disabled 0x20 and swap 0x10
+  // (SES-3 table 72); other text passes through. Appliance text on every grid
+  // render: match only the positioned byte tail, and cap the shown value.
   function formatSlotHealth(value) {
     if (value === null || value === undefined) {
       return value;
@@ -5186,6 +5180,7 @@
         id: "temperature_delta_c",
         label: "Temperature vs View Average",
         shortLabel: "Delta",
+        fixedRange: [-10, 10], // #1103: 1 C stays near neutral
         historyMetrics: ["temperature_c"],
         value: (entry, entries, evaluation) => computeTemperatureDelta(entry, entries, evaluation),
         format: (value) => `${value >= 0 ? "+" : ""}${roundHeatmapValue(value)} C`,
@@ -5323,13 +5318,25 @@
     if (metricId === "attention_score") {
       return "Score 0-100: hotter than its neighbours, SMART errors, and heavy writes all add points. Hover a bay to see why.";
     }
+    if (metricId === "temperature_c" && heatmapTemperatureBandsActive(metricId)) {
+      return "Degrees Celsius. Colours use the drive's SMART thresholds when reported, else the defaults in the legend.";
+    }
     if (metricId === "temperature_c") {
-      return "Degrees Celsius. Use the drive vendor's warning and critical thresholds when available.";
+      return "Degrees Celsius. Relative colours stretch from the coolest to the warmest bay in view; use Bands to judge heat.";
     }
     if (metricId === "temperature_delta_c") {
-      return "Degrees Celsius relative to the current view average. Compare peer bays, then use vendor thresholds before acting.";
+      return "Degrees Celsius vs the view average, coloured from -10 to +10 C. Compare peer bays, then check vendor thresholds.";
     }
     return "";
+  }
+
+  function normalizeHeatmapTemperatureScale(value) {
+    return value === "relative" ? value : "bands";
+  }
+
+  function heatmapTemperatureBandsActive(metricId = state.heatmap.metric) {
+    return metricId === "temperature_c"
+      && normalizeHeatmapTemperatureScale(state.heatmap.temperatureScale) === "bands";
   }
 
   function heatmapMetricDefinition(metricId = state.heatmap.metric) {
@@ -5956,6 +5963,7 @@
     } else if (metric.id === "temperature_delta_c") {
       evaluation.temperatureAverage = heatmapTemperatureAverage(entries, evaluation);
     }
+    const temperatureBands = heatmapTemperatureBandsActive(metric.id);
     const records = new Map();
     const numericValues = [];
 
@@ -5973,6 +5981,10 @@
         value: hasDiskIdentity && Number.isFinite(numericValue) ? numericValue : null,
         reasons,
       };
+      if (temperatureBands && Number.isFinite(record.value)) {
+        record.thresholds = resolveHeatmapTemperatureThresholds(entry?.smartEntry?.data, entry?.slot);
+        record.band = heatmapTemperatureBand(record.value, record.thresholds);
+      }
       records.set(entry.key, record);
       if (Number.isFinite(record.value)) {
         numericValues.push(record.value);
@@ -5990,6 +6002,8 @@
       min,
       max,
       sensitivity: state.heatmap.sensitivity,
+      temperatureBands,
+      bandSummary: temperatureBands ? summarizeHeatmapTemperatureBands(records) : null,
       valueCount: numericValues.length,
       timelineActive,
       playbackIndex,
@@ -6031,19 +6045,133 @@
     return interpolateRgb(amber, red, (clamped - 0.68) / 0.32);
   }
 
+  // #1103: absolute bands; drive SMART ratings win over the defaults (wiki
+  // Heat Map Mode).
+  function heatmapTemperatureBandDefinitions() {
+    return [
+      { id: "cool", label: "Cool", rgb: [47, 110, 187], alpha: 0.72 },
+      { id: "normal", label: "Normal", rgb: [44, 171, 103], alpha: 0.66 },
+      { id: "warm", label: "Warm", rgb: [215, 182, 43], alpha: 0.72 },
+      { id: "warning", label: "Warning", rgb: [245, 130, 40], alpha: 0.8 },
+      { id: "critical", label: "Critical", rgb: [218, 50, 50], alpha: 0.82 },
+    ];
+  }
+
+  function heatmapTemperatureDefaultProfiles() {
+    return {
+      hdd: { id: "hdd", label: "HDD defaults", cool: 30, warm: 45, warning: 50, critical: 60 },
+      solid_state: { id: "solid_state", label: "SSD/NVMe defaults", cool: 30, warm: 60, warning: 70, critical: 80 },
+    };
+  }
+
+  function heatmapTemperatureProfileId(data, slot) {
+    const nvme = String(data?.transport_protocol || slot?.transport_protocol || "").trim().toLowerCase() === "nvme";
+    return nvme || nullableMetricNumber(data?.rotation_rate_rpm) === 0 || /^nvme\d/i.test(String(slot?.device_name || "").trim())
+      ? "solid_state"
+      : "hdd";
+  }
+
+  function heatmapTemperatureThresholdValue(value) {
+    // Unreported limits arrive as 0, 255 or -128.
+    const numeric = nullableMetricNumber(value);
+    return numeric >= 20 && numeric <= 150 ? numeric : null;
+  }
+
+  function resolveHeatmapTemperatureThresholds(data, slot) {
+    const profile = heatmapTemperatureDefaultProfiles()[heatmapTemperatureProfileId(data, slot)];
+    let warning = heatmapTemperatureThresholdValue(data?.warning_temperature_c);
+    let critical = heatmapTemperatureThresholdValue(data?.critical_temperature_c);
+    if (warning > critical && critical !== null) warning = null;
+    const reported = (warning !== null) + (critical !== null);
+    const gap = profile.critical - profile.warning;
+    if (warning === null && critical === null) ({ warning, critical } = profile);
+    else if (critical === null) critical = warning + gap;
+    else if (warning === null) warning = critical - gap;
+    const warm = warning - (profile.warning - profile.warm);
+    return {
+      cool: Math.min(profile.cool, warm), warm, warning, critical,
+      source: ["default", "drive_partial", "drive"][reported], profileId: profile.id, profileLabel: profile.label,
+    };
+  }
+
+  function heatmapTemperatureBand(value, thresholds) {
+    const numeric = nullableMetricNumber(value);
+    if (numeric === null || !thresholds) return null;
+    // Classify the number the tile shows, so "50 C" never reads as warm.
+    const shown = Math.round(numeric);
+    const { cool, warm, warning, critical } = thresholds;
+    return heatmapTemperatureBandDefinitions()[[cool, warm, warning, critical].filter((edge) => shown >= edge).length];
+  }
+
+  function heatmapTemperatureThresholdKey(thresholds) {
+    return Object.values(thresholds).join("|");
+  }
+
+  function summarizeHeatmapTemperatureBands(records) {
+    const groups = new Map();
+    let total = 0;
+    let primary = null;
+    records.forEach(({ thresholds }) => {
+      if (!thresholds) return;
+      total += 1;
+      const key = heatmapTemperatureThresholdKey(thresholds);
+      const group = groups.get(key) || { thresholds, count: 0 };
+      group.count += 1;
+      groups.set(key, group);
+      if (!primary || group.count > primary.count) primary = group;
+    });
+    return { total, distinctCount: groups.size, primary: primary?.thresholds || null, primaryCount: primary?.count || 0 };
+  }
+
+  function heatmapTemperatureSourceLabel(thresholds) {
+    return { drive: "drive SMART thresholds", drive_partial: "one drive SMART threshold, default spacing" }[thresholds?.source]
+      || thresholds?.profileLabel || "HDD defaults";
+  }
+
+  function heatmapTemperatureBandRanges({ cool, warm, warning, critical }) {
+    const span = (low, next) => (next - 1 < low ? "none" : next - 1 === low ? `${low} C` : `${low}-${next - 1} C`);
+    return { cool: `<${cool} C`, normal: span(cool, warm), warm: span(warm, warning), warning: span(warning, critical), critical: `${critical}+ C` };
+  }
+
+  // WCAG 2.x relative luminance and contrast ratio.
+  function heatmapRelativeLuminance(rgb) {
+    const [red, green, blue] = Array.from(rgb).slice(0, 3).map((component) => {
+      const channel = component / 255;
+      return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return Math.min(1, (0.2126 * red) + (0.7152 * green) + (0.0722 * blue));
+  }
+
+  function heatmapContrastRatio(first, second) {
+    const [low, high] = [heatmapRelativeLuminance(first), heatmapRelativeLuminance(second)].sort((a, b) => a - b);
+    return (high + 0.05) / (low + 0.05);
+  }
+
+  // A heat colour at `alpha` over the dark bay face (#11161a), or over `base`.
+  function heatmapSurfaceRgb(rgb, alpha, base = [17, 22, 26]) {
+    return Array.from(rgb).slice(0, 3).map((component, index) => Math.round((component * alpha) + (base[index] * (1 - alpha))));
+  }
+
+  // The value badge's former rgba(5, 8, 12, 0.62) chip, made opaque.
+  function heatmapBadgeRgb(surfaceRgb) {
+    return heatmapSurfaceRgb([5, 8, 12], 0.62, surfaceRgb);
+  }
+
+  // White or black: one reaches at least 4.58:1 on any surface (WCAG AA).
+  function heatmapReadableTextRgb(surfaceRgb) {
+    const [light, dark] = [[255, 255, 255], [0, 0, 0]];
+    return heatmapContrastRatio(light, surfaceRgb) >= heatmapContrastRatio(dark, surfaceRgb) ? light : dark;
+  }
+
   function resetHeatmapTile(tile) {
     if (!tile) {
       return;
     }
     tile.classList.remove("heatmap-active", "heatmap-missing");
-    tile.style.removeProperty("--heatmap-rgb");
-    tile.style.removeProperty("--heatmap-alpha");
-    tile.style.removeProperty("--heatmap-border-alpha");
-    Array.from(tile.children).forEach((child) => {
-      if (child.classList?.contains("slot-heatmap-value")) {
-        child.remove();
-      }
-    });
+    ["rgb", "alpha", "border-alpha", "surface-rgb", "text-rgb", "badge-rgb"]
+      .forEach((name) => tile.style.removeProperty(`--heatmap-${name}`));
+    if (tile.dataset) delete tile.dataset.heatmapBand;
+    tile.querySelectorAll(".slot-heatmap-value").forEach((badge) => badge.remove());
   }
 
   function applyHeatmapToTile(tile, context, entryKey) {
@@ -6055,34 +6183,44 @@
     const metric = context.metric;
     const badge = document.createElement("span");
     badge.className = "slot-heatmap-value";
+    // #1123: NVMe cards show it in their head row.
+    const host = tile.querySelector(".storage-view-runtime-card--nvme .storage-view-runtime-card-head") || tile;
     if (tile.classList.contains("state-empty") || !record || !Number.isFinite(record.value)) {
       tile.classList.add("heatmap-missing");
       badge.textContent = "--";
+      badge.dataset.placeholder = "";
       badge.title = `${metric.label}: unknown`;
-      tile.appendChild(badge);
+      host.appendChild(badge);
       return;
     }
-    const intensity = heatmapIntensity(record, context);
-    if (intensity === null) {
+    const intensity = record.band ? null : heatmapIntensity(record, context);
+    if (!record.band && intensity === null) {
       tile.classList.add("heatmap-missing");
       badge.textContent = metric.format(record.value);
-      tile.appendChild(badge);
+      host.appendChild(badge);
       return;
     }
-    const rgb = heatmapRgbForIntensity(intensity);
+    const rgb = record.band ? record.band.rgb : heatmapRgbForIntensity(intensity);
+    const alpha = record.band ? record.band.alpha : 0.5 + (intensity * 0.25);
+    // #1103: tile text sits on chips of this surface.
+    const surface = heatmapSurfaceRgb(rgb, alpha);
+    if (record.band && tile.dataset) tile.dataset.heatmapBand = record.band.id;
     tile.classList.add("heatmap-active");
-    tile.style.setProperty("--heatmap-rgb", rgb.join(", "));
-    tile.style.setProperty("--heatmap-alpha", String(0.5 + (intensity * 0.25)));
-    tile.style.setProperty("--heatmap-border-alpha", String(0.58 + (intensity * 0.32)));
+    Object.entries({
+      rgb, alpha: [alpha], "border-alpha": [record.band ? 0.9 : 0.58 + (intensity * 0.32)], "surface-rgb": surface,
+      "text-rgb": heatmapReadableTextRgb(surface), "badge-rgb": heatmapBadgeRgb(surface),
+    }).forEach(([name, value]) => tile.style.setProperty(`--heatmap-${name}`, value.join(", ")));
     badge.textContent = metric.format(record.value);
     badge.title = `${metric.label}: ${metric.format(record.value)}`;
-    tile.appendChild(badge);
+    host.appendChild(badge);
   }
 
   function refreshHeatmapTileOverlays(context = null) {
     const heatmapContext = context || buildHeatmapContext();
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       applyHeatmapToTile(tile, heatmapContext, tile.dataset.slot);
+      // #1110: the value is text the bay shows, so its name follows it.
+      if (tile.dataset.detail !== undefined) bayName(tile);
     });
     renderHeatmapControls(heatmapContext);
     scheduleStateChipPlacement();
@@ -6116,6 +6254,9 @@
       return [`Heat Map: ${metric.label} unknown`];
     }
     const lines = [`Heat Map: ${metric.label} ${metric.format(record.value)}`];
+    if (record.band && record.thresholds) {
+      lines.push(`Band: ${record.band.label} (${heatmapTemperatureSourceLabel(record.thresholds)}: warning ${record.thresholds.warning} C, critical ${record.thresholds.critical} C)`);
+    }
     if (heatmapContext.timelineActive) {
       lines.push(`Sample: ${formatHeatmapPlaybackLabel(
         heatmapContext.playbackTimestampMs,
@@ -6302,6 +6443,13 @@
       heatmapPlaybackSelect.value = timelineActive ? HEATMAP_HISTORY_MODE_TIMELINE : HEATMAP_HISTORY_MODE_CURRENT;
       heatmapPlaybackSelect.disabled = !supportsTimeline;
     }
+    const temperatureBands = heatmapTemperatureBandsActive(metric.id);
+    heatmapColourField?.classList.toggle("hidden", !state.heatmap.enabled || metric.id !== "temperature_c");
+    if (heatmapColourSelect) {
+      heatmapColourSelect.value = state.heatmap.temperatureScale;
+    }
+    // Scale only applies to relative colours; Colours takes its place.
+    heatmapScaleField?.classList.toggle("hidden", temperatureBands);
     if (heatmapScaleSlider) {
       heatmapScaleSlider.value = String(state.heatmap.sensitivity);
     }
@@ -6335,6 +6483,9 @@
       heatmapScrubValue.value = playbackLabel;
       heatmapScrubValue.textContent = playbackLabel;
     }
+    const legendBands = Boolean(heatmapContext.temperatureBands);
+    heatmapLegend?.classList.toggle("heatmap-legend-banded", legendBands);
+    renderHeatmapLegendBands(legendBands ? heatmapContext.bandSummary : null);
     if (heatmapLegendMin) {
       setTextIfChanged(heatmapLegendMin, Number.isFinite(heatmapContext.min) ? activeMetric.format(heatmapContext.min) : "Low");
     }
@@ -6365,7 +6516,7 @@
         const valueCount = heatmapContext.valueCount || 0;
         const windowLabel = needsHistory ? ` - ${formatHistoryWindowLabel(currentHeatmapWindowHours())}` : "";
         const timelineLabel = timelineActive ? ` - ${playbackLabel}` : "";
-        const scaleLabel = state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
+        const scaleLabel = !legendBands && state.heatmap.sensitivity !== HEATMAP_DEFAULT_SCALE_SENSITIVITY
           ? ` - scale ${formatHeatmapScaleSensitivity(state.heatmap.sensitivity)}`
           : "";
         legendStatusText = `${valueCount} value${valueCount === 1 ? "" : "s"}${windowLabel}${timelineLabel}${scaleLabel}`;
@@ -6376,6 +6527,27 @@
         heatmapLegendStatus.title = legendStatusTitle;
       }
     }
+  }
+
+  function renderHeatmapLegendBands(summary) {
+    heatmapLegendBands?.classList.toggle("hidden", !summary);
+    heatmapLegendSource?.classList.toggle("hidden", !summary);
+    if (!summary) {
+      return;
+    }
+    const thresholds = summary.primary || resolveHeatmapTemperatureThresholds(null, null);
+    const key = heatmapTemperatureThresholdKey(thresholds);
+    if (heatmapLegendBands && heatmapLegendBands.dataset.bandsKey !== key) {
+      const ranges = heatmapTemperatureBandRanges(thresholds);
+      const bands = heatmapTemperatureBandDefinitions();
+      heatmapLegendBands.dataset.bandsKey = key;
+      heatmapLegendBands.innerHTML = bands.map(({ id, label }) => `<li data-band="${id}"><span aria-hidden="true"></span>${label} <b>${ranges[id]}</b></li>`).join("");
+      heatmapLegendBands.querySelectorAll("span").forEach((swatch, index) => swatch.style.setProperty("--heatmap-band-rgb", bands[index].rgb.join(", ")));
+    }
+    const others = summary.total - summary.primaryCount;
+    setTextIfChanged(heatmapLegendSource, `Bands: ${heatmapTemperatureSourceLabel(thresholds)}${summary.distinctCount > 1 && others > 0
+      ? ` (${summary.primaryCount} of ${summary.total} bays). ${others === 1 ? "1 other bay has" : `${others} other bays have`} different bands; hover a bay.`
+      : ""}`);
   }
 
   function ensureHeatmapData() {
@@ -6564,21 +6736,30 @@
     return appendHeatmapTooltipLines(lines, slot.slot);
   }
 
-  // Short accessible name for a bay tile: "Slot 05, sda, pool tank, healthy".
-  // The full tooltip stays available through aria-describedby.
+  function slotNameLead(slot) {
+    return slot.physical_location_known === false ? "" : "Slot ";
+  }
+
+  // What a live bay does not show; its tooltip has the rest.
   function slotAccessibleName(slot) {
-    const parts = [slotLocationLabel(slot)];
-    if (slot.device_name) {
-      parts.push(String(slot.device_name));
+    return [
+      slot.health ? formatSlotHealth(slot.health).toLowerCase() : stateLabel(slot).toLowerCase(),
+      slot.identify_active ? "Locate light on" : "",
+    ].filter(Boolean).join(", ");
+  }
+
+  // #1110: a bay's name is its shown text in order (heat value too), then
+  // what it does not show: "Slot 05, sda, tank, 38 C, online". Every label
+  // counts, "/--" too; only a missing value's "--" placeholder is no fact.
+  function bayName(tile, detail = tile.dataset.detail, lead = tile.dataset.lead) {
+    Object.assign(tile.dataset, { detail, lead });
+    const shown = [];
+    const walk = document.createTreeWalker(tile, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) {
+      const text = walk.currentNode.textContent.trim();
+      if (text && !walk.currentNode.parentElement.hasAttribute("data-placeholder")) shown.push(text);
     }
-    if (slot.pool_name) {
-      parts.push(`${currentPlatform() === "linux" ? "mount" : "pool"} ${slot.pool_name}`);
-    }
-    parts.push(slot.health ? formatSlotHealth(slot.health).toLowerCase() : stateLabel(slot).toLowerCase());
-    if (slot.identify_active) {
-      parts.push("Locate light on");
-    }
-    return parts.join(", ");
+    tile.setAttribute("aria-label", lead + [...shown, detail].filter(Boolean).join(", "));
   }
 
   function searchSummaryText(matched, total, term) {
@@ -6654,7 +6835,7 @@
   function refreshGridTileAriaLabel(slotNumber, label) {
     grid.querySelectorAll(".slot-tile[data-slot]").forEach((tile) => {
       if (Number(tile.dataset.slot) === Number(slotNumber)) {
-        tile.setAttribute("aria-label", label);
+        bayName(tile, label);
       }
     });
   }
@@ -6859,9 +7040,8 @@
     scheduleStateChipPlacement();
   }
 
-  // Every tile kind resolves through the same delegated handlers on the grid:
-  // live bays, live NVMe carriers and saved storage views. Tiles carry no
-  // listeners of their own, so a re-render attaches nothing per bay.
+  // Every tile kind uses the grid delegated handlers; tiles carry no
+  // listeners, so a re-render attaches nothing per bay.
   function delegatedGridSlot(tile) {
     const slotNumber = Number(tile?.dataset?.slot);
     if (!Number.isInteger(slotNumber)) {
@@ -7027,9 +7207,8 @@
     });
   }
 
-  // Walks the live grid and a freshly rendered one together. When rows, groups,
-  // dividers and slot order match, it collects the [current, next] tile pairs;
-  // any other difference means the layout changed and returns false.
+  // Pairs live and fresh tiles when rows, groups, dividers and slot order
+  // match; any other difference returns false (layout changed).
   function matchGridStructure(current, next, pairs) {
     if (current.childElementCount !== next.childElementCount) {
       return false;
@@ -7091,11 +7270,10 @@
     return true;
   }
 
-  // #913: the state chip (a bay's ::after, 24px with its border) sits in the
-  // top-right corner, where many bays draw their LED or latch. Pick one spot per
-  // face that clears every bay's parts: corner, beside the latch, under the LED,
-  // mid-sled, the foot, then top-left (above an M.2 card's screw hole). If none
-  // is clear, take the one with fewest overlaps.
+  // #913: the state chip (a bay's 24px ::after) defaults to the top-right
+  // corner, where many bays draw an LED or latch. Pick one spot per face that
+  // clears every bay: corner, beside the latch, under the LED, mid-sled, foot,
+  // top-left; else the spot with fewest overlaps.
   function chooseStateChipSpot(bays, size = 24, inset = 6) {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
     let right = inset;
@@ -7184,10 +7362,9 @@
     }
   }
 
-  // #461: a refresh used to clear the grid and recreate every tile. Renders now
-  // build into a detached container; when the layout is unchanged, existing
-  // tiles are patched in place (an identical refresh creates no tiles and keeps
-  // focus and hover on the same elements). A new layout replaces the grid.
+  // #461: renders build into a detached container. An unchanged layout patches
+  // existing tiles in place (no new tiles; focus and hover stay); a new layout
+  // replaces the grid.
   function commitGridRender(staging) {
     const pairs = [];
     if (!grid.childElementCount || !matchGridStructure(grid, staging, pairs)) {
@@ -7208,9 +7385,8 @@
     return patched ? "patched" : "unchanged";
   }
 
-  // The renderers hide the tooltip before building. When the hovered or focused
-  // tile survives the commit, no new mouseover/focusin fires on it, so redraw
-  // its tooltip here instead of leaving it empty until the pointer moves away.
+  // Renders hide the tooltip; a hovered or focused tile that survives the
+  // commit gets no new mouseover/focusin, so redraw its tooltip here.
   function restoreReusedTileTooltip(outcome) {
     if (outcome === "replaced" || !Number.isInteger(state.hoveredSlot)) {
       return;
@@ -7294,11 +7470,11 @@
         tile.classList.add("group-divider-after");
       }
       tile.dataset.slot = String(slot.slot);
-      tile.setAttribute("aria-label", slotAccessibleName(slot));
       tile.setAttribute("aria-describedby", "slot-tooltip");
       tile.setAttribute("aria-pressed", state.selectedSlot === slot.slot ? "true" : "false");
       tile.innerHTML = buildLiveSlotTileMarkup(slot, sharedMount);
       applyHeatmapToTile(tile, heatmapContext, slot.slot);
+      bayName(tile, slotAccessibleName(slot), slotNameLead(slot));
       container.appendChild(tile);
     };
 
@@ -9575,7 +9751,7 @@
         return `
           <button type="button" class="topology-pill state-${sasFabricClassToken(member.state)}${selected}" data-topology-slot="${member.slot}">
             <span>${escapeHtml(member.slot_label)}</span>
-            <small>${escapeHtml(member.device_name || member.serial || member.state)}</small>
+            <small title="${escapeHtml(member.device_name || member.serial || member.state)}">${escapeHtml(member.device_name || member.serial || member.state)}</small>
           </button>
         `;
       })
@@ -9687,7 +9863,7 @@
               (section) => `
                 <div class="topology-summary">
                   <div class="topology-label">${escapeHtml(section.label)}</div>
-                  <div class="topology-pill-row">${renderMultipathPills(section.members)}</div>
+                  <div class="topology-pill-row">${renderMultipathPills(section.members, openPathPills)}</div>
                 </div>
               `
             )
@@ -9695,7 +9871,7 @@
         : `
             <div class="topology-summary">
               <div class="topology-label">Member Paths</div>
-              <div class="topology-pill-row">${renderMultipathPills(multipath.members)}</div>
+              <div class="topology-pill-row">${renderMultipathPills(multipath.members, openPathPills)}</div>
             </div>
           `}
     `;
@@ -9821,7 +9997,8 @@
     return `Multipath is degraded: ${fragments.join(", ")}.`;
   }
 
-  function renderMultipathPills(members) {
+  // #1112: a path pill is a button that opens its cut-off detail in full.
+  function renderMultipathPills(members, open = new Set()) {
     if (!members.length) {
       return '<div class="warning-item muted compact">No member-path detail returned.</div>';
     }
@@ -9833,11 +10010,13 @@
         if (member.controller_label) {
           detailParts.push(member.controller_label);
         }
+        const detail = escapeHtml(detailParts.join(" / "));
+        const key = `${member.device_name} ${detailParts.join(" / ")}`;
         return `
-          <div class="topology-pill path-state-${sasFabricClassToken(stateName)}">
+          <button type="button" class="topology-pill path-state-${sasFabricClassToken(stateName)}" data-path-pill="${escapeHtml(key)}" aria-expanded="${open.has(key)}">
             <span>${escapeHtml(member.device_name)}</span>
-            <small>${escapeHtml(detailParts.join(" / "))}</small>
-          </div>
+            <small title="${detail}">${detail}</small>
+          </button>
         `;
       })
       .join("");
@@ -10064,10 +10243,8 @@
     return { ...counts, populated, total, headline };
   }
 
-  // Where a bay source code means something else on a non-TrueNAS platform.
-  // Linux and ESXi bays are drawn from the enclosure layout and filled over
-  // SSH; a bay number on Linux comes from the UniFi storage tool and on ESXi
-  // from StorCLI (#1066).
+  // Bay source codes off TrueNAS: Linux numbers come from the UniFi storage
+  // tool, ESXi ones from StorCLI (#1066).
   function platformMappingSourceLabel(source, platform) {
     const key = String(platform || "").toLowerCase();
     const apiCodes = ["api", "api-slot", "api-slot-fallback"];
@@ -10142,9 +10319,8 @@
     return null;
   }
 
-  // The snapshot's locate card describes the enclosure. A storage view such
-  // as an NVMe carrier or boot devices, where no slot has a light, says so
-  // instead of repeating it (#950). Chassis views keep the card as reported.
+  // Storage views with no bay lights (NVMe carriers, boot devices) say so
+  // instead of repeating the enclosure locate card (#950).
   function locateCapabilityForView(capability, view) {
     if (!capability || !view || isLiveStyledStorageView(view)) {
       return capability;
@@ -10520,11 +10696,9 @@
       comparisonSelect.innerHTML = optionsHtml;
       const currentOptions = Array.from(select.options);
       const desiredOptions = Array.from(comparisonSelect.options);
-      // `selected` is deliberately not compared. Option HTML for the
-      // enclosure/view selector carries no `selected` attribute, so the
-      // detached comparison select auto-selects its first option and would
-      // disagree with the live select on every render. The selection is
-      // carried by `intendedValue` instead.
+      // `selected` is not compared: the option HTML has no `selected`, so the
+      // detached select picks its first option and would always differ. The
+      // selection rides on `intendedValue`.
       const optionsMatch = currentOptions.length === desiredOptions.length
         && currentOptions.every((option, index) => {
           const desired = desiredOptions[index];
@@ -10652,9 +10826,8 @@
     renderCacheTimingChips();
   }
 
-  // The 1 Hz tick only runs while something on screen counts down: a scheduled
-  // auto refresh, or the cache chips shown with UI Timing (#461). Paused, off,
-  // and "Refreshing..." labels are static and are rendered by the state change.
+  // The 1 Hz tick runs only while a scheduled refresh or UI Timing cache chip
+  // counts down (#461); static labels render on state change.
   function timingTickNeeded() {
     if (state.snapshotMode) {
       return false;
@@ -12397,6 +12570,13 @@
       renderGrid();
       renderHeatmapControls();
       ensureHeatmapData();
+    });
+  }
+  if (heatmapColourSelect) {
+    heatmapColourSelect.addEventListener("change", () => {
+      state.heatmap.temperatureScale = normalizeHeatmapTemperatureScale(heatmapColourSelect.value);
+      renderGrid();
+      renderHeatmapControls();
     });
   }
   if (heatmapScrubSlider) {

@@ -129,6 +129,17 @@ function loadMetricFunctions(context = {}) {
   ];
   // Baseline replay must reach the actual defect, not fail on a missing new helper.
   if (APP_SOURCE.includes("function nullableMetricNumber(")) names.push("nullableMetricNumber");
+  // #1103 temperature bands and tile text contrast helpers.
+  for (const name of [
+    "heatmapTemperatureBandsActive", "normalizeHeatmapTemperatureScale", "resolveHeatmapTemperatureThresholds",
+    "heatmapTemperatureDefaultProfiles", "heatmapTemperatureProfileId", "heatmapTemperatureThresholdValue",
+    "heatmapTemperatureBand", "heatmapTemperatureBandDefinitions", "summarizeHeatmapTemperatureBands",
+    "heatmapTemperatureThresholdKey", "heatmapSurfaceRgb", "heatmapReadableTextRgb", "heatmapContrastRatio",
+    "heatmapBadgeRgb",
+    "heatmapRelativeLuminance",
+  ]) {
+    if (APP_SOURCE.includes(`function ${name}(`)) names.push(name);
+  }
   return loadFunctions(names, {
     ANNUALIZED_MIN_POWER_ON_HOURS: 720,
     HEATMAP_MIN_SCALE_SENSITIVITY: 0.5, HEATMAP_MAX_SCALE_SENSITIVITY: 2,
@@ -278,12 +289,14 @@ test("unknown temperature renders a missing badge while zero renders an active b
   const api = loadMetricFunctions({
     state: { heatmap: { enabled: true, metric: "temperature_c", sensitivity: 1 } },
     currentHeatmapEntries: () => entries,
-    document: { createElement: () => ({}) },
+    document: { createElement: () => ({ dataset: {} }) },
   });
   for (const entry of entries) {
     const classes = new Set();
     const tile = {
       children: [],
+      querySelector: () => null,
+      querySelectorAll() { return this.children.filter((child) => child.className === "slot-heatmap-value"); },
       classList: { contains: (name) => classes.has(name), add: (...names) => names.forEach((name) => classes.add(name)),
         remove: (...names) => names.forEach((name) => classes.delete(name)) },
       style: { removeProperty() {}, setProperty() {} },
@@ -294,6 +307,8 @@ test("unknown temperature renders a missing badge while zero renders an active b
     assert.equal(classes.has("heatmap-active"), entry.key === "1");
     assert.equal(tile.children[0].textContent, entry.key === "0" ? "--" : "0 C");
     assert.equal(tile.children[0].title, entry.key === "0" ? "Temperature: unknown" : "Temperature: 0 C");
+    // #1110: only the unknown badge is a placeholder, kept out of the bay name.
+    assert.equal("placeholder" in tile.children[0].dataset, entry.key === "0");
   }
 });
 

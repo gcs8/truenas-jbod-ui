@@ -151,6 +151,9 @@ class SegmentedHistoryReader:
         self._segment_system_summaries: dict[
             Path, tuple[_VerifiedSegmentDigest, tuple[tuple[str, sqlite3.Row], ...]]
         ] = {}
+        # Per-table row counts of each catalogued segment, recorded while the
+        # catalog's coverage is verified against every row (#1093).
+        self._segment_row_counts: dict[Path, dict[str, int]] = {}
 
     @classmethod
     def from_catalog(
@@ -621,6 +624,7 @@ class SegmentedHistoryReader:
         for segment in self._catalog_segments or ():
             actual_start: datetime | None = None
             actual_end: datetime | None = None
+            row_counts: dict[str, int] = {}
             with self._read_only_connection(
                 segment.path,
                 expected_size_bytes=segment.size_bytes,
@@ -628,15 +632,22 @@ class SegmentedHistoryReader:
                 immutable=True,
             ) as connection:
                 for table_name, timestamp_column in HISTORY_TABLE_TIMESTAMPS.items():
-                    rows = connection.execute(
-                        f"SELECT {timestamp_column} FROM {table_name} WHERE {timestamp_column} IS NOT NULL"
-                    )
+                    rows = connection.execute(f"SELECT {timestamp_column} FROM {table_name}")
+                    row_count = 0
                     for row in rows:
+                        row_count += 1
+                        if row[0] is None:
+                            continue
                         timestamp = _parse_catalog_timestamp(row[0])
                         actual_start = timestamp if actual_start is None else min(actual_start, timestamp)
                         actual_end = timestamp if actual_end is None else max(actual_end, timestamp)
+                    row_counts[table_name] = row_count
             if actual_start != segment.coverage_start or actual_end != segment.coverage_end:
                 raise ValueError("Segmented history catalog coverage does not match segment contents.")
+            # This pass already read every row of the authenticated, immutable
+            # segment, so its row counts come free; tracked_counts() reuses
+            # them instead of scanning again (#1093).
+            self._segment_row_counts[segment.path] = row_counts
 
     def counts(self) -> dict[str, int]:
         totals = {
@@ -660,6 +671,69 @@ class SegmentedHistoryReader:
                 totals["metric_rollup_count"] += int(
                     connection.execute("SELECT COUNT(*) FROM metric_rollups").fetchone()[0]
                 )
+        return totals
+
+    def tracked_counts(self) -> dict[str, int]:
+        """The totals without scanning a hot history table (#1093).
+
+        The hot database answers from its trigger-maintained
+        ``history_table_counts`` rows, as the unsegmented tracked path does.
+        A catalogued segment answers from the row counts recorded when the
+        reader verified its coverage. Only a segment this reader was given
+        directly, without a catalog, is counted; segments are immutable files
+        that no index build reads.
+        """
+
+        totals = {
+            "tracked_slots": 0,
+            "event_count": 0,
+            "metric_sample_count": 0,
+            "metric_rollup_count": 0,
+        }
+        keys = {
+            "slot_events": "event_count",
+            "metric_samples": "metric_sample_count",
+            "metric_rollups": "metric_rollup_count",
+        }
+        with self._query_connection(self.hot_path) as connection:
+            totals["tracked_slots"] = int(
+                connection.execute("SELECT COUNT(*) FROM slot_state_current").fetchone()[0]
+            )
+            tracked: dict[str, int] = {}
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'history_table_counts'"
+            ).fetchone():
+                tracked = {
+                    str(row[0]): int(row[1])
+                    for row in connection.execute(
+                        "SELECT table_name, row_count FROM history_table_counts"
+                    ).fetchall()
+                }
+            for table_name, key in keys.items():
+                if table_name in tracked:
+                    totals[key] += tracked[table_name]
+                else:
+                    # A hot database the service has not started on yet has
+                    # no seeded counter to read.
+                    totals[key] += int(
+                        connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                    )
+        for path in self._selected_segment_paths(since=None):
+            # Always enter the guarded connection: recorded counts do not
+            # authenticate a segment, so the identity, digest and sidecar
+            # checks still run before they are reused, as in
+            # list_history_system_summaries().
+            with self._query_connection(path) as connection:
+                recorded = self._segment_row_counts.get(path)
+                if recorded is None:
+                    recorded = {
+                        table_name: int(
+                            connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                        )
+                        for table_name in keys
+                    }
+            for table_name, key in keys.items():
+                totals[key] += int(recorded.get(table_name, 0))
         return totals
 
     def database_size_bytes(self) -> int:

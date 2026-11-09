@@ -28,6 +28,136 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- The history service now keeps SQLite's temporary sort and VACUUM files in
+  `./history/.sqlite-tmp` (mode `0700`, created and emptied of stale files at
+  startup), whatever `TMPDIR` the Compose file sets. An older or customised
+  Compose file without `TMPDIR` for the history service, or a hardened one with
+  a tmpfs `/tmp`, no longer needs that line added by hand. Setting
+  `SQLITE_TMPDIR` for the history service still overrides it. Backups and
+  exports never include the folder (#1094, #1095).
+
+### Fixed
+
+- Fixed page reloads and bay-assignment saves waiting with no limit when the
+  app's own background inventory refresh never finished. A request now waits
+  at most 5 seconds behind it: a read that accepts an older view gets the
+  cached one with a warning naming when it was read, other reads answer a
+  retryable 503 "still refreshing", and a save that is already stored answers
+  success with the earlier bay view and a warning instead of an error. A
+  background refresh that runs past 5 minutes is stopped and logged, the next
+  one can start, and its late result is never published, including bay details
+  it was still saving to disk. Opt-in startup prewarming follows the same
+  rules: a request before the first inventory read finishes answers a
+  retryable 503 saying no inventory has been read yet. The appliance call
+  budget is unchanged (#1125, #1126).
+- Fixed a page reload right after an enclosure rename, or a bay-assignment
+  save while the page's own background refresh was still running, answering
+  503 "server is busy". A request that starts after the change now waits for
+  the earlier refresh and is served; only a refresh that began before the
+  change still refuses to publish its older view. The appliance call budget is
+  unchanged: no extra or concurrent appliance reads (#1113, #1121).
+- Fixed bay tiles and the Rename button announcing names that differ from
+  what they show: a bay is now named by its visible number, disk, pool or
+  mount (punctuation-only and non-ASCII labels included) and heat value, then
+  its health. Disk Path facts are proper term and value pairs, cut-off
+  Connections, Storage Fabric, topology and multipath path text has its full
+  text on hover and unfolds on keyboard focus, and path pills are buttons
+  that open and close their full text. The heat-map value no longer hides the
+  device name on NVMe carrier cards. In a narrow window grouped bays, boot
+  and NVMe cards and UniFi heat values no longer overlap or wrap one letter
+  per line, state chips on every UniFi face (UNVR, UNVR Pro, UNVR-G2,
+  UNVR-G2-Pro, ENVR, ENVR Core) clear the temperature, labels, LED and
+  handle, and the history table scrolls on its own (#1122).
+- Fixed heat-map temperature colours stretching to the coolest and warmest bay
+  in view, which showed a 49 C disk beside a 48 C one, or 35 C disks on a cool
+  shelf, as red. Temperatures now use absolute bands from each drive's SMART
+  warning and critical ratings (now read from smartctl for NVMe, ATA and SCSI
+  drives) or documented HDD and SSD/NVMe defaults, shown in the legend; the
+  relative view is an explicit `Colours` option. `Temperature vs View Avg`
+  uses a fixed -10 to +10 C scale, and the bay's slot, device, pool and serial
+  text now meets WCAG AA contrast on every heat colour. The value sits in its
+  own row, so it no longer covers the device name in short bays (#1105).
+- Fixed the enclosure title on the main page and in offline snapshots
+  stacking one letter per line when Heat Map is on: the title keeps its width
+  and the heat-map controls wrap beside it or move to their own row. On
+  Storage Fabric > Disk Path every card now fills its column, so the SAS LINK
+  card no longer leaves an empty column or breaks labels such as Remote,
+  Handle and Parent mid-word (#1104).
+- Fixed history index builds and startup upgrades spilling their sort files
+  outside the history volume when the history service's Compose entry had no
+  `TMPDIR`: into the container's own filesystem, or, on a read-only container,
+  its tmpfs `/tmp`, which put the sort back in memory and could bring back the
+  #1092 out-of-memory failure. The history service and the
+  segmented-history maintenance scripts now choose the history volume
+  themselves, and the free-space check before an index build looks at that same
+  folder (#1094, #1095).
+- Fixed `scripts/update_immutable_deployment.py --replace-compose` replacing
+  operator overlays: overlays named with `--keep-overlay` now stay in the
+  Compose chain, the merged chain is validated, and a kept overlay may set
+  only `restart` on shipped services: any other setting, YAML anchor or merge
+  key, or reference to another file is refused before any Docker command, and
+  the merged model may differ from the shipped files' only in `restart`. The
+  deployment directory and every input must be owned by root or the updater and
+  not writable by group or others, and every directory from / down to the
+  deployment must be owned by root and not writable by group or others, so a
+  deployment under `/tmp` or another writable directory is refused (#1100,
+  #1101). Every input is read without following links,
+  frozen in the private receipt and checked unchanged before each step; under
+  `--replace-compose` kept overlays are also rewritten with their frozen bytes
+  as new helper-owned files before Compose reads them; and
+  rollback restores and rechecks file modes as well as bytes. Health and
+  retention URLs may also use an address and port the deployment itself
+  publishes (#1097).
+
+## v0.24.0-beta.6 - 2026-11-07
+
+This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
+fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- The first bays of a single-row chassis face wider than its bezel, such as a
+  24-bay 2.5" front at 1600 px, can be scrolled to and selected again (#1081).
+- Storage Fabric keeps the CORE HBA PHY table and exposes lane pairs in the
+  API: per HBA-to-expander or expander cascade link, the PHY pairs both ends
+  report, with lane count and rate. The page does not draw lanes (#1086).
+- The admin page shows real saved history row counts on segmented history
+  deployments instead of 0 (#1083).
+- The history container no longer runs out of memory while it builds its
+  background indexes after an upgrade or restore of a large v0.22.2 history
+  (#1093).
+- The image is built on a digest-pinned `python:3.12-slim` base, with
+  pydantic 2.14.3, websockets 17.4 and boto3 1.43.126 (#1073, #1074).
+
+### Upgrade notes
+
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.5`, no operator
+  action is expected: Compose files, settings, environment variables and data
+  formats are unchanged. Upgrading from `v0.23.0` or older, read the
+  `v0.24.0-beta.1` to `v0.24.0-beta.5` upgrade notes too.
+- The image now builds `FROM` a digest-pinned `python:3.12-slim`, and the
+  bundled Python packages moved to pydantic 2.14.3, websockets 17.4 and boto3
+  1.43.126. Rebuilds of this tag use the same base image. Renovate keeps
+  Python minor/major base bumps and the screenshot toolchain out of its routine
+  group, and never pins this project's own image in `docker-compose.yml`
+  (#1073, #1074, #1080).
+- Storage Fabric links gain an optional `reported_lanes` field, null when either
+  end's PHY rows are missing or disagree. API consumers that validate the exact
+  link field set must accept it. The app runs no new appliance command for it
+  (#1086).
+- History index builds and the startup schema upgrade now sort through
+  temporary files in the history service's `TMPDIR` instead of memory. The
+  shipped Compose file already sets it to the history volume, so the default
+  install needs no change. A custom Compose file that points the history
+  service's `TMPDIR` at a tmpfs puts that sort data back in memory; point it at
+  the history volume instead. A build that does not fit on the volume waits,
+  reported as waiting for free disk space, and retries every five minutes
+  while collection continues (#1093).
+
 ### Added
 
 - Added the CORE HBA PHY table to Storage Fabric controller data, and an
@@ -65,6 +195,21 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   the key input and admin credential redacted. A `--root` name that is not a
   lowercase Compose project name is refused before anything is created
   (#1090).
+- Fixed the history container running out of memory while it built its
+  background indexes after an upgrade or restore of a large v0.22.2 history.
+  The build kept its sort data in memory, so memory grew with the table and
+  could pass the default 1 GiB `HISTORY_MEM_LIMIT`. Index builds and the
+  startup upgrade now sort through temporary files in the history volume
+  (`TMPDIR`) with a bounded cache. A background index build that fills the
+  volume is rolled back and retried every five minutes while collection
+  continues, reported as waiting for free disk space; before it starts, a
+  build that cannot fit even at the smallest possible index size waits the
+  same way. A startup upgrade that fills the volume stops with a message
+  naming the volume and the free space needed instead of a traceback. Stored
+  row counters are no longer trusted, and a restore recounts them. While an
+  index builds, `exact_counts=true` overview requests answer from the tracked
+  totals, also with segmented history, and say exact counts are deferred
+  (#1092, #1093).
 
 ### Internal
 

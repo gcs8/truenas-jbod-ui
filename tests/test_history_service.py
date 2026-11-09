@@ -1366,6 +1366,7 @@ class HistoryPublicationDurabilityTests(unittest.TestCase):
     def _production_runtime(self):
         # Execute unchanged construction bodies without importing app startup.
         from history_service.startup import DEFAULT_ATTEMPTS, DEFAULT_INITIAL_BACKOFF_SECONDS
+        from history_service.sqlite_temp import configure_sqlite_temporary_directory
         from history_service.startup_migration import open_history_store_after_recovery
 
         source = Path(history_store.__file__).with_name("main.py")
@@ -1380,6 +1381,7 @@ class HistoryPublicationDurabilityTests(unittest.TestCase):
             DEFAULT_INITIAL_BACKOFF_SECONDS=DEFAULT_INITIAL_BACKOFF_SECONDS,
             open_history_store_with_retries=open_history_store_with_retries,
             open_history_store_after_recovery=open_history_store_after_recovery,
+            configure_sqlite_temporary_directory=configure_sqlite_temporary_directory,
         )
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
         get_history_settings.cache_clear()
@@ -2451,8 +2453,13 @@ class HistoryStoreTests(unittest.TestCase):
             def __init__(self, name: str) -> None:
                 self.name = name
 
-            def execute(self, _statement: str) -> None:
+            def execute(self, _statement: str, *_parameters: object) -> "FakeConnection":
                 events.append(f"{self.name}:execute")
+                return self
+
+            def fetchone(self) -> None:
+                # The restore's counter recount (#1093) finds no counter table.
+                return None
 
             def backup(self, _target: object) -> None:
                 events.append(f"{self.name}:backup")

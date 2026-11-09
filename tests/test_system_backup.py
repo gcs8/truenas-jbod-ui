@@ -557,6 +557,35 @@ class SystemBackupServiceTests(unittest.TestCase):
                 self.temp_dir / "unreferenced-segment-snapshot"
             )
 
+    def test_history_export_ignores_the_sqlite_temporary_directory(self) -> None:
+        # #1094: history startup keeps SQLite's temporary files in a private
+        # dot-named directory on the history volume. Exports never pick it up,
+        # even when it holds something that looks like a segment.
+        service, catalog_path, _segment_path = self._build_segmented_debug_service()
+        for directory in (catalog_path.parent.parent, catalog_path.parent):
+            temporary = directory / ".sqlite-tmp"
+            temporary.mkdir(mode=0o700)
+            (temporary / "etilqs_stalesortrun").write_bytes(b"stale sort run")
+            shutil.copyfile(_segment_path, temporary / "segment-stray.sqlite3")
+
+        artifact = service.export_bundle_to_file(
+            encrypt=False,
+            packaging="zip",
+            included_paths=[HISTORY_DB_KEY],
+        )
+        try:
+            with zipfile.ZipFile(artifact.path) as archive:
+                self.assertEqual(
+                    set(archive.namelist()),
+                    {
+                        "manifest.json",
+                        "history/history.sqlite3",
+                        "history/segments/segment-0001.sqlite3",
+                    },
+                )
+        finally:
+            artifact.cleanup()
+
     def test_segmented_snapshot_rejects_catalog_change_during_copy(self) -> None:
         service, catalog_path, segment_path = self._build_segmented_debug_service()
         real_copyfile = shutil.copyfile

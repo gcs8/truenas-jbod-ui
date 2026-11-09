@@ -1064,6 +1064,22 @@ textarea {
   margin-bottom: 12px;
 }
 
+/* The title keeps its natural width (#1102). Header actions wrap in the rest,
+   and drop to their own row when under 360px is left beside the title. */
+.enclosure-panel > .panel-header {
+  flex-wrap: wrap;
+}
+
+.enclosure-panel > .panel-header > .enclosure-title-stack {
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+.enclosure-panel > .panel-header > .panel-header-actions {
+  flex: 1 1 360px;
+  min-width: 0;
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
@@ -1119,7 +1135,8 @@ textarea {
   width: 92px;
 }
 
-.heatmap-playback-field {
+.heatmap-playback-field,
+.heatmap-colour-field {
   width: 112px;
 }
 
@@ -1180,6 +1197,48 @@ textarea {
   border-radius: 999px;
   background: linear-gradient(90deg, #2f6ebb, #2cab67 30%, #d7b62b 68%, #d24a4a);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+/* #1103: bands replace the min-max gradient. */
+.heatmap-legend.heatmap-legend-banded {
+  max-width: 300px;
+}
+
+.heatmap-legend-banded > :is(#heatmap-legend-min, .heatmap-legend-bar, #heatmap-legend-max) {
+  display: none;
+}
+
+.heatmap-legend-bands {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: #dfe7f0;
+}
+
+.heatmap-legend-bands li {
+  white-space: nowrap;
+}
+
+.heatmap-legend-bands span {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 3px;
+  background: rgb(var(--heatmap-band-rgb));
+}
+
+.heatmap-legend-bands b {
+  font: 400 1em var(--mono);
+}
+
+.heatmap-legend-source {
+  grid-column: 1 / -1;
+  color: #c5d4e6;
 }
 
 .heatmap-legend-status {
@@ -1773,6 +1832,19 @@ textarea {
   white-space: nowrap;
 }
 
+/* #1112: keyboard focus or an opened path pill unfolds cut-off lines; hover
+   has a title. */
+:is(.sas-fabric-item, .fabric-focus-card, .topology-pill):focus-visible :is(span, small),
+.topology-pill[aria-expanded="true"] :is(span, small) {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+:is(.fabric-focus-card, .topology-pill):focus-visible {
+  outline: 2px solid var(--selected);
+  outline-offset: 2px;
+}
+
 .fabric-warning-list:empty {
   display: none;
 }
@@ -2250,6 +2322,9 @@ textarea {
 }
 
 .disk-path-card {
+  /* A button card shrinks to its content; fill the grid column instead so a
+     card with short values does not leave an empty column beside it (#1102). */
+  width: 100%;
   min-width: 0;
   max-width: none;
   display: flex;
@@ -2336,7 +2411,9 @@ button.disk-path-card:hover,
 
 .disk-path-facts span {
   display: grid;
-  grid-template-columns: minmax(42px, 0.54fr) minmax(0, 1fr);
+  /* Labels wrap only between words; the label column is never narrower than
+     its longest word, and values keep wrapping anywhere (#1102). */
+  grid-template-columns: minmax(min-content, 0.54fr) minmax(0, 1fr);
   gap: 6px;
   min-width: 0;
   color: #b7c9d8;
@@ -2349,6 +2426,7 @@ button.disk-path-card:hover,
 .disk-path-facts em {
   color: #7890a7;
   font-style: normal;
+  overflow-wrap: normal;
 }
 
 .fabric-diagnostic-evidence {
@@ -3175,7 +3253,7 @@ button.fabric-trace-crumb:hover {
   margin: 0;
 }
 
-.fabric-path-member-card dl span {
+.fabric-path-member-card dl div {
   display: grid;
   gap: 2px;
   min-width: 0;
@@ -3545,10 +3623,8 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="drawer"] {
-  /* Top-down view of vertically mounted drives: each bay is a tall, narrow
-     tray, so the face owns its proportions instead of the drive-scale ones.
-     Trays keep a minimum width and the drawer scrolls inside its bezel when
-     the window cannot fit all fourteen columns. */
+  /* Top-down drawer of tall, narrow trays: the face owns its proportions.
+     Trays keep a minimum width; the drawer scrolls inside its bezel. */
   --slot-bay-width: 118px;
   --slot-bay-aspect: 0.46 / 1;
   --slot-grid-gap: 12px;
@@ -3618,6 +3694,7 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-face-style="boot-devices"] {
+  --slot-track-min-width: 240px;
   --chassis-min-height: 390px;
   --slot-grid-gap: 12px;
   margin-top: 10px;
@@ -3873,10 +3950,8 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-latch-edge="bottom"] .row-slots,
 .chassis-shell[data-latch-edge="top"] .row-slots {
   justify-items: center;
-  /* A bay group wider than its track (a 24-bay single row in a narrow bezel)
-     must overflow toward the end, where the chassis shell can scroll to it.
-     Plain center splits the overflow and strands the first bay past the start
-     edge (#1065). Rows that fit are centred exactly as before. */
+  /* A bay group wider than its track overflows toward the end, where the shell
+     scrolls; plain center would strand the first bay past the start (#1065). */
   justify-items: safe center;
 }
 
@@ -3891,7 +3966,8 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-face-style="generic"] .row-group,
 .chassis-shell[data-face-style="front-drive"] .row-group,
 .chassis-shell[data-face-style="rear-drive"] .row-group,
-.chassis-shell[data-face-style="top-loader"] .row-group {
+.chassis-shell[data-face-style="top-loader"] .row-group,
+.chassis-shell[data-face-style="boot-devices"] .row-group {
   grid-template-columns: repeat(var(--group-columns, 1), minmax(var(--slot-track-min-width), 1fr));
 }
 
@@ -4000,10 +4076,9 @@ button.fabric-trace-crumb:hover {
   cursor: pointer;
   text-align: left;
   color: var(--text);
-  /* Selected, peer and Connections rings (#925). An inset outline survives the
-     state and face rules that replace box-shadow, and leaves ::after to the
-     state chip. It paints under the tray face, so it sits in the gap between
-     the tile edge and the face; :focus-visible below replaces it. */
+  /* Selected, peer and Connections rings (#925): an inset outline survives the
+     rules that replace box-shadow and leaves ::after to the state chip. It sits
+     between tile edge and tray face; :focus-visible replaces it. */
   outline: var(--bay-ring-width, 0px) solid var(--bay-ring-color, transparent);
   outline-offset: var(--bay-ring-offset, -5px);
   transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
@@ -4595,29 +4670,44 @@ button.fabric-trace-crumb:hover {
 @media (max-width: 640px) {
   /* Bays keep a readable width on a phone; the face scrolls sideways, like
      the other chassis faces, instead of squeezing the tray labels. */
-  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] {
+  .chassis-shell[data-face-style="unifi-drive"] {
     --unifi-bay-min: 76px;
     --unifi-decor-min: 34px;
     padding: 10px 8px 8px;
     overflow-x: auto;
   }
 
-  .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-grid {
+  .chassis-shell[data-face-style="unifi-drive"] .slot-grid {
     min-width: max-content;
+  }
+
+  /* #1109: the value beside a UniFi bay number stays on one line. */
+  .chassis-shell[data-face-style="unifi-drive"] .slot-heatmap-value {
+    white-space: nowrap;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
     gap: 4px;
   }
 
+  /* #1124: the right gutter holds the state chip above the LED. */
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile {
     height: 76px;
     min-height: 76px;
-    padding: 8px 18px 8px 8px;
+    padding: 8px 36px 8px 8px;
   }
 
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-status-led {
     right: 6px;
+  }
+
+  /* A G2 bay's text ends before the chip, which sits left of the handle. */
+  .chassis-shell[data-face-family="g2"] {
+    --unifi-bay-min: 182px;
+  }
+
+  .chassis-shell[data-face-family="g2"][data-face-variant] .slot-tile {
+    padding-right: 84px;
   }
 
   .unifi-face-band {
@@ -4760,10 +4850,8 @@ button.fabric-trace-crumb:hover {
   --bay-dim-filter: saturate(0.34) brightness(0.64);
 }
 
-/* A dimmed bay filters its tray face, chip and labels, not the tile: a filter
-   on the tile would grey the LED dot inside it too, and no rule on the dot can
-   undo that. The dot keeps its colour, so a fault or locate light still reads
-   (#925). */
+/* A dimmed bay filters its face, chip and labels, not the tile, so the LED
+   dot keeps its colour and a fault or locate light still reads (#925). */
 .slot-tile:is(.peer-dimmed, .fabric-dimmed)::before,
 .slot-tile:is(.peer-dimmed, .fabric-dimmed)::after,
 .slot-tile:is(.peer-dimmed, .fabric-dimmed) > :not(.slot-status-led) {
@@ -4897,25 +4985,37 @@ button.fabric-trace-crumb:hover {
   background: rgba(214, 222, 230, 0.09);
 }
 
-.slot-tile.heatmap-active .slot-number,
-.slot-tile.heatmap-missing .slot-number {
-  z-index: 6;
-}
-
-.slot-tile.heatmap-active .slot-device,
-.slot-tile.heatmap-active .slot-pool,
-.slot-tile.heatmap-active .slot-tertiary,
-.slot-tile.heatmap-missing .slot-device,
-.slot-tile.heatmap-missing .slot-pool,
-.slot-tile.heatmap-missing .slot-tertiary {
-  position: relative;
-  z-index: 1;
-  opacity: 0.45;
-}
-
 .slot-tile.selected .slot-number {
   background: rgba(91, 183, 255, 0.18);
   color: #eff8ff;
+}
+
+.slot-tile:is(.heatmap-active, .heatmap-missing) .slot-number {
+  z-index: 6;
+  background: rgb(var(--heatmap-surface-rgb));
+  color: rgb(var(--heatmap-text-rgb));
+  box-shadow: inset 0 0 0 1px rgba(var(--heatmap-text-rgb), 0.32);
+}
+
+/* #1103: app.js sets these for coloured tiles (WCAG AA text). */
+.slot-tile.heatmap-missing {
+  --heatmap-surface-rgb: 52, 59, 67;
+  --heatmap-text-rgb: 238, 242, 246;
+  --heatmap-badge-rgb: 23, 26, 30;
+}
+
+.slot-tile:is(.heatmap-active, .heatmap-missing) :is(.slot-device, .slot-pool, .slot-tertiary) {
+  position: relative;
+  z-index: 6;
+  order: 1;
+  align-self: flex-start;
+  margin: 0;
+  width: fit-content;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgb(var(--heatmap-surface-rgb));
+  color: rgb(var(--heatmap-text-rgb));
+  opacity: 1;
 }
 
 .slot-device,
@@ -4954,7 +5054,7 @@ button.fabric-trace-crumb:hover {
   transform: translate(-50%, -42%);
   border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(5, 8, 12, 0.62);
+  background: rgb(var(--heatmap-badge-rgb));
   color: #f4f7fb;
   font-family: var(--mono);
   font-size: 0.82rem;
@@ -4969,14 +5069,35 @@ button.fabric-trace-crumb:hover {
 }
 
 .chassis-shell[data-layout-mode^="top-loader"] .slot-heatmap-value {
-  top: 52%;
-  width: calc(100% - 8px);
   min-height: 24px;
   max-height: 42px;
   padding: 3px 3px;
   border-radius: 5px;
   font-size: 0.75rem;
   line-height: 1.02;
+}
+
+/* #1106: in a drive bay the value has its own row between the number and
+   the labels (order 1); a short UniFi bay puts it beside the number. */
+.slot-number ~ .slot-heatmap-value {
+  position: relative;
+  inset: auto;
+  flex: none;
+  width: auto;
+  min-height: 24px;
+  margin: auto -2px;
+  padding: 4px 3px;
+  transform: none;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] .slot-tile:is(.heatmap-active, .heatmap-missing) {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-content: space-between;
+}
+
+.chassis-shell[data-face-style="unifi-drive"] :is(.slot-device, .slot-pool, .slot-tertiary) {
+  grid-column: span 2;
 }
 
 .slot-tertiary {
@@ -6019,6 +6140,15 @@ button.fabric-trace-crumb:hover {
   min-width: 0;
 }
 
+/* #1123 */
+.storage-view-runtime-card-head > .slot-heatmap-value {
+  position: static;
+  width: auto;
+  min-height: 0;
+  transform: none;
+  white-space: nowrap;
+}
+
 .storage-view-runtime-card-size-chip {
   display: inline-flex;
   align-items: center;
@@ -6789,6 +6919,16 @@ button.fabric-trace-crumb:hover {
     margin: 0 0 10px;
     color: var(--muted);
     font-size: 0.86rem;
+  }
+
+  /* #1114, #1115: faces scroll inside the shell; bays never overlap. */
+  .chassis-shell {
+    --group-min: min-content;
+    overflow-x: auto;
+  }
+
+  .nvme-carrier-canvas {
+    min-width: 820px;
   }
 
   .fabric-lane-board,

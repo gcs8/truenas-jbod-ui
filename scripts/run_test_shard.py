@@ -100,6 +100,8 @@ SHARDS: dict[str, tuple[str, ...]] = {
     "2": (
         "test_admin_runtime_routes",
         "test_admin_safety",
+        "test_background_refresh_busy_routes",
+        "test_background_refresh_deadlines",
         "test_backup_integration",
         "test_ci_contract",
         "test_combined_shelf_upgrade",

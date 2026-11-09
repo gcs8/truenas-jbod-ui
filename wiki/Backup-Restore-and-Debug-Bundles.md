@@ -76,7 +76,9 @@ Each immutable segment is limited to 1.5 GiB. Allow temporary-disk and archive s
 The base Compose file keeps large temporary workspaces on disk-backed scratch
 inside an existing state mount. `TMPDIR` points history work at `/app/history`,
 admin work at its dedicated `/app/host-prep` volume, and the one-shot backup
-worker at `/app/backups`. The private `/tmp` tmpfs remains available for small
+worker at `/app/backups`. SQLite's own sort and VACUUM files in the history
+service go to `/app/history/.sqlite-tmp` whatever `TMPDIR` says, unless
+`SQLITE_TMPDIR` is set; backups never include that folder. The private `/tmp` tmpfs remains available for small
 library/runtime files, but full backup and restore archives do not consume that
 memory-backed filesystem.
 

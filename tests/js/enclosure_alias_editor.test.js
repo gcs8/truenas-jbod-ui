@@ -786,7 +786,8 @@ test("virtual inventory uses system-scoped disk copy without physical profile or
 
 test("template and stylesheet expose an accessible inline alias editor", () => {
   assert.match(TEMPLATE, /id="enclosure-alias-edit-button"/);
-  assert.match(TEMPLATE, /aria-label="Edit enclosure name"/);
+  // #1110: the name contains the visible "Rename".
+  assert.match(TEMPLATE, /aria-label="Rename enclosure"/);
   assert.match(TEMPLATE, /id="enclosure-alias-form"/);
   assert.match(TEMPLATE, /id="enclosure-alias-input"/);
   assert.match(TEMPLATE, /id="enclosure-alias-clear"/);

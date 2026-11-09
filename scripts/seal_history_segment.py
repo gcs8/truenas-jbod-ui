@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from history_service.segment_sealer import seal_history_segment
+from history_service.sqlite_temp import maintenance_sqlite_temporary_directory
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,14 +24,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    receipt = seal_history_segment(
-        source=args.source,
-        output_directory=args.output_dir,
-        segment_id=args.segment_id,
-        cutoff=args.cutoff,
-        key_id=args.key_id,
-        sequence=args.sequence,
-    )
+    # Keep SQLite's VACUUM and sort spill on the history volume (#1094).
+    with maintenance_sqlite_temporary_directory(args.source.absolute().parent):
+        receipt = seal_history_segment(
+            source=args.source,
+            output_directory=args.output_dir,
+            segment_id=args.segment_id,
+            cutoff=args.cutoff,
+            key_id=args.key_id,
+            sequence=args.sequence,
+        )
     print(json.dumps(receipt, sort_keys=True))
     return 0
 

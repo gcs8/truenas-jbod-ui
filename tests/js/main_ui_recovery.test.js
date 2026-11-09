@@ -360,24 +360,83 @@ test("search reports how many bays match, offers a clear control, and selects a 
 });
 
 test("bay tiles get a short accessible name and point at the tooltip for the rest", () => {
-  const { slotAccessibleName } = loadFunctions(["slotAccessibleName", "slotLocationLabel", "stateLabel", "formatSlotHealth"], {
+  const { slotAccessibleName, slotNameLead } = loadFunctions(["slotAccessibleName", "slotNameLead", "stateLabel", "formatSlotHealth"], {
     currentPlatform: () => "core",
   });
+  // #1110: the name is the tile's own text (number, device, pool, heat value)
+  // followed by what the tile does not show; these are the trailing facts.
   assert.equal(
     slotAccessibleName({ slot: 5, slot_label: "05", device_name: "da5", pool_name: "tank", health: "ONLINE", state: "healthy" }),
-    "Slot 05, da5, pool tank, online",
+    "online",
   );
-  assert.equal(slotAccessibleName({ slot: 6, slot_label: "06", state: "empty" }), "Slot 06, empty");
-  assert.equal(
-    slotAccessibleName({ slot: 1, slot_label: "Disk 1", physical_location_known: false, device_name: "sda", state: "unmapped" }),
-    "Disk 1, sda, unmapped",
-  );
+  assert.equal(slotAccessibleName({ slot: 6, slot_label: "06", state: "empty" }), "empty");
+  assert.equal(slotAccessibleName({ slot: 4, slot_label: "04", state: "identify", identify_active: true }), "identify, Locate light on");
+  assert.equal(slotNameLead({ slot_label: "05" }), "Slot ");
+  assert.equal(slotNameLead({ slot_label: "Disk 1", physical_location_known: false }), "");
 
   const renderGrid = functionSource("renderGrid");
-  assert.match(renderGrid, /tile\.setAttribute\("aria-label", slotAccessibleName\(slot\)\)/);
+  assert.match(renderGrid, /bayName\(tile, slotAccessibleName\(slot\), slotNameLead\(slot\)\)/);
   assert.match(renderGrid, /tile\.setAttribute\("aria-describedby", "slot-tooltip"\)/);
+  assert.match(functionSource("refreshHeatmapTileOverlays"), /bayName\(tile\)/);
   assert.doesNotMatch(APP_SOURCE, /function slotTooltip\(/, "the multi-line tooltip is no longer an accessible name");
   assert.match(TEMPLATE, /id="slot-tooltip"[^>]*role="tooltip"/);
+});
+
+test("a bay's name keeps every shown label, including non-ASCII and punctuation-only text, and skips placeholders", () => {
+  // Text nodes in document order, as a TreeWalker over the tile returns them;
+  // { placeholder } marks the missing-value badge's text.
+  const tileWith = (texts) => {
+    const attributes = {};
+    return {
+      dataset: {},
+      texts,
+      setAttribute: (name, value) => { attributes[name] = value; },
+      attributes,
+    };
+  };
+  const { bayName } = loadFunctions(["bayName"], {
+    Object,
+    NodeFilter: { SHOW_TEXT: 4 },
+    document: {
+      createTreeWalker: (tile) => {
+        let index = -1;
+        const walker = {
+          currentNode: null,
+          nextNode() {
+            index += 1;
+            const entry = tile.texts[index];
+            const placeholder = typeof entry === "object";
+            walker.currentNode = index < tile.texts.length ? {
+              textContent: placeholder ? entry.placeholder : entry,
+              parentElement: { hasAttribute: (name) => placeholder && name === "data-placeholder" },
+            } : null;
+            return walker.currentNode;
+          },
+        };
+        return walker;
+      },
+    },
+  });
+  // #1110 review: a Linux mount such as /数据 has no ASCII word character.
+  const linux = tileWith(["  ", "07", "sdh", "/数据", "38 C"]);
+  bayName(linux, "online", "Slot ");
+  assert.equal(linux.attributes["aria-label"], "Slot 07, sdh, /数据, 38 C, online");
+  // #1110 review: punctuation-only labels such as the mounts /-- and / are
+  // shown text too.
+  const punctuation = tileWith(["00", "sda", "/--", "--"]);
+  bayName(punctuation, "online", "Slot ");
+  assert.equal(punctuation.attributes["aria-label"], "Slot 00, sda, /--, --, online");
+  const root = tileWith(["01", "sdb", "/"]);
+  bayName(root, "online", "Slot ");
+  assert.equal(root.attributes["aria-label"], "Slot 01, sdb, /, online");
+  // The missing-value badge's "--" placeholder is not a label.
+  const empty = tileWith(["08", "EMPTY", "Empty", { placeholder: "--" }]);
+  bayName(empty, "empty", "Slot ");
+  assert.equal(empty.attributes["aria-label"], "Slot 08, EMPTY, Empty, empty");
+  // A later call (heat overlay refresh) reuses the stored detail and lead.
+  empty.texts = ["08", "EMPTY", "Empty"];
+  bayName(empty);
+  assert.equal(empty.attributes["aria-label"], "Slot 08, EMPTY, Empty, empty");
 });
 
 test("arrow keys move by row across the bay layout", () => {

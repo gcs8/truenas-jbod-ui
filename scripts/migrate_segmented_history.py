@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -67,6 +68,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _history_volume_temporary_files(args: argparse.Namespace):
+    """Keep SQLite's VACUUM and sort spill on the history volume (#1094).
+
+    Only an applying run does that work; a dry run writes nothing.
+    """
+    if not args.apply:
+        return contextlib.nullcontext()
+    from history_service.sqlite_temp import maintenance_sqlite_temporary_directory
+
+    return maintenance_sqlite_temporary_directory(args.source.absolute().parent)
+
+
 def main() -> int:
     args = parse_args()
     (
@@ -74,31 +87,31 @@ def main() -> int:
         recover_pending_migration,
         rollback_segmented_history,
     ) = _load_migration_api()
-    if args.rollback:
-        receipt = rollback_segmented_history(
-            source=args.source,
-            segments_directory=args.segments_dir,
-            apply=args.apply,
-        )
-    elif args.recover_rollback:
-        receipt = recover_pending_migration(
-            source=args.source,
-            segments_directory=args.segments_dir,
-            apply=args.apply,
-        )
-    else:
-        if args.cutoff is None or args.key_id is None:
-            raise SystemExit("--cutoff and --key-id are required unless a rollback mode is used.")
-        receipt = migrate_segmented_history(
-            source=args.source,
-            segments_directory=args.segments_dir,
-            cutoff=args.cutoff,
-            key_id=args.key_id,
-            apply=args.apply,
-        )
+    with _history_volume_temporary_files(args):
+        if args.rollback:
+            receipt = rollback_segmented_history(
+                source=args.source,
+                segments_directory=args.segments_dir,
+                apply=args.apply,
+            )
+        elif args.recover_rollback:
+            receipt = recover_pending_migration(
+                source=args.source,
+                segments_directory=args.segments_dir,
+                apply=args.apply,
+            )
+        else:
+            if args.cutoff is None or args.key_id is None:
+                raise SystemExit("--cutoff and --key-id are required unless a rollback mode is used.")
+            receipt = migrate_segmented_history(
+                source=args.source,
+                segments_directory=args.segments_dir,
+                cutoff=args.cutoff,
+                key_id=args.key_id,
+                apply=args.apply,
+            )
     print(json.dumps(receipt, sort_keys=True))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -43,6 +43,24 @@ Keep your existing Compose files. Do not use `down` for a normal update, and
 do not download a replacement Compose file. The full steps are in
 [[Docker and GHCR Deployment|Docker-and-GHCR-Deployment#update]].
 
+For a controlled, digest-pinned update with an automatic rollback receipt, use
+`scripts/update_immutable_deployment.py` from the
+[immutable GHCR deployment runbook](https://github.com/gcs8/truenas-jbod-ui/blob/main/docs/IMMUTABLE_GHCR_DEPLOYMENT.md).
+When a reviewed release also replaces the shipped Compose file
+(`--replace-compose`), name your own overlay, such as `compose.override.yaml`,
+with `--keep-overlay` so it stays in the chain. A kept overlay may set only
+`restart` (`no`, `always`, `on-failure[:N]` or `unless-stopped`) on services
+the shipped files define, nothing else: environment, ports, labels, logging,
+resource limits and every other setting are refused, and there is no flag to
+allow them. Setting `restart: always` or `unless-stopped` on the admin service
+undoes its auto-stop, because Docker starts it again after it exits. The deployment directory, `.env` and every Compose file must be
+owned by root or the user running the helper and not writable by group or
+others, and every directory from / down to the deployment must be owned by
+root and not writable by group or others, so keep the deployment under a
+directory such as `/opt` or `/srv`, not `/tmp` or a home directory. If the UI
+or admin service is published only on the host's LAN address, its health and
+retention URLs may use that published address and port instead of loopback.
+
 ## History
 
 A normal upgrade needs nothing: the history service migrates its database when
@@ -149,6 +167,30 @@ every 1,000 SQLite VM instructions. SQLite writer-lock waits keep their existing
 five-second timeout. This does not impose a wall-clock bound on stalled storage
 I/O or rollback, and production-scale Docker shutdown timing remains unqualified.
 Compose stop-grace settings are unchanged.
+Index builds, inline or deferred, sort through SQLite temporary files with a
+bounded cache instead of in memory, so their memory no longer grows with the
+table (#1092). The temporary files go to a private `.sqlite-tmp` folder on the
+history volume (`./history/.sqlite-tmp`, mode `0700`), which the history
+service creates and empties of stale files at startup whatever `TMPDIR` the
+Compose file sets, so an older or hardened Compose file with a tmpfs `/tmp` no
+longer puts them in memory. An operator-set `SQLITE_TMPDIR` still wins. Backups
+and exports never include the folder (#1094). If a deferred build fills
+the volume, SQLite rolls it back and deletes its temporary files, the service
+returns the build's WAL space with a checkpoint, logs the free space, reports
+degraded ("waiting for free disk space"), keeps collecting, and retries the
+build every five minutes (#1093). Before each deferred build it also refuses,
+with the same status and retry, a build that cannot fit even if every index
+record had the smallest size SQLite can store. That pre-flight counts the
+table's rows itself and samples nothing, so it never refuses a build that
+would fit. A startup upgrade that fills the volume (for example, an imported
+backup too large for the disk) stops with a message naming the volume and
+roughly how much free space it needs; the database is unchanged, and the
+service starts once space is freed. Startup recounts a stored row counter
+above its table's id range, and a restore recounts the backup's row counters. While an index builds, `/api/history/overview?exact_counts=true`
+answers with the tracked totals, no per-scope activity counts, and
+`counts_deferred_reason` set. With segmented history, the default overview and
+the deferred totals read the hot database's tracked counts and the segment row
+counts recorded when the catalog was verified, without scanning.
 A 2-million-row synthetic
 database took 14.6 seconds to start without the deferral; production's
 4-million-row database took 58.7 seconds, past the healthcheck.

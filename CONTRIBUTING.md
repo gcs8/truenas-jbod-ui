@@ -368,13 +368,14 @@ PLAYWRIGHT_ADMIN_BASE_URL=http://127.0.0.1:8082 npx playwright test qa/admin-ope
 CI runs the fixture-only browser specs on every pull request, in the
 `Checked-in public demo artifact` job's `Run fixture-only browser specs` step:
 `qa/chassis-row-overflow.spec.js`, `qa/connections-clear-selection.spec.js`,
-`qa/connections-overflow.spec.js`, `qa/offline-snapshot.spec.js`,
-`qa/saved-view-selection.spec.js`, `qa/ui-scope-safety.spec.js`, and
-`qa/upgrade-notice.spec.js`. They build their own synthetic fixtures and need
-no running stack:
+`qa/connections-overflow.spec.js`, `qa/header-and-disk-path-layout.spec.js`,
+`qa/heatmap-temperature-bands.spec.js`, `qa/offline-snapshot.spec.js`,
+`qa/saved-view-selection.spec.js`, `qa/ui-a11y-narrow-layout.spec.js`,
+`qa/ui-scope-safety.spec.js`, and `qa/upgrade-notice.spec.js`. They build their
+own synthetic fixtures and need no running stack:
 
 ```bash
-npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
+npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
 
 The switching and ESXi suites are live-appliance contracts, not portable fixture
