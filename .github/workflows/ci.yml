@@ -985,7 +985,9 @@ jobs:
     name: Checked-in public demo artifact
     if: needs.route.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The UI coverage crawl (qa/ui-coverage.spec.js) adds about 10 minutes to
+    # the fixture-only browser specs; keep headroom over the ~20 minute total.
+    timeout-minutes: 35
     needs:
       - route
       - javascript-source
