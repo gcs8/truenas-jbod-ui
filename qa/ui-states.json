@@ -53,7 +53,7 @@
       "id": "main.select", "page": "main", "safety": "read", "ci": true,
       "matrix": {"selection": ["healthy", "empty", "fault", "unknown"]},
       "steps": [{"selectBay": "{selection}"}, {"wait": 600}],
-      "covers": ["[data-slot]", "[data-copy]", "#history-toggle-button", "[data-led-action=IDENTIFY]", "[data-led-action=CLEAR]", "[data-topology-slot]"]
+      "covers": ["[data-slot]", "[data-copy]", "#history-toggle-button", "[data-led-action=IDENTIFY]", "[data-led-action=CLEAR]", "[data-topology-slot]", "[data-path-pill]"]
     },
     {
       "id": "main.select.smart-open", "page": "main", "safety": "read", "ci": true,
@@ -403,7 +403,7 @@
     {
       "id": "history.default", "page": "history", "safety": "read", "ci": true,
       "steps": [],
-      "covers": []
+      "covers": [".table-scroll"]
     },
     {
       "id": "history.refresh", "page": "history", "safety": "forbidden",
@@ -565,6 +565,7 @@
   ],
   "runtime_controls": [],
   "render_gaps": [
+    {"key": "[data-path-pill]", "reason": "Multipath member pills render only for a selected bay that has multipath members; the crawl fixtures have none yet. qa/ui-a11y-narrow-layout.spec.js renders them on a synthetic multipath bay and checks keyboard reveal (#1112)."},
     {"key": "#backup-import-file", "reason": "Hidden file input; its visible pick button #backup-import-pick-button is rendered and audited."},
     {"key": "#mapping-import-file", "reason": "Hidden file input; its visible button #import-mappings-button is rendered and audited."},
     {"key": "#setup-esxi-host-prep-file", "reason": "Hidden file input; its visible pick button #setup-esxi-host-prep-pick-button is rendered (admin.system-form.esxi)."},
