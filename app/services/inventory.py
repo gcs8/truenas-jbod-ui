@@ -107,6 +107,7 @@ from app.services.core_expander_counters import (
     CAPABILITY_DENIED,
     CAPABILITY_GRANTED,
     SMP_CAPABILITY_RETRY_SECONDS,
+    SMP_COUNTER_TIME_BUDGET_SECONDS,
     SMP_MAX_CALLS_PER_REFRESH,
     SMP_MAX_COMMANDS_PER_REFRESH,
     KeptCounterRead,
@@ -1629,6 +1630,9 @@ class InventoryService:
         # (#1088 review). Kept readings are bounded (see bound_kept_reads()).
         self._smp_counter_last_read: dict[tuple[int, str], float] = {}
         self._smp_counter_reads: dict[tuple[int, str], KeptCounterRead] = {}
+        # Expanders whose one-PHY capability probe gave no answer; the next
+        # probe goes to another expander (#1088 review).
+        self._smp_counter_silent_probes: set[tuple[int, str]] = set()
         self._reset_smp_counter_plan()
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
@@ -5132,6 +5136,7 @@ class InventoryService:
         self._smp_counter_queue: dict[tuple[int, str], list[str]] = {}
         self._smp_counter_stopped: dict[tuple[int, str], tuple[str, int]] = {}
         self._smp_counter_capability_memo: dict[tuple[str, int, int], str | None] = {}
+        self._smp_counter_started_at: float | None = None
 
     def _record_smp_counter_reads(self, command_results: list[SSHCommandResult]) -> None:
         """Keep each full read this collection ran, as decoded rows with a read time.
@@ -5225,6 +5230,7 @@ class InventoryService:
             return
         self._smp_counter_capability = state
         self._smp_counter_checked_at = self._smp_counter_clock()
+        self._smp_counter_silent_probes = set()
 
     def retry_expander_counter_capability(self) -> None:
         """Ask sudo again on the next collection after a remembered refusal.
@@ -5254,8 +5260,8 @@ class InventoryService:
         in that refresh.
         """
         keys = {smp_output_key(item.command) for item in command_results} - {None}
-        probe_key = smp_output_key(build_phy_error_log_command(targets[0], [0]))
-        if keys - {probe_key}:
+        # The capability probe reads PHY 0 of one expander ("...:00-00").
+        if {key for key in keys if not key.endswith(":00-00")}:
             return []
         now = self._smp_counter_clock()
         current = {(target.unit, target.expander_sas_address) for target in targets}
@@ -5272,6 +5278,7 @@ class InventoryService:
             if expander in current
         }
         self._reset_smp_counter_plan()
+        self._smp_counter_started_at = now
         budget = SMP_MAX_CALLS_PER_REFRESH - sum(smp_output_calls(key) for key in keys)
         command_budget = SMP_MAX_COMMANDS_PER_REFRESH - len(keys)
         commands: list[str] = []
@@ -5292,9 +5299,20 @@ class InventoryService:
         with no answer, or past the SSH command deadline), whose output was
         rejected, that failed, or that sudo refused; its remaining chunks are
         not sent this refresh, so a hung expander costs about one call
-        timeout. The read interval still applies to it.
+        timeout. The read interval still applies to it. Once
+        SMP_COUNTER_TIME_BUDGET_SECONDS have passed since the full reads
+        started, no further chunk is sent (``time_budget``), so slow but
+        answering expanders cannot push the collection past its deadline.
         """
         planned = self._smp_counter_planned
+        started = getattr(self, "_smp_counter_started_at", None)
+        if started is not None and self._smp_counter_clock() - started >= SMP_COUNTER_TIME_BUDGET_SECONDS:
+            for expander, queue in self._smp_counter_queue.items():
+                span = chunk_output_span(smp_output_key(queue[0])) if queue else None
+                if span is not None and expander not in self._smp_counter_stopped:
+                    self._smp_counter_stopped[expander] = ("time_budget", span[1][0])
+                queue.clear()
+            return []
         by_key = {
             key: item for item in command_results if (key := smp_output_key(item.command)) in planned
         }
@@ -5323,9 +5341,10 @@ class InventoryService:
 
         Targets come from the mprutil and camcontrol reads already in this
         refresh. An unknown or long-ago refused capability is checked with one
-        sudo call (PHY 0 of the first expander) before any full read; a recent
-        refusal is not retried unless a forced refresh asked for it. A full
-        read of a granted capability renews it.
+        sudo call (PHY 0 of the first expander, or of the next one after a
+        probe that got no answer) before any full read; a recent refusal is
+        not retried unless a forced refresh asked for it. A full read of a
+        granted capability renews it.
         """
         if self.system.truenas.platform != "core":
             return []
@@ -5351,10 +5370,26 @@ class InventoryService:
         recent = self._smp_counter_clock() - self._smp_counter_checked_at < SMP_CAPABILITY_RETRY_SECONDS
         if state == CAPABILITY_DENIED and recent:
             return []
-        if any(smp_output_key(item.command) for item in command_results):
-            # The probe ran this refresh but proved nothing (no answer).
+        current = {(target.unit, target.expander_sas_address) for target in targets}
+        silent = {expander for expander in (getattr(self, "_smp_counter_silent_probes", None) or set()) if expander in current}
+        probed = [key for item in command_results if (key := smp_output_key(item.command))]
+        if probed:
+            # The probe ran this refresh but proved nothing (no answer): the
+            # next refresh probes another expander, so one silent expander
+            # cannot keep the capability unknown (#1088 review).
+            for key in probed:
+                span = chunk_output_span(key)
+                if span is not None:
+                    unit, address, _device = span[0].split(":")
+                    silent.add((int(unit), address))
+            self._smp_counter_silent_probes = silent
             return []
-        return [build_phy_error_log_command(targets[0], [0])]
+        target = next((item for item in targets if (item.unit, item.expander_sas_address) not in silent), None)
+        if target is None:
+            # Every expander was silent once: start the turn again.
+            silent, target = set(), targets[0]
+        self._smp_counter_silent_probes = silent
+        return [build_phy_error_log_command(target, [0])]
 
     def _core_zpool_by_device_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         """Read pool members by device for a saved CORE command list that predates it (#948)."""

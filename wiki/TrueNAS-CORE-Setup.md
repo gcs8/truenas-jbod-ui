@@ -227,7 +227,11 @@ past the SSH timeout ends that expander's read for this refresh, so a hung
 expander costs about one timeout. Storage Fabric then shows "read stopped at
 PHY N (no answer)" next to the PHYs read before it, or "the expander did not
 answer" when none were; the unread PHYs show as unknown, and the next try waits
-for the 15 minutes. An answer that is larger than four PHYs can print, or that
+for the 15 minutes. Counter reads stop sending new commands about a minute
+into a refresh, so slow expanders cannot hold up the rest of the inventory;
+what was read is shown and the remaining PHYs say "read stopped at PHY N
+(refresh time budget)". If the first expander does not answer the permission
+check, the next refresh checks with another expander. An answer that is larger than four PHYs can print, or that
 names another expander or PHY, is discarded and shown as an error. The app keeps
 only the decoded readings between refreshes, for at most 64 expanders and
 4,096 PHYs, dropping the least recently read first. A larger fabric is

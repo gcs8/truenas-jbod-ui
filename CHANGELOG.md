@@ -50,8 +50,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   most once every 15 minutes, Refresh included, and one refresh makes at most
   512 such calls, four PHYs per SSH command. An expander that stops answering
   ends its read at that point (about one 3-second timeout) and is marked as not
-  answering, and an oversized or malformed answer is discarded and shown as an
-  error. In between, the last reading is shown with its read time; the app
+  answering, counter reads stop about a minute into a refresh, and an
+  oversized or malformed answer is discarded and shown as an error. In between, the last reading is shown with its read time; the app
   keeps only decoded readings, for at most 64 expanders and 4,096 PHYs (#1088).
 
 ### Fixed

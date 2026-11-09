@@ -108,6 +108,13 @@ SMP_MAX_RETAINED_PHYS = 4096
 # They are cumulative error counts, so a reading minutes old is current
 # enough; inside the interval the last reading is shown with its read time.
 SMP_COUNTER_READ_INTERVAL_SECONDS = 15 * 60
+# Counter reads are optional enrichment inside one inventory collection, whose
+# SSH commands run one after another and which is abandoned whole after
+# BACKGROUND_REFRESH_DEADLINE_SECONDS (300 s). No further chunk is sent once
+# this long has passed since the full reads started; one planning round sends
+# at most one chunk per expander (8 x 4 calls), so counters add at most about
+# this budget plus one round, and what was read is kept (#1088 review).
+SMP_COUNTER_TIME_BUDGET_SECONDS = 60
 # A refused capability is asked again only after this long (or after the app
 # restarts, or with one probe call on a forced refresh), not on every refresh.
 SMP_CAPABILITY_RETRY_SECONDS = 6 * 60 * 60
@@ -129,6 +136,7 @@ STOP_REASON_LABELS = {
     "rejected_output": "answer rejected",
     "command_failed": "command failed",
     "permission_denied": "permission not granted",
+    "time_budget": "refresh time budget",
 }
 READ_BUDGET_MESSAGE = (
     f"Expander counters not read this refresh (read budget of {SMP_MAX_TARGETS_PER_REFRESH} expanders "

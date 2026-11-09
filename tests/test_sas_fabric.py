@@ -6491,3 +6491,71 @@ class CoreExpanderCounterHungTests(unittest.TestCase):
                 address = _chunk_identity(command)[1]
                 per_expander[address] = per_expander.get(address, 0) + 1
         self.assertEqual(per_expander, {targets[0].expander_sas_address: 3, hung: 1, targets[2].expander_sas_address: 3})
+
+    def test_a_silent_probe_moves_to_another_expander(self):
+        """Codex review on f7cbc630: one silent expander must not keep the capability unknown."""
+        base = CoreExpanderCounterTests.results()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            spent: list[float] = []
+            silent = self.hung_from(0, spent)
+
+            def answer(command):
+                if _chunk_identity(command)[1] == SMP_EXPANDER_A:
+                    return silent(command)
+                return CoreExpanderCounterRetentionTests.valid(command)
+
+            first, _results = self.refresh(service, base, answer)
+            self.assertEqual([_chunk_identity(command)[1:4] for command in first], [(SMP_EXPANDER_A, "pass10", [0])])
+            self.assertIsNone(service._smp_counter_capability)
+            # The next refresh probes the other expander, which answers: the
+            # capability is granted and both expanders get their turn.
+            second, results = self.refresh(service, base, answer)
+            self.assertEqual(_chunk_identity(second[0])[1:4], (SMP_EXPANDER_B, "pass30", [0]))
+            self.assertEqual(service._smp_counter_capability, "granted")
+            self.assertEqual(
+                sorted({_chunk_identity(command)[1] for command in second[1:]}), sorted([SMP_EXPANDER_A, SMP_EXPANDER_B]),
+            )
+            fresh = {item.command: item.stdout for item in results if item.ok}
+            node = self.expander(
+                self.fabric(fresh, "granted", selected=SMP_EXPANDER_B, reads=service.expander_counter_reads()),
+                SMP_EXPANDER_B,
+            )
+            self.assertEqual(node.raw["phy_error_counters"]["state"], "available")
+
+    def test_counter_reads_stop_within_the_collection_time_budget(self):
+        """Codex review on f7cbc630: slow counter reads must not outlast the refresh deadline."""
+        from app.services.inventory import BACKGROUND_REFRESH_DEADLINE_SECONDS
+
+        outputs = _nine_expander_outputs(8, num_phys=48)
+        base = self.base_results(outputs)
+        now = [1000.0]
+
+        def slow(command):
+            # Every call answers, one second each: each chunk fits the SSH deadline.
+            unit, address, device, phys = _chunk_identity(command)
+            now[0] += len(phys)
+            return CoreExpanderCounterRetentionTests.valid(command)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_clock = lambda: now[0]
+            service._smp_counter_wall_clock = lambda: self.READ_AT
+            commands, results = self.refresh(service, base, slow)
+            spent = now[0] - 1000.0
+            # Without a budget this is 8 x 48 = 384 s, past the 300 s refresh deadline.
+            self.assertLessEqual(spent, BACKGROUND_REFRESH_DEADLINE_SECONDS - 100, spent)
+            import app.services.core_expander_counters as counters
+
+            # At most the budget plus one round (one chunk per expander).
+            self.assertLessEqual(spent, counters.SMP_COUNTER_TIME_BUDGET_SECONDS + 8 * counters.SMP_PHYS_PER_COMMAND)
+            reads = service.expander_counter_reads()
+            self.assertEqual(len(reads), 8, "what was read is kept")
+            address = _chunk_identity(commands[0])[1]
+            fresh = {item.command: item.stdout for item in results if item.ok}
+            node = self.expander(self.fabric(fresh, "granted", selected=address, reads=reads), address)
+        summary = node.raw["phy_error_counters"]
+        self.assertEqual((summary["state"], summary["reason"]), ("available", "time_budget"))
+        self.assertIn(f"read stopped at PHY {summary['stopped_at_phy']} (refresh time budget)", node.metrics["phy_error_counters"])
+        self.assertGreater(summary["measured_phys"], 0)
