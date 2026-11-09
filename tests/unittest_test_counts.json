@@ -16,7 +16,7 @@
     "test_app_history_bounds": 12,
     "test_atomic_write": 11,
     "test_background_refresh_busy_routes": 4,
-    "test_background_refresh_deadlines": 17,
+    "test_background_refresh_deadlines": 25,
     "test_backup_archive_journal": 35,
     "test_backup_archive_lifecycle": 40,
     "test_backup_archive_transport": 78,

@@ -1282,7 +1282,8 @@ _background_refresh_ticket: ContextVar[_BackgroundRefreshTicket | None] = Contex
 _snapshot_wait_budget: ContextVar[_SnapshotWaitBudget | None] = ContextVar(
     "snapshot_wait_budget", default=None,
 )
-# Set by the routes that serve a user's Refresh (a forced read, #1139).
+# Set by the routes that serve a user's Refresh (a forced read, #1139), and by
+# a bay-assignment save's or clear's pre-write read (#1141).
 _user_refresh: ContextVar[bool] = ContextVar("user_refresh", default=False)
 
 
@@ -1292,7 +1293,8 @@ def user_refresh(enabled: bool = True):
 
     A Refresh that finds a background refresh running waits for it, up to that
     refresh's own deadline, instead of answering busy after the short user
-    wait bound. Other reads and saves keep the short bound.
+    wait bound. A bay-assignment save's or clear's pre-write read joins the
+    same way (#1141). Other reads keep the short bound.
     """
     token = _user_refresh.set(enabled)
     try:
@@ -1925,9 +1927,10 @@ class InventoryService:
         Each user request's waits share one total of SNAPSHOT_REFRESH_WAIT_SECONDS;
         its own work between waits is not counted (#1125).
 
-        A user's Refresh joins the running refresh instead: it may wait until
-        that refresh's deadline, and at most BACKGROUND_REFRESH_DEADLINE_SECONDS
-        in total from its first such wait (#1139). It then reuses what the
+        A user's Refresh, and a bay-assignment write's pre-write read (#1141),
+        join the running refresh instead: they may wait until that refresh's
+        deadline, and at most BACKGROUND_REFRESH_DEADLINE_SECONDS in total from
+        the first such wait (#1139). It then reuses what the
         running refresh published when that meets its freshness requirement.
         An abandoned refresh is not waited on beyond the short bound.
         """
@@ -6771,6 +6774,19 @@ class InventoryService:
             reason=None,
         )
 
+    async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
+        """Read the current view a bay-assignment write is checked against.
+
+        The read is strict: an expired view is not good enough to decide whether
+        the bay can take an assignment and which enclosure it belongs to. If the
+        page's own refresh is running, the read joins it like a user Refresh
+        (#1141), bounded by that refresh's deadline and the same total cap, and
+        reuses what it publishes. A refresh past its deadline still answers the
+        retryable busy error before anything is written.
+        """
+        with user_refresh():
+            return await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+
     async def save_mapping(
         self,
         slot: int,
@@ -6780,7 +6796,7 @@ class InventoryService:
         expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> ManualMapping:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if slot_view is not None and not slot_view.mapping_supported:
             raise TrueNASAPIError(
@@ -6812,7 +6828,7 @@ class InventoryService:
         expected_revision: str | None = None,
         invalidate_snapshot: bool = True,
     ) -> bool:
-        snapshot = await self.get_snapshot(selected_enclosure_id=selected_enclosure_id)
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
         slot_view = next((item for item in snapshot.slots if item.slot == slot), None)
         if slot_view is not None and not slot_view.mapping_supported:
             raise TrueNASAPIError(

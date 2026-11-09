@@ -25,7 +25,7 @@ from unittest.mock import Mock, patch
 from app import main as app_main
 from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
-from app.models.domain import SourceStatus
+from app.models.domain import ManualMapping, SourceStatus
 from app.services import inventory as inventory_module
 from app.services.parsers import ParsedSSHData
 from app.services.truenas_ws import MiddlewareCallLimiter, TrueNASRawData
@@ -367,16 +367,13 @@ class UserRefreshDuringARunningRefreshTests(RefreshDeadlineTests):
             # It started no appliance call of its own while that one runs.
             self.assertEqual(len(self.appliance.calls), 2)
 
-            # A bay-assignment save meanwhile keeps the short bound.
-            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            # A page read meanwhile still answers at once from the cached view.
+            # (A bay-assignment save meanwhile joins as well, #1141; see
+            # MappingWriteDuringARunningRefreshTests.)
             status, _headers, content = await asyncio.wait_for(call_app(
-                self.application,
-                "POST",
-                "/api/slots/0/mapping",
-                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
-                body={"expected_revision": revision, "serial": "SANITIZED-SN-0200"},
+                self.application, "GET", "/api/inventory", query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
             ), timeout=ANSWER_CEILING_SECONDS)
-            self.assertIn(status, (200, 503), content[:300])
+            self.assertEqual(status, 200, content[:300])
             self.assertFalse(refresh.done(), refresh.result()[2][:300] if refresh.done() else "")
 
             # The running refresh finishes; the Refresh answers with a view read
@@ -469,6 +466,266 @@ class UserRefreshDuringARunningRefreshTests(RefreshDeadlineTests):
         self.assertGreaterEqual(elapsed, USER_WAIT_SECONDS)
         self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
         self.assertEqual(len(self.appliance.calls), 2)
+
+
+class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
+    """A bay-assignment save or clear during a slow page refresh joins it (#1141).
+
+    The shelf's cached view is present but expired, so the write's strict
+    pre-write read waits for the running refresh. Since #1126 it answered 503
+    "still refreshing" at the short user bound, before writing; before #1126 it
+    waited and the write succeeded. It now joins the running refresh like a
+    user Refresh (#1139), within that refresh's deadline and the same total cap,
+    then validates against the view the refresh published.
+    """
+
+    def save(self, slot: int, serial: str, revision: str | None = None):
+        if revision is None:
+            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, slot)
+        return asyncio.ensure_future(call_app(
+            self.application,
+            "POST",
+            f"/api/slots/{slot}/mapping",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
+            body={"expected_revision": revision, "serial": serial, "clear_identify_after_save": False},
+        ))
+
+    def stored_serial(self, slot: int) -> str | None:
+        mapping = self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, slot)
+        return None if mapping is None else mapping.serial
+
+    async def test_save_with_an_expired_view_joins_a_slow_refresh_and_is_stored(self) -> None:
+        published_before = self.service._snapshot_published_sequence[SHELF]
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            self.assertIn(SHELF, self.service._cache, "the expired view should still be cached")
+            save = self.save(0, "SANITIZED-SN-0300")
+            # Well past the user wait bound the save is waiting for the running
+            # refresh, has written nothing and started no appliance call.
+            await asyncio.sleep(USER_WAIT_SECONDS * 3)
+            self.assertFalse(save.done(), save.result()[2][:300] if save.done() else "")
+            self.assertIsNone(self.stored_serial(0))
+            self.assertEqual(len(self.appliance.calls), 2)
+
+            self.appliance.answer.set()
+            status, headers, content = await asyncio.wait_for(save, timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 200, content[:400])
+        self.assertNotIn("retry-after", headers)
+        payload = json.loads(content)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mapping"]["serial"], "SANITIZED-SN-0300")
+        self.assertEqual(self.stored_serial(0), "SANITIZED-SN-0300")
+        # The save validated against the view the running refresh published,
+        # and its readback shows the stored assignment.
+        self.assertGreater(self.service._snapshot_published_sequence[SHELF], published_before)
+        bay = next(slot for slot in payload["snapshot"]["slots"] if slot["slot"] == 0)
+        self.assertEqual(bay["serial"], "SANITIZED-SN-0300")
+        # Setup, the running refresh, then the save's readback: the pre-write
+        # read reused the joined refresh and added no read of its own.
+        await self.settle()
+        self.assertEqual(self.appliance.reads, 3)
+        self.assertEqual(self.appliance.limiter.active, 0)
+        self.assert_budget_respected()
+
+    async def test_clear_with_an_expired_view_joins_a_slow_refresh(self) -> None:
+        status, _headers, content = await self.save(0, "SANITIZED-SN-0301")
+        self.assertEqual(status, 200, content[:400])
+        reads = self.appliance.reads
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            revision = self.service.mapping_store.clear_revision(SYSTEM_ID, SHELF, 0)
+            clear = asyncio.ensure_future(call_app(
+                self.application,
+                "DELETE",
+                "/api/slots/0/mapping",
+                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&expected_revision={revision}",
+            ))
+            await asyncio.sleep(USER_WAIT_SECONDS * 3)
+            self.assertFalse(clear.done(), clear.result()[2][:300] if clear.done() else "")
+            self.assertEqual(self.stored_serial(0), "SANITIZED-SN-0301")
+            self.assertEqual(len(self.appliance.calls), reads + 1)
+
+            self.appliance.answer.set()
+            status, headers, content = await asyncio.wait_for(clear, timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 200, content[:400])
+        self.assertNotIn("retry-after", headers)
+        self.assertTrue(json.loads(content)["ok"])
+        self.assertIsNone(self.stored_serial(0))
+        await self.settle()
+        # The running refresh, then the clear's readback.
+        self.assertEqual(self.appliance.reads, reads + 2)
+        self.assertEqual(self.appliance.limiter.active, 0)
+        self.assert_budget_respected()
+
+    async def test_save_still_fails_retryably_when_the_running_refresh_misses_its_deadline(self) -> None:
+        # The running refresh's read cannot stop and outlives its deadline.
+        self.appliance.ignore_cancellation = True
+        loop = asyncio.get_running_loop()
+        with self.assertLogs(inventory_module.logger, "WARNING") as logs:
+            await self.start_hung_page_refresh()
+            started = loop.time()
+            status, headers, content = await asyncio.wait_for(
+                self.save(0, "SANITIZED-SN-0302"), timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+            elapsed = loop.time() - started
+        self.assertTrue(any("did not finish" in line for line in logs.output), logs.output)
+        self.assertEqual(status, 503, content[:300])
+        self.assertIn("retry-after", headers)
+        self.assertIn("still refreshing", json.loads(content)["detail"])
+        self.assertLess(elapsed, REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS)
+        # Refused before writing, and no call of its own.
+        self.assertIsNone(self.stored_serial(0))
+        self.assertEqual(len(self.appliance.calls), 2)
+        self.assert_budget_respected()
+
+    async def abandon_the_running_refresh(self) -> None:
+        # The running refresh's read cannot stop; it is abandoned at its
+        # deadline and is still unwinding afterwards.
+        self.appliance.ignore_cancellation = True
+        with self.assertLogs(inventory_module.logger, "WARNING"):
+            await self.start_hung_page_refresh()
+            await wait_for_condition(
+                lambda: self.service._background_refresh_abandoned_at is not None,
+                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+        self.assertTrue(self.service._background_refresh_workers, "the abandoned read should still be running")
+
+    async def test_pre_write_read_does_not_wait_on_a_refresh_already_past_its_deadline(self) -> None:
+        # Called on the service so that only the pre-write read runs: it does
+        # not wait past the short bound on an abandoned refresh, even with a
+        # much longer configured deadline, and nothing is written.
+        await self.abandon_the_running_refresh()
+        loop = asyncio.get_running_loop()
+        revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            started = loop.time()
+            with self.assertRaises(inventory_module.SnapshotRefreshWaitTimeout):
+                await asyncio.wait_for(self.service.save_mapping(
+                    0,
+                    {"serial": "SANITIZED-SN-0303"},
+                    selected_enclosure_id=SHELF,
+                    expected_revision=revision,
+                    invalidate_snapshot=False,
+                ), timeout=ANSWER_CEILING_SECONDS)
+            with self.assertRaises(inventory_module.SnapshotRefreshWaitTimeout):
+                await asyncio.wait_for(self.service.clear_mapping(
+                    0,
+                    selected_enclosure_id=SHELF,
+                    expected_revision=self.service.mapping_store.clear_revision(SYSTEM_ID, SHELF, 0),
+                    invalidate_snapshot=False,
+                ), timeout=ANSWER_CEILING_SECONDS)
+        self.assertLess(loop.time() - started, ANSWER_CEILING_SECONDS)
+        self.assertIsNone(self.stored_serial(0))
+        self.assertEqual(len(self.appliance.calls), 2)
+
+    async def test_save_after_an_abandoned_refresh_waits_at_most_for_the_next_refresh_deadline(self) -> None:
+        # Through the route, the bay check reads the expired view and starts
+        # the page's next refresh. That refresh is not abandoned, so the save
+        # joins it, but only until its own deadline: its appliance call
+        # cannot get a permit while the abandoned call holds the only one.
+        await self.abandon_the_running_refresh()
+        loop = asyncio.get_running_loop()
+        with self.assertLogs(inventory_module.logger, "WARNING"):
+            started = loop.time()
+            status, headers, content = await asyncio.wait_for(
+                self.save(0, "SANITIZED-SN-0307"), timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+            )
+            elapsed = loop.time() - started
+        self.assertEqual(status, 503, content[:300])
+        self.assertIn("retry-after", headers)
+        self.assertLess(elapsed, REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS)
+        self.assertIsNone(self.stored_serial(0))
+        # Only the abandoned call holds a permit; nothing overlapped it.
+        self.assertEqual(self.appliance.limiter.active, 1)
+        self.assert_budget_respected()
+
+    async def test_save_joins_for_at_most_one_refresh_deadline_in_total(self) -> None:
+        # The running refresh's own deadline is far away; the save still stops
+        # at BACKGROUND_REFRESH_DEADLINE_SECONDS from its first wait.
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        status, headers, _content = await asyncio.wait_for(
+            self.save(0, "SANITIZED-SN-0304"), timeout=ANSWER_CEILING_SECONDS,
+        )
+        elapsed = loop.time() - started
+        self.assertEqual(status, 503)
+        self.assertIn("retry-after", headers)
+        self.assertGreaterEqual(elapsed, USER_WAIT_SECONDS)
+        self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+        self.assertIsNone(self.stored_serial(0))
+        self.assertEqual(len(self.appliance.calls), 2)
+
+    async def test_save_from_a_superseded_view_is_still_refused_after_joining(self) -> None:
+        # The editor read the bay at revision r0; while its save waits on the
+        # running refresh, another tab stores a different assignment.
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            stale_revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            save = self.save(0, "SANITIZED-SN-0305", revision=stale_revision)
+            await asyncio.sleep(USER_WAIT_SECONDS * 2)
+            self.assertFalse(save.done())
+            self.service.mapping_store.save_mapping(
+                ManualMapping(system_id=SYSTEM_ID, slot=0, enclosure_id=SHELF, serial="SANITIZED-SN-0306"),
+                expected_revision=stale_revision,
+            )
+            self.appliance.answer.set()
+            status, _headers, content = await asyncio.wait_for(save, timeout=ANSWER_CEILING_SECONDS)
+        # Joining does not weaken the write's own check (#1121): the editor's
+        # superseded view is refused and the other tab's assignment stays.
+        self.assertEqual(status, 409, content[:300])
+        self.assertEqual(self.stored_serial(0), "SANITIZED-SN-0306")
+        await self.settle()
+        self.assertEqual(self.appliance.reads, 2)
+        self.assert_budget_respected()
+
+    async def test_concurrent_saves_and_refreshes_join_without_adding_appliance_calls(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            # Four tabs save different bays from the same view of the shelf,
+            # while two more press Refresh.
+            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            saves = [self.save(slot, f"SANITIZED-SN-{310 + slot:04d}", revision=revision) for slot in range(4)]
+            refreshes = [
+                asyncio.ensure_future(call_app(
+                    self.application, "GET", "/api/inventory",
+                    query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&force=true",
+                ))
+                for _ in range(2)
+            ]
+            await asyncio.sleep(USER_WAIT_SECONDS * 3)
+            self.assertFalse(any(request.done() for request in saves + refreshes), "a request did not join")
+            # Joining adds no appliance call while the running one is held.
+            self.assertEqual(len(self.appliance.calls), 2)
+            self.assertEqual(self.appliance.limiter.active, 1)
+            for slot in range(4):
+                self.assertIsNone(self.stored_serial(slot))
+
+            self.appliance.answer.set()
+            saved = await asyncio.wait_for(asyncio.gather(*saves), timeout=ANSWER_CEILING_SECONDS * 2)
+            refreshed = await asyncio.wait_for(asyncio.gather(*refreshes), timeout=ANSWER_CEILING_SECONDS * 2)
+        for status, _headers, content in refreshed:
+            self.assertEqual(status, 200, content[:300])
+        # The saves share one scope revision, so exactly one is stored. The
+        # others were based on a view the first one superseded and are
+        # refused before writing, as without a running refresh (#1121).
+        stored = [slot for slot in range(4) if self.stored_serial(slot) is not None]
+        self.assertEqual(len(stored), 1, [response[:1] for response in saved])
+        for slot, (status, headers, content) in enumerate(saved):
+            if slot in stored:
+                self.assertEqual(status, 200, content[:300])
+                self.assertEqual(self.stored_serial(slot), f"SANITIZED-SN-{310 + slot:04d}")
+            else:
+                self.assertIn(status, (409, 503), content[:300])
+                if status == 503:
+                    self.assertIn("retry-after", headers)
+        await self.settle()
+        # Afterwards each request makes at most one read of its own (two for a
+        # stored save: its pre-write read and its readback), one at a time.
+        self.assertLessEqual(self.appliance.reads, 2 + len(refreshes) + len(saves) + 1)
+        self.assertEqual(self.appliance.limiter.active, 0)
+        self.assert_budget_respected()
 
 
 class AbandonedRefreshTests(RefreshDeadlineTests):
