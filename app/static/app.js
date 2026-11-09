@@ -7322,11 +7322,59 @@
       .map((part) => `.storage-view-runtime-card-${part}`),
   ].join(", ");
 
+  // #1145: a heat value never wraps. One that does not fit its bay steps
+  // down until it does: a smaller font, then (in a tall bay) turned to run
+  // along it, then without its unit, and last it takes the labels' room
+  // (slot details keep them); the title keeps the whole value. Each step
+  // lays out every unfitted badge at once.
+  function fitHeatmapBadges() {
+    // The bay keeps its height; the badge and the labels stay in its content
+    // box (the padding holds the latch, LED and chip), the labels at full
+    // height.
+    const fits = (badge, height) => {
+      const tile = badge.parentElement;
+      const bay = tile.getBoundingClientRect();
+      const pad = getComputedStyle(tile);
+      const inset = (side) => parseFloat(pad[`border-${side}-width`]) + parseFloat(pad[`padding-${side}`]) - 3;
+      const content = { left: bay.left + inset("left"), top: bay.top + inset("top"), right: bay.right - inset("right"), bottom: bay.bottom - inset("bottom") };
+      const within = (box, area) => box.left >= area.left - 1 && box.top >= area.top - 1 && box.right <= area.right + 1 && box.bottom <= area.bottom + 1;
+      return Math.abs(bay.height - height) < 1 && badge.scrollWidth <= badge.clientWidth + 1 && badge.scrollHeight <= badge.clientHeight + 1
+        && within(badge.getBoundingClientRect(), content)
+        && Array.from(tile.querySelectorAll(":scope > :is(.slot-device, .slot-pool, .slot-tertiary)"))
+          .every((line) => !line.checkVisibility({ visibilityProperty: true })
+            || (line.scrollHeight <= line.clientHeight + 1 && within(line.getBoundingClientRect(), content)));
+    };
+    const badges = Array.from(grid.querySelectorAll(".slot-tile > .slot-number ~ .slot-heatmap-value"));
+    badges.forEach((badge) => {
+      badge.textContent = badge.dataset.value ??= badge.textContent;
+      delete badge.dataset.fit;
+    });
+    let pending = badges.map((badge) => {
+      const tall = badge.parentElement.clientHeight > badge.parentElement.clientWidth * 1.5;
+      return {
+        badge,
+        height: badge.parentElement.getBoundingClientRect().height,
+        steps: tall ? ["small", "vertical", "vertical small", "compact small", "compact vertical small", "vertical small own"] : ["small", "compact small"],
+      };
+    });
+    for (let step = 0; pending.length; step += 1) {
+      pending = pending.filter(({ badge, height, steps }) => badge.clientWidth && step < steps.length && !fits(badge, height));
+      pending.forEach(({ badge, steps }) => {
+        const { value } = badge.dataset;
+        badge.dataset.fit = steps[step];
+        // Still a part of the bay's name: the number, a size keeps its unit.
+        badge.textContent = !steps[step].startsWith("compact") ? value
+          : /\d [KMGTPE]?B\b/.test(value) ? value.replace(/\/\w+$/, "") : value.split(" ")[0];
+      });
+    }
+  }
+
   function placeStateChips() {
     stateChipFrameId = null;
     if (!chassisShell) {
       return;
     }
+    fitHeatmapBadges();
     const bays = [];
     // #925: every bay draws its chip, ringed ones included (the ring is an
     // outline on the tile), so every bay steers the spot.

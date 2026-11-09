@@ -134,7 +134,7 @@ print(json.dumps(dict(html=builder.build_live_fixture_html(runtime), snapshot=sn
 `], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 }
 
-function smartSummary(bay) {
+function smartSummary(bay, slot = 0) {
   return {
     available: true,
     temperature_c: bay.temperature,
@@ -143,6 +143,15 @@ function smartSummary(bay) {
     smart_health_status: "PASSED",
     rotation_rate_rpm: 7200,
     transport_protocol: "SAS",
+    // #1145: wide values for the other metrics ("54,153 hr", "100% left",
+    // "12.3 TB/yr", "1:2.50 R/W").
+    ...(bay.wide ? {
+      power_on_hours: 54153 + (slot * 1037),
+      endurance_remaining_percent: 100 - (slot % 3),
+      bytes_written: 1.23e14 + (slot * 7.7e12),
+      annualized_bytes_written: 1.23e13 + (slot * 7.7e11),
+      bytes_read: (slot % 2 ? 4.1e13 : 3.08e14) + (slot * 1e12),
+    } : {}),
   };
 }
 
@@ -176,13 +185,13 @@ async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "")
     if (url.pathname === "/api/inventory") data = pageFixture.snapshot;
     if (url.pathname === "/api/storage-views") data = pageFixture.runtime || { system_id: "synthetic-system", views: [] };
     const viewSmart = /^\/api\/storage-views\/[^/]+\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (viewSmart) data = smartSummary(bayAt(Number(viewSmart[1])));
+    if (viewSmart) data = smartSummary(bayAt(Number(viewSmart[1])), Number(viewSmart[1]));
     if (url.pathname === "/api/slots/smart-batch") {
       const requested = JSON.parse(request.postData() || "{}").slots || [];
-      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bayAt(slot)) })) };
+      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bayAt(slot), slot) })) };
     }
     const single = /^\/api\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (single) data = smartSummary(bayAt(Number(single[1])));
+    if (single) data = smartSummary(bayAt(Number(single[1])), Number(single[1]));
     return route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
   await page.goto(`https://synthetic.invalid/${query}`);
@@ -338,6 +347,103 @@ for (const [index, shape] of SHAPES.entries()) {
       if (!hidesLabels) {
         for (const tile of tiles) {
           expect(tile.lines.map((line) => line.line), where(tile)).toEqual(expect.arrayContaining(["slot-device", "slot-pool"]));
+        }
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1145: a value never breaks inside a number or between a number and its
+// unit ("+0.22 C" stacked one character per line on 24-bay 2.5-inch sleds),
+// on every face style, at every width, for the widest metric values. It
+// stays on one line, whole, inside its bay, off the bay's text, and the
+// crawler's squeeze check would flag it if it did not.
+const VALUE_METRICS = ["temperature_c", "temperature_delta_c", "power_on_hours", "endurance_remaining_percent",
+  "annualized_bytes_written", "read_write_ratio"];
+const ALL_WIDTHS = [{ width: 390, height: 900 }, ...VIEWPORTS];
+
+async function measureValues(page) {
+  // Two frames: fitting runs on the frame after a render or resize.
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  return page.locator("#slot-grid .slot-tile.heatmap-active").evaluateAll((tiles) => tiles.map((tile) => {
+    const box = (rect) => ({ left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom });
+    const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1
+      && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+    const badge = tile.querySelector(".slot-heatmap-value");
+    const range = document.createRange();
+    range.selectNodeContents(badge);
+    const fragments = [...range.getClientRects()].filter((rect) => rect.width > 0.5 && rect.height > 0.5);
+    const badgeBox = box(badge.getBoundingClientRect());
+    const tileBox = box(tile.getBoundingClientRect());
+    // The bay's content box: its padding holds the latch, LED and state chip.
+    const pad = getComputedStyle(tile);
+    const inset = (side) => parseFloat(pad[`border-${side}-width`]) + parseFloat(pad[`padding-${side}`]) - 3;
+    const content = { left: tileBox.left + inset("left"), top: tileBox.top + inset("top"), right: tileBox.right - inset("right"), bottom: tileBox.bottom - inset("bottom") };
+    const outside = [];
+    const covered = [];
+    for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+      if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+      const lineRange = document.createRange();
+      lineRange.selectNodeContents(line);
+      const own = line.getBoundingClientRect();
+      const rects = [...lineRange.getClientRects()].map((rect) => ({
+        left: Math.max(rect.left, own.left), right: Math.min(rect.right, own.right), top: rect.top, bottom: rect.bottom,
+      }));
+      if (rects.some((rect) => overlap(rect, badgeBox))) covered.push(line.className);
+      if (!rects.every((rect) => inside(rect, content))) outside.push(line.className);
+    }
+    // #1145: a one-line value grows sideways; it must not run over the
+    // bay's latch handle or LED in the padding either.
+    for (const part of tile.querySelectorAll(".slot-latch, .slot-status-led")) {
+      if (part.checkVisibility({ visibilityProperty: true }) && overlap(part.getBoundingClientRect(), badgeBox)) covered.push(part.className);
+    }
+    const text = badge.textContent.trim();
+    return {
+      slot: tile.dataset.slot,
+      text,
+      title: badge.title,
+      fragments: fragments.length,
+      clipped: badge.scrollWidth > badge.clientWidth + 1 || badge.scrollHeight > badge.clientHeight + 1,
+      inTile: inside(badgeBox, content),
+      covered,
+      outside,
+      // The crawler's text-narrow-wrap rule (qa/ui-crawl/checks.js).
+      squeezed: fragments.length >= 3 && text.length >= 6 && text.length / fragments.length < 4,
+      size: [Math.round(badgeBox.right - badgeBox.left), Math.round(badgeBox.bottom - badgeBox.top)],
+    };
+  }));
+}
+
+for (const [index, shape] of SHAPES.entries()) {
+  test(`heat values stay on one line on ${shape.name} for every metric and width (#1145)`, async ({ page }) => {
+    const bays = shape.bays.map((entry) => ({ ...entry, wide: true }));
+    const errors = await openHeatMap(page, shapeFixtures[index], bays);
+    for (const metric of VALUE_METRICS) {
+      await page.locator("#heatmap-metric-select").selectOption(metric);
+      await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
+      for (const viewport of ALL_WIDTHS) {
+        await page.setViewportSize(viewport);
+        expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
+        const values = await measureValues(page);
+        expect(values).toHaveLength(bays.length);
+        if (process.env.HEATMAP_BANDS_SCREENSHOT_DIR && ["temperature_delta_c", "power_on_hours"].includes(metric)) {
+          await page.mouse.move(0, 0);
+          await page.locator(".enclosure-face").screenshot({
+            path: path.join(process.env.HEATMAP_BANDS_SCREENSHOT_DIR, `values-${shape.name.replace(/\W+/g, "-")}-${metric}-${viewport.width}.png`),
+          });
+        }
+        for (const value of values) {
+          const where = `${shape.name} ${metric} at ${viewport.width} px, bay ${value.slot} "${value.text}" ${JSON.stringify(value.size)}`;
+          expect(value.fragments, `${where} renders on one line`).toBe(1);
+          expect(value.squeezed, `${where} squeezed`).toBe(false);
+          expect(value.clipped, `${where} cut off`).toBe(false);
+          expect(value.inTile, `${where} inside the bay's content box`).toBe(true);
+          expect(value.outside, `${where} pushes bay text out of the content box`).toEqual([]);
+          expect(value.covered, `${where} covers bay text, the latch or the LED`).toEqual([]);
+          expect(value.title, `${where} full value in the title`).toContain(":");
         }
       }
     }

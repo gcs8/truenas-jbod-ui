@@ -36,6 +36,7 @@ const STORAGE_VIEWS = ["boot-doms", "nvme-carrier-x4", "manual-group"];
 const UNIFI_FACES = [["unifi-plain", 8], ["unvr", 4], ["unvr-pro", 7], ["unvr-g2", 4], ["unvr-g2-pro", 8], ["envr", 16], ["envr-core", 16]];
 
 const FIXTURE_SCRIPT = `
+import asyncio
 import json
 
 from jinja2 import Environment, FileSystemLoader
@@ -186,11 +187,38 @@ for profile in ProfileRegistry(Settings()).list_profiles():
             profile.id, profile.label, profile.face_style, profile.rows, profile.columns, bay_size=profile.bay_size,
             layout=profile.slot_layout, face_variant=profile.face_variant, latch_edge=profile.latch_edge,
             slot_number_base=profile.slot_number_base), empty_runtime)
+# The admin sidecar as the coverage crawl renders it (#1146), with the
+# shipped layout catalog in the builder.
+import scripts.build_ui_crawl_fixture as crawl_fixture
+from admin_service.route_support import serialize_profiles
+RUNTIME = [("enclosure-ui", "Main UI", "The main page you normally use.", "truenas-jbod-ui"),
+           ("history", "History", "Records disk history and charts.", "truenas-jbod-history"),
+           ("admin", "Admin", "This admin page.", "truenas-jbod-admin"),
+           ("backup-scheduler", "Backup scheduler", "Runs scheduled backups.", "truenas-jbod-backup-scheduler")]
+# The backup and debug path pills with their real labels (the debug ones carry
+# a long description); paths shown as the container's /app layout.
+from history_service.config import HistorySettings
+from history_service.system_backup import default_backup_included_paths, default_debug_included_paths, describe_bundle_groups
+path_groups = [{**group, "path": str(group["path"]).replace(str(builder.ROOT), "/app")} for group in describe_bundle_groups(Settings(), HistorySettings())]
+admin_state = {**crawl_fixture.ADMIN_BOOTSTRAP, "profiles": serialize_profiles(Settings()), "backup_defaults": {
+    "packaging": "tar.zst", "debug_packaging": "tar.zst", "included_paths": default_backup_included_paths(),
+    "debug_included_paths": default_debug_included_paths(), "debug_scrub_secrets": True, "debug_scrub_disk_identifiers": True,
+    "path_groups": path_groups}, "runtime": {
+    "available": True, "version_detail": "Running containers agree on 0.0.0-synthetic.", "containers": [
+        {"key": key, "label": label, "description": text, "name": name, "running": True, "status": "running",
+         "lifecycle_label": "Normal", "health": "healthy", "status_text": "Up 3 hours (healthy)",
+         "running_version": "0.0.0-synthetic.7", "latest_version": "v0.0.0", "can_stop": key != "admin", "can_restart": True,
+         "release_status": {"summary": "Development build (newest release is v0.0.0)"},
+         "version_sync_summary": "Matches other running containers."}
+        for key, label, text, name in RUNTIME]}}
+admin_api = {"/api/admin/state": admin_state, **{key.split(":", 1)[1]: value for key, value in asyncio.run(crawl_fixture.build())["api"].items()
+                                                 if key.startswith("admin:") and key != "admin:/api/admin/state"}}
 print(json.dumps({
     "main": {name: {"html": main_page(snapshot, runtime), "snapshot": dump(snapshot), "runtime": dump(runtime)}
              for name, (snapshot, runtime) in pages.items()},
     "fabric": {"html": fabric_html, "fabric": fabric},
     "history": history_html,
+    "admin": {"html": crawl_fixture.render_admin(admin_state), "api": admin_api},
 }))
 `;
 
@@ -216,13 +244,14 @@ async function routeSynthetic(page, documentBody, data = {}) {
       return route.fulfill({ contentType: "text/html; charset=utf-8", body: documentBody });
     }
     if (url.pathname.startsWith("/static/")) {
-      for (const base of ["app", "history_service"]) {
+      for (const base of ["app", "history_service", "admin_service"]) {
         const file = path.join(root, base, url.pathname);
         if (fs.existsSync(file)) return route.fulfill({ path: file });
       }
       return route.fulfill({ status: 404, body: "" });
     }
     let body = { ok: true, available: false };
+    if (data.api && url.pathname in data.api) body = data.api[url.pathname];
     if (url.pathname === "/api/inventory" && data.snapshot) body = data.snapshot;
     if (url.pathname === "/api/storage-views" && data.runtime) body = data.runtime;
     if (url.pathname === "/api/sas-fabric") body = fixture.fabric.fabric;
@@ -290,6 +319,18 @@ async function layoutReport(page, scope = "body") {
     const controls = Array.from(container.querySelectorAll("button, a[href], select, input:not([type=hidden]), summary"))
       .filter((element) => visible(element) && !element.closest(".hidden"));
     const name = (element) => element.id ? `#${element.id}` : `${element.tagName.toLowerCase()}.${Array.from(element.classList).slice(0, 2).join(".")}${element.dataset.slot ? `[${element.dataset.slot}]` : ""}`;
+    // #1146: against a control outside its scroll box (a long list), a
+    // control counts only where that box shows it, as the crawler does.
+    const visibleIn = (element, other) => {
+      let { left, right, top, bottom } = element.getBoundingClientRect();
+      for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if ((style.overflowX === "visible" && style.overflowY === "visible") || node.contains(other)) continue;
+        const box = node.getBoundingClientRect();
+        [left, right, top, bottom] = [Math.max(left, box.left), Math.min(right, box.right), Math.max(top, box.top), Math.min(bottom, box.bottom)];
+      }
+      return { left, right, top, bottom };
+    };
     const overlaps = [];
     for (let i = 0; i < controls.length; i += 1) {
       for (let j = i + 1; j < controls.length; j += 1) {
@@ -297,8 +338,8 @@ async function layoutReport(page, scope = "body") {
         const b = controls[j];
         if (a.contains(b) || b.contains(a)) continue;
         if (a.closest("label") && a.closest("label") === b.closest("label")) continue;
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
+        const ra = visibleIn(a, b);
+        const rb = visibleIn(b, a);
         const w = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
         const h = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
         if (w > 1 && h > 1) overlaps.push(`${name(a)} x ${name(b)} (${Math.round(w)}x${Math.round(h)})`);
@@ -727,6 +768,55 @@ for (const viewport of [NARROW, ...DESKTOP]) {
     const region = page.getByRole("region", { name: "Systems and enclosures" });
     await expect(region).toHaveAttribute("tabindex", "0");
     await capture(page, `history-${viewport.width}`);
+    expect(errors).toEqual([]);
+  });
+}
+
+// ---- #1146 admin -------------------------------------------------------------
+
+async function openAdmin(page, viewport) {
+  await page.setViewportSize(viewport);
+  const errors = await routeSynthetic(page, fixture.admin.html, { api: fixture.admin.api });
+  await page.goto(`${ORIGIN}/`);
+  await expect(page.locator("#existing-system-select option").first()).toBeAttached();
+  expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
+  return errors;
+}
+
+// The crawler's own layout checks (qa/ui-crawl/checks.js) on the same page:
+// the beta.7 crawl reported both #1146 defects through them.
+async function crawlerLayoutFindings(page) {
+  const { pageChecks } = require("./ui-crawl/checks");
+  const result = await page.evaluate(pageChecks, {});
+  return result.findings.filter((finding) => ["control-overlap", "page-horizontal-overflow", "control-clipped"].includes(finding.type))
+    .map((finding) => `${finding.type} ${finding.selector} ${JSON.stringify(finding.detail)}`);
+}
+
+for (const viewport of [NARROW, ...DESKTOP]) {
+  test(`admin Setup + Maintenance and the layout builder keep controls apart without page-wide sideways scroll at ${viewport.width} px (#1146)`, async ({ page }) => {
+    const errors = await openAdmin(page, viewport);
+    // The debug bundle's long path descriptions are what widened the page.
+    await expect(page.locator("#debug-path-list .path-pill")).toHaveCount(12);
+    await capture(page, `admin-operations-${viewport.width}`);
+    expectCleanLayout(await layoutReport(page, "body"), "admin Setup + Maintenance");
+    expect(await crawlerLayoutFindings(page), "admin Setup + Maintenance, crawler checks").toEqual([]);
+    // A long path shrinks to the column and keeps its full text in a title.
+    const pill = page.locator("#debug-path-list .path-pill").last();
+    expect(await pill.evaluate((element) => element.getBoundingClientRect().right <= element.closest(".path-list").getBoundingClientRect().right + 1)).toBe(true);
+    await expect(pill).toHaveAttribute("title", /Generated in a temporary export workspace/);
+
+    await page.locator("[data-admin-view-button=builder]").click();
+    await expect(page.locator("#profile-catalog .profile-card").first()).toBeVisible();
+    await capture(page, `admin-builder-${viewport.width}`);
+    expectCleanLayout(await layoutReport(page, "body"), "admin layout builder");
+    expect(await crawlerLayoutFindings(page), "admin layout builder, crawler checks").toEqual([]);
+    // Nothing paints over Load: the catalog clips the cards scrolled out of it.
+    const load = page.locator("#profile-builder-load-button");
+    await load.scrollIntoViewIfNeeded();
+    expect(await load.evaluate((button) => {
+      const box = button.getBoundingClientRect();
+      return document.elementFromPoint(box.left + (box.width / 2), box.top + (box.height / 2)) === button;
+    }), "Load selected is the topmost element at its centre").toBe(true);
     expect(errors).toEqual([]);
   });
 }

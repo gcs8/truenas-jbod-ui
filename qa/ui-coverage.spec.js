@@ -67,6 +67,8 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   .trunc { display: block; width: 80px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .slot-tile { display: inline-block; width: 90px; height: 60px; position: relative; background: #11161a; }
   .slot-tile span { display: block; color: rgb(149, 163, 179); }
+  .value { display: block; width: 44px; font: 14px monospace; }
+  .list { height: 40px; overflow: auto; } .list button { display: block; height: 30px; } .below { display: block; }
 </style></head><body>
   <div class="head"><h2 id="title">Demo Enclosure Title</h2><div class="controls"><button>Heat Map</button></div></div>
   <div class="row"><div class="card">HBA</div><div class="card"><dl><dt>Remote</dt><dd>01</dd><dt>Handle</dt><dd>0043</dd></dl></div><div class="card empty-col">EXPANDER</div></div>
@@ -76,6 +78,8 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   <select id="heatmap-metric-select"><option selected>Temperature</option></select>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 210, 74, 74; --heatmap-alpha: 0.75"><span class="slot-heatmap-value">37 C</span><span>pool-a</span></button>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 47, 110, 187; --heatmap-alpha: 0.5"><span class="slot-heatmap-value">36 C</span><span>pool-a</span></button>
+  <span class="value">+0.22 C</span>
+  <div class="list"><button>Listed 1</button><button>Listed 2</button><button>Listed 3</button></div><button class="below">Below the list</button>
 </body></html>`;
 
 test("the layout and heat-map checks report each synthetic defect shape", async ({ page }) => {
@@ -87,12 +91,18 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
   const types = new Set(result.findings.map((finding) => finding.type));
   for (const type of [
     "text-narrow-wrap", "text-mid-word-break", "empty-track-squeeze", "page-horizontal-overflow", "control-overlap",
-    "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast",
+    "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast", "text-value-wrap",
   ]) {
     expect(types.has(type), `${type} not reported: ${JSON.stringify(result.findings.map((f) => [f.type, f.selector]))}`).toBe(true);
   }
   const midWord = result.findings.find((finding) => finding.type === "text-mid-word-break");
   expect(midWord.detail.word).toMatch(/Remote|Handle/);
+  // #1145: "+0.22 C" on two lines.
+  expect(result.findings.filter((finding) => finding.type === "text-value-wrap").map((finding) => finding.text)).toEqual(["+0.22 C"]);
+  // #1146: list items scrolled out of their own box are clipped there; only
+  // the overlapping pair is an overlap, not the list against the button below.
+  expect(result.findings.filter((finding) => finding.type === "control-overlap").map((finding) => `${finding.text} x ${finding.detail.other}`))
+    .toEqual(["First x html > body > div.over > button"]);
 });
 
 // The app's own heat-map colour and band functions, loaded from app.js so the
@@ -258,6 +268,7 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
     "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
     "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
+    "ui-dense-sleds": "https://ui-dense-sleds.synthetic.invalid",
   };
   const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
@@ -281,6 +292,8 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
     // Sol #1108: a QuantaStor page sends a forced startup read; only its declared page-load window admits it.
     { page: "main", ready: "main", variant: "quantastor", platform: "quantastor", label: "fixture/main-quantastor", url: `${origins["ui-quantastor"]}/` },
+    // #1145: 24 narrow 2.5-inch sleds, where heat values once wrapped mid-number.
+    { page: "main", ready: "main", variant: "dense-sleds", label: "fixture/main-dense-sleds", url: `${origins["ui-dense-sleds"]}/` },
     // #1127: a saved storage view selected through the target URL, as a live
     // crawl reaches it (a later scope: only the `scope: "all"` states run).
     { page: "main", ready: "main", scopeIndex: 1, label: "fixture/main-view-boot-doms", url: `${origins.ui}/?system_id=demo-system&storage_view_id=boot-doms` },

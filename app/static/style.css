@@ -4681,11 +4681,6 @@ button.fabric-trace-crumb:hover {
     min-width: max-content;
   }
 
-  /* #1109: the value beside a UniFi bay number stays on one line. */
-  .chassis-shell[data-face-style="unifi-drive"] .slot-heatmap-value {
-    white-space: nowrap;
-  }
-
   .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .unifi-face-row {
     gap: 4px;
   }
@@ -5063,8 +5058,7 @@ button.fabric-trace-crumb:hover {
   text-align: center;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
   overflow: hidden;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  white-space: nowrap;
   pointer-events: none;
 }
 
@@ -5088,6 +5082,24 @@ button.fabric-trace-crumb:hover {
   margin: auto -2px;
   padding: 4px 3px;
   transform: none;
+}
+
+/* #1145: app.js steps a value that does not fit down (fitHeatmapBadges). */
+.slot-tile > .slot-heatmap-value[data-fit~="small"] {
+  font-size: 0.75rem;
+  padding-inline: 1px;
+}
+
+.slot-tile > .slot-heatmap-value[data-fit~="vertical"] {
+  min-height: 0;
+  max-height: none;
+  padding: 3px 1px;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+.slot-tile:has(> .slot-heatmap-value[data-fit~="own"]) > :is(.slot-device, .slot-pool, .slot-tertiary) {
+  display: none;
 }
 
 .chassis-shell[data-face-style="unifi-drive"] .slot-tile:is(.heatmap-active, .heatmap-missing) {
@@ -6925,6 +6937,11 @@ button.fabric-trace-crumb:hover {
   .chassis-shell {
     --group-min: min-content;
     overflow-x: auto;
+  }
+
+  /* #1145: a side latch takes 30px; the rest of the sled holds the value. */
+  .chassis-shell[data-layout-mode="dense-2.5"]:is([data-latch-edge="left"], [data-latch-edge="right"]) {
+    --slot-track-min-width: 64px;
   }
 
   .nvme-carrier-canvas {
