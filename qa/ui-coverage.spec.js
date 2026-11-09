@@ -182,6 +182,20 @@ test("valid band rendering passes: 49 C warm next to 50 C warning, and labels on
   expect(result.heat.minContrast).toBeGreaterThanOrEqual(4.5);
 });
 
+test("a drive's own low thresholds decide the alarm band: 32 C critical on 28/32 C limits is not a healthy-temperature alarm", async ({ page }) => {
+  const api = appHeatApi();
+  const lowLimits = { warning_temperature_c: 28, critical_temperature_c: 32 };
+  expect(api.heatmapTemperatureBand(32, api.resolveHeatmapTemperatureThresholds(lowLimits, {})).id).toBe("critical");
+  const css = fs.readFileSync(path.join(root, "app/static/style.css"), "utf8");
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><style>.slot-tile { height: auto; min-height: 220px; }</style></head><body>
+    <select id="heatmap-metric-select"><option selected>Temperature</option></select>${heatLegendHtml(api)}
+    <div class="slot-grid">${bandTileHtml(api, 1, 32, "", lowLimits)}</div></body></html>`;
+  const result = await runChecksOn(page, html);
+  const heatFindings = result.findings.filter((finding) => HEAT_FINDINGS.includes(finding.type));
+  expect(heatFindings, JSON.stringify(heatFindings)).toEqual([]);
+  expect(result.heat).toMatchObject({ active: 1, temperature: true, bands: { critical: 1 } });
+});
+
 test("heat checks still flag same-band alarm spreads, band colour mismatches and low-contrast tile text", async ({ page }) => {
   const api = appHeatApi();
   const bands = Object.fromEntries(api.heatmapTemperatureBandDefinitions().map((band) => [band.id, band]));
@@ -209,6 +223,11 @@ test("heat checks still flag same-band alarm spreads, band colour mismatches and
   expect(of("heat-small-range-spread")[0].detail).toMatchObject({ band: "normal", min: 36, max: 37 });
   expect(of("heat-band-colour-mismatch").map((finding) => finding.detail), summary).toEqual([
     { band: "normal", value: 36, rgb: red.join(","), expected: bands.normal.rgb.join(",") },
+  ]);
+  // A healthy (normal-band, HDD defaults) 36 C tile painted an alarm colour is
+  // judged by its rendered band, not a fixed cutoff.
+  expect(of("heat-alarm-healthy-temp").map((finding) => finding.detail), summary).toEqual([
+    { band: "normal", value: 36, rgb: red.join(","), bandRgb: bands.normal.rgb.join(",") },
   ]);
   const contrast = Object.fromEntries(of("heat-tile-contrast").map((finding) => [finding.selector.split(" > ").pop(), finding.detail.background]));
   expect(contrast, summary).toEqual({

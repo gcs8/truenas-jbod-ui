@@ -330,7 +330,16 @@ function pageChecks(options) {
     }
     if (isTemperature) {
       for (const record of records) {
-        if (alarm(record.rgb) && record.value < opts.temperatureAlarmMinC) {
+        // A banded tile is judged by its rendered band (the drive's own
+        // thresholds, so 32 C can be critical on 28/32 C limits): an alarm
+        // colour on a band whose legend colour is calm is the defect. The
+        // fixed cutoff applies only to tiles without a validated band colour.
+        const bandRgb = record.band && legendRgb[record.band];
+        if (bandRgb) {
+          if (alarm(record.rgb) && !alarm(bandRgb)) {
+            push("heat-alarm-healthy-temp", "error", record.tile, { band: record.band, value: record.value, rgb: record.rgb.join(","), bandRgb: bandRgb.join(",") });
+          }
+        } else if (alarm(record.rgb) && record.value < opts.temperatureAlarmMinC) {
           push("heat-alarm-healthy-temp", "error", record.tile, { value: record.value, rgb: record.rgb.join(","), alarmMinC: opts.temperatureAlarmMinC });
         }
       }
