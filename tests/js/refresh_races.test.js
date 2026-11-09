@@ -780,6 +780,27 @@ test("mapping import preview lists every exact scope and slot classification", (
   assert.match(message, /Unchanged \(1\): default enclosure slot 4/);
   assert.match(message, /^Restore these bay assignments\?/);
   assert.match(message, /inventory changes before you confirm/i);
+  assert.doesNotMatch(message, /different disk/i);
+});
+
+test("mapping import preview warns about bays that now hold a different disk (#1141)", () => {
+  const { fn: mappingImportPreviewMessage } = loadFunction(APP_SOURCE, "mappingImportPreviewMessage", {});
+  const message = mappingImportPreviewMessage({
+    additions: [{ enclosure_id: "enc-a", slot: 1, incoming: { serial: "SANITIZED-A" } }],
+    updates: [],
+    removals: [],
+    unchanged: [],
+    disk_warnings: [
+      { enclosure_id: "enc-a", slot: 1, field: "serial", backup: "SANITIZED-A", current: "SANITIZED-B" },
+      { enclosure_id: "enc-a", slot: 2, field: "gptid", backup: "SANITIZED-ID", current: null },
+    ],
+  });
+
+  assert.match(
+    message,
+    /This bay now holds a different disk \(2\): enc-a slot 1 \[backup Serial SANITIZED-A, bay now Serial SANITIZED-B\], enc-a slot 2 \[backup Persistent ID SANITIZED-ID, bay now empty\]/,
+  );
+  assert.match(message, /Confirming restores the backup's assignments to these bays anyway\./);
 });
 
 test("mapping import previews and confirms the exact diff before rendering imported state", async () => {
@@ -850,6 +871,41 @@ test("mapping import previews and confirms the exact diff before rendering impor
   assert.equal(renderedScopeKey, null);
   assert.equal(mappingImportFile.value, "");
   assert.deepEqual(events, ["apply", "invalidate", "render"]);
+});
+
+test("a restore refused because a bay's disk changed since the preview reloads the bays and says why", async () => {
+  const state = { snapshotMode: false, mappingFormScopeKey: "system|enc||7" };
+  const statuses = [];
+  const refreshes = [];
+  const mappingImportFile = { value: "selected-file" };
+  const detail = "Bays changed since the preview. Preview the import again.";
+  const { fn: importMappingsFromFile } = loadFunction(APP_SOURCE, "importMappingsFromFile", {
+    state,
+    mappingImportFile,
+    window: { confirm: () => true },
+    mappingImportUnavailableReason: () => null,
+    mappingImportPreviewMessage: () => "preview",
+    setStatus(message, tone) { statuses.push([message, tone]); },
+    writeBlockedByPolicy: () => false,
+    handleWriteRejection: () => assert.fail("a disk change is not a write-policy rejection"),
+    async sendScopedRequest(url) {
+      if (url.endsWith("/preview")) {
+        return { revision: "a".repeat(64), import_digest: "b".repeat(64), additions: [], updates: [], removals: [], unchanged: [] };
+      }
+      throw Object.assign(new Error(detail), { status: 409, code: "mapping_import_bays_changed", detail });
+    },
+    async refreshSnapshot(force, reason) { refreshes.push([force, reason]); },
+    applySnapshot() { assert.fail("a refused restore has no snapshot to apply"); },
+    renderAll() {},
+    scheduleSmartPrefetch() {},
+  });
+
+  await importMappingsFromFile({ name: "mappings.json", async text() { return '{"mappings":[]}'; } });
+
+  assert.deepEqual(refreshes, [[false, "mapping-import-bays-changed"]]);
+  assert.deepEqual(statuses.at(-1), [detail, "error"]);
+  assert.ok(statuses.every(([message]) => !/failed/i.test(message)), JSON.stringify(statuses));
+  assert.equal(mappingImportFile.value, "");
 });
 
 test("canceling a mapping import preview performs no write and clears the file input", async () => {

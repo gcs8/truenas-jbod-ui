@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from tests.mapping_fixtures import write_v1_mappings
 from app.models.domain import ManualMapping, SlotView
 from app.services.mapping_store import (
+    MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingScopeConflict,
     MappingStore,
@@ -1086,6 +1087,47 @@ class MappingStoreImportTests(unittest.TestCase):
                 "system-a", "enc-a", 0, expected_revision=bound_clear, revision_binding=disk_a,
             ))
             self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+    def test_bound_import_digest_checks_the_binding_under_the_store_lock(self) -> None:
+        # The inventory binds the disks in the bays an import writes into the
+        # preview's import digest (#1141). The bound digest only matches when
+        # the bundle, the stored assignments and that binding are unchanged.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = self.make_store(temp_dir)
+            bays_a = "a" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            bays_b = "b" * mapping_store_module.MAPPING_REVISION_BINDING_LENGTH
+            incoming = [ManualMapping(system_id="system-a", enclosure_id="enc-a", slot=0, serial="SANITIZED-A")]
+            preview = store.preview_replace_mappings("system-a", "enc-a", incoming)
+            bound = mapping_store_module.bind_mapping_revision(preview["import_digest"], bays_a)
+            self.assertEqual(len(bound), len(preview["import_digest"]))
+            self.assertTrue(bound.endswith(bays_a))
+
+            with self.assertRaises(MappingImportDigestMismatch) as raised:
+                store.apply_mapping_import(
+                    "system-a", "enc-a", incoming,
+                    expected_revision=preview["revision"], import_digest=bound, import_digest_binding=bays_b,
+                )
+            self.assertEqual(
+                raised.exception.current_import_digest,
+                mapping_store_module.bind_mapping_revision(preview["import_digest"], bays_b),
+            )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+            # The unbound store digest does not satisfy a bound import either.
+            with self.assertRaises(MappingImportDigestMismatch):
+                store.apply_mapping_import(
+                    "system-a", "enc-a", incoming,
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                    import_digest_binding=bays_a,
+                )
+            self.assertIsNone(store.get_mapping("system-a", "enc-a", 0))
+
+            result = store.apply_mapping_import(
+                "system-a", "enc-a", incoming,
+                expected_revision=preview["revision"], import_digest=bound, import_digest_binding=bays_a,
+            )
+            self.assertEqual(result["saved_count"], 1)
+            self.assertEqual(store.get_mapping("system-a", "enc-a", 0).serial, "SANITIZED-A")
 
     def test_fallback_clear_rejects_concurrent_change_elsewhere_in_exact_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

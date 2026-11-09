@@ -93,8 +93,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   made against a disk that has since left the bay, found by that read or by an
   earlier one, is now refused with 409 "The disk in this bay changed" and
   stores nothing, where it used to store the old disk's serial and notes on
-  the bay or clear them; the page then reloads the bay to show the new disk
-  (#1141, #1142).
+  the bay or clear them; the page then reloads the bay to show the new disk.
+  Restoring bay assignments from a backup file is bound the same way: the
+  preview names any bay that now holds a different disk than the backup, and
+  confirming a preview after a bay it writes got another disk is refused with
+  409 "Bays changed since the preview" and writes nothing (#1141, #1142).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for

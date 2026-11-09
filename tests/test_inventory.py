@@ -19160,7 +19160,11 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["imported"], 1)
             self.assertEqual(result["previous_revision"], preview["revision"])
             self.assertNotEqual(result["revision"], preview["revision"])
-            self.assertEqual(service.get_snapshot.await_count, 0)
+            # The preview and the confirmation each read the bays the restore
+            # writes, as a save does (#1141); neither forces a refresh.
+            self.assertEqual(service.get_snapshot.await_count, 2)
+            for call in service.get_snapshot.await_args_list:
+                self.assertFalse(call.kwargs.get("force_refresh", False))
             self.assertIn(inventory_module.SNAPSHOT_NO_ENCLOSURE_KEY, service._cache)
 
     async def test_preview_mapping_bundle_rejects_unscoped_virtual_mapping_before_store_preview(self) -> None:

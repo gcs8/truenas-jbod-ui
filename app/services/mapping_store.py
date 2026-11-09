@@ -87,6 +87,13 @@ class MappingSlotDiskChangedBeforeClear(MappingSlotDiskChanged):
     public_detail = "The disk in this bay changed. Reload to see it, then clear again."
 
 
+class MappingImportBaysChanged(MappingRevisionConflict):
+    """A bay the confirmed restore writes holds another disk than at its preview (#1141)."""
+
+    public_detail = "Bays changed since the preview. Preview the import again."
+    error_code = "mapping_import_bays_changed"
+
+
 class MappingImportDigestMismatch(RuntimeError):
     public_detail = "Mapping import digest does not match the confirmed preview."
 
@@ -1352,6 +1359,7 @@ class MappingStore:
         *,
         expected_revision: str,
         import_digest: str,
+        import_digest_binding: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             state = self._load_state()
@@ -1361,9 +1369,14 @@ class MappingStore:
             )
             if preview["revision"] != expected_revision:
                 raise MappingRevisionConflict(preview["revision"])
-            if preview["import_digest"] != import_digest:
+            # The caller can bind the disks in the bays the restore writes into
+            # the digest, as a save binds the bay's disk (#1141).
+            current_import_digest = bind_mapping_revision(
+                preview["import_digest"], import_digest_binding
+            )
+            if current_import_digest != import_digest:
                 raise MappingImportDigestMismatch(
-                    preview["revision"], preview["import_digest"]
+                    preview["revision"], current_import_digest
                 )
             current = {
                 identity: mapping

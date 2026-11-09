@@ -730,21 +730,11 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
         self.assert_budget_respected()
 
 
-class MappingWriteAfterTheBayDiskChangedTests(RefreshDeadlineTests):
-    """A bay-assignment write is bound to the disk its editor showed (#1141).
-
-    The editor's save and clear revisions carry the identity of the disk that
-    was in the bay. When the write's pre-write read, joined to a running
-    refresh or not, finds another disk in that bay, the write is refused with a
-    409 that says so and nothing is stored, although no other tab changed the
-    saved assignments. Before, the old disk's serial and notes were stored onto
-    the bay, or its notes cleared, against the new disk.
-    """
+class BayDiskSwapTests(RefreshDeadlineTests):
+    """Bay 0 holds disk A until a test puts disk B at the same device name."""
 
     DISK_A = "SANITIZED-SN-0400"
     DISK_B = "SANITIZED-SN-0401"
-    SAVE_DETAIL = "The disk in this bay changed. Reload to see it, then save again."
-    CLEAR_DETAIL = "The disk in this bay changed. Reload to see it, then clear again."
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
@@ -773,6 +763,41 @@ class MappingWriteAfterTheBayDiskChangedTests(RefreshDeadlineTests):
         self.assertEqual(bay.serial, self.DISK_A)
         return bay
 
+    async def write_while_the_running_refresh_reads(self, write, *, release_after: float, serial: str):
+        """Send the write while the page's refresh is held, then let it read `serial`."""
+        # Each round holds a fresh appliance call.
+        self.appliance.answer.clear()
+        self.appliance.hung.clear()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            request = write()
+            await asyncio.sleep(release_after)
+            if release_after > USER_WAIT_SECONDS:
+                self.assertFalse(request.done(), request.result()[2][:300] if request.done() else "")
+            self.disk_serial = serial
+            self.appliance.answer.set()
+            response = await asyncio.wait_for(request, timeout=ANSWER_CEILING_SECONDS)
+        await self.settle()
+        return response
+
+    def cached_bay(self):
+        return next(slot for slot in self.service._cache[SHELF].slots if slot.slot == 0)
+
+
+class MappingWriteAfterTheBayDiskChangedTests(BayDiskSwapTests):
+    """A bay-assignment write is bound to the disk its editor showed (#1141).
+
+    The editor's save and clear revisions carry the identity of the disk that
+    was in the bay. When the write's pre-write read, joined to a running
+    refresh or not, finds another disk in that bay, the write is refused with a
+    409 that says so and nothing is stored, although no other tab changed the
+    saved assignments. Before, the old disk's serial and notes were stored onto
+    the bay, or its notes cleared, against the new disk.
+    """
+
+    SAVE_DETAIL = "The disk in this bay changed. Reload to see it, then save again."
+    CLEAR_DETAIL = "The disk in this bay changed. Reload to see it, then clear again."
+
     def save_from(self, bay):
         return asyncio.ensure_future(call_app(
             self.application,
@@ -795,26 +820,6 @@ class MappingWriteAfterTheBayDiskChangedTests(RefreshDeadlineTests):
             "/api/slots/0/mapping",
             query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&expected_revision={bay.mapping_clear_revision}",
         ))
-
-    async def write_while_the_running_refresh_reads(self, write, *, release_after: float, serial: str):
-        """Send the write while the page's refresh is held, then let it read `serial`."""
-        # Each round holds a fresh appliance call.
-        self.appliance.answer.clear()
-        self.appliance.hung.clear()
-        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
-            await self.start_hung_page_refresh()
-            request = write()
-            await asyncio.sleep(release_after)
-            if release_after > USER_WAIT_SECONDS:
-                self.assertFalse(request.done(), request.result()[2][:300] if request.done() else "")
-            self.disk_serial = serial
-            self.appliance.answer.set()
-            response = await asyncio.wait_for(request, timeout=ANSWER_CEILING_SECONDS)
-        await self.settle()
-        return response
-
-    def cached_bay(self):
-        return next(slot for slot in self.service._cache[SHELF].slots if slot.slot == 0)
 
     def assert_disk_change_refused(self, response, detail: str) -> None:
         status, headers, content = response
@@ -919,6 +924,162 @@ class MappingWriteAfterTheBayDiskChangedTests(RefreshDeadlineTests):
         snapshot = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
         other_b = next(slot for slot in snapshot.slots if slot.slot == 1)
         self.assertEqual(other_a.mapping_revision, other_b.mapping_revision)
+
+
+class MappingImportAfterTheBayDiskChangedTests(BayDiskSwapTests):
+    """A confirmed restore is bound to the disks its preview saw (#1141).
+
+    The preview records the disk in every bay the restore would write and binds
+    them into its import digest. The confirmation makes the same strict
+    pre-write read a save makes, joined to a running refresh or not; when any of
+    those bays now holds another disk, it is refused with a 409 and nothing is
+    written. Before, a preview made while disk A was in the bay restored A's
+    assignment onto disk B. A preview made after the swap names the mismatch,
+    and confirming it then restores the backup on purpose.
+    """
+
+    BAYS_CHANGED_DETAIL = "Bays changed since the preview. Preview the import again."
+
+    def bundle_for(self, slot: int, serial: str, notes: str) -> dict:
+        return {
+            "schema_version": 1,
+            "mappings": [{"system_id": SYSTEM_ID, "enclosure_id": SHELF, "slot": slot, "serial": serial,
+                          "device_name": "da0", "notes": notes}],
+        }
+
+    async def preview(self, bundle: dict) -> dict:
+        status, _headers, content = await asyncio.wait_for(call_app(
+            self.application, "POST", "/api/mappings/import/preview",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}", body=bundle,
+        ), timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 200, content[:400])
+        return json.loads(content)
+
+    def confirm(self, bundle: dict, preview: dict):
+        return asyncio.ensure_future(call_app(
+            self.application, "POST", "/api/mappings/import",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
+            body={"bundle": bundle, "expected_revision": preview["revision"],
+                  "import_digest": preview["import_digest"], "confirmed": True},
+        ))
+
+    def assert_bays_changed_refused(self, response) -> None:
+        status, headers, content = response
+        self.assertEqual(status, 409, content[:400])
+        self.assertNotIn("retry-after", headers)
+        payload = json.loads(content)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "mapping_import_bays_changed")
+        self.assertEqual(payload["detail"], self.BAYS_CHANGED_DETAIL)
+        self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0))
+        self.assertEqual(self.cached_bay().serial, self.DISK_B)
+
+    async def preview_of_disk_a(self) -> tuple[dict, dict]:
+        await self.open_editor()
+        bundle = self.bundle_for(0, self.DISK_A, "SANITIZED notes for disk A")
+        return bundle, await self.preview(bundle)
+
+    async def test_import_is_refused_when_the_joined_refresh_finds_another_disk(self) -> None:
+        bundle, preview = await self.preview_of_disk_a()
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.confirm(bundle, preview), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_B,
+        )
+        self.assert_bays_changed_refused(response)
+
+    async def test_import_is_refused_when_a_short_wait_finds_another_disk(self) -> None:
+        bundle, preview = await self.preview_of_disk_a()
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.confirm(bundle, preview), release_after=0.05, serial=self.DISK_B,
+        )
+        self.assert_bays_changed_refused(response)
+
+    async def published_disk_b_then_confirm(self, bundle: dict, preview: dict, *, release_after: float):
+        # A strict read joins the page's refresh, which publishes disk B before
+        # the restore is confirmed; nothing in the assignment store changed.
+        self.appliance.answer.clear()
+        self.appliance.hung.clear()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            strict = asyncio.ensure_future(self.service._get_pre_write_snapshot(SHELF))
+            await asyncio.sleep(release_after)
+            self.disk_serial = self.DISK_B
+            self.appliance.answer.set()
+            await asyncio.wait_for(strict, timeout=ANSWER_CEILING_SECONDS)
+        await self.settle()
+        self.assertEqual(self.cached_bay().serial, self.DISK_B)
+        reads = self.appliance.reads
+        response = await asyncio.wait_for(self.confirm(bundle, preview), timeout=ANSWER_CEILING_SECONDS)
+        return response, reads
+
+    async def test_import_is_refused_after_a_short_refresh_already_published_another_disk(self) -> None:
+        bundle, preview = await self.preview_of_disk_a()
+        response, _reads = await self.published_disk_b_then_confirm(bundle, preview, release_after=0.05)
+        self.assert_bays_changed_refused(response)
+
+    async def test_import_is_refused_after_a_joined_refresh_already_published_another_disk(self) -> None:
+        bundle, preview = await self.preview_of_disk_a()
+        response, reads = await self.published_disk_b_then_confirm(
+            bundle, preview, release_after=USER_WAIT_SECONDS * 3,
+        )
+        self.assert_bays_changed_refused(response)
+        # The confirmation's pre-write read reused the current view.
+        self.assertEqual(self.appliance.reads, reads)
+
+    async def test_preview_after_the_swap_names_the_other_disk_and_confirming_restores_the_backup(self) -> None:
+        await self.open_editor()
+        self.disk_serial = self.DISK_B
+        await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
+        bundle = self.bundle_for(0, self.DISK_A, "SANITIZED notes for disk A")
+        preview = await self.preview(bundle)
+        self.assertEqual(preview["disk_warnings"], [{
+            "enclosure_id": SHELF, "slot": 0, "field": "serial",
+            "backup": self.DISK_A, "current": self.DISK_B,
+        }])
+        status, _headers, content = await asyncio.wait_for(
+            self.confirm(bundle, preview), timeout=ANSWER_CEILING_SECONDS,
+        )
+        # Restoring historical assignments onto the current disk is the user's choice.
+        self.assertEqual(status, 200, content[:400])
+        stored = self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0)
+        self.assertEqual((stored.serial, stored.notes), (self.DISK_A, "SANITIZED notes for disk A"))
+
+    async def test_import_into_unchanged_bays_after_a_joined_refresh_is_stored(self) -> None:
+        bundle, preview = await self.preview_of_disk_a()
+        # The backup names the disk that is in the bay: nothing to warn about.
+        self.assertEqual(preview.get("disk_warnings"), [])
+        status, _headers, content = await self.write_while_the_running_refresh_reads(
+            lambda: self.confirm(bundle, preview), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_A,
+        )
+        self.assertEqual(status, 200, content[:400])
+        stored = self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0)
+        self.assertEqual((stored.serial, stored.notes), (self.DISK_A, "SANITIZED notes for disk A"))
+
+    async def test_a_disk_change_in_a_bay_the_import_does_not_write_does_not_refuse_it(self) -> None:
+        await self.open_editor()
+        bundle = self.bundle_for(1, "SANITIZED-SN-0499", "SANITIZED notes for bay 1")
+        preview = await self.preview(bundle)
+        status, _headers, content = await self.write_while_the_running_refresh_reads(
+            lambda: self.confirm(bundle, preview), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_B,
+        )
+        self.assertEqual(status, 200, content[:400])
+        self.assertEqual(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 1).serial, "SANITIZED-SN-0499")
+        self.assertEqual(self.cached_bay().serial, self.DISK_B)
+
+    async def test_a_restore_that_removes_an_assignment_is_refused_after_the_bay_changed(self) -> None:
+        # Removing a bay's assignment is a write to it as well, as a clear is.
+        await self.open_editor(saved_notes="SANITIZED notes for disk A")
+        bundle = {"schema_version": 1, "mappings": []}
+        preview = await self.preview(bundle)
+        self.assertEqual([item["slot"] for item in preview["removals"]], [0])
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.confirm(bundle, preview), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_B,
+        )
+        status, _headers, content = response
+        self.assertEqual(status, 409, content[:400])
+        self.assertEqual(json.loads(content)["error"], "mapping_import_bays_changed")
+        self.assertEqual(
+            self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0).notes, "SANITIZED notes for disk A",
+        )
 
 
 class AbandonedRefreshTests(RefreshDeadlineTests):

@@ -76,6 +76,8 @@ from app.services.combined_shelf_ids import (
 )
 from app.services.mapping_store import (
     MAPPING_REVISION_BINDING_LENGTH,
+    MappingImportBaysChanged,
+    MappingImportDigestMismatch,
     MappingRevisionConflict,
     MappingSlotDiskChanged,
     MappingSlotDiskChangedBeforeClear,
@@ -8142,6 +8144,89 @@ class InventoryService:
         ):
             raise TrueNASAPIError(VIRTUAL_MAPPING_UNAVAILABLE_REASON)
 
+    @staticmethod
+    def _mapping_import_written_bays(preview: dict[str, Any]) -> list[tuple[str | None, int]]:
+        """The bays a restore writes: assignments it adds, changes or removes."""
+        return sorted(
+            {
+                (entry["enclosure_id"], entry["slot"])
+                for kind in ("additions", "updates", "removals")
+                for entry in preview[kind]
+            },
+            key=lambda bay: (bay[0] or "", bay[1]),
+        )
+
+    async def _read_mapping_import_bays(
+        self,
+        bays: list[tuple[str | None, int]],
+        selected_enclosure_id: str | None,
+    ) -> dict[tuple[str | None, int], SlotView | None]:
+        """The bays a restore writes, as the strict pre-write read finds them (#1141).
+
+        The read is the one a save makes, joined to a running refresh. A bay
+        outside the selected view (another drawer of the same shelf, or another
+        enclosure in an unscoped restore) is read from its own enclosure's view
+        when that enclosure is known; a bay no view shows reads as absent.
+        """
+        if not bays:
+            return {}
+        views: dict[tuple[str | None, int], SlotView] = {}
+
+        def collect(snapshot: InventorySnapshot) -> None:
+            for slot_view in snapshot.slots:
+                views.setdefault((resolve_physical_mapping_scope(slot_view.enclosure_id), slot_view.slot), slot_view)
+
+        snapshot = await self._get_pre_write_snapshot(selected_enclosure_id)
+        collect(snapshot)
+        known = {option.id for option in snapshot.enclosures}
+        read = {selected_enclosure_id, snapshot.selected_enclosure_id}
+        for enclosure_id in sorted({bay[0] for bay in bays if bay not in views and bay[0] is not None}):
+            if enclosure_id in known and enclosure_id not in read:
+                read.add(enclosure_id)
+                collect(await self._get_pre_write_snapshot(enclosure_id))
+        return {bay: views.get(bay) for bay in bays}
+
+    def _mapping_import_bays_binding(
+        self,
+        bay_views: dict[tuple[str | None, int], SlotView | None],
+    ) -> str:
+        """Digest of the disks in the bays a restore writes, bound into its import digest."""
+        identity = [
+            [bay[0], bay[1], self._slot_disk_binding(bay_views[bay])]
+            for bay in sorted(bay_views, key=lambda item: (item[0] or "", item[1]))
+        ]
+        digest = hashlib.sha256(
+            json.dumps(["mapping-import-bays-v1", identity], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return digest[:MAPPING_REVISION_BINDING_LENGTH]
+
+    @staticmethod
+    def _mapping_import_disk_warning(
+        bay: tuple[str | None, int],
+        mapping: ManualMapping,
+        slot_view: SlotView | None,
+    ) -> dict[str, Any] | None:
+        """Name a bay whose current disk is not the one the backup row names.
+
+        The backup row names its disk by serial, or else by persistent id. A
+        bay that shows no value for that identifier cannot be compared.
+        """
+        for field_name in ("serial", "gptid"):
+            backup = normalize_text(getattr(mapping, field_name))
+            if backup:
+                break
+        else:
+            return None
+        if slot_view is None:
+            return None
+        if not slot_view.present or slot_view.state == SlotState.empty:
+            current = None
+        else:
+            current = normalize_text(getattr(slot_view, field_name))
+            if not current or current.casefold() == backup.casefold():
+                return None
+        return {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+
     async def preview_mapping_bundle(
         self,
         bundle: MappingBundle,
@@ -8155,8 +8240,34 @@ class InventoryService:
             mapping_enclosure_id,
             rewritten,
         )
+        # Record the disk in every bay the restore writes and bind them into
+        # the digest the confirmation returns, so a confirmation after any of
+        # those disks changed is refused (#1141). Name the bays whose disk is
+        # not the one the backup row names; restoring onto them stays the
+        # user's choice.
+        bays = self._mapping_import_written_bays(preview)
+        bay_views = await self._read_mapping_import_bays(bays, selected_enclosure_id)
+        incoming = {
+            (resolve_physical_mapping_scope(mapping.enclosure_id), mapping.slot): mapping
+            for mapping in rewritten
+        }
+        written = {
+            (entry["enclosure_id"], entry["slot"])
+            for kind in ("additions", "updates")
+            for entry in preview[kind]
+        }
+        disk_warnings = [
+            warning
+            for bay in bays
+            if bay in written and bay in incoming
+            and (warning := self._mapping_import_disk_warning(bay, incoming[bay], bay_views[bay])) is not None
+        ]
         return {
             **preview,
+            "import_digest": bind_mapping_revision(
+                preview["import_digest"], self._mapping_import_bays_binding(bay_views),
+            ),
+            "disk_warnings": disk_warnings,
             "system_id": self.system.id,
             "enclosure_id": mapping_enclosure_id,
         }
@@ -8173,13 +8284,41 @@ class InventoryService:
         self._require_physical_mapping_scope(selected_enclosure_id, bundle)
         mapping_enclosure_id = resolve_physical_mapping_scope(selected_enclosure_id)
         rewritten = self._rewrite_mapping_bundle(bundle, selected_enclosure_id)
-        result = self.mapping_store.apply_mapping_import(
+        preview = self.mapping_store.preview_replace_mappings(
             self.system.id,
             mapping_enclosure_id,
             rewritten,
-            expected_revision=expected_revision,
-            import_digest=import_digest,
         )
+        if preview["revision"] != expected_revision:
+            # Already stale: refuse before reading the bays.
+            raise MappingRevisionConflict(preview["revision"])
+        # The confirmation is bound to the disks its preview saw in the bays it
+        # writes. Read them as a save does, strict and joined to a running
+        # refresh, and refuse before writing if any of them changed (#1141).
+        bay_views = await self._read_mapping_import_bays(
+            self._mapping_import_written_bays(preview), selected_enclosure_id,
+        )
+        binding = self._mapping_import_bays_binding(bay_views)
+        try:
+            result = self.mapping_store.apply_mapping_import(
+                self.system.id,
+                mapping_enclosure_id,
+                rewritten,
+                expected_revision=expected_revision,
+                import_digest=import_digest,
+                import_digest_binding=binding,
+            )
+        except MappingImportDigestMismatch as mismatch:
+            split = len(mismatch.current_import_digest) - MAPPING_REVISION_BINDING_LENGTH
+            if (
+                len(import_digest) == len(mismatch.current_import_digest)
+                and import_digest[:split] == mismatch.current_import_digest[:split]
+                and import_digest[split:] != binding
+            ):
+                # The bundle and the stored assignments match the preview;
+                # only the disks in the bays differ.
+                raise MappingImportBaysChanged(mismatch.current_revision) from mismatch
+            raise
         if invalidate_snapshot:
             self.invalidate_snapshot_cache(reason="import_mapping_bundle")
         return {
