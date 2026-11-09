@@ -15,7 +15,7 @@ async function flush() {
 // Render the complete production template without importing service startup or
 // opening a database. The DOM adapter below supports only this asset's APIs;
 // these are offline DOM behavior tests, not browser layout or live-service QA.
-function templateDocument(initial, buttons) {
+function templateDocument(initial, buttons, context = {}) {
   const rendered = spawnSync(process.env.PYTHON || "python", ["-c", `
 import json, sys
 from html.parser import HTMLParser
@@ -29,6 +29,7 @@ html = env.get_template("dashboard.html").render(
     status_json=json.dumps(payload["initial"]), direct_refresh_enabled=payload["buttons"],
     refresh={}, counts={}, scopes=[], collector_state_label="Running",
     collector_banner_text="", url_for=lambda name, path: "/static/" + path,
+    **payload["context"],
 )
 class DOM(HTMLParser):
     def __init__(self):
@@ -51,7 +52,7 @@ assert len(dom.stack) == 1
 print(json.dumps(dom.root))
 `], {
     cwd: path.resolve(__dirname, "../.."),
-    input: JSON.stringify({ initial, buttons }), encoding: "utf8", timeout: 10000,
+    input: JSON.stringify({ initial, buttons, context }), encoding: "utf8", timeout: 10000,
   });
   assert.equal(rendered.status, 0, rendered.stderr);
   const elements = new Map();
@@ -88,13 +89,13 @@ print(json.dumps(dom.root))
   return { elements, times, createElement: () => node({ attrs: {}, children: [] }) };
 }
 
-function dashboard({ hidden = false, buttons = true, initial = { collector_running: true }, template = false } = {}) {
+function dashboard({ hidden = false, buttons = true, initial = { collector_running: true }, template = false, context = {} } = {}) {
   let now = 0;
   let nextTimer = 0;
   const timers = new Map();
   const requests = [];
   const listeners = {};
-  const dom = template ? templateDocument(initial, buttons) : null;
+  const dom = template ? templateDocument(initial, buttons, context) : null;
   const elements = dom?.elements || new Map();
   function element(id) {
     if (dom) {
@@ -702,4 +703,139 @@ test("token-policy DOM without action buttons still polls without issuing writes
   await d.advance(10000);
   assert.ok(d.requests.length > 0);
   assert.ok(d.requests.every(r => r.options.method !== "POST"));
+});
+
+// #864: the census card is rendered once from the cached summary. The health
+// poll carries the same summary, so a census that finishes (or starts failing
+// authentication) after page load must reach the open card on the next poll.
+// Polling only reads /healthz; the dashboard never asks for census work.
+const censusPending = {
+  state: "census", indexed: null, unindexed: null, candidates: null, candidate_bytes: null,
+  last_census_at: null, errors: [], errors_omitted: 0,
+};
+const censusDone = {
+  state: "census", indexed: 3, unindexed: 2, candidates: 1, candidate_bytes: 2048,
+  last_census_at: "2026-11-08T12:00:00+00:00",
+  errors: [{ segment_id: "segment-0004", reason: "segment_sha256_mismatch" }], errors_omitted: 0,
+};
+const censusIds = ["indexed", "unindexed", "candidates", "last-at", "errors"].map(name => `segment-census-${name}`);
+const censusDashboard = (options = {}) => dashboard({
+  ...options,
+  template: Boolean(process.env.PYTHON),
+  context: {
+    segment_conversion: censusPending,
+    segment_candidate_bytes_label: "not counted yet",
+    segment_census_errors_label: "none",
+  },
+});
+const censusText = d => Object.fromEntries(censusIds.map(id => [id, d.element(id).textContent]));
+const censusHealth = census => ({ status: "ok", collector: { collector_running: true }, segment_conversion: census });
+
+async function pollHealth(d, payload, code = 200) {
+  const index = d.requests.length;
+  d.poll.pollCollectorStatus();
+  assert.equal(d.requests[index].url, "/healthz");
+  await d.reply(index, payload, code);
+}
+
+test(`census ${recoveryFixture}: a census completing after page load reaches the card on the next health poll`, async () => {
+  const d = censusDashboard();
+  if (process.env.PYTHON) {
+    assert.deepEqual(censusText(d), {
+      "segment-census-indexed": "-", "segment-census-unindexed": "-",
+      "segment-census-candidates": "- (not counted yet)", "segment-census-last-at": "not run yet",
+      "segment-census-errors": "none",
+    });
+  }
+  await pollHealth(d, censusHealth(censusPending));
+  assert.equal(d.element("segment-census-indexed").textContent, "-");
+  assert.equal(d.element("segment-census-indexed").getAttribute?.("title") ?? d.element("segment-census-indexed").title, "not counted yet");
+  assert.equal(d.element("segment-census-last-at").textContent, "not run yet");
+  await pollHealth(d, censusHealth(censusDone));
+  assert.deepEqual(censusText(d), {
+    "segment-census-indexed": "3", "segment-census-unindexed": "2",
+    "segment-census-candidates": "1 (2.0 KiB)",
+    "segment-census-last-at": new Date(censusDone.last_census_at).toLocaleString(),
+    "segment-census-errors": "segment-0004: segment_sha256_mismatch",
+  });
+  assert.equal(d.element("segment-census-indexed").getAttribute?.("title") ?? d.element("segment-census-indexed").title ?? null, null);
+  // Polling read the health summary only; no census endpoint or write exists.
+  assert.ok(d.requests.every(r => r.url === "/healthz" && r.options.method === undefined));
+  // Informational only: an authentication error is not styled as degraded.
+  assert.equal(d.element("segment-census-errors").classList.contains("status-error"), false);
+});
+
+test(`census ${recoveryFixture}: authentication errors appear, change and clear on later polls`, async () => {
+  const d = censusDashboard();
+  await pollHealth(d, censusHealth({ ...censusDone, errors: [] }));
+  assert.equal(d.element("segment-census-errors").textContent, "none");
+  await pollHealth(d, censusHealth({
+    ...censusDone, indexed: 2, unindexed: 1, candidates: 0, candidate_bytes: 0,
+    errors: [
+      { segment_id: null, reason: "catalog_sha256_mismatch" },
+      { segment_id: "segment-0002", reason: "segment_identity_changed" },
+    ],
+    errors_omitted: 4,
+  }));
+  assert.equal(d.element("segment-census-indexed").textContent, "2");
+  assert.equal(d.element("segment-census-candidates").textContent, "0 (0 B)");
+  assert.equal(d.element("segment-census-errors").textContent,
+    "catalog_sha256_mismatch; segment-0002: segment_identity_changed; and 4 more");
+  await pollHealth(d, censusHealth({ ...censusDone, errors: [] }));
+  assert.equal(d.element("segment-census-errors").textContent, "none");
+});
+
+test(`census ${recoveryFixture}: census text is shown as text, never parsed as markup`, async () => {
+  const d = censusDashboard();
+  const hostile = "<img src=x onerror=alert(1)>";
+  await pollHealth(d, censusHealth({ ...censusDone, errors: [{ segment_id: hostile, reason: "</dd><script>x</script>" }] }));
+  assert.equal(d.element("segment-census-errors").textContent, `${hostile}: </dd><script>x</script>`);
+  const renderer = source.slice(source.indexOf("function renderSegmentCensus"));
+  assert.ok(source.includes("function renderSegmentCensus"));
+  assert.doesNotMatch(renderer.slice(0, renderer.indexOf("\n  }\n")), /innerHTML|insertAdjacentHTML|outerHTML/);
+});
+
+test(`census ${recoveryFixture}: missing, malformed or failed census evidence keeps the last known card`, async () => {
+  const d = censusDashboard();
+  await pollHealth(d, censusHealth(censusDone));
+  const known = censusText(d);
+  for (const malformed of [undefined, null, "census", [], 7, { state: "converting" }, { ...censusDone, errors: "x" }]) {
+    await pollHealth(d, censusHealth(malformed));
+    assert.deepEqual(censusText(d), known);
+  }
+  await pollHealth(d, {}, 503);
+  assert.deepEqual(censusText(d), known);
+  // Malformed individual counts are not counted, never an invented number.
+  await pollHealth(d, censusHealth({ ...censusDone, indexed: -1, unindexed: "2", candidates: 1.5, candidate_bytes: "x" }));
+  assert.equal(d.element("segment-census-indexed").textContent, "-");
+  assert.equal(d.element("segment-census-unindexed").textContent, "-");
+  assert.equal(d.element("segment-census-candidates").textContent, "- (not counted yet)");
+});
+
+test(`census ${recoveryFixture}: a response fenced by hiding the page cannot repaint the card`, async () => {
+  const d = censusDashboard();
+  await pollHealth(d, censusHealth(censusPending));
+  const pending = censusText(d);
+  d.poll.pollCollectorStatus();
+  const late = d.requests.length - 1;
+  await d.visibility(true);
+  await d.reply(late, censusHealth(censusDone));
+  assert.deepEqual(censusText(d), pending);
+  await d.visibility(false);
+  const resumed = d.requests.findIndex((r, i) => i > late && r.url === "/healthz");
+  await d.reply(resumed, censusHealth(censusDone));
+  assert.equal(d.element("segment-census-indexed").textContent, "3");
+});
+
+test(`census ${recoveryFixture}: overview and refresh replies, which carry no census, leave the card alone`, async () => {
+  const d = censusDashboard();
+  await pollHealth(d, censusHealth(censusDone));
+  const known = censusText(d);
+  d.poll.pollOverviewStatus();
+  await d.reply(d.requests.length - 1, { collector: { collector_running: true }, ok: true, counts: { tracked_slots: 1 } });
+  assert.deepEqual(censusText(d), known);
+  await d.click("fast");
+  const post = d.requests.findIndex(r => r.options.method === "POST");
+  await d.reply(post, { ok: true, collector: { collector_running: true }, counts: {} });
+  assert.deepEqual(censusText(d), known);
 });

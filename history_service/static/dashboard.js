@@ -236,6 +236,47 @@
     setText("status-last-error-summary", statusValue(collector.last_error_summary, "nothing recorded"));
   }
 
+  // #864: the health poll carries the same cached census summary the page
+  // rendered, so a census that finishes, changes or fails authentication after
+  // page load reaches the open card. Rendering only reads the payload; the
+  // census itself runs in the service and polling never requests one. Missing
+  // or malformed evidence keeps the last known card.
+  function censusCount(value) {
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  }
+
+  function censusErrorsLabel(census) {
+    const parts = [];
+    for (const error of census.errors) {
+      if (!error || typeof error !== "object") continue;
+      const reason = String(error.reason);
+      parts.push(error.segment_id ? `${error.segment_id}: ${reason}` : reason);
+    }
+    const omitted = census.errors_omitted;
+    if (Number.isInteger(omitted) && omitted > 0) parts.push(`and ${omitted} more`);
+    return parts.join("; ") || "none";
+  }
+
+  function renderSegmentCensus(census) {
+    if (!census || typeof census !== "object" || Array.isArray(census)
+        || census.state !== "census" || !Array.isArray(census.errors)) {
+      return;
+    }
+    setCount("segment-census-indexed", censusCount(census.indexed));
+    setCount("segment-census-unindexed", censusCount(census.unindexed));
+    const candidates = censusCount(census.candidates);
+    const candidateBytes = censusCount(census.candidate_bytes);
+    setCount("segment-census-candidates", candidates);
+    setText(
+      "segment-census-candidates",
+      `${formatCount(candidates)} (${candidateBytes === null ? "not counted yet" : formatBytes(candidateBytes)})`,
+    );
+    setText("segment-census-last-at", formatTimestamp(census.last_census_at, "not run yet"));
+    // Plain text like the page render: the census is informational and never
+    // marks history degraded.
+    setText("segment-census-errors", censusErrorsLabel(census));
+  }
+
   function renderOverview(payload) {
     if (!payload) {
       return;
@@ -434,6 +475,7 @@
         throw new Error("Invalid dashboard response");
       }
       acceptCollector(payload, ticket);
+      if (channel === healthPoll) renderSegmentCensus(payload.segment_conversion);
       if (channel === overviewPoll) {
         renderOverview(payload);
         setText("history-overview-freshness", "Overview checked successfully.");

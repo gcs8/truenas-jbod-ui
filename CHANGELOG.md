@@ -43,8 +43,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Added a read-only census of segmented-history segments. `/healthz`
   (`segment_conversion`) and the history dashboard now count which segments
   still lack the newer read indexes, after checking each one against its
-  catalog entry. The counts are informational, never mark history degraded,
-  and nothing converts segments yet (#1129).
+  catalog entry. An open dashboard picks up a finished census, and any
+  segment it could not check, on its next health check. The counts are
+  informational, never mark history degraded, and nothing converts segments
+  yet (#1129).
 
 ### Fixed
 
