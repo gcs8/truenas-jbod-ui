@@ -91,7 +91,7 @@ class HealthzShapeTests(unittest.TestCase):
     def test_healthz_carries_collector_fields_once_and_a_plain_detail(self) -> None:
         payload = self._healthz({"collector_running": True, "last_error": None}, None)
 
-        self.assertEqual(set(payload), {"status", "detail", "collector", "database_size_bytes"})
+        self.assertEqual(set(payload), {"status", "detail", "collector", "database_size_bytes", "segment_conversion"})
         self.assertEqual(payload["status"], "ok")
         self.assertIsNone(payload["detail"])
 

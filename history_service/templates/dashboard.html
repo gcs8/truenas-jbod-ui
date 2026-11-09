@@ -108,6 +108,20 @@
         </dl>
       </section>
 
+      {% if segment_conversion %}
+      <section class="card" id="segment-census">
+        <h2>Segment format census</h2>
+        <p>Read-only and informational. Older segments are read correctly on a slower path; nothing converts them yet, and these counts are not migration progress.</p>
+        <dl>
+          <dt>Segments with the current indexes</dt><dd id="segment-census-indexed">{{ count(segment_conversion.get('indexed')) }}</dd>
+          <dt>Older-format segments</dt><dd id="segment-census-unindexed">{{ count(segment_conversion.get('unindexed')) }}</dd>
+          <dt>Could be converted later</dt><dd id="segment-census-candidates">{{ count(segment_conversion.get('candidates')) }} ({{ segment_candidate_bytes_label }})</dd>
+          <dt>Last census</dt><dd id="segment-census-last-at">{{ timestamp(segment_conversion.get('last_census_at'), 'not run yet') }}</dd>
+          <dt>Segments not checked</dt><dd id="segment-census-errors">{{ segment_census_errors_label }}</dd>
+        </dl>
+      </section>
+      {% endif %}
+
       <section class="tracked-scopes-section">
         <h2 id="tracked-scopes-heading">Systems and enclosures</h2>
         <!-- #1116: a narrow window scrolls the table, not the whole page. -->
