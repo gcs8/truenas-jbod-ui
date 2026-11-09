@@ -440,6 +440,7 @@ class SegmentCensusReport:
     catalog_error: str | None
     segments: tuple[SegmentCensusEntry, ...] = ()
     catalog_identity: FileIdentity | None = None
+    # Per segment: (file name, identity, sidecar presence) as inspected.
     segment_identities: tuple[
         tuple[str, FileIdentity | None, tuple[bool, ...]], ...
     ] = field(default=(), repr=False)
@@ -467,7 +468,18 @@ class SegmentCensusReport:
         }
 
 
-def _census_entry(directory: Path, entry: CatalogEntry) -> SegmentCensusEntry:
+_SegmentFingerprint = tuple[str, "FileIdentity | None", tuple[bool, ...]]
+
+
+def _census_entry(directory: Path, entry: CatalogEntry) -> tuple[SegmentCensusEntry, _SegmentFingerprint]:
+    """One segment's census result and the file state that result describes.
+
+    The fingerprint of an authenticated segment is the pinned identity it was
+    hashed under, not a later stat, so a file replaced after its inspection
+    makes the cached pass stale instead of looking fresh.
+    """
+
+    path = directory / entry.file_name
     base = {
         "segment_id": entry.segment_id,
         "size_bytes": entry.size_bytes,
@@ -476,7 +488,7 @@ def _census_entry(directory: Path, entry: CatalogEntry) -> SegmentCensusEntry:
     }
     try:
         with pinned_file(
-            directory / entry.file_name,
+            path,
             prefix="segment",
             expected_size_bytes=entry.size_bytes,
             expected_sha256=entry.sha256,
@@ -487,16 +499,14 @@ def _census_entry(directory: Path, entry: CatalogEntry) -> SegmentCensusEntry:
                 except sqlite3.Error as exc:
                     raise SegmentAuthenticationError("segment_unreadable") from exc
             pinned.require_unchanged("segment_identity_changed")
-    except SegmentAuthenticationError as exc:
-        return SegmentCensusEntry(
+            fingerprint: _SegmentFingerprint = (path.name, pinned.identity, (False, False, False))
+    except (SegmentAuthenticationError, OSError) as exc:
+        reason = exc.reason if isinstance(exc, SegmentAuthenticationError) else "segment_unreadable"
+        failed = SegmentCensusEntry(
             **base, authenticated=False, indexed=False, missing_indexes=(), candidate=False,
-            error=exc.reason,
+            error=reason,
         )
-    except OSError:
-        return SegmentCensusEntry(
-            **base, authenticated=False, indexed=False, missing_indexes=(), candidate=False,
-            error="segment_unreadable",
-        )
+        return failed, _segment_fingerprint(path)
     indexed = not inventory.missing and not inventory.nonstandard
     candidate = (
         bool(inventory.missing)
@@ -510,7 +520,7 @@ def _census_entry(directory: Path, entry: CatalogEntry) -> SegmentCensusEntry:
         missing_indexes=inventory.missing,
         candidate=candidate,
         error="segment_nonstandard_index" if inventory.nonstandard else None,
-    )
+    ), fingerprint
 
 
 def _optional_identity(path: Path) -> FileIdentity | None:
@@ -544,7 +554,8 @@ def run_segment_census(
             catalog_identity=_optional_identity(catalog_path),
         )
     directory = catalog_path.parent
-    segments = tuple(_census_entry(directory, entry) for entry in catalog.entries)
+    inspected = [_census_entry(directory, entry) for entry in catalog.entries]
+    segments = tuple(result for result, _ in inspected)
     catalog_error = None
     if _optional_identity(catalog_path) != catalog.identity:
         # A rotation or restore replaced the catalog mid-pass; the next pass
@@ -555,9 +566,7 @@ def run_segment_census(
         catalog_error=catalog_error,
         segments=segments,
         catalog_identity=catalog.identity,
-        segment_identities=tuple(
-            _segment_fingerprint(directory / entry.file_name) for entry in catalog.entries
-        ),
+        segment_identities=tuple(fingerprint for _, fingerprint in inspected),
     )
 
 

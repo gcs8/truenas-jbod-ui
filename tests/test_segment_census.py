@@ -354,6 +354,30 @@ class SegmentCensusTests(SegmentTreeFixture):
         census.summary()
         self.assertEqual(len(started), 1, "a new sidecar makes the census stale")
 
+    def test_segment_changed_later_in_the_same_pass_is_not_cached_as_fresh(self) -> None:
+        first = self.segment(1, indexes=())
+        second = self.segment(2, indexes=())
+        write_catalog(self.catalog, [catalog_entry(first), catalog_entry(second)])
+        inspect = segment_census._census_entry
+
+        def corrupt_first_after_second(directory: Path, entry: Any) -> Any:
+            result = inspect(directory, entry)
+            if entry.segment_id == "segment-0002":
+                mutate(first, "UPDATE metric_samples SET value_integer = 0 WHERE id = 2")
+            return result
+
+        started: list[Callable[[], None]] = []
+        census = SegmentCensus(catalog_path=self.catalog, min_interval_seconds=0, start_background=started.append)
+        census.summary()
+        with patch.object(segment_census, "_census_entry", side_effect=corrupt_first_after_second):
+            started.pop()()
+        self.assertEqual(census.summary()["candidates"], 2, "the pass itself saw two good segments")
+        self.assertEqual(len(started), 1, "the change after inspection makes the result stale")
+        started.pop()()
+        self.assertEqual(
+            census.summary()["errors"], [{"segment_id": "segment-0001", "reason": "segment_sha256_mismatch"}],
+        )
+
     def test_sidecar_created_during_the_census_pass_fails_authentication(self) -> None:
         legacy = self.segment(1, indexes=())
         write_catalog(self.catalog, [catalog_entry(legacy)])
