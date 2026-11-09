@@ -367,6 +367,24 @@ async def build() -> dict:
     for view_id, summaries in (bundle.storage_view_smart_summary_cache or {}).items():
         for slot_index, summary in (summaries or {}).items():
             api[f"ui:/api/storage-views/{view_id}/slots/{slot_index}/smart"] = summary
+    # Codex PRRT_kwDOSAqK-M61IUDz: with a storage view selected, the heat
+    # map's rate metrics and timeline read the view's own history
+    # (heatmapHistoryScopeRequest -> ui:/api/storage-views/{view_id}/history),
+    # shaped like the route's answer (histories keyed by display slot).
+    for view in fixture.storage_views:
+        indices = [slot.slot_index for slot in view.slots]
+        view_history = await history.get_scope_history(
+            system_id=snapshot.selected_system_id,
+            enclosure_id=f"storage-view:{view.id}",
+            slots=indices,
+            window_hours=fixture.history_window_hours,
+        )
+        api[f"ui:/api/storage-views/{view.id}/history"] = {
+            "configured": True,
+            "system_id": snapshot.selected_system_id,
+            "storage_view_id": view.id,
+            "histories": {str(index): payload for index, payload in view_history.items()},
+        }
     return {
         "origin": UI_ORIGIN,
         "pages": {

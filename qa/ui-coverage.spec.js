@@ -18,6 +18,7 @@ const path = require("node:path");
 const controls = require("./ui-crawl/controls");
 const { loadInventory, validateInventory, expandStates, selectStates, checkObserved, readsFor, selectsBay } = require("./ui-crawl/inventory");
 const routes = require("./ui-crawl/routes");
+const reach = require("./ui-crawl/reach");
 const { RequestGuard } = require("./ui-crawl/guard");
 const { installRoutes, fixtureHandler } = require("./ui-crawl/transport");
 const { Crawler } = require("./ui-crawl/crawler");
@@ -47,6 +48,8 @@ test("every backend route has a reviewed safety class and every browser API call
   expect(routes.discoverRouteFiles(root), "a Python file declares routes but is not in qa/ui-routes.json `sources`").toEqual(Object.keys(manifest.sources).sort());
   expect(routes.checkManifest(routes.scanRoutes(root, manifest), manifest), "Review the route's class in qa/ui-routes.json (see qa/ui-crawl/routes.js) and update its fingerprint").toEqual([]);
   expect(routes.checkScriptApiPaths(root, controls.UI_SOURCES.scripts, manifest)).toEqual([]);
+  // D-TNJ-20261109-CRAWLER-SWEEP: plain reads are generated from the page scripts.
+  expect(reach.reachProblems(root, { manifest }), "Review the page scripts' new reads, then run node scripts/generate_ui_read_reach.js").toEqual([]);
 });
 
 // A synthetic page with one instance of each defect shape the checks exist
@@ -308,7 +311,7 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
   const misclassified = [];
   for (const [stateId, seen] of guard.observed) {
     const state = byId.get(stateId);
-    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state)));
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state, "*")));
   }
   expect(misclassified, "a control called a route its state's safety class or read allowlist does not allow; fix the class, the reads or the control").toEqual([]);
 
@@ -421,7 +424,7 @@ test("bay selection before the SMART prefetch and HA candidate reads stay inside
   const misclassified = [];
   for (const [stateId, seen] of guard.observed) {
     const state = byId.get(stateId);
-    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state)));
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state, "*")));
   }
   expect(misclassified).toEqual([]);
 
@@ -429,4 +432,65 @@ test("bay selection before the SMART prefetch and HA candidate reads stay inside
   const haCandidates = guard.log.filter((entry) => entry.allowed && entry.path.startsWith("/api/admin/storage-views/candidates?") && /[?&]target_system_id=synthetic-qs-node-b(&|$)/.test(entry.path));
   expect(haCandidates.length, "no candidate read with target_system_id= was admitted on the HA fixture").toBeGreaterThan(0);
   for (const entry of haCandidates) expect(entry.path).toMatch(/[?&]system_id=synthetic-qs-ha(&|$)/);
+});
+
+// Codex PRRT_kwDOSAqK-M61IUDz / D-TNJ-20261109-CRAWLER-SWEEP: a system whose
+// FIRST scope is a storage view with history. Every main read state runs on
+// it (not only the `scope: "all"` ones), with the guard bound like a live
+// target (system and storage view) and the reads it admits generated from
+// app.js for the storage-view scope. The heat map's rate metrics and
+// timeline read the view's history through /api/storage-views/{view_id}/history.
+test("a storage view as the first scope: every main read state stays inside the generated, bound reads", async ({ browser }, testInfo) => {
+  test.setTimeout(12 * 60_000);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-r9-"));
+  const fixturePath = path.join(tempDir, "fixture.json");
+  execFileSync(process.env.PYTHON || "python3", ["scripts/build_ui_crawl_fixture.py", "--output", fixturePath], { cwd: root, stdio: "inherit" });
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+  const origins = { ui: "https://ui.synthetic.invalid", assets: "https://synthetic.invalid" };
+  const guard = new RequestGuard({ origins });
+  const stats = { blocked: [], writes: [], routeErrors: [] };
+  const context = await browser.newContext({ viewport: null, serviceWorkers: "block" });
+  const routesHandle = await installRoutes(context, { guard, origins, stats, fixture: fixtureHandler(fixture) });
+  const crawler = new Crawler({
+    context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir: testInfo.outputPath("ui-crawl-r9"),
+    widths: [inventory.widths.ci[0]], fixtureMode: true, settleMs: 300, log: (line) => process.stdout.write(`${line}\n`),
+  });
+  const system = fixture.api["ui:/api/inventory"].selected_system_id;
+  const view = "nvme-carrier-x4";
+  expect(fixture.api[`ui:/api/storage-views/${view}/history`], "the fixture serves the view's heat-map history").toBeTruthy();
+  // Bound like a live view target: its system and its storage view.
+  crawler.bindFor = () => ({ system_id: system, enclosure_id: null, storage_view_id: view });
+  const target = { page: "main", ready: "main", scopeIndex: 0, label: "fixture/main-view-first", url: `${origins.ui}/?system_id=${system}&storage_view_id=${view}` };
+  expect(crawler.scopeFor(target)).toBe("storage-view");
+  const states = expandStates(inventory).filter((state) => state.page === "main" && !state.variant && !state.heavy && state.safety === "read" && !state.appliance_load);
+  for (const id of ["main.heatmap.metric", "main.heatmap.timeline", "main.history", "main.select[healthy]"]) expect(states.map((state) => state.id)).toContain(id);
+  try {
+    await crawler.crawlTarget(target, states);
+  } finally {
+    await routesHandle.drain();
+    await context.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  const broken = crawler.records.filter((record) => !["done", "not-applicable"].includes(record.status));
+  expect(broken.map((record) => `${record.target} ${record.state}: ${record.status} ${JSON.stringify(record.findings)}`)).toEqual([]);
+  expect(stats.blocked, "a legitimate read on the storage-view target the guard refused").toEqual([]);
+  expect(stats.routeErrors).toEqual([]);
+  const viewHistory = "read GET /api/storage-views/{view_id}/history";
+  const sentBy = [...guard.observed].filter(([, seen]) => seen.has(viewHistory)).map(([stateId]) => stateId);
+  for (const base of ["main.heatmap.metric", "main.heatmap.timeline"]) {
+    expect(sentBy.some((id) => id.startsWith(base)), `${base} did not read the view's heat-map history`).toBe(true);
+  }
+  // Each admitted view read named the target's view and system.
+  const viewReads = guard.log.filter((entry) => entry.allowed && /^\/api\/storage-views\/[^/]+\//.test(entry.path));
+  for (const entry of viewReads) {
+    expect(entry.path.startsWith(`/api/storage-views/${view}/`), entry.path).toBe(true);
+    expect(entry.path).toMatch(new RegExp(`[?&]system_id=${system}(&|$)`));
+  }
+  const byId = new Map(states.map((state) => [state.id, state]));
+  const misclassified = [];
+  for (const [stateId, seen] of guard.observed) {
+    const state = byId.get(stateId) || byId.get(stateId.replace(/\{[^}]*\}$/, ""));
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state, "storage-view")));
+  }
+  expect(misclassified).toEqual([]);
 });

@@ -7,7 +7,7 @@
     "ci": [1600, 3840]
   },
   "safety_classes": {
-    "read": "Looks only. The crawler's network guard admits only exact routes the reviewed manifest (qa/ui-routes.json) classes as read or read-post; any other route, any unknown route and any forced appliance refresh is aborted and fails the run.",
+    "read": "Looks only. The crawler's network guard admits only exact routes the reviewed manifest (qa/ui-routes.json) classes as read or read-post that the page's own scripts can send on the target's scope kind (generated: qa/ui-read-reach.json), bound to the target's system, enclosure and storage view; any other route, any unknown route and any forced appliance refresh is aborted and fails the run.",
     "app-write-revert": "Changes app-local state only (names, notes, display preferences, saved views/page order). The crawler records the original value and reads the store through the app's read API (`semantic_reads`), performs the write, performs the exact `revert` steps immediately, then reloads and re-reads to verify the original is back and the store reads back equal. Only the requests in `writes` are admitted, only while the state runs, and only for the write system, the target enclosure and the captured bay.",
     "led": "Turns a bay's identify (locate) light on and then off, and verifies it reads back off. Only POST .../led with IDENTIFY then CLEAR for the selected bay is admitted.",
     "forbidden": "Would change an appliance or array beyond the identify LED, an account or sudo, start a SMART test, back up or restore, purge or adopt history, or save configuration that reaches appliances. Listed for completeness and never actuated. With `confirm_preview` the crawler may press the control only to render a harmless native confirmation, which it always dismisses; the guard aborts the request in any case."
@@ -15,20 +15,19 @@
   "pages": {
     "main": {
       "service": "ui", "path": "/", "ready": "main", "scopes": true, "description": "Enclosure page: chassis face, bay details, heat map, history drawer, connections panel, mapping, export.",
-      "reads": [{"method": "GET", "path": "/", "query": ["system_id", "enclosure_id", "storage_view_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/api/inventory", "query": ["system_id", "enclosure_id", "force"]}, {"method": "GET", "path": "/api/storage-views", "query": ["system_id", "enclosure_id", "force"]}, {"method": "POST", "path": "/api/slots/smart-batch", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/history/status", "query": []}, {"method": "GET", "path": "/api/release-status", "query": []}],
+      "reads": [{"method": "GET", "path": "/", "query": ["system_id", "enclosure_id", "storage_view_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}],
       "load_requests": [
         {"method": "GET", "path": "/api/inventory", "force": true, "max": 1, "platforms": ["quantastor"], "why": "QuantaStor pages with LED-capable bays queue one forced inventory read at startup to re-check locate lights (app.js queueIdentifyVerify(\"startup\")). It is the page load's own request, so every state on a QuantaStor target inherits it: admitted only in the window of that page load, once per load, bound to the target's system and enclosure (Sol #1108)."},
         {"method": "GET", "path": "/api/storage-views", "force": true, "max": 1, "platforms": ["quantastor"], "why": "The same startup refresh then reloads the storage-view runtime with force (refreshSnapshot -> fetchStorageViewRuntime(force)) once the inventory answers; same window, once per load, bound to the target."}
       ],
       "selection": {
-        "why": "Selecting a bay renders its detail, which asks for that bay's SMART summary directly (renderLiveSlotDetail -> ensureSmartSummary, sendScopedRequest), even while the batch prefetch is still scheduled (a long APP_SMART_PREFETCH_DELAY_MS). Every state whose steps select a bay (a selectBay step, or pressing one of `controls`, whose handlers call selectSlot()) admits these reads, bound to the target's system and enclosure (Codex #1108). Derived in qa/ui-crawl/inventory.js selectsBay(); a state never declares them itself.",
-        "controls": ["[data-topology-slot]", "[data-sas-fabric-trace]", "[data-sas-fabric-slot]", "#search-box"],
-        "reads": [{"method": "GET", "path": "/api/slots/{slot}/smart", "query": ["system_id", "enclosure_id"], "bind": ["system_id", "enclosure_id"]}]
+        "why": "Controls whose press selects a bay (a selectBay step, or pressing one of `controls`, whose handlers call selectSlot()); derived per state in qa/ui-crawl/inventory.js selectsBay(). The bay detail then asks for that bay's SMART summary directly (renderLiveSlotDetail -> ensureSmartSummary), even before the batch prefetch. That read is no longer declared here: it is generated from app.js for the main page (qa/ui-read-reach.json, D-TNJ-20261109-CRAWLER-SWEEP) and bound to the target's system and enclosure. The browser test crawls every selecting state on a page whose prefetch has not started.",
+        "controls": ["[data-topology-slot]", "[data-sas-fabric-trace]", "[data-sas-fabric-slot]", "#search-box"]
       }
     },
-    "fabric": {"service": "ui", "path": "/sas-fabric", "ready": "fabric", "scopes": "enclosures", "description": "Storage Fabric page: Storage Lanes, Impact Map, Physical Trace and Disk Path tabs with the inspector.", "reads": [{"method": "GET", "path": "/sas-fabric", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/api/slots/{slot}/smart", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/inventory", "query": ["system_id", "enclosure_id", "force"]}, {"method": "GET", "path": "/api/sas-fabric", "query": ["system_id", "enclosure_id", "force"]}]},
-    "history": {"service": "history", "path": "/", "ready": "history", "description": "History sidecar dashboard.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/healthz", "query": []}, {"method": "GET", "path": "/api/history/overview", "query": []}]},
-    "admin": {"service": "admin", "path": "/", "ready": "admin", "description": "Admin sidecar: Setup + Maintenance, Backups, Enclosure / Profile Builder.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/api/admin/state", "query": []}, {"method": "GET", "path": "/api/admin/history/orphaned", "query": []}]},
+    "fabric": {"service": "ui", "path": "/sas-fabric", "ready": "fabric", "scopes": "enclosures", "description": "Storage Fabric page: Storage Lanes, Impact Map, Physical Trace and Disk Path tabs with the inspector.", "reads": [{"method": "GET", "path": "/sas-fabric", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]},
+    "history": {"service": "history", "path": "/", "ready": "history", "description": "History sidecar dashboard.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/healthz", "query": []}]},
+    "admin": {"service": "admin", "path": "/", "ready": "admin", "description": "Admin sidecar: Setup + Maintenance, Backups, Enclosure / Profile Builder.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]},
     "offline": {"service": "offline", "path": "/", "ready": "main", "description": "Offline snapshot export (the downloaded single-file copy and the public demo).", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/copy-{n}", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]}
   },
   "selections": {
@@ -62,7 +61,7 @@
     },
     {
       "id": "main.select.smart-open", "page": "main", "safety": "read", "ci": true,
-      "steps": [{"selectBay": "healthy"}, {"waitFor": ".detail-smart-details"}, {"open": ".detail-smart-details"}],
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": ".detail-smart-details", "timeoutMs": 20000}, {"open": ".detail-smart-details"}],
       "covers": [".detail-smart-details"]
     },
     {
@@ -77,14 +76,12 @@
     },
     {
       "id": "main.heatmap", "page": "main", "safety": "read", "scope": "all", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-toggle-button", "#heatmap-metric-select", "#heatmap-scale-slider"]
     },
     {
       "id": "main.heatmap.temperature", "page": "main", "safety": "read", "scope": "all", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-metric-select", "#heatmap-colour-select"]
@@ -92,71 +89,61 @@
     {
       "id": "main.heatmap.relative", "page": "main", "safety": "read", "ci": true,
       "description": "Relative colours stretch from the coolest to the warmest bay by design, so heat-map findings are reported as warnings here.",
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-colour-select"}, {"select": "#heatmap-colour-select", "value": "relative"}, {"wait": 800}],
       "covers": ["#heatmap-colour-select"]
     },
     {
       "id": "main.heatmap.metric", "page": "main", "safety": "read",
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 16}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-metric-select"]
     },
     {
       "id": "main.heatmap.timeline", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/api/history/scope", "query": ["system_id", "enclosure_id", "slots", "metrics", "metric_limit", "event_limit", "window_hours"]}],
-      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"requireVisible": "#heatmap-playback-select"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
+      "description": "Timeline playback exists only for metrics with history samples (app.js heatmapMetricSupportsTimeline), so the state picks temperature first; on a storage-view scope it reads the view's history (Codex #1108).",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-playback-select"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-playback-select", "#heatmap-timeframe-select", "#heatmap-scrub-slider"]
     },
     {
       "id": "main.heatmap.scale-max", "page": "main", "safety": "read",
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"setRange": "#heatmap-scale-slider", "value": "2"}, {"wait": 600}],
       "checks": ["heatmap"],
       "covers": ["#heatmap-scale-slider"]
     },
     {
       "id": "main.heatmap.select", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/storage-views/{view_id}/slots/{slot_index}/smart", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"selectBay": "healthy"}, {"wait": 800}],
       "checks": ["heatmap"],
       "covers": ["[data-slot]"]
     },
     {
       "id": "main.history", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/slots/{slot}/history", "query": ["system_id", "enclosure_id", "window_hours"]}],
       "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"wait": 2500}],
       "covers": ["#history-toggle-button", "#history-timeframe-select", "#history-close-button", "#history-retry-button", "[data-history-io-mode=total]", "[data-history-io-mode=average]"]
     },
     {
       "id": "main.history.rate", "page": "main", "safety": "read",
-      "reads": [{"method": "GET", "path": "/api/slots/{slot}/history", "query": ["system_id", "enclosure_id", "window_hours"]}],
       "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"clickIfPresent": "[data-history-io-mode=average]"}, {"wait": 1500}],
       "covers": ["[data-history-io-mode=average]"]
     },
     {
       "id": "main.history.window", "page": "main", "safety": "read",
-      "reads": [{"method": "GET", "path": "/api/slots/{slot}/history", "query": ["system_id", "enclosure_id", "window_hours"]}],
       "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"select": "#history-timeframe-select", "value": "168"}, {"wait": 2500}],
       "covers": ["#history-timeframe-select"]
     },
     {
       "id": "main.connections", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/sas-fabric", "query": ["system_id", "enclosure_id", "force"]}],
       "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"wait": 2500}],
       "covers": ["#sas-fabric-toggle-button", "#sas-fabric-show-all-button", "#sas-fabric-view-link", "[data-sas-fabric-node]", "[data-sas-fabric-trace]", "[data-sas-fabric-slot]", "[data-sas-fabric-expand-slots]"]
     },
     {
       "id": "main.connections.select", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/sas-fabric", "query": ["system_id", "enclosure_id", "force"]}],
       "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"wait": 2000}, {"clickIfPresent": "[data-sas-fabric-trace]"}, {"wait": 800}, {"clickIfPresent": "[data-sas-fabric-expand-slots]"}, {"wait": 600}],
       "covers": ["[data-sas-fabric-trace]", "[data-sas-fabric-expand-slots]", "#sas-fabric-show-all-button"]
     },
     {
       "id": "main.connections.refresh", "page": "main", "safety": "read", "appliance_load": true,
-      "reads": [{"method": "GET", "path": "/api/sas-fabric", "query": ["system_id", "enclosure_id", "force"]}],
       "read_requests": [{"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
       "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"click": "#sas-fabric-refresh-button"}, {"wait": 2500}],
       "covers": ["#sas-fabric-refresh-button"]
@@ -175,7 +162,6 @@
     },
     {
       "id": "main.rename.save", "page": "main", "safety": "app-write-revert",
-      "reads": [{"method": "GET", "path": "/api/sas-fabric", "query": ["system_id", "enclosure_id", "force"]}],
       "requires": "#enclosure-alias-edit-button:not(.hidden)",
       "capture": [
         {"read": "#enclosure-select", "as": "object_id", "prefix": "enclosure:", "before": "::"},
@@ -212,12 +198,12 @@
     },
     {
       "id": "main.mapping.form", "page": "main", "safety": "read", "ci": true,
-      "steps": [{"selectBay": "healthy"}, {"waitFor": "#mapping-form:not(.hidden)"}],
+      "description": "A storage-view slot has no bay assignment form, so on a storage-view scope (a system whose first scope is a view) this state is not applicable.",
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#mapping-form:not(.hidden)", "timeoutMs": 20000}],
       "covers": ["#prefill-mapping-button", "[name=serial]", "[name=device_name]", "[name=gptid]", "[name=notes]", "[name=clear_identify_after_save]", "button\"Save assignment\"@#mapping-form", "#clear-mapping-button", "#export-mappings-button", "#import-mappings-button"]
     },
     {
       "id": "main.mapping.notes", "page": "main", "safety": "app-write-revert",
-      "reads": [{"method": "GET", "path": "/api/mappings/export", "query": ["system_id", "enclosure_id"]}],
       "requires": ".slot-tile.state-healthy[data-slot]",
       "precondition": {"selectBay": "healthy", "noManualMapping": true},
       "capture": [{"selectBay": "healthy"}, {"waitFor": "#mapping-form:not(.hidden)"}, {"read": "#detail-kv-grid", "as": "detailText"}],
@@ -268,19 +254,16 @@
     },
     {
       "id": "main.export.dialog", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "POST", "path": "/api/export/enclosure-snapshot/estimate", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"wait": 1500}],
       "covers": ["#export-snapshot-button", "#export-snapshot-dialog", "#export-redact-toggle", "#export-packaging-select", "#export-allow-oversize-toggle", "#export-include-enclosures-toggle", "#export-include-views-toggle", "#export-snapshot-cancel", "#export-snapshot-confirm"]
     },
     {
       "id": "main.export.scope", "page": "main", "safety": "read", "ci": true,
-      "reads": [{"method": "POST", "path": "/api/export/enclosure-snapshot/estimate", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"check": "#export-include-enclosures-toggle"}, {"check": "#export-include-views-toggle"}, {"wait": 1500}],
       "covers": ["#export-include-enclosures-toggle", "#export-include-views-toggle", "[data-export-enclosure-id]", "[data-export-storage-view-id]", "input\"checkbox\"@app/static/app.js"]
     },
     {
       "id": "main.export.download", "page": "main", "safety": "read", "heavy": true,
-      "reads": [{"method": "POST", "path": "/api/export/enclosure-snapshot/estimate", "query": ["system_id", "enclosure_id"]}],
       "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"select": "#export-packaging-select", "value": "html"}, {"download": "#export-snapshot-confirm", "as": "offline"}],
       "read_requests": [{"method": "POST", "path": "/api/export/enclosure-snapshot"}],
       "covers": ["#export-snapshot-confirm", "#export-packaging-select"]
@@ -495,13 +478,11 @@
     },
     {
       "id": "admin.backups", "page": "admin", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/admin/backups", "query": []}],
       "steps": [{"click": "[data-admin-view-button=backups]"}, {"wait": 800}],
       "covers": ["[data-admin-view-button=backups]", "#backup-library-refresh-button", "#backup-library-edit-button", "[data-backup-action]"]
     },
     {
       "id": "admin.backups.dialog", "page": "admin", "safety": "read", "ci": true,
-      "reads": [{"method": "GET", "path": "/api/admin/backups", "query": []}, {"method": "GET", "path": "/api/admin/backups/policy", "query": []}],
       "steps": [{"click": "[data-admin-view-button=backups]"}, {"wait": 600}, {"click": "#backup-library-edit-button"}, {"waitFor": "#backup-library-dialog[open]"}],
       "covers": ["#backup-library-edit-button", "#backup-library-dialog"]
     },
@@ -576,8 +557,6 @@
     {"key": "#setup-tls-ca-file", "reason": "Hidden file input; its visible pick button #setup-tls-ca-pick-button is rendered and audited."},
     {"key": "#read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in, an account action the crawl never performs; the sign-in form renders in the write-sign-in variant."},
     {"key": "#fabric-read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in (never performed); the fabric sign-in form renders in the write-sign-in variant."},
-    {"key": "#heatmap-scrub-slider", "reason": "Heat-map timeline needs heat history the synthetic history API does not serve, so main.heatmap.timeline is not applicable on the fixture; live crawls run it."},
-    {"key": "#heatmap-timeframe-select", "reason": "Same as #heatmap-scrub-slider: timeline playback needs heat history the fixture does not serve."},
     {"key": "#history-retry-button", "reason": "Shown only after a bay history request fails; no fixture variant fails history yet."},
     {"key": "#platform-details-toggle-button", "reason": "Platform details exist only for platforms with platform data (UniFi, ESXi, QuantaStor); the public demo fixture is a TrueNAS enclosure. Live crawls cover it."},
     {"key": "[data-platform-details-section-toggle]", "reason": "Same as #platform-details-toggle-button."},

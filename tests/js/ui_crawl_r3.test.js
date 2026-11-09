@@ -114,7 +114,10 @@ test("#1120b inventory read lists name exact read routes; every state's effectiv
   const byId = new Map(states.map((state) => [state.id, state]));
   const reads = (id) => inventory.readsFor(inv, byId.get(id)).map((rule) => `${rule.method} ${rule.path}`);
   assert.ok(reads("main.default").includes("GET /api/inventory"));
-  assert.ok(!reads("main.default").includes("GET /api/mappings/export"), "export is a control read, not a page read");
+  // D-TNJ-20261109-CRAWLER-SWEEP: plain reads are the page's generated reach
+  // (bound to the target), so the export read is reachable on the main page.
+  assert.ok(reads("main.default").includes("GET /api/mappings/export"), "app.js can send the mappings export on the main page");
+  assert.ok(!reads("fabric.lanes").includes("GET /api/mappings/export"), "the fabric page's scripts cannot");
   assert.ok(!reads("main.default").includes("POST /api/history/scopes/bundle") || reads("main.history").includes("POST /api/history/scopes/bundle"));
   assert.ok(reads("main.mapping.notes").includes("GET /api/mappings/export"), "the notes probe's semantic read is its own");
   for (const state of states) {

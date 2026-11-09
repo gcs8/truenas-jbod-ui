@@ -40,6 +40,7 @@ const { chromium } = require("@playwright/test");
 const { EXIT } = require("../qa/ui-crawl/gate");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
+const { reachProblems } = require("../qa/ui-crawl/reach");
 const { Crawler } = require("../qa/ui-crawl/crawler");
 const { writeReport, mergeReports } = require("../qa/ui-crawl/report");
 
@@ -168,6 +169,11 @@ function fixtureTargets() {
     // #1127: a saved storage view selected through the target URL, as
     // liveTargets() emits it (a later scope, so the `scope: "all"` states run).
     { page: "main", ready: "main", scopeIndex: 1, system: "fixture", label: "fixture/main-view-boot-doms", url: `${FIXTURE_ORIGINS.ui}/?system_id=demo-system&storage_view_id=boot-doms` },
+    // Codex PRRT_kwDOSAqK-M61IUDz: a system whose FIRST scope is a storage
+    // view with history (no enclosure options), so every main read state,
+    // the heat-map rate metrics and timeline included, runs on the view.
+    // Read states only: the write and identify states target fixture/main.
+    { page: "main", ready: "main", scopeIndex: 0, system: "fixture", readOnly: true, label: "fixture/main-view-first-nvme", url: `${FIXTURE_ORIGINS.ui}/?system_id=demo-system&storage_view_id=nvme-carrier-x4` },
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", label: "fixture/fabric", url: `${FIXTURE_ORIGINS.ui}/sas-fabric` },
     { page: "history", ready: "history", scopeIndex: 0, label: "fixture/history", url: `${FIXTURE_ORIGINS.history}/` },
     { page: "admin", ready: "admin", scopeIndex: 0, label: "fixture/admin", url: `${FIXTURE_ORIGINS.admin}/` },
@@ -188,7 +194,7 @@ function statesFor(target, states, args, used) {
       used.heavy = true;
     }
     if (["app-write-revert", "led"].includes(state.safety)) {
-      if (!args.allow.includes(state.safety)) return false;
+      if (!args.allow.includes(state.safety) || target.readOnly) return false;
       if (!args.fixture && target.system !== args.writeSystem) return false;
       if (target.scopeIndex > 0) return false;
     }
@@ -300,6 +306,8 @@ function preflightProblems(inventory) {
   const manifest = routes.loadManifest();
   problems.push(...routes.checkManifest(routes.scanRoutes(REPO_ROOT, manifest), manifest));
   problems.push(...routes.checkScriptApiPaths(REPO_ROOT, controls.UI_SOURCES.scripts, manifest));
+  // D-TNJ-20261109-CRAWLER-SWEEP: the generated read reach must match the page scripts.
+  problems.push(...reachProblems(REPO_ROOT, { manifest }));
   return problems;
 }
 

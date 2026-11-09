@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "about": "Reviewed backend route manifest for the UI coverage crawler (#1120). qa/ui-coverage.spec.js and tests/js/ui_crawl.test.js fail when a route is added, removed or its handler changes (fingerprint) without this file being updated, and when a browser script calls an /api/ path no route matches. The crawler's request guard admits only exact method + path templates listed here: `read`/`read-post` for every state, other classes only when the running state declares them (bound to its system, enclosure and bay). See qa/ui-crawl/routes.js for the classes.",
+  "about": "Reviewed backend route manifest for the UI coverage crawler (#1120). qa/ui-coverage.spec.js and tests/js/ui_crawl.test.js fail when a route is added, removed or its handler changes (fingerprint) without this file being updated, and when a browser script calls an /api/ path no route matches. The crawler's request guard admits only exact method + path templates listed here: `read`/`read-post` only when the page's scripts can send them on the target's scope kind (generated: qa/ui-read-reach.json) and bound to the target, other classes only when the running state declares them (bound to its system, enclosure and bay). See qa/ui-crawl/routes.js for the classes.",
   "sources": {
     "app/routes.py": "ui",
     "app/metrics.py": "ui",

@@ -14,6 +14,7 @@ const { runState } = require("./actuation");
 const { CrawlDriver, NotApplicable, navigate } = require("./driver");
 const { pageChecks, axeFindings } = require("./checks");
 const { readsFor, loadRequestsFor } = require("./inventory");
+const { scopeKindFor } = require("./reach");
 const png = require("./png");
 
 const READY = {
@@ -234,7 +235,7 @@ class Crawler {
     const index = (state.steps || []).findIndex((step) => step.forEachOption);
     if (index < 0) return [state];
     const step = state.steps[index];
-    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state), bind: this.bindFor(target) });
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     await this.load(target);
     const driver = this.newDriver(target);
     await driver.runSteps(state.steps.slice(0, index));
@@ -265,15 +266,29 @@ class Crawler {
   // #1120: bound requests are admitted only for the target's system (the
   // runner only gives write states the --write-system target) and the
   // target's own enclosure (from its URL). Fixture runs have no live scope.
+  // D-TNJ-20261109-CRAWLER-SWEEP: a storage-view target (storage_view_id in
+  // its URL) also binds its view, so a generated storage-view read is
+  // admitted for that view only.
   bindFor(target) {
     if (this.fixtureMode) return {};
     let enclosure = null;
+    let view = null;
     try {
-      enclosure = new URL(target.url).searchParams.get("enclosure_id");
+      const params = new URL(target.url).searchParams;
+      enclosure = params.get("enclosure_id");
+      view = params.get("storage_view_id");
     } catch {
       enclosure = null;
     }
-    return { system_id: target.system || this.writeSystem || null, enclosure_id: enclosure };
+    const bind = { system_id: target.system || this.writeSystem || null, enclosure_id: enclosure };
+    if (view) bind.storage_view_id = view;
+    return bind;
+  }
+
+  // The scope kind whose generated reads a target's states get (an enclosure
+  // or a storage view on the main page; one kind on the other pages).
+  scopeFor(target) {
+    return target.scope || scopeKindFor(target.page, target.url);
   }
 
   // Sol #1108: a page load may send requests of its own before any state
@@ -356,7 +371,7 @@ class Crawler {
     this.bucket = record.findings;
     this.log(`${target.label} ${state.id}: start`);
     let driver = null;
-    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state), bind: this.bindFor(target) });
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state, this.scopeFor(target)), bind: this.bindFor(target) });
     try {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });

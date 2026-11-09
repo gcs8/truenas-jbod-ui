@@ -402,6 +402,18 @@ tooling exists to catch those automatically.
   until its class is re-reviewed and its fingerprint updated (the failure
   prints the new value), and so does a browser script that calls an `/api/`
   path no route matches.
+- `qa/ui-read-reach.json` is generated (`node scripts/generate_ui_read_reach.js`;
+  do not edit it). It lists, per page and scope kind (an enclosure or a
+  storage view on the main page), every `read`/`read-post` request the page's
+  own scripts can send: method, route template, query keys, call sites and
+  the target keys each one is bound to. It is extracted statically from the
+  scripts each template loads (fetch wrappers, template-literal paths, query
+  helpers such as `buildSelectionParams`, path builders such as
+  `artifactUrl`). A route with a storage view in its path is reachable only
+  on a storage-view scope. Every other class the scripts reach is listed
+  under `declared_per_state` for review only. CI regenerates it and fails
+  when the output differs, and a call site the extractor cannot resolve fails
+  the generator.
 - `qa/ui-coverage.spec.js` (fixture-only CI) scans the templates and browser
   scripts for interactive controls (buttons, links styled as buttons, selects,
   inputs, `details`, dialogs, elements with an interactive `role`, `tabindex`
@@ -450,14 +462,19 @@ node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8
 ```
 
 A live crawl is read-only by default. The request guard admits only exact
-method + path templates from `qa/ui-routes.json`, and reads only from the
-running state's read allowlist: its page's `reads` plus the state's own, each
-an exact manifest template with the query keys it sends. A page's `selection`
-reads (the bay detail's own SMART read on the enclosure page) are added only
-to states whose steps select a bay (a `selectBay` step or pressing one of its
-`selection.controls`), bound to the target's system and enclosure. An unknown route, a
-read outside the list, a forced appliance refresh or any write is aborted and
-fails the run. Query booleans are read the way FastAPI reads them (`t`, `y`,
+method + path templates from `qa/ui-routes.json`, and plain reads only from
+the running state's read allowlist: its page's own documents and static
+assets (`reads` in `qa/ui-states.json`, never an `/api/` route) plus the
+generated reach of the page and the target's scope kind
+(`qa/ui-read-reach.json`). A generated read is admitted only bound to the
+target: `system_id` and `enclosure_id` must be carried with the target's
+values when the target has them, a `storage_view_id` it carries must be the
+target's, and a storage-view route's `{view_id}` must be the target's view.
+Appliance loads, writes, identify lights, read-heavy exports and forbidden
+routes are never generated: they stay explicit per-state declarations with
+budgets. An unknown route, a read outside the list, a read for another
+system, enclosure or storage view, a forced appliance refresh or any write is
+aborted and fails the run. Query booleans are read the way FastAPI reads them (`t`, `y`,
 `on` and so on are true; any value that is not a clean false counts as
 forced), and a backend handler with a `force`/`refresh`/`fresh` flag must
 declare it in `query_classes`. Forced refreshes pass only when a state that
@@ -510,9 +527,10 @@ Adding a control: give it an `id` or a `data-*` hook, then add the key to the
 safety class. A control that only exists in one configuration (for example
 the write sign-in panel) needs a state that reaches that configuration: an
 unsaved form selection, or a `fixture_only` + `ci` state with a `variant`
-fixture page (see `scripts/build_ui_crawl_fixture.py`). A control that reads a
-route the page does not already read adds that route (and its query keys) to
-the state's `reads`. Adding a route: add it to `qa/ui-routes.json` with its
+fixture page (see `scripts/build_ui_crawl_fixture.py`). A script change that
+sends a new plain read needs no hand declaration: regenerate
+`qa/ui-read-reach.json` and review the diff (the read becomes admitted on
+that page and scope kind, bound to the target). Adding a route: add it to `qa/ui-routes.json` with its
 class and reason; a route whose body names an object (an alias) lists it in
 `object_keys`, and its write rules bind it to a captured placeholder. When a crawl finds a real
 defect that will be fixed separately, add it to `known_findings` with the issue

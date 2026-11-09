@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { SAFETY_CLASSES, substitute } = require("./common");
 const { RouteTable, DECLARABLE, BASE_READ_CLASSES, FORCE_PARAMS, loadManifest } = require("./routes");
+const reachModule = require("./reach");
 
 const INVENTORY_PATH = path.join(__dirname, "..", "ui-states.json");
 const STEP_KINDS = new Set([
@@ -120,6 +121,44 @@ function validateReads(errors, where, reads, service, manifest, table) {
       continue;
     }
     if (!BASE_READ_CLASSES.has(entry.class)) errors.push(`${where}: read ${method} ${rule.path} is a ${entry.class} route; reads may only name read or read-post routes`);
+    // D-TNJ-20261109-CRAWLER-SWEEP: /api reads come from the generated reach
+    // (qa/ui-read-reach.json) only; a hand copy is a second source of truth.
+    if (String(rule.path).startsWith("/api/")) errors.push(`${where}: read ${method} ${rule.path} is generated from the page scripts (qa/ui-read-reach.json); remove the hand declaration`);
+  }
+}
+
+// D-TNJ-20261109-CRAWLER-SWEEP: the generated reach must cover every page,
+// name only exact read/read-post manifest routes of the page's service, and
+// bind only the target keys the guard knows.
+function validateReach(errors, inventory, reach, manifest) {
+  if (!reach || !reach.pages) {
+    errors.push("qa/ui-read-reach.json is missing or has no pages; run node scripts/generate_ui_read_reach.js");
+    return;
+  }
+  for (const [pageId, page] of Object.entries(inventory.pages || {})) {
+    const generated = reach.pages[pageId];
+    if (!generated) {
+      errors.push(`qa/ui-read-reach.json has no page ${pageId}; add it to qa/ui-crawl/reach.js PAGES and regenerate`);
+      continue;
+    }
+    if ((generated.service || "ui") !== (page.service || "ui")) errors.push(`qa/ui-read-reach.json ${pageId}: service ${generated.service} is not the page's ${page.service || "ui"}`);
+    for (const [scope, rules] of Object.entries(generated.scopes || {})) {
+      for (const rule of rules || []) {
+        const where = `qa/ui-read-reach.json ${pageId}/${scope}: ${rule.method} ${rule.path}`;
+        const entry = manifest ? exactEntry(manifest, page.service || "ui", String(rule.method || "").toUpperCase(), rule.path) : null;
+        if (manifest && !entry) {
+          errors.push(`${where} is not an exact ${page.service || "ui"} manifest route`);
+          continue;
+        }
+        if (entry && !BASE_READ_CLASSES.has(entry.class)) errors.push(`${where} is a ${entry.class} route; the generated reach may only hold read or read-post routes`);
+        if (entry && rule.class !== entry.class) errors.push(`${where}: class ${rule.class} is not the manifest's ${entry.class}`);
+        if (!Array.isArray(rule.query)) errors.push(`${where}: needs its query keys`);
+        if (rule.force) errors.push(`${where}: a generated read cannot force a refresh`);
+        for (const key of [...(rule.bind || []), ...(rule.bind_if_sent || [])]) {
+          if (!["system_id", "enclosure_id", "storage_view_id"].includes(key) || !(rule.query || []).includes(key)) errors.push(`${where}: cannot bind ${key}`);
+        }
+      }
+    }
   }
 }
 
@@ -140,13 +179,10 @@ function validateLoadRequests(errors, pageId, page, table) {
   }
 }
 
-// Codex #1108: reads a page sends when a bay is selected (the bay detail's
-// own SMART summary). Admitted only in states whose steps select a bay, each
-// bound to the target's scope: `bind` names the query keys that must equal
-// the target's system/enclosure.
-const SELECTION_BIND_KEYS = new Set(["system_id", "enclosure_id"]);
-
-function validateSelection(errors, pageId, page, manifest, table) {
+// D-TNJ-20261109-CRAWLER-SWEEP: the selection's reads are generated now
+// (page reach, bound to the target); `selection` only names the controls
+// whose press selects a bay, for tests that crawl every selecting state.
+function validateSelection(errors, pageId, page) {
   const selection = page.selection;
   if (selection === undefined) return;
   const where = `pages.${pageId}.selection`;
@@ -154,25 +190,7 @@ function validateSelection(errors, pageId, page, manifest, table) {
   if (!Array.isArray(selection.controls) || !selection.controls.length || selection.controls.some((c) => typeof c !== "string" || !c)) {
     errors.push(`${where} needs controls (the selectors whose press selects a bay)`);
   }
-  if (!Array.isArray(selection.reads) || !selection.reads.length) {
-    errors.push(`${where} needs reads`);
-    return;
-  }
-  validateReads(errors, where, selection.reads, page.service || "ui", manifest, table);
-  for (const rule of selection.reads) {
-    const name = `${where}: selection read ${rule.method} ${rule.path}`;
-    if (!Array.isArray(rule.bind) || !rule.bind.length) {
-      errors.push(`${name} must bind its scope keys (bind: ["system_id", "enclosure_id"])`);
-      continue;
-    }
-    for (const key of rule.bind) {
-      if (!SELECTION_BIND_KEYS.has(key)) errors.push(`${name} cannot bind ${key}; bind keys are ${[...SELECTION_BIND_KEYS].join(", ")}`);
-      else if (!(rule.query || []).includes(key)) errors.push(`${name}: bind key ${key} must be one of its query keys`);
-    }
-    // A plain read of the same route on that page would admit it unbound.
-    const same = (read) => String(read.method || "GET").toUpperCase() === String(rule.method || "GET").toUpperCase() && read.path === rule.path;
-    if ((page.reads || []).some(same)) errors.push(`${name} is also an unbound copy in pages.${pageId}.reads`);
-  }
+  if (selection.reads !== undefined) errors.push(`${where}.reads: selection reads are generated from the page scripts (qa/ui-read-reach.json); remove them`);
 }
 
 // Does the state select a bay on its page (Codex #1108)? Derived from every
@@ -200,16 +218,18 @@ function validateFollowUp(errors, id, state) {
   }
 }
 
-function validateInventory(inventory, { manifest = undefined } = {}) {
+function validateInventory(inventory, { manifest = undefined, reach = undefined } = {}) {
   const errors = [];
   const ids = new Set();
   const pages = inventory.pages || {};
   const resolvedManifest = manifest === undefined ? loadManifest() : manifest;
+  const resolvedReach = reach === undefined ? reachModule.loadReach() : reach;
   const table = resolvedManifest ? new RouteTable(resolvedManifest) : null;
+  if (resolvedReach !== null) validateReach(errors, inventory, resolvedReach, resolvedManifest);
   for (const [pageId, page] of Object.entries(pages)) {
     validateReads(errors, `pages.${pageId}`, page.reads, page.service || "ui", resolvedManifest, table);
     validateLoadRequests(errors, pageId, page, table);
-    validateSelection(errors, pageId, page, resolvedManifest, table);
+    validateSelection(errors, pageId, page);
   }
   for (const state of inventory.states || []) {
     const id = state.id || "(missing id)";
@@ -236,9 +256,16 @@ function validateInventory(inventory, { manifest = undefined } = {}) {
       validateRules(errors, id, "read_requests", state.read_requests, state, pages[state.page], table);
     }
     validateReads(errors, id, state.reads, (pages[state.page] || {}).service || "ui", resolvedManifest, table);
-    for (const rule of ((pages[state.page] || {}).selection || {}).reads || []) {
-      if ((state.reads || []).some((read) => String(read.method || "GET").toUpperCase() === String(rule.method || "GET").toUpperCase() && read.path === rule.path)) {
-        errors.push(`${id}: read ${rule.method} ${rule.path} is a selection read of its page; declaring it here is an unbound copy`);
+    // read-heavy keeps its per-state declaration and budget; it must also be
+    // a request the page's own scripts can send.
+    if (resolvedReach && resolvedReach.pages && table) {
+      const generated = resolvedReach.pages[state.page] || {};
+      for (const rule of state.read_requests || []) {
+        const probe = new URL(`http://rule.invalid${String(rule.path).replace(/\{slot\}/g, "1")}`);
+        const { entry } = table.classify((pages[state.page] || {}).service || "ui", String(rule.method || "GET").toUpperCase(), probe);
+        if (!entry || entry.class !== "read-heavy") continue;
+        const reachable = (generated.declared_per_state || []).some((item) => item.method === entry.method && item.path === entry.path);
+        if (!reachable) errors.push(`${id}: read_requests ${rule.method} ${rule.path} is read-heavy but no script of page ${state.page} sends it (qa/ui-read-reach.json)`);
       }
     }
     validateFollowUp(errors, id, state);
@@ -348,12 +375,18 @@ function checkObserved(state, observed, reads = null) {
   return problems;
 }
 
-// The exact read allowlist of a state: its page's reads, its page's bound
-// selection reads when its steps select a bay (Codex #1108), then its own.
-function readsFor(inventory, state) {
+// The exact read allowlist of a state on one scope kind of its page: its
+// page's own documents and static assets (hand-declared), the GENERATED
+// reach of that page and scope kind (qa/ui-read-reach.json, bound to the
+// target; D-TNJ-20261109-CRAWLER-SWEEP), then any non-/api read the state
+// declares itself. `scope` defaults to the page's first scope kind (an
+// enclosure on the main page); "*" is the union over every scope kind, for
+// checking what a state observed across several targets.
+function readsFor(inventory, state, scope = null, reach = reachModule.loadReach()) {
   const page = (inventory.pages || {})[state.page] || {};
-  const selection = selectsBay(inventory, state) ? ((page.selection || {}).reads || []) : [];
-  return [...(page.reads || []), ...selection, ...(state.reads || [])];
+  const generated = !reach || !(reach.pages || {})[state.page] ? []
+    : scope === "*" ? reachModule.reachRulesAnyScope(reach, state.page) : reachModule.reachRules(reach, state.page, scope);
+  return [...(page.reads || []), ...generated, ...(state.reads || [])];
 }
 
 // The page-load requests of a page on one platform (Sol #1108).

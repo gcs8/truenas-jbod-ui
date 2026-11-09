@@ -268,30 +268,31 @@ test("#1117 with the watchdog heartbeating but not clearing, the supervisor clea
 
 const VIEW_SMART = "/api/storage-views/{view_id}/slots/{slot_index}/smart";
 
-test("#1127 the storage-view SMART read is declared for the heat-map states that send it, with its exact query keys, and nowhere else", () => {
+test("#1127 the storage-view SMART read is admitted for a storage-view target (generated reach), bound to its view, and not for an enclosure target", () => {
   const { loadInventory, readsFor, validateInventory, expandStates } = req("qa/ui-crawl/inventory");
   const inventory = loadInventory();
   assert.deepEqual(validateInventory(inventory), []);
   const states = new Map(expandStates(inventory).map((state) => [state.id, state]));
-  // Learned with a scratch learning guard on the synthetic saved view
-  // (boot-doms): every heat-map state sends it there with exactly these keys
-  // (main.heatmap and main.heatmap.temperature on a later view scope; all of
-  // them when a view is a system's first scope).
+  // D-TNJ-20261109-CRAWLER-SWEEP: generated from app.js
+  // (ensureStorageViewSmartSummary) for the storage-view scope kind; the
+  // heat-map states no longer declare it by hand.
   const senders = ["main.heatmap", "main.heatmap.temperature", "main.heatmap.relative", "main.heatmap.metric", "main.heatmap.timeline", "main.heatmap.scale-max", "main.heatmap.select"];
   for (const id of senders) {
-    const rule = readsFor(inventory, states.get(id)).find((read) => read.path === VIEW_SMART);
-    assert.ok(rule, `${id} declares ${VIEW_SMART}`);
+    const rule = readsFor(inventory, states.get(id), "storage-view").find((read) => read.path === VIEW_SMART);
+    assert.ok(rule, `${id} admits ${VIEW_SMART} on a storage-view target`);
     assert.equal(rule.method, "GET");
-    assert.deepEqual([...rule.query].sort(), ["enclosure_id", "system_id"]);
+    assert.deepEqual([...rule.query].sort(), ["enclosure_id", "storage_view_id", "system_id"]);
+    assert.deepEqual(rule.bind_params, { view_id: "storage_view_id" });
+    assert.equal(readsFor(inventory, states.get(id), "enclosure").some((read) => read.path === VIEW_SMART), false, `${id}: not on an enclosure target`);
   }
-  // Not on the page, and not on a state that does not send it.
+  // Not hand-declared on the page or any state.
   assert.equal((inventory.pages.main.reads || []).some((read) => read.path === VIEW_SMART), false);
-  assert.equal(readsFor(inventory, states.get("main.default")).some((read) => read.path === VIEW_SMART), false);
+  assert.equal(inventory.states.some((state) => (state.reads || []).some((read) => read.path === VIEW_SMART)), false);
 
   const { RequestGuard } = req("qa/ui-crawl/guard");
   const g = new RequestGuard({ origins: { ui: ORIGIN } });
   const url = `${ORIGIN}/api/storage-views/boot-doms/slots/0/smart?system_id=demo-system&enclosure_id=enc-1`;
-  g.beginState("main.heatmap", { reads: readsFor(inventory, states.get("main.heatmap")) });
+  g.beginState("main.heatmap", { reads: readsFor(inventory, states.get("main.heatmap"), "storage-view"), bind: { system_id: "demo-system", storage_view_id: "boot-doms" } });
   const ok = g.admit({ method: "GET", url });
   assert.equal(ok.allowed, true, ok.reason);
   assert.equal(ok.cls, "read");
@@ -300,10 +301,13 @@ test("#1127 the storage-view SMART read is declared for the heat-map states that
   const fresh = g.admit({ method: "GET", url: `${url}&fresh=true` });
   assert.equal(fresh.allowed, false);
   assert.equal(fresh.cls, "appliance-load");
-  assert.equal(g.admit({ method: "GET", url: `${url}&storage_view_id=boot-doms` }).allowed, false, "an undeclared query key");
-  // Another state cannot reuse the heat-map state's list.
+  assert.equal(g.admit({ method: "GET", url: `${url}&storage_view_id=boot-doms` }).allowed, true, "the target's own view key");
+  assert.equal(g.admit({ method: "GET", url: `${url}&storage_view_id=nvme-carrier-x4` }).allowed, false, "another view's key");
+  assert.equal(g.admit({ method: "GET", url: `${ORIGIN}/api/storage-views/nvme-carrier-x4/slots/0/smart?system_id=demo-system` }).allowed, false, "another view in the path");
+  assert.equal(g.admit({ method: "GET", url: `${url}&view=x` }).allowed, false, "an undeclared query key");
+  // An enclosure target's list does not hold it.
   g.endState();
-  g.beginState("main.default", { reads: readsFor(inventory, states.get("main.default")) });
+  g.beginState("main.default", { reads: readsFor(inventory, states.get("main.default"), "enclosure") });
   assert.equal(g.admit({ method: "GET", url }).allowed, false);
 });
 

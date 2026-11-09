@@ -51,54 +51,52 @@ test("Codex P2 1: app.js still sends the per-slot SMART read straight from the b
   assert.match(scoped, /buildSelectionParams\(\)/);
 });
 
-test("Codex P2 1: every main-page state that selects a bay (derived from its steps) admits the bound per-slot SMART read, and no other state does", () => {
+// D-TNJ-20261109-CRAWLER-SWEEP: the per-slot SMART read is no longer a
+// hand-declared selection read; it is generated from app.js for the main
+// page (both scope kinds) and bound to the target's system and enclosure.
+// selectsBay() still names the states the browser test crawls on the
+// slow-prefetch page.
+test("Codex P2 1: the per-slot SMART read is generated for the main page, bound to the target's system and enclosure, and selectsBay still derives the selecting states", () => {
   const { inventory, states } = inventoryStates();
   const { validateInventory, readsFor, selectsBay } = req("qa/ui-crawl/inventory");
   assert.deepEqual(validateInventory(inventory), []);
   assert.equal(typeof selectsBay, "function", "inventory.selectsBay derives bay selection from a state's steps");
   const main = inventory.pages.main;
-  assert.equal((main.reads || []).some((rule) => rule.path === SLOT_SMART), false, "not an unbound page-wide read");
-  const [rule, ...rest] = (main.selection || {}).reads || [];
-  assert.equal(rest.length, 0);
-  assert.deepEqual({ method: rule.method, path: rule.path, query: rule.query, bind: rule.bind }, {
-    method: "GET", path: SLOT_SMART, query: ["system_id", "enclosure_id"], bind: ["system_id", "enclosure_id"],
-  });
+  assert.equal((main.reads || []).some((rule) => rule.path === SLOT_SMART), false, "not hand-declared on the page");
+  assert.equal((main.selection || {}).reads, undefined, "the selection read is generated now");
   const selecting = states.filter((state) => state.page === "main" && selectsBay(inventory, state)).map((state) => state.id);
   for (const id of ["main.select[healthy]", "main.select[empty]", "main.select[fault]", "main.select[unknown]", "main.select.smart-open", "main.select.topology",
     "main.heatmap.select", "main.history", "main.history.rate", "main.history.window", "main.mapping.form", "main.mapping.notes", "main.led", "main.quantastor"]) {
     assert.ok(selecting.includes(id), `${id} selects a bay`);
   }
   for (const state of states.filter((s) => s.page === "main")) {
-    const reads = readsFor(inventory, state).filter((read) => read.path === SLOT_SMART);
-    if (scanSelects(state)) {
-      assert.ok(selecting.includes(state.id), `${state.id}: the steps select a bay, so the inventory must derive it`);
-      assert.equal(reads.length, 1, `${state.id} admits the per-slot SMART read once`);
+    assert.equal(scanSelects(state), selecting.includes(state.id), `${state.id}: the steps and selectsBay agree`);
+    for (const scope of ["enclosure", "storage-view"]) {
+      const reads = readsFor(inventory, state, scope).filter((read) => read.path === SLOT_SMART);
+      assert.equal(reads.length, 1, `${state.id}/${scope} admits the per-slot SMART read once`);
       assert.deepEqual(reads[0].bind, ["system_id", "enclosure_id"], `${state.id}: bound to the target`);
-    } else {
-      assert.deepEqual(reads, [], `${state.id} selects no bay and must not admit ${SLOT_SMART}`);
     }
   }
   for (const id of ["main.default", "main.heatmap", "main.export.dialog", "main.connections", "main.refresh-now"]) {
     assert.equal(selecting.includes(id), false, `${id} selects no bay`);
   }
-  // No state declares it on its own (that would be an unbound copy).
+  // No state declares it on its own (that would be a second source of truth).
   for (const state of inventory.states.filter((s) => s.page === "main")) {
     assert.equal((state.reads || []).some((read) => read.path === SLOT_SMART), false, `${state.id} declares ${SLOT_SMART} itself`);
   }
 });
 
-test("Codex P2 1: the inventory rejects an unbound or malformed selection read", () => {
+test("Codex P2 1: the inventory rejects a hand-declared selection read or a malformed selection", () => {
   const { loadInventory, validateInventory } = req("qa/ui-crawl/inventory");
   const broken = (mutate) => {
     const inventory = loadInventory();
     mutate(inventory);
     return validateInventory(inventory).join("\n");
   };
-  assert.match(broken((inv) => { delete inv.pages.main.selection.reads[0].bind; }), /selection read .* must bind/);
-  assert.match(broken((inv) => { inv.pages.main.selection.reads[0].bind = ["system_id", "slot"]; }), /selection read .* bind/);
-  assert.match(broken((inv) => { inv.pages.main.selection.reads[0].query = ["system_id"]; }), /bind key enclosure_id .* query/);
+  assert.match(broken((inv) => { inv.pages.main.selection.reads = [{ method: "GET", path: SLOT_SMART, query: ["system_id", "enclosure_id"], bind: ["system_id", "enclosure_id"] }]; }), /selection reads are generated/);
   assert.match(broken((inv) => { inv.pages.main.selection.controls = []; }), /selection needs controls/);
-  assert.match(broken((inv) => { inv.states.find((s) => s.id === "main.history").reads.push({ method: "GET", path: SLOT_SMART, query: ["system_id", "enclosure_id"] }); }), /unbound copy/);
+  assert.match(broken((inv) => { delete inv.pages.main.selection.why; }), /selection needs a why/);
+  assert.match(broken((inv) => { inv.states.find((s) => s.id === "main.history").reads = [{ method: "GET", path: SLOT_SMART, query: ["system_id", "enclosure_id"] }]; }), /generated from the page scripts/);
 });
 
 function selectionGuard(stateId, bind) {
@@ -106,15 +104,15 @@ function selectionGuard(stateId, bind) {
   const { readsFor } = req("qa/ui-crawl/inventory");
   const { inventory, byId } = inventoryStates();
   const g = new RequestGuard({ origins: { ui: ORIGIN } });
-  g.beginState(stateId, { reads: readsFor(inventory, byId.get(stateId)), bind });
+  g.beginState(stateId, { reads: readsFor(inventory, byId.get(stateId), "enclosure"), bind });
   return g;
 }
 
 const smart = (query) => `${ORIGIN}/api/slots/7/smart${query === null ? "" : `?${query}`}`;
 
-test("Codex P2 1: the guard admits the per-slot SMART read of the target's system and enclosure in a selecting state, and refuses every other scope", () => {
+test("Codex P2 1: the guard admits the per-slot SMART read of the target's system and enclosure on the main page, and refuses every other scope", () => {
   const bind = { system_id: "sys-a", enclosure_id: "enc-1" };
-  for (const stateId of ["main.select[healthy]", "main.history", "main.mapping.form", "main.heatmap.select", "main.select.smart-open"]) {
+  for (const stateId of ["main.select[healthy]", "main.history", "main.mapping.form", "main.heatmap.select", "main.select.smart-open", "main.default"]) {
     const g = selectionGuard(stateId, bind);
     const ok = g.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=enc-1") });
     assert.equal(ok.allowed, true, `${stateId}: ${ok.reason}`);
@@ -131,15 +129,20 @@ test("Codex P2 1: the guard admits the per-slot SMART read of the target's syste
       const verdict = g.admit({ method: "GET", url: smart(query) });
       assert.equal(verdict.allowed, false, `${stateId}: ${why} must be refused`);
     }
-    // A forced read is an appliance load, never a selection read.
+    // A forced read is an appliance load, never a plain read.
     assert.equal(g.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=enc-1&force=true") }).allowed, false);
   }
-  // A state that selects no bay refuses it even in scope.
-  const plain = selectionGuard("main.default", bind);
-  assert.equal(plain.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=enc-1") }).allowed, false);
-  // The binding covers only the selection read: the page's own reads keep their rules.
+  // A page whose scripts cannot send it refuses it even in scope.
+  const { RequestGuard } = req("qa/ui-crawl/guard");
+  const { readsFor } = req("qa/ui-crawl/inventory");
+  const { inventory, byId } = inventoryStates();
+  const history = new RequestGuard({ origins: { ui: ORIGIN } });
+  history.beginState("history.default", { reads: readsFor(inventory, byId.get("history.default")), bind });
+  assert.equal(history.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=enc-1") }).allowed, false);
+  // The binding covers every generated read of the page.
   const g = selectionGuard("main.select[healthy]", bind);
-  assert.equal(g.admit({ method: "GET", url: `${ORIGIN}/api/inventory?system_id=sys-a` }).allowed, true);
+  assert.equal(g.admit({ method: "GET", url: `${ORIGIN}/api/inventory?system_id=sys-a&enclosure_id=enc-1` }).allowed, true);
+  assert.equal(g.admit({ method: "GET", url: `${ORIGIN}/api/inventory?system_id=sys-b&enclosure_id=enc-1` }).allowed, false);
 });
 
 test("Codex P2 1: with no captured scope (fixture runs, a storage-view target) only the query keys are checked; a bound key that is set still binds", () => {

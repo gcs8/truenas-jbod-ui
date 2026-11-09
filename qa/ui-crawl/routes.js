@@ -31,7 +31,9 @@ const path = require("node:path");
 
 const MANIFEST_PATH = path.join(__dirname, "..", "ui-routes.json");
 const ROUTE_CLASSES = ["read", "read-post", "read-heavy", "appliance-load", "app-write", "led", "forbidden", "internal"];
-// Classes a browser request may use without a per-state declaration.
+// Plain read classes: admitted without a per-state declaration, but only from
+// the generated page reach (qa/ui-read-reach.json, qa/ui-crawl/reach.js) and
+// bound to the target.
 const BASE_READ_CLASSES = new Set(["read", "read-post"]);
 // What each inventory safety class may declare in `writes` / `read_requests`.
 const DECLARABLE = {

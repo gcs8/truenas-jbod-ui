@@ -158,6 +158,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The UI crawler now allows a selected bay's own SMART read, bound to the
   target system and enclosure, in every state that selects a bay, and the HA
   target key on storage-view candidate reads (#1108).
+- The UI crawler's plain reads are now generated from the requests each
+  page's scripts can send, per page and scope kind, and admitted only for the
+  target's system, enclosure and storage view; a saved storage view's
+  heat-map history is allowed. Appliance polls, writes and identify lights
+  stay declared per state (#1108).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

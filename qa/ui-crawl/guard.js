@@ -15,8 +15,15 @@
 //      keys). Any `force`/`refresh`/`fresh` value that is not a clean false,
 //      or a route's own `query_classes`, raises a read to `appliance-load`.
 //   4. `read` and `read-post` pass only when the running state's read
-//      allowlist (its page's reads plus its own, qa/ui-states.json) names the
-//      exact manifest route and every query key the request carries.
+//      allowlist names the exact manifest route and every query key the
+//      request carries, and the request is bound to the target. The list is
+//      the page's own documents (qa/ui-states.json) plus the GENERATED reach
+//      of the page and the target's scope kind (qa/ui-read-reach.json: every
+//      /api read the page's scripts can send; D-TNJ-20261109-CRAWLER-SWEEP).
+//      Bound: each `bind` key the target has must be carried with the
+//      target's value (every copy), each `bind_if_sent` key it carries must
+//      equal the target's, and each `bind_params` path parameter (a storage
+//      view's id) must equal the target's.
 //   5. Any other class passes only inside a declared window, and only when a
 //      rule matches exactly: method, the substituted path (the captured bay),
 //      the route class, body predicates (a route with `object_keys` must have
@@ -40,6 +47,30 @@ const { RouteTable, BASE_READ_CLASSES, templateRegExp, loadManifest, parseQueryB
 
 const BOUND_CLASSES = new Set(["app-write", "led", "appliance-load"]);
 const BIND_KEYS = ["system_id", "enclosure_id"];
+// Target keys a read rule may bind: the window keys plus the storage view.
+const READ_BIND_KEYS = [...BIND_KEYS, "storage_view_id"];
+
+// Path parameter values of a manifest template, by name.
+function pathParams(template, pathname) {
+  const names = [];
+  const pattern = String(template).replace(/[.+?^$()|[\]\\]/g, "\\$&")
+    .replace(/\{([A-Za-z_]\w*)(:path)?\}/g, (all, name, isPath) => {
+      names.push(name);
+      return isPath ? "\u0001" : "\u0000";
+    })
+    .replace(/\u0000/g, "([^/]+)").replace(/\u0001/g, "(.+)");
+  const hit = new RegExp(`^${pattern}$`).exec(pathname);
+  if (!hit) return null;
+  return Object.fromEntries(names.map((name, index) => {
+    let value = hit[index + 1];
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // keep the raw segment; it cannot equal a decoded target id by accident
+    }
+    return [name, value];
+  }));
+}
 
 function bodyJson(text) {
   try {
@@ -133,9 +164,14 @@ class RequestGuard {
       if (!Array.isArray(rule.query)) throw new Error(`${stateId}: read ${method} ${rule.path} needs its query keys`);
       if (rule.force) throw new Error(`${stateId}: reads cannot force a refresh (${method} ${rule.path})`);
       const bind = rule.bind || [];
-      const unknown = bind.filter((key) => !BIND_KEYS.includes(key) || !rule.query.includes(key));
+      const ifSent = rule.bind_if_sent || [];
+      const unknown = [...bind, ...ifSent].filter((key) => !READ_BIND_KEYS.includes(key) || !rule.query.includes(key));
       if (unknown.length) throw new Error(`${stateId}: read ${method} ${rule.path} cannot bind ${unknown.join(", ")}`);
-      return { key: `${method} ${rule.path}`, query: new Set(rule.query), bind };
+      const params = rule.bind_params || {};
+      const templateParams = [...String(rule.path).matchAll(/\{(\w+)(?::\w+)?\}/g)].map((m) => m[1]);
+      const badParams = Object.entries(params).filter(([name, key]) => !templateParams.includes(name) || !READ_BIND_KEYS.includes(key));
+      if (badParams.length) throw new Error(`${stateId}: read ${method} ${rule.path} cannot bind path ${badParams.map(([name]) => name).join(", ")}`);
+      return { key: `${method} ${rule.path}`, path: rule.path, query: new Set(rule.query), bind, ifSent, params };
     });
   }
 
@@ -287,10 +323,37 @@ class RequestGuard {
     }
     let outside = null;
     for (const rule of fitting) {
-      outside = this.outsideBind(rule.bind, this.reads.bind, parsed);
+      outside = this.outsideBind(rule.bind, this.reads.bind, parsed)
+        || this.outsideBindIfSent(rule.ifSent, this.reads.bind, parsed)
+        || this.outsidePathBind(rule, this.reads.bind, parsed);
       if (!outside) return null;
     }
     return `read ${route} outside the bound ${outside} of ${this.reads.stateId}`;
+  }
+
+  // null when every copy of each key the request carries equals the target's.
+  outsideBindIfSent(keys, bind, parsed) {
+    for (const key of keys || []) {
+      const want = (bind || {})[key];
+      if (want === undefined || want === null) continue;
+      const got = parsed.searchParams.getAll(key);
+      if (got.some((value) => value !== String(want))) return `${key} (other)`;
+    }
+    return null;
+  }
+
+  // null when each bound path parameter equals the target's value.
+  outsidePathBind(rule, bind, parsed) {
+    const entries = Object.entries(rule.params || {});
+    if (!entries.length) return null;
+    const values = pathParams(rule.path, parsed.pathname);
+    if (!values) return `path (no match for ${rule.path})`;
+    for (const [name, key] of entries) {
+      const want = (bind || {})[key];
+      if (want === undefined || want === null) continue;
+      if (values[name] !== String(want)) return `${key} (other ${name} in the path)`;
+    }
+    return null;
   }
 
   // null when every bound key the target has is carried, every copy equal.
@@ -363,4 +426,4 @@ class RequestGuard {
 // actuation. (Admitted appliance polls are counted separately.)
 const WRITE_CLASSES = new Set(["app-write", "led", "forbidden"]);
 
-module.exports = { RequestGuard, WRITE_CLASSES, forcesRefresh, parseQueryBool, matchesRule, compileRule, jsonIncludes, FORCE_PARAMS };
+module.exports = { RequestGuard, WRITE_CLASSES, forcesRefresh, parseQueryBool, matchesRule, compileRule, jsonIncludes, pathParams, FORCE_PARAMS, READ_BIND_KEYS };
