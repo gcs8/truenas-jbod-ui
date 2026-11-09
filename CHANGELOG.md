@@ -38,6 +38,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `SQLITE_TMPDIR` for the history service still overrides it. Backups and
   exports never include the folder (#1094, #1095).
 
+### Added
+
+- Added a read-only census of segmented-history segments. `/healthz`
+  (`segment_conversion`) and the history dashboard now count which segments
+  still lack the newer read indexes, after checking each one against its
+  catalog entry. The counts are informational, never mark history degraded,
+  and nothing converts segments yet (#1129).
+
 ### Fixed
 
 - Fixed page reloads and bay-assignment saves waiting with no limit when the
