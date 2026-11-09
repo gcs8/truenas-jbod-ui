@@ -92,6 +92,135 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
   expect(midWord.detail.word).toMatch(/Remote|Handle/);
 });
 
+// The app's own heat-map colour and band functions, loaded from app.js so the
+// heat fixtures below use exactly the colours, bands and badge chips a real
+// tile gets (applyHeatmapToTile), not hand-copied numbers.
+function appHeatApi() {
+  const source = fs.readFileSync(path.join(root, "app/static/app.js"), "utf8");
+  const functionSource = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    if (start < 0) throw new Error(`app.js has no function ${name}`);
+    let depth = 0;
+    let quote = null;
+    for (let index = source.indexOf("{", source.indexOf(")", start)); index < source.length; index += 1) {
+      const character = source[index];
+      if (quote) {
+        if (character === "\\") index += 1;
+        else if (character === quote) quote = null;
+      } else if (character === "'" || character === "\"" || character === "`") quote = character;
+      else if (character === "{") depth += 1;
+      else if (character === "}" && --depth === 0) return source.slice(start, index + 1);
+    }
+    throw new Error(`app.js function ${name} has no complete body`);
+  };
+  const names = [
+    "nullableMetricNumber", "heatmapTemperatureBandDefinitions", "heatmapTemperatureDefaultProfiles", "heatmapTemperatureProfileId",
+    "heatmapTemperatureThresholdValue", "resolveHeatmapTemperatureThresholds", "heatmapTemperatureBand", "heatmapRelativeLuminance",
+    "heatmapContrastRatio", "heatmapSurfaceRgb", "heatmapReadableTextRgb", "heatmapBadgeRgb",
+  ];
+  const sandbox = require("node:vm").createContext({});
+  require("node:vm").runInContext(`${names.map(functionSource).join("\n")}\nthis.api = { ${names.join(", ")} };`, sandbox);
+  return sandbox.api;
+}
+
+const HEAT_FINDINGS = ["heat-small-range-spread", "heat-band-colour-mismatch", "heat-tile-contrast", "heat-alarm-healthy-temp"];
+
+function heatLegendHtml(api) {
+  return `<ul id="heatmap-legend-bands" class="heatmap-legend-bands" aria-label="Temperature bands">${api.heatmapTemperatureBandDefinitions()
+    .map((band) => `<li data-band="${band.id}"><span aria-hidden="true" style="--heatmap-band-rgb: ${band.rgb.join(", ")}"></span>${band.label}</li>`).join("")}</ul>`;
+}
+
+// A temperature-band tile exactly as applyHeatmapToTile() paints it.
+function bandTileHtml(api, slot, value, extra = "", data = {}) {
+  const band = api.heatmapTemperatureBand(value, api.resolveHeatmapTemperatureThresholds(data, {}));
+  const surface = api.heatmapSurfaceRgb(band.rgb, band.alpha);
+  const vars = {
+    rgb: band.rgb, alpha: [band.alpha], "border-alpha": [0.9], "surface-rgb": surface,
+    "text-rgb": api.heatmapReadableTextRgb(surface), "badge-rgb": api.heatmapBadgeRgb(surface),
+  };
+  const style = Object.entries(vars).map(([name, list]) => `--heatmap-${name}: ${Array.from(list).join(", ")}`).join("; ");
+  return `<button class="slot-tile heatmap-active" data-slot="${slot}" data-heatmap-band="${band.id}" style="${style}">`
+    + `<span class="slot-number">${String(slot).padStart(2, "0")}</span><span class="slot-device">sd${"abcdefgh"[slot]}</span>`
+    + `<span class="slot-pool">pool-a</span>${extra}<span class="slot-heatmap-value">${Math.round(value)} C</span></button>`;
+}
+
+async function runChecksOn(page, html) {
+  await page.route("**/*", (route) => route.fulfill({ contentType: "text/html; charset=utf-8", body: html }));
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  await page.goto("https://heat.synthetic.invalid/");
+  const { pageChecks } = require("./ui-crawl/checks");
+  return page.evaluate(pageChecks, {});
+}
+
+test("valid band rendering passes: 49 C warm next to 50 C warning, and labels on their own painted chips", async ({ page }) => {
+  const api = appHeatApi();
+  // The fixture models Codex's two cases on the real HDD defaults.
+  const thresholds = api.resolveHeatmapTemperatureThresholds({}, {});
+  expect([49, 50].map((value) => api.heatmapTemperatureBand(value, thresholds).id)).toEqual(["warm", "warning"]);
+  const warm = api.heatmapTemperatureBandDefinitions().find((band) => band.id === "warm");
+  const warmSurface = api.heatmapSurfaceRgb(warm.rgb, warm.alpha);
+  const badgeText = [244, 247, 251]; // .slot-heatmap-value colour #f4f7fb in style.css
+  expect(api.heatmapContrastRatio(badgeText, warmSurface), "the badge text would fail on the bare warm surface").toBeLessThan(4.5);
+  expect(api.heatmapContrastRatio(badgeText, api.heatmapBadgeRgb(warmSurface))).toBeGreaterThan(10.5);
+
+  // The production stylesheet paints the chips (badge, number, device, pool).
+  const css = fs.readFileSync(path.join(root, "app/static/style.css"), "utf8");
+  // A semi-transparent chip: composited over the warm surface it is the badge colour.
+  const translucent = `<span class="translucent-note" style="position: relative; z-index: 6; background: rgba(5, 8, 12, 0.62); color: #f4f7fb">note</span>`
+    // A gradient chip like the boot-media cards: measured at each colour stop.
+    + `<span class="gradient-note" style="position: relative; z-index: 6; background: radial-gradient(circle, rgba(76, 216, 164, 0.12), transparent 28%), linear-gradient(180deg, rgba(12, 36, 30, 0.96), rgba(9, 21, 19, 0.96)); color: #f4f7fb">boot</span>`;
+  // Room for every label (bay height is the chassis view's business, not this check's).
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><style>.slot-tile { height: auto; min-height: 220px; }</style></head><body>
+    <select id="heatmap-metric-select"><option selected>Temperature</option></select>${heatLegendHtml(api)}
+    <div class="slot-grid">${bandTileHtml(api, 1, 49, translucent)}${bandTileHtml(api, 2, 50)}</div></body></html>`;
+  const result = await runChecksOn(page, html);
+  const heatFindings = result.findings.filter((finding) => HEAT_FINDINGS.includes(finding.type));
+  expect(heatFindings, JSON.stringify(heatFindings)).toEqual([]);
+  expect(result.heat).toMatchObject({ active: 2, temperature: true, bands: { warm: 1, warning: 1 } });
+  // Every label measured (number, device, pool, badge; plus two notes on bay 1), none skipped.
+  expect(result.heat).toMatchObject({ contrastChecked: 10, contrastUnmeasured: 0 });
+  expect(result.heat.minContrast).toBeGreaterThanOrEqual(4.5);
+});
+
+test("heat checks still flag same-band alarm spreads, band colour mismatches and low-contrast tile text", async ({ page }) => {
+  const api = appHeatApi();
+  const bands = Object.fromEntries(api.heatmapTemperatureBandDefinitions().map((band) => [band.id, band]));
+  const red = [210, 74, 74];
+  const redSurface = api.heatmapSurfaceRgb(red, 0.75);
+  const translucentOverRed = api.heatmapSurfaceRgb([255, 255, 255], 0.1, redSurface);
+  const tile = (slot, value, rgb, alpha, inner) => `<button class="slot-tile heatmap-active" data-slot="${slot}" data-heatmap-band="normal" `
+    + `style="--heatmap-rgb: ${rgb.join(", ")}; --heatmap-alpha: ${alpha}"><span class="slot-heatmap-value">${value} C</span>${inner}</button>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+    body { margin: 0; font: 14px sans-serif; background: #111; color: #ddd; }
+    .slot-tile { display: inline-block; width: 120px; height: 90px; position: relative; background: #11161a; color: #f4f7fb; }
+    .slot-tile span { display: block; }
+    .slot-heatmap-value { background: rgb(23, 26, 30); color: #f4f7fb; }
+  </style></head><body><select id="heatmap-metric-select"><option selected>Temperature</option></select>${heatLegendHtml(api)}
+    ${tile(1, 36, red, 0.75, `<span class="bare" style="color: rgb(149, 163, 179)">pool-a</span><span class="veil" style="background: rgba(255, 255, 255, 0.1); color: rgb(149, 163, 179)">veil</span>`)}
+    ${tile(2, 37, bands.normal.rgb, bands.normal.alpha, `<span class="own-chip" style="background: rgb(200, 200, 200); color: #f4f7fb">pool-b</span>`
+      + `<span class="gradient-chip" style="background: linear-gradient(90deg, rgb(20, 20, 20), rgb(230, 230, 230)); color: #f4f7fb">grad</span>`
+      + `<span class="image-chip" style="background: url(data:image/gif;base64,R0lGODlhAQABAAAAACw=) rgb(0, 0, 0); color: #f4f7fb">img</span>`)}
+  </body></html>`;
+  const result = await runChecksOn(page, html);
+  const of = (type) => result.findings.filter((finding) => finding.type === type);
+  const summary = JSON.stringify(result.findings.map((finding) => [finding.type, finding.selector, finding.detail]));
+  // Two healthy disks 1 C apart, both in the normal band, one painted an alarm colour.
+  expect(of("heat-small-range-spread").length, summary).toBe(1);
+  expect(of("heat-small-range-spread")[0].detail).toMatchObject({ band: "normal", min: 36, max: 37 });
+  expect(of("heat-band-colour-mismatch").map((finding) => finding.detail), summary).toEqual([
+    { band: "normal", value: 36, rgb: red.join(","), expected: bands.normal.rgb.join(",") },
+  ]);
+  const contrast = Object.fromEntries(of("heat-tile-contrast").map((finding) => [finding.selector.split(" > ").pop(), finding.detail.background]));
+  expect(contrast, summary).toEqual({
+    "span.bare": redSurface.join(","), // no own background: the tile's heat surface
+    "span.veil": translucentOverRed.join(","), // a semi-transparent layer composited over that surface
+    "span.own-chip": "200,200,200", // its own opaque background
+    "span.gradient-chip": "230,230,230", // a gradient's worst colour stop
+  });
+  // An image has no single colour: counted as unmeasured, never guessed.
+  expect(result.heat.contrastUnmeasured).toBe(1);
+});
+
 test("the crawler's layout, heat-map and contrast checks pass on the synthetic fixtures", async ({ browser }, testInfo) => {
   test.setTimeout(16 * 60_000);
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-coverage-"));

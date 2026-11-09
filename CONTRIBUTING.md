@@ -424,8 +424,11 @@ Checks the crawler runs on every state and width: text squeezed to fewer than
 about four characters per line or broken inside a word, an empty grid or flex
 track beside a squeezed sibling, page-level horizontal overflow, clipped,
 truncated (without a tooltip) or overlapping controls, axe-core WCAG A/AA
-violations (contrast and every serious or critical rule), heat-map colours
-that turn a small value range into alarm colours, text contrast on heat tiles,
+violations (contrast and every serious or critical rule), relative heat-map
+colours that turn a small value range into alarm colours, temperature-band
+tiles whose colour differs from their rendered band (the drive's own
+thresholds decide the band, so 49 C warm beside 50 C warning is fine), text
+contrast on heat tiles against each label's own painted background,
 console and page errors, failed requests, HTTP 400 or above, slow page ready
 and slow requests, and, with `--baseline DIR`, a pixel diff against an earlier
 crawl of the same state.

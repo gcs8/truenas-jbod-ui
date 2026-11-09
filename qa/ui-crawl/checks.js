@@ -265,7 +265,12 @@ function pageChecks(options) {
       const value = parseFloat(String(raw).replace(/[^0-9.\-]/g, ""));
       const rgb = parseRgb(tile.style.getPropertyValue("--heatmap-rgb"));
       const alpha = Number(tile.style.getPropertyValue("--heatmap-alpha")) || 0.62;
-      return { tile, raw, value, rgb, alpha };
+      // Absolute temperature bands: the app classifies each bay with its own
+      // drive's SMART thresholds (else the profile defaults) and records the
+      // band it painted. Those thresholds are not in the DOM, so the rendered
+      // band is the expected band; its colour is checked against the legend.
+      const band = (tile.dataset && tile.dataset.heatmapBand) || null;
+      return { tile, raw, value, rgb, alpha, band };
     }).filter((record) => Number.isFinite(record.value) && record.rgb.length === 3);
     // Absolute temperature (not a delta from the average): alarm colours need a hot disk.
     const isTemperature = (/temp/i.test(metricLabel) && !/\bvs\b|delta|average/i.test(metricLabel))
@@ -276,13 +281,52 @@ function pageChecks(options) {
     const min = Math.min(...values);
     const max = Math.max(...values);
     const colours = new Set(records.map((record) => record.rgb.join(",")));
-    const spread = records.some((record) => alarm(record.rgb)) && records.some((record) => !alarm(record.rgb));
     Object.assign(heat, { active: records.length, metric: metricLabel, min, max, colours: colours.size, temperature: isTemperature });
     const smallDelta = isTemperatureLike ? opts.temperatureSmallDeltaC : Math.max(1, Math.abs(max) * opts.relativeSmallDelta);
-    if (records.length >= 2 && max - min <= smallDelta && spread) {
-      push("heat-small-range-spread", "error", records[0].tile.closest(".enclosure-face") || records[0].tile, {
-        metric: metricLabel, min, max, range: Number((max - min).toFixed(2)), note: "values within a small delta map to alarm and non-alarm colours",
+    // Relative colours (no band): a small value range must not span alarm and
+    // calm colours. Banded tiles legitimately change colour at a threshold
+    // (49 C warm, 50 C warning on HDD defaults), so they are judged per band.
+    const unbanded = records.filter((record) => !record.band);
+    const unbandedValues = unbanded.map((record) => record.value);
+    const unbandedMin = Math.min(...unbandedValues);
+    const unbandedMax = Math.max(...unbandedValues);
+    if (unbanded.length >= 2 && unbandedMax - unbandedMin <= smallDelta
+      && unbanded.some((record) => alarm(record.rgb)) && unbanded.some((record) => !alarm(record.rgb))) {
+      push("heat-small-range-spread", "error", unbanded[0].tile.closest(".enclosure-face") || unbanded[0].tile, {
+        metric: metricLabel, min: unbandedMin, max: unbandedMax, range: Number((unbandedMax - unbandedMin).toFixed(2)), note: "values within a small delta map to alarm and non-alarm colours",
       });
+    }
+    const bandGroups = new Map();
+    for (const record of records) {
+      if (!record.band) continue;
+      if (!bandGroups.has(record.band)) bandGroups.set(record.band, []);
+      bandGroups.get(record.band).push(record);
+    }
+    if (bandGroups.size) heat.bands = Object.fromEntries([...bandGroups].map(([band, list]) => [band, list.length]));
+    // Tiles in the same band must share its colour: alarm and calm colours
+    // inside one band is the spread defect, whatever the value range.
+    for (const [band, list] of bandGroups) {
+      if (list.some((record) => alarm(record.rgb)) && list.some((record) => !alarm(record.rgb))) {
+        const bandValues = list.map((record) => record.value);
+        const bandMin = Math.min(...bandValues);
+        const bandMax = Math.max(...bandValues);
+        push("heat-small-range-spread", "error", list[0].tile.closest(".enclosure-face") || list[0].tile, {
+          metric: metricLabel, band, min: bandMin, max: bandMax, range: Number((bandMax - bandMin).toFixed(2)), note: "tiles in one temperature band have alarm and non-alarm colours",
+        });
+      }
+    }
+    // The band colours come from the page's own legend (the app's band definitions).
+    const legendRgb = {};
+    for (const item of document.querySelectorAll("#heatmap-legend-bands [data-band]")) {
+      const swatch = item.querySelector("span");
+      const rgb = swatch ? parseRgb(swatch.style.getPropertyValue("--heatmap-band-rgb")) : [];
+      if (rgb.length === 3 && rgb.every(Number.isFinite)) legendRgb[item.dataset.band] = rgb;
+    }
+    for (const record of records) {
+      const expected = record.band && legendRgb[record.band];
+      if (expected && expected.join(",") !== record.rgb.join(",")) {
+        push("heat-band-colour-mismatch", "error", record.tile, { band: record.band, value: record.value, rgb: record.rgb.join(","), expected: expected.join(",") });
+      }
     }
     if (isTemperature) {
       for (const record of records) {
@@ -291,9 +335,98 @@ function pageChecks(options) {
         }
       }
     }
-    // Text contrast on the heat colour (painted by a ::before overlay that
-    // axe cannot see): heat rgb at its alpha over the dark tile base.
+    // Text contrast against what is painted behind each label. A label's own
+    // background (or the nearest ancestor's, below the tile) wins: the value
+    // badge and the name chips are opaque computed chips. Semi-transparent
+    // layers are composited over what lies beneath. A gradient is measured
+    // at each colour stop and the worst stop counts. Text with no painted
+    // layer of its own sits on the heat colour (a ::before overlay that axe
+    // cannot see): heat rgb at its alpha over the dark tile base. An image
+    // (url()) has no single colour, so that label is counted as unmeasured
+    // instead of guessed.
     const base = [17, 22, 26];
+    const parseColour = (value) => {
+      const match = /^rgba?\(([^)]+)\)$/.exec(String(value || "").trim());
+      if (!match) return null;
+      const parts = match[1].split(/[\s,/]+/).filter(Boolean).map((part) => (part.endsWith("%") ? Number(part.slice(0, -1)) / 100 : Number(part)));
+      if (parts.length < 3 || !parts.every(Number.isFinite)) return null;
+      return { rgb: parts.slice(0, 3), alpha: parts.length > 3 ? parts[3] : 1 };
+    };
+    const topLevelLayers = (value) => {
+      const layers = [];
+      let depth = 0;
+      let start = 0;
+      for (let index = 0; index < value.length; index += 1) {
+        if (value[index] === "(") depth += 1;
+        else if (value[index] === ")") depth -= 1;
+        else if (value[index] === "," && depth === 0) {
+          layers.push(value.slice(start, index).trim());
+          start = index + 1;
+        }
+      }
+      layers.push(value.slice(start).trim());
+      return layers;
+    };
+    // One node's paint, top-most first: each entry lists the colours that can
+    // show at some point (a gradient's stops, else the one background colour).
+    // Null when unmeasurable.
+    const nodePaint = (s) => {
+      const paint = [];
+      if (s.backgroundImage && s.backgroundImage !== "none") {
+        for (const layer of topLevelLayers(s.backgroundImage)) {
+          if (!/^(repeating-)?(linear|radial|conic)-gradient\(/.test(layer)) return null;
+          const stops = layer.match(/rgba?\([^)]*\)/g) || [];
+          // Every colour in the computed gradient must be an rgb()/rgba() stop.
+          if (!stops.length || /(?:^|[^-a-z])(?:hsla?|hwb|lab|lch|oklab|oklch|color|color-mix)\(/.test(layer)) return null;
+          const colours = stops.map(parseColour);
+          if (colours.some((colour) => !colour)) return null;
+          paint.push(colours);
+        }
+      }
+      const colour = parseColour(s.backgroundColor);
+      if (!colour) return null;
+      paint.push([colour]);
+      return paint;
+    };
+    // Painted layers between a label and its tile, nearest first; null when unmeasurable.
+    const paintedLayers = (element, tile) => {
+      const layers = [];
+      for (let node = element; node && node !== tile; node = node.parentElement) {
+        const paint = nodePaint(style(node));
+        if (!paint) return null;
+        let opaque = false;
+        for (const colours of paint) {
+          if (colours.every((colour) => colour.alpha <= 0)) continue;
+          layers.push(colours);
+          if (colours.every((colour) => colour.alpha >= 1)) {
+            opaque = true;
+            break;
+          }
+        }
+        if (opaque) break;
+      }
+      return layers;
+    };
+    // Every background the label can sit on (bounded); null when too many.
+    const composite = (surface, layers) => {
+      let painted = [surface];
+      // Outermost first: each layer paints over everything beneath it.
+      for (let index = layers.length - 1; index >= 0; index -= 1) {
+        const next = new Map();
+        for (const below of painted) {
+          for (const { rgb, alpha } of layers[index]) {
+            const mixed = rgb.map((v, i) => Math.round(v * alpha + below[i] * (1 - alpha)));
+            next.set(mixed.join(","), mixed);
+          }
+        }
+        if (next.size > 256) return null;
+        painted = [...next.values()];
+      }
+      return painted;
+    };
+    let contrastChecked = 0;
+    let contrastUnmeasured = 0;
+    let minContrast = null;
     const lum = (rgb) => {
       const c = rgb.map((v) => {
         const x = v / 255;
@@ -306,16 +439,30 @@ function pageChecks(options) {
       return (hi + 0.05) / (lo + 0.05);
     };
     for (const record of records) {
-      const bg = record.rgb.map((v, i) => Math.round(v * record.alpha + base[i] * (1 - record.alpha)));
+      const surface = record.rgb.map((v, i) => Math.round(v * record.alpha + base[i] * (1 - record.alpha)));
       for (const element of record.tile.querySelectorAll("*")) {
         if (element.children.length || !(element.textContent || "").trim() || !visible(element)) continue;
+        const layers = paintedLayers(element, record.tile);
+        const backgrounds = layers && composite(surface, layers);
+        if (!backgrounds) {
+          contrastUnmeasured += 1;
+          continue;
+        }
         const color = style(element).color.match(/[\d.]+/g).slice(0, 3).map(Number);
-        const value = ratio(color, bg);
+        let bg = backgrounds[0];
+        let value = ratio(color, bg);
+        for (const candidate of backgrounds.slice(1)) {
+          const candidateRatio = ratio(color, candidate);
+          if (candidateRatio < value) [bg, value] = [candidate, candidateRatio];
+        }
+        contrastChecked += 1;
+        minContrast = minContrast === null ? value : Math.min(minContrast, value);
         if (value < opts.contrastMin) {
           push("heat-tile-contrast", "error", element, { ratio: Number(value.toFixed(2)), color: color.join(","), background: bg.join(",") });
         }
       }
     }
+    Object.assign(heat, { contrastChecked, contrastUnmeasured, minContrast: minContrast === null ? null : Number(minContrast.toFixed(2)) });
   }
 
   return { findings, counts, scanned, heat, viewport: [vw, vh], document: [docWidth, document.documentElement.scrollHeight] };
