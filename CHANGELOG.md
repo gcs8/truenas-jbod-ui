@@ -89,7 +89,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   checks the bay against the view it published and then stores the assignment.
   It starts no appliance read while the other one runs. A refresh that misses
   its deadline still answers a retryable 503 before anything is written, and a
-  save based on a view another save replaced is still refused (#1141).
+  save based on a view another save replaced is still refused (#1141, #1142).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for
