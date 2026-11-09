@@ -332,6 +332,42 @@ class SegmentCensusTests(SegmentTreeFixture):
         self.assertEqual(by_id["segment-0001"].error, "segment_sidecar_state")
         self.assertEqual(by_id["segment-0002"].error, "segment_not_regular")
 
+    def test_sidecar_appearing_or_disappearing_refreshes_the_cached_census(self) -> None:
+        legacy = self.segment(1, indexes=())
+        write_catalog(self.catalog, [catalog_entry(legacy)])
+        wal = Path(f"{legacy}-wal")
+        wal.write_bytes(b"")
+        started: list[Callable[[], None]] = []
+        census = SegmentCensus(catalog_path=self.catalog, min_interval_seconds=0, start_background=started.append)
+        census.summary()
+        started.pop()()
+        self.assertEqual(
+            census.summary()["errors"], [{"segment_id": "segment-0001", "reason": "segment_sidecar_state"}],
+        )
+        self.assertEqual(started, [])
+        wal.unlink()
+        census.summary()
+        self.assertEqual(len(started), 1, "a removed sidecar makes the census stale")
+        started.pop()()
+        self.assertEqual(census.summary()["candidates"], 1)
+        Path(f"{legacy}-shm").write_bytes(b"")
+        census.summary()
+        self.assertEqual(len(started), 1, "a new sidecar makes the census stale")
+
+    def test_sidecar_created_during_the_census_pass_fails_authentication(self) -> None:
+        legacy = self.segment(1, indexes=())
+        write_catalog(self.catalog, [catalog_entry(legacy)])
+        inventory = segment_census.chronological_index_inventory
+
+        def create_wal(connection: sqlite3.Connection) -> Any:
+            Path(f"{legacy}-wal").write_bytes(b"")
+            return inventory(connection)
+
+        with patch.object(segment_census, "chronological_index_inventory", side_effect=create_wal):
+            report = run_segment_census(self.catalog)
+        self.assertEqual(report.segments[0].error, "segment_sidecar_state")
+        self.assertFalse(report.segments[0].authenticated)
+
     def test_cached_summary_never_hashes_and_refreshes_only_after_change(self) -> None:
         legacy = self.segment(1, indexes=())
         write_catalog(self.catalog, [catalog_entry(legacy)])
@@ -587,6 +623,25 @@ class CandidateValidationTests(SegmentTreeFixture):
 
         with patch.object(segment_census, "_compare_candidate", side_effect=rewrite_catalog):
             self.assertEqual(self.validate("segment-0001", candidate).failures, ("catalog_changed",))
+
+    def test_sidecar_created_during_validation_is_refused(self) -> None:
+        compare = segment_census._compare_candidate
+        for owner in ("candidate", "original"):
+            with self.subTest(owner):
+                candidate = self.candidate_for(self.legacy, name=f"{owner}-sidecar.sqlite3")
+                target = candidate if owner == "candidate" else self.legacy
+                wal = Path(f"{target}-wal")
+
+                def create_wal(*args: Any) -> Any:
+                    result = compare(*args)
+                    wal.write_bytes(b"")
+                    return result
+
+                with patch.object(segment_census, "_compare_candidate", side_effect=create_wal):
+                    result = self.validate("segment-0001", candidate)
+                wal.unlink()
+                self.assertEqual(result.failures, (f"{owner}_sidecar_state",))
+                self.assertFalse(result.ok)
 
     def test_rollup_and_raw_reads_are_equal_on_original_and_candidate(self) -> None:
         # Rollup reads stay on their scan path (Sol review #5); only full-result

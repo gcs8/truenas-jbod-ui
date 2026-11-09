@@ -26,6 +26,7 @@ import logging
 import os
 import sqlite3
 import stat
+import string
 import struct
 import threading
 import time
@@ -52,7 +53,7 @@ HASH_CHUNK_BYTES = 1024 * 1024
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
 MAX_REPORTED_ERRORS = 20
 DEFAULT_MIN_CENSUS_INTERVAL_SECONDS = 300.0
-_SHA256_HEX = frozenset("0123456789abcdef")
+_SHA256_HEX = frozenset(string.hexdigits.lower())
 
 # Columns each released chronological index needs. A legacy segment whose
 # metric_samples table predates disk_identity_key is not expected to gain the
@@ -273,9 +274,8 @@ def _path_identity(path: Path) -> FileIdentity:
 
 
 def _require_no_sidecars(path: Path, *, reason: str) -> None:
-    for suffix in ("-wal", "-shm", "-journal"):
-        if path_entry_exists(Path(f"{path}{suffix}")):
-            raise SegmentAuthenticationError(reason)
+    if any(_sidecar_presence(path)):
+        raise SegmentAuthenticationError(reason)
 
 
 def _hash_descriptor(descriptor: int) -> str:
@@ -287,15 +287,24 @@ def _hash_descriptor(descriptor: int) -> str:
     return digest.hexdigest()
 
 
+def _sidecar_presence(path: Path) -> tuple[bool, ...]:
+    return tuple(path_entry_exists(Path(f"{path}{suffix}")) for suffix in ("-wal", "-shm", "-journal"))
+
+
 @dataclass
 class PinnedFile:
     path: Path
     descriptor: int
     identity: FileIdentity
     sha256: str
+    prefix: str
 
     def require_unchanged(self, reason: str) -> None:
-        """The path still names the pinned, single-link file, unchanged since hashing."""
+        """The path still names the pinned, single-link file, unchanged since hashing.
+
+        An immutable connection ignores a WAL, so a sidecar that appeared
+        while the file was read is refused too: its frames were never seen.
+        """
 
         try:
             current_path = _path_identity(self.path)
@@ -303,6 +312,7 @@ class PinnedFile:
             raise SegmentAuthenticationError(reason) from exc
         if current_path != self.identity or FileIdentity.of(os.fstat(self.descriptor)) != self.identity:
             raise SegmentAuthenticationError(reason)
+        _require_no_sidecars(self.path, reason=f"{self.prefix}_sidecar_state")
 
     def sqlite_uri(self) -> str:
         return f"file:/proc/self/fd/{self.descriptor}?mode=ro&immutable=1"
@@ -347,7 +357,9 @@ def pinned_file(
         sha256 = _hash_descriptor(descriptor)
         if expected_sha256 is not None and sha256 != expected_sha256:
             raise SegmentAuthenticationError(f"{prefix}_sha256_mismatch")
-        pinned = PinnedFile(path=path, descriptor=descriptor, identity=identity, sha256=sha256)
+        pinned = PinnedFile(
+            path=path, descriptor=descriptor, identity=identity, sha256=sha256, prefix=prefix,
+        )
         pinned.require_unchanged(f"{prefix}_identity_changed")
         yield pinned
     finally:
@@ -428,7 +440,9 @@ class SegmentCensusReport:
     catalog_error: str | None
     segments: tuple[SegmentCensusEntry, ...] = ()
     catalog_identity: FileIdentity | None = None
-    segment_identities: tuple[tuple[str, FileIdentity | None], ...] = field(default=(), repr=False)
+    segment_identities: tuple[
+        tuple[str, FileIdentity | None, tuple[bool, ...]], ...
+    ] = field(default=(), repr=False)
 
     def summary(self) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []
@@ -506,6 +520,12 @@ def _optional_identity(path: Path) -> FileIdentity | None:
         return None
 
 
+def _segment_fingerprint(path: Path) -> tuple[str, FileIdentity | None, tuple[bool, ...]]:
+    """What a cached census pass depends on for one segment, without reading it."""
+
+    return (path.name, _optional_identity(path), _sidecar_presence(path))
+
+
 def run_segment_census(
     catalog_path: Path,
     *,
@@ -536,8 +556,7 @@ def run_segment_census(
         segments=segments,
         catalog_identity=catalog.identity,
         segment_identities=tuple(
-            (entry.file_name, _optional_identity(directory / entry.file_name))
-            for entry in catalog.entries
+            _segment_fingerprint(directory / entry.file_name) for entry in catalog.entries
         ),
     )
 
@@ -580,8 +599,8 @@ class SegmentCensus:
             self.hot_path is not None and path_entry_exists(activation_pending_path(self.hot_path)),
         )
         segments = tuple(
-            (name, _optional_identity(self.catalog_path.parent / name))
-            for name, _ in (report.segment_identities if report is not None else ())
+            _segment_fingerprint(self.catalog_path.parent / name)
+            for name, _, _ in (report.segment_identities if report is not None else ())
         )
         return (markers, _optional_identity(self.catalog_path), segments)
 
