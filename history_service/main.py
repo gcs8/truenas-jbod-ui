@@ -63,6 +63,7 @@ from history_service.startup import (
     open_history_store_with_retries,
 )
 from history_service.startup_migration import open_history_store_after_recovery
+from history_service.segment_census import SegmentCensus
 from history_service.segment_reader import HistoryStorageUnavailableError, SegmentCatalogMissingError
 from history_service.sqlite_temp import configure_sqlite_temporary_directory
 from history_service.store import HistoryStore
@@ -165,6 +166,13 @@ def load_history_runtime(
 settings, store, startup_failure_reason = load_history_runtime()
 collector = HistoryCollector(settings, store) if store is not None else None
 logger = logging.getLogger(__name__)
+# Informational census of older-format segments (#864). It only reads: no
+# HistoryStore, no staging or state files. Unsegmented history has no segments.
+segment_census = (
+    SegmentCensus(catalog_path=Path(settings.segment_catalog_path), hot_path=Path(settings.sqlite_path))
+    if store is not None and settings.segment_catalog_path is not None
+    else None
+)
 refresh_admission = ManualRefreshAdmission(
     cooldown_seconds=settings.full_refresh_cooldown_seconds,
 )
@@ -623,8 +631,26 @@ async def index(request: Request, exact_counts: bool = Query(default=False)) -> 
             backup_footprint=disk["backup_footprint"],
             refresh=refresh_cooldown_status(),
             degraded_reason=summary.degraded_reason,
+            segment_conversion=await asyncio.to_thread(segment_conversion_status),
         ),
     )
+
+
+def segment_conversion_status() -> dict[str, object] | None:
+    """The cached segment census, or None for unsegmented history (#864).
+
+    It reports which older segments lack the released chronological indexes.
+    Nothing converts them yet, so this is a census, not migration progress,
+    and no census result makes history degraded.
+    """
+
+    if segment_census is None:
+        return None
+    try:
+        return segment_census.summary()
+    except Exception:  # noqa: BLE001 - an informational census never breaks health.
+        logger.warning("History segment census summary failed.", exc_info=True)
+        return None
 
 
 @app.get("/healthz")
@@ -692,6 +718,8 @@ async def healthz() -> JSONResponse:
         "detail": degraded_reason,
         "collector": collector_status,
         "database_size_bytes": database_size_bytes,
+        # Informational only; it never changes status above (#864).
+        "segment_conversion": await asyncio.to_thread(segment_conversion_status),
     }
     return JSONResponse(payload, status_code=200)
 
@@ -1140,6 +1168,26 @@ def collection_inventory_label(value: object) -> str:
     return "not recorded"
 
 
+def segment_census_errors_label(census: Mapping[str, object] | None) -> str:
+    """One line naming segments the census could not authenticate (#864)."""
+
+    if not census:
+        return "none"
+    errors = census.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return "none"
+    parts = []
+    for error in errors:
+        if not isinstance(error, Mapping):
+            continue
+        segment_id = error.get("segment_id")
+        parts.append(f"{segment_id}: {error.get('reason')}" if segment_id else str(error.get("reason")))
+    omitted = census.get("errors_omitted")
+    if isinstance(omitted, int) and omitted > 0:
+        parts.append(f"and {omitted} more")
+    return "; ".join(parts) or "none"
+
+
 def build_dashboard_context(
     *,
     request: Request,
@@ -1154,6 +1202,7 @@ def build_dashboard_context(
     backup_footprint: dict[str, int] | None = None,
     refresh: dict[str, object] | None = None,
     degraded_reason: str | None = None,
+    segment_conversion: dict[str, object] | None = None,
 ) -> dict[str, object]:
     release_payload = release_status or {}
     backoff_seconds = int(status.get("background_backoff_seconds_remaining") or 0)
@@ -1196,4 +1245,11 @@ def build_dashboard_context(
         "format_count": format_count,
         "refresh": refresh or {},
         "status_json": json.dumps(status),
+        "segment_conversion": segment_conversion,
+        "segment_census_errors_label": segment_census_errors_label(segment_conversion),
+        "segment_candidate_bytes_label": (
+            format_bytes(segment_conversion["candidate_bytes"])
+            if segment_conversion and isinstance(segment_conversion.get("candidate_bytes"), int)
+            else "not counted yet"
+        ),
     }

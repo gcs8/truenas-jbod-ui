@@ -122,6 +122,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_script_json",
         "test_script_platform_guards",
         "test_scripts_help",
+        "test_segment_census",
         "test_segment_rotation",
         "test_segmented_history",
         "test_segmented_history_reader",

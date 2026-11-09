@@ -53,6 +53,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   answering, counter reads stop about a minute into a refresh, and an
   oversized or malformed answer is discarded and shown as an error. In between, the last reading is shown with its read time; the app
   keeps only decoded readings, for at most 64 expanders and 4,096 PHYs (#1088).
+- Added a read-only census of segmented-history segments. `/healthz`
+  (`segment_conversion`) and the history dashboard now count which segments
+  still lack the newer read indexes, after checking each one against its
+  catalog entry. An open dashboard picks up a finished census, and any
+  segment it could not check, on its next health check. The counts are
+  informational, never mark history degraded, and nothing converts segments
+  yet (#1129).
 
 ### Fixed
 

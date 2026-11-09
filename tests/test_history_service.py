@@ -591,7 +591,7 @@ class HistoryDashboardRouteTests(unittest.TestCase):
         self.assertEqual(health_payload["collector"], expected)
         self.assertEqual(
             set(health_payload),
-            {"status", "detail", "collector", "database_size_bytes"},
+            {"status", "detail", "collector", "database_size_bytes", "segment_conversion"},
         )
         self.assertEqual(overview["collector"], expected)
         for serialized in (dashboard_bytes, health.body, json.dumps(overview).encode()):

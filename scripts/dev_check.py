@@ -196,6 +196,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_sas_fabric",
             "tests.test_scheduled_backup",
             "tests.test_script_json",
+            "tests.test_segment_census",
             "tests.test_segment_migration",
             "tests.test_segment_rotation",
             "tests.test_segment_sealer",
