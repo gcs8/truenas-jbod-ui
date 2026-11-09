@@ -103,6 +103,26 @@ from app.services.sas_fabric import (
     build_sas_fabric_snapshot,
     storage_node_legacy_alias_ids,
 )
+from app.services.core_expander_counters import (
+    CAPABILITY_DENIED,
+    CAPABILITY_GRANTED,
+    SMP_CAPABILITY_RETRY_SECONDS,
+    SMP_COUNTER_TIME_BUDGET_SECONDS,
+    SMP_MAX_CALLS_PER_REFRESH,
+    SMP_MAX_COMMANDS_PER_REFRESH,
+    KeptCounterRead,
+    bound_kept_reads,
+    build_phy_error_log_command,
+    build_phy_error_log_commands,
+    chunk_output_span,
+    chunk_stop,
+    compact_counter_row,
+    discover_smp_targets,
+    parse_chunk_output,
+    select_counter_reads,
+    smp_output_calls,
+    smp_output_key,
+)
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
 from app.services.quantastor_api import QuantastorRESTClient
@@ -1435,6 +1455,15 @@ SSH_FAILURE_CONTEXTS_BY_COMMAND: dict[str, dict[str, str]] = {
 # Checked in order, after the exact commands and the mprutil unit pattern.
 SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
     (
+        # The output key of the CORE expander counter read (#941).
+        "smp phy error log ",
+        {
+            "context": "sas_fabric_expander_phy_error_counters",
+            "context_label": "expander PHY error counters",
+            "criticality": "enrichment",
+        },
+    ),
+    (
         "sg_ses join ",
         {
             "context": "storage_fabric_sg_ses_join",
@@ -1478,6 +1507,10 @@ def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
 
 
 class InventoryService:
+    # Class defaults keep partially built services (tests, adapters) readable.
+    _smp_counter_capability: str | None = None
+    _smp_counter_checked_at = 0.0
+
     def __init__(
         self,
         settings: Settings,
@@ -1587,6 +1620,20 @@ class InventoryService:
         # ESXi 7 runs the StorCLI binary, ESXi 8 only `esxcli storcli`. True once
         # this host answered StorCLI reads only in the form the saved commands lack.
         self._esxi_storcli_swapped = False
+        # CORE expander PHY error counters (#941) are a discovered capability.
+        # A refusal is remembered so sudo is not asked again on every refresh.
+        self._smp_counter_capability = None
+        self._smp_counter_checked_at = 0.0
+        # Per expander (unit, SAS address): when its last full read was
+        # planned (monotonic), and that read's decoded rows with their
+        # wall-clock read time, reused until the expander is due again
+        # (#1088 review). Kept readings are bounded (see bound_kept_reads()).
+        self._smp_counter_last_read: dict[tuple[int, str], float] = {}
+        self._smp_counter_reads: dict[tuple[int, str], KeptCounterRead] = {}
+        # Expanders whose one-PHY capability probe gave no answer; the next
+        # probe goes to another expander (#1088 review).
+        self._smp_counter_silent_probes: set[tuple[int, str]] = set()
+        self._reset_smp_counter_plan()
         self._snapshot_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._source_bundle_refresh_task: asyncio.Task[InventorySourceBundle | None] | None = None
         # Source generation the shared background source task started under.
@@ -1888,6 +1935,8 @@ class InventoryService:
         # the slot-detail save's worker thread, which cannot see it (#1125).
         refresh_ticket = _background_refresh_ticket.get()
         refresh_sources = force_refresh if force_source_refresh is None else force_source_refresh
+        if force_refresh and refresh_sources:
+            self.retry_expander_counter_capability()
         observed_source_publication = SourcePublication(
             sequence=self._source_bundle_published_sequence,
             sg_cache_generation=self._sg_ses_device_cache_generation,
@@ -2710,6 +2759,8 @@ class InventoryService:
             warnings=source_bundle.warnings,
             command_failures=source_bundle.ssh_failure_details,
             aliases=aliases,
+            expander_counter_capability=self._smp_counter_capability,
+            expander_counter_reads=self.expander_counter_reads(),
         )
         return fabric.model_copy(
             update={
@@ -4948,6 +4999,7 @@ class InventoryService:
         commands.extend(self._core_zpool_by_device_probe_commands(command_results))
         commands.extend(self._core_mpr_dmesg_probe_commands(command_results))
         commands.extend(self._core_pci_slot_probe_commands(command_results))
+        commands.extend(self._core_expander_counter_probe_commands(command_results))
         if self._should_probe_unifi_gpio_debug(command_results):
             commands.append("cat /sys/kernel/debug/gpio")
         commands.extend(self._esxi_controller_diagnostic_commands(command_results))
@@ -5063,6 +5115,282 @@ class InventoryService:
         seen_commands = {canonicalize_ssh_command(item.command) for item in command_results}
         return build_core_mprutil_unit_commands(adapter_summary, seen_commands)
 
+    @staticmethod
+    def _smp_counter_clock() -> float:
+        return time.monotonic()
+
+    @staticmethod
+    def _smp_counter_wall_clock() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _reset_smp_counter_plan(self) -> None:
+        """Forget the full reads planned for the current collection.
+
+        ``_smp_counter_planned`` maps each chunk command sent this collection
+        (by output key) to its expander, in the order sent;
+        ``_smp_counter_queue`` holds each expander's chunks not sent yet, and
+        ``_smp_counter_stopped`` the expanders whose read ended early (reason,
+        PHY).
+        """
+        self._smp_counter_planned: dict[str, tuple[int, str]] = {}
+        self._smp_counter_queue: dict[tuple[int, str], list[str]] = {}
+        self._smp_counter_stopped: dict[tuple[int, str], tuple[str, int]] = {}
+        self._smp_counter_capability_memo: dict[tuple[str, int, int], str | None] = {}
+        self._smp_counter_started_at: float | None = None
+
+    def _record_smp_counter_reads(self, command_results: list[SSHCommandResult]) -> None:
+        """Keep each full read this collection ran, as decoded rows with a read time.
+
+        Called once after a collection. Only chunks the planner sent for full
+        reads count, so a one-PHY permission probe never replaces a kept full
+        reading. Raw output is never kept: each chunk is validated against the
+        key it was asked for, and an oversized or malformed one keeps only
+        ``rejected_output`` rows for its PHYs (#1088 security review). A new
+        read replaces an expander's kept rows with the chunks that completed;
+        a chunk that failed (for example past the SSH command deadline) leaves
+        its PHYs unread rather than mixing in an older reading, and a read
+        that ended early records where and why. A read with no completed chunk
+        keeps the previous rows. The kept readings stay within
+        SMP_MAX_RETAINED_EXPANDERS and SMP_MAX_RETAINED_PHYS, least recently
+        read dropped first.
+        """
+        planned = dict(getattr(self, "_smp_counter_planned", None) or {})
+        stopped = dict(getattr(self, "_smp_counter_stopped", None) or {})
+        self._reset_smp_counter_plan()
+        if not planned:
+            return
+        read_at = self._smp_counter_wall_clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+        by_key = {
+            key: item for item in command_results if (key := smp_output_key(item.command)) in planned
+        }
+        chunks: dict[tuple[int, str], list[str]] = {}
+        for key, expander in planned.items():
+            chunks.setdefault(expander, []).append(key)
+        kept = dict(getattr(self, "_smp_counter_reads", None) or {})
+        for expander, keys in chunks.items():
+            span = chunk_output_span(keys[0])
+            if span is None:
+                continue
+            device = span[0].split(":")[2]
+            stop = stopped.get(expander)
+            rows: dict[int, Any] = {}
+            completed = False
+            for key in keys:
+                item = by_key.get(key)
+                if item is None:
+                    continue
+                if stop is None:
+                    stop = chunk_stop(key, item.ok, item.stdout, item.stderr)
+                if not item.ok:
+                    continue
+                parsed = parse_chunk_output(key, item.stdout)
+                compact = [compact_counter_row(row) for row in parsed.rows] if parsed is not None else [None]
+                if parsed is None or None in compact:
+                    parsed = parse_chunk_output(key, None)
+                    compact = [compact_counter_row(row) for row in parsed.rows]
+                for row in compact:
+                    rows.setdefault(row[0], row)
+                completed = True
+            marker = (stop[0], stop[1], read_at) if stop else None
+            previous = kept.get(expander)
+            if completed:
+                kept[expander] = KeptCounterRead(device, read_at, tuple(rows[phy] for phy in sorted(rows)), marker)
+            elif previous is not None and previous.device == device:
+                kept[expander] = KeptCounterRead(previous.device, previous.read_at, previous.rows, marker)
+            elif marker is not None:
+                kept[expander] = KeptCounterRead(device, None, (), marker)
+        self._smp_counter_reads = bound_kept_reads(kept, getattr(self, "_smp_counter_last_read", None) or {})
+
+    def expander_counter_reads(self) -> dict[tuple[int, str], KeptCounterRead]:
+        """Kept readings by (unit, expander SAS address) for the fabric view."""
+        return dict(getattr(self, "_smp_counter_reads", None) or {})
+
+    def _record_smp_counter_capability(self, command_results: list[SSHCommandResult]) -> None:
+        """Remember whether sudo ran the expander counter read in these results."""
+        # Planning runs again after every round of commands; each output is
+        # parsed for its capability once per collection.
+        memo = getattr(self, "_smp_counter_capability_memo", None)
+        if memo is None or len(memo) > 4 * SMP_MAX_COMMANDS_PER_REFRESH:
+            memo = self._smp_counter_capability_memo = {}
+        outcomes: set[str | None] = set()
+        for item in command_results:
+            key = smp_output_key(item.command)
+            if not item.ok or key is None:
+                continue
+            memo_key = (key, len(item.stdout or ""), hash(item.stdout or ""))
+            if memo_key not in memo:
+                parsed = parse_chunk_output(key, item.stdout)
+                memo[memo_key] = parsed.capability if parsed is not None else None
+            outcomes.add(memo[memo_key])
+        if CAPABILITY_GRANTED in outcomes:
+            state = CAPABILITY_GRANTED
+        elif CAPABILITY_DENIED in outcomes:
+            state = CAPABILITY_DENIED
+        else:
+            return
+        self._smp_counter_capability = state
+        self._smp_counter_checked_at = self._smp_counter_clock()
+        self._smp_counter_silent_probes = set()
+
+    def retry_expander_counter_capability(self) -> None:
+        """Ask sudo again on the next collection after a remembered refusal.
+
+        A forced source refresh (the Refresh button, ``?force=true``) calls this,
+        so an operator who just added the grant through the admin bootstrap
+        does not wait out SMP_CAPABILITY_RETRY_SECONDS. The admin sidecar runs
+        in another process and cannot reach this cache directly. Background
+        and stale-cache refreshes do not call it.
+        """
+        if self._smp_counter_capability == CAPABILITY_DENIED:
+            self._smp_counter_checked_at = float("-inf")
+
+    def _smp_counter_read_commands(self, targets: list[Any], command_results: list[SSHCommandResult]) -> list[str]:
+        """Full reads for the expanders due this refresh (#1088 review).
+
+        Each expander is read at most once per SMP_COUNTER_READ_INTERVAL_SECONDS,
+        forced refresh or not; the interval starts when the read is planned, so
+        a read that fails or times out still counts. One refresh reads at most
+        SMP_MAX_TARGETS_PER_REFRESH expanders, SMP_MAX_CALLS_PER_REFRESH PHY
+        calls and SMP_MAX_COMMANDS_PER_REFRESH SSH commands, the probe
+        included; each expander is read in chunks of SMP_PHYS_PER_COMMAND PHYs,
+        one command each. Only each expander's first chunk is sent now; the
+        rest follow one per planning round (_smp_counter_next_chunks()), so
+        the first chunk that does not answer ends that expander's read. The
+        probe's output alone does not count, since the full reads follow it
+        in that refresh.
+        """
+        keys = {smp_output_key(item.command) for item in command_results} - {None}
+        # The capability probe reads PHY 0 of one expander ("...:00-00").
+        if {key for key in keys if not key.endswith(":00-00")}:
+            return []
+        now = self._smp_counter_clock()
+        current = {(target.unit, target.expander_sas_address) for target in targets}
+        # Expired read times still order the rotation (select_counter_reads
+        # applies the interval); only departed expanders are dropped.
+        last_read = {
+            expander: planned_at
+            for expander, planned_at in (getattr(self, "_smp_counter_last_read", None) or {}).items()
+            if expander in current
+        }
+        self._smp_counter_reads = {
+            expander: read
+            for expander, read in (getattr(self, "_smp_counter_reads", None) or {}).items()
+            if expander in current
+        }
+        self._reset_smp_counter_plan()
+        self._smp_counter_started_at = now
+        budget = SMP_MAX_CALLS_PER_REFRESH - sum(smp_output_calls(key) for key in keys)
+        command_budget = SMP_MAX_COMMANDS_PER_REFRESH - len(keys)
+        commands: list[str] = []
+        for target in select_counter_reads(targets, last_read, now, budget, command_budget):
+            expander = (target.unit, target.expander_sas_address)
+            last_read[expander] = now
+            first, *rest = build_phy_error_log_commands(target)
+            self._smp_counter_planned[smp_output_key(first)] = expander
+            self._smp_counter_queue[expander] = rest
+            commands.append(first)
+        self._smp_counter_last_read = last_read
+        return commands
+
+    def _smp_counter_next_chunks(self, command_results: list[SSHCommandResult]) -> list[str]:
+        """The next chunk of each expander still being read this refresh.
+
+        An expander's read ends at the first chunk that did not answer (a call
+        with no answer, or past the SSH command deadline), whose output was
+        rejected, that failed, or that sudo refused; its remaining chunks are
+        not sent this refresh, so a hung expander costs about one call
+        timeout. The read interval still applies to it. Once
+        SMP_COUNTER_TIME_BUDGET_SECONDS have passed since the full reads
+        started, no further chunk is sent (``time_budget``), so slow but
+        answering expanders cannot push the collection past its deadline.
+        """
+        planned = self._smp_counter_planned
+        started = getattr(self, "_smp_counter_started_at", None)
+        if started is not None and self._smp_counter_clock() - started >= SMP_COUNTER_TIME_BUDGET_SECONDS:
+            for expander, queue in self._smp_counter_queue.items():
+                span = chunk_output_span(smp_output_key(queue[0])) if queue else None
+                if span is not None and expander not in self._smp_counter_stopped:
+                    self._smp_counter_stopped[expander] = ("time_budget", span[1][0])
+                queue.clear()
+            return []
+        by_key = {
+            key: item for item in command_results if (key := smp_output_key(item.command)) in planned
+        }
+        last_sent: dict[tuple[int, str], str] = {}
+        for key, expander in planned.items():
+            last_sent[expander] = key
+        commands: list[str] = []
+        for expander, queue in self._smp_counter_queue.items():
+            if not queue or expander in self._smp_counter_stopped:
+                continue
+            item = by_key.get(last_sent.get(expander, ""))
+            if item is None:
+                continue
+            stop = chunk_stop(last_sent[expander], item.ok, item.stdout, item.stderr)
+            if stop is not None:
+                self._smp_counter_stopped[expander] = stop
+                queue.clear()
+                continue
+            command = queue.pop(0)
+            planned[smp_output_key(command)] = expander
+            commands.append(command)
+        return commands
+
+    def _core_expander_counter_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
+        """Read expander PHY error counters when the account may (#941).
+
+        Targets come from the mprutil and camcontrol reads already in this
+        refresh. An unknown or long-ago refused capability is checked with one
+        sudo call (PHY 0 of the first expander, or of the next one after a
+        probe that got no answer) before any full read; a recent refusal is
+        not retried unless a forced refresh asked for it. A full read of a
+        granted capability renews it.
+        """
+        if self.system.truenas.platform != "core":
+            return []
+        planned = getattr(self, "_smp_counter_planned", None) or {}
+        if planned and any(smp_output_key(item.command) in planned for item in command_results):
+            # A later planning round of this collection's full reads.
+            self._record_smp_counter_capability(command_results)
+            if self._smp_counter_capability != CAPABILITY_GRANTED:
+                return []
+            return self._smp_counter_next_chunks(command_results)
+        outputs = {
+            canonicalize_ssh_command(item.command): item.stdout
+            for item in command_results
+            if item.ok
+        }
+        targets = discover_smp_targets(outputs)
+        if not targets:
+            return []
+        self._record_smp_counter_capability(command_results)
+        state = self._smp_counter_capability
+        if state == CAPABILITY_GRANTED:
+            return self._smp_counter_read_commands(targets, command_results)
+        recent = self._smp_counter_clock() - self._smp_counter_checked_at < SMP_CAPABILITY_RETRY_SECONDS
+        if state == CAPABILITY_DENIED and recent:
+            return []
+        current = {(target.unit, target.expander_sas_address) for target in targets}
+        silent = {expander for expander in (getattr(self, "_smp_counter_silent_probes", None) or set()) if expander in current}
+        probed = [key for item in command_results if (key := smp_output_key(item.command))]
+        if probed:
+            # The probe ran this refresh but proved nothing (no answer): the
+            # next refresh probes another expander, so one silent expander
+            # cannot keep the capability unknown (#1088 review).
+            for key in probed:
+                span = chunk_output_span(key)
+                if span is not None:
+                    unit, address, _device = span[0].split(":")
+                    silent.add((int(unit), address))
+            self._smp_counter_silent_probes = silent
+            return []
+        target = next((item for item in targets if (item.unit, item.expander_sas_address) not in silent), None)
+        if target is None:
+            # Every expander was silent once: start the turn again.
+            silent, target = set(), targets[0]
+        self._smp_counter_silent_probes = silent
+        return [build_phy_error_log_command(target, [0])]
+
     def _core_zpool_by_device_probe_commands(self, command_results: list[SSHCommandResult]) -> list[str]:
         """Read pool members by device for a saved CORE command list that predates it (#948)."""
         if self.system.truenas.platform != "core":
@@ -5167,6 +5495,8 @@ class InventoryService:
         skipped_sg_ses_reads = fixed_device_sg_ses_reads(self.system.truenas.platform, list(self.system.ssh.commands))
 
         async def load_ssh_payload() -> tuple[dict[str, str], bool, list[str], list[dict[str, Any]], SourceStatus]:
+            # A collection that ended early (cancelled) leaves no plan behind.
+            self._reset_smp_counter_plan()
             with perf_stage("inventory.ssh.run_commands"):
                 ssh_started = time.perf_counter()
                 if self.system.truenas.platform == "esxi":
@@ -5199,6 +5529,7 @@ class InventoryService:
                     sum(1 for result in command_results if not result.ok),
                     time.perf_counter() - ssh_started,
                 )
+            self._record_smp_counter_reads(command_results)
             outputs = {item.command: item.stdout for item in command_results if item.ok}
             failure_messages, status_message = self._summarize_ssh_failures(command_results, outputs)
             failure_details = self._ssh_failure_details(command_results)
