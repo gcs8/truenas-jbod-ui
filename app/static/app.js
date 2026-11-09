@@ -11036,6 +11036,7 @@
       const failure = new Error(payload?.detail || `Request failed with ${response.status}`);
       failure.status = response.status;
       failure.detail = payload?.detail ?? null;
+      failure.code = typeof payload?.error === "string" ? payload.error : null;
       throw failure;
     }
     return payload;
@@ -11601,6 +11602,19 @@
     }
   }
 
+  // The server refused a bay-assignment save or clear because another disk
+  // now sits in the bay (#1141). The draft belongs to the old disk: drop it,
+  // reload the view so the bay shows the new disk, and say why.
+  async function reloadAfterMappingDiskChange(error) {
+    const message = error.detail || error.message;
+    state.mappingFormScopeKey = null;
+    state.mappingFormValuesKey = null;
+    state.mappingFormBaseRevision = null;
+    state.mappingFormDirty = false;
+    await refreshSnapshot(false, "mapping-disk-changed");
+    setStatus(message, "error");
+  }
+
   async function saveMapping(event) {
     if (state.snapshotMode) {
       setStatus("Mapping changes are disabled in an offline snapshot export.", "error");
@@ -11662,6 +11676,10 @@
       setStatus(result.warning || `Saved mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
+      if (Number(error?.status) === 409 && error?.code === "mapping_disk_changed") {
+        await reloadAfterMappingDiskChange(error);
+        return;
+      }
       handleWriteRejection(error);
       setStatus(`Save mapping failed: ${error.message || error}`, "error");
     } finally {
@@ -11725,6 +11743,10 @@
       setStatus(`Cleared mapping for slot ${slot.slot_label}.`);
     } catch (error) {
       if (!mutationContextIsCurrent(mutation)) return;
+      if (Number(error?.status) === 409 && error?.code === "mapping_disk_changed") {
+        await reloadAfterMappingDiskChange(error);
+        return;
+      }
       handleWriteRejection(error);
       setStatus(`Clear mapping failed: ${error.message || error}`, "error");
     } finally {

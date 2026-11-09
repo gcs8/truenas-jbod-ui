@@ -74,7 +74,15 @@ from app.services.combined_shelf_ids import (
     combined_mapping_warnings,
     combined_reference_warnings,
 )
-from app.services.mapping_store import MappingStore, resolve_physical_mapping_scope
+from app.services.mapping_store import (
+    MAPPING_REVISION_BINDING_LENGTH,
+    MappingRevisionConflict,
+    MappingSlotDiskChanged,
+    MappingSlotDiskChangedBeforeClear,
+    MappingStore,
+    bind_mapping_revision,
+    resolve_physical_mapping_scope,
+)
 from app.services.profile_registry import (
     ENCLOSURE_SUB_VIEW_PROFILE_IDS,
     ESXI_AOC_SLG4_2H8M2_PROFILE_ID,
@@ -6774,6 +6782,53 @@ class InventoryService:
             reason=None,
         )
 
+    @staticmethod
+    def _slot_disk_binding(slot_view: SlotView | None) -> str:
+        """Digest of the disk in a bay, bound into its editor revisions (#1141).
+
+        The identity is the first strong identifier the bay shows (serial,
+        logical unit id, then persistent id), the same set that decides whether
+        an occupied bay's disk is known. An empty or missing bay binds as empty;
+        an occupied bay without a strong identifier binds as unknown, so a swap
+        between two such disks cannot be told apart. The reusable device name
+        and the bay's SAS address are not part of it.
+        """
+        if slot_view is None or not slot_view.present or slot_view.state == SlotState.empty:
+            identity: list[str | None] = ["empty"]
+        else:
+            identity = ["occupied", None, None]
+            for field_name in STRONG_SLOT_IDENTITY_FIELDS:
+                value = normalize_text(getattr(slot_view, field_name))
+                if value:
+                    identity = ["occupied", field_name, value.casefold()]
+                    break
+        digest = hashlib.sha256(
+            json.dumps(["mapping-slot-disk-v1", *identity], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return digest[:MAPPING_REVISION_BINDING_LENGTH]
+
+    @staticmethod
+    def _refuse_if_slot_disk_changed(
+        expected_revision: str | None,
+        conflict: MappingRevisionConflict,
+        binding: str,
+        changed: type[MappingSlotDiskChanged],
+    ) -> None:
+        """Name a disk change when it alone made the write's revision stale (#1141).
+
+        The store compared the editor's revision with its own current digest
+        bound to the disk the pre-write read found. When the store part still
+        matches, only the disk differs.
+        """
+        split = len(conflict.current_revision) - MAPPING_REVISION_BINDING_LENGTH
+        if (
+            expected_revision is not None
+            and len(expected_revision) == len(conflict.current_revision)
+            and expected_revision[:split] == conflict.current_revision[:split]
+            and expected_revision[split:] != binding
+        ):
+            raise changed(conflict.current_revision) from conflict
+
     async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
         """Read the current view a bay-assignment write is checked against.
 
@@ -6812,7 +6867,17 @@ class InventoryService:
             enclosure_id=enclosure_id,
             **payload,
         )
-        saved = self.mapping_store.save_mapping(mapping, expected_revision=expected_revision)
+        # The editor's revision is bound to the disk it showed; the bay's disk
+        # as the pre-write read found it is bound here, so a write prepared
+        # against another disk is refused before anything is stored (#1141).
+        binding = self._slot_disk_binding(slot_view)
+        try:
+            saved = self.mapping_store.save_mapping(
+                mapping, expected_revision=expected_revision, revision_binding=binding,
+            )
+        except MappingRevisionConflict as conflict:
+            self._refuse_if_slot_disk_changed(expected_revision, conflict, binding, MappingSlotDiskChanged)
+            raise
         if invalidate_snapshot:
             self.invalidate_physical_enclosure_snapshot_cache(
                 reason="save_mapping",
@@ -6838,12 +6903,20 @@ class InventoryService:
         enclosure_id = resolve_physical_mapping_scope(
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
-        cleared = self.mapping_store.clear_mapping(
-            self.system.id,
-            enclosure_id,
-            slot,
-            expected_revision=expected_revision,
-        )
+        binding = self._slot_disk_binding(slot_view)
+        try:
+            cleared = self.mapping_store.clear_mapping(
+                self.system.id,
+                enclosure_id,
+                slot,
+                expected_revision=expected_revision,
+                revision_binding=binding,
+            )
+        except MappingRevisionConflict as conflict:
+            self._refuse_if_slot_disk_changed(
+                expected_revision, conflict, binding, MappingSlotDiskChangedBeforeClear,
+            )
+            raise
         if cleared and invalidate_snapshot:
             self.invalidate_physical_enclosure_snapshot_cache(
                 reason="clear_mapping",
@@ -8410,15 +8483,19 @@ class InventoryService:
             targets,
             loaded_entries=loaded_entries,
         )
+        # Each bay's revisions also bind the disk in it, so an editor opened
+        # on one disk cannot save or clear after another took its place (#1141).
         return [
             slot.model_copy(
                 update={
-                    "mapping_revision": save_revisions[
-                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
-                    ],
-                    "mapping_clear_revision": clear_revisions[
-                        (resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)
-                    ],
+                    "mapping_revision": bind_mapping_revision(
+                        save_revisions[(resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)],
+                        self._slot_disk_binding(slot),
+                    ),
+                    "mapping_clear_revision": bind_mapping_revision(
+                        clear_revisions[(resolve_physical_mapping_scope(slot.enclosure_id), slot.slot)],
+                        self._slot_disk_binding(slot),
+                    ),
                 }
             )
             for slot in slots

@@ -35,6 +35,7 @@ from tests.test_background_refresh_busy_routes import (
     SYSTEM_ID,
     build_service,
     call_app,
+    editor_revision,
 )
 
 # Short bounds keep the suite fast; production values are module constants.
@@ -212,7 +213,7 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
                     ))
                 else:
                     slot = index // 4
-                    revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, slot)
+                    revision = editor_revision(self.service, slot)
                     requests.append(call_app(
                         self.application,
                         "POST",
@@ -261,7 +262,7 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
             # As after a locate press: the page's sources are being re-read and
             # that call hangs, while the shelf's snapshot is still current.
             await self.start_hung_source_refresh()
-            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            revision = editor_revision(self.service, 0)
             status, headers, content = await asyncio.wait_for(call_app(
                 self.application,
                 "POST",
@@ -299,7 +300,7 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
         self.assert_budget_respected()
 
     async def test_bay_assignment_clear_answers_within_the_bound(self) -> None:
-        revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+        revision = editor_revision(self.service, 0)
         status, _headers, content = await call_app(
             self.application,
             "POST",
@@ -311,7 +312,7 @@ class UserRequestsWaitingOnAHungRefreshTests(RefreshDeadlineTests):
         reads = self.appliance.reads
         with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
             await self.start_hung_source_refresh()
-            clear_revision = self.service.mapping_store.clear_revision(SYSTEM_ID, SHELF, 0)
+            clear_revision = editor_revision(self.service, 0, clear=True)
             status, headers, content = await asyncio.wait_for(call_app(
                 self.application,
                 "DELETE",
@@ -481,7 +482,7 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
 
     def save(self, slot: int, serial: str, revision: str | None = None):
         if revision is None:
-            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, slot)
+            revision = editor_revision(self.service, slot)
         return asyncio.ensure_future(call_app(
             self.application,
             "POST",
@@ -533,7 +534,7 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
         reads = self.appliance.reads
         with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
             await self.start_hung_page_refresh()
-            revision = self.service.mapping_store.clear_revision(SYSTEM_ID, SHELF, 0)
+            revision = editor_revision(self.service, 0, clear=True)
             clear = asyncio.ensure_future(call_app(
                 self.application,
                 "DELETE",
@@ -596,7 +597,7 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
         # much longer configured deadline, and nothing is written.
         await self.abandon_the_running_refresh()
         loop = asyncio.get_running_loop()
-        revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+        revision = editor_revision(self.service, 0)
         with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
             started = loop.time()
             with self.assertRaises(inventory_module.SnapshotRefreshWaitTimeout):
@@ -611,7 +612,7 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
                 await asyncio.wait_for(self.service.clear_mapping(
                     0,
                     selected_enclosure_id=SHELF,
-                    expected_revision=self.service.mapping_store.clear_revision(SYSTEM_ID, SHELF, 0),
+                    expected_revision=editor_revision(self.service, 0, clear=True),
                     invalidate_snapshot=False,
                 ), timeout=ANSWER_CEILING_SECONDS)
         self.assertLess(loop.time() - started, ANSWER_CEILING_SECONDS)
@@ -662,19 +663,20 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
         # running refresh, another tab stores a different assignment.
         with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
             await self.start_hung_page_refresh()
-            stale_revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
-            save = self.save(0, "SANITIZED-SN-0305", revision=stale_revision)
+            save = self.save(0, "SANITIZED-SN-0305", revision=editor_revision(self.service, 0))
             await asyncio.sleep(USER_WAIT_SECONDS * 2)
             self.assertFalse(save.done())
             self.service.mapping_store.save_mapping(
                 ManualMapping(system_id=SYSTEM_ID, slot=0, enclosure_id=SHELF, serial="SANITIZED-SN-0306"),
-                expected_revision=stale_revision,
+                expected_revision=self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0),
             )
             self.appliance.answer.set()
             status, _headers, content = await asyncio.wait_for(save, timeout=ANSWER_CEILING_SECONDS)
         # Joining does not weaken the write's own check (#1121): the editor's
         # superseded view is refused and the other tab's assignment stays.
         self.assertEqual(status, 409, content[:300])
+        # The disk did not change, so the refusal names the assignment change.
+        self.assertEqual(json.loads(content)["error"], "mapping_revision_conflict")
         self.assertEqual(self.stored_serial(0), "SANITIZED-SN-0306")
         await self.settle()
         self.assertEqual(self.appliance.reads, 2)
@@ -685,7 +687,7 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
             await self.start_hung_page_refresh()
             # Four tabs save different bays from the same view of the shelf,
             # while two more press Refresh.
-            revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+            revision = editor_revision(self.service, 0)
             saves = [self.save(slot, f"SANITIZED-SN-{310 + slot:04d}", revision=revision) for slot in range(4)]
             refreshes = [
                 asyncio.ensure_future(call_app(
@@ -726,6 +728,197 @@ class MappingWriteDuringARunningRefreshTests(RefreshDeadlineTests):
         self.assertLessEqual(self.appliance.reads, 2 + len(refreshes) + len(saves) + 1)
         self.assertEqual(self.appliance.limiter.active, 0)
         self.assert_budget_respected()
+
+
+class MappingWriteAfterTheBayDiskChangedTests(RefreshDeadlineTests):
+    """A bay-assignment write is bound to the disk its editor showed (#1141).
+
+    The editor's save and clear revisions carry the identity of the disk that
+    was in the bay. When the write's pre-write read, joined to a running
+    refresh or not, finds another disk in that bay, the write is refused with a
+    409 that says so and nothing is stored, although no other tab changed the
+    saved assignments. Before, the old disk's serial and notes were stored onto
+    the bay, or its notes cleared, against the new disk.
+    """
+
+    DISK_A = "SANITIZED-SN-0400"
+    DISK_B = "SANITIZED-SN-0401"
+    SAVE_DETAIL = "The disk in this bay changed. Reload to see it, then save again."
+    CLEAR_DETAIL = "The disk in this bay changed. Reload to see it, then clear again."
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.disk_serial = self.DISK_A
+        plain_bundle = self.appliance.bundle
+
+        def bundle_with_a_disk(*, late: bool = False) -> inventory_module.InventorySourceBundle:
+            # Raw appliance rows only: the build itself decides which disk sits
+            # in bay 0, as for a real disk swap at the same device name.
+            result = plain_bundle(late=late)
+            result.raw_data.disks = [
+                {"name": "da0", "serial": self.disk_serial, "model": "Synthetic disk", "size": 1_000_000_000},
+            ]
+            return result
+
+        self.appliance.bundle = bundle_with_a_disk
+
+    async def open_editor(self, *, saved_notes: str | None = None):
+        """The page reads the bay with disk A in it, as the editor shows it."""
+        if saved_notes is not None:
+            self.service.mapping_store.save_mapping(
+                ManualMapping(system_id=SYSTEM_ID, enclosure_id=SHELF, slot=0, notes=saved_notes),
+            )
+        snapshot = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
+        bay = next(slot for slot in snapshot.slots if slot.slot == 0)
+        self.assertEqual(bay.serial, self.DISK_A)
+        return bay
+
+    def save_from(self, bay):
+        return asyncio.ensure_future(call_app(
+            self.application,
+            "POST",
+            "/api/slots/0/mapping",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}",
+            body={
+                "expected_revision": bay.mapping_revision,
+                "serial": bay.serial,
+                "device_name": bay.device_name,
+                "notes": "edited against disk A",
+                "clear_identify_after_save": False,
+            },
+        ))
+
+    def clear_from(self, bay):
+        return asyncio.ensure_future(call_app(
+            self.application,
+            "DELETE",
+            "/api/slots/0/mapping",
+            query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&expected_revision={bay.mapping_clear_revision}",
+        ))
+
+    async def write_while_the_running_refresh_reads(self, write, *, release_after: float, serial: str):
+        """Send the write while the page's refresh is held, then let it read `serial`."""
+        # Each round holds a fresh appliance call.
+        self.appliance.answer.clear()
+        self.appliance.hung.clear()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            request = write()
+            await asyncio.sleep(release_after)
+            if release_after > USER_WAIT_SECONDS:
+                self.assertFalse(request.done(), request.result()[2][:300] if request.done() else "")
+            self.disk_serial = serial
+            self.appliance.answer.set()
+            response = await asyncio.wait_for(request, timeout=ANSWER_CEILING_SECONDS)
+        await self.settle()
+        return response
+
+    def cached_bay(self):
+        return next(slot for slot in self.service._cache[SHELF].slots if slot.slot == 0)
+
+    def assert_disk_change_refused(self, response, detail: str) -> None:
+        status, headers, content = response
+        self.assertEqual(status, 409, content[:400])
+        self.assertNotIn("retry-after", headers)
+        payload = json.loads(content)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "mapping_disk_changed")
+        self.assertEqual(payload["detail"], detail)
+        # The refusing read published disk B; the bay shows it, not A's draft.
+        self.assertEqual(self.cached_bay().serial, self.DISK_B)
+
+    async def test_save_is_refused_when_the_joined_refresh_finds_another_disk(self) -> None:
+        bay = await self.open_editor()
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.save_from(bay), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_B,
+        )
+        self.assert_disk_change_refused(response, self.SAVE_DETAIL)
+        self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0))
+        self.assertIsNone(self.cached_bay().notes)
+
+    async def test_save_is_refused_when_a_short_wait_finds_another_disk(self) -> None:
+        # Inherited before #1142: within the short bound the same stale save
+        # was stored as well.
+        bay = await self.open_editor()
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.save_from(bay), release_after=0.05, serial=self.DISK_B,
+        )
+        self.assert_disk_change_refused(response, self.SAVE_DETAIL)
+        self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0))
+
+    async def test_save_is_refused_when_an_earlier_refresh_already_replaced_the_disk(self) -> None:
+        # The editor stayed open on disk A while a refresh published disk B;
+        # the save's pre-write read reuses that current view without waiting.
+        bay = await self.open_editor()
+        self.disk_serial = self.DISK_B
+        await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
+        reads = self.appliance.reads
+        response = await asyncio.wait_for(self.save_from(bay), timeout=ANSWER_CEILING_SECONDS)
+        self.assert_disk_change_refused(response, self.SAVE_DETAIL)
+        self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0))
+        self.assertEqual(self.appliance.reads, reads)
+
+    async def test_clear_is_refused_when_the_joined_refresh_finds_another_disk(self) -> None:
+        bay = await self.open_editor(saved_notes="SANITIZED notes for disk A")
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.clear_from(bay), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_B,
+        )
+        self.assert_disk_change_refused(response, self.CLEAR_DETAIL)
+        self.assertEqual(
+            self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0).notes, "SANITIZED notes for disk A",
+        )
+
+    async def test_clear_is_refused_when_a_short_wait_finds_another_disk(self) -> None:
+        bay = await self.open_editor(saved_notes="SANITIZED notes for disk A")
+        response = await self.write_while_the_running_refresh_reads(
+            lambda: self.clear_from(bay), release_after=0.05, serial=self.DISK_B,
+        )
+        self.assert_disk_change_refused(response, self.CLEAR_DETAIL)
+        self.assertEqual(
+            self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0).notes, "SANITIZED notes for disk A",
+        )
+
+    async def test_save_and_clear_against_the_same_disk_after_a_joined_refresh_are_stored(self) -> None:
+        bay = await self.open_editor()
+        status, _headers, content = await self.write_while_the_running_refresh_reads(
+            lambda: self.save_from(bay), release_after=USER_WAIT_SECONDS * 3, serial=self.DISK_A,
+        )
+        self.assertEqual(status, 200, content[:400])
+        stored = self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0)
+        self.assertEqual((stored.serial, stored.notes), (self.DISK_A, "edited against disk A"))
+
+        bay = next(slot for slot in json.loads(content)["snapshot"]["slots"] if slot["slot"] == 0)
+        self.assertEqual(bay["serial"], self.DISK_A)
+        clear_revision = bay["mapping_clear_revision"]
+        status, _headers, content = await self.write_while_the_running_refresh_reads(
+            lambda: asyncio.ensure_future(call_app(
+                self.application,
+                "DELETE",
+                "/api/slots/0/mapping",
+                query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&expected_revision={clear_revision}",
+            )),
+            release_after=USER_WAIT_SECONDS * 3,
+            serial=self.DISK_A,
+        )
+        self.assertEqual(status, 200, content[:400])
+        self.assertIsNone(self.service.mapping_store.get_mapping(SYSTEM_ID, SHELF, 0))
+
+    async def test_a_disk_change_and_an_assignment_change_differ_in_the_editor_revision(self) -> None:
+        # Swapping the disk changes the bay's save and clear revisions although
+        # nothing in the assignment store changed.
+        bay_a = await self.open_editor()
+        self.disk_serial = self.DISK_B
+        snapshot = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
+        bay_b = next(slot for slot in snapshot.slots if slot.slot == 0)
+        self.assertEqual(bay_b.serial, self.DISK_B)
+        self.assertNotEqual(bay_a.mapping_revision, bay_b.mapping_revision)
+        self.assertNotEqual(bay_a.mapping_clear_revision, bay_b.mapping_clear_revision)
+        # Another bay with no disk change keeps its revisions.
+        other_a = next(slot for slot in self.service._cache[SHELF].slots if slot.slot == 1)
+        self.disk_serial = self.DISK_B
+        snapshot = await self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
+        other_b = next(slot for slot in snapshot.slots if slot.slot == 1)
+        self.assertEqual(other_a.mapping_revision, other_b.mapping_revision)
 
 
 class AbandonedRefreshTests(RefreshDeadlineTests):

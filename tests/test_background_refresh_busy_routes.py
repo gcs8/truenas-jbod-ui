@@ -20,7 +20,7 @@ from app import routes as app_routes
 from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
 from app.models.domain import SourceStatus
 from app.services import inventory as inventory_module
-from app.services.mapping_store import MappingStore
+from app.services.mapping_store import MappingStore, bind_mapping_revision
 from app.services.parsers import ParsedSSHData
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
@@ -67,6 +67,19 @@ class FakeAppliance:
                 )
             finally:
                 self.in_flight -= 1
+
+
+def editor_revision(service: inventory_module.InventoryService, slot: int, *, clear: bool = False) -> str:
+    """The save or clear revision the bay editor holds for `slot` right now.
+
+    That is the store's current revision bound to the disk the cached view of
+    the shelf shows in the bay (#1141), as the page's slot view carries it.
+    """
+    store = service.mapping_store
+    revision = (store.clear_revision if clear else store.save_revision)(SYSTEM_ID, SHELF, slot)
+    cached = service._cache.get(SHELF)
+    bay = next((item for item in cached.slots if item.slot == slot), None) if cached else None
+    return bind_mapping_revision(revision, service._slot_disk_binding(bay))
 
 
 def build_service(temp_dir: str, appliance: FakeAppliance) -> inventory_module.InventoryService:
@@ -189,7 +202,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         await self.service.get_snapshot(selected_enclosure_id=SHELF, allow_stale_cache=True)
         await asyncio.wait_for(self.appliance.holding.wait(), timeout=2)
 
-        revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+        revision = editor_revision(self.service, 0)
         save = asyncio.create_task(call_app(
             self.application,
             "POST",
@@ -230,7 +243,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(building.wait(), timeout=2)
         self.assertTrue(self.service._snapshot_activity.get(SHELF))
 
-        revision = self.service.mapping_store.save_revision(SYSTEM_ID, SHELF, 0)
+        revision = editor_revision(self.service, 0)
         save = asyncio.create_task(call_app(
             self.application,
             "POST",

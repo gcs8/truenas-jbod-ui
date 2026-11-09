@@ -22,6 +22,7 @@ from app import route_support as app_route_support
 from app import routes as app_routes
 from app.models.domain import SystemBackupExportRequest
 from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
+from app.services.mapping_store import bind_mapping_revision
 from app.services.snapshot_export import SnapshotExportBusyError
 
 
@@ -1135,7 +1136,12 @@ class RouteContractTests(unittest.TestCase):
         # Keep snapshot collection synthetic; mapping persistence, bounds, LED
         # aggregation, session sequencing and target preflight remain real.
         service.get_snapshot = AsyncMock(return_value=service._cache["shelf-a"])
-        revision = service.mapping_store.save_revision(service.system.id, "shelf-a", 0)
+        # The bay editor's revision, bound to the disk in bay 0 (#1141).
+        bay = next(slot for slot in service._cache["shelf-a"].slots if slot.slot == 0)
+        revision = bind_mapping_revision(
+            service.mapping_store.save_revision(service.system.id, "shelf-a", 0),
+            service._slot_disk_binding(bay),
+        )
         body.setdefault("expected_revision", revision)
         if body["expected_revision"] is None:
             del body["expected_revision"]
