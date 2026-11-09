@@ -1038,6 +1038,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "qa/offline-snapshot.spec.js",
             "qa/saved-view-selection.spec.js",
             "qa/ui-a11y-narrow-layout.spec.js",
+            "qa/ui-coverage.spec.js",
             "qa/ui-scope-safety.spec.js",
             "qa/upgrade-notice.spec.js",
         ):

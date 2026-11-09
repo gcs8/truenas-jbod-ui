@@ -1,0 +1,603 @@
+{
+  "schema": 1,
+  "about": "UI state inventory for the coverage crawler (qa/ui-crawl). Every interactive control in the templates and browser scripts must be named in a state's `covers` list or in `ignored_controls`; qa/ui-coverage.spec.js fails otherwise. `covers` means the state renders the control (and actuates it when the steps say so). See CONTRIBUTING.md, UI coverage.",
+  "widths": {
+    "release": [1600, 1920, 3840, 390],
+    "pr": [1600, 1920, 3840],
+    "ci": [1600, 3840]
+  },
+  "safety_classes": {
+    "read": "Looks only. The crawler's network guard admits only exact routes the reviewed manifest (qa/ui-routes.json) classes as read or read-post that the page's own scripts can send on the target's scope kind (generated: qa/ui-read-reach.json), bound to the target's system, enclosure and storage view; any other route, any unknown route and any forced appliance refresh is aborted and fails the run.",
+    "app-write-revert": "Changes app-local state only (names, notes, display preferences, saved views/page order). The crawler records the original value and reads the store through the app's read API (`semantic_reads`), performs the write, performs the exact `revert` steps immediately, then reloads and re-reads to verify the original is back and the store reads back equal. Only the requests in `writes` are admitted, only while the state runs, and only for the write system, the target enclosure and the captured bay.",
+    "led": "Turns a bay's identify (locate) light on and then off, and verifies it reads back off. Only POST .../led with IDENTIFY then CLEAR for the selected bay is admitted.",
+    "forbidden": "Would change an appliance or array beyond the identify LED, an account or sudo, start a SMART test, back up or restore, purge or adopt history, or save configuration that reaches appliances. Listed for completeness and never actuated. With `confirm_preview` the crawler may press the control only to render a harmless native confirmation, which it always dismisses; the guard aborts the request in any case."
+  },
+  "pages": {
+    "main": {
+      "service": "ui", "path": "/", "ready": "main", "scopes": true, "description": "Enclosure page: chassis face, bay details, heat map, history drawer, connections panel, mapping, export.",
+      "reads": [{"method": "GET", "path": "/", "query": ["system_id", "enclosure_id", "storage_view_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}],
+      "load_requests": [
+        {"method": "GET", "path": "/api/inventory", "force": true, "max": 1, "platforms": ["quantastor"], "why": "QuantaStor pages with LED-capable bays queue one forced inventory read at startup to re-check locate lights (app.js queueIdentifyVerify(\"startup\")). It is the page load's own request, so every state on a QuantaStor target inherits it: admitted only in the window of that page load, once per load, bound to the target's system and enclosure (Sol #1108)."},
+        {"method": "GET", "path": "/api/storage-views", "force": true, "max": 1, "platforms": ["quantastor"], "why": "The same startup refresh then reloads the storage-view runtime with force (refreshSnapshot -> fetchStorageViewRuntime(force)) once the inventory answers; same window, once per load, bound to the target."}
+      ],
+      "selection": {
+        "why": "Controls whose press selects a bay (a selectBay step, or pressing one of `controls`, whose handlers call selectSlot()); derived per state in qa/ui-crawl/inventory.js selectsBay(). The bay detail then asks for that bay's SMART summary directly (renderLiveSlotDetail -> ensureSmartSummary), even before the batch prefetch. That read is no longer declared here: it is generated from app.js for the main page (qa/ui-read-reach.json, D-TNJ-20261109-CRAWLER-SWEEP) and bound to the target's system and enclosure. The browser test crawls every selecting state on a page whose prefetch has not started.",
+        "controls": ["[data-topology-slot]", "[data-sas-fabric-trace]", "[data-sas-fabric-slot]", "#search-box"]
+      }
+    },
+    "fabric": {"service": "ui", "path": "/sas-fabric", "ready": "fabric", "scopes": "enclosures", "description": "Storage Fabric page: Storage Lanes, Impact Map, Physical Trace and Disk Path tabs with the inspector.", "reads": [{"method": "GET", "path": "/sas-fabric", "query": ["system_id", "enclosure_id"]}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]},
+    "history": {"service": "history", "path": "/", "ready": "history", "description": "History sidecar dashboard.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}, {"method": "GET", "path": "/healthz", "query": []}]},
+    "admin": {"service": "admin", "path": "/", "ready": "admin", "description": "Admin sidecar: Setup + Maintenance, Backups, Enclosure / Profile Builder.", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]},
+    "offline": {"service": "offline", "path": "/", "ready": "main", "description": "Offline snapshot export (the downloaded single-file copy and the public demo).", "reads": [{"method": "GET", "path": "/", "query": []}, {"method": "GET", "path": "/copy-{n}", "query": []}, {"method": "GET", "path": "/static/{path:path}", "query": ["v"]}]}
+  },
+  "selections": {
+    "healthy": ".slot-tile.state-healthy[data-slot]",
+    "empty": ".slot-tile.state-empty[data-slot]",
+    "fault": ".slot-tile.state-fault[data-slot]",
+    "unknown": ".slot-tile:is(.state-unknown, .state-unmapped)[data-slot]",
+    "identify": ".slot-tile.state-identify[data-slot]"
+  },
+  "states": [
+    {
+      "id": "main.default", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "steps": [],
+      "covers": ["#system-select", "#enclosure-select", "#app-version-note", "#search-box", "#auto-refresh-toggle", "#refresh-interval-select", "#heatmap-toggle-button", "#sas-fabric-toggle-button", "#enclosure-alias-edit-button", "#export-snapshot-button", "#export-mappings-button", "#import-mappings-button", "#mapping-import-file", "#prefill-mapping-button", "[data-slot]", "#sas-fabric-view-link", "a\"System Setup\"@(root)", "button\"System Setup\"@#admin-launch-stopped"]
+    },
+    {
+      "id": "main.summary-open", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"open": "#inventory-evidence-disclosure"}],
+      "covers": ["#inventory-evidence-disclosure"]
+    },
+    {
+      "id": "main.search", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"fill": "#search-box", "text": "sd"}, {"wait": 400}],
+      "covers": ["#search-box", "#search-clear"]
+    },
+    {
+      "id": "main.select", "page": "main", "safety": "read", "ci": true,
+      "matrix": {"selection": ["healthy", "empty", "fault", "unknown"]},
+      "steps": [{"selectBay": "{selection}"}, {"wait": 600}],
+      "covers": ["[data-slot]", "[data-copy]", "#history-toggle-button", "[data-led-action=IDENTIFY]", "[data-led-action=CLEAR]", "[data-topology-slot]", "[data-path-pill]"]
+    },
+    {
+      "id": "main.select.smart-open", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": ".detail-smart-details", "timeoutMs": 20000}, {"open": ".detail-smart-details"}],
+      "covers": [".detail-smart-details"]
+    },
+    {
+      "id": "main.select.topology", "page": "main", "safety": "read",
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "[data-topology-slot]"}, {"clickIfPresent": "[data-topology-slot]:not(.is-selected)"}, {"wait": 600}],
+      "covers": ["[data-topology-slot]"]
+    },
+    {
+      "id": "main.tooltip", "page": "main", "safety": "read",
+      "steps": [{"hover": ".slot-tile.state-healthy[data-slot]"}, {"wait": 400}],
+      "covers": ["[data-slot]"]
+    },
+    {
+      "id": "main.heatmap", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-toggle-button", "#heatmap-metric-select", "#heatmap-scale-slider"]
+    },
+    {
+      "id": "main.heatmap.temperature", "page": "main", "safety": "read", "scope": "all", "ci": true,
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select", "#heatmap-colour-select"]
+    },
+    {
+      "id": "main.heatmap.relative", "page": "main", "safety": "read", "ci": true,
+      "description": "Relative colours stretch from the coolest to the warmest bay by design, so heat-map findings are reported as warnings here.",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-colour-select"}, {"select": "#heatmap-colour-select", "value": "relative"}, {"wait": 800}],
+      "covers": ["#heatmap-colour-select"]
+    },
+    {
+      "id": "main.heatmap.metric", "page": "main", "safety": "read",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"forEachOption": "#heatmap-metric-select", "max": 16}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
+    },
+    {
+      "id": "main.heatmap.timeline", "page": "main", "safety": "read", "ci": true,
+      "description": "Timeline playback exists only for metrics with history samples (app.js heatmapMetricSupportsTimeline), so the state picks temperature first; on a storage-view scope it reads the view's history (Codex #1108).",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_c"}, {"requireVisible": "#heatmap-playback-select"}, {"selectIfVisible": "#heatmap-playback-select", "value": "timeline"}, {"wait": 1500}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-playback-select", "#heatmap-timeframe-select", "#heatmap-scrub-slider"]
+    },
+    {
+      "id": "main.heatmap.scale-max", "page": "main", "safety": "read",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"setRange": "#heatmap-scale-slider", "value": "2"}, {"wait": 600}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-scale-slider"]
+    },
+    {
+      "id": "main.heatmap.select", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"selectBay": "healthy"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["[data-slot]"]
+    },
+    {
+      "id": "main.history", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"wait": 2500}],
+      "covers": ["#history-toggle-button", "#history-timeframe-select", "#history-close-button", "#history-retry-button", "[data-history-io-mode=total]", "[data-history-io-mode=average]"]
+    },
+    {
+      "id": "main.history.rate", "page": "main", "safety": "read",
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"clickIfPresent": "[data-history-io-mode=average]"}, {"wait": 1500}],
+      "covers": ["[data-history-io-mode=average]"]
+    },
+    {
+      "id": "main.history.window", "page": "main", "safety": "read",
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#history-toggle-button"}, {"click": "#history-toggle-button"}, {"waitFor": "#detail-history-panel:not(.hidden)"}, {"select": "#history-timeframe-select", "value": "168"}, {"wait": 2500}],
+      "covers": ["#history-timeframe-select"]
+    },
+    {
+      "id": "main.connections", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"wait": 2500}],
+      "covers": ["#sas-fabric-toggle-button", "#sas-fabric-show-all-button", "#sas-fabric-view-link", "[data-sas-fabric-node]", "[data-sas-fabric-trace]", "[data-sas-fabric-slot]", "[data-sas-fabric-expand-slots]"]
+    },
+    {
+      "id": "main.connections.select", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"wait": 2000}, {"clickIfPresent": "[data-sas-fabric-trace]"}, {"wait": 800}, {"clickIfPresent": "[data-sas-fabric-expand-slots]"}, {"wait": 600}],
+      "covers": ["[data-sas-fabric-trace]", "[data-sas-fabric-expand-slots]", "#sas-fabric-show-all-button"]
+    },
+    {
+      "id": "main.connections.refresh", "page": "main", "safety": "read", "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
+      "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"click": "#sas-fabric-refresh-button"}, {"wait": 2500}],
+      "covers": ["#sas-fabric-refresh-button"]
+    },
+    {
+      "id": "main.platform-details", "page": "main", "safety": "read",
+      "requires": "#platform-details-toggle-button:not(.hidden)",
+      "steps": [{"click": "#platform-details-toggle-button"}, {"waitFor": "#platform-details-panel:not(.hidden)"}, {"clickIfPresent": "[data-platform-details-section-toggle]"}, {"wait": 600}],
+      "covers": ["#platform-details-toggle-button", "[data-platform-details-section-toggle]"]
+    },
+    {
+      "id": "main.rename.editor", "page": "main", "safety": "read", "ci": true,
+      "requires": "#enclosure-alias-edit-button:not(.hidden)",
+      "steps": [{"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"}],
+      "covers": ["#enclosure-alias-edit-button", "#enclosure-alias-input", "button\"Save\"@#enclosure-alias-form", "#enclosure-alias-clear", "#enclosure-alias-cancel"]
+    },
+    {
+      "id": "main.rename.save", "page": "main", "safety": "app-write-revert",
+      "requires": "#enclosure-alias-edit-button:not(.hidden)",
+      "capture": [
+        {"read": "#enclosure-select", "as": "object_id", "prefix": "enclosure:", "before": "::"},
+        {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
+        {"read": "#enclosure-alias-input", "as": "alias"}, {"click": "#enclosure-alias-cancel"}
+      ],
+      "steps": [
+        {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
+        {"fill": "#enclosure-alias-input", "text": "UI coverage probe"},
+        {"click": "#enclosure-alias-form button[type=submit]"},
+        {"waitResponse": {"method": "POST", "path": "/api/sas-fabric/aliases"}},
+        {"waitFor": "#enclosure-alias-edit-button:not(.hidden)"}
+      ],
+      "revert": [
+        {"reload": true},
+        {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
+        {"fill": "#enclosure-alias-input", "text": "{alias}"},
+        {"click": "#enclosure-alias-form button[type=submit]"},
+        {"waitResponse": {"method": "POST", "path": "/api/sas-fabric/aliases"}},
+        {"waitFor": "#enclosure-alias-edit-button:not(.hidden)"}
+      ],
+      "verify": [
+        {"reload": true},
+        {"click": "#enclosure-alias-edit-button"}, {"waitFor": "#enclosure-alias-form:not(.hidden)"},
+        {"expectValue": "#enclosure-alias-input", "equals": "{alias}"}, {"click": "#enclosure-alias-cancel"}
+      ],
+      "semantic_reads": [{"path": "/api/sas-fabric", "pick": "aliases", "ignore": ["updated_at"]}],
+      "writes": [
+        {"method": "POST", "path": "/api/sas-fabric/aliases", "body_json": {"object_kind": "enclosure", "scope": "system", "object_id": "{object_id}"}, "max": 4},
+        {"method": "GET", "path": "/api/inventory", "force": true, "max": 8},
+        {"method": "GET", "path": "/api/storage-views", "force": true, "max": 8}
+      ],
+      "covers": ["button\"Save\"@#enclosure-alias-form"]
+    },
+    {
+      "id": "main.mapping.form", "page": "main", "safety": "read", "ci": true,
+      "description": "A storage-view slot has no bay assignment form, so on a storage-view scope (a system whose first scope is a view) this state is not applicable.",
+      "steps": [{"selectBay": "healthy"}, {"requireVisible": "#mapping-form:not(.hidden)", "timeoutMs": 20000}],
+      "covers": ["#prefill-mapping-button", "[name=serial]", "[name=device_name]", "[name=gptid]", "[name=notes]", "[name=clear_identify_after_save]", "button\"Save assignment\"@#mapping-form", "#clear-mapping-button", "#export-mappings-button", "#import-mappings-button"]
+    },
+    {
+      "id": "main.mapping.notes", "page": "main", "safety": "app-write-revert",
+      "requires": ".slot-tile.state-healthy[data-slot]",
+      "precondition": {"selectBay": "healthy", "noManualMapping": true},
+      "capture": [{"selectBay": "healthy"}, {"waitFor": "#mapping-form:not(.hidden)"}, {"read": "#detail-kv-grid", "as": "detailText"}],
+      "steps": [
+        {"selectBay": "healthy"}, {"waitFor": "#mapping-form:not(.hidden)"},
+        {"click": "#prefill-mapping-button"},
+        {"uncheck": "[name=clear_identify_after_save]"},
+        {"fill": "[name=notes]", "text": "UI coverage probe"},
+        {"click": "#mapping-form button[type=submit]"},
+        {"waitResponse": {"method": "POST", "path": "/api/slots/*/mapping"}}
+      ],
+      "revert": [
+        {"reload": true},
+        {"selectBay": "same"}, {"waitFor": "#mapping-form:not(.hidden)"},
+        {"acceptNextDialog": true},
+        {"click": "#clear-mapping-button"},
+        {"waitResponse": {"method": "DELETE", "path": "/api/slots/*/mapping"}}
+      ],
+      "verify": [{"reload": true}, {"selectBay": "same"}, {"waitFor": "#mapping-form:not(.hidden)"}, {"expectValue": "[name=notes]", "equals": ""}],
+      "semantic_reads": [{"path": "/api/mappings/export", "pick": "mappings"}],
+      "writes": [
+        {"method": "POST", "path": "/api/slots/{slot}/mapping", "max": 1, "body_excludes": "\"clear_identify_after_save\":true"},
+        {"method": "DELETE", "path": "/api/slots/{slot}/mapping", "query": ["expected_revision"], "max": 3},
+        {"method": "GET", "path": "/api/inventory", "force": true, "max": 8},
+        {"method": "GET", "path": "/api/storage-views", "force": true, "max": 8}
+      ],
+      "covers": ["button\"Save assignment\"@#mapping-form", "#clear-mapping-button", "[name=notes]"]
+    },
+    {
+      "id": "main.led", "page": "main", "safety": "led",
+      "requires": ".slot-tile.state-healthy[data-slot]",
+      "capture": [{"selectBay": "healthy"}, {"waitFor": "#detail-led-controls:not(.hidden)"}],
+      "steps": [
+        {"selectBay": "same"}, {"waitFor": "#detail-led-controls:not(.hidden)"},
+        {"click": "[data-led-action=IDENTIFY]"},
+        {"waitResponse": {"method": "POST", "path": "/api/slots/*/led"}}
+      ],
+      "revert": [
+        {"click": "[data-led-action=CLEAR]"},
+        {"waitResponse": {"method": "POST", "path": "/api/slots/*/led"}}
+      ],
+      "verify": [{"ledOff": true}],
+      "writes": [
+        {"method": "POST", "path": "/api/slots/{slot}/led", "body_json": {"action": "IDENTIFY"}, "max": 1},
+        {"method": "POST", "path": "/api/slots/{slot}/led", "body_json": {"action": "CLEAR"}, "max": 3}
+      ],
+      "covers": ["[data-led-action=IDENTIFY]", "[data-led-action=CLEAR]"]
+    },
+    {
+      "id": "main.export.dialog", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"wait": 1500}],
+      "covers": ["#export-snapshot-button", "#export-snapshot-dialog", "#export-redact-toggle", "#export-packaging-select", "#export-allow-oversize-toggle", "#export-include-enclosures-toggle", "#export-include-views-toggle", "#export-snapshot-cancel", "#export-snapshot-confirm"]
+    },
+    {
+      "id": "main.export.scope", "page": "main", "safety": "read", "ci": true,
+      "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"check": "#export-include-enclosures-toggle"}, {"check": "#export-include-views-toggle"}, {"wait": 1500}],
+      "covers": ["#export-include-enclosures-toggle", "#export-include-views-toggle", "[data-export-enclosure-id]", "[data-export-storage-view-id]", "input\"checkbox\"@app/static/app.js"]
+    },
+    {
+      "id": "main.export.download", "page": "main", "safety": "read", "heavy": true,
+      "steps": [{"click": "#export-snapshot-button"}, {"waitFor": "#export-snapshot-dialog[open]"}, {"select": "#export-packaging-select", "value": "html"}, {"download": "#export-snapshot-confirm", "as": "offline"}],
+      "read_requests": [{"method": "POST", "path": "/api/export/enclosure-snapshot"}],
+      "covers": ["#export-snapshot-confirm", "#export-packaging-select"]
+    },
+    {
+      "id": "main.refresh-now", "page": "main", "safety": "read", "appliance_load": true,
+      "follow_up_ms": 30000,
+      "follow_up_why": "Refresh sends a forced inventory read, and the forced storage-view read only once that answers (refreshSnapshot); on a slow appliance the inventory answer can come after the steps' fixed wait (#1128). For 30 s after the steps end, and only until the next navigation, the declared forced reads with budget left stay admitted; nothing else, and a follow-up later than that is a hard failure.",
+      "read_requests": [{"method": "GET", "path": "/api/inventory", "force": true, "max": 2}, {"method": "GET", "path": "/api/storage-views", "force": true, "max": 2}, {"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
+      "steps": [{"click": "#refresh-button"}, {"wait": 2500}],
+      "covers": ["#refresh-button"]
+    },
+    {
+      "id": "main.disk-sync", "page": "main", "safety": "forbidden", "confirm_preview": true,
+      "requires": "#disk-inventory-sync-multipath-button",
+      "reason": "Runs a disk sync on the appliance.",
+      "steps": [{"click": "#disk-inventory-sync-multipath-button"}],
+      "covers": ["#disk-inventory-sync-multipath-button", "#disk-inventory-sync-full-button"]
+    },
+    {
+      "id": "main.mapping.restore", "page": "main", "safety": "forbidden",
+      "reason": "Restores bay assignments from a backup file.",
+      "covers": ["#import-mappings-button", "#mapping-import-file"]
+    },
+    {
+      "id": "main.upgrade-notice", "page": "main", "safety": "forbidden",
+      "requires": "#upgrade-notice",
+      "reason": "Dismissing is app-local but has no revert path in the UI.",
+      "covers": ["#upgrade-notice-dismiss"]
+    },
+    {
+      "id": "main.storage-views-error", "page": "main", "safety": "read", "fixture_only": true, "ci": true, "variant": "storage-views-error",
+      "description": "Storage-view runtime unavailable: the retry button and note appear. Runs on the fixture variant whose storage-view endpoint fails.",
+      "steps": [{"requireVisible": "#storage-view-runtime-retry"}],
+      "expected_findings": [{"type": "http-error", "text": "503 GET /api/storage-views"}, {"type": "console-error", "text": "status of 503"}],
+      "covers": ["#storage-view-runtime-retry"]
+    },
+    {
+      "id": "main.write-sign-in", "page": "main", "safety": "read", "fixture_only": true, "ci": true, "variant": "write-sign-in",
+      "description": "Read-UI write sign-in panel, shown only when write sign-in is configured (fixture variant with Basic write policy). Signing in is an account action and is never submitted.",
+      "steps": [{"requireVisible": "#read-ui-auth-panel"}],
+      "covers": ["#read-ui-auth-username", "#read-ui-auth-password", "#read-ui-auth-submit", "#read-ui-auth-sign-out"]
+    },
+    {
+      "id": "main.quantastor", "page": "main", "safety": "read", "ci": true, "fixture_only": true, "variant": "quantastor",
+      "description": "QuantaStor system with LED-capable bays (fixture variant). Its page sends the startup forced inventory read that only the page's declared load window admits (Sol #1108); the state then selects a bay.",
+      "steps": [{"selectBay": "healthy"}, {"wait": 600}],
+      "covers": []
+    },
+    {
+      "id": "fabric.lanes", "page": "fabric", "safety": "read", "scope": "all", "ci": true,
+      "steps": [],
+      "covers": ["#fabric-system-select", "#fabric-enclosure-select", "#fabric-mode-lanes", "#fabric-mode-impact", "#fabric-mode-trace", "#fabric-mode-disk", "#fabric-back-button", "#fabric-guide-link", "[data-fabric-node]", "[data-fabric-trace]", "[data-fabric-expand-slots]", "[data-fabric-slot-cell]", "[data-fabric-alias-edit]"]
+    },
+    {
+      "id": "fabric.lanes.select", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"clickIfPresent": "#fabric-map-panel [data-fabric-node]"}, {"wait": 800}],
+      "covers": ["[data-fabric-node]", "[data-fabric-mode-target]"]
+    },
+    {
+      "id": "fabric.lanes.expand", "page": "fabric", "safety": "read",
+      "requires": "[data-fabric-expand-slots]",
+      "steps": [{"click": "[data-fabric-expand-slots]"}, {"wait": 600}],
+      "covers": ["[data-fabric-expand-slots]"]
+    },
+    {
+      "id": "fabric.impact", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-impact"}, {"wait": 1000}],
+      "covers": ["#fabric-mode-impact"]
+    },
+    {
+      "id": "fabric.impact.select", "page": "fabric", "safety": "read",
+      "steps": [{"click": "#fabric-mode-impact"}, {"wait": 800}, {"clickIfPresent": "#fabric-map-panel [data-fabric-trace]"}, {"wait": 800}],
+      "covers": ["[data-fabric-trace]"]
+    },
+    {
+      "id": "fabric.trace", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-trace"}, {"wait": 1000}],
+      "covers": ["#fabric-mode-trace", "[data-fabric-trace-home]"]
+    },
+    {
+      "id": "fabric.trace.drill", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-trace"}, {"wait": 800}, {"clickIfPresent": "#fabric-map-panel [data-fabric-trace]"}, {"wait": 800}, {"clickIfPresent": "[data-fabric-breadcrumb]"}, {"wait": 600}],
+      "covers": ["[data-fabric-breadcrumb]", "[data-fabric-trace-home]"]
+    },
+    {
+      "id": "fabric.disk", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-disk"}, {"wait": 1000}],
+      "covers": ["#fabric-mode-disk"]
+    },
+    {
+      "id": "fabric.disk.bay", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-disk"}, {"wait": 800}, {"clickIfPresent": "#fabric-map-panel .fabric-bay-chip[data-fabric-trace^='bay:']:not(.is-unavailable)"}, {"wait": 1000}],
+      "covers": ["[data-fabric-trace]"]
+    },
+    {
+      "id": "fabric.disk.bay.more", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"click": "#fabric-mode-disk"}, {"wait": 800}, {"clickIfPresent": "#fabric-map-panel .fabric-bay-chip[data-fabric-trace^='bay:']:not(.is-unavailable)"}, {"wait": 1000}, {"openAll": ".disk-path-card-details"}],
+      "covers": [".disk-path-card-details"]
+    },
+    {
+      "id": "fabric.diagnostics", "page": "fabric", "safety": "read", "ci": true,
+      "description": "Disk Path fault evidence and its event tables. The evidence renders only in Disk Path, so the state switches there first and is not applicable only when no evidence shows after the switch.",
+      "steps": [{"click": "#fabric-mode-disk"}, {"wait": 800}, {"requireVisible": "[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-evidence-key]"}, {"openAll": "details[data-fabric-diagnostic-table-key]"}, {"wait": 600}],
+      "covers": ["[data-fabric-evidence-key]", "[data-fabric-diagnostic-table-key]", "[data-fabric-diagnostic-page]", "[data-fabric-diagnostic-page=prev]", "[data-fabric-diagnostic-page=next]", "[data-fabric-diagnostic-filter-key]", "[data-fabric-diagnostic-type-key]", "[data-fabric-diagnostic-severity-key]", "[data-fabric-diagnostic-confidence-key]"]
+    },
+    {
+      "id": "fabric.alias.editor", "page": "fabric", "safety": "read", "ci": true,
+      "steps": [{"clickIfPresent": "#fabric-map-panel [data-fabric-node]"}, {"requireVisible": "[data-fabric-alias-edit]"}, {"click": "[data-fabric-alias-edit]"}, {"wait": 400}],
+      "covers": ["[data-fabric-alias-edit]", "[data-fabric-alias-input]", "[data-fabric-alias-form]", "button\"Save\"@app/static/sas_fabric_view.js", "[data-fabric-alias-clear]", "[data-fabric-alias-cancel]"]
+    },
+    {
+      "id": "fabric.refresh", "page": "fabric", "safety": "read", "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/inventory", "force": true, "max": 2}, {"method": "GET", "path": "/api/sas-fabric", "force": true, "max": 2}],
+      "steps": [{"click": "#fabric-refresh-button"}, {"wait": 2500}],
+      "covers": ["#fabric-refresh-button"]
+    },
+    {
+      "id": "fabric.write-sign-in", "page": "fabric", "safety": "read", "fixture_only": true, "ci": true, "variant": "write-sign-in",
+      "description": "Write sign-in panel on the fabric page (fixture variant with Basic write policy); never submitted.",
+      "steps": [{"requireVisible": "#fabric-read-ui-auth-panel"}],
+      "covers": ["#fabric-read-ui-auth-username", "#fabric-read-ui-auth-password", "#fabric-read-ui-auth-submit", "#fabric-read-ui-auth-sign-out"]
+    },
+    {
+      "id": "history.default", "page": "history", "safety": "read", "ci": true,
+      "steps": [],
+      "covers": [".table-scroll"]
+    },
+    {
+      "id": "history.refresh", "page": "history", "safety": "forbidden",
+      "reason": "Starts a history collection pass that polls every appliance (Archive load rules).",
+      "covers": ["#history-refresh-fast", "#history-refresh-full"]
+    },
+    {
+      "id": "admin.operations", "page": "admin", "safety": "read", "ci": true,
+      "steps": [],
+      "covers": ["#refresh-state-button", "#admin-origin-link", "[data-admin-view-button=operations]", "[data-existing-system-id]", "#existing-system-select", "#existing-system-reset-button", "[data-runtime-behavior-key]", "#runtime-behavior-discard-button", "[data-admin-view-switch=builder]"]
+    },
+    {
+      "id": "admin.system-form", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"openAll": "details"}, {"wait": 400}],
+      "covers": ["#setup-system-label", "#setup-system-id", "#setup-platform", "#setup-profile", "#setup-make-default", "#setup-truenas-host", "#setup-verify-ssl", "#setup-tls-ca-bundle-path", "#setup-tls-server-name", "[data-tls-server-name]", "#setup-enclosure-filter", "#setup-api-key", "#setup-api-user", "#setup-api-password", "#setup-bmc-enabled", "#setup-bmc-host", "#setup-bmc-username", "#setup-bmc-password", "#setup-bmc-verify-ssl", "#setup-bmc-timeout-seconds", "#setup-ssh-enabled", "#setup-ha-enabled", "#setup-ssh-host", "#setup-ssh-user", "#setup-ssh-port", "#setup-ssh-key-mode", "#setup-ssh-key-path", "#setup-ssh-password", "#setup-ssh-sudo-password", "#setup-ssh-strict-host-key", "#setup-ssh-existing-key", "#setup-generate-key-name", "#setup-bootstrap-details", "#setup-bootstrap-enabled", "#setup-bootstrap-host", "#setup-bootstrap-user", "#setup-bootstrap-password", "#setup-bootstrap-key-path", "#setup-bootstrap-service-home", "#setup-bootstrap-install-sudo", "#setup-ssh-commands-details", "#setup-ssh-commands", "#setup-load-recommended-button", "#setup-tls-ca-file", "#setup-tls-ca-pick-button"]
+    },
+    {
+      "id": "admin.system-form.quantastor-ha", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "description": "Unsaved form edit: QuantaStor with SSH and HA on reveals the HA node rows. Nothing is saved.",
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "quantastor"}, {"check": "#setup-ssh-enabled"}, {"check": "#setup-ha-enabled"}, {"requireVisible": "[data-ha-node-host]"}, {"wait": 400}],
+      "covers": ["#setup-platform", "#setup-ha-enabled", "[data-ha-node-system-id=0]", "[data-ha-node-label=0]", "[data-ha-node-host=0]", "[data-ha-node-system-id=1]", "[data-ha-node-label=1]", "[data-ha-node-host=1]", "[data-ha-node-system-id=2]", "[data-ha-node-label=2]", "[data-ha-node-host=2]"]
+    },
+    {
+      "id": "admin.system-form.esxi", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "description": "Unsaved form edit: ESXi with SSH on reveals the StorCLI host-preparation panel. Nothing is uploaded or installed.",
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"select": "#setup-platform", "value": "esxi"}, {"check": "#setup-ssh-enabled"}, {"requireVisible": "#setup-esxi-host-prep-pick-button"}, {"wait": 400}],
+      "covers": ["#setup-platform", "#setup-esxi-host-prep-file", "#setup-esxi-host-prep-pick-button", "#setup-esxi-host-prep-package-select"]
+    },
+    {
+      "id": "admin.system-form.ssh-key", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "description": "Unsaved form edit: each SSH key source reveals its own fields. Generating or refreshing keys is never pressed here.",
+      "matrix": {"mode": ["reuse", "generate", "manual", "none"]},
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"check": "#setup-ssh-enabled"}, {"select": "#setup-ssh-key-mode", "value": "{mode}"}, {"wait": 400}],
+      "covers": ["#setup-ssh-key-mode", "#setup-ssh-existing-key", "#setup-refresh-keys-button", "#setup-generate-key-name", "#setup-generate-key-button", "#setup-ssh-key-path", "#setup-ssh-password"]
+    },
+    {
+      "id": "admin.storage-views.binding", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "description": "Unsaved draft edit: each storage-view binding mode reveals its own fields. Nothing is saved.",
+      "matrix": {"binding": ["auto", "pool", "serial", "hybrid"]},
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"clickIfPresent": "[data-storage-view-id]"}, {"wait": 600}, {"selectIfVisible": "#setup-storage-view-binding-mode", "value": "{binding}"}, {"wait": 400}],
+      "covers": ["#setup-storage-view-binding-mode", "#setup-storage-view-enclosure-ids", "#setup-storage-view-pool-names", "#setup-storage-view-serials", "#setup-storage-view-pcie-addresses", "#setup-storage-view-device-names", "#setup-storage-view-target-system", "#setup-storage-view-profile", "#setup-storage-view-order", "#setup-storage-view-slot-labels", "#setup-storage-view-slot-sizes"]
+    },
+    {
+      "id": "admin.storage-views", "page": "admin", "safety": "read", "ci": true,
+      "appliance_load": true,
+      "read_requests": [{"method": "GET", "path": "/api/admin/storage-views/live-enclosures", "max": 8}, {"method": "GET", "path": "/api/admin/storage-views/candidates", "query": ["target_system_id"], "max": 8}, {"method": "GET", "path": "/api/admin/tls/saved-status", "query": ["system_id"], "max": 1}],
+      "description": "Storage-view and page-order editing in the setup draft. Nothing is saved until Save System, which is forbidden.",
+      "steps": [{"clickIfPresent": "[data-existing-system-id]"}, {"wait": 800}, {"clickIfPresent": "[data-storage-view-id]"}, {"wait": 600}],
+      "covers": ["#setup-view-order-reset-button", "[data-view-order-action]", "[data-view-order-action=up]", "[data-view-order-action=down]", "#setup-storage-view-template", "#setup-storage-view-add-button", "#setup-storage-view-label", "#setup-storage-view-id", "#setup-storage-view-template-select", "#setup-storage-view-profile", "#setup-storage-view-binding-mode", "#setup-storage-view-target-system", "#setup-storage-view-order", "#setup-storage-view-enabled", "#setup-storage-view-show-main", "#setup-storage-view-collapsed", "#setup-storage-view-enclosure-ids", "#setup-storage-view-pool-names", "#setup-storage-view-serials", "#setup-storage-view-pcie-addresses", "#setup-storage-view-device-names", "#setup-storage-view-slot-labels", "#setup-storage-view-slot-sizes", "#setup-storage-view-move-up-button", "#setup-storage-view-move-down-button", "#setup-storage-view-duplicate-button", "#setup-storage-view-remove-button", "[data-storage-view-id]", "[data-storage-view-candidate-id]", "#setup-storage-view-candidates-add-all-button"]
+    },
+    {
+      "id": "admin.appliance-reads", "page": "admin", "safety": "read", "appliance_load": true,
+      "description": "Admin buttons that read from an appliance (TLS inspection, HA node discovery, storage-view candidates, SSH key list).",
+      "covers": ["#setup-inspect-tls-button", "#setup-discover-ha-nodes-button", "#setup-storage-view-candidates-refresh-button", "#setup-refresh-keys-button"]
+    },
+    {
+      "id": "admin.config-save", "page": "admin", "safety": "forbidden",
+      "reason": "Saves configuration that reaches appliances, or changes TLS trust, runtime settings or demo systems.",
+      "covers": ["#setup-create-button", "#setup-create-demo-button", "#setup-trust-remote-tls-button", "#setup-tls-import-ca-button", "#runtime-behavior-save-button", "#existing-system-delete-button", "#existing-system-delete-history-toggle"]
+    },
+    {
+      "id": "admin.account", "page": "admin", "safety": "forbidden",
+      "reason": "Bootstrap, sudo, SSH key generation and host preparation change accounts or the appliance.",
+      "covers": ["#setup-bootstrap-button", "#setup-generate-key-button", "#setup-esxi-host-prep-upload-button", "#setup-esxi-host-prep-install-button"]
+    },
+    {
+      "id": "admin.runtime-actions", "page": "admin", "safety": "forbidden",
+      "reason": "Starts, stops or restarts containers.",
+      "covers": ["[data-runtime-action]", "button\"button\"@admin_service/static/admin.js"]
+    },
+    {
+      "id": "admin.history-maintenance", "page": "admin", "safety": "forbidden",
+      "reason": "Purges or adopts history.",
+      "covers": ["#history-purge-orphaned-button", "#history-adopt-source-select", "#history-adopt-target-select", "#history-adopt-button"]
+    },
+    {
+      "id": "admin.backups", "page": "admin", "safety": "read", "ci": true,
+      "steps": [{"click": "[data-admin-view-button=backups]"}, {"wait": 800}],
+      "covers": ["[data-admin-view-button=backups]", "#backup-library-refresh-button", "#backup-library-edit-button", "[data-backup-action]"]
+    },
+    {
+      "id": "admin.backups.dialog", "page": "admin", "safety": "read", "ci": true,
+      "steps": [{"click": "[data-admin-view-button=backups]"}, {"wait": 600}, {"click": "#backup-library-edit-button"}, {"waitFor": "#backup-library-dialog[open]"}],
+      "covers": ["#backup-library-edit-button", "#backup-library-dialog"]
+    },
+    {
+      "id": "admin.backup-restore", "page": "admin", "safety": "forbidden",
+      "reason": "Creates, exports, imports, cleans up or restores backups and debug bundles.",
+      "covers": ["#backup-packaging", "#backup-encrypt-toggle", "#backup-export-passphrase", "#backup-export-stop-toggle", "#backup-export-restart-toggle", "#backup-export-button", "#debug-packaging", "#debug-scrub-secrets-toggle", "#debug-scrub-identifiers-toggle", "#debug-encrypt-toggle", "#debug-export-passphrase", "#debug-export-stop-toggle", "#debug-export-restart-toggle", "#debug-export-button", "#backup-import-file", "#backup-import-pick-button", "#backup-import-passphrase", "#backup-import-stop-toggle", "#backup-import-restart-toggle", "#backup-import-button", "#backup-library-cleanup-button", "[data-bundle-type]", "[data-path-key]"]
+    },
+    {
+      "id": "admin.builder", "page": "admin", "safety": "read", "ci": true,
+      "steps": [{"click": "[data-admin-view-button=builder]"}, {"wait": 800}],
+      "covers": ["[data-admin-view-button=builder]", "[data-profile-id]", "#profile-builder-load-button", "#profile-builder-reset-button", "#profile-builder-id", "#profile-builder-label", "#profile-builder-eyebrow", "#profile-builder-summary", "#profile-builder-panel-title", "#profile-builder-edge-label", "#profile-builder-face-style", "#profile-builder-latch-edge", "#profile-builder-bay-size", "#profile-builder-rows", "#profile-builder-columns", "#profile-builder-slot-count", "#profile-builder-ordering", "#profile-builder-row-groups", "#profile-builder-layout-text"]
+    },
+    {
+      "id": "admin.builder.profile", "page": "admin", "safety": "read", "ci": true,
+      "steps": [{"click": "[data-admin-view-button=builder]"}, {"wait": 600}, {"clickIfPresent": "[data-profile-id]"}, {"wait": 600}],
+      "covers": ["[data-profile-id]"]
+    },
+    {
+      "id": "admin.builder.custom-layout", "page": "admin", "safety": "read", "ci": true,
+      "description": "Unsaved builder edit: the custom bay-number ordering reveals the layout editor.",
+      "steps": [{"click": "[data-admin-view-button=builder]"}, {"wait": 600}, {"select": "#profile-builder-ordering", "value": "custom-layout"}, {"wait": 400}],
+      "covers": ["#profile-builder-ordering", "#profile-builder-layout-text"]
+    },
+    {
+      "id": "admin.builder.save", "page": "admin", "safety": "forbidden",
+      "reason": "Saving or deleting a custom profile rewrites the profile file every system reads. App-local, but no exact revert exists for an edited built-in.",
+      "covers": ["#profile-builder-save-button", "#profile-builder-delete-button"]
+    },
+    {
+      "id": "offline.default", "page": "offline", "safety": "read", "ci": true,
+      "steps": [],
+      "covers": [".summary-disclosure"]
+    },
+    {
+      "id": "offline.about", "page": "offline", "safety": "read", "ci": true,
+      "steps": [{"openAll": ".snapshot-banner-about"}],
+      "covers": [".summary-disclosure"]
+    },
+    {
+      "id": "offline.heatmap", "page": "offline", "safety": "read", "ci": true,
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-toggle-button"]
+    },
+    {
+      "id": "offline.select", "page": "offline", "safety": "read", "ci": true,
+      "matrix": {"selection": ["healthy", "empty", "fault"]},
+      "steps": [{"selectBay": "{selection}"}, {"wait": 800}],
+      "covers": ["[data-slot]"]
+    },
+    {
+      "id": "offline.history", "page": "offline", "safety": "read", "ci": true,
+      "steps": [{"selectBay": "healthy"}, {"clickIfPresent": "#history-toggle-button:not(.hidden)"}, {"wait": 1500}],
+      "covers": ["#history-toggle-button"]
+    },
+    {
+      "id": "offline.connections", "page": "offline", "safety": "read", "ci": true,
+      "steps": [{"click": "#sas-fabric-toggle-button"}, {"waitFor": "#sas-fabric-panel:not(.hidden)"}, {"wait": 1500}],
+      "covers": ["#sas-fabric-toggle-button"]
+    }
+  ],
+  "ignored_controls": [
+    {"key": "textarea\"\"@app/static/app.js", "reason": "Off-screen clipboard helper created and removed inside the Copy handler; covered through [data-copy]."}
+  ],
+  "runtime_controls": [],
+  "render_gaps": [
+    {"key": "[data-path-pill]", "reason": "Multipath member pills render only for a selected bay that has multipath members; the crawl fixtures have none yet. qa/ui-a11y-narrow-layout.spec.js renders them on a synthetic multipath bay and checks keyboard reveal (#1112)."},
+    {"key": "#backup-import-file", "reason": "Hidden file input; its visible pick button #backup-import-pick-button is rendered and audited."},
+    {"key": "#mapping-import-file", "reason": "Hidden file input; its visible button #import-mappings-button is rendered and audited."},
+    {"key": "#setup-esxi-host-prep-file", "reason": "Hidden file input; its visible pick button #setup-esxi-host-prep-pick-button is rendered (admin.system-form.esxi)."},
+    {"key": "#setup-tls-ca-file", "reason": "Hidden file input; its visible pick button #setup-tls-ca-pick-button is rendered and audited."},
+    {"key": "#read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in, an account action the crawl never performs; the sign-in form renders in the write-sign-in variant."},
+    {"key": "#fabric-read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in (never performed); the fabric sign-in form renders in the write-sign-in variant."},
+    {"key": "#history-retry-button", "reason": "Shown only after a bay history request fails; no fixture variant fails history yet."},
+    {"key": "#platform-details-toggle-button", "reason": "Platform details exist only for platforms with platform data (UniFi, ESXi, QuantaStor); the public demo fixture is a TrueNAS enclosure. Live crawls cover it."},
+    {"key": "[data-platform-details-section-toggle]", "reason": "Same as #platform-details-toggle-button."},
+    {"key": "#setup-storage-view-enclosure-ids", "reason": "Field of live-enclosure storage views; the synthetic admin bootstrap has one manual view."},
+    {"key": "#setup-storage-view-order", "reason": "Field shown for view kinds the synthetic admin bootstrap does not have (one manual view)."},
+    {"key": "#setup-storage-view-pcie-addresses", "reason": "Field of NVMe/PCIe storage views; the synthetic admin bootstrap has one manual view."},
+    {"key": "#setup-storage-view-profile", "reason": "Field of profile-backed storage views; the synthetic admin bootstrap has one manual view."},
+    {"key": "#setup-storage-view-slot-sizes", "reason": "Field of storage views with sized slots; the synthetic admin bootstrap has one manual view."},
+    {"key": "#setup-storage-view-target-system", "reason": "HA-node target of a storage view on an HA system; the synthetic admin system is not HA."},
+    {"key": "#upgrade-notice-dismiss", "reason": "Shown only after a version upgrade; qa/upgrade-notice.spec.js renders and exercises it."},
+    {"key": "[data-bundle-type]", "reason": "Backup/debug path pills come from the admin state's bundle path groups, which the synthetic admin bootstrap does not include."},
+    {"key": "[data-path-key]", "reason": "Same as [data-bundle-type]."},
+    {"key": "[data-export-enclosure-id]", "reason": "Per-enclosure export choices appear only on systems with more than one enclosure; the fixture has one."},
+    {"key": "[data-fabric-breadcrumb]", "reason": "Trace breadcrumbs need a multi-hop trace the public demo fabric does not have."},
+    {"key": "[data-runtime-action]", "reason": "Container controls need the admin runtime API, which the synthetic fixture does not answer (and their actions are forbidden)."},
+    {"key": "[data-runtime-behavior-key]", "reason": "Runtime behaviour editor needs the admin runtime API, which the synthetic fixture does not answer."},
+    {"key": "[data-sas-fabric-expand-slots]", "reason": "Shown only for Connections nodes with more bays than the collapsed row holds; the public demo fabric has none."},
+    {"key": "[data-storage-view-candidate-id]", "reason": "Storage-view candidates are an appliance-load read; the fixture answers an empty list."},
+    {"key": "[data-tls-server-name]", "reason": "TLS server-name suggestions appear only after a TLS inspection (appliance-load, not run)."},
+    {"key": "a\"System Setup\"@(root)", "reason": "Shown only when the admin sidecar is configured (admin_launch_url); the fixture main page has none."},
+    {"key": "button\"System Setup\"@#admin-launch-stopped", "reason": "Shown only when the configured admin sidecar is stopped; the fixture main page has no admin sidecar."}
+  ],
+  "known_findings": [
+    {"state": "main.heatmap*", "type": "text-narrow-wrap", "selector": "#enclosure-panel-title", "issue": 1102},
+    {"state": "fabric.disk*", "type": "text-mid-word-break", "issue": 1102},
+    {"state": "fabric.disk*", "type": "empty-track-squeeze", "issue": 1102},
+    {"state": "fabric.disk*", "type": "text-narrow-wrap", "issue": 1102},
+    {"state": "main.*", "type": "text-mid-word-break", "selector": "#enclosure-panel-title", "issue": 1102},
+    {"state": "main.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
+    {"state": "offline.heatmap*", "type": "heat-tile-contrast", "issue": 1103},
+    {"state": "main.heatmap*", "type": "heat-alarm-healthy-temp", "issue": 1103},
+    {"state": "main.heatmap*", "type": "heat-small-range-spread", "issue": 1103},
+    {"state": "main.*", "type": "text-narrow-wrap", "selector": "#enclosure-panel-title", "issue": 1102},
+    {"state": "*", "type": "axe-label-content-name-mismatch", "issue": 1110},
+    {"state": "main.*", "type": "control-overlap", "selector": "storage-view-slot", "issue": 1114},
+    {"state": "main.*", "type": "control-clipped", "selector": "storage-view-slot", "issue": 1114},
+    {"state": "main.*", "type": "text-narrow-wrap", "selector": "storage-view-runtime-card", "issue": 1114},
+    {"state": "main.*", "type": "text-mid-word-break", "selector": "storage-view-runtime-card", "issue": 1114},
+    {"state": "main.*", "type": "control-overlap", "selector": "div.row-group > button.slot-tile", "issue": 1115},
+    {"state": "history.*", "type": "page-horizontal-overflow", "issue": 1116},
+    {"state": "fabric.disk*", "type": "axe-definition-list", "issue": 1111},
+    {"state": "fabric.disk*", "type": "axe-dlitem", "issue": 1111}
+  ]
+}

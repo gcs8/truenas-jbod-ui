@@ -134,6 +134,36 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   retention URLs may also use an address and port the deployment itself
   publishes (#1097).
 
+### Internal
+
+- Added a UI state inventory with safety classes, a CI check that every
+  interactive control has an inventory entry, and a crawler that checks every
+  state for squeezed or broken text, overflow, clipped controls, contrast,
+  heat-map colour sanity and console errors, with native-resolution review
+  tiles (#1108).
+- Made the UI crawler fail closed: it admits only reviewed backend routes,
+  binds writes to one system, enclosure and bay, checks reverted stores
+  through the app's read API, turns identify lights back off after an
+  interruption and exits non-zero on any safety failure (#1108).
+- Hardened the UI crawler further: an independent watchdog turns an identify
+  light off when its lease expires or the crawler is killed, reads are allowed
+  per state, refresh flags are parsed the way the backend parses them, the
+  BMC locator status counts as an appliance query, rename writes are bound to
+  the target enclosure, and a QuantaStor page's startup refresh is declared
+  instead of failing the crawl (#1108).
+- Identify leases now run on the monotonic clock, and the crawler turns its
+  lights off itself and fails if its watchdog stops; saved storage views'
+  heat-map SMART reads are allowed, and a refresh's delayed follow-up is
+  admitted only within a short declared window (#1108).
+- The UI crawler now allows a selected bay's own SMART read, bound to the
+  target system and enclosure, in every state that selects a bay, and the HA
+  target key on storage-view candidate reads (#1108).
+- The UI crawler's plain reads are now generated from the requests each
+  page's scripts can send, per page and scope kind, and admitted only for the
+  target's system, enclosure and storage view; a saved storage view's
+  heat-map history is allowed. Appliance polls, writes and identify lights
+  stay declared per state (#1108).
+
 ## v0.24.0-beta.6 - 2026-11-07
 
 This prerelease adds the changes merged after `v0.24.0-beta.5`. GHCR gets the
