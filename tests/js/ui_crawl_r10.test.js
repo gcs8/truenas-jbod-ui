@@ -52,7 +52,10 @@ function liveBind(target) {
   return Crawler.prototype.bindFor.call({ fixtureMode: false, writeSystem: null }, target);
 }
 
-const viewTarget = (viewEnclosure) => ({ page: "main", system: "sys-a", url: `${UI}/?system_id=sys-a&storage_view_id=view-a`, ...(viewEnclosure === undefined ? {} : { viewEnclosure }) });
+// A view target whose view resolved against the page's own enclosure (the
+// common case: backing enclosure == the page's live enclosure). Views bound
+// elsewhere (a QuantaStor HA partner, a snapshot view) are in ui_crawl_r12.
+const viewTarget = (viewEnclosure) => ({ page: "main", system: "sys-a", url: `${UI}/?system_id=sys-a&storage_view_id=view-a`, ...(viewEnclosure === undefined ? {} : { pageEnclosure: viewEnclosure, viewEnclosure, viewSource: "inventory_binding" }) });
 const get = (g, url) => g.admit({ method: "GET", url });
 
 // --------------------------------------------- DayBreak-Blue's exact probe --
@@ -159,7 +162,10 @@ test("SVBIND: liveTargets carries each storage view's bound enclosure into its t
   assert.equal(byView["view-b"].viewEnclosure, "enc-1");
   assert.equal(byView["view-c"].viewEnclosure, null);
   for (const target of main.filter((t) => !/storage_view_id=/.test(t.url))) assert.equal("viewEnclosure" in target, false, target.label);
-  assert.equal(liveBind(byView["view-c"]).enclosure_id, null);
+  // beta.7 QA: every view target binds the enclosure its page sends (the
+  // default snapshot's), whatever enclosure its view names.
+  for (const id of ["view-a", "view-b", "view-c"]) assert.equal(byView[id].pageEnclosure, "enc-1", id);
+  assert.equal(liveBind(byView["view-c"]).enclosure_id, "enc-1");
   assert.equal(liveBind(byView["view-a"]).enclosure_id, "enc-1");
 });
 
