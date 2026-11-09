@@ -38,6 +38,22 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   `SQLITE_TMPDIR` for the history service still overrides it. Backups and
   exports never include the folder (#1094, #1095).
 
+### Added
+
+- Added SAS expander PHY error counters to Storage Fabric on TrueNAS CORE. The
+  app reads each expander's PHY error log when the service account may, and
+  says "Expander counters not available (permission not granted)" when it may
+  not; a PHY it could not read shows as unknown, never zero. The admin
+  bootstrap now grants one read-only `camcontrol smpcmd` rule for this by
+  default; re-run bootstrap on an existing CORE account to add it, then press
+  Refresh, which checks the grant with one sudo call. Each expander is read at
+  most once every 15 minutes, Refresh included, and one refresh makes at most
+  512 such calls, four PHYs per SSH command. An expander that stops answering
+  ends its read at that point (about one 3-second timeout) and is marked as not
+  answering, and an oversized or malformed answer is discarded and shown as an
+  error. In between, the last reading is shown with its read time; the app
+  keeps only decoded readings, for at most 64 expanders and 4,096 PHYs (#1088).
+
 ### Fixed
 
 - Fixed page reloads and bay-assignment saves waiting with no limit when the
@@ -166,19 +182,6 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
   other, with lane count and negotiated rate, and stays null when either end's
   rows are missing or disagree. It does not claim cable count or width
   (#1086).
-- Added SAS expander PHY error counters to Storage Fabric on TrueNAS CORE. The
-  app reads each expander's PHY error log when the service account may, and
-  says "Expander counters not available (permission not granted)" when it may
-  not; a PHY it could not read shows as unknown, never zero. The admin
-  bootstrap now grants one read-only `camcontrol smpcmd` rule for this by
-  default; re-run bootstrap on an existing CORE account to add it, then press
-  Refresh, which checks the grant with one sudo call. Each expander is read at
-  most once every 15 minutes, Refresh included, and one refresh makes at most
-  512 such calls, four PHYs per SSH command. An expander that stops answering
-  ends its read at that point (about one 3-second timeout) and is marked as not
-  answering, and an oversized or malformed answer is discarded and shown as an
-  error. In between, the last reading is shown with its read time; the app
-  keeps only decoded readings, for at most 64 expanders and 4,096 PHYs (#1088).
 
 ### Fixed
 
@@ -215,9 +218,9 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
 
 ### Internal
 
-- Added an SMP REPORT PHY ERROR LOG response decoder and per-phy counter
-  delta helper with strict frame validation, reset and saturation handling
-  (#1084).
+- Added an inactive, unwired SMP REPORT PHY ERROR LOG response decoder and
+  per-phy counter delta helper with strict frame validation, reset and
+  saturation handling; no grant, collector or UI changed (#1084).
 
 ### Docs
 
