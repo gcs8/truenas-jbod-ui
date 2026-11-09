@@ -5,7 +5,7 @@ import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import quote, unquote
 
 from app.config import SystemConfig
@@ -24,18 +24,22 @@ from app.models.domain import (
 from app.services.core_expander_counters import (
     CAPABILITY_DENIED as SMP_CAPABILITY_DENIED,
     COUNTER_FIELDS as SMP_COUNTER_FIELDS,
+    HUNG_MESSAGE as SMP_HUNG_MESSAGE,
     NO_ANSWER_MESSAGE as SMP_NO_ANSWER_MESSAGE,
     NO_ROUTE_MESSAGE as SMP_NO_ROUTE_MESSAGE,
     NOT_READ_MESSAGE as SMP_NOT_READ_MESSAGE,
     PERMISSION_DENIED_MESSAGE as SMP_PERMISSION_DENIED_MESSAGE,
     READ_BUDGET_MESSAGE as SMP_READ_BUDGET_MESSAGE,
     READ_BUDGET_REASON as SMP_READ_BUDGET_REASON,
+    REJECTED_OUTPUT_MESSAGE as SMP_REJECTED_OUTPUT_MESSAGE,
+    STOP_REASON_LABELS as SMP_STOP_REASON_LABELS,
+    KeptCounterRead,
     SMP_MAX_CALLS_PER_REFRESH,
     SMP_MAX_TARGETS_PER_REFRESH,
     SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX,
     counter_summary as smp_counter_summary,
     discover_smp_targets,
-    parse_phy_error_log_output,
+    parse_chunk_output,
 )
 from app.services.parsers import canonicalize_ssh_command, normalize_text, parse_camcontrol_devlist
 from app.services.sas_fabric_parsers import (
@@ -130,9 +134,10 @@ class SasFabricBuildContext:
     # CORE expander PHY error counter capability last seen by the collector
     # (#941): "granted", "permission_denied" or None when not yet known.
     expander_counter_capability: str | None = None
-    # Kept full counter reads by output key: (stdout, UTC read time). Shown
-    # until the expander is due for its next read (#1088 review).
-    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None
+    # Kept counter readings by (unit, expander SAS address): decoded rows
+    # with their UTC read time, shown until the expander is due for its next
+    # read (#1088 review).
+    expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None
 
 
 class SasFabricBuilder(Protocol):
@@ -183,7 +188,7 @@ def _build_sas_fabric_context(
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
-    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None,
+    expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
 ) -> SasFabricBuildContext:
     return SasFabricBuildContext(
         system=system,
@@ -217,7 +222,7 @@ def build_sas_fabric_snapshot(
     command_failures: list[dict[str, Any]] | None = None,
     aliases: list[SasFabricAlias] | None = None,
     expander_counter_capability: str | None = None,
-    expander_counter_reads: Mapping[str, tuple[str, str]] | None = None,
+    expander_counter_reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
 ) -> SasFabricSnapshot:
     context = _build_sas_fabric_context(
         system=system,
@@ -3175,81 +3180,94 @@ def _smp_output_span(command: str) -> int:
 def _merged_phy_error_log_rows(
     outputs: dict[str, str],
     routed: dict[tuple[int, str], Any],
+    kept: Mapping[tuple[int, str], KeptCounterRead],
 ) -> dict[tuple[int, str], dict[int, dict[str, Any]]]:
     """Counter rows per (unit, expander address).
 
-    Only an output read through the pass device this refresh's topology routes
-    to that expander counts. A measured row wins over an unknown one, and when
-    both the probe and the full read measured a PHY, the full read wins.
+    Only output read through the pass device this refresh's topology routes
+    to that expander counts, and each output is validated against the key it
+    was asked for (parse_chunk_output()): oversized or malformed output reads
+    as ``rejected_output``, never as counters. An expander with a kept
+    reading takes its full-read rows from it (the collector keeps exactly
+    what it read, decoded) and only the one-PHY probe from this refresh's
+    output. A measured row wins over an unknown one, and when both the probe
+    and the full read measured a PHY, the full read wins.
     """
     merged: dict[tuple[int, str], dict[int, dict[str, Any]]] = {}
+
+    def add(key: tuple[int, str], rows: Iterable[dict[str, Any]]) -> None:
+        current = merged.setdefault(key, {})
+        for row in rows:
+            existing = current.get(row["phy"])
+            if existing is None or existing.get("counter_state") != "measured" or row["counter_state"] == "measured":
+                current[row["phy"]] = row
+
     smp_outputs = [
         (command, stdout) for command, stdout in outputs.items()
         if command.startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX)
     ]
     for command, stdout in sorted(smp_outputs, key=lambda item: (_smp_output_span(item[0]), item[0])):
-        parsed = parse_phy_error_log_output(stdout)
-        if parsed.unit is None or parsed.expander_sas_address is None:
+        parsed = parse_chunk_output(command, stdout)
+        if parsed is None or parsed.unit is None or parsed.expander_sas_address is None:
             continue
         key = (parsed.unit, parsed.expander_sas_address)
         target = routed.get(key)
         if target is None or target.device != parsed.device:
             continue
-        rows = merged.setdefault(key, {})
-        for row in parsed.rows:
-            existing = rows.get(row["phy"])
-            if existing is None or existing.get("counter_state") != "measured" or row["counter_state"] == "measured":
-                rows[row["phy"]] = row
+        if key in kept and _smp_output_span(command) != 0:
+            continue
+        add(key, parsed.rows)
+    for key, read in kept.items():
+        add(key, read.row_dicts())
     return merged
 
 
-def _kept_read_times(
-    outputs: dict[str, str],
-    reads: Mapping[str, tuple[str, str]] | None,
+def _kept_counter_reads(
+    reads: Mapping[tuple[int, str], KeptCounterRead] | None,
     routed: dict[tuple[int, str], Any],
-) -> dict[tuple[int, str], str]:
-    """Add kept full reads to ``outputs``; return each routed expander's read time.
+) -> dict[tuple[int, str], KeptCounterRead]:
+    """Kept readings that count this refresh: the pass device this refresh's
+    topology routes to that expander must be the one they were read through."""
+    kept: dict[tuple[int, str], KeptCounterRead] = {}
+    for key, read in (reads or {}).items():
+        target = routed.get(key)
+        if isinstance(read, KeptCounterRead) and target is not None and target.device == read.device:
+            kept[key] = read
+    return kept
 
-    A kept read replaces this refresh's output under the same key (the
-    collector keeps exactly what it just read), and counts only for the pass
-    device this refresh's topology routes to that expander.
-    """
-    read_at: dict[tuple[int, str], str] = {}
-    for key, (stdout, at) in (reads or {}).items():
-        if not str(key).startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
-            continue
-        parsed = parse_phy_error_log_output(stdout)
-        if parsed.unit is None or parsed.expander_sas_address is None:
-            continue
-        expander = (parsed.unit, parsed.expander_sas_address)
-        target = routed.get(expander)
-        if target is None or target.device != parsed.device:
-            continue
-        outputs[key] = stdout
-        read_at[expander] = str(at)
-    return read_at
+
+def _counter_read_stop(
+    read: KeptCounterRead | None, rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, int] | None:
+    """Where and why the latest read of an expander ended early, if it did."""
+    if read is not None and read.stopped is not None:
+        return read.stopped[0], read.stopped[1]
+    for row in rows:
+        if row.get("counter_reason") in {"no_response", "rejected_output"}:
+            return str(row["counter_reason"]), int(row["phy"])
+    return None
 
 
 def _attach_expander_phy_error_counters(
     nodes: dict[str, SasFabricNode],
     outputs: dict[str, str],
     capability: str | None,
-    reads: Mapping[str, tuple[str, str]] | None = None,
+    reads: Mapping[tuple[int, str], KeptCounterRead] | None = None,
 ) -> None:
     """Attach SMP REPORT PHY ERROR LOG counters to CORE expander PHY rows (#941).
 
     Counters the app could not read stay None with a reason, never zero. A
     refused sudo grant reads as "not available (permission not granted)".
     Counters kept from an earlier refresh carry their read time; they are not
-    shown once sudo refuses the read.
+    shown once sudo refuses the read. A read that ended early (the expander
+    did not answer, or its answer was rejected) says where it stopped.
     """
     expander_nodes = [node for node in nodes.values() if node.kind == "expander"]
     if not expander_nodes:
         return
     routed = {(target.unit, target.expander_sas_address): target for target in discover_smp_targets(outputs)}
-    outputs = dict(outputs)
-    read_at = {} if capability == SMP_CAPABILITY_DENIED else _kept_read_times(outputs, reads, routed)
-    results = _merged_phy_error_log_rows(outputs, routed)
+    kept = {} if capability == SMP_CAPABILITY_DENIED else _kept_counter_reads(reads, routed)
+    results = _merged_phy_error_log_rows(outputs, routed, kept)
     # More routed expanders or PHYs than one refresh may read: the unread
     # ones wait their turn in the rotation; they are not a routing failure.
     budget_limited = bool(results) and (
@@ -3260,21 +3278,32 @@ def _attach_expander_phy_error_counters(
         unit = node.raw.get("unit")
         key = (unit if isinstance(unit, int) else -1, str(node.raw.get("sas_address") or "").lower())
         target = routed.get(key)
+        read = kept.get(key)
         rows = [results[key][phy] for phy in sorted(results.get(key, {}))]
         states = {row["counter_state"] for row in rows}
+        stop = _counter_read_stop(read, rows)
         reason = None
         if "measured" in states:
             state, message = "available", None
+            reason = stop[0] if stop else None
         elif (rows and states == {SMP_CAPABILITY_DENIED}) or (not rows and capability == SMP_CAPABILITY_DENIED):
             state, message = "permission_denied", SMP_PERMISSION_DENIED_MESSAGE
         elif target is None and not rows:
             state, message = "no_route", SMP_NO_ROUTE_MESSAGE
-        elif rows:
+        elif rows or stop:
             state, message = "unavailable", SMP_NO_ANSWER_MESSAGE
+            if stop and stop[0] == "no_response":
+                message, reason = SMP_HUNG_MESSAGE, stop[0]
+            elif stop and stop[0] == "rejected_output":
+                message, reason = SMP_REJECTED_OUTPUT_MESSAGE, stop[0]
+            elif stop:
+                reason = stop[0]
         elif budget_limited:
             state, message, reason = "not_read", SMP_READ_BUDGET_MESSAGE, SMP_READ_BUDGET_REASON
         else:
             state, message = "not_read", SMP_NOT_READ_MESSAGE
+        if state != "available" and state != "unavailable":
+            stop = None
         by_phy = {row["phy"]: row for row in rows}
         phys: list[dict[str, Any]] = []
         unread = 0
@@ -3290,7 +3319,7 @@ def _attach_expander_phy_error_counters(
                 copied["counter_state"] = counters["counter_state"]
                 copied["counter_reason"] = counters["counter_reason"]
             else:
-                # A batch can stop early (no answer); the PHYs after it were
+                # A read can stop early (no answer); the PHYs after it were
                 # not read, so they are unknown rather than missing.
                 copied.update({field: None for field in SMP_COUNTER_FIELDS})
                 copied["counter_state"] = "unknown" if state == "available" else state
@@ -3302,13 +3331,15 @@ def _attach_expander_phy_error_counters(
             node.raw["phys"] = phys
         summary = smp_counter_summary(rows)
         summary["unknown_phys"] += unread
+        read_at = read.read_at if read is not None else None
         node.raw["phy_error_counters"] = {
             "state": state,
             "message": message,
             "reason": reason,
+            "stopped_at_phy": stop[1] if stop else None,
             "source": _SMP_COUNTER_EVIDENCE,
             "device": target.device if target else None,
-            "read_at": read_at.get(key),
+            "read_at": read_at,
             **summary,
             "rows": rows,
         }
@@ -3316,8 +3347,15 @@ def _attach_expander_phy_error_counters(
             parts = [f"{summary['measured_phys']} PHYs read", f"{summary['phys_with_errors']} with errors"]
             if summary["unknown_phys"]:
                 parts.append(f"{summary['unknown_phys']} unknown")
-            if read_at.get(key):
-                parts.append(f"read at {read_at[key]}")
+            stop_text = f"stopped at PHY {stop[1]} ({SMP_STOP_REASON_LABELS.get(stop[0], stop[0])})" if stop else ""
+            later = read is not None and read.stopped is not None and read.stopped[2] != read_at
+            if stop and not later:
+                parts.append(f"read {stop_text}")
+            if read_at:
+                parts.append(f"read at {read_at}")
+            if stop and later:
+                # The rows are from an earlier read; the latest one stopped.
+                parts.append(f"a later read {stop_text} at {read.stopped[2]}")
             node.metrics["phy_error_counters"] = ", ".join(parts)
         else:
             node.metrics["phy_error_counters"] = message

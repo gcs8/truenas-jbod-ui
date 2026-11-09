@@ -221,8 +221,16 @@ not you press Refresh. They are cumulative error counts, so in between Storage
 Fabric shows the last reading with its time ("read at ..." in UTC); pressing
 Refresh again does not start a new read. One refresh reads at most eight
 expanders and 512 PHYs, the permission check included. Each SSH command reads
-at most four PHYs, so an expander that answers slowly loses only the PHYs of a
-command that runs past the SSH timeout; those show as unknown. A larger fabric is
+at most four PHYs, and an expander's commands run one after another: the first
+one that gets no answer (each call is stopped after about 3 seconds) or runs
+past the SSH timeout ends that expander's read for this refresh, so a hung
+expander costs about one timeout. Storage Fabric then shows "read stopped at
+PHY N (no answer)" next to the PHYs read before it, or "the expander did not
+answer" when none were; the unread PHYs show as unknown, and the next try waits
+for the 15 minutes. An answer that is larger than four PHYs can print, or that
+names another expander or PHY, is discarded and shown as an error. The app keeps
+only the decoded readings between refreshes, for at most 64 expanders and
+4,096 PHYs, dropping the least recently read first. A larger fabric is
 read in turn, least recently read first, and an expander waiting for its turn
 shows "not read this refresh (read budget...)" rather than a missing route. A disk whose `mprutil` parent and
 expander PHY tables disagree is never used as a route, so counters are not

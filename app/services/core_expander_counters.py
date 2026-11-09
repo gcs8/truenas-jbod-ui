@@ -56,9 +56,11 @@ SMP_PHY_ERROR_LOG_SUDO_GRANT = (
 SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX = "smp phy error log "
 SMP_PHY_ERROR_LOG_MARKER = "tnj-smp-phy-error-log"
 # Per call and per refresh bounds. One call that gives no answer at all stops
-# that chunk (SMP_PHYS_PER_COMMAND PHYs), so a hung expander costs about one
-# timeout per chunk. timeout(1) sends SIGTERM (sudo relays it to camcontrol),
-# then SIGKILL after the grace.
+# that chunk (SMP_PHYS_PER_COMMAND PHYs), and the collector sends an
+# expander's chunks one planning round at a time, so the first chunk that does
+# not answer ends that expander's read for the refresh: a hung expander costs
+# about one call timeout per read, not one per chunk. timeout(1) sends SIGTERM
+# (sudo relays it to camcontrol), then SIGKILL after the grace.
 SMP_CALL_TIMEOUT_SECONDS = 2
 SMP_CALL_KILL_AFTER_SECONDS = 1
 # Route discovery is complete; these budgets only limit what one refresh
@@ -87,6 +89,20 @@ SMP_MAX_COMMANDS_PER_REFRESH = (
 # and a whole refresh retains at most 136 x 64 KiB = 8.5 MiB of counter output
 # whatever the server sends (#1088 security review).
 SMP_MAX_OUTPUT_BYTES_PER_COMMAND = 64 * 1024
+# Admissible output of one chunk: a short header plus at most this much per
+# PHY (a hex-dumped 28-byte frame is about 100 bytes, a hex-dumped camcontrol
+# or sudo message a few hundred). Larger output is rejected unparsed, and its
+# PHYs read as an error (#1088 security review).
+SMP_OUTPUT_HEADER_BYTES = 256
+SMP_MAX_OUTPUT_BYTES_PER_PHY = 4096
+# What the collector keeps between refreshes: decoded, validated rows only,
+# never raw output. Each row has a fixed shape (PHY, four bounded counters,
+# a state and a reason token from fixed sets), an expander keeps at most one
+# row per PHY (255), and all kept readings together hold at most this many
+# expanders and PHY rows; the least recently read are dropped first and read
+# as not read until their next turn (#1088 security review).
+SMP_MAX_RETAINED_EXPANDERS = 64
+SMP_MAX_RETAINED_PHYS = 4096
 # One expander's counters are read in full at most once per this interval,
 # whatever asked for the refresh (the Refresh button and ?force=true too).
 # They are cumulative error counts, so a reading minutes old is current
@@ -100,6 +116,20 @@ PERMISSION_DENIED_MESSAGE = "Expander counters not available (permission not gra
 NO_ROUTE_MESSAGE = "Expander counters not available (no CAM pass device reaches this expander)."
 NO_ANSWER_MESSAGE = "Expander counters not available (the expander did not return a readable error log)."
 NOT_READ_MESSAGE = "Expander counters not read yet."
+HUNG_MESSAGE = (
+    "Expander counters not available (the expander did not answer; its read stopped "
+    "and is tried again after the read interval)."
+)
+REJECTED_OUTPUT_MESSAGE = (
+    "Expander counters not available (the expander's answer was malformed or too large and was discarded)."
+)
+# Why a read stopped before its last chunk, as shown after "read stopped at PHY N".
+STOP_REASON_LABELS = {
+    "no_response": "no answer",
+    "rejected_output": "answer rejected",
+    "command_failed": "command failed",
+    "permission_denied": "permission not granted",
+}
 READ_BUDGET_MESSAGE = (
     f"Expander counters not read this refresh (read budget of {SMP_MAX_TARGETS_PER_REFRESH} expanders "
     f"and {SMP_MAX_CALLS_PER_REFRESH} PHY reads per refresh; expanders are read in turn)."
@@ -573,6 +603,11 @@ def classify_phy_output(phy: int, payload: bytes | None) -> dict[str, Any]:
 class PhyErrorLogResult:
     target_identity: str | None
     rows: list[dict[str, Any]]
+    # The marker's PHY range ("00-03"), whether the end marker was seen, and
+    # whether parse_chunk_output() refused the output as a whole.
+    phy_range: str | None = None
+    ended: bool = False
+    rejected: bool = False
 
     @property
     def unit(self) -> int | None:
@@ -592,8 +627,10 @@ class PhyErrorLogResult:
     @property
     def capability(self) -> str | None:
         """granted when sudo ran camcontrol for any PHY, refused when it never did."""
+        if self.rejected:
+            return None
         states = {row["counter_state"] for row in self.rows}
-        not_run = {"sudo_refused", "no_response", "incomplete_output"}
+        not_run = {"sudo_refused", "no_response", "incomplete_output", "rejected_output"}
         if "measured" in states or any(row["counter_reason"] not in not_run for row in self.rows):
             return CAPABILITY_GRANTED
         if CAPABILITY_DENIED in states:
@@ -604,6 +641,8 @@ class PhyErrorLogResult:
 def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
     """Parse the output of :func:`build_phy_error_log_command`."""
     identity: str | None = None
+    phy_range: str | None = None
+    ended = False
     rows: list[dict[str, Any]] = []
     current: int | None = None
     lines: list[str] = []
@@ -624,6 +663,7 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
                 and _PASS_DEVICE.fullmatch(parts[2]) and re.fullmatch(r"[0-9a-f]{2}-[0-9a-f]{2}", parts[3])
             ):
                 identity = ":".join(parts[:3])
+                phy_range = parts[3]
             continue
         phy_marker = re.fullmatch(r"@phy=([0-9a-f]{2})", line)
         if phy_marker:
@@ -636,6 +676,7 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
             continue
         if line == "@end":
             flush()
+            ended = True
             break
         if current is not None and line:
             lines.append(line)
@@ -643,7 +684,147 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
         # No end marker: the batch was cut short; the open PHY is unknown.
         if current is not None:
             rows.append(_unknown_row(current, "unknown", "incomplete_output"))
-    return PhyErrorLogResult(identity, rows)
+    return PhyErrorLogResult(identity, rows, phy_range, ended)
+
+
+def chunk_output_span(output_key: str | None) -> tuple[str, list[int]] | None:
+    """The expander identity and PHYs a counter output key names, or None."""
+    text = str(output_key or "")
+    if not text.startswith(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):
+        return None
+    parts = text[len(SMP_PHY_ERROR_LOG_OUTPUT_KEY_PREFIX):].split(":")
+    if (
+        len(parts) != 4 or not parts[0].isdigit() or not parts[0].isascii()
+        or _SAS_ADDRESS.fullmatch(parts[1]) is None or _PASS_DEVICE.fullmatch(parts[2]) is None
+        or re.fullmatch(r"[0-9a-f]{2}-[0-9a-f]{2}", parts[3]) is None
+    ):
+        return None
+    first, last = (int(part, 16) for part in parts[3].split("-"))
+    if not first <= last <= 254:
+        return None
+    return ":".join(parts[:3]), list(range(first, last + 1))
+
+
+def parse_chunk_output(output_key: str | None, stdout: object) -> PhyErrorLogResult | None:
+    """Parse one counter command's output against the key it was asked for.
+
+    None when the key is not a counter key. Output larger than the chunk can
+    legitimately print is refused unparsed; so is output whose marker names
+    another expander or pass device, that reports a PHY outside the key's
+    range, or that lacks its end marker. A refused output's PHYs read as
+    ``unknown`` / ``rejected_output``: an error, never counters.
+    """
+    span = chunk_output_span(output_key)
+    if span is None:
+        return None
+    identity, phys = span
+    phy_range = f"{phys[0]:02x}-{phys[-1]:02x}"
+    rejected = PhyErrorLogResult(
+        identity, [_unknown_row(phy, "unknown", "rejected_output") for phy in phys], phy_range, False, True,
+    )
+    text = stdout if isinstance(stdout, str) else ""
+    if len(text) > SMP_OUTPUT_HEADER_BYTES + SMP_MAX_OUTPUT_BYTES_PER_PHY * len(phys):
+        return rejected
+    parsed = parse_phy_error_log_output(text)
+    if (
+        parsed.target_identity != identity or not parsed.ended
+        or any(row["phy"] not in phys for row in parsed.rows)
+    ):
+        return rejected
+    return parsed
+
+
+def chunk_stop(output_key: str | None, ok: bool, stdout: object, stderr: object = "") -> tuple[str, int] | None:
+    """Why an expander's read must stop after this chunk, and at which PHY.
+
+    A chunk past the SSH command deadline or with a call that gave no answer
+    is ``no_response`` (the expander is hung); a refused output is
+    ``rejected_output``; any other failed command is ``command_failed``; a
+    chunk whose every call sudo refused is ``permission_denied``. None means
+    the next chunk may run.
+    """
+    span = chunk_output_span(output_key)
+    if span is None:
+        return None
+    first = span[1][0]
+    if not ok:
+        timed_out = "timed out" in str(stderr or "").lower()
+        return ("no_response" if timed_out else "command_failed", first)
+    parsed = parse_chunk_output(output_key, stdout)
+    if parsed is None or parsed.rejected:
+        return ("rejected_output", first)
+    for row in parsed.rows:
+        if row["counter_reason"] == "no_response":
+            return ("no_response", row["phy"])
+    if parsed.rows and all(row["counter_state"] == CAPABILITY_DENIED for row in parsed.rows):
+        return ("permission_denied", first)
+    return None
+
+
+# --- kept readings -----------------------------------------------------------
+
+_ROW_STATES = frozenset({"measured", "unknown", CAPABILITY_DENIED})
+_ROW_REASONS = frozenset({
+    None, "unreadable_output", "no_response", "incomplete_output", "sudo_refused", "command_failed",
+    "rejected_output", "frame_type_error", "frame_length", "frame_type", "function", "function_result",
+    "response_length", "phy_identifier",
+})
+# One kept row: (phy, four counters, state, reason).
+KeptRow = tuple[int, int | None, int | None, int | None, int | None, str, str | None]
+
+
+def compact_counter_row(row: Mapping[str, Any]) -> KeptRow | None:
+    """A decoded row in the fixed kept shape, or None when it is not one."""
+    phy = row.get("phy")
+    if type(phy) is not int or not 0 <= phy <= 254:
+        return None
+    counters: list[int | None] = []
+    for name in COUNTER_FIELDS:
+        value = row.get(name)
+        if value is not None and (type(value) is not int or not 0 <= value <= COUNTER_SATURATED):
+            return None
+        counters.append(value)
+    state, reason = row.get("counter_state"), row.get("counter_reason")
+    if state not in _ROW_STATES or reason not in _ROW_REASONS:
+        return None
+    return (phy, *counters, state, reason)
+
+
+@dataclass(frozen=True)
+class KeptCounterRead:
+    """One expander's last reading, kept between refreshes (#1088 security review).
+
+    ``rows`` are decoded rows in the fixed KeptRow shape, at most one per PHY,
+    from the latest read that completed a chunk, read at ``read_at`` (UTC).
+    ``stopped`` is (reason, PHY, UTC time) when the latest read ended early,
+    for example because the expander did not answer.
+    """
+
+    device: str
+    read_at: str | None
+    rows: tuple[KeptRow, ...]
+    stopped: tuple[str, int, str] | None = None
+
+    def row_dicts(self) -> list[dict[str, Any]]:
+        return [
+            {"phy": row[0], **dict(zip(COUNTER_FIELDS, row[1:5])), "counter_state": row[5], "counter_reason": row[6]}
+            for row in self.rows
+        ]
+
+
+def bound_kept_reads(
+    reads: Mapping[tuple[int, str], KeptCounterRead],
+    recency: Mapping[tuple[int, str], float],
+) -> dict[tuple[int, str], KeptCounterRead]:
+    """Drop the least recently read readings until the kept totals fit."""
+    order = sorted(reads, key=lambda expander: recency.get(expander, float("-inf")))
+    kept = dict(reads)
+    rows = sum(len(read.rows) for read in kept.values())
+    for expander in order:
+        if len(kept) <= SMP_MAX_RETAINED_EXPANDERS and rows <= SMP_MAX_RETAINED_PHYS:
+            break
+        rows -= len(kept.pop(expander).rows)
+    return kept
 
 
 def counter_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:

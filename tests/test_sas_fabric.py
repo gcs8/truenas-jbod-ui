@@ -5355,7 +5355,11 @@ class CoreExpanderCounterTests(unittest.TestCase):
         for phy in ("2", "3"):
             self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
             self.assertIsNone(phys[phy]["invalid_dword_count"])
-        self.assertEqual(node.metrics["phy_error_counters"], "1 PHYs read, 0 with errors, 3 unknown")
+        # The read stopped at the silent PHY, and says so.
+        self.assertEqual((counters["reason"], counters["stopped_at_phy"]), ("no_response", 1))
+        self.assertEqual(
+            node.metrics["phy_error_counters"], "1 PHYs read, 0 with errors, 3 unknown, read stopped at PHY 1 (no answer)",
+        )
 
     def test_fabric_reports_refused_permission_without_zeros(self):
         message = "Expander counters not available (permission not granted)."
@@ -5813,7 +5817,8 @@ class CoreExpanderCounterRateLimitTests(unittest.TestCase):
             service.retry_expander_counter_capability()
         results = list(base)
         commands: list[str] = []
-        for _round in range(10):
+        # Chunks follow one planning round at a time: up to 64 rounds per 255-PHY expander.
+        for _round in range(100):
             planned = [command for command in service._core_expander_counter_probe_commands(list(results))
                        if command not in commands]
             if not planned:
@@ -5989,7 +5994,8 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
         """One collection; the chunk holding ``slow_phy`` runs past the SSH timeout."""
         results = list(base)
         commands: list[str] = []
-        for _round in range(10):
+        # Chunks follow one planning round at a time: up to 64 rounds per 255-PHY expander.
+        for _round in range(100):
             planned = [command for command in service._core_expander_counter_probe_commands(list(results))
                        if command not in commands]
             if not planned:
@@ -6038,24 +6044,29 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
         # The hang stop still works inside a chunk: one silent call ends that chunk.
         self.assertIn("then echo @no-response; break; fi", commands[0])
 
-    def test_a_slow_chunk_loses_only_its_own_phys(self):
+    def test_a_slow_chunk_ends_the_read_and_keeps_the_phys_before_it(self):
+        # A chunk past the SSH command deadline means the expander is not
+        # answering (each call is killed after 3 s, a chunk takes at most 12 s),
+        # so the read stops there for this refresh (tnj-941f); the chunks
+        # already read keep their counters.
         base = self.base_results(_wide_expander_outputs(10))
         with tempfile.TemporaryDirectory() as temp_dir:
             service = self.service(temp_dir)
             service._smp_counter_capability = "granted"
             service._smp_counter_wall_clock = lambda: self.READ_AT
             commands, results = self.refresh(service, base, slow_phy=5)
-            self.assertEqual(len(commands), 3, "one SSH command per chunk")
-            self.assertEqual(self.calls(commands), 10, "calls, not chunks, count against the ceiling")
+            self.assertEqual(len(commands), 2, "one SSH command per chunk, none after the slow one")
+            self.assertEqual(self.calls(commands), 8, "calls, not chunks, count against the ceiling")
             node, phys = self.phy_rows(service, results)
         counters = node.raw["phy_error_counters"]
         self.assertEqual(counters["state"], "available")
-        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (6, 4))
-        for phy in (0, 1, 2, 3, 8, 9):
+        self.assertEqual((counters["reason"], counters["stopped_at_phy"]), ("no_response", 4))
+        self.assertEqual((counters["measured_phys"], counters["unknown_phys"]), (4, 6))
+        for phy in (0, 1, 2, 3):
             with self.subTest(phy=phy):
                 self.assertEqual(phys[phy]["counter_state"], "measured")
                 self.assertEqual(phys[phy]["invalid_dword_count"], phy + 1)
-        for phy in (4, 5, 6, 7):
+        for phy in range(4, 10):
             with self.subTest(phy=phy):
                 self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
                 self.assertIsNone(phys[phy]["invalid_dword_count"])
@@ -6070,6 +6081,8 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
             service = self.service(temp_dir)
             service._smp_counter_capability = "granted"
             service._smp_counter_clock = lambda: now[0]
+            wall = [self.READ_AT]
+            service._smp_counter_wall_clock = lambda: wall[0]
             self.refresh(service, base)
             # Inside the interval nothing is read; the kept chunks are shown.
             commands, results = self.refresh(service, base, offset=100)
@@ -6086,15 +6099,19 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
             for phy in (8, 9):
                 self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
             self.assertEqual(node.raw["phy_error_counters"]["measured_phys"], 8)
-            # A read whose every chunk failed keeps the previous reading.
+            # A read whose first chunk fails ends there and keeps the previous
+            # reading, which says that a later read stopped.
             now[0] += SMP_COUNTER_READ_INTERVAL_SECONDS
-            results = list(base)
-            commands = service._core_expander_counter_probe_commands(list(results))
-            self.assertEqual(len(commands), 3)
-            results.extend(SSHCommandResult(command=command, ok=False, stderr="Command timed out") for command in commands)
-            service._record_smp_counter_reads(results)
-            _node, phys = self.phy_rows(service, results)
+            wall[0] = datetime(2026, 11, 7, 12, 30, tzinfo=timezone.utc)
+            commands, results = self.refresh(service, base, slow_phy=0, offset=200)
+            self.assertEqual(len(commands), 1)
+            node, phys = self.phy_rows(service, results)
             self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(8)], list(range(101, 109)))
+            self.assertEqual(node.raw["phy_error_counters"]["reason"], "no_response")
+            self.assertEqual(node.raw["phy_error_counters"]["read_at"], "2026-11-07T12:00:00Z")
+            self.assertTrue(node.metrics["phy_error_counters"].endswith(
+                "read at 2026-11-07T12:00:00Z, a later read stopped at PHY 0 (no answer) at 2026-11-07T12:30:00Z",
+            ), node.metrics["phy_error_counters"])
 
     def test_ssh_round_trips_per_refresh_stay_bounded(self):
         import app.services.core_expander_counters as counters
@@ -6116,3 +6133,361 @@ class CoreExpanderCounterChunkTests(unittest.TestCase):
             + (counters.SMP_MAX_CALLS_PER_REFRESH - 1) // counters.SMP_PHYS_PER_COMMAND,
             counters.SMP_MAX_COMMANDS_PER_REFRESH,
         )
+
+
+def _retained_leaves(value):
+    """Every leaf value of a retained structure (mappings, sequences, dataclasses)."""
+    import dataclasses
+
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            stack.extend(item)
+        elif dataclasses.is_dataclass(item) and not isinstance(item, type):
+            stack.extend(getattr(item, field.name) for field in dataclasses.fields(item))
+        else:
+            yield item
+
+
+def _chunk_identity(command: str) -> tuple[int, str, str, list[int]]:
+    unit, address, device, span = canonicalize_ssh_command(command)[len("smp phy error log "):].split(":")
+    first, last = (int(part, 16) for part in span.split("-"))
+    return int(unit), address, device, list(range(first, last + 1))
+
+
+class CoreExpanderCounterRetentionTests(unittest.TestCase):
+    """Codex security P2 on #1088: bound retained counter output across refreshes.
+
+    A configured CORE peer under hostile control may advertise many expanders
+    and answer every chunk with as much output as SSHProbe lets through. The
+    collector keeps only validated decoded rows, never raw output, with hard
+    bounds per PHY, per expander and in total; oversized or malformed output
+    is rejected and shown as an error, never accumulated.
+    """
+
+    snapshot = CoreExpanderCounterTests.snapshot
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    fabric = CoreExpanderCounterRateLimitTests.fabric
+    base_results = staticmethod(CoreExpanderCounterRateLimitTests.base_results)
+
+    def refresh(self, service, base, answer):
+        """One collection planned round by round, as SSHProbe.run_planned_commands does."""
+        results = list(base)
+        commands: list[str] = []
+        for _round in range(300):
+            planned = [command for command in service._core_expander_counter_probe_commands(list(results))
+                       if command not in commands]
+            if not planned:
+                break
+            commands.extend(planned)
+            results.extend(answer(command) for command in planned)
+        else:
+            self.fail("the planner never settled")
+        service._record_smp_counter_reads(results)
+        return commands, results
+
+    @staticmethod
+    def valid(command):
+        unit, address, device, phys = _chunk_identity(command)
+        return SSHCommandResult(command=command, ok=True, stdout=_smp_output(
+            unit, address, device, {phy: _smp_frame(phy, (phy + 1, 0, 0, 0)) for phy in phys},
+        ))
+
+    def test_a_hostile_peer_cannot_grow_retained_counter_data(self):
+        import pickle
+
+        import app.services.core_expander_counters as counters
+
+        outputs = _nine_expander_outputs(100, num_phys=16)
+        base = self.base_results(outputs)
+        # Hex that parses as bytes but is far more than four PHYs can print.
+        junk = "\n".join([" 41 11 00 06" * 16] * 320)
+
+        def hostile(command):
+            unit, address, device, phys = _chunk_identity(command)
+            stdout = (
+                f"tnj-smp-phy-error-log:{unit}:{address}:{device}:{phys[0]:02x}-{phys[-1]:02x}\n"
+                f"@phy={phys[0]:02x}\n{junk}\n@end\n"
+            )
+            # The most SSHProbe lets through for one counter command, exit 0.
+            self.assertLess(len(stdout), counters.SMP_MAX_OUTPUT_BYTES_PER_COMMAND)
+            self.assertGreater(len(stdout), 60_000)
+            return SSHCommandResult(command=command, ok=True, stdout=stdout)
+
+        now = [1000.0]
+        sizes: list[int] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_clock = lambda: now[0]
+            for refresh in range(13):
+                commands, results = self.refresh(service, base, hostile)
+                self.assertTrue(commands, refresh)
+                reads = service.expander_counter_reads()
+                # Only decoded rows are kept: no raw output, no long strings.
+                longest = max(
+                    (len(leaf) for leaf in _retained_leaves(reads) if isinstance(leaf, (str, bytes))), default=0,
+                )
+                self.assertLessEqual(longest, 64, f"raw output kept after refresh {refresh}")
+                sizes.append(len(pickle.dumps(reads)))
+                # A rejected chunk ends that expander's read for this refresh.
+                per_expander: dict[str, int] = {}
+                for command in commands:
+                    address = _chunk_identity(command)[1]
+                    per_expander[address] = per_expander.get(address, 0) + 1
+                self.assertEqual(set(per_expander.values()), {1}, refresh)
+                now[0] += 1
+            self.assertLessEqual(max(sizes), 256 * 1024, sizes)
+            self.assertLessEqual(len(reads), counters.SMP_MAX_RETAINED_EXPANDERS)
+            address = _chunk_identity(commands[0])[1]
+            fresh = {item.command: item.stdout for item in results if item.ok}
+            node = self.expander(self.fabric(fresh, "granted", selected=address, reads=reads), address)
+        summary = node.raw["phy_error_counters"]
+        self.assertEqual((summary["state"], summary["reason"]), ("unavailable", "rejected_output"))
+        self.assertEqual(summary["measured_phys"], 0)
+        self.assertEqual(summary["message"], counters.REJECTED_OUTPUT_MESSAGE)
+        phy0 = next(row for row in node.raw["phys"] if str(row["phy"]) == "0")
+        self.assertEqual((phy0["counter_state"], phy0["counter_reason"]), ("unknown", "rejected_output"))
+        self.assertIsNone(phy0["invalid_dword_count"])
+
+    def test_malformed_chunk_output_is_rejected_not_attached(self):
+        import app.services.core_expander_counters as counters
+
+        base = self.base_results(_wide_expander_outputs(12))
+        cases = {
+            # Rows for PHYs outside the chunk that was asked for.
+            "other_phys": lambda unit, address, device, phys: _smp_output(
+                unit, address, device, {phy + 8: _smp_frame(phy + 8, (77, 0, 0, 0)) for phy in phys},
+            ).replace(f":{phys[0] + 8:02x}-{phys[-1] + 8:02x}", f":{phys[0]:02x}-{phys[-1]:02x}"),
+            # A marker for another pass device.
+            "other_device": lambda unit, address, device, phys: _smp_output(
+                unit, address, "pass12", {phy: _smp_frame(phy, (77, 0, 0, 0)) for phy in phys},
+            ),
+            # Exit 0 without the end marker.
+            "no_end": lambda unit, address, device, phys: _smp_output(
+                unit, address, device, {phy: _smp_frame(phy, (77, 0, 0, 0)) for phy in phys}, end=False,
+            ),
+        }
+        for name, build in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp_dir:
+                service = self.service(temp_dir)
+                service._smp_counter_capability = "granted"
+
+                def answer(command, build=build):
+                    unit, address, device, phys = _chunk_identity(command)
+                    if phys[0] == 4:
+                        return SSHCommandResult(command=command, ok=True, stdout=build(unit, address, device, phys))
+                    return self.valid(command)
+
+                commands, results = self.refresh(service, base, answer)
+                # The rejected chunk (PHYs 4-7) ends the read: 8-11 is never asked for.
+                self.assertEqual([_chunk_identity(command)[3][0] for command in commands], [0, 4])
+                fresh = {item.command: item.stdout for item in results if item.ok}
+                node = self.expander(
+                    self.fabric(fresh, "granted", reads=service.expander_counter_reads()), SMP_EXPANDER_A,
+                )
+                phys = {int(row["phy"]): row for row in node.raw["phys"]}
+                self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(4)], [1, 2, 3, 4])
+                for phy in range(4, 8):
+                    self.assertEqual(
+                        (phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "rejected_output"),
+                    )
+                for phy in range(8, 12):
+                    self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+                    self.assertNotEqual(phys[phy]["invalid_dword_count"], 77)
+                summary = node.raw["phy_error_counters"]
+                self.assertEqual((summary["state"], summary["reason"]), ("available", "rejected_output"))
+                self.assertEqual(summary["stopped_at_phy"], 4)
+                self.assertIn("read stopped at PHY 4 (answer rejected)", node.metrics["phy_error_counters"])
+                # The same output in this refresh's raw outputs alone is rejected too.
+                raw_only = self.expander(self.fabric(fresh, "granted"), SMP_EXPANDER_A)
+                raw_phys = {int(row["phy"]): row for row in raw_only.raw["phys"]}
+                self.assertTrue(all(raw_phys[phy]["invalid_dword_count"] != 77 for phy in range(12)))
+                self.assertEqual(raw_phys[4]["counter_reason"], "rejected_output")
+                self.assertLessEqual(counters.SMP_MAX_RETAINED_EXPANDERS, 64)
+
+    def test_retained_readings_have_hard_per_expander_and_total_bounds(self):
+        import app.services.core_expander_counters as counters
+
+        for count, num_phys, refreshes in ((100, 16, 13), (20, 255, 10)):
+            outputs = _nine_expander_outputs(count, num_phys=num_phys)
+            addresses = [target.expander_sas_address for target in counters.discover_smp_targets(outputs)]
+            base = self.base_results(outputs)
+            now = [1000.0]
+            order: list[str] = []
+            with self.subTest(count=count, num_phys=num_phys), tempfile.TemporaryDirectory() as temp_dir:
+                service = self.service(temp_dir)
+                service._smp_counter_capability = "granted"
+                service._smp_counter_clock = lambda: now[0]
+                for _refresh in range(refreshes):
+                    commands, results = self.refresh(service, base, self.valid)
+                    for command in commands:
+                        address = _chunk_identity(command)[1]
+                        if address not in order:
+                            order.append(address)
+                    reads = service.expander_counter_reads()
+                    rows = [row for read in reads.values() for row in read.rows]
+                    self.assertLessEqual(len(reads), counters.SMP_MAX_RETAINED_EXPANDERS)
+                    self.assertLessEqual(len(rows), counters.SMP_MAX_RETAINED_PHYS)
+                    for read in reads.values():
+                        self.assertLessEqual(len(read.rows), 255)
+                        self.assertEqual(len({row[0] for row in read.rows}), len(read.rows))
+                    for leaf in _retained_leaves(reads):
+                        self.assertTrue(
+                            leaf is None or type(leaf) in (int, bool) or (isinstance(leaf, str) and len(leaf) <= 64),
+                            repr(leaf)[:80],
+                        )
+                    now[0] += 1
+                self.assertEqual(sorted(order), sorted(addresses), "every expander was read once")
+                kept = {address for (_unit, address) in reads}
+                # The least recently read are evicted first; the newest are kept.
+                self.assertLess(len(kept), len(order))
+                self.assertEqual(kept, set(order[-len(kept):]))
+                evicted = order[0]
+                fresh = {item.command: item.stdout for item in results if item.ok}
+                node = self.expander(self.fabric(fresh, "granted", selected=evicted, reads=reads), evicted)
+                self.assertEqual(node.raw["phy_error_counters"]["state"], "not_read")
+                self.assertEqual(node.raw["phy_error_counters"]["measured_phys"], 0)
+                newest = order[-1]
+                node = self.expander(self.fabric(fresh, "granted", selected=newest, reads=reads), newest)
+                self.assertEqual(node.raw["phy_error_counters"]["state"], "available")
+
+
+class CoreExpanderCounterHungTests(unittest.TestCase):
+    """A hung expander costs about one chunk timeout per read, not one per chunk.
+
+    The first chunk that does not answer ends that expander's read for this
+    refresh; the expander is marked as not answering and keeps the 15-minute
+    read interval. Other expanders are read as usual.
+    """
+
+    snapshot = CoreExpanderCounterTests.snapshot
+    expander = CoreExpanderCounterTests.expander
+    service = CoreExpanderCounterTests.service
+    fabric = CoreExpanderCounterRateLimitTests.fabric
+    base_results = staticmethod(CoreExpanderCounterRateLimitTests.base_results)
+    refresh = CoreExpanderCounterRetentionTests.refresh
+    READ_AT = CoreExpanderCounterRateLimitTests.READ_AT
+
+    def hung_from(self, hang_phy, spent, *, ssh_timeout=False):
+        """Answers every PHY before ``hang_phy``; the call for it never answers.
+
+        ``spent`` collects the simulated seconds of each chunk: a quick answer
+        is 0.05 s, a call killed by timeout(1) is its timeout plus the kill
+        grace, a command past the SSH deadline is the whole deadline.
+        """
+        import app.services.core_expander_counters as counters
+        from app.config import SSHConfig
+
+        def answer(command):
+            unit, address, device, phys = _chunk_identity(command)
+            if hang_phy in phys and ssh_timeout:
+                spent.append(float(SSHConfig().timeout_seconds))
+                return SSHCommandResult(command=command, ok=False, stderr="SSH command timed out.")
+            per_phy: dict[int, object] = {}
+            seconds = 0.0
+            for phy in phys:
+                if hang_phy is not None and phy >= hang_phy:
+                    per_phy[phy] = None
+                    seconds += counters.SMP_CALL_TIMEOUT_SECONDS + counters.SMP_CALL_KILL_AFTER_SECONDS
+                    break
+                per_phy[phy] = _smp_frame(phy, (phy + 1, 0, 0, 0))
+                seconds += 0.05
+            spent.append(seconds)
+            return SSHCommandResult(command=command, ok=True, stdout=_smp_output(unit, address, device, per_phy))
+
+        return answer
+
+    def test_a_silent_expander_costs_one_chunk_timeout(self):
+        import app.services.core_expander_counters as counters
+
+        base = self.base_results(_wide_expander_outputs(40))
+        for ssh_timeout in (False, True):
+            with self.subTest(ssh_timeout=ssh_timeout), tempfile.TemporaryDirectory() as temp_dir:
+                service = self.service(temp_dir)
+                service._smp_counter_capability = "granted"
+                service._smp_counter_wall_clock = lambda: self.READ_AT
+                now = [1000.0]
+                service._smp_counter_clock = lambda: now[0]
+                spent: list[float] = []
+                commands, results = self.refresh(service, base, self.hung_from(0, spent, ssh_timeout=ssh_timeout))
+                self.assertEqual(len(commands), 1, "the first silent chunk ends the read")
+                per_chunk = 30.0 if ssh_timeout else counters.SMP_CALL_TIMEOUT_SECONDS + counters.SMP_CALL_KILL_AFTER_SECONDS
+                self.assertLessEqual(sum(spent), per_chunk)
+                fresh = {item.command: item.stdout for item in results if item.ok}
+                node = self.expander(self.fabric(fresh, "granted", reads=service.expander_counter_reads()),
+                                     SMP_EXPANDER_A)
+                summary = node.raw["phy_error_counters"]
+                self.assertEqual((summary["state"], summary["reason"]), ("unavailable", "no_response"))
+                self.assertEqual(summary["stopped_at_phy"], 0)
+                self.assertEqual(summary["message"], counters.HUNG_MESSAGE)
+                self.assertTrue(all(row["invalid_dword_count"] is None for row in node.raw["phys"]))
+                # The 15-minute interval holds: no retry until it passes, and the mark stays.
+                now[0] += counters.SMP_COUNTER_READ_INTERVAL_SECONDS - 1
+                self.assertEqual(self.refresh(service, base, self.hung_from(0, spent))[0], [])
+                base_outputs = {item.command: item.stdout for item in base}
+                node = self.expander(
+                    self.fabric(base_outputs, "granted", reads=service.expander_counter_reads()), SMP_EXPANDER_A,
+                )
+                self.assertEqual(node.raw["phy_error_counters"]["reason"], "no_response")
+                now[0] += 1
+                self.assertEqual(len(self.refresh(service, base, self.hung_from(0, spent))[0]), 1)
+
+    def test_a_hang_part_way_keeps_the_phys_read_before_it(self):
+        import app.services.core_expander_counters as counters
+
+        base = self.base_results(_wide_expander_outputs(40))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            service._smp_counter_wall_clock = lambda: self.READ_AT
+            spent: list[float] = []
+            commands, results = self.refresh(service, base, self.hung_from(9, spent))
+            self.assertEqual([_chunk_identity(command)[3][0] for command in commands], [0, 4, 8])
+            self.assertLessEqual(
+                sum(spent), counters.SMP_CALL_TIMEOUT_SECONDS + counters.SMP_CALL_KILL_AFTER_SECONDS + 1,
+            )
+            fresh = {item.command: item.stdout for item in results if item.ok}
+            node = self.expander(self.fabric(fresh, "granted", reads=service.expander_counter_reads()), SMP_EXPANDER_A)
+        phys = {int(row["phy"]): row for row in node.raw["phys"]}
+        self.assertEqual([phys[phy]["invalid_dword_count"] for phy in range(9)], list(range(1, 10)))
+        self.assertEqual((phys[9]["counter_state"], phys[9]["counter_reason"]), ("unknown", "no_response"))
+        for phy in range(10, 40):
+            self.assertEqual((phys[phy]["counter_state"], phys[phy]["counter_reason"]), ("unknown", "not_read"))
+        summary = node.raw["phy_error_counters"]
+        self.assertEqual((summary["state"], summary["reason"], summary["stopped_at_phy"]), ("available", "no_response", 9))
+        self.assertEqual((summary["measured_phys"], summary["unknown_phys"]), (9, 31))
+        self.assertEqual(
+            node.metrics["phy_error_counters"],
+            "9 PHYs read, 9 with errors, 31 unknown, read stopped at PHY 9 (no answer), read at 2026-11-07T12:00:00Z",
+        )
+
+    def test_a_hung_expander_does_not_stop_the_others(self):
+        outputs = _nine_expander_outputs(3, num_phys=12)
+        from app.services.core_expander_counters import discover_smp_targets
+
+        targets = discover_smp_targets(outputs)
+        hung = targets[1].expander_sas_address
+        base = self.base_results(outputs)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = self.service(temp_dir)
+            service._smp_counter_capability = "granted"
+            spent: list[float] = []
+            silent = self.hung_from(0, spent)
+
+            def answer(command):
+                if _chunk_identity(command)[1] == hung:
+                    return silent(command)
+                return CoreExpanderCounterRetentionTests.valid(command)
+
+            commands, _results = self.refresh(service, base, answer)
+            per_expander: dict[str, int] = {}
+            for command in commands:
+                address = _chunk_identity(command)[1]
+                per_expander[address] = per_expander.get(address, 0) + 1
+        self.assertEqual(per_expander, {targets[0].expander_sas_address: 3, hung: 1, targets[2].expander_sas_address: 3})

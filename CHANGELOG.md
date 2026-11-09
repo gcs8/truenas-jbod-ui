@@ -174,9 +174,11 @@ fixed `v0.24.0-beta.6` and `0.24.0-beta.6` tags and moves `dev` to it;
   default; re-run bootstrap on an existing CORE account to add it, then press
   Refresh, which checks the grant with one sudo call. Each expander is read at
   most once every 15 minutes, Refresh included, and one refresh makes at most
-  512 such calls, four PHYs per SSH command so a command that runs out of time
-  loses only its own PHYs; in between, the last reading is shown with its read
-  time (#1088).
+  512 such calls, four PHYs per SSH command. An expander that stops answering
+  ends its read at that point (about one 3-second timeout) and is marked as not
+  answering, and an oversized or malformed answer is discarded and shown as an
+  error. In between, the last reading is shown with its read time; the app
+  keeps only decoded readings, for at most 64 expanders and 4,096 PHYs (#1088).
 
 ### Fixed
 
