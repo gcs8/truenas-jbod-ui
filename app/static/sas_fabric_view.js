@@ -1038,6 +1038,7 @@
       const failure = new Error(payload?.detail || `Request failed with ${response.status}`);
       failure.status = response.status;
       failure.detail = payload?.detail ?? null;
+      failure.code = typeof payload?.error === "string" ? payload.error : null;
       throw failure;
     }
     return payload;

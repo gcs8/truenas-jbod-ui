@@ -259,12 +259,13 @@ def build_router() -> APIRouter:
         return service
 
     def mapping_revision_conflict_response(exc: MappingRevisionConflict) -> JSONResponse:
+        # A subclass names the cause, such as another disk in the bay (#1141).
         return JSONResponse(
             status_code=409,
             content={
                 "ok": False,
-                "error": "mapping_revision_conflict",
-                "detail": MappingRevisionConflict.public_detail,
+                "error": exc.error_code,
+                "detail": exc.public_detail,
                 "current_revision": exc.current_revision,
             },
         )
