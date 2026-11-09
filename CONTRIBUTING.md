@@ -452,7 +452,10 @@ node scripts/ui_crawl.js --ui http://127.0.0.1:8080 --history http://127.0.0.1:8
 A live crawl is read-only by default. The request guard admits only exact
 method + path templates from `qa/ui-routes.json`, and reads only from the
 running state's read allowlist: its page's `reads` plus the state's own, each
-an exact manifest template with the query keys it sends. An unknown route, a
+an exact manifest template with the query keys it sends. A page's `selection`
+reads (the bay detail's own SMART read on the enclosure page) are added only
+to states whose steps select a bay (a `selectBay` step or pressing one of its
+`selection.controls`), bound to the target's system and enclosure. An unknown route, a
 read outside the list, a forced appliance refresh or any write is aborted and
 fails the run. Query booleans are read the way FastAPI reads them (`t`, `y`,
 `on` and so on are true; any value that is not a clean false counts as

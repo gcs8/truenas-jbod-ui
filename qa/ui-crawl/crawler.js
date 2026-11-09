@@ -234,7 +234,7 @@ class Crawler {
     const index = (state.steps || []).findIndex((step) => step.forEachOption);
     if (index < 0) return [state];
     const step = state.steps[index];
-    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state) });
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state), bind: this.bindFor(target) });
     await this.load(target);
     const driver = this.newDriver(target);
     await driver.runSteps(state.steps.slice(0, index));
@@ -356,7 +356,7 @@ class Crawler {
     this.bucket = record.findings;
     this.log(`${target.label} ${state.id}: start`);
     let driver = null;
-    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state) });
+    this.guard.beginState(state.id, { reads: readsFor(this.inventory, state), bind: this.bindFor(target) });
     try {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });

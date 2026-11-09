@@ -16,7 +16,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const controls = require("./ui-crawl/controls");
-const { loadInventory, validateInventory, expandStates, selectStates, checkObserved, readsFor } = require("./ui-crawl/inventory");
+const { loadInventory, validateInventory, expandStates, selectStates, checkObserved, readsFor, selectsBay } = require("./ui-crawl/inventory");
 const routes = require("./ui-crawl/routes");
 const { RequestGuard } = require("./ui-crawl/guard");
 const { installRoutes, fixtureHandler } = require("./ui-crawl/transport");
@@ -359,4 +359,74 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
   if (stale.length) {
     testInfo.annotations.push({ type: "stale-known-finding", description: stale.map((e) => `#${e.issue} ${e.type} ${e.state}`).join("; ") });
   }
+});
+
+// Codex #1108 (round 8): two request shapes the default fixture never sends.
+//   - A main page whose batch SMART prefetch is still waiting (a long
+//     APP_SMART_PREFETCH_DELAY_MS): selecting a bay sends that bay's own
+//     GET /api/slots/{slot}/smart. Every read state that selects a bay
+//     (derived from its steps) runs there, with the guard bound to the
+//     fixture's system and enclosure, and must stay green.
+//   - An admin QuantaStor HA system whose storage view binds an HA node:
+//     loading it sends the candidate read with target_system_id.
+test("bay selection before the SMART prefetch and HA candidate reads stay inside the declared, bound reads", async ({ browser }, testInfo) => {
+  test.setTimeout(12 * 60_000);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-r8-"));
+  const fixturePath = path.join(tempDir, "fixture.json");
+  execFileSync(process.env.PYTHON || "python3", ["scripts/build_ui_crawl_fixture.py", "--output", fixturePath], { cwd: root, stdio: "inherit" });
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+  const origins = {
+    assets: "https://synthetic.invalid",
+    "ui-slow-prefetch": "https://ui-slow-prefetch.synthetic.invalid",
+    "admin-quantastor-ha": "https://admin-quantastor-ha.synthetic.invalid",
+  };
+  const guard = new RequestGuard({ origins });
+  const stats = { blocked: [], writes: [], routeErrors: [] };
+  const context = await browser.newContext({ viewport: null, serviceWorkers: "block" });
+  const routes = await installRoutes(context, { guard, origins, stats, fixture: fixtureHandler(fixture) });
+  const crawler = new Crawler({
+    context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir: testInfo.outputPath("ui-crawl-r8"),
+    widths: [inventory.widths.ci[0]], fixtureMode: true, settleMs: 300, log: (line) => process.stdout.write(`${line}\n`),
+  });
+  // Bound like a live target: the fixture's own system and enclosure.
+  const scope = fixture.api["ui:/api/inventory"];
+  const bind = { system_id: scope.selected_system_id, enclosure_id: scope.selected_enclosure_id };
+  expect(bind.system_id && bind.enclosure_id, "the fixture inventory names its system and enclosure").toBeTruthy();
+  crawler.bindFor = (target) => (target.page === "main" ? bind : { system_id: "synthetic-qs-ha" });
+  const all = expandStates(inventory).filter((state) => !state.variant && !state.heavy && state.safety === "read");
+  const selecting = all.filter((state) => state.page === "main" && selectsBay(inventory, state));
+  const loading = all.filter((state) => state.page === "admin" && (state.read_requests || []).some((rule) => rule.path === "/api/admin/storage-views/candidates"));
+  expect(selecting.length).toBeGreaterThan(8);
+  expect(loading.length).toBeGreaterThan(4);
+  try {
+    await crawler.crawlTarget({ page: "main", ready: "main", label: "fixture/main-slow-smart-prefetch", url: `${origins["ui-slow-prefetch"]}/` }, selecting);
+    await crawler.crawlTarget({ page: "admin", ready: "admin", label: "fixture/admin-quantastor-ha", url: `${origins["admin-quantastor-ha"]}/` }, loading);
+  } finally {
+    await routes.drain();
+    await context.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  const broken = crawler.records.filter((record) => !["done", "not-applicable"].includes(record.status));
+  expect(broken.map((record) => `${record.target} ${record.state}: ${record.status} ${JSON.stringify(record.findings)}`)).toEqual([]);
+  expect(stats.blocked, "a bay selection or HA candidate read the guard refused").toEqual([]);
+  expect(stats.routeErrors).toEqual([]);
+
+  // Selection really sent the per-slot read (the prefetch had not started).
+  const slotSmart = "read GET /api/slots/{slot}/smart";
+  const sent = selecting.filter((state) => (guard.observed.get(state.id) || new Map()).has(slotSmart)).map((state) => state.id);
+  for (const id of ["main.select[healthy]", "main.history", "main.mapping.form", "main.heatmap.select"]) {
+    expect(sent, `${id} did not send the per-slot SMART read on the slow-prefetch page`).toContain(id);
+  }
+  const byId = new Map(all.map((state) => [state.id, state]));
+  const misclassified = [];
+  for (const [stateId, seen] of guard.observed) {
+    const state = byId.get(stateId);
+    if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state)));
+  }
+  expect(misclassified).toEqual([]);
+
+  // Loading the HA system sent the candidate read with its HA target, admitted by the loading state.
+  const haCandidates = guard.log.filter((entry) => entry.allowed && entry.path.startsWith("/api/admin/storage-views/candidates?") && /[?&]target_system_id=synthetic-qs-node-b(&|$)/.test(entry.path));
+  expect(haCandidates.length, "no candidate read with target_system_id= was admitted on the HA fixture").toBeGreaterThan(0);
+  for (const entry of haCandidates) expect(entry.path).toMatch(/[?&]system_id=synthetic-qs-ha(&|$)/);
 });

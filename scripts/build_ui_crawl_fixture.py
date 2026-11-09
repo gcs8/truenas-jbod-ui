@@ -68,14 +68,32 @@ def live_snapshot(bundle, *, platform: str | None = None):
     return snapshot.model_copy(update=update)
 
 
-def render_main(bundle, *, history_configured: bool = True, write_policy: dict = WRITE_POLICY, platform: str | None = None) -> str:
+# Codex #1108: a main page whose batch SMART prefetch waits far longer than
+# any crawl state (as with a large APP_SMART_PREFETCH_DELAY_MS), so selecting
+# a bay sends the bay's own GET /api/slots/{slot}/smart first.
+SLOW_SMART_PREFETCH_DELAY_MS = 3600000
+
+
+def slow_prefetch_settings() -> Settings:
+    settings = Settings()
+    return settings.model_copy(update={"app": settings.app.model_copy(update={"smart_prefetch_delay_ms": SLOW_SMART_PREFETCH_DELAY_MS})})
+
+
+def render_main(
+    bundle,
+    *,
+    history_configured: bool = True,
+    write_policy: dict = WRITE_POLICY,
+    platform: str | None = None,
+    settings: Settings | None = None,
+) -> str:
     snapshot = live_snapshot(bundle, platform=platform)
     runtime = bundle.storage_view_runtime
     context = {
         "request": build_fixture_request(),
         "snapshot": snapshot,
         "storage_view_runtime": runtime,
-        "settings": Settings(),
+        "settings": settings or Settings(),
         "initial_snapshot_json": json.dumps(_dump(snapshot)),
         "initial_storage_view_runtime_json": json.dumps(_dump(runtime)),
         "history_configured": history_configured,
@@ -202,10 +220,49 @@ ADMIN_BOOTSTRAP = {
 }
 
 
-def render_admin() -> str:
+# Codex #1108: a QuantaStor HA system whose saved storage view binds an HA
+# node (binding.target_system_id). Loading it sends the candidate read with
+# target_system_id. Synthetic names only.
+ADMIN_BOOTSTRAP_QUANTASTOR_HA = {
+    **ADMIN_BOOTSTRAP,
+    "systems": [
+        {
+            "id": "synthetic-qs-ha",
+            "label": "Synthetic QuantaStor HA",
+            "platform": "quantastor",
+            "truenas_host": "qs.example.test",
+            "verify_ssl": False,
+            "api_user": "synthetic",
+            "api_password_configured": True,
+            "ssh_enabled": True,
+            "ssh_host": "qs.example.test",
+            "ha_enabled": True,
+            "ha_nodes": [
+                {"system_id": "synthetic-qs-node-a", "label": "Synthetic node A", "host": "qs-a.example.test"},
+                {"system_id": "synthetic-qs-node-b", "label": "Synthetic node B", "host": "qs-b.example.test"},
+            ],
+            "storage_views": [
+                {
+                    "id": "synthetic-ha-view",
+                    "label": "Synthetic HA View",
+                    "kind": "manual",
+                    "template_id": "synthetic-manual",
+                    "enabled": True,
+                    "order": 10,
+                    "render": {"show_in_main_ui": True, "show_in_admin_ui": True},
+                    "binding": {"mode": "manual", "device_names": [], "target_system_id": "synthetic-qs-node-b"},
+                }
+            ],
+        }
+    ],
+    "default_system_id": "synthetic-qs-ha",
+}
+
+
+def render_admin(bootstrap: dict = ADMIN_BOOTSTRAP) -> str:
     env = _script_json_env(ROOT / "admin_service" / "templates")
     return env.get_template("index.html").render(
-        admin_bootstrap_json=json.dumps(ADMIN_BOOTSTRAP),
+        admin_bootstrap_json=json.dumps(bootstrap),
         url_for=lambda name, path: "/static/" + path,
     )
 
@@ -280,6 +337,7 @@ async def build() -> dict:
         "ui:/api/mappings/export": {"schema_version": 1, "mappings": []},
         "history:/healthz": {"status": "ok"},
         "admin:/api/admin/state": ADMIN_BOOTSTRAP,
+        "admin-quantastor-ha:/api/admin/state": ADMIN_BOOTSTRAP_QUANTASTOR_HA,
         "admin:/api/admin/backups": {"available": True, "classes": {}, "targets": [], "artifacts": []},
         "admin:/api/admin/backups/policy": {"policies": {}, "targets": []},
         "admin:/api/admin/ssh-keys": {"keys": []},
@@ -320,8 +378,10 @@ async def build() -> dict:
             "ui-write-sign-in:/": render_main(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-quantastor:/": render_main(bundle, platform="quantastor"),
+            "ui-slow-prefetch:/": render_main(bundle, settings=slow_prefetch_settings()),
             "history:/": render_history(),
             "admin:/": render_admin(),
+            "admin-quantastor-ha:/": render_admin(ADMIN_BOOTSTRAP_QUANTASTOR_HA),
             "offline:/": await build_public_demo_html(settings=settings),
         },
         "api": api,

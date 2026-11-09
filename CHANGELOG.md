@@ -155,6 +155,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   lights off itself and fails if its watchdog stops; saved storage views'
   heat-map SMART reads are allowed, and a refresh's delayed follow-up is
   admitted only within a short declared window (#1108).
+- The UI crawler now allows a selected bay's own SMART read, bound to the
+  target system and enclosure, in every state that selects a bay, and the HA
+  target key on storage-view candidate reads (#1108).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

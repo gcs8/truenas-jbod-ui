@@ -140,6 +140,52 @@ function validateLoadRequests(errors, pageId, page, table) {
   }
 }
 
+// Codex #1108: reads a page sends when a bay is selected (the bay detail's
+// own SMART summary). Admitted only in states whose steps select a bay, each
+// bound to the target's scope: `bind` names the query keys that must equal
+// the target's system/enclosure.
+const SELECTION_BIND_KEYS = new Set(["system_id", "enclosure_id"]);
+
+function validateSelection(errors, pageId, page, manifest, table) {
+  const selection = page.selection;
+  if (selection === undefined) return;
+  const where = `pages.${pageId}.selection`;
+  if (!selection.why) errors.push(`${where} needs a why`);
+  if (!Array.isArray(selection.controls) || !selection.controls.length || selection.controls.some((c) => typeof c !== "string" || !c)) {
+    errors.push(`${where} needs controls (the selectors whose press selects a bay)`);
+  }
+  if (!Array.isArray(selection.reads) || !selection.reads.length) {
+    errors.push(`${where} needs reads`);
+    return;
+  }
+  validateReads(errors, where, selection.reads, page.service || "ui", manifest, table);
+  for (const rule of selection.reads) {
+    const name = `${where}: selection read ${rule.method} ${rule.path}`;
+    if (!Array.isArray(rule.bind) || !rule.bind.length) {
+      errors.push(`${name} must bind its scope keys (bind: ["system_id", "enclosure_id"])`);
+      continue;
+    }
+    for (const key of rule.bind) {
+      if (!SELECTION_BIND_KEYS.has(key)) errors.push(`${name} cannot bind ${key}; bind keys are ${[...SELECTION_BIND_KEYS].join(", ")}`);
+      else if (!(rule.query || []).includes(key)) errors.push(`${name}: bind key ${key} must be one of its query keys`);
+    }
+    // A plain read of the same route on that page would admit it unbound.
+    const same = (read) => String(read.method || "GET").toUpperCase() === String(rule.method || "GET").toUpperCase() && read.path === rule.path;
+    if ((page.reads || []).some(same)) errors.push(`${name} is also an unbound copy in pages.${pageId}.reads`);
+  }
+}
+
+// Does the state select a bay on its page (Codex #1108)? Derived from every
+// step list: a selectBay step, or pressing/filling a selection control.
+function selectsBay(inventory, state) {
+  const selection = (((inventory || {}).pages || {})[state.page] || {}).selection;
+  if (!selection) return false;
+  const controls = selection.controls || [];
+  const steps = ["capture", "steps", "revert", "verify"].flatMap((field) => state[field] || []);
+  return steps.some((step) => step && (step.selectBay !== undefined
+    || ["click", "clickIfPresent", "fill"].some((kind) => typeof step[kind] === "string" && controls.some((control) => step[kind].includes(control)))));
+}
+
 // #1128: the longest follow-up window a state may declare. Short on purpose:
 // a delayed follow-up after it is a hard failure, not a reason to wait longer.
 const MAX_FOLLOW_UP_MS = 60_000;
@@ -163,6 +209,7 @@ function validateInventory(inventory, { manifest = undefined } = {}) {
   for (const [pageId, page] of Object.entries(pages)) {
     validateReads(errors, `pages.${pageId}`, page.reads, page.service || "ui", resolvedManifest, table);
     validateLoadRequests(errors, pageId, page, table);
+    validateSelection(errors, pageId, page, resolvedManifest, table);
   }
   for (const state of inventory.states || []) {
     const id = state.id || "(missing id)";
@@ -189,6 +236,11 @@ function validateInventory(inventory, { manifest = undefined } = {}) {
       validateRules(errors, id, "read_requests", state.read_requests, state, pages[state.page], table);
     }
     validateReads(errors, id, state.reads, (pages[state.page] || {}).service || "ui", resolvedManifest, table);
+    for (const rule of ((pages[state.page] || {}).selection || {}).reads || []) {
+      if ((state.reads || []).some((read) => String(read.method || "GET").toUpperCase() === String(rule.method || "GET").toUpperCase() && read.path === rule.path)) {
+        errors.push(`${id}: read ${rule.method} ${rule.path} is a selection read of its page; declaring it here is an unbound copy`);
+      }
+    }
     validateFollowUp(errors, id, state);
     if (state.safety === "forbidden") {
       if (writes.length) errors.push(`${id}: a forbidden state cannot declare writes`);
@@ -296,10 +348,12 @@ function checkObserved(state, observed, reads = null) {
   return problems;
 }
 
-// The exact read allowlist of a state: its page's reads, then its own.
+// The exact read allowlist of a state: its page's reads, its page's bound
+// selection reads when its steps select a bay (Codex #1108), then its own.
 function readsFor(inventory, state) {
   const page = (inventory.pages || {})[state.page] || {};
-  return [...(page.reads || []), ...(state.reads || [])];
+  const selection = selectsBay(inventory, state) ? ((page.selection || {}).reads || []) : [];
+  return [...(page.reads || []), ...selection, ...(state.reads || [])];
 }
 
 // The page-load requests of a page on one platform (Sol #1108).
@@ -322,5 +376,5 @@ function summarize(inventory) {
 
 module.exports = {
   INVENTORY_PATH, loadInventory, validateInventory, expandStates, selectStates, substitute, summarize, stepKind, deriveSafety, checkObserved,
-  readsFor, loadRequestsFor, FORCE_PARAMS, MAX_FOLLOW_UP_MS,
+  readsFor, loadRequestsFor, selectsBay, FORCE_PARAMS, MAX_FOLLOW_UP_MS,
 };

@@ -111,10 +111,13 @@ class RequestGuard {
   }
 
   // The state now running, with its read allowlist: [{ method, path (an exact
-  // manifest template), query: [keys] }]. Reads outside it are refused.
-  beginState(stateId, { reads = [] } = {}) {
+  // manifest template), query: [keys], bind?: [scope keys] }] and the target's
+  // scope `bind` ({ system_id, enclosure_id }). Reads outside it are refused;
+  // a read rule with `bind` (a page's selection read, Codex #1108) also needs
+  // each named key to equal the target's, when the target has one.
+  beginState(stateId, { reads = [], bind = {} } = {}) {
     this.state = stateId;
-    this.reads = { stateId, rules: this.compileReads(stateId, reads) };
+    this.reads = { stateId, rules: this.compileReads(stateId, reads), bind: { ...(bind || {}) } };
   }
 
   // The finished state's read list stays until the next state begins, so a
@@ -129,7 +132,10 @@ class RequestGuard {
       const method = String(rule.method || "GET").toUpperCase();
       if (!Array.isArray(rule.query)) throw new Error(`${stateId}: read ${method} ${rule.path} needs its query keys`);
       if (rule.force) throw new Error(`${stateId}: reads cannot force a refresh (${method} ${rule.path})`);
-      return { key: `${method} ${rule.path}`, query: new Set(rule.query) };
+      const bind = rule.bind || [];
+      const unknown = bind.filter((key) => !BIND_KEYS.includes(key) || !rule.query.includes(key));
+      if (unknown.length) throw new Error(`${stateId}: read ${method} ${rule.path} cannot bind ${unknown.join(", ")}`);
+      return { key: `${method} ${rule.path}`, query: new Set(rule.query), bind };
     });
   }
 
@@ -274,9 +280,28 @@ class RequestGuard {
     const rules = this.reads.rules.filter((rule) => rule.key === route);
     if (!rules.length) return `read ${route} is not in the read allowlist of ${this.reads.stateId}`;
     const keys = queryKeys(parsed);
-    if (rules.some((rule) => keys.every((key) => rule.query.has(key)))) return null;
-    const extra = keys.filter((key) => !rules.some((rule) => rule.query.has(key)));
-    return `read ${route} with query key ${extra.join(", ") || keys.join(", ")} is not declared for ${this.reads.stateId}`;
+    const fitting = rules.filter((rule) => keys.every((key) => rule.query.has(key)));
+    if (!fitting.length) {
+      const extra = keys.filter((key) => !rules.some((rule) => rule.query.has(key)));
+      return `read ${route} with query key ${extra.join(", ") || keys.join(", ")} is not declared for ${this.reads.stateId}`;
+    }
+    let outside = null;
+    for (const rule of fitting) {
+      outside = this.outsideBind(rule.bind, this.reads.bind, parsed);
+      if (!outside) return null;
+    }
+    return `read ${route} outside the bound ${outside} of ${this.reads.stateId}`;
+  }
+
+  // null when every bound key the target has is carried, every copy equal.
+  outsideBind(keys, bind, parsed) {
+    for (const key of keys || []) {
+      const want = (bind || {})[key];
+      if (want === undefined || want === null) continue;
+      const got = parsed.searchParams.getAll(key);
+      if (!got.length || got.some((value) => value !== String(want))) return `${key} (${got.length ? "other" : "missing"})`;
+    }
+    return null;
   }
 
   matchWindow(window, verb, parsed, body, cls) {
