@@ -269,20 +269,27 @@ class Crawler {
   // D-TNJ-20261109-CRAWLER-SWEEP: a storage-view target (storage_view_id in
   // its URL) also binds its view, so a generated storage-view read is
   // admitted for that view only.
+  // D-TNJ-20261109-CRAWLER-SVBIND (DayBreak-Blue #1108 r9): every live target
+  // binds each key to a value or to null, and null means a request may not
+  // carry the key. A storage-view target binds the enclosure its view is
+  // bound to (target.viewEnclosure, from viewBoundEnclosure()), which the page
+  // may omit (`optional`); with none, any enclosure_id is refused. An
+  // enclosure target binds no storage view.
   bindFor(target) {
     if (this.fixtureMode) return {};
     let enclosure = null;
     let view = null;
     try {
       const params = new URL(target.url).searchParams;
-      enclosure = params.get("enclosure_id");
-      view = params.get("storage_view_id");
+      enclosure = params.get("enclosure_id") || null;
+      view = params.get("storage_view_id") || null;
     } catch {
       enclosure = null;
+      view = null;
     }
-    const bind = { system_id: target.system || this.writeSystem || null, enclosure_id: enclosure };
-    if (view) bind.storage_view_id = view;
-    return bind;
+    const system = target.system || this.writeSystem || null;
+    if (view) return { system_id: system, enclosure_id: target.viewEnclosure || null, storage_view_id: view, optional: ["enclosure_id"] };
+    return { system_id: system, enclosure_id: enclosure, storage_view_id: null };
   }
 
   // The scope kind whose generated reads a target's states get (an enclosure
@@ -440,4 +447,17 @@ class Crawler {
   }
 }
 
-module.exports = { Crawler, READY, safeName, keySpec, renderedKeys };
+// D-TNJ-20261109-CRAWLER-SVBIND: the enclosure a storage view is bound to, as
+// the app derives it: its runtime backing_enclosure_id. The backend builds it
+// from the snapshot the view runtime was resolved against (inventory.py,
+// both view sources), which for a view target (no enclosure_id in its URL) is
+// the page's own live enclosure: the one app.js sends as the selection
+// enclosure and as a snapshot view's history enclosure, and the one the
+// backend falls back to when the request omits enclosure_id. null when the
+// view names none.
+function viewBoundEnclosure(view) {
+  const id = view && view.backing_enclosure_id;
+  return typeof id === "string" && id ? id : null;
+}
+
+module.exports = { Crawler, READY, safeName, keySpec, renderedKeys, viewBoundEnclosure };

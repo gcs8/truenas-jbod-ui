@@ -21,7 +21,7 @@ const routes = require("./ui-crawl/routes");
 const reach = require("./ui-crawl/reach");
 const { RequestGuard } = require("./ui-crawl/guard");
 const { installRoutes, fixtureHandler } = require("./ui-crawl/transport");
-const { Crawler } = require("./ui-crawl/crawler");
+const { Crawler, viewBoundEnclosure } = require("./ui-crawl/crawler");
 const { writeReport, allFindings, unexplainedErrors } = require("./ui-crawl/report");
 
 const root = path.resolve(__dirname, "..");
@@ -455,12 +455,27 @@ test("a storage view as the first scope: every main read state stays inside the 
     context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir: testInfo.outputPath("ui-crawl-r9"),
     widths: [inventory.widths.ci[0]], fixtureMode: true, settleMs: 300, log: (line) => process.stdout.write(`${line}\n`),
   });
+  // SVBIND: what the guard admitted, to check the enclosure each request named.
+  const admittedPaths = [];
+  const admitOne = guard.admit.bind(guard);
+  guard.admit = (request) => {
+    const verdict = admitOne(request);
+    if (verdict.allowed) admittedPaths.push(verdict.path);
+    return verdict;
+  };
   const system = fixture.api["ui:/api/inventory"].selected_system_id;
   const view = "nvme-carrier-x4";
   expect(fixture.api[`ui:/api/storage-views/${view}/history`], "the fixture serves the view's heat-map history").toBeTruthy();
-  // Bound like a live view target: its system and its storage view.
-  crawler.bindFor = () => ({ system_id: system, enclosure_id: null, storage_view_id: view });
-  const target = { page: "main", ready: "main", scopeIndex: 0, label: "fixture/main-view-first", url: `${origins.ui}/?system_id=${system}&storage_view_id=${view}` };
+  // Bound like a live view target, by the live bindFor: its system, its
+  // storage view and the enclosure that view is bound to (its runtime
+  // backing enclosure, as liveTargets() records it; D-TNJ-20261109-CRAWLER-SVBIND).
+  const viewRuntime = (fixture.api["ui:/api/storage-views"].views || []).find((entry) => entry.id === view);
+  const viewEnclosure = viewBoundEnclosure(viewRuntime);
+  expect(viewEnclosure, "the fixture view names its backing enclosure").toBeTruthy();
+  const liveBindFor = (target) => Crawler.prototype.bindFor.call({ fixtureMode: false, writeSystem: null }, target);
+  crawler.bindFor = liveBindFor;
+  const target = { page: "main", ready: "main", scopeIndex: 0, system, viewEnclosure, label: "fixture/main-view-first", url: `${origins.ui}/?system_id=${system}&storage_view_id=${view}` };
+  expect(liveBindFor(target)).toEqual({ system_id: system, enclosure_id: viewEnclosure, storage_view_id: view, optional: ["enclosure_id"] });
   expect(crawler.scopeFor(target)).toBe("storage-view");
   const states = expandStates(inventory).filter((state) => state.page === "main" && !state.variant && !state.heavy && state.safety === "read" && !state.appliance_load);
   for (const id of ["main.heatmap.metric", "main.heatmap.timeline", "main.history", "main.select[healthy]"]) expect(states.map((state) => state.id)).toContain(id);
@@ -485,6 +500,13 @@ test("a storage view as the first scope: every main read state stays inside the 
   for (const entry of viewReads) {
     expect(entry.path.startsWith(`/api/storage-views/${view}/`), entry.path).toBe(true);
     expect(entry.path).toMatch(new RegExp(`[?&]system_id=${system}(&|$)`));
+  }
+  // SVBIND: every admitted request that named an enclosure named the view's
+  // own, and the page's reads did name it (the bound path ran).
+  const named = admittedPaths.filter((entry) => new URLSearchParams(entry.split("?")[1] || "").has("enclosure_id"));
+  expect(named.length, "no admitted request named the view's enclosure").toBeGreaterThan(0);
+  for (const entry of named) {
+    for (const value of new URLSearchParams(entry.split("?")[1] || "").getAll("enclosure_id")) expect(value, entry).toBe(viewEnclosure);
   }
   const byId = new Map(states.map((state) => [state.id, state]));
   const misclassified = [];

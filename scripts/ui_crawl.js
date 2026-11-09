@@ -41,7 +41,7 @@ const { EXIT } = require("../qa/ui-crawl/gate");
 const { RequestGuard } = require("../qa/ui-crawl/guard");
 const { installRoutes, fixtureHandler, ReadCache } = require("../qa/ui-crawl/transport");
 const { reachProblems } = require("../qa/ui-crawl/reach");
-const { Crawler } = require("../qa/ui-crawl/crawler");
+const { Crawler, viewBoundEnclosure } = require("../qa/ui-crawl/crawler");
 const { writeReport, mergeReports } = require("../qa/ui-crawl/report");
 
 const FIXTURE_ORIGINS = {
@@ -142,12 +142,14 @@ async function liveTargets(args) {
     }
     const scopes = [
       ...(snapshot.enclosures || []).map((e) => ({ kind: "enc", id: e.id, query: `enclosure_id=${encodeURIComponent(e.id)}` })),
-      ...(views.views || []).filter((v) => v.enabled !== false && (v.render?.show_in_main_ui ?? true)).map((v) => ({ kind: "view", id: v.id, query: `storage_view_id=${encodeURIComponent(v.id)}` })),
+      // SVBIND: a view target binds the enclosure its view is bound to (null: none).
+      ...(views.views || []).filter((v) => v.enabled !== false && (v.render?.show_in_main_ui ?? true)).map((v) => ({ kind: "view", id: v.id, query: `storage_view_id=${encodeURIComponent(v.id)}`, viewEnclosure: viewBoundEnclosure(v) })),
     ];
     if (!scopes.length) scopes.push({ kind: "default", id: "default", query: "" });
     scopes.forEach((scope, index) => targets.push({
       page: "main", ready: "main", system, platform, scopeIndex: index, label: `${system}/main/${scope.kind}-${index}`,
       url: `${args.ui}/?system_id=${encodeURIComponent(system)}${scope.query ? `&${scope.query}` : ""}`,
+      ...(scope.kind === "view" ? { viewEnclosure: scope.viewEnclosure } : {}),
     }));
     (snapshot.enclosures || [{ id: null }]).forEach((enclosure, index) => targets.push({
       page: "fabric", ready: "fabric", system, platform, scopeIndex: index, label: `${system}/fabric/enc-${index}`,
@@ -488,4 +490,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { parseArgs, statesFor, fixtureTargets, createExitGuards, startLedWatchdog, preflightProblems, FIXTURE_ORIGINS };
+module.exports = { parseArgs, statesFor, fixtureTargets, liveTargets, createExitGuards, startLedWatchdog, preflightProblems, FIXTURE_ORIGINS };

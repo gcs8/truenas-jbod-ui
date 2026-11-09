@@ -106,6 +106,11 @@ async function runReverted(driver, state, options) {
   if (bind.system_id && !bind.enclosure_id) {
     return result(state, "precheck-failed", { error: "no enclosure scope to bind the writes to; nothing was written" });
   }
+  // SVBIND: a storage-view target's enclosure binds its reads only; writes
+  // stay refused there, as before it carried one.
+  if (bind.storage_view_id) {
+    return result(state, "precheck-failed", { error: "a storage-view target has no exact enclosure write scope; nothing was written" });
+  }
   // A captured enclosure object must be the target's own enclosure.
   if (vars.object_id !== undefined && bind.enclosure_id && String(bind.enclosure_id).split("::", 1)[0] !== String(vars.object_id)) {
     return result(state, "precheck-failed", { error: "the captured object is not the target enclosure; nothing was written" });

@@ -182,14 +182,19 @@ test("Codex PRRT_kwDOSAqK-M61IUDz: app.js reads a selected storage view's heat-m
 });
 
 test("Codex PRRT_kwDOSAqK-M61IUDz: main.heatmap.metric and main.heatmap.timeline on a storage-view target admit its heat-map history, bound to the target", () => {
-  const bind = { system_id: "sys-a", storage_view_id: "view-a" };
+  const bind = { system_id: "sys-a", enclosure_id: null, storage_view_id: "view-a" };
   for (const stateId of ["main.heatmap.metric", "main.heatmap.timeline"]) {
     const g = stateGuard(stateId, "storage-view", bind);
     const ok = get(g, viewHistory("view-a", `system_id=sys-a&${HEAT_QUERY}`));
     assert.equal(ok.allowed, true, `${stateId}: ${ok.reason}`);
     assert.equal(ok.cls, "read");
-    // A selected_enclosure_snapshot view also names its backing enclosure.
-    assert.equal(get(g, viewHistory("view-a", `system_id=sys-a&enclosure_id=enc-9&${HEAT_QUERY}`)).allowed, true);
+    // DayBreak #1108 r9 / D-TNJ-20261109-CRAWLER-SVBIND: this view has no
+    // bound enclosure, so an enclosure_id is refused (it was admitted as "any").
+    assert.equal(get(g, viewHistory("view-a", `system_id=sys-a&enclosure_id=enc-9&${HEAT_QUERY}`)).allowed, false);
+    // A view bound to enc-9 admits that enclosure only.
+    const bound = stateGuard(stateId, "storage-view", { ...bind, enclosure_id: "enc-9", optional: ["enclosure_id"] });
+    assert.equal(get(bound, viewHistory("view-a", `system_id=sys-a&enclosure_id=enc-9&${HEAT_QUERY}`)).allowed, true);
+    assert.equal(get(bound, viewHistory("view-a", `system_id=sys-a&enclosure_id=enc-8&${HEAT_QUERY}`)).allowed, false);
     const refused = {
       "another storage view": viewHistory("view-b", `system_id=sys-a&${HEAT_QUERY}`),
       "another system": viewHistory("view-a", `system_id=sys-b&${HEAT_QUERY}`),
@@ -346,7 +351,7 @@ test("r9: the crawler gives each state the reach of its target's scope kind and 
   assert.equal(scopeFor.call({}, { page: "admin", url: `${ADMIN}/` }), "page");
   const bindFor = Crawler.prototype.bindFor;
   assert.deepEqual(bindFor.call({ fixtureMode: false, writeSystem: null }, { system: "sys-a", url: `${UI}/?system_id=sys-a&storage_view_id=view-a` }),
-    { system_id: "sys-a", enclosure_id: null, storage_view_id: "view-a" });
+    { system_id: "sys-a", enclosure_id: null, storage_view_id: "view-a", optional: ["enclosure_id"] });
 });
 
 test("r9: the CI fixture serves a storage view's heat-map history and crawls a target whose first scope is that view", () => {
@@ -362,7 +367,8 @@ test("r9: the CI fixture serves a storage view's heat-map history and crawls a t
   assert.equal(withWrites.some((id) => ["main.rename.save", "main.mapping.notes", "main.led"].includes(id)), false, "the view-first fixture target runs read states only");
   const spec = fs.readFileSync(path.join(root, "qa/ui-coverage.spec.js"), "utf8");
   assert.match(spec, /read GET \/api\/storage-views\/\{view_id\}\/history/);
-  assert.match(spec, /storage_view_id: view \}/, "the browser test binds the view target like a live one");
+  assert.match(spec, /Crawler\.prototype\.bindFor\.call\(\{ fixtureMode: false, writeSystem: null \}, target\)/, "the browser test binds the view target with the live bindFor");
+  assert.match(spec, /viewEnclosure = viewBoundEnclosure\(viewRuntime\)/, "with the enclosure its view is bound to (SVBIND)");
 });
 
 test("r9: a live crawl refuses to start when the committed reach is stale", () => {

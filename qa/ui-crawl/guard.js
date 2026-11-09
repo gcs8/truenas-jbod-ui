@@ -23,7 +23,8 @@
 //      Bound: each `bind` key the target has must be carried with the
 //      target's value (every copy), each `bind_if_sent` key it carries must
 //      equal the target's, and each `bind_params` path parameter (a storage
-//      view's id) must equal the target's.
+//      view's id) must equal the target's. A key the target binds to null
+//      may not be carried at all (D-TNJ-20261109-CRAWLER-SVBIND).
 //   5. Any other class passes only inside a declared window, and only when a
 //      rule matches exactly: method, the substituted path (the captured bay),
 //      the route class, body predicates (a route with `object_keys` must have
@@ -49,6 +50,29 @@ const BOUND_CLASSES = new Set(["app-write", "led", "appliance-load"]);
 const BIND_KEYS = ["system_id", "enclosure_id"];
 // Target keys a read rule may bind: the window keys plus the storage view.
 const READ_BIND_KEYS = [...BIND_KEYS, "storage_view_id"];
+// D-TNJ-20261109-CRAWLER-SVBIND (DayBreak-Blue #1108 r9): the value a target
+// binds for a key is one of
+//   - undefined: no live scope (fixture runs only); the key is not checked;
+//   - null: the target kind has no value for it, so a request may not carry
+//     the key at all (not even empty) -- never "any value";
+//   - a string: every copy the request carries must equal it, and a required
+//     key must be carried.
+// A target's `optional` list (a storage-view target's enclosure, which the
+// page may omit) makes a bound key may-be-absent; it can relax only these.
+const OPTIONAL_BIND_KEYS = new Set(["enclosure_id"]);
+
+// null when `key` of the request fits the target's binding `want`.
+function outsideKey(key, want, parsed, required) {
+  if (want === undefined) return null;
+  const got = parsed.searchParams.getAll(key);
+  if (want === null) return got.length ? `${key} (target has none)` : null;
+  if (!got.length) return required ? `${key} (missing)` : null;
+  return got.some((value) => value !== String(want)) ? `${key} (other)` : null;
+}
+
+function optionalIn(bind, key) {
+  return OPTIONAL_BIND_KEYS.has(key) && Array.isArray((bind || {}).optional) && bind.optional.includes(key);
+}
 
 // Path parameter values of a manifest template, by name.
 function pathParams(template, pathname) {
@@ -331,13 +355,12 @@ class RequestGuard {
     return `read ${route} outside the bound ${outside} of ${this.reads.stateId}`;
   }
 
-  // null when every copy of each key the request carries equals the target's.
+  // null when every copy of each key the request carries equals the target's
+  // (a key the target binds to null may not be carried; SVBIND).
   outsideBindIfSent(keys, bind, parsed) {
     for (const key of keys || []) {
-      const want = (bind || {})[key];
-      if (want === undefined || want === null) continue;
-      const got = parsed.searchParams.getAll(key);
-      if (got.some((value) => value !== String(want))) return `${key} (other)`;
+      const outside = outsideKey(key, (bind || {})[key], parsed, false);
+      if (outside) return outside;
     }
     return null;
   }
@@ -350,19 +373,21 @@ class RequestGuard {
     if (!values) return `path (no match for ${rule.path})`;
     for (const [name, key] of entries) {
       const want = (bind || {})[key];
-      if (want === undefined || want === null) continue;
+      if (want === undefined) continue;
+      // SVBIND: the path always carries the segment; a target with no value refuses it.
+      if (want === null) return `${key} (target has none; ${name} in the path)`;
       if (values[name] !== String(want)) return `${key} (other ${name} in the path)`;
     }
     return null;
   }
 
-  // null when every bound key the target has is carried, every copy equal.
+  // null when every bound key the target has a value for is carried (unless
+  // the target lists it `optional`), every copy equal, and no key the target
+  // binds to null is carried (SVBIND).
   outsideBind(keys, bind, parsed) {
     for (const key of keys || []) {
-      const want = (bind || {})[key];
-      if (want === undefined || want === null) continue;
-      const got = parsed.searchParams.getAll(key);
-      if (!got.length || got.some((value) => value !== String(want))) return `${key} (${got.length ? "other" : "missing"})`;
+      const outside = outsideKey(key, (bind || {})[key], parsed, !optionalIn(bind, key));
+      if (outside) return outside;
     }
     return null;
   }
@@ -373,13 +398,10 @@ class RequestGuard {
     if (!candidates.length) return null;
     if (BOUND_CLASSES.has(cls)) {
       for (const key of BIND_KEYS) {
-        const want = window.bind[key];
-        if (want === undefined || want === null) continue;
-        // FastAPI reads the last of repeated keys; every copy must match.
-        const got = parsed.searchParams.getAll(key);
-        if (!got.length || got.some((value) => value !== String(want))) {
-          return { error: `${cls} request outside the bound ${key} (${got.length ? "other" : "missing"})` };
-        }
+        // FastAPI reads the last of repeated keys; every copy must match. A
+        // key the target binds to null may not be carried (SVBIND).
+        const outside = outsideKey(key, window.bind[key], parsed, !optionalIn(window.bind, key));
+        if (outside) return { error: `${cls} request outside the bound ${outside}` };
       }
     }
     const slot = candidates.find((entry) => entry.used < entry.max);

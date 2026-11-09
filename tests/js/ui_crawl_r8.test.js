@@ -145,11 +145,13 @@ test("Codex P2 1: the guard admits the per-slot SMART read of the target's syste
   assert.equal(g.admit({ method: "GET", url: `${ORIGIN}/api/inventory?system_id=sys-b&enclosure_id=enc-1` }).allowed, false);
 });
 
-test("Codex P2 1: with no captured scope (fixture runs, a storage-view target) only the query keys are checked; a bound key that is set still binds", () => {
+test("Codex P2 1: with no captured scope (fixture runs) only the query keys are checked; a null target key refuses the key (SVBIND); a bound key that is set still binds", () => {
   const free = selectionGuard("main.select[healthy]", {});
   assert.equal(free.admit({ method: "GET", url: smart("system_id=demo-system&enclosure_id=demo-enclosure") }).allowed, true);
   const systemOnly = selectionGuard("main.select[healthy]", { system_id: "sys-a", enclosure_id: null });
-  assert.equal(systemOnly.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=any") }).allowed, true);
+  // DayBreak #1108 r9 / D-TNJ-20261109-CRAWLER-SVBIND: a null enclosure is not "any enclosure".
+  assert.equal(systemOnly.admit({ method: "GET", url: smart("system_id=sys-a&enclosure_id=any") }).allowed, false);
+  assert.equal(systemOnly.admit({ method: "GET", url: smart("system_id=sys-a") }).allowed, true);
   assert.equal(systemOnly.admit({ method: "GET", url: smart("system_id=sys-b&enclosure_id=any") }).allowed, false);
 });
 
@@ -160,7 +162,7 @@ test("Codex P2 1: the crawler gives every state its target's scope, and a live t
   for (const call of begins) assert.match(call, /bind: this\.bindFor\(target\)/, call);
   const { Crawler } = req("qa/ui-crawl/crawler");
   const bindFor = Crawler.prototype.bindFor;
-  assert.deepEqual(bindFor.call({ fixtureMode: false, writeSystem: null }, { system: "sys-a", url: `${ORIGIN}/?system_id=sys-a&enclosure_id=enc-1` }), { system_id: "sys-a", enclosure_id: "enc-1" });
+  assert.deepEqual(bindFor.call({ fixtureMode: false, writeSystem: null }, { system: "sys-a", url: `${ORIGIN}/?system_id=sys-a&enclosure_id=enc-1` }), { system_id: "sys-a", enclosure_id: "enc-1", storage_view_id: null });
 });
 
 test("Codex P2 1: the CI fixture has a long SMART prefetch delay page and crawls every selecting state on it", () => {
