@@ -51,11 +51,13 @@ WRITE_POLICY_BASIC = {
 }
 
 
-def live_snapshot(bundle, *, platform: str | None = None):
+def live_snapshot(bundle, *, platform: str | None = None, ssh: bool = False):
     """The demo snapshot as a live system: locate lights work (synthetic answers).
 
     ``platform`` overrides the selected system's platform (the QuantaStor
     variant: its page queues a forced startup read when bays are LED-capable).
+    ``ssh`` marks the SSH source configured (#1143: the CORE disk-sync buttons
+    are enabled only then, so the default fixture renders them disabled).
     """
     snapshot = bundle.primary_snapshot
     slots = [
@@ -65,6 +67,10 @@ def live_snapshot(bundle, *, platform: str | None = None):
     update = {"slots": slots}
     if platform:
         update["selected_system_platform"] = platform
+    if ssh:
+        sources = dict(snapshot.sources)
+        sources["ssh"] = sources["ssh"].model_copy(update={"enabled": True, "message": "Synthetic fixture: SSH marked configured; nothing is contacted."})
+        update["sources"] = sources
     return snapshot.model_copy(update=update)
 
 
@@ -79,6 +85,27 @@ def slow_prefetch_settings() -> Settings:
     return settings.model_copy(update={"app": settings.app.model_copy(update={"smart_prefetch_delay_ms": SLOW_SMART_PREFETCH_DELAY_MS})})
 
 
+# beta.7 QA: saved views whose runtime backing enclosure is not the page's
+# own, as on a QuantaStor HA pair where a view's binding.target_system_id
+# names the partner node (inventory.py builds backing_enclosure_id from that
+# node's snapshot). The page itself still loads the system's default
+# enclosure. Synthetic id only.
+SYNTHETIC_PARTNER_ENCLOSURE_ID = "synthetic-partner-node-enclosure"
+
+
+def partner_backed_runtime(runtime):
+    """The demo storage-view runtime with every inventory view backed by the partner."""
+    views = [
+        view.model_copy(update={
+            "backing_enclosure_id": SYNTHETIC_PARTNER_ENCLOSURE_ID,
+            "backing_enclosure_label": "Synthetic partner node",
+        })
+        if view.source == "inventory_binding" else view
+        for view in runtime.views
+    ]
+    return runtime.model_copy(update={"views": views})
+
+
 def render_main(
     bundle,
     *,
@@ -86,9 +113,11 @@ def render_main(
     write_policy: dict = WRITE_POLICY,
     platform: str | None = None,
     settings: Settings | None = None,
+    runtime=None,
+    ssh: bool = False,
 ) -> str:
-    snapshot = live_snapshot(bundle, platform=platform)
-    runtime = bundle.storage_view_runtime
+    snapshot = live_snapshot(bundle, platform=platform, ssh=ssh)
+    runtime = runtime or bundle.storage_view_runtime
     context = {
         "request": build_fixture_request(),
         "snapshot": snapshot,
@@ -330,6 +359,8 @@ async def build() -> dict:
         # The QuantaStor variant keeps its platform after its startup refresh.
         "ui-quantastor:/api/inventory": _dump(live_snapshot(bundle, platform="quantastor")),
         "ui:/api/storage-views": _dump(bundle.storage_view_runtime),
+        "ui-ha-view:/api/storage-views": _dump(partner_backed_runtime(bundle.storage_view_runtime)),
+        "ui-ssh:/api/inventory": _dump(live_snapshot(bundle, ssh=True)),
         "ui:/api/sas-fabric": fabric_with_diagnostics(bundle.sas_fabric),
         "ui:/api/history/status": await history.get_status(),
         "ui:/api/release-status": {"status": "disabled"},
@@ -397,6 +428,9 @@ async def build() -> dict:
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-quantastor:/": render_main(bundle, platform="quantastor"),
             "ui-slow-prefetch:/": render_main(bundle, settings=slow_prefetch_settings()),
+            "ui-ha-view:/": render_main(bundle, runtime=partner_backed_runtime(bundle.storage_view_runtime)),
+            # #1143: SSH configured, so the CORE disk-sync buttons are enabled.
+            "ui-ssh:/": render_main(bundle, ssh=True),
             "history:/": render_history(),
             "admin:/": render_admin(),
             "admin-quantastor-ha:/": render_admin(ADMIN_BOOTSTRAP_QUANTASTOR_HA),
