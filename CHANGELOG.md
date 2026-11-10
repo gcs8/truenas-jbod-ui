@@ -98,6 +98,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   preview names any bay that now holds a different disk than the backup, and
   confirming a preview after a bay it writes got another disk is refused with
   409 "Bays changed since the preview" and writes nothing (#1141, #1142).
+- Fixed the export dialog showing "Live estimate unavailable" for good, and
+  the export failing, while the app's own background refresh took longer than
+  5 seconds. The export and its size estimate now use the cached inventory
+  view after that wait, and the dialog says when that view was read. The views
+  one export reads share a single 5-second wait. A page or storage-view load,
+  enclosure switch, SMART prefetch or storage-view slot SMART read that finds
+  no cached view still gets "The inventory is still refreshing", and the page
+  now tries it again up to three times after the server's Retry-After, saying
+  so in the status line, the dialog or the slot's SMART note. A storage-view
+  slot no longer keeps that answer as its SMART data for five minutes; it is
+  read again on the next look after the Retry-After. A Refresh, a save and a
+  locate-light press are not retried automatically (#1144, #1147).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for

@@ -96,7 +96,13 @@ from app.services.history_backend import (
     HistoryBackendPolicyError,
 )
 from app.services.history_status import project_public_collector_status
-from app.services.inventory import DiskInventorySyncBusy, LedSessionBusyError, SplitEnclosureError, user_refresh
+from app.services.inventory import (
+    DiskInventorySyncBusy,
+    LedSessionBusyError,
+    SplitEnclosureError,
+    shared_wait_budget,
+    user_refresh,
+)
 from app.services.mapping_store import (
     MappingImportDigestMismatch,
     MappingRevisionConflict,
@@ -287,29 +293,35 @@ def build_router() -> APIRouter:
         enclosure_id: str | None,
         stage_prefix: str,
         settings: Any,
+        inventory_notes: list[str] | None = None,
     ) -> tuple[Any, Any, Any, Any, Any, Any]:
-        snapshot, smart_summary_cache = await _load_snapshot_export_source(
-            service=service,
-            payload=payload,
-            enclosure_id=enclosure_id,
-            stage_prefix=stage_prefix,
-            settings=settings,
-        )
-        storage_view_runtime, storage_view_smart_summary_cache = await _load_storage_view_export_source(
-            service=service,
-            payload=payload,
-            snapshot=snapshot,
-            enclosure_id=enclosure_id,
-        )
-        live_enclosure_snapshots, live_enclosure_smart_summary_cache = await _load_live_enclosure_export_sources(
-            service=service,
-            payload=payload,
-            snapshot=snapshot,
-            smart_summary_cache=smart_summary_cache,
-            enclosure_id=enclosure_id,
-            stage_prefix=stage_prefix,
-            settings=settings,
-        )
+        # The views this export reads share one wait bound behind a running
+        # background refresh, then fall back to their cached views (#1144).
+        with shared_wait_budget():
+            snapshot, smart_summary_cache = await _load_snapshot_export_source(
+                service=service,
+                payload=payload,
+                enclosure_id=enclosure_id,
+                stage_prefix=stage_prefix,
+                settings=settings,
+                inventory_notes=inventory_notes,
+            )
+            storage_view_runtime, storage_view_smart_summary_cache = await _load_storage_view_export_source(
+                service=service,
+                payload=payload,
+                snapshot=snapshot,
+                enclosure_id=enclosure_id,
+            )
+            live_enclosure_snapshots, live_enclosure_smart_summary_cache = await _load_live_enclosure_export_sources(
+                service=service,
+                payload=payload,
+                snapshot=snapshot,
+                smart_summary_cache=smart_summary_cache,
+                enclosure_id=enclosure_id,
+                stage_prefix=stage_prefix,
+                settings=settings,
+                inventory_notes=inventory_notes,
+            )
         return (
             snapshot,
             smart_summary_cache,
@@ -1530,6 +1542,7 @@ def build_router() -> APIRouter:
     ) -> JSONResponse:
         settings = get_settings()
         service = route_service(system_id, enclosure_id=enclosure_id)
+        inventory_notes: list[str] = []
         (
             snapshot,
             smart_summary_cache,
@@ -1543,6 +1556,7 @@ def build_router() -> APIRouter:
             enclosure_id=enclosure_id,
             stage_prefix="route.export_snapshot_estimate",
             settings=settings,
+            inventory_notes=inventory_notes,
         )
         exporter = get_snapshot_export_service()
         with perf_stage("route.export_snapshot_estimate.build_estimate"):
@@ -1564,6 +1578,9 @@ def build_router() -> APIRouter:
                 packaging=payload.packaging,
                 allow_oversize=payload.allow_oversize,
             )
+        # Shown in the export dialog when a running refresh meant the estimate
+        # was made from an older cached view (#1144).
+        estimate = {**estimate, "inventory_note": " ".join(inventory_notes) or None}
         return JSONResponse(estimate)
 
     @router.get("/livez")

@@ -20,11 +20,13 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from app import main as app_main
+from app import route_support
 from app import routes as app_routes
 from app.config import Settings, SystemConfig, TrueNASConfig
+from app.settings_reload import SettingsRuntime
 from app.models.domain import ManualMapping, SourceStatus
 from app.services import inventory as inventory_module
 from app.services.parsers import ParsedSSHData
@@ -1359,6 +1361,265 @@ class StartupPrewarmTests(RefreshDeadlineTests):
         self.assertNotIn(LATE_MARKER, snapshot.warnings)
         self.assertEqual(self.appliance.reads, 3)
         self.assert_budget_respected()
+
+
+class ReadsDuringARunningRefreshTests(RefreshDeadlineTests):
+    """User-facing reads during a background refresh are never a dead end (#1144).
+
+    The release QA crawl found the export dialog's size estimate answering 503
+    "still refreshing" whenever the page's own refresh ran past the short user
+    bound, and the dialog then showed "Live estimate unavailable" for good.
+    Each read below is checked in the three states a running refresh can leave
+    the shelf in: a current cached view, an expired but present one, and none
+    at all (a cold key). Only the last may answer the retryable 503.
+    """
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        settings = Settings(
+            systems=[SystemConfig(id=SYSTEM_ID, label="Synthetic SCALE", truenas=TrueNASConfig(platform="scale"))],
+            default_system_id=SYSTEM_ID,
+        )
+        self.exporter = Mock()
+        self.exported_snapshots: list = []
+
+        async def estimate(**kwargs):
+            self.exported_snapshots.append(kwargs["snapshot"])
+            return {"html_size_label": "1.0 MiB", "selected_packaging": "auto", "selected_allowed": True}
+
+        async def build(**kwargs):
+            self.exported_snapshots.append(kwargs["snapshot"])
+            return Mock(
+                content=b"<html></html>", media_type="text/html", filename="synthetic.html", size_bytes=13,
+                html_size_bytes=13, packaging="html", redaction="none", size_limit_bytes=1024,
+            )
+
+        self.exporter.estimate_enclosure_snapshot_export = estimate
+        self.exporter.build_enclosure_snapshot_export = build
+        for patcher in (
+            patch.object(app_routes, "get_snapshot_export_service", return_value=self.exporter),
+            patch.object(route_support, "SETTINGS_RUNTIME", SettingsRuntime(lambda: settings)),
+            # SMART is not under test here; the export reads it from its cache.
+            patch.object(self.service, "get_slot_smart_summaries", new=AsyncMock(return_value=[])),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        route_support.SNAPSHOT_EXPORT_SOURCE_CACHE.clear()
+        self.addCleanup(route_support.SNAPSHOT_EXPORT_SOURCE_CACHE.clear)
+
+    def export(self, path: str = "/api/export/enclosure-snapshot/estimate"):
+        return call_app(self.application, "POST", path, query=f"system_id={SYSTEM_ID}&enclosure_id={SHELF}", body={})
+
+    async def timed(self, request):
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        response = await asyncio.wait_for(request, timeout=ANSWER_CEILING_SECONDS)
+        return response, loop.time() - started
+
+    def assert_no_new_appliance_call(self) -> None:
+        # Setup, then the running refresh's hung read: nothing was added behind it.
+        self.assertEqual(self.appliance.reads, 2)
+        self.assertEqual(len(self.appliance.calls), 2)
+        self.assert_budget_respected()
+
+    async def test_export_estimate_answers_from_the_expired_view_with_a_staleness_note(self) -> None:
+        cached = self.service._cache[SHELF]
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            (status, headers, content), elapsed = await self.timed(self.export())
+            self.assertEqual(status, 200, content[:300])
+            self.assertNotIn("retry-after", headers)
+            self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            payload = json.loads(content)
+            # The estimate is built from the cached view and says how old it is.
+            self.assertEqual(len(self.exported_snapshots), 1)
+            self.assertEqual(self.exported_snapshots[0].last_updated, cached.last_updated)
+            self.assertIn("read at", payload["inventory_note"])
+            self.assertIn(payload["inventory_note"], self.exported_snapshots[0].warnings)
+            self.assert_no_new_appliance_call()
+            # An older view is never kept as the export's reusable source.
+            self.assertFalse(route_support.SNAPSHOT_EXPORT_SOURCE_CACHE)
+
+            # Once the refresh finishes, the next estimate uses the new view.
+            self.appliance.answer.set()
+            await self.settle()
+            status, _headers, content = await asyncio.wait_for(self.export(), timeout=ANSWER_CEILING_SECONDS)
+        self.assertEqual(status, 200, content[:300])
+        self.assertIsNone(json.loads(content).get("inventory_note"))
+        self.assertGreater(self.exported_snapshots[-1].last_updated, cached.last_updated)
+        self.assertEqual(self.appliance.limiter.active, 0)
+        self.assert_budget_respected()
+
+    async def test_export_download_answers_from_the_expired_view_with_a_staleness_note(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            (status, headers, content), _elapsed = await self.timed(self.export("/api/export/enclosure-snapshot"))
+        self.assertEqual(status, 200, content[:300])
+        self.assertEqual(headers.get("content-disposition"), 'attachment; filename="synthetic.html"')
+        exported = self.exported_snapshots[0]
+        self.assertTrue(any("read at" in warning for warning in exported.warnings), exported.warnings)
+        self.assert_no_new_appliance_call()
+
+    async def test_export_estimate_with_a_current_view_answers_at_once(self) -> None:
+        current = self.service._cache[SHELF]
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            # The shared source refresh hangs, but the shelf's view is current.
+            await self.start_hung_source_refresh()
+            (status, _headers, content), elapsed = await self.timed(self.export())
+        self.assertEqual(status, 200, content[:300])
+        self.assertLess(elapsed, USER_WAIT_SECONDS)
+        self.assertIsNone(json.loads(content).get("inventory_note"))
+        self.assertIs(self.exported_snapshots[0], current)
+        self.assert_no_new_appliance_call()
+
+    async def test_export_estimate_with_no_cached_view_answers_a_retryable_busy(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            # A change dropped the shelf's cached view, so nothing can stand in.
+            self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.rename", enclosure_id=SHELF)
+            (status, headers, content), elapsed = await self.timed(self.export())
+        self.assertEqual(status, 503, content[:300])
+        self.assertIn("retry-after", headers)
+        self.assertIn("still refreshing", json.loads(content)["detail"])
+        self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+        self.assertFalse(self.exported_snapshots)
+        self.assert_no_new_appliance_call()
+
+    async def test_reads_in_one_request_share_one_wait_bound(self) -> None:
+        # An export of several enclosures reads one view per enclosure. Their
+        # waits share one user bound, so the request cannot stack a full bound
+        # per enclosure before it answers.
+        loop = asyncio.get_running_loop()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            started = loop.time()
+            with inventory_module.shared_wait_budget():
+                results = [
+                    await asyncio.wait_for(
+                        self.service.get_current_or_cached_snapshot(selected_enclosure_id=SHELF),
+                        timeout=ANSWER_CEILING_SECONDS,
+                    )
+                    for _ in range(3)
+                ]
+            elapsed = loop.time() - started
+        self.assertGreaterEqual(elapsed, USER_WAIT_SECONDS)
+        self.assertLess(elapsed, 2 * USER_WAIT_SECONDS)
+        for snapshot, note in results:
+            # Each read fell back to the cached view and says when it was read.
+            self.assertIn("read at", note)
+            self.assertEqual(snapshot.warnings[0], note)
+        self.assert_no_new_appliance_call()
+
+    def scoped_reads(self):
+        query = f"system_id={SYSTEM_ID}&enclosure_id={SHELF}"
+        return {
+            "inventory": call_app(self.application, "GET", "/api/inventory", query=query),
+            "storage-views": call_app(self.application, "GET", "/api/storage-views", query=query),
+            "smart-batch": call_app(self.application, "POST", "/api/slots/smart-batch", query=query, body={"slots": [0]}),
+        }
+
+    async def test_scoped_reads_with_an_expired_view_answer_from_it(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            for name, request in self.scoped_reads().items():
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertNotIn("retry-after", headers)
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_scoped_reads_with_a_current_view_answer_at_once(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_source_refresh()
+            for name, request in self.scoped_reads().items():
+                with self.subTest(route=name):
+                    (status, _headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertLess(elapsed, USER_WAIT_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_scoped_reads_with_no_cached_view_answer_retryably_or_from_cache(self) -> None:
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.rename", enclosure_id=SHELF)
+            responses = {name: await self.timed(request) for name, request in self.scoped_reads().items()}
+            # Nothing can stand in for the shelf's view: a bounded, retryable
+            # busy answer the page retries (#1144).
+            for name in ("inventory", "storage-views"):
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = responses[name]
+                    self.assertEqual(status, 503, content[:300])
+                    self.assertIn("retry-after", headers)
+                    self.assertIn("still refreshing", json.loads(content)["detail"])
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            # The SMART batch answers from the SMART cache and says the layout
+            # could not be checked, as it does whenever the layout is unknown.
+            (status, _headers, content), _elapsed = responses["smart-batch"]
+            self.assertEqual(status, 200, content[:300])
+            self.assertEqual(json.loads(content)["layout_bounds"], "unavailable")
+            self.assert_no_new_appliance_call()
+
+    # Storage-view SMART and history reads resolve the view's slots from the
+    # inventory view first. Unlike a physical bay, a view slot cannot be
+    # matched to a disk without it, so with no cached view at all they answer
+    # the retryable 503 the page retries; with any cached view they answer 200.
+
+    def storage_view_reads(self):
+        query = f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&window_hours=24"
+        base = "/api/storage-views/primary-chassis"
+        return {
+            "slot-smart": call_app(self.application, "GET", f"{base}/slots/0/smart", query=query),
+            "smart-batch": call_app(self.application, "POST", f"{base}/slots/smart-batch", query=query, body={"slots": [0]}),
+            "slot-history": call_app(self.application, "GET", f"{base}/slots/0/history", query=query),
+            "view-history": call_app(self.application, "GET", f"{base}/history", query=query),
+        }
+
+    def patch_history_backend(self) -> None:
+        backend = AsyncMock()
+        backend.configured = False
+        backend.get_slot_history.return_value = {"configured": False}
+        backend.get_scopes_history.return_value = {"configured": False, "scopes": []}
+        patcher = patch.object(app_routes, "get_history_backend", return_value=backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_storage_view_smart_and_history_with_a_current_view_answer_at_once(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_source_refresh()
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, _headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertLess(elapsed, USER_WAIT_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_storage_view_smart_and_history_with_an_expired_view_answer_from_it(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertNotIn("retry-after", headers)
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_storage_view_smart_and_history_with_no_cached_view_answer_retryably(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.rename", enclosure_id=SHELF)
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 503, content[:300])
+                    self.assertIn("retry-after", headers)
+                    self.assertIn("still refreshing", json.loads(content)["detail"])
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            self.assert_no_new_appliance_call()
 
 
 if __name__ == "__main__":

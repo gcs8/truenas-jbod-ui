@@ -380,6 +380,7 @@ async def _load_snapshot_export_source(
     enclosure_id: str | None,
     stage_prefix: str,
     settings: Settings,
+    inventory_notes: list[str] | None = None,
 ) -> tuple[InventorySnapshot, dict[str, dict[str, Any]]]:
     generation = SETTINGS_RUNTIME.active()
     cache_key = _snapshot_export_source_cache_key(
@@ -394,7 +395,10 @@ async def _load_snapshot_export_source(
 
     add_perf_metadata(snapshot_export_source_cache="miss")
     with perf_stage(f"{stage_prefix}.load_snapshot"):
-        snapshot = await service.get_snapshot(selected_enclosure_id=enclosure_id)
+        # A running background refresh must not turn the export or its size
+        # estimate into a dead end (#1144): past the user wait bound the
+        # cached view is used, with a warning that says when it was read.
+        snapshot, inventory_note = await service.get_current_or_cached_snapshot(selected_enclosure_id=enclosure_id)
     with perf_stage(f"{stage_prefix}.load_smart_summaries", slot_count=len(snapshot.slots)):
         smart_summaries = await service.get_slot_smart_summaries(
             [slot.slot for slot in snapshot.slots],
@@ -405,6 +409,11 @@ async def _load_snapshot_export_source(
         str(item.slot): item.summary.model_dump(mode="json")
         for item in smart_summaries
     }
+    if inventory_note is not None:
+        # Not kept for reuse: the next export reads the refreshed view.
+        if inventory_notes is not None and inventory_note not in inventory_notes:
+            inventory_notes.append(inventory_note)
+        return snapshot, smart_summary_cache
     _store_snapshot_export_source_cache_entry(
         cache_key,
         snapshot=snapshot,
@@ -530,6 +539,7 @@ async def _load_live_enclosure_export_sources(
     enclosure_id: str | None,
     stage_prefix: str,
     settings: Settings,
+    inventory_notes: list[str] | None = None,
 ) -> tuple[dict[str, InventorySnapshot] | None, dict[str, dict[str, dict[str, Any]]] | None]:
     selected_enclosure_ids = _selected_snapshot_export_enclosure_ids(
         payload=payload,
@@ -558,6 +568,7 @@ async def _load_live_enclosure_export_sources(
             enclosure_id=selected_enclosure_id,
             stage_prefix=stage_prefix,
             settings=settings,
+            inventory_notes=inventory_notes,
         )
         resolved_enclosure_id = next_snapshot.selected_enclosure_id or selected_enclosure_id
         if not resolved_enclosure_id:

@@ -549,7 +549,7 @@ for (const outcome of ["success", "failure"]) {
   const d=deferred(); let applied=0, statuses=0, renders=0;
   const state={snapshotMode:false, selectedSystemId:"a",selectedEnclosureId:"one",storageViewsRuntimeRequestToken:0};
   const names=["currentUiScopeKey", "fetchStorageViewRuntime"].filter(n=>source.includes(`function ${n}(`));
-  const c=load(names,{state,renderSelectors(){renders++;},buildSelectionParams:()=>new URLSearchParams(),fetchJson:()=>d.promise,applyStorageViewRuntime(){applied++;},renderAll(){renders++;},renderStorageViewRuntimeStatus(){},setStatus(){statuses++;}});
+  const c=load(names,{state,renderSelectors(){renders++;},buildSelectionParams:()=>new URLSearchParams(),retryBusyRead:(read)=>read(),fetchJson:()=>d.promise,applyStorageViewRuntime(){applied++;},renderAll(){renders++;},renderStorageViewRuntimeStatus(){},setStatus(){statuses++;}});
   const p=c.fetchStorageViewRuntime(false,true); state.selectedSystemId="b"; state.storageViewsRuntimeLoading=true;
   const before=renders;
   if(outcome==="success") d.resolve({system_id:"a",views:[]}); else d.reject(new Error("synthetic failure"));
@@ -560,7 +560,7 @@ for (const outcome of ["success", "failure"]) {
 test("quiet runtime failure is explicitly stale and retryable", async () => {
  const state={snapshotMode:false,selectedSystemId:"a",selectedEnclosureId:"one",storageViewsRuntimeRequestToken:0,storageViewsRuntime:{system_id:"a",views:[{id:"old"}]}}; let status="";
  const names=["currentUiScopeKey", "fetchStorageViewRuntime"].filter(n=>source.includes(`function ${n}(`));
- const c=load(names,{state,renderSelectors(){},renderAll(){},renderStorageViewRuntimeStatus(){},buildSelectionParams:()=>new URLSearchParams(),fetchJson:async()=>{throw new Error("synthetic unavailable");},setStatus(m){status=m;}});
+ const c=load(names,{state,renderSelectors(){},renderAll(){},renderStorageViewRuntimeStatus(){},buildSelectionParams:()=>new URLSearchParams(),retryBusyRead:(read)=>read(),fetchJson:async()=>{throw new Error("synthetic unavailable");},setStatus(m){status=m;}});
  await c.fetchStorageViewRuntime(false,true);
  assert.match(status,/Storage view refresh failed/);
  assert.equal(state.storageViewsRuntimeError,"synthetic unavailable");
@@ -681,7 +681,7 @@ for (const sameObject of [false,true]) {
 
 test("runtime removal of selected view rerenders the now-live grid", async () => {
  const state={snapshotMode:false,selectedSystemId:"a",selectedEnclosureId:"one",selectedStorageViewRuntimeId:"removed",storageViewsRuntimeRequestToken:0};let rendered=0;
- const c=load(["currentUiScopeKey","fetchStorageViewRuntime"],{state,renderSelectors(){},renderAll(){rendered++;},renderStorageViewRuntimeStatus(){},buildSelectionParams:()=>new URLSearchParams(),fetchJson:async()=>({system_id:"a",views:[]}),applyStorageViewRuntime(){state.selectedStorageViewRuntimeId="";},setStatus(){}});
+ const c=load(["currentUiScopeKey","fetchStorageViewRuntime"],{state,renderSelectors(){},renderAll(){rendered++;},renderStorageViewRuntimeStatus(){},buildSelectionParams:()=>new URLSearchParams(),retryBusyRead:(read)=>read(),fetchJson:async()=>({system_id:"a",views:[]}),applyStorageViewRuntime(){state.selectedStorageViewRuntimeId="";},setStatus(){}});
  await c.fetchStorageViewRuntime(false,true);
  assert.equal(rendered,1);
 });

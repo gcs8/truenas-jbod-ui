@@ -2302,7 +2302,8 @@ class MainAppBoundaryTests(unittest.TestCase):
         fake_service = MagicMock()
         fake_service.system.id = "archive-core"
         fake_service.system.truenas.platform = "core"
-        fake_service.get_snapshot = AsyncMock(return_value=snapshot)
+        # The export reads a current view, or the cached one during a refresh (#1144).
+        fake_service.get_current_or_cached_snapshot = AsyncMock(return_value=(snapshot, None))
         fake_service.get_slot_smart_summaries = AsyncMock(
             return_value=[SimpleNamespace(slot=0, summary=fake_summary)]
         )
@@ -2348,7 +2349,8 @@ class MainAppBoundaryTests(unittest.TestCase):
             "bmc": {"host": "bmc206.route.invalid"},
         }
         fake_service.system.model_dump.return_value = source_config
-        fake_service.get_snapshot = AsyncMock(return_value=snapshot)
+        # The export reads a current view, or the cached one during a refresh (#1144).
+        fake_service.get_current_or_cached_snapshot = AsyncMock(return_value=(snapshot, None))
         fake_service.get_slot_smart_summaries = AsyncMock(
             return_value=[SimpleNamespace(slot=0, summary=fake_summary)]
         )
@@ -2427,7 +2429,7 @@ class MainAppBoundaryTests(unittest.TestCase):
         self.assertNotIn("source_config", fake_exporter.build_enclosure_snapshot_export.await_args.kwargs)
         self.assertEqual(fake_service.system.model_dump.call_count, 2)
         fake_service.system.model_dump.assert_called_with(mode="json")
-        fake_service.get_snapshot.assert_awaited_once_with(selected_enclosure_id="front")
+        fake_service.get_current_or_cached_snapshot.assert_awaited_once_with(selected_enclosure_id="front")
         fake_service.get_slot_smart_summaries.assert_awaited_once_with(
             [0, 1],
             selected_enclosure_id="front",
