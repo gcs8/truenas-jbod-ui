@@ -1136,6 +1136,9 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
       URLSearchParams,
       encodeURIComponent,
       fetchJson: () => request.promise,
+      // The #1144 busy-read retry is covered in refreshing_read_retry.test.js.
+      retryBusyRead: (read) => read(),
+      busyReadRetryDelayMs: () => null,
       renderDetail() { presentationEvents.push("detail"); },
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
@@ -1191,6 +1194,9 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
       URLSearchParams,
       encodeURIComponent,
       fetchJson: () => request.promise,
+      // The #1144 busy-read retry is covered in refreshing_read_retry.test.js.
+      retryBusyRead: (read) => read(),
+      busyReadRetryDelayMs: () => null,
       renderDetail() { presentationEvents.push("detail"); },
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
