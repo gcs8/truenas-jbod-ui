@@ -239,6 +239,8 @@ test("storage-view refresh updates the live selector before the completed main r
   const events = [];
   const { fn: fetchStorageViewRuntime } = loadFunction(APP_SOURCE, "fetchStorageViewRuntime", {
     state,
+    // Busy-read retries (#1144) are covered in refreshing_read_retry.test.js.
+    retryBusyRead: (read) => read(),
     renderSelectors() { events.push(state.storageViewsRuntimeLoading ? "loading-selectors" : "complete-selectors"); },
     buildSelectionParams() { return new URLSearchParams(); },
     URLSearchParams,
@@ -1134,6 +1136,9 @@ test("storage-view SMART completion cannot mutate a different active view", asyn
       URLSearchParams,
       encodeURIComponent,
       fetchJson: () => request.promise,
+      // The #1144 busy-read retry is covered in refreshing_read_retry.test.js.
+      retryBusyRead: (read) => read(),
+      busyReadRetryDelayMs: () => null,
       renderDetail() { presentationEvents.push("detail"); },
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,
@@ -1189,6 +1194,9 @@ test("storage-view SMART completion cannot mutate the same view ID in a differen
       URLSearchParams,
       encodeURIComponent,
       fetchJson: () => request.promise,
+      // The #1144 busy-read retry is covered in refreshing_read_retry.test.js.
+      retryBusyRead: (read) => read(),
+      busyReadRetryDelayMs: () => null,
       renderDetail() { presentationEvents.push("detail"); },
       getLiveBackedStorageViewSlot: () => null,
       getStorageViewSmartSummaryEntry: () => state.smartSummaries[cacheKey]?.data || null,

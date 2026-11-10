@@ -11,6 +11,9 @@
     : "auto";
   const SMART_PREFETCH_SINGLE_THRESHOLD = Math.max(1, Number(bootstrap.smartPrefetchSingleThreshold) || 128);
   const SMART_PREFETCH_CHUNK_SIZE = Math.max(1, Number(bootstrap.smartPrefetchChunkSize) || 24);
+  // Bounded retries of a read answered "still refreshing" (#1144); see retryBusyRead.
+  const BUSY_READ_RETRY_LIMIT = 3;
+  const BUSY_READ_RETRY_MAX_DELAY_MS = 10000;
   const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
 
   const SNAPSHOT_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.snapshotCacheTtlSeconds, 10);
@@ -153,6 +156,7 @@
         loading: false,
         error: null,
         data: null,
+        retryNote: null,
         requestToken: 0,
       },
     },
@@ -2740,7 +2744,11 @@
     try {
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
-      const payload = await fetchJson(`/api/sas-fabric?${params.toString()}`);
+      const readFabric = () => fetchJson(`/api/sas-fabric?${params.toString()}`);
+      // Only a non-forced load is retried after "still refreshing" (#1144).
+      const payload = force
+        ? await readFabric()
+        : await retryBusyRead(readFabric, { isCurrent: () => requestToken === state.sasFabric.requestToken });
       if (requestToken !== state.sasFabric.requestToken) {
         return;
       }
@@ -4280,7 +4288,8 @@
   }
 
   function isSmartEntryCurrent(entry) {
-    return Boolean(entry?.data) && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
+    // A retryable "still refreshing" answer is shown, never kept as data (#1144).
+    return Boolean(entry?.data) && !entry.transient && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
   }
 
   function isSmartEntryInFlight(entry) {
@@ -4347,14 +4356,16 @@
     return slots.length <= SMART_PREFETCH_SINGLE_THRESHOLD;
   }
 
-  async function requestSmartBatchForSlots(slots) {
-    return sendScopedRequest("/api/slots/smart-batch", {
+  async function requestSmartBatchForSlots(slots, isCurrent = () => true) {
+    // A batch answered "still refreshing" is retried while its prefetch run
+    // is current; the bays keep showing Loading meanwhile (#1144).
+    return retryBusyRead(() => sendScopedRequest("/api/slots/smart-batch", {
       method: "POST",
       body: JSON.stringify({
         slots: slots.map((slot) => slot.slot),
         max_concurrency: Math.min(SMART_BATCH_REQUEST_MAX_CONCURRENCY, slots.length),
       }),
-    });
+    }), { isCurrent });
   }
 
   function applySmartPrefetchPayload(slots, payload) {
@@ -4397,6 +4408,7 @@
     }
     state.smartPrefetchRunning = true;
     const slots = candidateSlotsForSmartPrefetch().map((slot) => ({ slot: slot.slot, cacheKey: getSmartCacheKey(slot), owner: null }));
+    const runIsCurrent = () => runToken === state.smartPrefetchToken && scopeKey === state.smartPrefetchScopeKey;
     if (!slots.length) {
       state.smartPrefetchRunning = false;
       return;
@@ -4432,7 +4444,7 @@
             const chunk = chunks[nextChunkIndex];
             nextChunkIndex += 1;
             try {
-              const payload = await requestSmartBatchForSlots(chunk);
+              const payload = await requestSmartBatchForSlots(chunk, runIsCurrent);
               if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
                 return;
               }
@@ -4455,7 +4467,7 @@
       const useSingleRequest = shouldUseSingleSmartPrefetchRequest(slots);
       if (useSingleRequest) {
         try {
-          const payload = await requestSmartBatchForSlots(slots);
+          const payload = await requestSmartBatchForSlots(slots, runIsCurrent);
           if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
             return;
           }
@@ -4467,6 +4479,15 @@
               return;
             }
             logSmartPrefetchFailure("SMART prefetch single-request path failed", error);
+            applySmartPrefetchError(slots, error);
+            updateSmartPrefetchViews();
+          } else if (busyReadRetryDelayMs(error) !== null) {
+            // Still refreshing after its bounded retries: chunks would only
+            // repeat the same answer, so wait for the next prefetch (#1144).
+            if (runToken !== state.smartPrefetchToken || scopeKey !== state.smartPrefetchScopeKey) {
+              return;
+            }
+            logSmartPrefetchFailure("SMART prefetch failed while the inventory refreshes", error, { fallback: true });
             applySmartPrefetchError(slots, error);
             updateSmartPrefetchViews();
           } else {
@@ -6573,6 +6594,7 @@
   function appendSmartTooltipMetrics(lines, slot, smartEntry) {
     if (smartEntry?.loading) {
       lines.push("SMART: loading...");
+      if (smartEntry.retryNote) lines.push(smartEntry.retryNote);
       return;
     }
 
@@ -7841,6 +7863,7 @@
     state.export.estimate.loading = false;
     state.export.estimate.error = null;
     state.export.estimate.data = null;
+    state.export.estimate.retryNote = null;
   }
 
   function invalidateSnapshotExportEstimateIfBasisChanged(previousBasisKey) {
@@ -8016,7 +8039,10 @@
     }
     const estimateState = state.export.estimate;
     if (estimateState.loading && !estimateState.data) {
-      exportSnapshotEstimate.innerHTML = '<p class="snapshot-export-estimate-message">Estimating export size...</p>';
+      // A retry of a "still refreshing" answer says so while it waits (#1144).
+      exportSnapshotEstimate.innerHTML = estimateState.retryNote
+        ? `<p class="snapshot-export-estimate-message">Estimating export size... ${escapeHtml(estimateState.retryNote)}</p>`
+        : '<p class="snapshot-export-estimate-message">Estimating export size...</p>';
       return;
     }
     if (estimateState.error && !estimateState.data) {
@@ -8061,6 +8087,7 @@
         </div>
       </div>
       <p class="${adviceClass}">${escapeHtml(buildEstimateAdvice(estimate))}</p>
+      ${estimate.inventory_note ? `<p class="snapshot-export-estimate-message warning">${escapeHtml(estimate.inventory_note)}</p>` : ""}
     `;
   }
 
@@ -8137,35 +8164,49 @@
     state.export.estimate.loading = true;
     state.export.estimate.error = null;
     state.export.estimate.data = null;
+    state.export.estimate.retryNote = null;
     syncSnapshotExportDialog();
 
+    const isCurrent = () => (
+      nextToken === state.export.estimate.requestToken
+      && estimateBasisKey === snapshotExportEstimateBasisKey()
+    );
+    const superseded = {};
     try {
-      const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot/estimate"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(snapshotExportRequestPayload()),
-      });
-      if (
-        nextToken !== state.export.estimate.requestToken
-        || estimateBasisKey !== snapshotExportEstimateBasisKey()
-      ) {
-        return;
-      }
-      if (!response.ok) {
-        let detail = `Estimate failed with ${response.status}`;
-        try {
-          const payload = await response.json();
-          detail = payload.detail || detail;
-        } catch (error) {
-          // Ignore parsing issues and use the HTTP status.
+      // A retryable 503 (the inventory is still refreshing) is retried, with
+      // the wait shown, while the dialog stays open on the same basis (#1144).
+      const estimate = await retryBusyRead(async () => {
+        const response = await fetch(buildScopedUrl("/api/export/enclosure-snapshot/estimate"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(snapshotExportRequestPayload()),
+        });
+        if (!isCurrent()) {
+          return superseded;
         }
-        throw new Error(detail);
-      }
-      const estimate = await response.json();
-      if (
-        nextToken !== state.export.estimate.requestToken
-        || estimateBasisKey !== snapshotExportEstimateBasisKey()
-      ) {
+        if (!response.ok) {
+          let detail = `Estimate failed with ${response.status}`;
+          try {
+            const payload = await response.json();
+            detail = payload.detail || detail;
+          } catch (error) {
+            // Ignore parsing issues and use the HTTP status.
+          }
+          const failure = new Error(detail);
+          failure.status = response.status;
+          failure.retryAfterSeconds = retryAfterSecondsFrom(response);
+          throw failure;
+        }
+        const payload = await response.json();
+        return isCurrent() ? payload : superseded;
+      }, {
+        isCurrent: () => isCurrent() && Boolean(exportSnapshotDialog?.open),
+        onRetry: (attempt, delayMs) => {
+          state.export.estimate.retryNote = busyReadRetryMessage(attempt, delayMs);
+          syncSnapshotExportDialog();
+        },
+      });
+      if (estimate === superseded) {
         return;
       }
       state.export.estimate.data = {
@@ -8174,7 +8215,7 @@
       };
       state.export.estimate.error = null;
     } catch (error) {
-      if (nextToken !== state.export.estimate.requestToken) {
+      if (!isCurrent()) {
         return;
       }
       state.export.estimate.error = `Live estimate unavailable: ${error.message || error}`;
@@ -8182,6 +8223,7 @@
     } finally {
       if (nextToken === state.export.estimate.requestToken) {
         state.export.estimate.loading = false;
+        state.export.estimate.retryNote = null;
         syncSnapshotExportDialog();
       }
     }
@@ -9294,7 +9336,9 @@
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
       ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
-    return [smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+    // While a "still refreshing" SMART read waits to retry (#1144).
+    const retryNote = (smartEntry?.loading || smartEntry?.refreshing) ? smartEntry.retryNote : null;
+    return [retryNote, smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
 
   function renderEmptyDetailState(message, { showDetailSecondary = true } = {}) {
@@ -11037,9 +11081,53 @@
       failure.status = response.status;
       failure.detail = payload?.detail ?? null;
       failure.code = typeof payload?.error === "string" ? payload.error : null;
+      // Lets a read retry a "still refreshing" answer after its Retry-After (#1144).
+      const retryAfter = response.headers?.get?.("Retry-After");
+      failure.retryAfterSeconds = /^\s*\d+\s*$/.test(retryAfter ?? "") ? Number(retryAfter) : null;
       throw failure;
     }
     return payload;
+  }
+
+  function retryAfterSecondsFrom(response) {
+    const value = response?.headers?.get?.("Retry-After");
+    if (value === null || value === undefined || !/^\s*\d+\s*$/.test(String(value))) return null;
+    return Number(value);
+  }
+
+  // A read answered by a retryable 503 (503 with Retry-After, such as "The
+  // inventory is still refreshing", #1144) is tried again after the server's
+  // Retry-After, a bounded number of times, instead of ending in an error.
+  // Never used for writes, identify lights or forced refreshes.
+  function busyReadRetryDelayMs(error) {
+    if (error?.status !== 503 || !Number.isFinite(error?.retryAfterSeconds)) return null;
+    return Math.min(Math.max(error.retryAfterSeconds * 1000, 1000), BUSY_READ_RETRY_MAX_DELAY_MS);
+  }
+
+  function busyReadRetryMessage(attempt, delayMs) {
+    return `The inventory is still refreshing. Trying again in ${Math.round(delayMs / 1000)} s (retry ${attempt} of ${BUSY_READ_RETRY_LIMIT}).`;
+  }
+
+  function waitMs(delayMs) {
+    return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+  }
+
+  async function retryBusyRead(read, options = {}) {
+    const isCurrent = options.isCurrent || (() => true);
+    const onRetry = options.onRetry || null;
+    const wait = options.wait || waitMs;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await read();
+      } catch (error) {
+        const delayMs = busyReadRetryDelayMs(error);
+        if (delayMs === null || attempt > BUSY_READ_RETRY_LIMIT || !isCurrent()) throw error;
+        if (onRetry) onRetry(attempt, delayMs, error);
+        await wait(delayMs);
+        // A superseded read ends with its last error; callers ignore it.
+        if (!isCurrent()) throw error;
+      }
+    }
   }
 
   async function sendScopedRequest(url, options = {}, queryParams = null) {
@@ -11073,7 +11161,17 @@
       renderStorageViewRuntimeStatus();
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
-      const payload = await fetchJson(`/api/storage-views?${params.toString()}`);
+      const readStorageViews = () => fetchJson(`/api/storage-views?${params.toString()}`);
+      // Only a non-forced load is retried after "still refreshing" (#1144);
+      // a forced one joins the running refresh and is never sent twice.
+      const payload = force
+        ? await readStorageViews()
+        : await retryBusyRead(readStorageViews, {
+          isCurrent,
+          onRetry: (attempt, delayMs) => {
+            if (!quiet) setStatus(`Loading storage views... ${busyReadRetryMessage(attempt, delayMs)}`);
+          },
+        });
       if (!isCurrent()) {
         return;
       }
@@ -11205,7 +11303,17 @@
       }
       const params = buildSelectionParams();
       params.set("force", force ? "true" : "false");
-      const snapshot = await fetchJson(`/api/inventory?${params.toString()}`);
+      const readInventory = () => fetchJson(`/api/inventory?${params.toString()}`);
+      // A page load or scope switch answered "still refreshing" (no cached
+      // view of this scope yet) is retried with the wait shown (#1144). A
+      // forced Refresh already joins the running refresh and is never sent
+      // twice; background refreshes stay quiet and try again on their timer.
+      const snapshot = force || background
+        ? await readInventory()
+        : await retryBusyRead(readInventory, {
+          isCurrent: () => refreshToken === state.latestRefreshToken && (!completionIsCurrent || completionIsCurrent()),
+          onRetry: (attempt, delayMs) => setStatus(`${refreshStatusMessage(force, reason)} ${busyReadRetryMessage(attempt, delayMs)}`),
+        });
       if (refreshToken !== state.latestRefreshToken || (completionIsCurrent && !completionIsCurrent())) {
         if (perfRun && state.uiPerf.currentRun?.id === perfRun.id) {
           archiveUiPerfRun(perfRun, "superseded");
@@ -12020,6 +12128,11 @@
     if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       return;
     }
+    // After a retryable answer the slot is read again once the server's
+    // Retry-After has passed, not on every render in between.
+    if (entry?.transient && Date.now() < entry.retryNotBefore) {
+      return;
+    }
 
     const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
@@ -12038,7 +12151,19 @@
       const scopedUrl = params.toString()
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
-      const payload = await fetchJson(scopedUrl);
+      // A storage-view slot cannot be matched to a disk until the inventory
+      // view exists, so with none cached the read answers the retryable 503
+      // "still refreshing". Retry it like the page's other reads, showing
+      // the wait, while this request still owns the slot (#1144).
+      const payload = await retryBusyRead(() => fetchJson(scopedUrl), {
+        isCurrent: () => state.smartSummaries[cacheKey] === owner && buildSelectionParams().toString() === requestScope,
+        onRetry: (attempt, delayMs) => {
+          owner.retryNote = busyReadRetryMessage(attempt, delayMs);
+          if (state.selectedStorageViewRuntimeId !== view.id) return;
+          if (state.selectedSlot === slot.slot_index) renderDetail();
+          if (state.hoveredSlot === slot.slot_index) refreshHoveredTooltip();
+        },
+      });
       if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
@@ -12049,12 +12174,15 @@
       };
     } catch (error) {
       if (state.smartSummaries[cacheKey] !== owner) return;
+      const retryDelayMs = busyReadRetryDelayMs(error);
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
         data: entry?.data || { available: false, message: error.message || String(error) },
         requestedAt: Date.now(),
         generation: state.smartSummaryGeneration,
+        // A retryable answer is shown but is not the slot's SMART data.
+        ...(retryDelayMs === null ? {} : { transient: true, retryNotBefore: Date.now() + retryDelayMs }),
       };
     }
 

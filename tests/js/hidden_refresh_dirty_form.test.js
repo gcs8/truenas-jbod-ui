@@ -345,6 +345,8 @@ test("a draft started during an automatic refresh blocks its response render", a
   };
   const refreshSnapshot = loadFunction("refreshSnapshot", {
     state,
+    // Busy-read retries (#1144) are covered in refreshing_read_retry.test.js.
+    retryBusyRead: (read) => read(),
     cancelAutoRefreshTimer() {},
     beginUiPerfRun() { return null; },
     refreshStatusMessage() { return "refreshing"; },
@@ -404,6 +406,7 @@ for (const loading of [true, false]) {
     };
     const refreshSnapshot = loadFunction("refreshSnapshot", {
       state,
+      retryBusyRead: (read) => read(),
       cancelAutoRefreshTimer() {},
       beginUiPerfRun() { return null; },
       refreshStatusMessage() { return "refreshing"; },

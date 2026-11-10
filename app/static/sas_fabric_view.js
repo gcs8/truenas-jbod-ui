@@ -1039,6 +1039,9 @@
       failure.status = response.status;
       failure.detail = payload?.detail ?? null;
       failure.code = typeof payload?.error === "string" ? payload.error : null;
+      // Lets a read retry a "still refreshing" answer after its Retry-After (#1144).
+      const retryAfter = response.headers?.get?.("Retry-After");
+      failure.retryAfterSeconds = /^\s*\d+\s*$/.test(retryAfter ?? "") ? Number(retryAfter) : null;
       throw failure;
     }
     return payload;
