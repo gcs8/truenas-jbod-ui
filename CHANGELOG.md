@@ -36,12 +36,14 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
 
 - Heat-map colours use absolute temperature bands from each drive's SMART
   ratings or documented defaults instead of stretching across the bays in
-  view, and tile text stays readable on every heat colour (#1104, #1105).
-- A page reload, Refresh or bay-assignment save during the app's own
+  view, tile text stays readable on every heat colour, and heat values stay on
+  one line on narrow bays (#1104, #1105, #1149).
+- A page reload, Refresh, bay-assignment save or export during the app's own
   background refresh is served instead of answering 503 busy, every wait
-  behind a refresh is bounded, with a deadline on the refresh itself, and a
-  save made against a disk that has since left the bay is refused instead of
-  stored (#1121, #1126, #1140, #1142).
+  behind a refresh is bounded, with a deadline on the refresh itself, reads
+  that still find no view are retried by the page, and a save made against a
+  disk that has since left the bay is refused instead of stored (#1121, #1126,
+  #1140, #1142, #1147).
 - Storage Fabric on TrueNAS CORE shows SAS expander PHY error counters when
   the service account has the new read-only sudo rule (#1088).
 - Bays, Disk Path facts and cut-off path text have accessible names and full

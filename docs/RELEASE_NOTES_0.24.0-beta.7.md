@@ -19,7 +19,8 @@ each pull request.
   defaults, instead of stretching from the coolest to the warmest bay in view.
   A 49 C disk beside a 48 C one, or 35 C disks on a cool shelf, no longer show
   as red. Tile text meets WCAG AA contrast on every heat colour, the heat value
-  no longer covers the device name, and the enclosure title no longer stacks
+  no longer covers the device name or breaks inside the number on narrow
+  bays such as 24-bay 2.5-inch sleds, and the enclosure title no longer stacks
   one letter per line when Heat Map is on.
 - A page reload right after a rename, a Refresh, or a bay-assignment save
   while the app's own background inventory refresh is running is now served
@@ -28,6 +29,12 @@ each pull request.
   refresh, up to its 5-minute deadline, and start no second appliance read. A
   background refresh that runs past 5 minutes is stopped and its late result
   discarded. The appliance call budget is unchanged.
+- The export dialog's size estimate and the export itself no longer fail with
+  "Live estimate unavailable" while the app's own background refresh runs:
+  after the 5-second wait they use the cached view and say when it was read.
+  A page, storage-view, Storage Fabric or SMART read that finds no cached view
+  yet is tried again up to three times after the server's Retry-After, with
+  the wait shown, instead of ending at "The inventory is still refreshing".
 - A bay-assignment save or clear made against a disk that has since left the
   bay is refused with "The disk in this bay changed" instead of storing the old
   disk's serial and notes on the bay, and the page reloads the bay to show the
@@ -41,7 +48,8 @@ each pull request.
 - Bays and the Rename button announce what they show, Disk Path facts are
   proper term and value pairs, cut-off path text has its full text on hover
   and keyboard focus, and narrow windows no longer overlap grouped bays or wrap
-  labels one letter per line.
+  labels one letter per line. The admin Setup + Maintenance page no longer
+  scrolls sideways in a narrow window.
 - The history service keeps SQLite's temporary sort files on the history
   volume whatever `TMPDIR` the Compose file sets, and its dashboard and
   `/healthz` show a read-only, informational census of segmented-history
@@ -68,6 +76,9 @@ each pull request.
   file, through the API should expect a 409 `mapping_disk_changed` or
   `mapping_import_bays_changed` answer when the bay's disk changed; nothing is
   written, and the bay or preview should be read again.
+- An export or export estimate made while the app's own background refresh
+  runs past 5 seconds now succeeds from the cached view with a warning naming
+  when it was read, where it used to answer 503 "still refreshing".
 - Upgrading from v0.23.0 or older, read the v0.24.0-beta.1 to v0.24.0-beta.6
   upgrade notes in `CHANGELOG.md` first; they all still apply.
 - The pre-release security review in #737 still has open items. They will be
