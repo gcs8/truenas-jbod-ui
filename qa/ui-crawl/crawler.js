@@ -275,6 +275,17 @@ class Crawler {
   // bound to (target.viewEnclosure, from viewBoundEnclosure()), which the page
   // may omit (`optional`); with none, any enclosure_id is refused. An
   // enclosure target binds no storage view.
+  // beta.7 QA (QuantaStor HA saved view): a view target binds the enclosure
+  // its page sends, not the view's backing enclosure. Its URL has no
+  // enclosure_id, so app.js (buildSelectionParams) sends the page's live
+  // enclosure (target.pageEnclosure: the system's default snapshot
+  // enclosure, which the server renders for that URL) on every selection
+  // read. A view's backing enclosure can be another enclosure (an HA view
+  // whose binding.target_system_id names the partner node), and the page
+  // sends it only from storageViewHistoryParams: on the two storage-view
+  // history routes, for a selected_enclosure_snapshot view. That one case is
+  // a read-only `read_alternates` entry for exactly those routes; windows
+  // (writes, LED, appliance loads) ignore it and bind the page enclosure.
   bindFor(target) {
     if (this.fixtureMode) return {};
     let enclosure = null;
@@ -288,7 +299,15 @@ class Crawler {
       view = null;
     }
     const system = target.system || this.writeSystem || null;
-    if (view) return { system_id: system, enclosure_id: target.viewEnclosure || null, storage_view_id: view, optional: ["enclosure_id"] };
+    if (view) {
+      const pageEnclosure = nonEmpty(target.pageEnclosure);
+      const bind = { system_id: system, enclosure_id: pageEnclosure, storage_view_id: view, optional: ["enclosure_id"] };
+      const historyEnclosure = target.viewSource === "selected_enclosure_snapshot" ? nonEmpty(target.viewEnclosure) : null;
+      if (historyEnclosure && historyEnclosure !== pageEnclosure) {
+        bind.read_alternates = [{ key: "enclosure_id", value: historyEnclosure, routes: [...VIEW_HISTORY_ROUTES] }];
+      }
+      return bind;
+    }
     return { system_id: system, enclosure_id: enclosure, storage_view_id: null };
   }
 
@@ -369,6 +388,21 @@ class Crawler {
     }
   }
 
+  // Why a state does not apply to this target, decided after the page loads
+  // and before any step runs; null when it applies. `requires`: a visible
+  // element. `requires_enabled` (#1143): that element is also enabled, so a
+  // control the page renders disabled (the CORE disk sync with SSH off or
+  // writes off) is not-applicable there instead of a failed actuation. It is
+  // only a precondition: a control that is enabled here and then fails its
+  // steps (a disabled click included) keeps its fail-closed result.
+  async unmetRequirement(state) {
+    if (!state.requires) return null;
+    const located = this.page.locator(state.requires).filter({ visible: true });
+    if (!(await located.count())) return `requires ${state.requires}`;
+    if (state.requires_enabled === true && !(await located.first().isEnabled())) return `requires ${state.requires} enabled; it is disabled here`;
+    return null;
+  }
+
   async crawlState(target, state) {
     const relDir = path.join(safeName(target.label), safeName(state.id));
     const record = {
@@ -383,9 +417,10 @@ class Crawler {
       const readyMs = await this.load(target);
       if (readyMs > this.budgets.readyMs) record.findings.push({ type: "slow-ready", severity: "warn", text: `${target.label} ready in ${readyMs} ms`, detail: { ms: readyMs, budgetMs: this.budgets.readyMs } });
       record.readyMs = readyMs;
-      if (state.requires && !(await this.page.locator(state.requires).filter({ visible: true }).count())) {
+      const unmet = await this.unmetRequirement(state);
+      if (unmet) {
         record.status = "not-applicable";
-        record.reason = `requires ${state.requires}`;
+        record.reason = unmet;
       } else {
         driver = this.newDriver(target);
         driver.resetState();
@@ -468,15 +503,27 @@ function visualDiffFinding(diff) {
 
 // D-TNJ-20261109-CRAWLER-SVBIND: the enclosure a storage view is bound to, as
 // the app derives it: its runtime backing_enclosure_id. The backend builds it
-// from the snapshot the view runtime was resolved against (inventory.py,
-// both view sources), which for a view target (no enclosure_id in its URL) is
-// the page's own live enclosure: the one app.js sends as the selection
-// enclosure and as a snapshot view's history enclosure, and the one the
-// backend falls back to when the request omits enclosure_id. null when the
-// view names none.
+// from the snapshot of the view's own target (inventory.py): a snapshot (SES)
+// view's enclosure, or for an inventory_binding view the snapshot of its
+// binding.target_system_id (on a QuantaStor HA pair, possibly the partner
+// node) or else the page's. So it is not always the page's live enclosure
+// (beta.7 QA); bindFor() binds that one and uses this value only for a
+// snapshot view's history reads. null when the view names none.
 function viewBoundEnclosure(view) {
-  const id = view && view.backing_enclosure_id;
-  return typeof id === "string" && id ? id : null;
+  return nonEmpty(view && view.backing_enclosure_id);
 }
 
-module.exports = { Crawler, READY, safeName, keySpec, renderedKeys, viewBoundEnclosure, visualDiffFinding };
+function nonEmpty(value) {
+  return typeof value === "string" && value ? value : null;
+}
+
+// The only routes on which app.js sends a storage view's own backing
+// enclosure instead of the page's (storageViewHistoryParams, used by
+// getSelectedHistoryTarget and heatmapHistoryScopeRequest, and only for a
+// selected_enclosure_snapshot view).
+const VIEW_HISTORY_ROUTES = Object.freeze([
+  "GET /api/storage-views/{view_id}/history",
+  "GET /api/storage-views/{view_id}/slots/{slot_index}/history",
+]);
+
+module.exports = { Crawler, READY, safeName, keySpec, renderedKeys, viewBoundEnclosure, visualDiffFinding, VIEW_HISTORY_ROUTES };

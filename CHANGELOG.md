@@ -196,6 +196,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   target's system, enclosure and storage view; a saved storage view's
   heat-map history is allowed. Appliance polls, writes and identify lights
   stay declared per state (#1108).
+- The UI crawler now records a state whose required control is shown but
+  disabled (such as the disk sync with SSH off) as not applicable instead of
+  a failed preview, and binds a saved storage view's page to the enclosure
+  the page itself reads, so a QuantaStor HA view on the partner node no
+  longer has its reads refused; other enclosures stay refused (#1148).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

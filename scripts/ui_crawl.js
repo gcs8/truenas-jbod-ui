@@ -162,16 +162,25 @@ async function liveTargets(args, options = {}) {
     // A storage-view error fails discovery too; it no longer drops this
     // system's view targets silently (PRRT_kwDOSAqK-M61Jv7a).
     const views = await getJson(`${args.ui}/api/storage-views?system_id=${encodeURIComponent(system)}`);
+    // beta.7 QA: a view target's URL names no enclosure, so its page renders
+    // (and app.js then sends) the system's default snapshot enclosure: this
+    // discovery read's selected_enclosure_id (same route, same omitted key).
+    const pageEnclosure = typeof snapshot.selected_enclosure_id === "string" && snapshot.selected_enclosure_id ? snapshot.selected_enclosure_id : null;
     const scopes = [
       ...(snapshot.enclosures || []).map((e) => ({ kind: "enc", id: e.id, query: `enclosure_id=${encodeURIComponent(e.id)}` })),
-      // SVBIND: a view target binds the enclosure its view is bound to (null: none).
-      ...(views.views || []).filter((v) => v.enabled !== false && (v.render?.show_in_main_ui ?? true)).map((v) => ({ kind: "view", id: v.id, query: `storage_view_id=${encodeURIComponent(v.id)}`, viewEnclosure: viewBoundEnclosure(v) })),
+      // SVBIND: a view target records its view's own enclosure and source;
+      // bindFor() binds the page enclosure and, for a snapshot view only, the
+      // view's enclosure on its history reads.
+      ...(views.views || []).filter((v) => v.enabled !== false && (v.render?.show_in_main_ui ?? true)).map((v) => ({
+        kind: "view", id: v.id, query: `storage_view_id=${encodeURIComponent(v.id)}`,
+        pageEnclosure, viewEnclosure: viewBoundEnclosure(v), viewSource: typeof v.source === "string" ? v.source : null,
+      })),
     ];
     if (!scopes.length) scopes.push({ kind: "default", id: "default", query: "" });
     scopes.forEach((scope, index) => targets.push({
       page: "main", ready: "main", system, platform, scopeIndex: index, label: `${system}/main/${scope.kind}-${index}`,
       url: `${args.ui}/?system_id=${encodeURIComponent(system)}${scope.query ? `&${scope.query}` : ""}`,
-      ...(scope.kind === "view" ? { viewEnclosure: scope.viewEnclosure } : {}),
+      ...(scope.kind === "view" ? { pageEnclosure: scope.pageEnclosure, viewEnclosure: scope.viewEnclosure, viewSource: scope.viewSource } : {}),
     }));
     (snapshot.enclosures || [{ id: null }]).forEach((enclosure, index) => targets.push({
       page: "fabric", ready: "fabric", system, platform, scopeIndex: index, label: `${system}/fabric/enc-${index}`,
