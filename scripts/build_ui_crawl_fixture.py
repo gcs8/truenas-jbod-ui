@@ -24,6 +24,7 @@ from markupsafe import Markup  # noqa: E402
 
 from app import __version__  # noqa: E402
 from app.config import Settings  # noqa: E402
+from app.models.domain import InventorySnapshot  # noqa: E402
 from app.services.public_demo_fixture import (  # noqa: E402
     PublicDemoHistoryBackend,
     build_public_demo_html,
@@ -85,6 +86,41 @@ def slow_prefetch_settings() -> Settings:
     return settings.model_copy(update={"app": settings.app.model_copy(update={"smart_prefetch_delay_ms": SLOW_SMART_PREFETCH_DELAY_MS})})
 
 
+# #1145: the demo's first 24 disks as one row of 2.5-inch top-latched sleds
+# (a 24-bay 2U front), whose narrow bays once stacked a heat value such as
+# "+0.22 C" one character per line.
+DENSE_SLED_BAYS = 24
+
+
+def dense_sled_snapshot(bundle):
+    data = _dump(live_snapshot(bundle))
+    layout = [list(range(DENSE_SLED_BAYS))]
+    data["slots"] = [
+        {**slot, "row_index": 0, "column_index": index}
+        for index, slot in enumerate(data["slots"][:DENSE_SLED_BAYS])
+    ]
+    data.update(layout_rows=layout, layout_slot_count=DENSE_SLED_BAYS, layout_columns=DENSE_SLED_BAYS)
+    data["selected_profile"] = {
+        **data["selected_profile"],
+        "id": "synthetic-dense-sleds-24",
+        "label": "Synthetic 24-bay 2.5in front",
+        "panel_title": "Synthetic 24-bay 2.5in front",
+        "face_style": "front-drive",
+        "latch_edge": "top",
+        "bay_size": "2.5",
+        "rows": 1,
+        "columns": DENSE_SLED_BAYS,
+        "slot_count": DENSE_SLED_BAYS,
+        "slot_layout": layout,
+        "row_groups": [],
+    }
+    data["enclosures"][0].update(
+        profile_id="synthetic-dense-sleds-24", rows=1, columns=DENSE_SLED_BAYS, slot_count=DENSE_SLED_BAYS, slot_layout=layout
+    )
+    data["summary"].update(disk_count=DENSE_SLED_BAYS, mapped_slot_count=DENSE_SLED_BAYS)
+    return InventorySnapshot.model_validate(data)
+
+
 # beta.7 QA: saved views whose runtime backing enclosure is not the page's
 # own, as on a QuantaStor HA pair where a view's binding.target_system_id
 # names the partner node (inventory.py builds backing_enclosure_id from that
@@ -115,8 +151,9 @@ def render_main(
     settings: Settings | None = None,
     runtime=None,
     ssh: bool = False,
+    snapshot: InventorySnapshot | None = None,
 ) -> str:
-    snapshot = live_snapshot(bundle, platform=platform, ssh=ssh)
+    snapshot = snapshot or live_snapshot(bundle, platform=platform, ssh=ssh)
     runtime = runtime or bundle.storage_view_runtime
     context = {
         "request": build_fixture_request(),
@@ -358,6 +395,7 @@ async def build() -> dict:
         "ui:/api/inventory": _dump(live_snapshot(bundle)),
         # The QuantaStor variant keeps its platform after its startup refresh.
         "ui-quantastor:/api/inventory": _dump(live_snapshot(bundle, platform="quantastor")),
+        "ui-dense-sleds:/api/inventory": _dump(dense_sled_snapshot(bundle)),
         "ui:/api/storage-views": _dump(bundle.storage_view_runtime),
         "ui-ha-view:/api/storage-views": _dump(partner_backed_runtime(bundle.storage_view_runtime)),
         "ui-ssh:/api/inventory": _dump(live_snapshot(bundle, ssh=True)),
@@ -428,6 +466,7 @@ async def build() -> dict:
             "ui-write-sign-in:/sas-fabric": render_fabric(bundle, write_policy=WRITE_POLICY_BASIC),
             "ui-quantastor:/": render_main(bundle, platform="quantastor"),
             "ui-slow-prefetch:/": render_main(bundle, settings=slow_prefetch_settings()),
+            "ui-dense-sleds:/": render_main(bundle, snapshot=dense_sled_snapshot(bundle)),
             "ui-ha-view:/": render_main(bundle, runtime=partner_backed_runtime(bundle.storage_view_runtime)),
             # #1143: SSH configured, so the CORE disk-sync buttons are enabled.
             "ui-ssh:/": render_main(bundle, ssh=True),

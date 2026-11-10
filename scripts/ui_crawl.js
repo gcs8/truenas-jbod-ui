@@ -59,6 +59,8 @@ const FIXTURE_ORIGINS = {
   // A QuantaStor system with LED-capable bays: the page sends a forced
   // inventory read at startup (Sol #1108), declared in pages.main.load_requests.
   "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
+  // 24 narrow 2.5-inch sleds, where heat values once wrapped mid-number (#1145).
+  "ui-dense-sleds": "https://ui-dense-sleds.synthetic.invalid",
 };
 const WATCHDOG_SCRIPT = path.join(__dirname, "..", "qa", "ui-crawl", "led-watchdog.js");
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -209,6 +211,7 @@ function fixtureTargets() {
     { page: "fabric", ready: "fabric", scopeIndex: 0, system: "fixture", variant: "write-sign-in", label: "fixture/fabric-write-sign-in", url: `${FIXTURE_ORIGINS["ui-write-sign-in"]}/sas-fabric` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${FIXTURE_ORIGINS["ui-storage-views-error"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", platform: "quantastor", variant: "quantastor", label: "fixture/main-quantastor", url: `${FIXTURE_ORIGINS["ui-quantastor"]}/` },
+    { page: "main", ready: "main", scopeIndex: 0, system: "fixture", variant: "dense-sleds", label: "fixture/main-dense-sleds", url: `${FIXTURE_ORIGINS["ui-dense-sleds"]}/` },
     { page: "main", ready: "main", scopeIndex: 0, system: "fixture", label: "fixture/main", url: `${FIXTURE_ORIGINS.ui}/` },
     // #1127: a saved storage view selected through the target URL, as
     // liveTargets() emits it (a later scope, so the `scope: "all"` states run).

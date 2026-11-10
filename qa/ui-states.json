@@ -314,6 +314,20 @@
       "covers": []
     },
     {
+      "id": "main.heatmap.values", "page": "main", "safety": "read", "ci": true, "fixture_only": true, "variant": "dense-sleds",
+      "description": "#1145: 24 bays of 2.5-inch top-latched sleds (fixture variant) with a signed two-decimal value per bay. Each value stays on one line; before the fix \"+0.22 C\" stacked one character per line here.",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_delta_c"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
+    },
+    {
+      "id": "main.heatmap.values-hours", "page": "main", "safety": "read", "ci": true, "fixture_only": true, "variant": "dense-sleds",
+      "description": "#1145: the same sleds with a long unit (\"12,000 hr\").",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "power_on_hours"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
+    },
+    {
       "id": "fabric.lanes", "page": "fabric", "safety": "read", "scope": "all", "ci": true,
       "steps": [],
       "covers": ["#fabric-system-select", "#fabric-enclosure-select", "#fabric-mode-lanes", "#fabric-mode-impact", "#fabric-mode-trace", "#fabric-mode-disk", "#fabric-back-button", "#fabric-guide-link", "[data-fabric-node]", "[data-fabric-trace]", "[data-fabric-expand-slots]", "[data-fabric-slot-cell]", "[data-fabric-alias-edit]"]

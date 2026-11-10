@@ -94,6 +94,26 @@ test("a bay with no clear spot gets the spot with the fewest overlaps", () => {
   assert.equal(choice.spot, "corner", "ties keep the earliest spot");
 });
 
+test("a chip that only touches a part, under a pixel, still clears it (#1145)", () => {
+  // Right-latched 2.5-inch rear bays at 1920 px under Endurance: "beside"
+  // grazes the slot number by half a pixel; "middle" would sit on the
+  // "100%" values (the wider badge) of some bays.
+  const rearRight = (badgeRight) => ({
+    width: 91,
+    height: 134,
+    parts: [[72.66, 8, 82.66, 18], [8, 10, 36.5, 32], [8, 88, 36.7, 103], [8, 109, 60.66, 124], [64.66, 8, 82.66, 126], [6, 48, badgeRight, 72]]
+      .map(([left, top, right, bottom]) => ({ left, top, right, bottom })),
+  });
+  const choice = choose([rearRight(38.91), rearRight(31.69), rearRight(31.69)]);
+  assert.equal(choice.spot, "beside");
+  assert.equal(choice.hits, 0);
+  // A real overlap still steers the chip away: a number pill 2.5px into
+  // "beside" sends it to the clear middle of narrow-valued bays.
+  const wideNumber = rearRight(31.69);
+  wideNumber.parts[1] = { ...wideNumber.parts[1], right: 38.5 };
+  assert.deepEqual(choose([wideNumber]), { spot: "middle", hits: 0, right: 31, top: 130 });
+});
+
 test("M.2 cards put the chip beside the gold latch, or top-left when a short card is mounted", () => {
   // 2280 card on the Hyper M.2 board: hole, slot label, size tag, gold latch.
   const card2280 = bay(334, 86, [[5, 37, 12, 12], [33, 12, 36, 15], [77, 11, 111, 18], [319, 21, 10, 44], [33, 35, 270, 17], [33, 57, 270, 17]]);

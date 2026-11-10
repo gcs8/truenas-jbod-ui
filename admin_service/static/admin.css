@@ -549,7 +549,15 @@ h3 {
   padding: 8px 12px;
 }
 
+/* #1146: the pills wrap and shrink to the column (their paths ellipsize,
+   the full path is the title); the list never widens the page. */
+.path-list {
+  contain: inline-size;
+}
+
 .path-list li {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
 }
 

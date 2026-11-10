@@ -7298,6 +7298,9 @@
   // top-left; else the spot with fewest overlaps.
   function chooseStateChipSpot(bays, size = 24, inset = 6) {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    // #1145: a chip grazing a part by under a pixel still clears it.
+    const covers = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 1
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 1;
     let right = inset;
     let top = inset;
     bays.forEach((bay) => {
@@ -7325,7 +7328,7 @@
         if (left < 0 || chipTop < 0 || chip.right > bay.width || chip.bottom > bay.height) {
           hits += 1;
         }
-        hits += bay.parts.filter((part) => overlaps(chip, part)).length;
+        hits += bay.parts.filter((part) => covers(chip, part)).length;
       });
       if (!best || hits < best.hits) {
         best = { spot, hits, right, top };
@@ -7344,11 +7347,65 @@
       .map((part) => `.storage-view-runtime-card-${part}`),
   ].join(", ");
 
+  // #1145: a heat value never wraps. One that does not fit its bay steps
+  // down until it does: a smaller font, then (in a tall bay) turned to run
+  // along it, then without its unit, and last with the bay's lines closed
+  // up around it and a size's unit joined to it. The device and serial lines
+  // stay; the title keeps the whole value. A face takes one step for all its
+  // bays of a shape, the first at which every value fits, so they read alike
+  // and the state chip has one badge shape to clear.
+  function fitHeatmapBadges() {
+    // The bay keeps its height; the badge and the labels stay in its content
+    // box (the padding holds the latch, LED and chip), the labels at full
+    // height.
+    const fits = (badge, height) => {
+      const tile = badge.parentElement;
+      const bay = tile.getBoundingClientRect();
+      const pad = getComputedStyle(tile);
+      const inset = (side) => parseFloat(pad[`border-${side}-width`]) + parseFloat(pad[`padding-${side}`]) - 3;
+      const content = { left: bay.left + inset("left"), top: bay.top + inset("top"), right: bay.right - inset("right"), bottom: bay.bottom - inset("bottom") };
+      const within = (box, area) => box.left >= area.left - 1 && box.top >= area.top - 1 && box.right <= area.right + 1 && box.bottom <= area.bottom + 1;
+      return Math.abs(bay.height - height) < 1 && badge.scrollWidth <= badge.clientWidth + 1 && badge.scrollHeight <= badge.clientHeight + 1
+        && within(badge.getBoundingClientRect(), content)
+        && Array.from(tile.querySelectorAll(":scope > :is(.slot-device, .slot-pool, .slot-tertiary)"))
+          .every((line) => !line.checkVisibility({ visibilityProperty: true })
+            || (line.scrollHeight <= line.clientHeight + 1 && within(line.getBoundingClientRect(), content)));
+    };
+    const badges = Array.from(grid.querySelectorAll(".slot-tile > .slot-number ~ .slot-heatmap-value"));
+    badges.forEach((badge) => {
+      badge.textContent = badge.dataset.value ??= badge.textContent;
+      delete badge.dataset.fit;
+    });
+    const groups = { tall: [], short: [] };
+    badges.filter((badge) => badge.clientWidth).forEach((badge) => {
+      const tile = badge.parentElement;
+      groups[tile.clientHeight > tile.clientWidth * 1.5 ? "tall" : "short"].push({ badge, height: tile.getBoundingClientRect().height });
+    });
+    const steps = {
+      tall: ["small", "vertical", "vertical small", "compact small", "compact vertical small", "compact vertical small tight"],
+      short: ["small", "compact small"],
+    };
+    Object.entries(groups).forEach(([shape, members]) => {
+      for (let step = 0; step < steps[shape].length && members.some(({ badge, height }) => !fits(badge, height)); step += 1) {
+        const fit = steps[shape][step];
+        members.forEach(({ badge }) => {
+          const { value } = badge.dataset;
+          badge.dataset.fit = fit;
+          // Compact keeps the number; a size keeps its unit ("12.3 TB"),
+          // joined to it at the tight step ("12.3TB").
+          const compact = /\d [KMGTPE]?B\b/.test(value) ? value.replace(/\/\w+$/, "") : value.split(" ")[0];
+          badge.textContent = !fit.startsWith("compact") ? value : fit.endsWith("tight") ? compact.replace(" ", "") : compact;
+        });
+      }
+    });
+  }
+
   function placeStateChips() {
     stateChipFrameId = null;
     if (!chassisShell) {
       return;
     }
+    fitHeatmapBadges();
     const bays = [];
     // #925: every bay draws its chip, ringed ones included (the ring is an
     // outline on the tile), so every bay steers the spot.
