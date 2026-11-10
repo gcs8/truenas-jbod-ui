@@ -5098,8 +5098,13 @@ button.fabric-trace-crumb:hover {
   transform: rotate(180deg);
 }
 
-.slot-tile:has(> .slot-heatmap-value[data-fit~="own"]) > :is(.slot-device, .slot-pool, .slot-tertiary) {
-  display: none;
+/* The last step closes the bay's lines up around the value. */
+.slot-tile:has(> .slot-heatmap-value[data-fit~="tight"]) {
+  gap: 3px;
+}
+
+.slot-tile > .slot-heatmap-value[data-fit~="tight"] {
+  padding: 1px;
 }
 
 .chassis-shell[data-face-style="unifi-drive"] .slot-tile:is(.heatmap-active, .heatmap-missing) {
@@ -6939,9 +6944,10 @@ button.fabric-trace-crumb:hover {
     overflow-x: auto;
   }
 
-  /* #1145: a side latch takes 30px; the rest of the sled holds the value. */
+  /* #1145: a side latch takes 30px; the rest of the sled holds the value,
+     and the state chip fits beside the number, clear of the latch. */
   .chassis-shell[data-layout-mode="dense-2.5"]:is([data-latch-edge="left"], [data-latch-edge="right"]) {
-    --slot-track-min-width: 64px;
+    --slot-track-min-width: 96px;
   }
 
   .nvme-carrier-canvas {

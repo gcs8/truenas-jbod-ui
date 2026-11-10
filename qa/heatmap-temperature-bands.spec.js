@@ -32,6 +32,7 @@ const SHAPES = [
   ["front-drive", "top", "3.5", 2, 4],
   ["front-drive", "top", "2.5", 1, 24],
   ["rear-drive", "left", "2.5", 2, 12],
+  ["rear-drive", "right", "2.5", 2, 12],
   ["top-loader", "bottom", "3.5", 3, 4],
   ["top-loader", "bottom", "2.5", 3, 4],
   ["drawer", "bottom", "3.5", 2, 6],
@@ -43,6 +44,9 @@ const SHAPES = [
   bay_size: size,
   rows,
   columns,
+  // The one-row top-latched 2.5-inch sled hides its labels under any heat
+  // map (style.css): its badge owns the sled. Every other face keeps them.
+  labelFree: face === "front-drive" && latch === "top" && size === "2.5" && rows === 1,
   bays: Array.from({ length: rows * columns }, (_, index) => ({ temperature: 30 + ((index * 7) % 32) })),
 }));
 
@@ -400,10 +404,20 @@ async function measureValues(page) {
     for (const part of tile.querySelectorAll(".slot-latch, .slot-status-led")) {
       if (part.checkVisibility({ visibilityProperty: true }) && overlap(part.getBoundingClientRect(), badgeBox)) covered.push(part.className);
     }
+    // #1145 review: fitting a value must not hide the bay's device or serial
+    // line; the checks above skip a line that is not drawn.
+    const hidden = [...tile.querySelectorAll(".slot-device, .slot-pool")]
+      .filter((line) => line.textContent.trim())
+      .filter((line) => {
+        const rect = line.getBoundingClientRect();
+        return !line.checkVisibility({ visibilityProperty: true, opacityProperty: true }) || rect.width < 1 || rect.height < 1;
+      })
+      .map((line) => line.className);
     const text = badge.textContent.trim();
     return {
       slot: tile.dataset.slot,
       text,
+      hidden,
       title: badge.title,
       fragments: fragments.length,
       clipped: badge.scrollWidth > badge.clientWidth + 1 || badge.scrollHeight > badge.clientHeight + 1,
@@ -444,7 +458,82 @@ for (const [index, shape] of SHAPES.entries()) {
           expect(value.outside, `${where} pushes bay text out of the content box`).toEqual([]);
           expect(value.covered, `${where} covers bay text, the latch or the LED`).toEqual([]);
           expect(value.title, `${where} full value in the title`).toContain(":");
+          if (!shape.labelFree) expect(value.hidden, `${where} hides the device or serial line`).toEqual([]);
         }
+        for (const chip of await stateChips(page)) {
+          expect(chip.hits.filter((hit) => hit.startsWith("slot-heatmap-value")),
+            `${shape.name} ${metric} at ${viewport.width} px, bay ${chip.slot} chip ${JSON.stringify(chip.chip)} covers the value`).toEqual([]);
+        }
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1145 review: each bay's state chip (its ::after, placed by app.js). It
+// never covers the value badge, and on the rear 2.5-inch 2x12 faces, whose
+// bays widen at 390 px, it also stays inside the bay and off the latch, LED
+// and text. Text by its Range; hardware and the badge by box. Measured once
+// two frames pass unchanged.
+async function stateChips(page) {
+  let last = "";
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
+      const style = getComputedStyle(tile, "::after");
+      const px = (value) => parseFloat(value) || 0;
+      const extra = style.boxSizing === "border-box" ? [0, 0] : [
+        px(style.paddingLeft) + px(style.paddingRight) + px(style.borderLeftWidth) + px(style.borderRightWidth),
+        px(style.paddingTop) + px(style.paddingBottom) + px(style.borderTopWidth) + px(style.borderBottomWidth),
+      ];
+      const width = px(style.width) + extra[0];
+      const height = px(style.height) + extra[1];
+      const shift = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+      const box = tile.getBoundingClientRect();
+      // From the offsets the spot's rule sets (style.css): Chromium can
+      // return a stale resolved left/top for a pseudo-element after a resize.
+      const spot = tile.closest(".chassis-shell")?.dataset.chipSpot || "corner";
+      const x = ["middle", "foot"].includes(spot) ? tile.clientWidth / 2 : spot === "start" ? px(style.left) : tile.clientWidth - px(style.right) - width;
+      const y = spot === "middle" ? tile.clientHeight / 2 : spot === "foot" ? tile.clientHeight - px(style.bottom) - height : px(style.top);
+      const left = box.left + tile.clientLeft + x + shift.e;
+      const top = box.top + tile.clientTop + y + shift.f;
+      const chip = { left, top, right: left + width, bottom: top + height };
+      const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+      const hits = [];
+      for (const part of tile.querySelectorAll(".slot-heatmap-value, .slot-status-led, .slot-latch")) {
+        if (part.checkVisibility({ visibilityProperty: true }) && overlap(chip, part.getBoundingClientRect())) hits.push(part.className);
+      }
+      for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+        if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
+      }
+      const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
+      return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
+    }));
+    if (JSON.stringify(chips) === last) return chips;
+    last = JSON.stringify(chips);
+  }
+  throw new Error(`state chips did not settle: ${last}`);
+}
+
+for (const [index, shape] of SHAPES.entries()) {
+  if (shape.face_style !== "rear-drive") continue;
+  test(`state chips clear the latch, LED, value and labels on ${shape.name} at 390 px (#1145)`, async ({ page }) => {
+    const bays = shape.bays.map((entry) => ({ ...entry, wide: true }));
+    const errors = await openHeatMap(page, shapeFixtures[index], bays);
+    await page.setViewportSize({ width: 390, height: 900 });
+    expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(390);
+    for (const metric of VALUE_METRICS) {
+      await page.locator("#heatmap-metric-select").selectOption(metric);
+      const chips = await stateChips(page);
+      expect(chips).toHaveLength(bays.length);
+      for (const chip of chips) {
+        const where = `${shape.name} ${metric} at 390 px, bay ${chip.slot} chip ${JSON.stringify(chip.chip)}`;
+        expect(chip.content, `${where} is drawn`).not.toBe("none");
+        expect(chip.hits, `${where} covers`).toEqual([]);
+        expect(chip.inside, `${where} inside the bay`).toBe(true);
       }
     }
     expect(errors).toEqual([]);

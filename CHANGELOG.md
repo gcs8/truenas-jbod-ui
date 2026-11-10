@@ -160,8 +160,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   "+0.22 C" stacked one character per line on 24-bay 2.5-inch sleds. A value
   now stays on one line: where it does not fit its bay it uses a smaller font,
   runs along a tall sled, drops its unit (the bay's tooltip keeps the whole
-  value), or takes the room of the bay's labels, which the slot details still
-  show. Also fixed the admin Setup + Maintenance page scrolling sideways in a
+  value), or last shrinks again with a size's unit joined to it ("12.3TB").
+  The bay's device and serial lines stay visible. In a narrow window the
+  rear 2.5-inch 2x12 bays widen so their state chips stay off the latch.
+  Also fixed the admin Setup + Maintenance page scrolling sideways in a
   narrow window, and the UI crawler reporting list items scrolled out of their
   own box as overlapping the controls below it (#1149).
 

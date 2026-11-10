@@ -7276,6 +7276,9 @@
   // top-left; else the spot with fewest overlaps.
   function chooseStateChipSpot(bays, size = 24, inset = 6) {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    // #1145: a chip grazing a part by under a pixel still clears it.
+    const covers = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 1
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 1;
     let right = inset;
     let top = inset;
     bays.forEach((bay) => {
@@ -7303,7 +7306,7 @@
         if (left < 0 || chipTop < 0 || chip.right > bay.width || chip.bottom > bay.height) {
           hits += 1;
         }
-        hits += bay.parts.filter((part) => overlaps(chip, part)).length;
+        hits += bay.parts.filter((part) => covers(chip, part)).length;
       });
       if (!best || hits < best.hits) {
         best = { spot, hits, right, top };
@@ -7324,9 +7327,11 @@
 
   // #1145: a heat value never wraps. One that does not fit its bay steps
   // down until it does: a smaller font, then (in a tall bay) turned to run
-  // along it, then without its unit, and last it takes the labels' room
-  // (slot details keep them); the title keeps the whole value. Each step
-  // lays out every unfitted badge at once.
+  // along it, then without its unit, and last with the bay's lines closed
+  // up around it and a size's unit joined to it. The device and serial lines
+  // stay; the title keeps the whole value. A face takes one step for all its
+  // bays of a shape, the first at which every value fits, so they read alike
+  // and the state chip has one badge shape to clear.
   function fitHeatmapBadges() {
     // The bay keeps its height; the badge and the labels stay in its content
     // box (the padding holds the latch, LED and chip), the labels at full
@@ -7349,24 +7354,28 @@
       badge.textContent = badge.dataset.value ??= badge.textContent;
       delete badge.dataset.fit;
     });
-    let pending = badges.map((badge) => {
-      const tall = badge.parentElement.clientHeight > badge.parentElement.clientWidth * 1.5;
-      return {
-        badge,
-        height: badge.parentElement.getBoundingClientRect().height,
-        steps: tall ? ["small", "vertical", "vertical small", "compact small", "compact vertical small", "vertical small own"] : ["small", "compact small"],
-      };
+    const groups = { tall: [], short: [] };
+    badges.filter((badge) => badge.clientWidth).forEach((badge) => {
+      const tile = badge.parentElement;
+      groups[tile.clientHeight > tile.clientWidth * 1.5 ? "tall" : "short"].push({ badge, height: tile.getBoundingClientRect().height });
     });
-    for (let step = 0; pending.length; step += 1) {
-      pending = pending.filter(({ badge, height, steps }) => badge.clientWidth && step < steps.length && !fits(badge, height));
-      pending.forEach(({ badge, steps }) => {
-        const { value } = badge.dataset;
-        badge.dataset.fit = steps[step];
-        // Still a part of the bay's name: the number, a size keeps its unit.
-        badge.textContent = !steps[step].startsWith("compact") ? value
-          : /\d [KMGTPE]?B\b/.test(value) ? value.replace(/\/\w+$/, "") : value.split(" ")[0];
-      });
-    }
+    const steps = {
+      tall: ["small", "vertical", "vertical small", "compact small", "compact vertical small", "compact vertical small tight"],
+      short: ["small", "compact small"],
+    };
+    Object.entries(groups).forEach(([shape, members]) => {
+      for (let step = 0; step < steps[shape].length && members.some(({ badge, height }) => !fits(badge, height)); step += 1) {
+        const fit = steps[shape][step];
+        members.forEach(({ badge }) => {
+          const { value } = badge.dataset;
+          badge.dataset.fit = fit;
+          // Compact keeps the number; a size keeps its unit ("12.3 TB"),
+          // joined to it at the tight step ("12.3TB").
+          const compact = /\d [KMGTPE]?B\b/.test(value) ? value.replace(/\/\w+$/, "") : value.split(" ")[0];
+          badge.textContent = !fit.startsWith("compact") ? value : fit.endsWith("tight") ? compact.replace(" ", "") : compact;
+        });
+      }
+    });
   }
 
   function placeStateChips() {
