@@ -269,6 +269,16 @@ function validateInventory(inventory, { manifest = undefined, reach = undefined 
       }
     }
     validateFollowUp(errors, id, state);
+    // #1143: `requires_enabled` makes a present-but-disabled `requires`
+    // control not-applicable before any step runs. A confirm-preview state
+    // that presses its required control must declare it, so a target that
+    // renders the control disabled is not reported as a failed preview.
+    if ("requires_enabled" in state && state.requires_enabled !== true) errors.push(`${id}: requires_enabled must be true or absent`);
+    if (state.requires_enabled === true && !state.requires) errors.push(`${id}: requires_enabled needs requires (the control that must be enabled)`);
+    if (state.confirm_preview && state.requires && state.requires_enabled !== true
+      && (state.steps || []).some((step) => step && step.click === state.requires)) {
+      errors.push(`${id}: a confirm_preview state that clicks its required control ${state.requires} needs requires_enabled: true (a disabled control is not-applicable, #1143)`);
+    }
     if (state.safety === "forbidden") {
       if (writes.length) errors.push(`${id}: a forbidden state cannot declare writes`);
       if ((state.steps || []).length && !state.confirm_preview) errors.push(`${id}: forbidden states have no steps unless confirm_preview is set`);
