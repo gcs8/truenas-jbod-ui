@@ -431,3 +431,144 @@ test("a SMART batch answered 'still refreshing' is retried while its prefetch ru
   await assert.rejects(replaced, /still refreshing/);
   assert.equal(requests, 1);
 });
+
+// Storage-view SMART (#1144 follow-up). A storage-view slot cannot be matched
+// to a disk until the inventory view exists, so with no cached view its SMART
+// read answers the retryable 503. The caller used to store that answer as the
+// slot's SMART data for the full SMART cache lifetime, so the panel kept
+// saying "still refreshing" long after the refresh had finished.
+
+const STORAGE_VIEW = { id: "synthetic-view", backing_enclosure_id: null };
+const STORAGE_VIEW_SLOT = { slot_index: 2, serial: "SYNTH-0002" };
+const SMART_CACHE_KEY = "system-a|storage-view|synthetic-view||2||synth-0002";
+
+function storageViewSmartHarness(fetchJson, { clock = { now: 1_000_000 } } = {}) {
+  const state = {
+    snapshotMode: false,
+    smartSummaries: {},
+    smartSummaryGeneration: 1,
+    selectedStorageViewRuntimeId: STORAGE_VIEW.id,
+    selectedSlot: STORAGE_VIEW_SLOT.slot_index,
+    hoveredSlot: null,
+    heatmap: { enabled: false },
+  };
+  const rendered = [];
+  const loaded = load([
+    "smartSummaryAgeMs",
+    "isSmartEntryCurrent",
+    "isSmartEntryInFlight",
+    "ensureStorageViewSmartSummary",
+  ], {
+    state,
+    fetchJson,
+    encodeURIComponent,
+    Date: { now: () => clock.now },
+    SMART_SUMMARY_CACHE_TTL_MS: 300_000,
+    getStorageViewSmartCacheKey: () => SMART_CACHE_KEY,
+    buildSelectionParams: () => new URLSearchParams("system_id=system-a"),
+    renderDetail() {
+      // The detail panel asks for SMART on every render, as the page does.
+      rendered.push({ ...state.smartSummaries[SMART_CACHE_KEY] });
+      void loaded.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+    },
+    refreshHoveredTooltip() {},
+    getLiveBackedStorageViewSlot: () => null,
+    refreshGridTileAriaLabel() {},
+    slotAccessibleName: () => "",
+    buildStorageViewRuntimeTooltip: () => "",
+    refreshHeatmapTileOverlays() {},
+  });
+  return { ...loaded, state, rendered, clock };
+}
+
+test("storage-view SMART answered 'still refreshing' is retried with the wait shown", async () => {
+  const urls = [];
+  const harness = storageViewSmartHarness(async (url) => {
+    urls.push(url);
+    if (urls.length === 1) throw busy(2);
+    return { available: true, temperature_c: 31 };
+  });
+
+  await harness.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+
+  assert.equal(urls.length, 2);
+  assert.ok(urls.every((url) => url === "/api/storage-views/synthetic-view/slots/2/smart?system_id=system-a"), urls);
+  assert.deepEqual(harness.waits, [2000]);
+  // While it waited, the panel showed the slot as loading and said why.
+  const waiting = harness.rendered.find((entry) => entry.loading && entry.retryNote);
+  assert.ok(waiting, JSON.stringify(harness.rendered));
+  assert.match(waiting.retryNote, /still refreshing.*again in 2 s.*retry 1 of 3/);
+  const entry = harness.state.smartSummaries[SMART_CACHE_KEY];
+  assert.deepEqual({ ...entry.data }, { available: true, temperature_c: 31 });
+  assert.equal(entry.loading, false);
+  assert.equal(harness.isSmartEntryCurrent(entry), true);
+});
+
+test("storage-view SMART that stays 'still refreshing' is not kept as the slot's data", async () => {
+  let requests = 0;
+  const harness = storageViewSmartHarness(async () => {
+    requests += 1;
+    if (requests <= constantValue("BUSY_READ_RETRY_LIMIT") + 1) throw busy(2);
+    return { available: true, temperature_c: 33 };
+  });
+
+  await harness.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+
+  // The same bounded policy as the page's other reads, then it gives up...
+  assert.equal(requests, constantValue("BUSY_READ_RETRY_LIMIT") + 1);
+  const failed = harness.state.smartSummaries[SMART_CACHE_KEY];
+  assert.equal(failed.loading, false);
+  assert.match(failed.data.message, /still refreshing/);
+  // ...but the answer is not current SMART data, and the re-render that
+  // shows it does not start another round at once.
+  assert.equal(harness.isSmartEntryCurrent(failed), false);
+  assert.equal(requests, constantValue("BUSY_READ_RETRY_LIMIT") + 1);
+
+  // After the server's Retry-After, the next look at the slot reads again.
+  harness.clock.now += 2000;
+  await harness.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+  assert.equal(requests, constantValue("BUSY_READ_RETRY_LIMIT") + 2);
+  const entry = harness.state.smartSummaries[SMART_CACHE_KEY];
+  assert.deepEqual({ ...entry.data }, { available: true, temperature_c: 33 });
+  assert.equal(harness.isSmartEntryCurrent(entry), true);
+});
+
+test("storage-view SMART stops retrying once another request owns the slot", async () => {
+  let requests = 0;
+  let harness;
+  harness = storageViewSmartHarness(async () => {
+    requests += 1;
+    // A scope change drops in-flight SMART entries.
+    delete harness.state.smartSummaries[SMART_CACHE_KEY];
+    throw busy(2);
+  });
+  await harness.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+  assert.equal(requests, 1);
+  assert.equal(harness.state.smartSummaries[SMART_CACHE_KEY], undefined);
+});
+
+test("storage-view SMART still keeps an error that waiting will not clear", async () => {
+  let requests = 0;
+  const harness = storageViewSmartHarness(async () => {
+    requests += 1;
+    throw Object.assign(new Error("synthetic fault"), { status: 400 });
+  });
+  await harness.ensureStorageViewSmartSummary(STORAGE_VIEW, STORAGE_VIEW_SLOT);
+  assert.equal(requests, 1);
+  const entry = harness.state.smartSummaries[SMART_CACHE_KEY];
+  assert.match(entry.data.message, /synthetic fault/);
+  assert.equal(harness.isSmartEntryCurrent(entry), true);
+});
+
+test("the SMART note and tooltip say a storage-view SMART read is waiting to retry", () => {
+  const { buildSmartNoteText, appendSmartTooltipMetrics } = load(["buildSmartNoteText", "appendSmartTooltipMetrics"], {
+    Number, String,
+  });
+  const retryNote = "The inventory is still refreshing. Trying again in 2 s (retry 1 of 3).";
+  assert.equal(buildSmartNoteText({ led_supported: true }, { loading: true, data: null, retryNote }), retryNote);
+  // A settled entry never repeats an old wait.
+  assert.equal(buildSmartNoteText({ led_supported: true }, { loading: false, data: { available: true }, retryNote }), "");
+  const lines = [];
+  appendSmartTooltipMetrics(lines, {}, { loading: true, retryNote });
+  assert.deepEqual(lines, ["SMART: loading...", retryNote]);
+});

@@ -1560,6 +1560,67 @@ class ReadsDuringARunningRefreshTests(RefreshDeadlineTests):
             self.assertEqual(json.loads(content)["layout_bounds"], "unavailable")
             self.assert_no_new_appliance_call()
 
+    # Storage-view SMART and history reads resolve the view's slots from the
+    # inventory view first. Unlike a physical bay, a view slot cannot be
+    # matched to a disk without it, so with no cached view at all they answer
+    # the retryable 503 the page retries; with any cached view they answer 200.
+
+    def storage_view_reads(self):
+        query = f"system_id={SYSTEM_ID}&enclosure_id={SHELF}&window_hours=24"
+        base = "/api/storage-views/primary-chassis"
+        return {
+            "slot-smart": call_app(self.application, "GET", f"{base}/slots/0/smart", query=query),
+            "smart-batch": call_app(self.application, "POST", f"{base}/slots/smart-batch", query=query, body={"slots": [0]}),
+            "slot-history": call_app(self.application, "GET", f"{base}/slots/0/history", query=query),
+            "view-history": call_app(self.application, "GET", f"{base}/history", query=query),
+        }
+
+    def patch_history_backend(self) -> None:
+        backend = AsyncMock()
+        backend.configured = False
+        backend.get_slot_history.return_value = {"configured": False}
+        backend.get_scopes_history.return_value = {"configured": False, "scopes": []}
+        patcher = patch.object(app_routes, "get_history_backend", return_value=backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_storage_view_smart_and_history_with_a_current_view_answer_at_once(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_source_refresh()
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, _headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertLess(elapsed, USER_WAIT_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_storage_view_smart_and_history_with_an_expired_view_answer_from_it(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 200, content[:300])
+                    self.assertNotIn("retry-after", headers)
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            self.assert_no_new_appliance_call()
+
+    async def test_storage_view_smart_and_history_with_no_cached_view_answer_retryably(self) -> None:
+        self.patch_history_backend()
+        with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
+            await self.start_hung_page_refresh()
+            self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.rename", enclosure_id=SHELF)
+            for name, request in self.storage_view_reads().items():
+                with self.subTest(route=name):
+                    (status, headers, content), elapsed = await self.timed(request)
+                    self.assertEqual(status, 503, content[:300])
+                    self.assertIn("retry-after", headers)
+                    self.assertIn("still refreshing", json.loads(content)["detail"])
+                    self.assertLess(elapsed, ANSWER_CEILING_SECONDS)
+            self.assert_no_new_appliance_call()
+
 
 if __name__ == "__main__":
     unittest.main()

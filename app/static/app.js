@@ -4288,7 +4288,8 @@
   }
 
   function isSmartEntryCurrent(entry) {
-    return Boolean(entry?.data) && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
+    // A retryable "still refreshing" answer is shown, never kept as data (#1144).
+    return Boolean(entry?.data) && !entry.transient && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
   }
 
   function isSmartEntryInFlight(entry) {
@@ -6593,6 +6594,7 @@
   function appendSmartTooltipMetrics(lines, slot, smartEntry) {
     if (smartEntry?.loading) {
       lines.push("SMART: loading...");
+      if (smartEntry.retryNote) lines.push(smartEntry.retryNote);
       return;
     }
 
@@ -9334,7 +9336,9 @@
     const enduranceEstimateNote = Number.isInteger(smartEntry?.data?.estimated_remaining_bytes_written)
       ? "Remaining write endurance is a projection from the current write rate and the NVMe percentage-used value."
       : null;
-    return [smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+    // While a "still refreshing" SMART read waits to retry (#1144).
+    const retryNote = (smartEntry?.loading || smartEntry?.refreshing) ? smartEntry.retryNote : null;
+    return [retryNote, smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
   }
 
   function renderEmptyDetailState(message, { showDetailSecondary = true } = {}) {
@@ -12124,6 +12128,11 @@
     if (isSmartEntryInFlight(entry) || isSmartEntryCurrent(entry)) {
       return;
     }
+    // After a retryable answer the slot is read again once the server's
+    // Retry-After has passed, not on every render in between.
+    if (entry?.transient && Date.now() < entry.retryNotBefore) {
+      return;
+    }
 
     const owner = state.smartSummaries[cacheKey] = {
       loading: !entry?.data,
@@ -12142,7 +12151,19 @@
       const scopedUrl = params.toString()
         ? `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart?${params.toString()}`
         : `/api/storage-views/${encodeURIComponent(view.id)}/slots/${slot.slot_index}/smart`;
-      const payload = await fetchJson(scopedUrl);
+      // A storage-view slot cannot be matched to a disk until the inventory
+      // view exists, so with none cached the read answers the retryable 503
+      // "still refreshing". Retry it like the page's other reads, showing
+      // the wait, while this request still owns the slot (#1144).
+      const payload = await retryBusyRead(() => fetchJson(scopedUrl), {
+        isCurrent: () => state.smartSummaries[cacheKey] === owner && buildSelectionParams().toString() === requestScope,
+        onRetry: (attempt, delayMs) => {
+          owner.retryNote = busyReadRetryMessage(attempt, delayMs);
+          if (state.selectedStorageViewRuntimeId !== view.id) return;
+          if (state.selectedSlot === slot.slot_index) renderDetail();
+          if (state.hoveredSlot === slot.slot_index) refreshHoveredTooltip();
+        },
+      });
       if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
@@ -12153,12 +12174,15 @@
       };
     } catch (error) {
       if (state.smartSummaries[cacheKey] !== owner) return;
+      const retryDelayMs = busyReadRetryDelayMs(error);
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
         data: entry?.data || { available: false, message: error.message || String(error) },
         requestedAt: Date.now(),
         generation: state.smartSummaryGeneration,
+        // A retryable answer is shown but is not the slot's SMART data.
+        ...(retryDelayMs === null ? {} : { transient: true, retryNotBefore: Date.now() + retryDelayMs }),
       };
     }
 
