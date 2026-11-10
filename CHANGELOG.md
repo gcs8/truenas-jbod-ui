@@ -26,10 +26,54 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.7 - 2026-11-09
+
+This prerelease adds the changes merged after `v0.24.0-beta.6`. GHCR gets the
+fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- Heat-map colours use absolute temperature bands from each drive's SMART
+  ratings or documented defaults instead of stretching across the bays in
+  view, tile text stays readable on every heat colour, and heat values stay on
+  one line on narrow bays (#1104, #1105, #1149).
+- A page reload, Refresh, bay-assignment save or export during the app's own
+  background refresh is served instead of answering 503 busy, every wait
+  behind a refresh is bounded, with a deadline on the refresh itself, reads
+  that still find no view are retried by the page, and a save made against a
+  disk that has since left the bay is refused instead of stored (#1121, #1126,
+  #1140, #1142, #1147).
+- Storage Fabric on TrueNAS CORE shows SAS expander PHY error counters when
+  the service account has the new read-only sudo rule (#1088).
+- Bays, Disk Path facts and cut-off path text have accessible names and full
+  text on hover and focus, and narrow windows no longer wrap labels one letter
+  per line (#1122).
+- History keeps SQLite temporary files on the history volume whatever the
+  Compose file sets, and its dashboard and `/healthz` count segmented-history
+  segments that still lack the newer indexes, read-only (#1095, #1129).
 
 ### Upgrade notes
 
+- This is a prerelease. `dev` is the only image tag that moves to it;
+  `latest` stays on `v0.23.0`. Upgrading from `v0.24.0-beta.6`, the only
+  operator action is the optional TrueNAS CORE sudo rule below; Compose files,
+  settings, environment variables and data formats are otherwise unchanged.
+  Upgrading from `v0.23.0` or older, read the `v0.24.0-beta.1` to
+  `v0.24.0-beta.6` upgrade notes too.
+- TrueNAS CORE systems need one more read-only sudo rule, `/sbin/camcontrol
+  smpcmd` limited to REPORT PHY ERROR LOG, before Storage Fabric can show
+  expander PHY error counters. New service accounts get it from the admin
+  bootstrap. On an existing CORE account, re-run the admin SSH access
+  bootstrap, or append only that rule as shown in the admin sudoers preview
+  and on the wiki's SSH Setup and Sudo page, then press Refresh once. Until
+  then Storage Fabric says "Expander counters not available (permission not
+  granted)" and everything else works as before. SCALE and other platforms
+  are unchanged (#1088).
+- `/healthz` on the history service gains an informational
+  `segment_conversion` field, null on unsegmented history; it never marks
+  history degraded. Health checks that validate the exact field set must
+  accept it (#1129).
 - The history service now keeps SQLite's temporary sort and VACUUM files in
   `./history/.sqlite-tmp` (mode `0700`, created and emptied of stale files at
   startup), whatever `TMPDIR` the Compose file sets. An older or customised
@@ -37,6 +81,25 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   a tmpfs `/tmp`, no longer needs that line added by hand. Setting
   `SQLITE_TMPDIR` for the history service still overrides it. Backups and
   exports never include the folder (#1094, #1095).
+- A bay-assignment save or clear made against a disk that has since left the
+  bay now answers 409 "The disk in this bay changed" (`mapping_disk_changed`)
+  and stores nothing; the page reloads the bay to show the new disk. Restoring
+  bay assignments from a backup file previews any bay that now holds a
+  different disk, and confirming a preview after a bay it writes got another
+  disk answers 409 "Bays changed since the preview"
+  (`mapping_import_bays_changed`) and writes nothing; preview it again. Scripts
+  that call these endpoints should treat these 409 answers like the existing
+  revision conflict (#1141, #1142).
+- Operators who update with `scripts/update_immutable_deployment.py`: the
+  deployment directory, `.env` and every Compose file must now be owned by
+  root or the user running the helper and not writable by group or others, and
+  every directory from / down to the deployment must be owned by root and not
+  writable by group or others, so a deployment under `/tmp` or a home directory
+  is refused. With `--replace-compose`, name your own overlay with
+  `--keep-overlay` to keep it; a kept overlay may set only `restart` on
+  shipped services. Health and retention URLs may use an address and port the
+  deployment publishes. Plain `docker compose pull` and `up -d` updates are
+  unchanged (#1096, #1097).
 
 ### Added
 
