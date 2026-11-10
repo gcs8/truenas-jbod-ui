@@ -67,6 +67,8 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   .trunc { display: block; width: 80px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .slot-tile { display: inline-block; width: 90px; height: 60px; position: relative; background: #11161a; }
   .slot-tile span { display: block; color: rgb(149, 163, 179); }
+  .value { display: block; width: 44px; font: 14px monospace; }
+  .list { height: 40px; overflow: auto; } .list button { display: block; height: 30px; } .below { display: block; }
 </style></head><body>
   <div class="head"><h2 id="title">Demo Enclosure Title</h2><div class="controls"><button>Heat Map</button></div></div>
   <div class="row"><div class="card">HBA</div><div class="card"><dl><dt>Remote</dt><dd>01</dd><dt>Handle</dt><dd>0043</dd></dl></div><div class="card empty-col">EXPANDER</div></div>
@@ -76,6 +78,8 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   <select id="heatmap-metric-select"><option selected>Temperature</option></select>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 210, 74, 74; --heatmap-alpha: 0.75"><span class="slot-heatmap-value">37 C</span><span>pool-a</span></button>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 47, 110, 187; --heatmap-alpha: 0.5"><span class="slot-heatmap-value">36 C</span><span>pool-a</span></button>
+  <span class="value">+0.22 C</span>
+  <div class="list"><button>Listed 1</button><button>Listed 2</button><button>Listed 3</button></div><button class="below">Below the list</button>
 </body></html>`;
 
 test("the layout and heat-map checks report each synthetic defect shape", async ({ page }) => {
@@ -87,12 +91,18 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
   const types = new Set(result.findings.map((finding) => finding.type));
   for (const type of [
     "text-narrow-wrap", "text-mid-word-break", "empty-track-squeeze", "page-horizontal-overflow", "control-overlap",
-    "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast",
+    "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast", "text-value-wrap",
   ]) {
     expect(types.has(type), `${type} not reported: ${JSON.stringify(result.findings.map((f) => [f.type, f.selector]))}`).toBe(true);
   }
   const midWord = result.findings.find((finding) => finding.type === "text-mid-word-break");
   expect(midWord.detail.word).toMatch(/Remote|Handle/);
+  // #1145: "+0.22 C" on two lines.
+  expect(result.findings.filter((finding) => finding.type === "text-value-wrap").map((finding) => finding.text)).toEqual(["+0.22 C"]);
+  // #1146: list items scrolled out of their own box are clipped there; only
+  // the overlapping pair is an overlap, not the list against the button below.
+  expect(result.findings.filter((finding) => finding.type === "control-overlap").map((finding) => `${finding.text} x ${finding.detail.other}`))
+    .toEqual(["First x html > body > div.over > button"]);
 });
 
 // The app's own heat-map colour and band functions, loaded from app.js so the
@@ -258,6 +268,7 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid",
     "ui-storage-views-error": "https://ui-storage-views-error.synthetic.invalid",
     "ui-quantastor": "https://ui-quantastor.synthetic.invalid",
+    "ui-dense-sleds": "https://ui-dense-sleds.synthetic.invalid",
   };
   const guard = new RequestGuard({ origins });
   const stats = { blocked: [], writes: [], routeErrors: [] };
@@ -281,6 +292,8 @@ test("the crawler's layout, heat-map and contrast checks pass on the synthetic f
     { page: "main", ready: "main", variant: "storage-views-error", label: "fixture/main-storage-views-error", url: `${origins["ui-storage-views-error"]}/` },
     // Sol #1108: a QuantaStor page sends a forced startup read; only its declared page-load window admits it.
     { page: "main", ready: "main", variant: "quantastor", platform: "quantastor", label: "fixture/main-quantastor", url: `${origins["ui-quantastor"]}/` },
+    // #1145: 24 narrow 2.5-inch sleds, where heat values once wrapped mid-number.
+    { page: "main", ready: "main", variant: "dense-sleds", label: "fixture/main-dense-sleds", url: `${origins["ui-dense-sleds"]}/` },
     // #1127: a saved storage view selected through the target URL, as a live
     // crawl reaches it (a later scope: only the `scope: "all"` states run).
     { page: "main", ready: "main", scopeIndex: 1, label: "fixture/main-view-boot-doms", url: `${origins.ui}/?system_id=demo-system&storage_view_id=boot-doms` },
@@ -472,9 +485,12 @@ test("a storage view as the first scope: every main read state stays inside the 
   const viewRuntime = (fixture.api["ui:/api/storage-views"].views || []).find((entry) => entry.id === view);
   const viewEnclosure = viewBoundEnclosure(viewRuntime);
   expect(viewEnclosure, "the fixture view names its backing enclosure").toBeTruthy();
+  // beta.7 QA: the page's own enclosure, as liveTargets() records it (here the view's too).
+  const pageEnclosure = fixture.api["ui:/api/inventory"].selected_enclosure_id;
+  expect(pageEnclosure).toBe(viewEnclosure);
   const liveBindFor = (target) => Crawler.prototype.bindFor.call({ fixtureMode: false, writeSystem: null }, target);
   crawler.bindFor = liveBindFor;
-  const target = { page: "main", ready: "main", scopeIndex: 0, system, viewEnclosure, label: "fixture/main-view-first", url: `${origins.ui}/?system_id=${system}&storage_view_id=${view}` };
+  const target = { page: "main", ready: "main", scopeIndex: 0, system, pageEnclosure, viewEnclosure, viewSource: viewRuntime.source, label: "fixture/main-view-first", url: `${origins.ui}/?system_id=${system}&storage_view_id=${view}` };
   expect(liveBindFor(target)).toEqual({ system_id: system, enclosure_id: viewEnclosure, storage_view_id: view, optional: ["enclosure_id"] });
   expect(crawler.scopeFor(target)).toBe("storage-view");
   const states = expandStates(inventory).filter((state) => state.page === "main" && !state.variant && !state.heavy && state.safety === "read" && !state.appliance_load);
@@ -515,4 +531,130 @@ test("a storage view as the first scope: every main read state stays inside the 
     if (state) misclassified.push(...checkObserved(state, [...seen.keys()], readsFor(inventory, state, "storage-view")));
   }
   expect(misclassified).toEqual([]);
+});
+
+// beta.7 QA (QuantaStor HA saved view): a view whose runtime backing
+// enclosure is the HA partner node's while its page loads the system's
+// default enclosure. A live crawl bound the view target to the backing
+// enclosure and refused every read the page sent (GET /api/inventory,
+// GET /api/storage-views, POST /api/slots/smart-batch, all carrying the
+// page's enclosure). Bound by the live bindFor exactly as liveTargets()
+// records the target, the page's reads pass, every admitted enclosure is the
+// page's own, and a foreign or partner enclosure is still refused.
+test("a saved view backed by another enclosure (QuantaStor HA partner) stays inside the page's own enclosure binding", async ({ browser }, testInfo) => {
+  test.setTimeout(12 * 60_000);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-ha-"));
+  const fixturePath = path.join(tempDir, "fixture.json");
+  execFileSync(process.env.PYTHON || "python3", ["scripts/build_ui_crawl_fixture.py", "--output", fixturePath], { cwd: root, stdio: "inherit" });
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+  const origins = { "ui-ha-view": "https://ui-ha-view.synthetic.invalid", assets: "https://synthetic.invalid" };
+  const guard = new RequestGuard({ origins });
+  const stats = { blocked: [], writes: [], routeErrors: [] };
+  const context = await browser.newContext({ viewport: null, serviceWorkers: "block" });
+  const routesHandle = await installRoutes(context, { guard, origins, stats, fixture: fixtureHandler(fixture) });
+  const crawler = new Crawler({
+    context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir: testInfo.outputPath("ui-crawl-ha-view"),
+    widths: [inventory.widths.ci[0]], fixtureMode: true, settleMs: 300, log: (line) => process.stdout.write(`${line}\n`),
+  });
+  const admittedPaths = [];
+  const admitOne = guard.admit.bind(guard);
+  guard.admit = (request) => {
+    const verdict = admitOne(request);
+    if (verdict.allowed) admittedPaths.push(verdict.path);
+    return verdict;
+  };
+  const system = fixture.api["ui:/api/inventory"].selected_system_id;
+  const pageEnclosure = fixture.api["ui:/api/inventory"].selected_enclosure_id;
+  const view = "nvme-carrier-x4";
+  const viewRuntime = (fixture.api["ui-ha-view:/api/storage-views"].views || []).find((entry) => entry.id === view);
+  const viewEnclosure = viewBoundEnclosure(viewRuntime);
+  expect(viewRuntime.source).toBe("inventory_binding");
+  expect(viewEnclosure && viewEnclosure !== pageEnclosure, "the fixture view is backed by another enclosure than the page's").toBe(true);
+  const liveBindFor = (target) => Crawler.prototype.bindFor.call({ fixtureMode: false, writeSystem: null }, target);
+  crawler.bindFor = liveBindFor;
+  // As liveTargets() emits a later view scope of the system.
+  const target = { page: "main", ready: "main", scopeIndex: 1, system, pageEnclosure, viewEnclosure, viewSource: viewRuntime.source, label: "fixture/main-ha-view", url: `${origins["ui-ha-view"]}/?system_id=${system}&storage_view_id=${view}` };
+  expect(liveBindFor(target)).toEqual({ system_id: system, enclosure_id: pageEnclosure, storage_view_id: view, optional: ["enclosure_id"] });
+  const all = expandStates(inventory).filter((state) => state.page === "main" && !state.variant && !state.heavy && state.safety === "read" && !state.appliance_load);
+  // What a live crawl runs on a later scope, plus a bay selection and history reads on the view.
+  const states = all.filter((state) => state.scope === "all" || ["main.select[healthy]", "main.history", "main.heatmap.metric"].includes(state.id));
+  expect(states.map((state) => state.id)).toEqual(expect.arrayContaining(["main.default", "main.heatmap", "main.heatmap.temperature", "main.select[healthy]", "main.history"]));
+  try {
+    await crawler.crawlTarget(target, states);
+  } finally {
+    await routesHandle.drain();
+    await context.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  const broken = crawler.records.filter((record) => !["done", "not-applicable"].includes(record.status));
+  expect(broken.map((record) => `${record.target} ${record.state}: ${record.status} ${JSON.stringify(record.findings)}`)).toEqual([]);
+  expect(stats.blocked, "a read the HA view's page sent was refused").toEqual([]);
+  expect(stats.routeErrors).toEqual([]);
+  expect(crawler.records.filter((record) => record.status === "done").map((record) => record.state)).toEqual(expect.arrayContaining(["main.default", "main.heatmap", "main.heatmap.temperature"]));
+  // Every admitted enclosure was the page's own; the page did send it.
+  const named = admittedPaths.filter((entry) => new URLSearchParams(entry.split("?")[1] || "").has("enclosure_id"));
+  expect(named.length, "no admitted request named the page's enclosure").toBeGreaterThan(0);
+  for (const entry of named) {
+    for (const value of new URLSearchParams(entry.split("?")[1] || "").getAll("enclosure_id")) expect(value, entry).toBe(pageEnclosure);
+  }
+  for (const route of ["/api/storage-views?", "/api/slots/smart-batch?"]) {
+    expect(named.some((entry) => entry.startsWith(route)), `the page sent no ${route} read with its enclosure`).toBe(true);
+  }
+  // Still refused with the last state's binding: a foreign enclosure, the
+  // partner's (never sent by this page), an empty one, another system.
+  const ui = origins["ui-ha-view"];
+  for (const query of [`system_id=${system}&enclosure_id=synthetic-foreign-enclosure`, `system_id=${system}&enclosure_id=${viewEnclosure}`, `system_id=${system}&enclosure_id=`, `system_id=synthetic-other-system&enclosure_id=${pageEnclosure}`]) {
+    for (const route of ["/api/inventory", "/api/storage-views"]) {
+      expect(admitOne({ method: "GET", url: `${ui}${route}?${query}` }).allowed, `${route}?${query}`).toBe(false);
+    }
+  }
+});
+
+// #1143: the disk-sync preview on a page that renders its button disabled
+// (SSH off, as on the default fixture and the beta.7 CORE twin; or writes
+// off: the write sign-in variant) is not-applicable before anything is
+// pressed. Where the button is enabled (SSH configured) the preview still
+// runs: the confirmation is shown and dismissed and nothing is sent.
+test("a forbidden preview whose control is disabled is not-applicable; an enabled one still previews and sends nothing", async ({ browser }, testInfo) => {
+  test.setTimeout(6 * 60_000);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jbod-ui-1143-"));
+  const fixturePath = path.join(tempDir, "fixture.json");
+  execFileSync(process.env.PYTHON || "python3", ["scripts/build_ui_crawl_fixture.py", "--output", fixturePath], { cwd: root, stdio: "inherit" });
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+  const origins = {
+    ui: "https://ui.synthetic.invalid", "ui-write-sign-in": "https://ui-write-sign-in.synthetic.invalid", "ui-ssh": "https://ui-ssh.synthetic.invalid",
+    assets: "https://synthetic.invalid",
+  };
+  const guard = new RequestGuard({ origins });
+  const stats = { blocked: [], writes: [], routeErrors: [] };
+  const context = await browser.newContext({ viewport: null, serviceWorkers: "block" });
+  const routesHandle = await installRoutes(context, { guard, origins, stats, fixture: fixtureHandler(fixture) });
+  const crawler = new Crawler({
+    context, cdpFactory: (page) => context.newCDPSession(page), guard, inventory, outDir: testInfo.outputPath("ui-crawl-1143"),
+    widths: [inventory.widths.ci[0]], fixtureMode: true, settleMs: 300, confirmPreview: true, log: (line) => process.stdout.write(`${line}\n`),
+  });
+  const state = expandStates(inventory).find((entry) => entry.id === "main.disk-sync");
+  expect(state.requires_enabled).toBe(true);
+  const disabled = [];
+  let enabled;
+  try {
+    await crawler.openPage();
+    disabled.push(await crawler.crawlState({ page: "main", ready: "main", label: "fixture/main", url: `${origins.ui}/` }, state));
+    disabled.push(await crawler.crawlState({ page: "main", ready: "main", label: "fixture/main-write-sign-in", url: `${origins["ui-write-sign-in"]}/` }, state));
+    expect(crawler.actuations.length, "a not-applicable preview is no actuation").toBe(0);
+    enabled = await crawler.crawlState({ page: "main", ready: "main", label: "fixture/main-ssh", url: `${origins["ui-ssh"]}/` }, state);
+  } finally {
+    await routesHandle.drain();
+    await context.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  for (const record of disabled) {
+    expect(record.status, JSON.stringify(record)).toBe("not-applicable");
+    expect(record.reason).toBe(`requires ${state.requires} enabled; it is disabled here`);
+  }
+  expect(enabled.status, JSON.stringify(enabled)).toBe("previewed");
+  expect(enabled.outcome.dialogs).toBeGreaterThan(0);
+  expect(crawler.actuations.map((entry) => entry.status)).toEqual(["previewed"]);
+  expect(stats.writes, "nothing was written").toEqual([]);
+  expect(stats.blocked, "nothing was sent that needed admission").toEqual([]);
 });

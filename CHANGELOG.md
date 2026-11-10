@@ -159,6 +159,18 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
   preview names any bay that now holds a different disk than the backup, and
   confirming a preview after a bay it writes got another disk is refused with
   409 "Bays changed since the preview" and writes nothing (#1141, #1142).
+- Fixed the export dialog showing "Live estimate unavailable" for good, and
+  the export failing, while the app's own background refresh took longer than
+  5 seconds. The export and its size estimate now use the cached inventory
+  view after that wait, and the dialog says when that view was read. The views
+  one export reads share a single 5-second wait. A page or storage-view load,
+  enclosure switch, SMART prefetch or storage-view slot SMART read that finds
+  no cached view still gets "The inventory is still refreshing", and the page
+  now tries it again up to three times after the server's Retry-After, saying
+  so in the status line, the dialog or the slot's SMART note. A storage-view
+  slot no longer keeps that answer as its SMART data for five minutes; it is
+  read again on the next look after the Retry-After. A Refresh, a save and a
+  locate-light press are not retried automatically (#1144, #1147).
 - Fixed a page reload right after an enclosure rename, or a bay-assignment
   save while the page's own background refresh was still running, answering
   503 "server is busy". A request that starts after the change now waits for
@@ -217,6 +229,16 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
   rollback restores and rechecks file modes as well as bytes. Health and
   retention URLs may also use an address and port the deployment itself
   publishes (#1097).
+- Fixed heat-map values breaking inside the number on narrow bays, such as
+  "+0.22 C" stacked one character per line on 24-bay 2.5-inch sleds. A value
+  now stays on one line: where it does not fit its bay it uses a smaller font,
+  runs along a tall sled, drops its unit (the bay's tooltip keeps the whole
+  value), or last shrinks again with a size's unit joined to it ("12.3TB").
+  The bay's device and serial lines stay visible. In a narrow window the
+  rear 2.5-inch 2x12 bays widen so their state chips stay off the latch.
+  Also fixed the admin Setup + Maintenance page scrolling sideways in a
+  narrow window, and the UI crawler reporting list items scrolled out of their
+  own box as overlapping the controls below it (#1149).
 
 ### Internal
 
@@ -247,6 +269,11 @@ fixed `v0.24.0-beta.7` and `0.24.0-beta.7` tags and moves `dev` to it;
   target's system, enclosure and storage view; a saved storage view's
   heat-map history is allowed. Appliance polls, writes and identify lights
   stay declared per state (#1108).
+- The UI crawler now records a state whose required control is shown but
+  disabled (such as the disk sync with SSH off) as not applicable instead of
+  a failed preview, and binds a saved storage view's page to the enclosure
+  the page itself reads, so a QuantaStor HA view on the partner node no
+  longer has its reads refused; other enclosures stay refused (#1148).
 
 ## v0.24.0-beta.6 - 2026-11-07
 

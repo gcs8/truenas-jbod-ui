@@ -393,7 +393,14 @@ tooling exists to catch those automatically.
   `forbidden` (appliance or array writes beyond the identify LED, bootstrap,
   sudo or account changes, SMART test starts, backup and restore, history purge
   or adopt, configuration saves that reach appliances). Forbidden states are
-  listed for completeness and never actuated.
+  listed for completeness and never actuated. A state's `requires` selector
+  must be visible for the state to run on a target, and with
+  `requires_enabled: true` also enabled; otherwise the state is
+  `not-applicable` there before any step runs. A forbidden confirm-preview
+  state that clicks its required control must set `requires_enabled`, so a
+  page that renders the control disabled (writes or SSH off) is not reported
+  as a failed preview, while an enabled control whose preview fails still
+  fails the crawl.
 - `qa/ui-routes.json` is the reviewed backend route manifest. Every FastAPI
   route of the main UI, history and admin services is listed with a class
   (`read`, `read-post`, `read-heavy`, `appliance-load`, `app-write`, `led`,

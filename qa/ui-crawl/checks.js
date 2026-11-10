@@ -123,6 +123,12 @@ function pageChecks(options) {
       continue;
     }
     if (lines < 2) continue;
+    // #1145: a value ("+0.22 C", "54,153 hr", "12.3 TB/yr") on two lines broke
+    // inside the number or between the number and its unit.
+    if (/^[+\-\u2212]?\d[\d.,:]*%?(?: ?[A-Za-z%/\u00b0]{1,6}){0,2}$/.test(text)) {
+      push("text-value-wrap", "error", element, { lines });
+      continue;
+    }
     // A dictionary-like word rendered on two lines was broken inside the word.
     // This applies even under overflow-wrap:anywhere or word-break:break-all
     // (that styling is how #1102's labels broke); only words inside a long
@@ -235,14 +241,30 @@ function pageChecks(options) {
       push("control-clipped", "error", element, { visibleFraction: Number((visibleWidth / r.width).toFixed(2)), clippedBy: describe(parent.node) });
     }
   }
-  const boxes = controls.map((element) => ({ element, r: element.getBoundingClientRect() }));
+  // #1146: a control scrolled out of its own scroll box (a long list) is
+  // clipped there, so against a control outside that box only its visible
+  // part counts. Two controls in the same scroll box keep their full boxes.
+  const clipsOf = (element) => {
+    const clips = [];
+    for (let node = element.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+      const s = style(node);
+      if (s.overflowX !== "visible" || s.overflowY !== "visible") clips.push({ node, r: node.getBoundingClientRect() });
+    }
+    return clips;
+  };
+  const visibleIn = (box, other) => box.clips.filter((clip) => !clip.node.contains(other.element)).reduce((r, clip) => ({
+    left: Math.max(r.left, clip.r.left), right: Math.min(r.right, clip.r.right), top: Math.max(r.top, clip.r.top), bottom: Math.min(r.bottom, clip.r.bottom),
+  }), box.r);
+  const boxes = controls.map((element) => ({ element, r: element.getBoundingClientRect(), clips: clipsOf(element) }));
   for (let i = 0; i < boxes.length; i += 1) {
     for (let j = i + 1; j < boxes.length; j += 1) {
       const a = boxes[i];
       const b = boxes[j];
       if (a.element.contains(b.element) || b.element.contains(a.element)) continue;
-      const w = Math.min(a.r.right, b.r.right) - Math.max(a.r.left, b.r.left);
-      const h = Math.min(a.r.bottom, b.r.bottom) - Math.max(a.r.top, b.r.top);
+      const ra = visibleIn(a, b);
+      const rb = visibleIn(b, a);
+      const w = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left);
+      const h = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
       if (w <= 2 || h <= 2) continue;
       const smaller = Math.min(a.r.width * a.r.height, b.r.width * b.r.height);
       if (w * h < smaller * 0.1) continue;

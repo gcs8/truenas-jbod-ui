@@ -24,7 +24,10 @@
 //      target's value (every copy), each `bind_if_sent` key it carries must
 //      equal the target's, and each `bind_params` path parameter (a storage
 //      view's id) must equal the target's. A key the target binds to null
-//      may not be carried at all (D-TNJ-20261109-CRAWLER-SVBIND).
+//      may not be carried at all (D-TNJ-20261109-CRAWLER-SVBIND). A target's
+//      `read_alternates` (beta.7 QA) name one other enclosure_id value for
+//      a few exact routes (a snapshot storage view's history reads); the
+//      read passes when it fits the binding with that value instead.
 //   5. Any other class passes only inside a declared window, and only when a
 //      rule matches exactly: method, the substituted path (the captured bay),
 //      the route class, body predicates (a route with `object_keys` must have
@@ -68,6 +71,27 @@ function outsideKey(key, want, parsed, required) {
   if (want === null) return got.length ? `${key} (target has none)` : null;
   if (!got.length) return required ? `${key} (missing)` : null;
   return got.some((value) => value !== String(want)) ? `${key} (other)` : null;
+}
+
+// beta.7 QA: a target may name, for reads only, one alternate value of
+// enclosure_id that its page sends on a few exact manifest routes (a snapshot
+// storage view's own enclosure on its history reads). Each entry is
+// { key: "enclosure_id", value: <non-empty id>, routes: ["METHOD /exact/template", ...] }.
+// Windows never read it. Anything else is refused before the state starts.
+const READ_ALTERNATE_KEYS = new Set(["enclosure_id"]);
+function checkReadAlternates(stateId, bind) {
+  const alternates = (bind || {}).read_alternates;
+  if (alternates === undefined) return;
+  const bad = (why) => new Error(`${stateId}: target read_alternates ${why}`);
+  if (!Array.isArray(alternates)) throw bad("must be a list");
+  for (const alt of alternates) {
+    if (!alt || !READ_ALTERNATE_KEYS.has(alt.key)) throw bad(`may only name ${[...READ_ALTERNATE_KEYS].join(", ")}`);
+    if (typeof alt.value !== "string" || !alt.value) throw bad(`needs a non-empty ${alt.key} value`);
+    if (!Array.isArray(alt.routes) || !alt.routes.length) throw bad("needs the exact routes it applies to");
+    for (const route of alt.routes) {
+      if (typeof route !== "string" || !/^(GET|POST) \/\S+$/.test(route) || /[*?]/.test(route)) throw bad(`route ${JSON.stringify(route)} is not one exact METHOD /template`);
+    }
+  }
 }
 
 function optionalIn(bind, key) {
@@ -171,6 +195,7 @@ class RequestGuard {
   // a read rule with `bind` (a page's selection read, Codex #1108) also needs
   // each named key to equal the target's, when the target has one.
   beginState(stateId, { reads = [], bind = {} } = {}) {
+    checkReadAlternates(stateId, bind);
     this.state = stateId;
     this.reads = { stateId, rules: this.compileReads(stateId, reads), bind: { ...(bind || {}) } };
   }
@@ -346,13 +371,24 @@ class RequestGuard {
       return `read ${route} with query key ${extra.join(", ") || keys.join(", ")} is not declared for ${this.reads.stateId}`;
     }
     let outside = null;
+    const bind = this.reads.bind;
+    // A target's read alternates for this exact route: the same binding with
+    // one key replaced by its alternate value (every copy must equal it).
+    const alternates = (bind.read_alternates || []).filter((alt) => alt.routes.includes(route)).map((alt) => ({ ...bind, [alt.key]: alt.value }));
     for (const rule of fitting) {
-      outside = this.outsideBind(rule.bind, this.reads.bind, parsed)
-        || this.outsideBindIfSent(rule.ifSent, this.reads.bind, parsed)
-        || this.outsidePathBind(rule, this.reads.bind, parsed);
-      if (!outside) return null;
+      for (const candidate of [bind, ...alternates]) {
+        const miss = this.outsideRuleBind(rule, candidate, parsed);
+        if (!miss) return null;
+        if (candidate === bind) outside = miss;
+      }
     }
     return `read ${route} outside the bound ${outside} of ${this.reads.stateId}`;
+  }
+
+  outsideRuleBind(rule, bind, parsed) {
+    return this.outsideBind(rule.bind, bind, parsed)
+      || this.outsideBindIfSent(rule.ifSent, bind, parsed)
+      || this.outsidePathBind(rule, bind, parsed);
   }
 
   // null when every copy of each key the request carries equals the target's

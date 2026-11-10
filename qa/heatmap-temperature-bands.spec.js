@@ -32,6 +32,7 @@ const SHAPES = [
   ["front-drive", "top", "3.5", 2, 4],
   ["front-drive", "top", "2.5", 1, 24],
   ["rear-drive", "left", "2.5", 2, 12],
+  ["rear-drive", "right", "2.5", 2, 12],
   ["top-loader", "bottom", "3.5", 3, 4],
   ["top-loader", "bottom", "2.5", 3, 4],
   ["drawer", "bottom", "3.5", 2, 6],
@@ -43,6 +44,9 @@ const SHAPES = [
   bay_size: size,
   rows,
   columns,
+  // The one-row top-latched 2.5-inch sled hides its labels under any heat
+  // map (style.css): its badge owns the sled. Every other face keeps them.
+  labelFree: face === "front-drive" && latch === "top" && size === "2.5" && rows === 1,
   bays: Array.from({ length: rows * columns }, (_, index) => ({ temperature: 30 + ((index * 7) % 32) })),
 }));
 
@@ -134,7 +138,7 @@ print(json.dumps(dict(html=builder.build_live_fixture_html(runtime), snapshot=sn
 `], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }));
 }
 
-function smartSummary(bay) {
+function smartSummary(bay, slot = 0) {
   return {
     available: true,
     temperature_c: bay.temperature,
@@ -143,6 +147,15 @@ function smartSummary(bay) {
     smart_health_status: "PASSED",
     rotation_rate_rpm: 7200,
     transport_protocol: "SAS",
+    // #1145: wide values for the other metrics ("54,153 hr", "100% left",
+    // "12.3 TB/yr", "1:2.50 R/W").
+    ...(bay.wide ? {
+      power_on_hours: 54153 + (slot * 1037),
+      endurance_remaining_percent: 100 - (slot % 3),
+      bytes_written: 1.23e14 + (slot * 7.7e12),
+      annualized_bytes_written: 1.23e13 + (slot * 7.7e11),
+      bytes_read: (slot % 2 ? 4.1e13 : 3.08e14) + (slot * 1e12),
+    } : {}),
   };
 }
 
@@ -176,13 +189,13 @@ async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "")
     if (url.pathname === "/api/inventory") data = pageFixture.snapshot;
     if (url.pathname === "/api/storage-views") data = pageFixture.runtime || { system_id: "synthetic-system", views: [] };
     const viewSmart = /^\/api\/storage-views\/[^/]+\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (viewSmart) data = smartSummary(bayAt(Number(viewSmart[1])));
+    if (viewSmart) data = smartSummary(bayAt(Number(viewSmart[1])), Number(viewSmart[1]));
     if (url.pathname === "/api/slots/smart-batch") {
       const requested = JSON.parse(request.postData() || "{}").slots || [];
-      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bayAt(slot)) })) };
+      data = { summaries: requested.map((slot) => ({ slot, summary: smartSummary(bayAt(slot), slot) })) };
     }
     const single = /^\/api\/slots\/(\d+)\/smart$/.exec(url.pathname);
-    if (single) data = smartSummary(bayAt(Number(single[1])));
+    if (single) data = smartSummary(bayAt(Number(single[1])), Number(single[1]));
     return route.fulfill({ contentType: "application/json", body: JSON.stringify(data) });
   });
   await page.goto(`https://synthetic.invalid/${query}`);
@@ -339,6 +352,188 @@ for (const [index, shape] of SHAPES.entries()) {
         for (const tile of tiles) {
           expect(tile.lines.map((line) => line.line), where(tile)).toEqual(expect.arrayContaining(["slot-device", "slot-pool"]));
         }
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1145: a value never breaks inside a number or between a number and its
+// unit ("+0.22 C" stacked one character per line on 24-bay 2.5-inch sleds),
+// on every face style, at every width, for the widest metric values. It
+// stays on one line, whole, inside its bay, off the bay's text, and the
+// crawler's squeeze check would flag it if it did not.
+const VALUE_METRICS = ["temperature_c", "temperature_delta_c", "power_on_hours", "endurance_remaining_percent",
+  "annualized_bytes_written", "read_write_ratio"];
+const ALL_WIDTHS = [{ width: 390, height: 900 }, ...VIEWPORTS];
+
+async function measureValues(page) {
+  // Two frames: fitting runs on the frame after a render or resize.
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  return page.locator("#slot-grid .slot-tile.heatmap-active").evaluateAll((tiles) => tiles.map((tile) => {
+    const box = (rect) => ({ left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom });
+    const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const inside = (inner, outer) => inner.left >= outer.left - 1 && inner.right <= outer.right + 1
+      && inner.top >= outer.top - 1 && inner.bottom <= outer.bottom + 1;
+    const badge = tile.querySelector(".slot-heatmap-value");
+    const range = document.createRange();
+    range.selectNodeContents(badge);
+    const fragments = [...range.getClientRects()].filter((rect) => rect.width > 0.5 && rect.height > 0.5);
+    const badgeBox = box(badge.getBoundingClientRect());
+    const tileBox = box(tile.getBoundingClientRect());
+    // The bay's content box: its padding holds the latch, LED and state chip.
+    const pad = getComputedStyle(tile);
+    const inset = (side) => parseFloat(pad[`border-${side}-width`]) + parseFloat(pad[`padding-${side}`]) - 3;
+    const content = { left: tileBox.left + inset("left"), top: tileBox.top + inset("top"), right: tileBox.right - inset("right"), bottom: tileBox.bottom - inset("bottom") };
+    const outside = [];
+    const covered = [];
+    for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+      if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+      const lineRange = document.createRange();
+      lineRange.selectNodeContents(line);
+      const own = line.getBoundingClientRect();
+      const rects = [...lineRange.getClientRects()].map((rect) => ({
+        left: Math.max(rect.left, own.left), right: Math.min(rect.right, own.right), top: rect.top, bottom: rect.bottom,
+      }));
+      if (rects.some((rect) => overlap(rect, badgeBox))) covered.push(line.className);
+      if (!rects.every((rect) => inside(rect, content))) outside.push(line.className);
+    }
+    // #1145: a one-line value grows sideways; it must not run over the
+    // bay's latch handle or LED in the padding either.
+    for (const part of tile.querySelectorAll(".slot-latch, .slot-status-led")) {
+      if (part.checkVisibility({ visibilityProperty: true }) && overlap(part.getBoundingClientRect(), badgeBox)) covered.push(part.className);
+    }
+    // #1145 review: fitting a value must not hide the bay's device or serial
+    // line; the checks above skip a line that is not drawn.
+    const hidden = [...tile.querySelectorAll(".slot-device, .slot-pool")]
+      .filter((line) => line.textContent.trim())
+      .filter((line) => {
+        const rect = line.getBoundingClientRect();
+        return !line.checkVisibility({ visibilityProperty: true, opacityProperty: true }) || rect.width < 1 || rect.height < 1;
+      })
+      .map((line) => line.className);
+    const text = badge.textContent.trim();
+    return {
+      slot: tile.dataset.slot,
+      text,
+      hidden,
+      title: badge.title,
+      fragments: fragments.length,
+      clipped: badge.scrollWidth > badge.clientWidth + 1 || badge.scrollHeight > badge.clientHeight + 1,
+      inTile: inside(badgeBox, content),
+      covered,
+      outside,
+      // The crawler's text-narrow-wrap rule (qa/ui-crawl/checks.js).
+      squeezed: fragments.length >= 3 && text.length >= 6 && text.length / fragments.length < 4,
+      size: [Math.round(badgeBox.right - badgeBox.left), Math.round(badgeBox.bottom - badgeBox.top)],
+    };
+  }));
+}
+
+for (const [index, shape] of SHAPES.entries()) {
+  test(`heat values stay on one line on ${shape.name} for every metric and width (#1145)`, async ({ page }) => {
+    const bays = shape.bays.map((entry) => ({ ...entry, wide: true }));
+    const errors = await openHeatMap(page, shapeFixtures[index], bays);
+    for (const metric of VALUE_METRICS) {
+      await page.locator("#heatmap-metric-select").selectOption(metric);
+      await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
+      for (const viewport of ALL_WIDTHS) {
+        await page.setViewportSize(viewport);
+        expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
+        const values = await measureValues(page);
+        expect(values).toHaveLength(bays.length);
+        if (process.env.HEATMAP_BANDS_SCREENSHOT_DIR && ["temperature_delta_c", "power_on_hours"].includes(metric)) {
+          await page.mouse.move(0, 0);
+          await page.locator(".enclosure-face").screenshot({
+            path: path.join(process.env.HEATMAP_BANDS_SCREENSHOT_DIR, `values-${shape.name.replace(/\W+/g, "-")}-${metric}-${viewport.width}.png`),
+          });
+        }
+        for (const value of values) {
+          const where = `${shape.name} ${metric} at ${viewport.width} px, bay ${value.slot} "${value.text}" ${JSON.stringify(value.size)}`;
+          expect(value.fragments, `${where} renders on one line`).toBe(1);
+          expect(value.squeezed, `${where} squeezed`).toBe(false);
+          expect(value.clipped, `${where} cut off`).toBe(false);
+          expect(value.inTile, `${where} inside the bay's content box`).toBe(true);
+          expect(value.outside, `${where} pushes bay text out of the content box`).toEqual([]);
+          expect(value.covered, `${where} covers bay text, the latch or the LED`).toEqual([]);
+          expect(value.title, `${where} full value in the title`).toContain(":");
+          if (!shape.labelFree) expect(value.hidden, `${where} hides the device or serial line`).toEqual([]);
+        }
+        for (const chip of await stateChips(page)) {
+          expect(chip.hits.filter((hit) => hit.startsWith("slot-heatmap-value")),
+            `${shape.name} ${metric} at ${viewport.width} px, bay ${chip.slot} chip ${JSON.stringify(chip.chip)} covers the value`).toEqual([]);
+        }
+      }
+    }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1145 review: each bay's state chip (its ::after, placed by app.js). It
+// never covers the value badge, and on the rear 2.5-inch 2x12 faces, whose
+// bays widen at 390 px, it also stays inside the bay and off the latch, LED
+// and text. Text by its Range; hardware and the badge by box. Measured once
+// two frames pass unchanged.
+async function stateChips(page) {
+  let last = "";
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+    const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
+      const style = getComputedStyle(tile, "::after");
+      const px = (value) => parseFloat(value) || 0;
+      const extra = style.boxSizing === "border-box" ? [0, 0] : [
+        px(style.paddingLeft) + px(style.paddingRight) + px(style.borderLeftWidth) + px(style.borderRightWidth),
+        px(style.paddingTop) + px(style.paddingBottom) + px(style.borderTopWidth) + px(style.borderBottomWidth),
+      ];
+      const width = px(style.width) + extra[0];
+      const height = px(style.height) + extra[1];
+      const shift = new DOMMatrixReadOnly(style.transform === "none" ? undefined : style.transform);
+      const box = tile.getBoundingClientRect();
+      // From the offsets the spot's rule sets (style.css): Chromium can
+      // return a stale resolved left/top for a pseudo-element after a resize.
+      const spot = tile.closest(".chassis-shell")?.dataset.chipSpot || "corner";
+      const x = ["middle", "foot"].includes(spot) ? tile.clientWidth / 2 : spot === "start" ? px(style.left) : tile.clientWidth - px(style.right) - width;
+      const y = spot === "middle" ? tile.clientHeight / 2 : spot === "foot" ? tile.clientHeight - px(style.bottom) - height : px(style.top);
+      const left = box.left + tile.clientLeft + x + shift.e;
+      const top = box.top + tile.clientTop + y + shift.f;
+      const chip = { left, top, right: left + width, bottom: top + height };
+      const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+      const hits = [];
+      for (const part of tile.querySelectorAll(".slot-heatmap-value, .slot-status-led, .slot-latch")) {
+        if (part.checkVisibility({ visibilityProperty: true }) && overlap(chip, part.getBoundingClientRect())) hits.push(part.className);
+      }
+      for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+        if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
+      }
+      const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
+      return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
+    }));
+    if (JSON.stringify(chips) === last) return chips;
+    last = JSON.stringify(chips);
+  }
+  throw new Error(`state chips did not settle: ${last}`);
+}
+
+for (const [index, shape] of SHAPES.entries()) {
+  if (shape.face_style !== "rear-drive") continue;
+  test(`state chips clear the latch, LED, value and labels on ${shape.name} at 390 px (#1145)`, async ({ page }) => {
+    const bays = shape.bays.map((entry) => ({ ...entry, wide: true }));
+    const errors = await openHeatMap(page, shapeFixtures[index], bays);
+    await page.setViewportSize({ width: 390, height: 900 });
+    expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(390);
+    for (const metric of VALUE_METRICS) {
+      await page.locator("#heatmap-metric-select").selectOption(metric);
+      const chips = await stateChips(page);
+      expect(chips).toHaveLength(bays.length);
+      for (const chip of chips) {
+        const where = `${shape.name} ${metric} at 390 px, bay ${chip.slot} chip ${JSON.stringify(chip.chip)}`;
+        expect(chip.content, `${where} is drawn`).not.toBe("none");
+        expect(chip.hits, `${where} covers`).toEqual([]);
+        expect(chip.inside, `${where} inside the bay`).toBe(true);
       }
     }
     expect(errors).toEqual([]);

@@ -442,6 +442,10 @@ class ConcurrencyTests(ConfigReloadTestCase):
                 await self.release.wait()
                 return InventorySnapshot(slots=[], refresh_interval_seconds=30)
 
+            async def get_current_or_cached_snapshot(self, **kwargs: Any) -> tuple[InventorySnapshot, None]:
+                # The export's read since #1144: a current view, not a fallback.
+                return await self.get_snapshot(**kwargs), None
+
             async def get_slot_smart_summaries(self, *_: Any, **__: Any) -> list[Any]:
                 return []
 
@@ -458,7 +462,13 @@ class ConcurrencyTests(ConfigReloadTestCase):
                         settings=old_settings,
                     )
                 )
-            await service.started.wait()
+            # Fail, rather than hang, if the export ends before its read starts.
+            started = asyncio.ensure_future(service.started.wait())
+            await asyncio.wait({old_export, started}, return_when=asyncio.FIRST_COMPLETED)
+            if old_export.done():
+                started.cancel()
+                old_export.result()
+                self.fail("the export finished before its snapshot read started")
             self.config["systems"][0]["label"] = "Alpha New"
             self._write_config()
             self.assertTrue(await reloader.check_now())

@@ -277,7 +277,7 @@
       "covers": ["#refresh-button"]
     },
     {
-      "id": "main.disk-sync", "page": "main", "safety": "forbidden", "confirm_preview": true,
+      "id": "main.disk-sync", "page": "main", "safety": "forbidden", "confirm_preview": true, "requires_enabled": true,
       "requires": "#disk-inventory-sync-multipath-button",
       "reason": "Runs a disk sync on the appliance.",
       "steps": [{"click": "#disk-inventory-sync-multipath-button"}],
@@ -312,6 +312,20 @@
       "description": "QuantaStor system with LED-capable bays (fixture variant). Its page sends the startup forced inventory read that only the page's declared load window admits (Sol #1108); the state then selects a bay.",
       "steps": [{"selectBay": "healthy"}, {"wait": 600}],
       "covers": []
+    },
+    {
+      "id": "main.heatmap.values", "page": "main", "safety": "read", "ci": true, "fixture_only": true, "variant": "dense-sleds",
+      "description": "#1145: 24 bays of 2.5-inch top-latched sleds (fixture variant) with a signed two-decimal value per bay. Each value stays on one line; before the fix \"+0.22 C\" stacked one character per line here.",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "temperature_delta_c"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
+    },
+    {
+      "id": "main.heatmap.values-hours", "page": "main", "safety": "read", "ci": true, "fixture_only": true, "variant": "dense-sleds",
+      "description": "#1145: the same sleds with a long unit (\"12,000 hr\").",
+      "steps": [{"click": "#heatmap-toggle-button"}, {"waitFor": "#heatmap-controls:not(.hidden)"}, {"select": "#heatmap-metric-select", "value": "power_on_hours"}, {"wait": 800}],
+      "checks": ["heatmap"],
+      "covers": ["#heatmap-metric-select"]
     },
     {
       "id": "fabric.lanes", "page": "fabric", "safety": "read", "scope": "all", "ci": true,

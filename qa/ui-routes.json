@@ -48,7 +48,7 @@
     {"service":"ui","method":"GET","path":"/api/history/scope","class":"read","why":"Scope history read.","fingerprint":"aa5b5cd4825d6c99a9a9abf7"},
     {"service":"ui","method":"GET","path":"/api/storage-views/{view_id}/history","class":"read","why":"Storage-view history read.","fingerprint":"304f6030da7bcb14374bc70f"},
     {"service":"ui","method":"POST","path":"/api/export/enclosure-snapshot","class":"read-heavy","why":"Builds the offline snapshot download; declared per state.","fingerprint":"84d273911b52e4056ec02c12"},
-    {"service":"ui","method":"POST","path":"/api/export/enclosure-snapshot/estimate","class":"read-post","why":"Size estimate for the export dialog.","fingerprint":"70072644c6e687e18b605b32"},
+    {"service":"ui","method":"POST","path":"/api/export/enclosure-snapshot/estimate","class":"read-post","why":"Size estimate for the export dialog; during a running refresh it reads the cached view (#1144).","fingerprint":"91ee76a9edf8a0e140ef9562"},
     {"service":"ui","method":"GET","path":"/livez","class":"read","why":"Liveness probe.","fingerprint":"9ee2c3b9239653cf08d6d634"},
     {"service":"ui","method":"GET","path":"/healthz","class":"read","why":"Health probe.","fingerprint":"9ccec61362520d21b8655e23"},
     {"service":"ui","method":"GET","path_expr":"metrics_mount_path","path":"/metrics","class":"internal","why":"Prometheus metrics; never requested by a page.","fingerprint":"ad8e70b2a0de9cc6de76b64f"},
