@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 from scripts.validate_release_wrap import (
     DEFERRABLE_NARROW_BETA_GATES,
+    NARROW_BETA_QA_TOOLING,
     REQUIRED_GATES,
     changelog_coverage_required,
     public_demo_freshness_required,
@@ -700,6 +702,144 @@ class NarrowBetaReleaseWrapTests(unittest.TestCase):
         joined = "\n".join(self._messages(_narrow_wrap(), repository=repository))
 
         self.assertIn("app/__init__.py", joined)
+
+    def test_version_patch_header_spoof_is_rejected(self) -> None:
+        repository = _narrow_repository(self.root, extra_changes={
+            "app/__init__.py": _version_files("1.0.0-beta.2")["app/__init__.py"]
+            + '++ (globals().__setitem__("RUNTIME_FEATURE", True) or 0)\n',
+        })
+        self.assertIn("app/__init__.py", "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_missing_version_assignment_is_rejected(self) -> None:
+        repository = _narrow_repository(self.root, extra_changes={
+            "app/__init__.py": '"""Synthetic app."""\n\n',
+        })
+        self.assertIn("app/__init__.py", "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_json_version_bump_with_extra_line_is_rejected(self) -> None:
+        for path in ("package.json", "package-lock.json"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory(dir=self.root) as raw:
+                content = _version_files("1.0.0-beta.2")[path].replace(
+                    '{\n', '{\n  "extra": true,\n', 1,
+                )
+                repository = _narrow_repository(Path(raw), extra_changes={path: content})
+                self.assertIn(path, "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_version_bump_preserves_every_other_byte(self) -> None:
+        for suffix in (b"\n", b"\r\n", b"\xff"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory(dir=self.root) as raw:
+                repository = _narrow_repository(Path(raw))
+                path = repository / "app/__init__.py"
+                path.write_bytes(path.read_bytes() + suffix)
+                _commit(repository, "extra bytes")
+                self.assertIn("app/__init__.py", "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_version_file_deletion_or_rename_is_rejected(self) -> None:
+        for path in _version_files("1.0.0-beta.2"):
+            for rename in (False, True):
+                with self.subTest(path=path, rename=rename), tempfile.TemporaryDirectory(dir=self.root) as raw:
+                    repository = _narrow_repository(Path(raw))
+                    if rename:
+                        _git(repository, "mv", path, "docs/version.md")
+                    else:
+                        (repository / path).unlink()
+                    _commit(repository, "remove version file")
+                    self.assertIn(path, "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_clean_version_bump_preserves_dependency_versions(self) -> None:
+        repository = _narrow_repository(self.root)
+        _git(repository, "reset", "--hard", "v1.0.0-beta.1")
+        path = "package-lock.json"
+        dependency = '    "node_modules/synthetic": {\n      "version": "1.0.0-beta.1"\n    },\n'
+        old = _version_files("1.0.0-beta.1")[path].replace('  "packages": {\n', '  "packages": {\n' + dependency)
+        _write(repository, path, old)
+        _commit(repository, "dependency version")
+        _git(repository, "tag", "-f", "v1.0.0-beta.1")
+        for relative, content in _version_files("1.0.0-beta.2").items():
+            if relative == path:
+                content = content.replace('  "packages": {\n', '  "packages": {\n' + dependency)
+            _write(repository, relative, content)
+        _commit(repository, "clean bump")
+        self.assertEqual(self._messages(_narrow_wrap(), repository=repository), [])
+
+    def test_appended_deferred_row_is_rejected(self) -> None:
+        repository = _narrow_repository(self.root)
+        for required in ("yes", "no"):
+            for version, mode in (("1.0.0-beta.2", True), ("1.0.0-beta.2", False), ("1.0.0-rc.1", True), ("1.0.0", True)):
+                with self.subTest(required=required, version=version, mode=mode):
+                    text = _narrow_wrap(deferred=()) if mode else _wrap_with_rows({})
+                    text += f"\n| Human-view gate | {required} | {NARROW_DEFERRED_EVIDENCE} | Deferred |  |\n"
+                    joined = "\n".join(self._messages(text, repository=repository, version=version))
+                    self.assertIn("Human-view gate: Deferred is not allowed for this gate", joined)
+                    if not mode:
+                        self.assertIn("Deferred rows require", joined)
+                    if "beta" not in version:
+                        self.assertIn("Deferred rows are only allowed for a beta prerelease", joined)
+
+    def test_case_insensitive_deferred_row_still_requires_evidence(self) -> None:
+        repository = _narrow_repository(self.root)
+        text = _narrow_wrap().replace(
+            f"| Linux QA restore gate | yes | {NARROW_DEFERRED_EVIDENCE}",
+            "| linux qa restore gate | yes | no target",
+        )
+        joined = "\n".join(self._messages(text, repository=repository))
+        self.assertIn("Deferred evidence must name the next rc/final full run", joined)
+
+    def test_git_replacement_cannot_hide_backend_change(self) -> None:
+        repository = _narrow_repository(self.root)
+        _write(repository, "app/main.py", "VALUE = 999\n")
+        _commit(repository, "backend change")
+        replacement = _git(repository, "commit-tree", "HEAD^{tree}", "-m", "replacement").strip()
+        _git(repository, "replace", "v1.0.0-beta.1", replacement)
+        self.assertEqual(_git(repository, "diff", "--name-only", "v1.0.0-beta.1", "HEAD"), "")
+        environment = {key: value for key, value in os.environ.items() if key != "GIT_NO_REPLACE_OBJECTS"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            joined = "\n".join(self._messages(_narrow_wrap(), repository=repository))
+        self.assertIn("app/main.py", joined)
+
+    def test_release_qa_tools_keep_the_beta_narrow(self) -> None:
+        required_tools = {
+            "scripts/validate_release_wrap.py", "scripts/check_release_changelog_coverage.py",
+            "scripts/dev_check.py", "scripts/run_test_shard.py",
+            "scripts/check_public_docs.py", "scripts/check_public_screenshots.py",
+            "scripts/check_public_demo_artifact.py", "scripts/verify_wiki_drift.py",
+        }
+        self.assertTrue(required_tools <= NARROW_BETA_QA_TOOLING)
+        repository = _narrow_repository(self.root, extra_changes={path: "# QA only\n" for path in required_tools})
+        self.assertEqual(self._messages(_narrow_wrap(), repository=repository), [])
+
+    def _assert_qa_tools_not_copied(self, dockerfile: str) -> list[str]:
+        sources = []
+        for line in dockerfile.replace("\\\n", " ").splitlines():
+            words = shlex.split(line, comments=True)
+            if not words or words[0].upper() not in {"COPY", "ADD"}:
+                continue
+            # Fail closed if Dockerfile stops using simple literal local sources.
+            self.assertEqual(len(words), 3, line)
+            source = str(PurePosixPath(words[1]))
+            self.assertNotRegex(source, r"[\[\]{}*$?]|^[-/]|\.\.")
+            self.assertTrue((REPOSITORY_ROOT / source).exists(), source)
+            sources.append(source)
+            for tool in NARROW_BETA_QA_TOOLING:
+                self.assertFalse(source == "." or tool == source or tool.startswith(source + "/"), (source, tool))
+        self.assertTrue(sources)
+        return sources
+
+    def test_narrow_qa_tools_are_not_copied_into_the_image(self) -> None:
+        sources = self._assert_qa_tools_not_copied((REPOSITORY_ROOT / "Dockerfile").read_text())
+        self.assertTrue(all((REPOSITORY_ROOT / tool).is_file() for tool in NARROW_BETA_QA_TOOLING))
+        repository = _narrow_repository(self.root)
+        for source in sources:
+            if source.startswith("scripts/"):
+                _write(repository, source, "# runtime change\n")
+                _commit(repository, "runtime script")
+                self.assertIn(source, "\n".join(self._messages(_narrow_wrap(), repository=repository)))
+
+    def test_image_copy_guard_rejects_qa_file_and_parent_sources(self) -> None:
+        for instruction in ("COPY", "ADD"):
+            for source in ("scripts/validate_release_wrap.py", "scripts/", "."):
+                with self.subTest(instruction=instruction, source=source), self.assertRaises(AssertionError):
+                    self._assert_qa_tools_not_copied(f"{instruction} {source} /app/\n")
 
     def test_deferred_required_gate_is_rejected(self) -> None:
         repository = _narrow_repository(self.root)

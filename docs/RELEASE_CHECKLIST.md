@@ -704,10 +704,19 @@ to the next full run. A deferred gate is not a pass and not a waiver.
 
 - Eligibility: every path changed since the previous release tag is under
   `app/static/`, `app/templates/`, `tests/`, `qa/`, `docs/` or `wiki/`, is a
-  `*.md` file (including `CHANGELOG.md`), or is QA-only tooling the image never
-  runs (`scripts/build_ui_crawl_fixture.py`, `scripts/ui_crawl.js`). The
+  `*.md` file (including `CHANGELOG.md`), or is release/QA-only tooling the
+  image never copies. The explicit reviewed list is
+  `NARROW_BETA_QA_TOOLING` in `scripts/validate_release_wrap.py`; it includes
+  the wrap, changelog-coverage, docs, wiki and artifact checkers, source-check
+  and test-shard runners, release/perf/restore harnesses, and browser fixture
+  builders and crawler. A contract test parses Dockerfile `COPY`/`ADD` sources
+  and rejects any listed tool or a directory containing one. This is not a
+  blanket exception for `scripts/`: the four history scripts copied into the
+  image remain runtime code and disqualify a narrow beta. The
   release version bump in `app/__init__.py`, `package.json` and
-  `package-lock.json` is allowed only when it changes nothing but the version.
+  `package-lock.json` is allowed only when complete old/new blobs differ at
+  the expected version assignments and nowhere else, byte for byte. Missing
+  assignments, renamed/deleted files and non-version edits disqualify it.
   Any other path (`app/*.py`, `app/services/`, `history_service/`,
   `admin_service/`, `Dockerfile`, Compose files, requirements, other scripts,
   migrations, workflows) makes the beta full.
@@ -718,10 +727,15 @@ to the next full run. A deferred gate is not a pass and not a waiver.
   deploy and examination rows.
 - May be `Deferred`: `Optional-sidecar runtime matrix`, `Local release perf
   harnesses`, `Linux QA restore gate` (legacy live restore, `tar.zst` and `7z`
-  round trips) and `Restored Linux QA perf harnesses`. Inside rows that must
-  `Pass`, the CORE VM checks and Archive comparator (Feature-specific live
-  API/UI gates) and the full UI crawl (Full Playwright/browser gates) may be
-  noted as deferred in the evidence; the row's required parts still pass.
+  round trips) and `Restored Linux QA perf harnesses`.
+- `Feature-specific live API/UI gates` and `Full Playwright/browser gates`
+  remain required mixed rows, not deferrable rows. Both must record `Pass`
+  for their required narrow parts: touched-area API/UI checks, fixture browser
+  specs and human-view checks. Their evidence must name the long subchecks
+  separately: `CORE VM checks and Archive comparator: Deferred to the next
+  rc/final full run`; `Full UI crawl: Deferred to the next rc/final full run`.
+  Do not mark either entire row `Deferred`. Snapshot/export/offline artifact
+  qualification also remains required or needs a concrete `N/A` reason.
 - Wrap wording, near the top:
 
   ```text
@@ -735,9 +749,10 @@ to the next full run. A deferred gate is not a pass and not a waiver.
   --name-only --no-renames` from the declared tag to the candidate (`HEAD`
   before tagging, the release tag after), requires the declared tag to be the
   latest earlier release tag and an ancestor of the candidate, and lists every
-  disqualifying path. A missing tag or failed git command fails the check, as
-  do a `Deferred` row without narrow mode, on any other gate, or on an rc or
-  final version.
+  disqualifying path. Every eligibility Git call disables replacement objects
+  with `GIT_NO_REPLACE_OBJECTS=1`. A missing tag or failed git command fails
+  the check, as does a `Deferred` row without narrow mode, on any other gate,
+  or on an rc or final version.
 - The next rc or final release runs every deferred gate and records it as
   `Pass`.
 

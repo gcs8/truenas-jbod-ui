@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -85,20 +86,47 @@ NARROW_BETA_PATH_PREFIXES = (
     "docs/",
     "wiki/",
 )
-# QA-only tooling the image never runs. Extend only with a reviewed change.
+# Release/QA-only tooling reviewed against Dockerfile COPY/ADD sources and the
+# release checklist. Tests fail closed if a tool or its parent enters the image.
+# Do not replace this explicit list with a scripts/ prefix exception.
 NARROW_BETA_QA_TOOLING = frozenset(
     {
+        "scripts/build_current_source_browser_fixture.py",
+        "scripts/build_perf_baseline.py",
+        "scripts/build_public_demo.py",
         "scripts/build_ui_crawl_fixture.py",
+        "scripts/check_changelog_entry.py",
+        "scripts/check_public_demo_artifact.py",
+        "scripts/check_public_docs.py",
+        "scripts/check_public_screenshots.py",
+        "scripts/check_release_changelog_coverage.py",
+        "scripts/dev_check.py",
+        "scripts/render_release_notes.py",
+        "scripts/run_compose_runtime_matrix.py",
+        "scripts/run_history_perf_harness.py",
+        "scripts/run_perf_harness.py",
+        "scripts/run_private_qa_restore.py",
+        "scripts/run_test_shard.py",
         "scripts/ui_crawl.js",
+        "scripts/validate_release_wrap.py",
+        "scripts/verify_wiki_drift.py",
     }
 )
-# A release commit bumps the version in these files. They stay narrow only when
-# the diff changes nothing but the version string, from the previous tag's
-# version to the candidate version.
+# Match only the exact expected assignments in the old blob. Byte comparison
+# after replacing their version groups preserves whitespace, newlines and all
+# other content, including dependency versions in package-lock.json.
+_JSON_ROOT_VERSION = re.compile(rb'^  "version": "(?P<version>[^"\n]+)",?$', re.MULTILINE)
 NARROW_BETA_VERSION_LINES = {
-    "app/__init__.py": re.compile(r'__version__ = "(?P<version>[^"]+)"'),
-    "package.json": re.compile(r'"version": "(?P<version>[^"]+)",?'),
-    "package-lock.json": re.compile(r'"version": "(?P<version>[^"]+)",?'),
+    "app/__init__.py": (re.compile(rb'^__version__ = "(?P<version>[^"\n]+)"$', re.MULTILINE),),
+    "package.json": (_JSON_ROOT_VERSION,),
+    "package-lock.json": (
+        _JSON_ROOT_VERSION,
+        re.compile(
+            rb'^    "": \{\n(?:      "name": "[^"\n]*",\n)?'
+            rb'      "version": "(?P<version>[^"\n]+)",?$',
+            re.MULTILINE,
+        ),
+    ),
 }
 GIT_TIMEOUT_SECONDS = 60
 
@@ -222,22 +250,6 @@ def validate_release_wrap_text(
             issues.append(ValidationIssue(f"{gate}: Result must be Pass, Blocked, N/A, or Deferred"))
             continue
 
-        if normalized_result == "deferred":
-            if gate not in DEFERRABLE_NARROW_BETA_GATES:
-                issues.append(
-                    ValidationIssue(
-                        f"{gate}: Deferred is not allowed for this gate; only "
-                        f"{', '.join(DEFERRABLE_NARROW_BETA_GATES)} may be Deferred in a narrow beta"
-                    )
-                )
-            elif DEFERRAL_TARGET_RE.search(evidence) is None:
-                issues.append(
-                    ValidationIssue(
-                        f"{gate}: Deferred evidence must name the next rc/final full run "
-                        "('Deferred to the next rc/final full run')"
-                    )
-                )
-
         if normalized_result == "pass" and not evidence:
             issues.append(ValidationIssue(f"{gate}: Pass requires evidence"))
         if normalized_result == "blocked" and not allow_blocked:
@@ -320,10 +332,13 @@ def _prerelease_label(version: str) -> str:
     return version.split("+", 1)[0].partition("-")[2].split(".", 1)[0].lower()
 
 
-def _git(repository: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(repository: Path, *args: str, text: bool = True) -> subprocess.CompletedProcess:
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return subprocess.run(
         ("git", "-C", str(repository), *args),
-        text=True,
+        text=text,
+        env=environment,
         capture_output=True,
         check=False,
         timeout=GIT_TIMEOUT_SECONDS,
@@ -339,25 +354,25 @@ def _git_error(result: subprocess.CompletedProcess[str]) -> str:
 def _version_only_change(
     repository: Path, previous_ref: str, candidate_ref: str, path: str, previous: str, candidate: str
 ) -> bool:
-    pattern = NARROW_BETA_VERSION_LINES[path]
-    result = _git(
-        repository, "diff", "--no-color", "--no-ext-diff", "--no-renames", "-U0",
-        previous_ref, candidate_ref, "--", path,
-    )
-    if result.returncode != 0:
-        return False
-    changed = 0
-    for line in result.stdout.splitlines():
-        if line.startswith(("diff ", "index ", "--- ", "+++ ", "@@")):
-            continue
-        if line[:1] not in {"+", "-"}:
+    blobs = []
+    for ref in (previous_ref, candidate_ref):
+        entry = _git(repository, "ls-tree", "-z", ref, "--", path, text=False)
+        # Missing, renamed, deleted, executable or symlink version files are not
+        # a version-only bump, even if their blob content happens to match.
+        if entry.returncode != 0 or not entry.stdout.startswith(b"100644 blob "):
             return False
-        match = pattern.fullmatch(line[1:].strip())
-        expected = previous if line[0] == "-" else candidate
-        if match is None or match.group("version") != expected:
+        blob = _git(repository, "show", f"{ref}:{path}", text=False)
+        if blob.returncode != 0:
             return False
-        changed += 1
-    return changed > 0
+        blobs.append(blob.stdout)
+    expected, actual = blobs
+    for pattern in NARROW_BETA_VERSION_LINES[path]:
+        matches = list(pattern.finditer(expected))
+        if len(matches) != 1 or matches[0].group("version") != previous.encode("ascii"):
+            return False
+        start, end = matches[0].span("version")
+        expected = expected[:start] + candidate.encode("ascii") + expected[end:]
+    return expected == actual
 
 
 def narrow_beta_path_is_allowed(path: str) -> bool:
@@ -455,13 +470,27 @@ def narrow_beta_issues(
     repository: Path | None,
     phase: str,
 ) -> list[ValidationIssue]:
-    deferred = [row[0] for row in rows.values() if row[3].lower() == "deferred"]
+    # Canonical presence checks are separate. Release-specific rows must obey
+    # the same Deferred restrictions even when Required is no.
+    deferred_rows = [row for row in rows.values() if row[3].lower() == "deferred"]
+    deferred = [row[0] for row in deferred_rows]
+    issues: list[ValidationIssue] = []
+    allowed = {gate.lower() for gate in DEFERRABLE_NARROW_BETA_GATES}
+    for gate, _required, evidence, _result, _reason in deferred_rows:
+        if gate.lower() not in allowed:
+            issues.append(ValidationIssue(
+                f"{gate}: Deferred is not allowed for this gate; only "
+                f"{', '.join(DEFERRABLE_NARROW_BETA_GATES)} may be Deferred in a narrow beta"
+            ))
+        if DEFERRAL_TARGET_RE.search(evidence) is None:
+            issues.append(ValidationIssue(
+                f"{gate}: Deferred evidence must name the next rc/final full run "
+                "('Deferred to the next rc/final full run')"
+            ))
     modes = [value.strip("`").strip().lower() for value in RELEASE_MODE_LINE.findall(text)]
     previous_tags = [value.strip("`").strip() for value in PREVIOUS_TAG_LINE.findall(text)]
     if not deferred and not modes:
-        return []
-
-    issues: list[ValidationIssue] = []
+        return issues
     if len(modes) > 1:
         issues.append(ValidationIssue("release wrap must declare Release mode at most once"))
     mode = modes[0] if modes else None
