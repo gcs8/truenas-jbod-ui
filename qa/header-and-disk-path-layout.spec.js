@@ -21,6 +21,12 @@ const TITLE = "Front 24 Bay";
 const DESKTOP_WIDTHS = [1600, 1920, 3840];
 const SCREENSHOT_DIR = process.env.LAYOUT_1102_SCREENSHOT_DIR || "";
 
+// This existing CI entry point also runs the related behavior suites. Keep
+// registration in ordinary modules: Playwright forbids importing spec files.
+test.describe("Storage Fabric stale refresh", () => {
+  require("./fixture-suites/fabric-stale-refresh")({ test, expect });
+});
+
 function python(script, args = []) {
   return JSON.parse(execFileSync(process.env.PYTHON || "python3", ["-c", script, ...args], {
     cwd: root,

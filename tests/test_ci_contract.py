@@ -1048,6 +1048,17 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
                 self.assertNotIn("PLAYWRIGHT_LIVE_APPLIANCE_QA", self.read(ROOT / spec))
         self.assertIn("--retries=0", step["run"])
         self.assertIn("git status --short", step["run"])
+        # The standalone spec shares registration with an already-selected
+        # entry point, keeping frontend regressions covered without a workflow delta.
+        entry = self.read(ROOT / "qa/header-and-disk-path-layout.spec.js")
+        for suite in ("fabric-stale-refresh",):
+            with self.subTest(suite=suite):
+                self.assertIn(f'require("./fixture-suites/{suite}")', entry)
+                self.assertTrue((ROOT / f"qa/fixture-suites/{suite}.js").is_file())
+                self.assertIn(
+                    f'require("./fixture-suites/{suite}")',
+                    self.read(ROOT / f"qa/{suite}.spec.js"),
+                )
         contributing = self.read(ROOT / "CONTRIBUTING.md")
         self.assertIn("Run fixture-only browser specs", contributing)
 

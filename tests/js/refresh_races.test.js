@@ -1083,6 +1083,10 @@ test("dedicated fabric refresh ignores a response for an older selection", async
       state.selectedSystemId = snapshot.selected_system_id || state.selectedSystemId;
     },
     applyFabric(fabric) { state.fabric = fabric; },
+    // #1158 stale-hit revalidation collaborators; these payloads are not stale.
+    cancelStaleRefetch() {},
+    fabricHasStaleHit: () => false,
+    scheduleStaleRefetch() { throw new Error("no stale-hit refetch expected"); },
   });
 
   const oldRefresh = refreshFabric(false);

@@ -30,6 +30,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Storage Fabric no longer shows the red STALE banner for a normal cached read
+  just past the short cache TTL: evidence read within three refresh intervals
+  (5 to 15 minutes) shows as OK with its age while the background refresh runs,
+  and the page re-reads once to pick it up. Idle and back/forward-cache restored
+  pages re-evaluate the status when that evidence ages out. Older or fallback
+  evidence, and evidence without a usable timestamp, keep the STALE tone and
+  now name their age (#1159).
 - UniFi model faces (UNVR, UNVR Pro, UNVR-G2, UNVR-G2-Pro, ENVR and ENVR
   Core) no longer squeeze a bay's device line and pool label until their
   text is cut off top or bottom, most visibly on ENVR Core at 390 px; a label

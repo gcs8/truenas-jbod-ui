@@ -378,6 +378,12 @@ own synthetic fixtures and need no running stack:
 npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selection.spec.js qa/connections-overflow.spec.js qa/header-and-disk-path-layout.spec.js qa/heatmap-temperature-bands.spec.js qa/offline-snapshot.spec.js qa/saved-view-selection.spec.js qa/ui-a11y-narrow-layout.spec.js qa/ui-coverage.spec.js qa/ui-scope-safety.spec.js qa/upgrade-notice.spec.js
 ```
 
+`qa/header-and-disk-path-layout.spec.js` also registers the Storage Fabric
+stale-refresh suite from `qa/fixture-suites/`. Its standalone entry point is
+`qa/fabric-stale-refresh.spec.js`, so it can run alone locally without changing
+CI's workflow list. Run either the combined entry point or the standalone
+suite, not both, to avoid duplicate execution.
+
 ### UI coverage
 
 Screenshots of default views miss most layout defects: a heading that stacks
