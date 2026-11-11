@@ -86,6 +86,7 @@
     refreshRequestToken: 0,
     staleRefetchTimer: null,
     staleAgeTimer: null,
+    pageHidden: false,
   };
 
   const elements = {
@@ -3832,7 +3833,11 @@
       refreshing: revalidating,
       // Seconds until this young evidence leaves the window and must be
       // re-evaluated (#1158), or null when nothing ages out.
-      refreshingForSeconds: revalidating ? windowSeconds - ageSeconds : null,
+      // Use the absolute timestamp, not the age clamped for display: tolerated
+      // future clock skew must not cause an early check and a second timer.
+      refreshingForSeconds: revalidating
+        ? windowSeconds - (evidence.now - new Date(evidence.lastUpdated).getTime()) / 1000
+        : null,
       message: `Loaded ${traceLabel} for ${selectionLabel}.${refreshNote}`,
     };
   }
@@ -3849,13 +3854,13 @@
   // an idle page cannot keep green OK on evidence that has become old.
   function scheduleStaleAgeCheck(refreshingForSeconds) {
     cancelStaleAgeCheck();
-    if (!Number.isFinite(refreshingForSeconds)) {
+    if (state.pageHidden || !Number.isFinite(refreshingForSeconds)) {
       return;
     }
     state.staleAgeTimer = window.setTimeout(() => {
       state.staleAgeTimer = null;
       renderStatus();
-    }, Math.max(0, Math.ceil(refreshingForSeconds * 1000)) + 1000);
+    }, Math.max(0, Math.ceil(refreshingForSeconds * 1000)) + 1);
   }
 
   function renderStatus() {
@@ -4196,6 +4201,9 @@
   // skips it rather than discarding the draft.
   function scheduleStaleRefetch(requestToken) {
     cancelStaleRefetch();
+    if (state.pageHidden) {
+      return;
+    }
     state.staleRefetchTimer = window.setTimeout(() => {
       state.staleRefetchTimer = null;
       if (requestToken !== state.refreshRequestToken || state.loading || state.aliasEditObjectId) {
@@ -4516,8 +4524,21 @@
 
   if (typeof window.addEventListener === "function") {
     window.addEventListener("pagehide", () => {
+      state.pageHidden = true;
       cancelStaleRefetch();
       cancelStaleAgeCheck();
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) {
+        return;
+      }
+      state.pageHidden = false;
+      // A bfcache restore keeps the old DOM and timestamps, but pagehide
+      // retired its timers. Re-evaluate before the one optional network read.
+      renderStatus();
+      if (!state.loading && fabricHasStaleHit(state.fabric)) {
+        scheduleStaleRefetch(state.refreshRequestToken);
+      }
     });
   }
 
