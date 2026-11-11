@@ -11,6 +11,12 @@ user-visible change is the state-chip correction in #1153.
   marker or accessible-only state keeps the underlying content visible.
 - The UI crawler now reports a chip painted over bay text.
 
+## Internal
+
+- Release tooling now records approved long-gate deferrals for an eligible
+  narrow beta. The validator checks the whole release delta and keeps the
+  required narrow gates mandatory (#1155).
+
 ## Before you test it
 
 Upgrading from v0.24.0-beta.7 requires no operator action beyond the normal
