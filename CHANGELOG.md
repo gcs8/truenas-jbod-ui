@@ -41,7 +41,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - The release-wrap validator accepts a `Deferred` result for four long gates
   in a beta whose changes since the previous tag are front-end, tests, QA
-  tooling or docs, checked with git; rc and final releases still need `Pass`.
+  tooling or docs, checked with git; rc and final releases still need `Pass`
+  (#1155).
 
 ## v0.24.0-beta.7 - 2026-11-09
 
