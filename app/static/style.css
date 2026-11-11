@@ -3522,6 +3522,15 @@ button.fabric-trace-crumb:hover {
 .chassis-shell[data-chip-spot="middle"] .slot-tile::after { inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
 .chassis-shell[data-chip-spot="foot"] .slot-tile::after { inset: auto auto 10px 50%; transform: translateX(-50%); }
 .chassis-shell[data-chip-spot="start"] .slot-tile::after { inset: 6px auto auto 6px; }
+/* #1150/#1151: a free place the scan found, and a smaller chip where a full
+   one has none; a 12px dot keeps its colour and border, not its glyph. */
+.chassis-shell[data-chip-spot="free"] .slot-tile::after { inset: var(--chip-top) var(--chip-right) auto auto; }
+.chassis-shell[data-chip-size] .slot-tile::after,
+.chassis-shell .slot-tile[data-chip-size]::after { width: calc(var(--chip-size) - 4px); height: calc(var(--chip-size) - 4px); }
+.chassis-shell[data-chip-size="12"] .slot-tile::after,
+.chassis-shell .slot-tile[data-chip-size="12"]::after { content: ""; }
+/* No unprotected space even for a marker: keep the bay's accessible state. */
+.chassis-shell .slot-tile[data-chip-hidden]::after { content: none; }
 
 .slot-tile.state-healthy::after { content: "✓"; border-style: solid; }
 .slot-tile.state-empty::after { content: "○"; border-style: dotted; }
@@ -4531,7 +4540,7 @@ button.fabric-trace-crumb:hover {
   right: 50px;
 }
 
-.chassis-shell[data-face-family="g2"] .slot-tile::after {
+.chassis-shell[data-face-family="g2"]:not([data-chip-spot]) .slot-tile::after {
   right: 56px;
 }
 

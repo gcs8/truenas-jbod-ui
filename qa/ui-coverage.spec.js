@@ -69,6 +69,9 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   .slot-tile span { display: block; color: rgb(149, 163, 179); }
   .value { display: block; width: 44px; font: 14px monospace; }
   .list { height: 40px; overflow: auto; } .list button { display: block; height: 30px; } .below { display: block; }
+  .chassis-shell .slot-tile { display: block; }
+  .chassis-shell .slot-tile::after { content: "\\2713"; position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; border: 2px solid; }
+  .chassis-shell .slot-number { position: absolute; top: 8px; right: 8px; }
 </style></head><body>
   <div class="head"><h2 id="title">Demo Enclosure Title</h2><div class="controls"><button>Heat Map</button></div></div>
   <div class="row"><div class="card">HBA</div><div class="card"><dl><dt>Remote</dt><dd>01</dd><dt>Handle</dt><dd>0043</dd></dl></div><div class="card empty-col">EXPANDER</div></div>
@@ -79,6 +82,7 @@ const DEFECTS_HTML = `<!doctype html><html><head><meta charset="utf-8"><style>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 210, 74, 74; --heatmap-alpha: 0.75"><span class="slot-heatmap-value">37 C</span><span>pool-a</span></button>
   <button class="slot-tile heatmap-active" style="--heatmap-rgb: 47, 110, 187; --heatmap-alpha: 0.5"><span class="slot-heatmap-value">36 C</span><span>pool-a</span></button>
   <span class="value">+0.22 C</span>
+  <div class="chassis-shell" data-chip-spot="corner"><div class="slot-tile" data-slot="7"><span class="slot-number">07</span></div></div>
   <div class="list"><button>Listed 1</button><button>Listed 2</button><button>Listed 3</button></div><button class="below">Below the list</button>
 </body></html>`;
 
@@ -92,6 +96,7 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
   for (const type of [
     "text-narrow-wrap", "text-mid-word-break", "empty-track-squeeze", "page-horizontal-overflow", "control-overlap",
     "text-truncated-no-tooltip", "heat-alarm-healthy-temp", "heat-small-range-spread", "heat-tile-contrast", "text-value-wrap",
+    "state-chip-overlap",
   ]) {
     expect(types.has(type), `${type} not reported: ${JSON.stringify(result.findings.map((f) => [f.type, f.selector]))}`).toBe(true);
   }
@@ -99,6 +104,9 @@ test("the layout and heat-map checks report each synthetic defect shape", async 
   expect(midWord.detail.word).toMatch(/Remote|Handle/);
   // #1145: "+0.22 C" on two lines.
   expect(result.findings.filter((finding) => finding.type === "text-value-wrap").map((finding) => finding.text)).toEqual(["+0.22 C"]);
+  // #1150 / #1151: a bay's state chip (::after) painted over its number.
+  expect(result.findings.filter((finding) => finding.type === "state-chip-overlap").map((finding) => finding.detail.covered))
+    .toEqual([['span.slot-number "07"']]);
   // #1146: list items scrolled out of their own box are clipped there; only
   // the overlapping pair is an overlap, not the list against the button below.
   expect(result.findings.filter((finding) => finding.type === "control-overlap").map((finding) => `${finding.text} x ${finding.detail.other}`))
