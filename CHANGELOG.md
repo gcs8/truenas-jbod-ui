@@ -37,6 +37,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   without painting over content. G2 faces preserve the chosen inset, and the UI
   crawler now reports a chip painted over bay text (#1153).
 
+### Internal
+
+- The release-wrap validator accepts a `Deferred` result for four long gates
+  in a beta whose changes since the previous tag are front-end, tests, QA
+  tooling or docs, checked with git; rc and final releases still need `Pass`.
+  Complete-blob version checks and replacement-free Git reject hidden runtime
+  changes, every extra Deferred row is checked, and reviewed image-excluded
+  release tools remain narrow (#1155).
+
 ## v0.24.0-beta.7 - 2026-11-09
 
 This prerelease adds the changes merged after `v0.24.0-beta.6`. GHCR gets the
