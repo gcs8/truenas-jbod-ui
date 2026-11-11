@@ -187,6 +187,20 @@ for profile in ProfileRegistry(Settings()).list_profiles():
             profile.id, profile.label, profile.face_style, profile.rows, profile.columns, bay_size=profile.bay_size,
             layout=profile.slot_layout, face_variant=profile.face_variant, latch_edge=profile.latch_edge,
             slot_number_base=profile.slot_number_base), empty_runtime)
+# #1157: the other chassis face shapes (the SCALE 24-bay front, top- and
+# side-latched sleds, top loader, generic and drawer) for the bay label fit
+# check, and an ENVR Core face whose device and pool names are too long to fit.
+for name, face_style, latch, size, rows, columns in [
+    ("scale-front-24", "front-drive", "right", "3.5", 6, 4), ("front-top-3.5", "front-drive", "top", "3.5", 2, 4),
+    ("front-top-2.5", "front-drive", "top", "2.5", 1, 24), ("rear-left-2.5", "rear-drive", "left", "2.5", 2, 12),
+    ("rear-right-2.5", "rear-drive", "right", "2.5", 2, 12), ("top-loader-2.5", "top-loader", "bottom", "2.5", 3, 4),
+    ("generic-3.5", "generic", "bottom", "3.5", 1, 6), ("drawer-3.5", "drawer", "bottom", "3.5", 2, 6),
+]:
+    pages[name] = (variant(f"synthetic-{name}", f"Synthetic {name}", face_style, rows, columns, bay_size=size, latch_edge=latch), empty_runtime)
+long_labels = dump(pages["envr-core"][0])
+for slot in long_labels["slots"]:
+    slot.update(device_name=f"synthetic-long-device-name-{slot['slot']:02d}", pool_name="synthetic-pool-with-a-long-descriptive-name")
+pages["envr-core-long"] = (InventorySnapshot.model_validate(long_labels), empty_runtime)
 # The admin sidecar as the coverage crawl renders it (#1146), with the
 # shipped layout catalog in the builder.
 import scripts.build_ui_crawl_fixture as crawl_fixture
@@ -620,7 +634,7 @@ for (const viewport of [NARROW, DESKTOP[0]]) {
 // here until it joins UNIFI_FACES.
 test("the UniFi matrix covers every built-in UniFi model face", () => {
   const models = Object.entries(fixture.main)
-    .filter(([, page]) => page.snapshot.selected_profile?.face_variant)
+    .filter(([name, page]) => page.snapshot.selected_profile?.face_variant && !name.endsWith("-long"))
     .map(([name, page]) => [name, page.snapshot.slots.length]);
   expect(Object.fromEntries(models)).toEqual(Object.fromEntries(UNIFI_FACES.filter(([face]) => face !== "unifi-plain")));
 });
@@ -671,6 +685,58 @@ async function measureStateChips(page) {
     const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
     return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
   }));
+}
+
+// #1157: every chassis face the fixture draws, and long labels on ENVR Core.
+const LABEL_FACES = ["demo", "grouped", ...UNIFI_FACES.map(([face]) => face), "envr-core-long", "scale-front-24", "front-top-3.5",
+  "front-top-2.5", "rear-left-2.5", "rear-right-2.5", "top-loader-2.5", "generic-3.5", "drawer-3.5"];
+
+// Each shown bay label line (device, pool, tertiary): its text's Range sits
+// inside the line box top to bottom, the line's content fits its box
+// (scrollHeight), and the line sits inside the bay's padding box. A line
+// that is wider than its box must ellipsize on one line and the bay's
+// accessible name must keep its full text.
+async function bayLabelFit(page) {
+  return page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => {
+    const failures = [];
+    let lines = 0;
+    let truncated = 0;
+    for (const tile of tiles) {
+      const bay = tile.getBoundingClientRect();
+      const style = getComputedStyle(tile);
+      const inner = {
+        top: bay.top + parseFloat(style.borderTopWidth), bottom: bay.bottom - parseFloat(style.borderBottomWidth),
+        left: bay.left + parseFloat(style.borderLeftWidth), right: bay.right - parseFloat(style.borderRightWidth),
+      };
+      for (const line of tile.querySelectorAll(":scope > :is(.slot-device, .slot-pool, .slot-tertiary)")) {
+        const text = line.textContent.trim();
+        if (!text || !line.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue;
+        lines += 1;
+        const where = `bay ${tile.dataset.slot} ${line.className} "${text}"`;
+        const box = line.getBoundingClientRect();
+        if (line.scrollHeight > line.clientHeight) failures.push(`${where} content ${line.scrollHeight}px in a ${line.clientHeight}px box`);
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        const rects = [...range.getClientRects()].filter((rect) => rect.width > 0);
+        if (new Set(rects.map((rect) => Math.round(rect.top))).size > 1) failures.push(`${where} wraps`);
+        for (const rect of rects) {
+          if (rect.top < box.top - 0.5 || rect.bottom > box.bottom + 0.5) {
+            failures.push(`${where} text ${rect.top.toFixed(1)}-${rect.bottom.toFixed(1)} outside its box ${box.top.toFixed(1)}-${box.bottom.toFixed(1)}`);
+          }
+        }
+        if (box.top < inner.top - 0.5 || box.bottom > inner.bottom + 0.5 || box.left < inner.left - 0.5 || box.right > inner.right + 0.5) {
+          failures.push(`${where} box ${[box.left, box.top, box.right, box.bottom].map((v) => v.toFixed(1))} outside the bay ${[inner.left, inner.top, inner.right, inner.bottom].map((v) => v.toFixed(1))}`);
+        }
+        if (line.scrollWidth > line.clientWidth) {
+          truncated += 1;
+          const lineStyle = getComputedStyle(line);
+          if (lineStyle.textOverflow !== "ellipsis" || lineStyle.whiteSpace !== "nowrap") failures.push(`${where} is cut off without an ellipsis`);
+          if (!(tile.getAttribute("aria-label") || "").includes(text)) failures.push(`${where} is cut off and missing from the bay's name`);
+        }
+      }
+    }
+    return { lines, truncated, failures };
+  });
 }
 
 const MAIN_STATES = [
@@ -744,6 +810,30 @@ for (const viewport of [NARROW, ...DESKTOP]) {
       }
       await expectClearChips("Heat Map");
       await capture(page, `${face}-heatmap-${viewport.width}`, page.locator(".enclosure-panel"));
+      expect(errors).toEqual([]);
+    });
+  }
+
+  // #1157: a bay's device line and pool label are never cut off top or
+  // bottom: each line box holds its text, the bay holds each line. A label
+  // too long for the bay ends in an ellipsis on one line and the bay's
+  // accessible name (and tooltip) keeps the whole text.
+  for (const face of LABEL_FACES) {
+    test(`${face} bay labels are not cut off vertically, with Heat Map off and on, at ${viewport.width} px (#1157)`, async ({ page }) => {
+      const errors = await openMain(page, face, viewport);
+      for (const mode of ["Heat Map off", "Heat Map"]) {
+        if (mode === "Heat Map") await enableHeatMap(page);
+        await stateChips(page);
+        const report = await bayLabelFit(page);
+        // The one-row top-latched 2.5-inch sled hides its labels under a heat
+        // map by design (style.css): its value badge owns the sled.
+        if (!(face === "front-top-2.5" && mode === "Heat Map")) expect(report.lines, `${face} ${mode}: label lines measured`).toBeGreaterThan(0);
+        expect(report.failures, `${face} ${mode} at ${viewport.width} px`).toEqual([]);
+        // At 390 px a UniFi face scrolls sideways at its content width, so a
+        // long label can show in full; desktop bays must ellipsize it.
+        if (face.endsWith("-long") && viewport.width !== NARROW.width) expect(report.truncated, `${face} ${mode}: long labels end in an ellipsis`).toBeGreaterThan(0);
+        await capture(page, `labels-${face}-${mode.replace(/\s+/g, "-").toLowerCase()}-${viewport.width}`, page.locator(".enclosure-panel"));
+      }
       expect(errors).toEqual([]);
     });
   }

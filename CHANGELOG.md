@@ -37,6 +37,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   pages re-evaluate the status when that evidence ages out. Older or fallback
   evidence, and evidence without a usable timestamp, keep the STALE tone and
   now name their age (#1159).
+- UniFi model faces (UNVR, UNVR Pro, UNVR-G2, UNVR-G2-Pro, ENVR and ENVR
+  Core) no longer squeeze a bay's device line and pool label until their
+  text is cut off top or bottom, most visibly on ENVR Core at 390 px; a label
+  too long for its bay still ends in an ellipsis (#1160).
 
 ## v0.24.0-beta.8 - 2026-11-11
 
