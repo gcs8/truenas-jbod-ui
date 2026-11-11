@@ -26,7 +26,29 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-rc.1 - 2026-11-11
+
+This release candidate includes the changes since `v0.24.0-beta.8` below.
+It is for testing, not final promotion. Fixed prerelease tags and `dev` use
+this candidate; `latest` stays on `v0.23.0`.
+
+### Highlights
+
+- UniFi bay device and pool labels keep their full line height on every
+  model face, including narrow windows (#1160).
+- Storage Fabric distinguishes a recent cached view refreshing in the
+  background from genuinely old or fallback evidence (#1159).
+- Main-page SMART reads have a 15-second deadline and a Retry SMART path
+  instead of waiting forever (#1163).
+
+### Upgrade notes
+
+- Upgrading from `v0.24.0-beta.8` requires no operator action beyond the
+  normal image update. Compose files, settings, environment variables,
+  stored formats and appliance commands are unchanged. Earlier upgrade
+  notes still apply when coming from `v0.23.0` or older betas.
+- This is a prerelease. Only `dev` moves; `latest` remains `v0.23.0`. The
+  public demo and its screenshots wait for the stable release.
 
 ### Fixed
 
