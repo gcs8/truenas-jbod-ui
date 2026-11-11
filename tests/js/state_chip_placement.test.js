@@ -38,7 +38,7 @@ function functionSource(name) {
 
 const sandbox = vm.createContext({});
 vm.runInContext(`${functionSource("chooseStateChipSpot")}\nthis.choose = chooseStateChipSpot;`, sandbox);
-const choose = (bays) => JSON.parse(JSON.stringify(sandbox.choose(bays)));
+const choose = (bays, ...options) => JSON.parse(JSON.stringify(sandbox.choose(bays, ...options)));
 
 // Part boxes are [left, top, width, height] inside the bay's padding box, as
 // measured in Chromium on the shipped layouts (heat map off unless noted).
@@ -86,12 +86,29 @@ test("one spot serves the whole face, so a bay that blocks the corner moves ever
   assert.equal(choose([clearCorner, LAYOUTS.rightLatch3_5]).spot, "beside");
 });
 
-test("a bay with no clear spot gets the spot with the fewest overlaps", () => {
-  // A 30px bay with a label across its middle: every spot overlaps something.
-  const crowded = bay(30, 60, [[0, 0, 30, 60]]);
-  const choice = choose([crowded]);
-  assert.ok(choice.hits > 0);
-  assert.equal(choice.spot, "corner", "ties keep the earliest spot");
+test("a fully protected bay returns no placement rather than covering content", () => {
+  assert.equal(choose([bay(30, 60, [[0, 0, 30, 60]])]), null);
+});
+
+test("opposite obstructions need per-bay 12px markers, never a shared overlapping chip", () => {
+  const bays = [bay(30, 44, [[0, 0, 14, 44]]), bay(30, 44, [[16, 0, 14, 44]])];
+  assert.equal(choose(bays), null, "no shared position clears both bays");
+  for (const layout of bays) {
+    const choice = choose([layout], 24, 6, true);
+    assert.equal(choice.size, 12);
+    assert.equal(choice.hits, 0);
+    assert.ok(clearOfEveryPart(choice, [layout]), JSON.stringify(choice));
+  }
+});
+
+test("per-bay full chips take priority over a shared smaller fallback", () => {
+  const bays = [bay(56, 70, [[0, 0, 28, 70]]), bay(56, 70, [[28, 0, 28, 70]])];
+  assert.equal(choose(bays), null);
+  for (const layout of bays) {
+    const choice = choose([layout], 24, 6, true);
+    assert.equal(choice.size, 24);
+    assert.ok(clearOfEveryPart(choice, [layout]), JSON.stringify(choice));
+  }
 });
 
 test("a chip that only touches a part, under a pixel, still clears it (#1145)", () => {
@@ -146,15 +163,15 @@ test("dense sleds with a rotated hours value and empty bays keep the chip off th
   const hours = bay(41, 134, [[23, 8, 10, 10], [8, 30, 28.5, 22], [8, 8, 9.3, 18], [6, 58, 16.7, 51.4]]);
   const empty = bay(41, 134, [[23, 8, 10, 10], [8, 30, 28.5, 22], [8, 8, 9.3, 18], [6, 58.8, 16.7, 22.4]]);
   const choice = choose([hours, empty, hours]);
-  assert.equal(choice.hits, 0);
-  assert.ok(clearOfEveryPart(choice, [hours, empty]), JSON.stringify(choice));
+  for (const layout of [hours, empty]) {
+    const own = choice || choose([layout], 24, 6, true);
+    assert.equal(own.hits, 0);
+    assert.ok(clearOfEveryPart(own, [layout]), JSON.stringify(own));
+  }
 });
 
-test("a bay with no free place for even a dot keeps the fewest-overlap spot", () => {
-  const full = bay(30, 30, [[0, 0, 30, 30]]);
-  const choice = choose([full]);
-  assert.ok(choice.hits > 0);
-  assert.notEqual(choice.spot, "free");
+test("a bay with no free place for even a dot never returns an overlapping placement", () => {
+  assert.equal(choose([bay(30, 30, [[0, 0, 30, 30]])]), null);
 });
 
 test("M.2 cards put the chip beside the gold latch, or top-left when a short card is mounted", () => {

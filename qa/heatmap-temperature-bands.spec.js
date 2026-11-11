@@ -519,8 +519,11 @@ async function stateChips(page, strict = false) {
       // From the offsets the spot's rule sets (style.css): Chromium can
       // return a stale resolved left/top for a pseudo-element after a resize.
       const spot = tile.closest(".chassis-shell")?.dataset.chipSpot || "corner";
-      const x = ["middle", "foot"].includes(spot) ? tile.clientWidth / 2 : spot === "start" ? px(style.left) : tile.clientWidth - px(style.right) - width;
-      const y = spot === "middle" ? tile.clientHeight / 2 : spot === "foot" ? tile.clientHeight - px(style.bottom) - height : px(style.top);
+      const tileStyle = getComputedStyle(tile);
+      const bayWidth = box.width - px(tileStyle.borderLeftWidth) - px(tileStyle.borderRightWidth);
+      const bayHeight = box.height - px(tileStyle.borderTopWidth) - px(tileStyle.borderBottomWidth);
+      const x = ["middle", "foot"].includes(spot) ? bayWidth / 2 : spot === "start" ? px(style.left) : bayWidth - px(style.right) - width;
+      const y = spot === "middle" ? bayHeight / 2 : spot === "foot" ? bayHeight - px(style.bottom) - height : px(style.top);
       const left = box.left + tile.clientLeft + x + shift.e;
       const top = box.top + tile.clientTop + y + shift.f;
       const chip = { left, top, right: left + width, bottom: top + height };
@@ -606,6 +609,17 @@ for (const { shape, fixture: shapeFixture } of CHIP_SHAPES) {
         await page.setViewportSize(viewport);
         expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
         const chips = await stateChips(page, true);
+        // Fractional rear bays must agree with the actual border quads too;
+        // rounded clientWidth otherwise invents a subpixel latch intersection.
+        if (shape.face_style === "rear-drive" && shape.latch_edge === "right" && viewport.width === 1600) {
+          const painted = await paintedStateChips(page);
+          expect(painted).toHaveLength(bays.length);
+          for (const chip of painted) {
+            expect(chip.chip).not.toBeNull();
+            expect(chip.hits, `${mode.name} actual border quad`).toEqual([]);
+            expect(chip.inside).toBe(true);
+          }
+        }
         expect(chips).toHaveLength(bays.length);
         if (mode.hours) {
           const values = chips.filter((chip) => /^\d{2},\d{3}/.test(chip.value));
@@ -626,6 +640,114 @@ for (const { shape, fixture: shapeFixture } of CHIP_SHAPES) {
       }
     }
     expect(failures).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+}
+
+// Review regressions: use Chromium's actual pseudo-element border quad, not
+// the chooser's offsets or a second implementation of the CSS cascade.
+async function paintedStateChips(page) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    const { root: document } = await session.send("DOM.getDocument", { depth: -1, pierce: true });
+    const { nodeIds } = await session.send("DOM.querySelectorAll", { nodeId: document.nodeId, selector: "#slot-grid .slot-tile[data-slot]" });
+    const selected = new Set(nodeIds);
+    const nodes = [];
+    const visit = (node) => {
+      if (selected.has(node.nodeId)) nodes.push(node);
+      for (const child of node.children || []) visit(child);
+    };
+    visit(document);
+    const chips = [];
+    for (const node of nodes) {
+      const after = node.pseudoElements?.find((pseudo) => pseudo.pseudoType === "after");
+      let chip = null;
+      if (after) {
+        const { model } = await session.send("DOM.getBoxModel", { nodeId: after.nodeId });
+        const xs = model.border.filter((_, index) => index % 2 === 0);
+        const ys = model.border.filter((_, index) => index % 2 === 1);
+        chip = { left: Math.min(...xs), top: Math.min(...ys), right: Math.max(...xs), bottom: Math.max(...ys) };
+      }
+      chips.push(await page.locator("#slot-grid .slot-tile[data-slot]").nth(chips.length).evaluate((tile, chip) => {
+        const overlap = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        const box = tile.getBoundingClientRect();
+        const hits = [];
+        for (const part of tile.querySelectorAll(".slot-status-led, .slot-latch, .slot-number, .slot-heatmap-value")) {
+          if (!part.checkVisibility({ visibilityProperty: true })) continue;
+          const rects = [part.getBoundingClientRect()];
+          const range = document.createRange();
+          range.selectNodeContents(part);
+          rects.push(...range.getClientRects());
+          if (chip && rects.some((rect) => overlap(chip, rect))) hits.push(part.className);
+        }
+        return {
+          id: tile.id, chip, hits, content: getComputedStyle(tile, "::after").content,
+          inside: !chip || (chip.left >= box.left && chip.top >= box.top && chip.right <= box.right && chip.bottom <= box.bottom),
+        };
+      }, chip));
+    }
+    return chips;
+  } finally {
+    await session.detach();
+  }
+}
+
+for (const family of ["per-bay", "g2"]) {
+  test(`fallback markers clear protected content with actual ::after boxes on ${family}`, async ({ page }) => {
+    const errors = await openHeatMap(page);
+    await page.locator("#heatmap-toggle-button").click();
+    // Deliberately constrained geometry, using the shipping placement pipeline
+    // and stylesheet. Opposite obstructions each leave room for a 12px marker,
+    // but no shared position. G2 has a single bay requiring a free spot.
+    await page.addStyleTag({ content: `
+      #slot-grid { display: flex !important; flex: none; gap: 8px; min-height: 0; height: 150px; }
+      #slot-grid .slot-tile { box-sizing: content-box; flex: none; width: 30px; height: 44px; min-height: 0; padding: 0; border: 1px solid #888; }
+      #slot-grid .slot-latch { display: block; position: absolute; inset: 0 auto auto 0; box-sizing: border-box; width: 14px; height: 44px; margin: 0; transform: none; }
+      #slot-grid .slot-tile:nth-child(2) .slot-latch { left: 16px; }
+      #slot-grid .slot-tile::before { content: none; }
+    ` });
+    await page.locator("#slot-grid").evaluate((grid, family) => {
+      grid.closest(".chassis-shell").dataset.faceFamily = family === "g2" ? "g2" : "plain";
+      grid.innerHTML = Array.from({ length: family === "g2" ? 1 : 2 }, (_, index) =>
+        `<div id="fallback-bay-${index}" class="slot-tile state-healthy" data-slot="${index}" role="button" aria-label="Synthetic bay ${index}, healthy"><span class="slot-latch"></span></div>`).join("");
+    }, family);
+    const failures = [];
+    for (const viewport of ALL_WIDTHS) {
+      await page.setViewportSize(viewport);
+      expect(await page.evaluate(() => window.innerWidth)).toBe(viewport.width);
+      await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+      const chips = await paintedStateChips(page);
+      expect(chips).toHaveLength(family === "g2" ? 1 : 2);
+      if (process.env.HEATMAP_BANDS_SCREENSHOT_DIR) {
+        await page.mouse.move(0, 0);
+        await page.locator(".enclosure-face").screenshot({
+          path: path.join(process.env.HEATMAP_BANDS_SCREENSHOT_DIR, `chips-fallback-${family}-${viewport.width}.png`),
+        });
+      }
+      for (const chip of chips) {
+        if (!chip.chip || chip.chip.right - chip.chip.left !== 12 || chip.hits.length || !chip.inside) {
+          failures.push({ width: viewport.width, ...chip });
+        }
+      }
+    }
+    expect(failures).toEqual([]);
+    // A genuinely full bay must not draw over its content. On resize back to
+    // clear geometry, a shared full-size chip must return without stale attrs.
+    if (family === "per-bay") {
+      await page.locator(".slot-latch").evaluateAll((parts) => parts.forEach((part) => { part.style.width = "30px"; part.style.left = "0"; }));
+      await page.locator("#slot-grid").evaluate((grid) => { grid.style.height = "151px"; });
+      await expect.poll(() => page.locator("#fallback-bay-0").evaluate((tile) => getComputedStyle(tile, "::after").content)).toBe("none");
+      expect((await paintedStateChips(page)).every((chip) => !chip.chip)).toBe(true);
+      await page.locator(".slot-latch").evaluateAll((parts) => parts.forEach((part) => part.remove()));
+      await page.locator("#slot-grid .slot-tile").evaluateAll((tiles) => tiles.forEach((tile) => { tile.style.width = "80px"; }));
+      await page.locator("#slot-grid").evaluate((grid) => { grid.style.height = "152px"; });
+      await expect(page.locator(".chassis-shell")).toHaveAttribute("data-chip-spot", "corner");
+      for (const chip of await paintedStateChips(page)) {
+        expect(chip.chip.right - chip.chip.left).toBe(24);
+        expect(chip.hits).toEqual([]);
+        expect(chip.inside).toBe(true);
+      }
+    }
     expect(errors).toEqual([]);
   });
 }

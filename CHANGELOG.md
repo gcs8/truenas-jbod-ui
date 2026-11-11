@@ -32,7 +32,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - A bay's state chip no longer covers its slot number, heat-map value
   (rotated values included), LED or latch on any face at any width; where a
-  bay has no room for a full chip it shows a smaller chip or a dot, and the UI
+  bay has no shared clear position it places chips per bay, shrinking to a
+  marker when needed. A completely blocked bay keeps its accessible state name
+  without painting over content. G2 faces preserve the chosen inset, and the UI
   crawler now reports a chip painted over bay text (#1153).
 
 ## v0.24.0-beta.7 - 2026-11-09
