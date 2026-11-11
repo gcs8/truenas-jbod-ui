@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (5 to 15 minutes) shows as OK with its age while the background refresh runs,
   and the page re-reads once to pick it up. Older or fallback evidence, and
   evidence without a usable timestamp, keep the STALE tone and now name their
-  age.
+  age (#1159).
 
 ## v0.24.0-beta.8 - 2026-11-11
 
