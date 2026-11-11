@@ -12,6 +12,7 @@ from unittest import mock
 from scripts.validate_release_wrap import (
     DEFERRABLE_NARROW_BETA_GATES,
     NARROW_BETA_QA_TOOLING,
+    RELEASE_MODE_LINE,
     REQUIRED_GATES,
     changelog_coverage_required,
     public_demo_freshness_required,
@@ -1003,14 +1004,19 @@ class NarrowBetaReleaseWrapTests(unittest.TestCase):
         self.assertNotEqual(ineligible.returncode, 0)
         self.assertIn("app/main.py", ineligible.stdout)
 
-    def test_existing_release_wraps_are_unchanged_by_narrow_beta_rules(self) -> None:
-        wraps = sorted((REPOSITORY_ROOT / "docs").glob("RELEASE_WRAP_*.md")) + sorted(
-            (REPOSITORY_ROOT / "docs" / "archive").glob("RELEASE_WRAP_*.md")
+    def _assert_pre_mode_release_wraps_unchanged(self, repository: Path) -> set[Path]:
+        wraps = sorted((repository / "docs").glob("RELEASE_WRAP_*.md")) + sorted(
+            (repository / "docs" / "archive").glob("RELEASE_WRAP_*.md")
         )
-        self.assertGreater(len(wraps), 0)
+        compared: set[Path] = set()
+        declared_modes: set[Path] = set()
         for path in wraps:
             version = path.stem.removeprefix("RELEASE_WRAP_")
             text = path.read_text(encoding="utf-8")
+            if RELEASE_MODE_LINE.search(text):
+                # Mode-specific behavior is covered by the dedicated narrow tests.
+                declared_modes.add(path)
+                continue
             for phase in ("pre-tag", "final"):
                 with self.subTest(version=version, phase=phase):
                     baseline = validate_release_wrap_text(
@@ -1023,12 +1029,44 @@ class NarrowBetaReleaseWrapTests(unittest.TestCase):
                         phase=phase,
                         require_changelog_coverage=changelog_coverage_required(version),
                         version=version,
-                        repository=REPOSITORY_ROOT,
+                        repository=repository,
                     )
                     self.assertEqual(with_release_context, baseline)
                     self.assertFalse(
                         [issue for issue in baseline if "eferred" in issue.message or "narrow" in issue.message]
                     )
+                    compared.add(path)
+        self.assertEqual(compared, set(wraps) - declared_modes)
+        self.assertTrue(compared)
+        return compared
+
+    def test_existing_release_wrap_comparison_skips_declared_modes(self) -> None:
+        legacy_wraps = {
+            self.root / "docs" / "RELEASE_WRAP_1.0.0.md",
+            self.root / "docs" / "archive" / "RELEASE_WRAP_0.9.0.md",
+        }
+        for path in legacy_wraps:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_wrap_with_rows({}), encoding="utf-8")
+        for index, mode in enumerate(("Release mode: narrow beta", "rElEaSe MoDe:\t`narrow beta`"), 1):
+            path = self.root / "docs" / f"RELEASE_WRAP_1.1.0-beta.{index}.md"
+            path.write_text(_narrow_wrap(mode_lines=(mode,)), encoding="utf-8")
+
+        wraps = set((self.root / "docs").glob("RELEASE_WRAP_*.md")) | set(
+            (self.root / "docs" / "archive").glob("RELEASE_WRAP_*.md")
+        )
+        declared_modes = {
+            path for path in wraps if RELEASE_MODE_LINE.search(path.read_text(encoding="utf-8"))
+        }
+        self.assertEqual(len(declared_modes), 2)
+        compared = self._assert_pre_mode_release_wraps_unchanged(self.root)
+
+        self.assertEqual(compared, wraps - declared_modes)
+        self.assertEqual(compared, legacy_wraps)
+        self.assertTrue(compared)
+
+    def test_existing_release_wraps_are_unchanged_by_narrow_beta_rules(self) -> None:
+        self._assert_pre_mode_release_wraps_unchanged(REPOSITORY_ROOT)
         for version in ("0.23.0", *(f"0.24.0-beta.{n}" for n in range(1, 7))):
             with self.subTest(version=version, phase="pre-tag clean"):
                 text = release_wrap_path(REPOSITORY_ROOT, version).read_text(encoding="utf-8")
