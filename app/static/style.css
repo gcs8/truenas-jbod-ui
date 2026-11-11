@@ -6262,8 +6262,11 @@ button.fabric-trace-crumb:hover {
 }
 
 .detail-smart-retry {
-  margin-left: 6px;
-  vertical-align: baseline;
+  margin: 4px 0 0;
+  padding: 3px 10px;
+  border-radius: 8px;
+  font-size: inherit;
+  vertical-align: middle;
 }
 
 .detail-slot-head,

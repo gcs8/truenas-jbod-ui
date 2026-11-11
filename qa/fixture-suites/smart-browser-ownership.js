@@ -58,7 +58,7 @@ async function open(page, { fabric = false, strategy = "single" } = {}) {
     if (url.pathname === "/static/app.js") return route.fulfill({ contentType: "text/javascript", body: exposed("app/static/app.js", "state, ensureSmartSummary, ensureStorageViewSmartSummary, ensureSmartSummaryOnInteraction, runSmartPrefetch, scheduleSmartPrefetch, refreshSnapshot, applySnapshot, applyStorageViewRuntime, getSmartCacheKey, getStorageViewSmartCacheKey, getSmartSummaryEntry, getStorageViewSmartSummaryEntry, renderAll") });
     if (url.pathname === "/static/sas_fabric_view.js") return route.fulfill({ contentType: "text/javascript", body: exposed("app/static/sas_fabric_view.js", "state, render, applySnapshot, refreshFabric, ensureSelectedSmartSummary, smartSummaryForSlot") });
     if (url.pathname.startsWith("/static/")) {
-      const file = path.join(root, url.pathname);
+      const file = path.join(root, "app", url.pathname);
       return fs.existsSync(file) ? route.fulfill({ path: file }) : route.fulfill({ status: 404, body: "" });
     }
     if (url.pathname.endsWith("/smart") || url.pathname.endsWith("/smart-batch")) {

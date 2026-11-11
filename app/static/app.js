@@ -9488,7 +9488,7 @@
     const retryButton = document.createElement("button");
     retryButton.type = "button";
     retryButton.id = "detail-smart-retry-button";
-    retryButton.className = "secondary small detail-smart-retry";
+    retryButton.className = "button secondary small detail-smart-retry";
     retryButton.textContent = "Retry SMART";
     detailSmartNote.append(" ", retryButton);
   }
