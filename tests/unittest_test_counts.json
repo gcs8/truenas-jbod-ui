@@ -86,7 +86,7 @@
     "test_read_ui_auth": 16,
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
-    "test_release_wrap_validator": 29,
+    "test_release_wrap_validator": 47,
     "test_route_contracts": 51,
     "test_sas_fabric": 223,
     "test_scheduled_backup": 27,

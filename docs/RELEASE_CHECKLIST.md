@@ -15,6 +15,8 @@ The goal is to make releases boring, repeatable, and easy to audit later.
 - Every applicable checklist item must be recorded as `Pass`, `Blocked`, or
   `N/A` in the release wrap. `N/A` requires a concrete reason. "Not enough
   time" is not a valid reason; stop the release instead.
+  A narrow beta may also record four long gates as `Deferred`; see "Narrow
+  beta" below. An rc or final release never may.
 - Do not push the release tag until the pre-tag release wrap proves every
   pre-publish gate is `Pass` or justified `N/A`. Only inherently post-publish
   rows may remain `Blocked` at this point: `Docs/wiki/public-demo publication`,
@@ -694,6 +696,50 @@ prerelease. Anything that is not a full release ships this way.
 - Every other gate in this checklist still applies.
 - The in-app update check reads GitHub's latest stable release, so a beta
   never prompts a stable install to upgrade.
+
+## Narrow beta
+
+The maintainer's narrow-beta policy lets a small beta defer the longest gates
+to the next full run. A deferred gate is not a pass and not a waiver.
+
+- Eligibility: every path changed since the previous release tag is under
+  `app/static/`, `app/templates/`, `tests/`, `qa/`, `docs/` or `wiki/`, is a
+  `*.md` file (including `CHANGELOG.md`), or is QA-only tooling the image never
+  runs (`scripts/build_ui_crawl_fixture.py`, `scripts/ui_crawl.js`). The
+  release version bump in `app/__init__.py`, `package.json` and
+  `package-lock.json` is allowed only when it changes nothing but the version.
+  Any other path (`app/*.py`, `app/services/`, `history_service/`,
+  `admin_service/`, `Dockerfile`, Compose files, requirements, other scripts,
+  migrations, workflows) makes the beta full.
+- Only a beta (`vX.Y.Z-beta.N`) can be narrow. An rc and a final release are
+  always full and must `Pass` every gate.
+- Still required: exact-head CI and Codex review, `dev_check.py --full`, the
+  image build, browser specs for the touched areas, the human-view gate, and the
+  deploy and examination rows.
+- May be `Deferred`: `Optional-sidecar runtime matrix`, `Local release perf
+  harnesses`, `Linux QA restore gate` (legacy live restore, `tar.zst` and `7z`
+  round trips) and `Restored Linux QA perf harnesses`. Inside rows that must
+  `Pass`, the CORE VM checks and Archive comparator (Feature-specific live
+  API/UI gates) and the full UI crawl (Full Playwright/browser gates) may be
+  noted as deferred in the evidence; the row's required parts still pass.
+- Wrap wording, near the top:
+
+  ```text
+  Release mode: narrow beta
+  Previous release tag: `vX.Y.Z-beta.N`
+  ```
+
+  Each deferred row has Result `Deferred` and evidence that says
+  `Deferred to the next rc/final full run`.
+- `validate_release_wrap.py` checks all of this. It runs `git diff
+  --name-only --no-renames` from the declared tag to the candidate (`HEAD`
+  before tagging, the release tag after), requires the declared tag to be the
+  latest earlier release tag and an ancestor of the candidate, and lists every
+  disqualifying path. A missing tag or failed git command fails the check, as
+  do a `Deferred` row without narrow mode, on any other gate, or on an rc or
+  final version.
+- The next rc or final release runs every deferred gate and records it as
+  `Pass`.
 
 ## After Release
 
