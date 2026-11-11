@@ -26,7 +26,28 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
-## Unreleased
+## v0.24.0-beta.8 - 2026-11-11
+
+This prerelease follows `v0.24.0-beta.7` with the state-chip correction in
+#1153. It is for testing only. Its fixed tags and `dev` are the beta channel;
+`latest` stays on `v0.23.0`.
+
+### Highlights
+
+- State chips leave slot numbers and heat-map values clear, including rotated
+  values on dense faces (#1153).
+- Chip placement also avoids each bay's LED and latch, with a smaller marker
+  or accessible-only state when no painted chip fits (#1153).
+- The UI crawler reports a state chip painted over bay text (#1153).
+
+### Upgrade notes
+
+- Upgrading from `v0.24.0-beta.7` requires no operator action beyond the normal
+  image update. Compose files, settings, environment variables, data formats
+  and appliance commands are unchanged. Earlier beta upgrade notes still
+  apply when upgrading from an older version.
+- This is a prerelease. Only `dev` moves; `latest` remains `v0.23.0`. The public
+  demo and its screenshots wait for the stable release.
 
 ### Fixed
 
