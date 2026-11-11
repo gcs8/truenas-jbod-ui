@@ -4334,6 +4334,19 @@ button.fabric-trace-crumb:hover {
   border-left-width: 5px;
 }
 
+/* #1157: the bay keeps its height, so its number, device line and pool
+   label share a fixed content box. The lines keep their full line height
+   (never squeezed and cut off top or bottom); the device line's auto top
+   margin, not a fixed gap, spaces them from the number. A label too long
+   for the bay still ends in an ellipsis on its one line. */
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile:not(.heatmap-active, .heatmap-missing) {
+  row-gap: 0;
+}
+
+.chassis-shell[data-face-style="unifi-drive"][data-face-variant] .slot-tile:not(.heatmap-active, .heatmap-missing) > :is(.slot-device, .slot-pool, .slot-tertiary) {
+  flex-shrink: 0;
+}
+
 .chassis-shell[data-face-style="unifi-drive"][data-face-variant] .front-edge {
   margin-top: 6px;
   padding-top: 6px;
