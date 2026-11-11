@@ -64,7 +64,7 @@ async function openFabric(page, replies, { bootstrapped = false } = {}) {
     if (url.pathname === "/api/inventory") {
       const reply = replies[Math.min(http.inventoryReads, replies.length - 1)];
       http.inventoryReads += 1;
-      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...fixture.snapshot, last_updated: isoAgo(reply.ageSeconds) }) });
+      return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ...fixture.snapshot, refresh_interval_seconds: 30, last_updated: isoAgo(reply.ageSeconds) }) });
     }
     if (url.pathname === "/api/sas-fabric") {
       const reply = replies[Math.min(http.fabricReads, replies.length - 1)];
@@ -163,5 +163,23 @@ test("a server-rendered stale-hit bootstrap reads as refreshing and refetches on
   await expect(statusText(page)).toHaveText("Loaded 3 traces for current selection.");
   await page.clock.runFor(10 * REFETCH_DELAY_MS);
   expect(http.fabricReads).toBe(1);
+  expect(http.errors).toEqual([]);
+});
+
+test("a young stale-hit that is still stale after the refetch turns STALE when it ages out, without more reads", async ({ page }) => {
+  // Both reads return the same evidence, read 3 min before NOW; with a 30 s
+  // refresh interval the 5 min window ends at NOW + 120 s.
+  const http = await openFabric(page, [{ cacheState: "stale-hit", ageSeconds: 180 }]);
+  await expect(statusText(page)).toHaveAttribute("data-tone", "info");
+  await page.clock.runFor(REFETCH_DELAY_MS + 1000);
+  await expect.poll(() => http.fabricReads).toBe(2);
+  await expect(statusText(page)).toHaveAttribute("data-tone", "info");
+  await page.clock.runFor(90_000);
+  await expect(chip(page)).toHaveText(/OK$/);
+  await page.clock.runFor(30_000);
+  await expect(chip(page)).toHaveText(/STALE$/);
+  await expect(statusText(page)).toHaveAttribute("data-tone", "error");
+  await expect(statusText(page)).toContainText("5 min ago");
+  expect(http.fabricReads).toBe(2);
   expect(http.errors).toEqual([]);
 });

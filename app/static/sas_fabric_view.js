@@ -85,6 +85,7 @@
     error: null,
     refreshRequestToken: 0,
     staleRefetchTimer: null,
+    staleAgeTimer: null,
   };
 
   const elements = {
@@ -3777,8 +3778,8 @@
     const ageSeconds = fabricEvidenceAgeSeconds(evidence?.lastUpdated, evidence?.now);
     // A stale-hit is a normal revalidation only while its evidence is young
     // and its age is known; anything else fails toward the STALE tone.
-    const revalidating = staleHit && !trustedFallback && ageSeconds !== null
-      && ageSeconds <= fabricRefreshingWindowSeconds(evidence?.refreshIntervalSeconds);
+    const windowSeconds = fabricRefreshingWindowSeconds(evidence?.refreshIntervalSeconds);
+    const revalidating = staleHit && !trustedFallback && ageSeconds !== null && ageSeconds <= windowSeconds;
     const retainedReasons = [];
     if (trustedFallback || (staleHit && !revalidating)) {
       if (snapshotCacheState === "trusted-fallback") {
@@ -3829,11 +3830,36 @@
       suffix: "OK",
       statusTone: "info",
       refreshing: revalidating,
+      // Seconds until this young evidence leaves the window and must be
+      // re-evaluated (#1158), or null when nothing ages out.
+      refreshingForSeconds: revalidating ? windowSeconds - ageSeconds : null,
       message: `Loaded ${traceLabel} for ${selectionLabel}.${refreshNote}`,
     };
   }
 
+  function cancelStaleAgeCheck() {
+    if (state.staleAgeTimer !== null) {
+      window.clearTimeout(state.staleAgeTimer);
+      state.staleAgeTimer = null;
+    }
+  }
+
+  // Young stale-hit evidence shows OK only while it is inside the refreshing
+  // window. Re-evaluate the status locally (no request) when it ages out, so
+  // an idle page cannot keep green OK on evidence that has become old.
+  function scheduleStaleAgeCheck(refreshingForSeconds) {
+    cancelStaleAgeCheck();
+    if (!Number.isFinite(refreshingForSeconds)) {
+      return;
+    }
+    state.staleAgeTimer = window.setTimeout(() => {
+      state.staleAgeTimer = null;
+      renderStatus();
+    }, Math.max(0, Math.ceil(refreshingForSeconds * 1000)) + 1000);
+  }
+
   function renderStatus() {
+    cancelStaleAgeCheck();
     const fabric = state.fabric;
     const copy = fabricViewCopy(fabric);
     let className = "status-chip";
@@ -3859,6 +3885,9 @@
       text = `${copy.statusBase} ${trustStatus.suffix}`;
       elements.statusText.textContent = trustStatus.message;
       elements.statusText.dataset.tone = trustStatus.statusTone;
+      if (trustStatus.refreshing) {
+        scheduleStaleAgeCheck(trustStatus.refreshingForSeconds);
+      }
     } else {
       elements.statusText.textContent = "Ready.";
       elements.statusText.dataset.tone = "info";
@@ -4486,7 +4515,10 @@
   });
 
   if (typeof window.addEventListener === "function") {
-    window.addEventListener("pagehide", cancelStaleRefetch);
+    window.addEventListener("pagehide", () => {
+      cancelStaleRefetch();
+      cancelStaleAgeCheck();
+    });
   }
 
   ensureSelectionForMode(state.fabric);

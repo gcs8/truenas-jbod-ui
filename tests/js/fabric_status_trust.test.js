@@ -280,6 +280,14 @@ for (const [snapshotState, sourceState] of [["stale-hit", "stale-hit"], ["stale-
   });
 }
 
+test("young stale-hit status says when it leaves the refreshing window; settled states do not", () => {
+  const fabricTrustStatus = loadTrustStatus();
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(180)).refreshingForSeconds, 120);
+  assert.equal(fabricTrustStatus(cachedFabric("hit", "hit"), "STORAGE", evidence(180)).refreshingForSeconds, null);
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(20 * 60)).refreshingForSeconds, undefined);
+  assert.match(functionSource("renderStatus"), /scheduleStaleAgeCheck\(trustStatus\.refreshingForSeconds\)/);
+});
+
 test("a stale-hit read under a minute old says so", () => {
   const status = loadTrustStatus()(cachedFabric("stale-hit", "stale-hit"), "STORAGE", evidence(20));
   assert.equal(status.statusTone, "info");
