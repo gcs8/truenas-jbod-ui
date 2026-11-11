@@ -62,7 +62,7 @@
     {
       "id": "main.select.smart-open", "page": "main", "safety": "read", "ci": true,
       "steps": [{"selectBay": "healthy"}, {"requireVisible": ".detail-smart-details", "timeoutMs": 20000}, {"open": ".detail-smart-details"}],
-      "covers": [".detail-smart-details"]
+      "covers": [".detail-smart-details", "#detail-smart-retry-button"]
     },
     {
       "id": "main.select.topology", "page": "main", "safety": "read",
@@ -572,6 +572,7 @@
     {"key": "#read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in, an account action the crawl never performs; the sign-in form renders in the write-sign-in variant."},
     {"key": "#fabric-read-ui-auth-sign-out", "reason": "Shown only after a successful write sign-in (never performed); the fabric sign-in form renders in the write-sign-in variant."},
     {"key": "#history-retry-button", "reason": "Shown only after a bay history request fails; no fixture variant fails history yet."},
+    {"key": "#detail-smart-retry-button", "reason": "Shown only after a bay SMART read misses its deadline; no crawl fixture holds SMART reads. qa/smart-browser-ownership.spec.js holds them, renders the button and exercises Retry (#1161)."},
     {"key": "#platform-details-toggle-button", "reason": "Platform details exist only for platforms with platform data (UniFi, ESXi, QuantaStor); the public demo fixture is a TrueNAS enclosure. Live crawls cover it."},
     {"key": "[data-platform-details-section-toggle]", "reason": "Same as #platform-details-toggle-button."},
     {"key": "#setup-storage-view-enclosure-ids", "reason": "Field of live-enclosure storage views; the synthetic admin bootstrap has one manual view."},

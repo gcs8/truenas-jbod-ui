@@ -1051,7 +1051,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
         # The standalone spec shares registration with an already-selected
         # entry point, keeping frontend regressions covered without a workflow delta.
         entry = self.read(ROOT / "qa/header-and-disk-path-layout.spec.js")
-        for suite in ("fabric-stale-refresh",):
+        for suite in ("fabric-stale-refresh", "smart-browser-ownership"):
             with self.subTest(suite=suite):
                 self.assertIn(f'require("./fixture-suites/{suite}")', entry)
                 self.assertTrue((ROOT / f"qa/fixture-suites/{suite}.js").is_file())

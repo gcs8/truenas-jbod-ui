@@ -15,6 +15,10 @@
   const BUSY_READ_RETRY_LIMIT = 3;
   const BUSY_READ_RETRY_MAX_DELAY_MS = 10000;
   const SMART_PREFETCH_BATCH_CONCURRENCY = Math.max(1, Number(bootstrap.smartPrefetchBatchConcurrency) || 2);
+  // A SMART summary read that has not answered by this deadline is aborted and
+  // releases its bay (#1161). Storage Fabric uses the same deadline
+  // (sas_fabric_view.js); tests/js/smart_summary_deadline.test.js keeps them equal.
+  const SMART_SUMMARY_REQUEST_TIMEOUT_MS = 15000;
 
   const SNAPSHOT_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.snapshotCacheTtlSeconds, 10);
   const SOURCE_BUNDLE_CACHE_TTL_SECONDS = positiveSeconds(refreshTiming.sourceBundleCacheTtlSeconds, 60);
@@ -137,6 +141,7 @@
     preloadedSnapshotSmartSummaries,
     preloadedStorageViewSmartSummaries,
     smartSummaryGeneration: 0,
+    detailSmartRetry: null,
     smartPrefetchToken: 0,
     smartPrefetchTimerId: null,
     smartPrefetchRunning: false,
@@ -4292,6 +4297,23 @@
     return Boolean(entry?.data) && !entry.transient && smartSummaryAgeMs(entry) <= SMART_SUMMARY_CACHE_TTL_MS;
   }
 
+  // Each attempt gets its own native deadline: a hung read must not keep
+  // ownership of its bay (#1161). Wall-clock steps do not end it early.
+  function smartSummaryRequestSignal() {
+    return AbortSignal.timeout(SMART_SUMMARY_REQUEST_TIMEOUT_MS);
+  }
+
+  function isSmartSummaryTimeout(error) {
+    return error?.name === "TimeoutError";
+  }
+
+  function smartSummaryFailureMessage(error) {
+    if (isSmartSummaryTimeout(error)) {
+      return `SMART did not answer within ${Math.round(SMART_SUMMARY_REQUEST_TIMEOUT_MS / 1000)} s, so its details are unavailable.`;
+    }
+    return error?.message || String(error);
+  }
+
   function isSmartEntryInFlight(entry) {
     // A queued entry only carries tooltip feedback: no request owns it yet, so it
     // must stay eligible for the batch it is waiting on.
@@ -4361,6 +4383,7 @@
     // is current; the bays keep showing Loading meanwhile (#1144).
     return retryBusyRead(() => sendScopedRequest("/api/slots/smart-batch", {
       method: "POST",
+      signal: smartSummaryRequestSignal(),
       body: JSON.stringify({
         slots: slots.map((slot) => slot.slot),
         max_concurrency: Math.min(SMART_BATCH_REQUEST_MAX_CONCURRENCY, slots.length),
@@ -4368,7 +4391,7 @@
     }), { isCurrent });
   }
 
-  function applySmartPrefetchPayload(slots, payload) {
+  function applySmartPrefetchPayload(slots, payload, outcome = {}) {
     const summaries = new Map((payload.summaries || []).map((item) => [item.slot, item.summary]));
     slots.forEach(({ slot, cacheKey, owner }) => {
       if (state.smartSummaries[cacheKey] !== owner) return;
@@ -4378,20 +4401,22 @@
         data: summaries.get(slot) || owner.data || { available: false, message: "SMART prefetch returned no data for this slot." },
         requestedAt: Date.now(),
         generation: owner.generation,
+        ...(outcome.timedOut ? { timedOut: true } : {}),
       };
     });
   }
 
   function applySmartPrefetchError(slots, error) {
     applySmartPrefetchPayload(slots, { summaries: slots.map(({ slot, owner }) => ({
-      slot, summary: owner.data || { available: false, message: error.message || String(error) },
-    })) });
+      slot, summary: owner.data || { available: false, message: smartSummaryFailureMessage(error) },
+    })) }, { timedOut: isSmartSummaryTimeout(error) });
   }
 
   function logSmartPrefetchFailure(message, error, options = {}) {
     const detail = error?.message || String(error);
     const transientFetchFailure =
       error?.name === "AbortError" ||
+      isSmartSummaryTimeout(error) ||
       detail === "Failed to fetch" ||
       detail === "Load failed" ||
       detail.includes("NetworkError");
@@ -9444,7 +9469,39 @@
       : null;
     // While a "still refreshing" SMART read waits to retry (#1144).
     const retryNote = (smartEntry?.loading || smartEntry?.refreshing) ? smartEntry.retryNote : null;
-    return [retryNote, smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+    // A refresh that missed its deadline keeps the last reading (#1161).
+    const staleTimeoutNote = smartEntry?.timedOut && smartEntry.data?.available !== false
+      ? `SMART did not answer within ${Math.round(SMART_SUMMARY_REQUEST_TIMEOUT_MS / 1000)} s; showing the last reading.`
+      : null;
+    return [retryNote, staleTimeoutNote, smartMessage, ledControlNote, ataVolumeCounterNote, lowHourAnnualizedNote, enduranceEstimateNote].filter(Boolean).join(" ");
+  }
+
+  // A SMART read that missed its deadline shows as unavailable with a Retry
+  // button instead of an endless Loading (#1161). Retry asks again at once;
+  // otherwise the bay follows the normal SMART cache interval.
+  function renderDetailSmartNote(text, smartEntry, ensureSmart) {
+    const canRetry = Boolean(smartEntry?.timedOut && !smartEntry.loading && !smartEntry.refreshing && !state.snapshotMode);
+    state.detailSmartRetry = canRetry ? { entry: smartEntry, ensureSmart } : null;
+    detailSmartNote.textContent = text || "";
+    detailSmartNote.classList.toggle("hidden", !text);
+    if (!text || !canRetry) return;
+    const retryButton = document.createElement("button");
+    retryButton.type = "button";
+    retryButton.id = "detail-smart-retry-button";
+    retryButton.className = "button secondary small detail-smart-retry";
+    retryButton.textContent = "Retry SMART";
+    detailSmartNote.append(" ", retryButton);
+  }
+
+  function retryDetailSmartSummary() {
+    const retry = state.detailSmartRetry;
+    if (!retry || !retry.entry.timedOut || retry.entry.loading || retry.entry.refreshing) return;
+    state.detailSmartRetry = null;
+    // Age the settled timeout so the ordinary request path asks again; an
+    // in-flight owner is never touched.
+    retry.entry.requestedAt = 0;
+    void retry.ensureSmart();
+    renderDetail();
   }
 
   function renderEmptyDetailState(message, { showDetailSecondary = true } = {}) {
@@ -9454,6 +9511,7 @@
     detailKvGrid.innerHTML = "";
     detailSmartNote.classList.add("hidden");
     detailSmartNote.textContent = "";
+    state.detailSmartRetry = null;
     detailSecondary.classList.toggle("hidden", !showDetailSecondary);
     detailLedControls.classList.add("hidden");
     renderTopologyContext(null);
@@ -9681,14 +9739,11 @@
       state.detailSmartExpanded = Boolean(event.target.open);
     });
 
-    const smartNoteText = buildSmartNoteText(slot, smartEntry);
-    if (smartNoteText) {
-      detailSmartNote.textContent = smartNoteText;
-      detailSmartNote.classList.remove("hidden");
-    } else {
-      detailSmartNote.classList.add("hidden");
-      detailSmartNote.textContent = "";
-    }
+    renderDetailSmartNote(
+      buildSmartNoteText(slot, smartEntry),
+      smartEntry,
+      typeof options.ensureSmart === "function" ? options.ensureSmart : () => ensureSmartSummary(slot),
+    );
 
     wireDetailCopyButtons();
     renderTopologyContext(slot);
@@ -9833,14 +9888,11 @@
         })(),
       ].filter(Boolean).join("");
       wireDetailCopyButtons();
-      const smartNoteText = buildSmartNoteText(storageViewSlot, smartEntry);
-      if (smartNoteText) {
-        detailSmartNote.textContent = smartNoteText;
-        detailSmartNote.classList.remove("hidden");
-      } else {
-        detailSmartNote.classList.add("hidden");
-        detailSmartNote.textContent = "";
-      }
+      renderDetailSmartNote(
+        buildSmartNoteText(storageViewSlot, smartEntry),
+        smartEntry,
+        () => ensureStorageViewSmartSummary(selectedStorageView, storageViewSlot),
+      );
       renderTopologyContext(null);
       renderMultipathContext(null);
       resetMappingForm();
@@ -12193,7 +12245,7 @@
       refreshHoveredTooltip();
     }
     try {
-      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`);
+      const payload = await sendScopedRequest(`/api/slots/${slot.slot}/smart`, { signal: smartSummaryRequestSignal() });
       if (state.smartSummaries[cacheKey] !== owner) return;
       state.smartSummaries[cacheKey] = {
         loading: false,
@@ -12207,9 +12259,10 @@
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
-        data: entry?.data || { available: false, message: error.message || String(error) },
+        data: entry?.data || { available: false, message: smartSummaryFailureMessage(error) },
         requestedAt: Date.now(),
         generation: state.smartSummaryGeneration,
+        ...(isSmartSummaryTimeout(error) ? { timedOut: true } : {}),
       };
     }
 
@@ -12261,7 +12314,7 @@
       // view exists, so with none cached the read answers the retryable 503
       // "still refreshing". Retry it like the page's other reads, showing
       // the wait, while this request still owns the slot (#1144).
-      const payload = await retryBusyRead(() => fetchJson(scopedUrl), {
+      const payload = await retryBusyRead(() => fetchJson(scopedUrl, { signal: smartSummaryRequestSignal() }), {
         isCurrent: () => state.smartSummaries[cacheKey] === owner && buildSelectionParams().toString() === requestScope,
         onRetry: (attempt, delayMs) => {
           owner.retryNote = busyReadRetryMessage(attempt, delayMs);
@@ -12284,9 +12337,10 @@
       state.smartSummaries[cacheKey] = {
         loading: false,
         refreshing: false,
-        data: entry?.data || { available: false, message: error.message || String(error) },
+        data: entry?.data || { available: false, message: smartSummaryFailureMessage(error) },
         requestedAt: Date.now(),
         generation: state.smartSummaryGeneration,
+        ...(isSmartSummaryTimeout(error) ? { timedOut: true } : {}),
         // A retryable answer is shown but is not the slot's SMART data.
         ...(retryDelayMs === null ? {} : { transient: true, retryNotBefore: Date.now() + retryDelayMs }),
       };
@@ -12594,6 +12648,9 @@
   mappingForm.addEventListener("change", markMappingFormDirty);
   clearMappingButton.addEventListener("click", clearMapping);
   prefillMappingButton.addEventListener("click", prefillMapping);
+  detailSmartNote.addEventListener("click", (event) => {
+    if (event.target?.closest?.("#detail-smart-retry-button")) retryDetailSmartSummary();
+  });
   if (exportMappingsButton) {
     exportMappingsButton.addEventListener("click", exportMappings);
   }
