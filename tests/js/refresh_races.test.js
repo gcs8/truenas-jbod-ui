@@ -72,9 +72,17 @@ function functionSource(source, name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
+// #1161: SMART summary reads carry a native deadline through these helpers.
+const SMART_DEADLINE_HELPERS = ["smartSummaryRequestSignal", "isSmartSummaryTimeout", "smartSummaryFailureMessage"];
+function smartDeadlineHelpers(source) {
+  return source.includes("function smartSummaryRequestSignal(")
+    ? SMART_DEADLINE_HELPERS.map((name) => functionSource(source, name)).join("\n")
+    : "";
+}
+
 function loadFunction(source, name, context = {}) {
-  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, ...context });
-  vm.runInContext(`${functionSource(source, name)}\nthis.__loaded = ${name};`, sandbox, {
+  const sandbox = vm.createContext({ inventoryScopeMatchesSelection: () => true, currentUiScopeKey: () => "scope", captureMutationContext: () => ({}), mutationContextIsCurrent: () => true, finishMutationContext() {}, renderStorageViewRuntimeStatus() {}, AbortSignal, SMART_SUMMARY_REQUEST_TIMEOUT_MS: 15000, ...context });
+  vm.runInContext(`${smartDeadlineHelpers(source)}\n${functionSource(source, name)}\nthis.__loaded = ${name};`, sandbox, {
     filename: `${name}.behavior.js`,
   });
   return { fn: sandbox.__loaded, context: sandbox };

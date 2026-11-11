@@ -46,7 +46,7 @@ test("Codex P2 1: app.js still sends the per-slot SMART read straight from the b
   const app = fs.readFileSync(path.join(root, "app/static/app.js"), "utf8");
   const detail = app.slice(app.indexOf("function renderLiveSlotDetail("), app.indexOf("function renderLiveSlotDetail(") + 8000);
   assert.match(detail, /void ensureSmartSummary\(slot\);/, "selection renders the detail, which asks for the slot's SMART summary directly");
-  assert.match(app, /sendScopedRequest\(`\/api\/slots\/\$\{slot\.slot\}\/smart`\)/, "the read goes through buildScopedUrl (system_id, enclosure_id)");
+  assert.match(app, /sendScopedRequest\(`\/api\/slots\/\$\{slot\.slot\}\/smart`(?:, \{ signal: smartSummaryRequestSignal\(\) \})?\)/, "the read goes through buildScopedUrl (system_id, enclosure_id)");
   const scoped = app.slice(app.indexOf("function buildScopedUrl("), app.indexOf("function buildScopedUrl(") + 900);
   assert.match(scoped, /buildSelectionParams\(\)/);
 });

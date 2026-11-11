@@ -58,7 +58,7 @@ function functionSource(name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
-const RETRY_HELPERS = ["busyReadRetryDelayMs", "busyReadRetryMessage", "retryBusyRead"];
+const RETRY_HELPERS = ["busyReadRetryDelayMs", "busyReadRetryMessage", "retryBusyRead", "smartSummaryRequestSignal", "isSmartSummaryTimeout", "smartSummaryFailureMessage"];
 
 function constantValue(name) {
   const match = APP_SOURCE.match(new RegExp(`const ${name} = (\\d+);`));
@@ -78,6 +78,9 @@ function load(names, context = {}) {
     BUSY_READ_RETRY_MAX_DELAY_MS: constantValue("BUSY_READ_RETRY_MAX_DELAY_MS"),
     // Waits resolve at once; the delays asked for are recorded.
     waitMs: async (delayMs) => { waits.push(delayMs); },
+    // #1161: SMART summary reads carry a native deadline.
+    AbortSignal,
+    SMART_SUMMARY_REQUEST_TIMEOUT_MS: constantValue("SMART_SUMMARY_REQUEST_TIMEOUT_MS"),
     ...context,
   });
   vm.runInContext(`${[...RETRY_HELPERS, ...names].map(functionSource).join("\n")}

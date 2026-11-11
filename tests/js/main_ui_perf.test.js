@@ -301,6 +301,8 @@ const SMART_PREFETCH_FUNCTIONS = [
   "shouldUseSingleSmartPrefetchRequest",
   "applySmartPrefetchPayload",
   "applySmartPrefetchError",
+  "isSmartSummaryTimeout",
+  "smartSummaryFailureMessage",
   "candidateSlotsForSmartPrefetch",
   "isSmartEntryCurrent",
   "isSmartEntryInFlight",

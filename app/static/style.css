@@ -6261,6 +6261,11 @@ button.fabric-trace-crumb:hover {
   line-height: 1.45;
 }
 
+.detail-smart-retry {
+  margin-left: 6px;
+  vertical-align: baseline;
+}
+
 .detail-slot-head,
 .action-header,
 .button-row {

@@ -1,5 +1,8 @@
 (function () {
   const bootstrap = window.SAS_FABRIC_BOOTSTRAP || {};
+  // Deadline for one SMART summary read; the main page uses the same value
+  // (app.js, #1161).
+  const SMART_SUMMARY_REQUEST_TIMEOUT_MS = 15000;
   const modeIds = new Set(["lanes", "impact", "trace", "disk"]);
   const modeCopy = {
     lanes: {
@@ -1615,7 +1618,7 @@
     }
     const owner = {};
     state.smartRequests[key] = owner;
-    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`), { signal: AbortSignal.timeout(15000) })
+    fetchJson(scopedUrl(`/api/slots/${slotNumber}/smart`), { signal: AbortSignal.timeout(SMART_SUMMARY_REQUEST_TIMEOUT_MS) })
       .then((summary) => {
         if (state.smartRequests[key] !== owner) return;
         state.smartSummaryTimes[key] = Date.now();

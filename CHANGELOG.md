@@ -41,6 +41,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Core) no longer squeeze a bay's device line and pool label until their
   text is cut off top or bottom, most visibly on ENVR Core at 390 px; a label
   too long for its bay still ends in an ellipsis (#1160).
+- A bay's SMART read on the main page (single bay, saved view or batch) that
+  gets no answer within 15 seconds, the same deadline Storage Fabric uses, now
+  stops waiting, frees the bay for a later read, and shows the SMART details
+  as unavailable with a Retry SMART button instead of loading forever; a
+  refresh that times out keeps the last reading and says so (#1161).
 
 ## v0.24.0-beta.8 - 2026-11-11
 
