@@ -38,6 +38,23 @@
     },
   };
 
+  // Storage Fabric reads cached inventory stale-while-revalidate (#1158). Just
+  // past the short snapshot/source cache TTL the API answers "stale-hit" and
+  // refreshes in the background. Evidence whose inventory snapshot was read
+  // within this window is a normal revalidation, not retained evidence: three
+  // configured refresh intervals, at least 5 and at most 15 minutes. Older
+  // evidence, evidence without a usable timestamp, and trusted-fallback keep
+  // the STALE tone.
+  const FABRIC_REFRESHING_WINDOW_MIN_SECONDS = 300;
+  const FABRIC_REFRESHING_WINDOW_MAX_SECONDS = 900;
+  const FABRIC_REFRESHING_WINDOW_INTERVALS = 3;
+  // Tolerated browser-versus-server clock difference before a future timestamp
+  // stops counting as fresh evidence.
+  const FABRIC_EVIDENCE_CLOCK_SKEW_SECONDS = 120;
+  // After a stale-hit, read once more after this delay to pick up the
+  // background refresh. One refetch per user-driven load, never a loop.
+  const FABRIC_STALE_REFETCH_DELAY_MS = 15000;
+
   const initialMode = new URLSearchParams(window.location.search).get("mode");
   const state = {
     snapshot: bootstrap.snapshot || { systems: [], enclosures: [], slots: [] },
@@ -67,6 +84,7 @@
     loading: false,
     error: null,
     refreshRequestToken: 0,
+    staleRefetchTimer: null,
   };
 
   const elements = {
@@ -3699,31 +3717,92 @@
     elements.lastUpdated.textContent = formatTimestamp(state.snapshot.last_updated || fabric.generated_at);
   }
 
-  function fabricTrustStatus(fabric, statusBase) {
+  function fabricRefreshingWindowSeconds(refreshIntervalSeconds) {
+    const interval = Number(refreshIntervalSeconds);
+    const scaled = Number.isFinite(interval) && interval > 0 ? interval * FABRIC_REFRESHING_WINDOW_INTERVALS : 0;
+    return Math.min(FABRIC_REFRESHING_WINDOW_MAX_SECONDS, Math.max(FABRIC_REFRESHING_WINDOW_MIN_SECONDS, scaled));
+  }
+
+  // Age in seconds of the evidence read at `lastUpdated`, or null when it
+  // cannot be trusted (missing, unparseable, or too far in the future).
+  function fabricEvidenceAgeSeconds(lastUpdated, now) {
+    if (!lastUpdated || !Number.isFinite(now)) {
+      return null;
+    }
+    const readAt = new Date(lastUpdated).getTime();
+    if (!Number.isFinite(readAt)) {
+      return null;
+    }
+    const ageSeconds = (now - readAt) / 1000;
+    if (ageSeconds < -FABRIC_EVIDENCE_CLOCK_SKEW_SECONDS) {
+      return null;
+    }
+    return Math.max(0, ageSeconds);
+  }
+
+  function formatEvidenceAge(ageSeconds) {
+    if (ageSeconds < 60) {
+      return "less than a minute ago";
+    }
+    if (ageSeconds < 3600) {
+      return `${Math.floor(ageSeconds / 60)} min ago`;
+    }
+    if (ageSeconds < 86400) {
+      return `${Math.floor(ageSeconds / 3600)} h ago`;
+    }
+    return `${Math.floor(ageSeconds / 86400)} d ago`;
+  }
+
+  function fabricEvidenceContext() {
+    return {
+      lastUpdated: state.snapshot?.last_updated || null,
+      refreshIntervalSeconds: state.snapshot?.refresh_interval_seconds,
+      now: Date.now(),
+    };
+  }
+
+  function fabricHasStaleHit(fabric) {
+    return fabric?.snapshot_cache_state === "stale-hit" || fabric?.source_cache_state === "stale-hit";
+  }
+
+  function fabricTrustStatus(fabric, statusBase, evidence = {}) {
     const traceCount = Array.isArray(fabric?.traces) ? fabric.traces.length : 0;
     const traceLabel = `${traceCount} ${traceCount === 1 ? "trace" : "traces"}`;
     const selectionLabel = fabric?.selected_enclosure_label || fabric?.system_label || "current selection";
     const snapshotCacheState = String(fabric?.snapshot_cache_state || "miss");
     const sourceCacheState = String(fabric?.source_cache_state || "miss");
-    const retainedStates = new Set(["stale-hit", "trusted-fallback"]);
+    const cacheStates = [snapshotCacheState, sourceCacheState];
+    const staleHit = cacheStates.includes("stale-hit");
+    const trustedFallback = cacheStates.includes("trusted-fallback");
+    const ageSeconds = fabricEvidenceAgeSeconds(evidence?.lastUpdated, evidence?.now);
+    // A stale-hit is a normal revalidation only while its evidence is young
+    // and its age is known; anything else fails toward the STALE tone.
+    const revalidating = staleHit && !trustedFallback && ageSeconds !== null
+      && ageSeconds <= fabricRefreshingWindowSeconds(evidence?.refreshIntervalSeconds);
     const retainedReasons = [];
-    if (retainedStates.has(snapshotCacheState)) {
-      retainedReasons.push(
-        snapshotCacheState === "trusted-fallback" ? "last trusted inventory topology" : "stale inventory snapshot",
-      );
-    }
-    if (retainedStates.has(sourceCacheState)) {
-      retainedReasons.push("stale source evidence");
+    if (trustedFallback || (staleHit && !revalidating)) {
+      if (snapshotCacheState === "trusted-fallback") {
+        retainedReasons.push("last trusted inventory topology");
+      } else if (snapshotCacheState === "stale-hit") {
+        retainedReasons.push("stale inventory snapshot");
+      }
+      if (sourceCacheState === "trusted-fallback" || sourceCacheState === "stale-hit") {
+        retainedReasons.push("stale source evidence");
+      }
     }
     if (retainedReasons.length) {
+      const ageNote = ageSeconds === null ? "of unknown age" : `read ${formatEvidenceAge(ageSeconds)}`;
       return {
         chipTone: "partial",
         suffix: "STALE",
         statusTone: "error",
-        message: `Showing retained ${statusBase.toLowerCase()} evidence from ${retainedReasons.join(" and ")}. Loaded ${traceLabel} for ${selectionLabel}.`,
+        message: `Showing retained ${statusBase.toLowerCase()} evidence from ${retainedReasons.join(" and ")}, ${ageNote}. Loaded ${traceLabel} for ${selectionLabel}.`,
       };
     }
 
+    const refreshNote = revalidating
+      ? ` Evidence read ${formatEvidenceAge(ageSeconds)}; a background refresh was requested.`
+      : "";
     const failedSources = Object.entries(fabric?.sources || {})
       .filter(([, source]) => source?.enabled && source.ok === false)
       .map(([name]) => String(name).toUpperCase());
@@ -3741,7 +3820,7 @@
         chipTone: "partial",
         suffix: "PARTIAL",
         statusTone: "error",
-        message: `Loaded ${traceLabel} for ${selectionLabel} with partial evidence. ${details.join(" ")}`,
+        message: `Loaded ${traceLabel} for ${selectionLabel} with partial evidence. ${details.join(" ")}${refreshNote}`,
       };
     }
 
@@ -3749,7 +3828,8 @@
       chipTone: "ok",
       suffix: "OK",
       statusTone: "info",
-      message: `Loaded ${traceLabel} for ${selectionLabel}.`,
+      refreshing: revalidating,
+      message: `Loaded ${traceLabel} for ${selectionLabel}.${refreshNote}`,
     };
   }
 
@@ -3774,7 +3854,7 @@
       elements.statusText.textContent = list(fabric.warnings)[0] || "Storage Fabric is not available for this system.";
       elements.statusText.dataset.tone = "error";
     } else if (fabric) {
-      const trustStatus = fabricTrustStatus(fabric, copy.statusBase);
+      const trustStatus = fabricTrustStatus(fabric, copy.statusBase, fabricEvidenceContext());
       className += ` ${trustStatus.chipTone}`;
       text = `${copy.statusBase} ${trustStatus.suffix}`;
       elements.statusText.textContent = trustStatus.message;
@@ -4074,7 +4154,30 @@
     pruneSelectionTrail(fabric);
   }
 
-  async function refreshFabric(force = false) {
+  function cancelStaleRefetch() {
+    if (state.staleRefetchTimer !== null) {
+      window.clearTimeout(state.staleRefetchTimer);
+      state.staleRefetchTimer = null;
+    }
+  }
+
+  // One delayed re-read after a stale-hit picks up the background refresh the
+  // API started (#1158). It belongs to the load that scheduled it: any newer
+  // load, selection change or navigation retires it, and an open alias editor
+  // skips it rather than discarding the draft.
+  function scheduleStaleRefetch(requestToken) {
+    cancelStaleRefetch();
+    state.staleRefetchTimer = window.setTimeout(() => {
+      state.staleRefetchTimer = null;
+      if (requestToken !== state.refreshRequestToken || state.loading || state.aliasEditObjectId) {
+        return;
+      }
+      void refreshFabric(false, { revalidation: true });
+    }, FABRIC_STALE_REFETCH_DELAY_MS);
+  }
+
+  async function refreshFabric(force = false, { revalidation = false } = {}) {
+    cancelStaleRefetch();
     const requestToken = ++state.refreshRequestToken;
     state.fabricScopeReady = false;
     state.loading = true;
@@ -4099,6 +4202,9 @@
       });
       applyFabric(fabric);
       state.fabricScopeReady = true;
+      if (!revalidation && fabricHasStaleHit(fabric)) {
+        scheduleStaleRefetch(requestToken);
+      }
     } catch (error) {
       if (requestToken === state.refreshRequestToken) {
         state.error = error.message || String(error);
@@ -4379,9 +4485,15 @@
     cancelAliasEdit();
   });
 
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("pagehide", cancelStaleRefetch);
+  }
+
   ensureSelectionForMode(state.fabric);
   render();
   if (!state.fabric) {
     void refreshFabric(false);
+  } else if (fabricHasStaleHit(state.fabric)) {
+    scheduleStaleRefetch(state.refreshRequestToken);
   }
 })();

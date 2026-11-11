@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Storage Fabric no longer shows the red STALE banner for a normal cached read
+  just past the short cache TTL: evidence read within three refresh intervals
+  (5 to 15 minutes) shows as OK with its age while the background refresh runs,
+  and the page re-reads once to pick it up. Older or fallback evidence, and
+  evidence without a usable timestamp, keep the STALE tone and now name their
+  age.
+
 ## v0.24.0-beta.8 - 2026-11-11
 
 This prerelease follows `v0.24.0-beta.7` with the state-chip correction in

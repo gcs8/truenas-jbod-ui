@@ -60,14 +60,48 @@ function functionSource(name) {
   assert.fail(`function ${name} must have a complete body`);
 }
 
+function constantSource(name) {
+  const match = FABRIC_SOURCE.match(new RegExp(`^\\s*const ${name} = [^;]+;`, "m"));
+  assert.ok(match, `constant ${name} must exist`);
+  return match[0];
+}
+
 function loadTrustStatus() {
-  const sandbox = vm.createContext({ Array, Object, Set, String });
+  const sandbox = vm.createContext({ Array, Date, Math, Number, Object, Set, String });
   const source = [
+    constantSource("FABRIC_REFRESHING_WINDOW_MIN_SECONDS"),
+    constantSource("FABRIC_REFRESHING_WINDOW_MAX_SECONDS"),
+    constantSource("FABRIC_REFRESHING_WINDOW_INTERVALS"),
+    constantSource("FABRIC_EVIDENCE_CLOCK_SKEW_SECONDS"),
     functionSource("isSasFabricEnrichmentWarning"),
+    functionSource("fabricRefreshingWindowSeconds"),
+    functionSource("fabricEvidenceAgeSeconds"),
+    functionSource("formatEvidenceAge"),
     functionSource("fabricTrustStatus"),
   ].join("\n");
   vm.runInContext(`${source}\nthis.__loaded = fabricTrustStatus;`, sandbox);
   return sandbox.__loaded;
+}
+
+// #1158: Storage Fabric reads cached inventory stale-while-revalidate. The
+// evidence age comes from the inventory snapshot's last_updated.
+const NOW = Date.parse("2026-11-11T12:00:00Z");
+function evidence(ageSeconds, refreshIntervalSeconds = 30) {
+  return {
+    lastUpdated: new Date(NOW - ageSeconds * 1000).toISOString(),
+    refreshIntervalSeconds,
+    now: NOW,
+  };
+}
+function cachedFabric(snapshotCacheState, sourceCacheState, extra = {}) {
+  return {
+    available: true,
+    traces: Array.from({ length: 63 }, (_, index) => ({ id: `trace-${index}` })),
+    snapshot_cache_state: snapshotCacheState,
+    source_cache_state: sourceCacheState,
+    sources: { api: { enabled: true, ok: true } },
+    ...extra,
+  };
 }
 
 test("stale and trusted-fallback cache states cannot report Storage Fabric OK", () => {
@@ -218,6 +252,97 @@ test("known physical disk keeps bay labels and alias identity", () => {
   assert.match(ui.elements.get("fabric-inspector-body").innerHTML, /data-fabric-alias-edit="bay:0"/);
 });
 
-test("renderStatus delegates available payload wording to fabricTrustStatus", () => {
-  assert.match(functionSource("renderStatus"), /fabricTrustStatus\(fabric, copy\.statusBase\)/);
+test("renderStatus delegates available payload wording to fabricTrustStatus with evidence age", () => {
+  assert.match(functionSource("renderStatus"), /fabricTrustStatus\(fabric, copy\.statusBase, fabricEvidenceContext\(\)\)/);
+  assert.match(functionSource("fabricEvidenceContext"), /state\.snapshot\?\.last_updated/);
+  assert.match(functionSource("fabricEvidenceContext"), /state\.snapshot\?\.refresh_interval_seconds/);
+});
+
+test("a fresh cache hit reports OK without a refreshing note", () => {
+  const status = loadTrustStatus()(cachedFabric("hit", "hit"), "STORAGE", evidence(5));
+  assert.equal(status.suffix, "OK");
+  assert.equal(status.chipTone, "ok");
+  assert.equal(status.statusTone, "info");
+  assert.equal(status.message, "Loaded 63 traces for current selection.");
+});
+
+for (const [snapshotState, sourceState] of [["stale-hit", "stale-hit"], ["stale-hit", "hit"], ["hit", "stale-hit"]]) {
+  test(`a stale-hit (${snapshotState}/${sourceState}) just past the cache TTL reads as refreshing, not an error`, () => {
+    const status = loadTrustStatus()(cachedFabric(snapshotState, sourceState), "STORAGE", evidence(180));
+    assert.equal(status.suffix, "OK");
+    assert.equal(status.chipTone, "ok");
+    assert.equal(status.statusTone, "info");
+    assert.equal(status.refreshing, true);
+    assert.match(status.message, /Loaded 63 traces/);
+    assert.match(status.message, /3 min ago/);
+    assert.match(status.message, /refresh/i);
+    assert.doesNotMatch(status.message, /retained|stale/i);
+  });
+}
+
+test("a stale-hit read under a minute old says so", () => {
+  const status = loadTrustStatus()(cachedFabric("stale-hit", "stale-hit"), "STORAGE", evidence(20));
+  assert.equal(status.statusTone, "info");
+  assert.match(status.message, /less than a minute ago/);
+});
+
+test("a stale-hit older than the refreshing window keeps the STALE error tone and names its age", () => {
+  const status = loadTrustStatus()(cachedFabric("stale-hit", "stale-hit"), "STORAGE", evidence(20 * 60));
+  assert.equal(status.suffix, "STALE");
+  assert.equal(status.chipTone, "partial");
+  assert.equal(status.statusTone, "error");
+  assert.match(status.message, /retained/i);
+  assert.match(status.message, /20 min ago/);
+});
+
+test("the refreshing window follows the configured refresh interval within bounds", () => {
+  const fabricTrustStatus = loadTrustStatus();
+  // 3 x 200 s = 600 s window: an 8-minute-old read is still a normal revalidation.
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(8 * 60, 200)).statusTone, "info");
+  // The default 30 s interval keeps the 300 s floor.
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(8 * 60, 30)).statusTone, "error");
+  // A very long interval is capped at 900 s.
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(16 * 60, 3600)).statusTone, "error");
+  assert.equal(fabricTrustStatus(cachedFabric("stale-hit", "hit"), "STORAGE", evidence(14 * 60, 3600)).statusTone, "info");
+});
+
+test("trusted-fallback stays STALE even when the snapshot is young", () => {
+  const fabricTrustStatus = loadTrustStatus();
+  for (const [snapshotState, sourceState] of [["trusted-fallback", "hit"], ["trusted-fallback", "stale-hit"], ["stale-hit", "trusted-fallback"]]) {
+    const status = fabricTrustStatus(cachedFabric(snapshotState, sourceState), "STORAGE", evidence(30));
+    assert.equal(status.suffix, "STALE", `${snapshotState}/${sourceState}`);
+    assert.equal(status.statusTone, "error");
+    assert.match(status.message, /retained/i);
+  }
+});
+
+test("a failed source still reports PARTIAL during a young stale-hit", () => {
+  const status = loadTrustStatus()(cachedFabric("stale-hit", "stale-hit", {
+    sources: { api: { enabled: true, ok: true }, ssh: { enabled: true, ok: false } },
+  }), "STORAGE", evidence(60));
+  assert.equal(status.suffix, "PARTIAL");
+  assert.equal(status.statusTone, "error");
+  assert.match(status.message, /Failed sources: SSH/);
+});
+
+test("a stale-hit without a usable evidence timestamp fails toward the STALE tone", () => {
+  const fabricTrustStatus = loadTrustStatus();
+  for (const [label, context] of [
+    ["no context", undefined],
+    ["missing", { lastUpdated: null, refreshIntervalSeconds: 30, now: NOW }],
+    ["unparseable", { lastUpdated: "not a date", refreshIntervalSeconds: 30, now: NOW }],
+    ["far future", { lastUpdated: new Date(NOW + 3600 * 1000).toISOString(), refreshIntervalSeconds: 30, now: NOW }],
+    ["missing clock", { lastUpdated: new Date(NOW).toISOString(), refreshIntervalSeconds: 30, now: Number.NaN }],
+  ]) {
+    const status = fabricTrustStatus(cachedFabric("stale-hit", "stale-hit"), "STORAGE", context);
+    assert.equal(status.suffix, "STALE", label);
+    assert.equal(status.statusTone, "error", label);
+  }
+});
+
+test("a small clock skew still counts as fresh evidence", () => {
+  const status = loadTrustStatus()(cachedFabric("stale-hit", "hit"), "STORAGE", {
+    lastUpdated: new Date(NOW + 30 * 1000).toISOString(), refreshIntervalSeconds: 30, now: NOW,
+  });
+  assert.equal(status.statusTone, "info");
 });
