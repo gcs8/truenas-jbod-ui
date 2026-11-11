@@ -50,6 +50,17 @@ const SHAPES = [
   bays: Array.from({ length: rows * columns }, (_, index) => ({ temperature: 30 + ((index * 7) % 32) })),
 }));
 
+// #1150: the SCALE 24-bay front (3.5-inch, right latch, 6 rows of 4).
+const SCALE_FRONT = {
+  name: "front-drive 3.5in right latch 6x4",
+  face_style: "front-drive",
+  latch_edge: "right",
+  bay_size: "3.5",
+  rows: 6,
+  columns: 4,
+  bays: Array.from({ length: 24 }, (_, index) => ({ temperature: 30 + ((index * 7) % 32) })),
+};
+
 function buildFixtures(layouts) {
   return JSON.parse(execFileSync(process.env.PYTHON || "python3", ["-c", `
 import json
@@ -77,6 +88,9 @@ for spec in json.loads(sys.argv[1]):
             "gptid": f"synthetic-gptid-{index}",
             "temperature_c": bay["temperature"],
             "notes": None,
+            **({"present": False, "state": "empty", "device_name": None, "serial": None, "gptid": None, "model": None,
+                "size_human": None, "pool_name": None, "vdev_name": None, "health": None, "temperature_c": None}
+               if bay.get("empty") else {}),
         }
         for index, bay in enumerate(spec["bays"])
     ]
@@ -96,7 +110,8 @@ for spec in json.loads(sys.argv[1]):
         "slot_layout": layout,
     }
     data["enclosures"][0].update(profile_id="synthetic-heat-row", rows=len(layout), columns=columns, slot_count=count, slot_layout=layout)
-    data["summary"].update(disk_count=count, mapped_slot_count=count, manual_mapping_count=0)
+    disks = sum(1 for bay in spec["bays"] if not bay.get("empty"))
+    data["summary"].update(disk_count=disks, mapped_slot_count=disks, manual_mapping_count=0)
     snapshot = InventorySnapshot.model_validate(data)
     builder.build_synthetic_live_snapshot = lambda: snapshot
     fixtures.append(dict(html=builder.build_live_fixture_html(runtime), snapshot=snapshot.model_dump(mode="json")))
@@ -156,6 +171,8 @@ function smartSummary(bay, slot = 0) {
       annualized_bytes_written: 1.23e13 + (slot * 7.7e11),
       bytes_read: (slot % 2 ? 4.1e13 : 3.08e14) + (slot * 1e12),
     } : {}),
+    // #1151: long Power-On Hours ("52,345 hr"); a bay without one has none.
+    ...("hours" in bay ? { power_on_hours: bay.hours ?? null } : {}),
   };
 }
 
@@ -163,16 +180,24 @@ let fixture;
 let shapeFixtures;
 let cardFixture;
 let liveNvmeFixture;
+let chipFixtures;
 // A live enclosure drawn as an NVMe carrier board uses the same cards.
 const LIVE_NVME = { face_style: "nvme-carrier", rows: 4, columns: 1, bays: [41, 40, 39, 38].map((temperature) => ({ temperature })) };
 test.beforeAll(() => {
-  [fixture, liveNvmeFixture, ...shapeFixtures] = buildFixtures([{ columns: BAYS.length, bays: BAYS }, LIVE_NVME, ...SHAPES]);
+  const chipShapes = [SCALE_FRONT, ...SHAPES];
+  let mixed;
+  [fixture, liveNvmeFixture, ...mixed] = buildFixtures([
+    { columns: BAYS.length, bays: BAYS }, LIVE_NVME, ...SHAPES,
+    ...chipShapes.map((shape) => ({ ...shape, bays: mixedBays(shape, true) })),
+  ]);
+  shapeFixtures = mixed.slice(0, SHAPES.length);
+  chipFixtures = mixed.slice(SHAPES.length);
   cardFixture = buildCardFixture();
 });
 
 test.use({ serviceWorkers: "block" });
 
-async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "") {
+async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "", { empty = false } = {}) {
   const errors = [];
   const bayAt = (slot) => (bays ? bays[slot] : { temperature: 30 + ((slot * 7) % 32) });
   page.on("pageerror", (error) => errors.push(error.message));
@@ -206,7 +231,8 @@ async function openHeatMap(page, pageFixture = fixture, bays = BAYS, query = "")
   await page.locator("#heatmap-metric-select").selectOption("temperature_c");
   // The drive-rated bay can only reach "warning" once its SMART summary loads.
   if (bays === BAYS) await expect(page.locator('#slot-grid [data-slot="5"]')).toHaveAttribute("data-heatmap-band", "warning");
-  if (bays) await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
+  if (bays && empty) await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.filter((entry) => !entry.empty).length);
+  else if (bays) await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(bays.length);
   else await expect(page.locator("#slot-grid .slot-tile.heatmap-active").first()).toBeVisible();
   return errors;
 }
@@ -475,11 +501,11 @@ for (const [index, shape] of SHAPES.entries()) {
 // bays widen at 390 px, it also stays inside the bay and off the latch, LED
 // and text. Text by its Range; hardware and the badge by box. Measured once
 // two frames pass unchanged.
-async function stateChips(page) {
+async function stateChips(page, strict = false) {
   let last = "";
   for (let attempt = 0; attempt < 20; attempt += 1) {
     await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
-    const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles) => tiles.map((tile) => {
+    const chips = await page.locator("#slot-grid .slot-tile[data-slot]").evaluateAll((tiles, strict) => tiles.map((tile) => {
       const style = getComputedStyle(tile, "::after");
       const px = (value) => parseFloat(value) || 0;
       const extra = style.boxSizing === "border-box" ? [0, 0] : [
@@ -498,20 +524,23 @@ async function stateChips(page) {
       const left = box.left + tile.clientLeft + x + shift.e;
       const top = box.top + tile.clientTop + y + shift.f;
       const chip = { left, top, right: left + width, bottom: top + height };
-      const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+      // #1150: strict means zero intersection, and the value by its text.
+      const slack = strict ? 0 : 0.5;
+      const overlap = (a, b) => Math.min(a.right, b.right) - Math.max(a.left, b.left) > slack && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > slack;
       const hits = [];
-      for (const part of tile.querySelectorAll(".slot-heatmap-value, .slot-status-led, .slot-latch")) {
+      for (const part of tile.querySelectorAll(strict ? ".slot-status-led, .slot-latch" : ".slot-heatmap-value, .slot-status-led, .slot-latch")) {
         if (part.checkVisibility({ visibilityProperty: true }) && overlap(chip, part.getBoundingClientRect())) hits.push(part.className);
       }
-      for (const line of tile.querySelectorAll(".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
+      for (const line of tile.querySelectorAll(strict ? ".slot-number, .slot-heatmap-value, .slot-device, .slot-pool, .slot-tertiary" : ".slot-number, .slot-device, .slot-pool, .slot-tertiary")) {
         if (!line.textContent.trim() || !line.checkVisibility({ visibilityProperty: true })) continue;
         const range = document.createRange();
         range.selectNodeContents(line);
         if ([...range.getClientRects()].some((rect) => overlap(chip, rect))) hits.push(`${line.className} text`);
       }
       const inside = chip.left >= box.left - 0.5 && chip.right <= box.right + 0.5 && chip.top >= box.top - 0.5 && chip.bottom <= box.bottom + 0.5;
-      return { slot: tile.dataset.slot, content: style.content, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
-    }));
+      const value = tile.querySelector(".slot-heatmap-value")?.textContent.trim() || "";
+      return { slot: tile.dataset.slot, content: style.content, value, hits, inside, chip: [chip.left - box.left, chip.top - box.top, width, height].map(Math.round) };
+    }), strict);
     if (JSON.stringify(chips) === last) return chips;
     last = JSON.stringify(chips);
   }
@@ -536,6 +565,67 @@ for (const [index, shape] of SHAPES.entries()) {
         expect(chip.inside, `${where} inside the bay`).toBe(true);
       }
     }
+    expect(errors).toEqual([]);
+  });
+}
+
+// #1150 / #1151: on every face shape at every width, with the heat map off,
+// on temperature, and on long rotated Power-On Hours ("52,345 hr"), with
+// occupied, empty and no-reading bays mixed, every bay's painted state chip
+// (its ::after) stays inside the bay and has zero intersection with the
+// slot-number text, the value text (by Range, so a rotated value counts as
+// painted), the LED and the latch. Device and serial lines too. Covers the
+// SCALE 24-bay front (3.5-inch right latch, 6x4) and dense mixed sleds.
+const CHIP_SHAPES = [SCALE_FRONT, ...SHAPES].map((shape, index) => ({ shape, fixture: () => chipFixtures[index] }));
+const CHIP_MODES = [
+  { name: "heat map off" },
+  { name: "temperature", metric: "temperature_c" },
+  { name: "long power-on hours", metric: "power_on_hours", hours: true },
+];
+
+// Every third bay is empty; every fifth other bay has no hours reading.
+function mixedBays(shape, hours) {
+  return shape.bays.map((entry, slot) => ({ ...entry, empty: slot % 3 === 1, hours: hours && slot % 5 !== 4 ? 52345 + (slot * 1037) : undefined }));
+}
+
+for (const { shape, fixture: shapeFixture } of CHIP_SHAPES) {
+  test(`state chips clear the number, value, LED and latch on ${shape.name} at every width (#1150, #1151)`, async ({ page }) => {
+    test.setTimeout(120_000);
+    const bays = mixedBays(shape, true);
+    const errors = await openHeatMap(page, shapeFixture(), bays, "", { empty: true });
+    const failures = [];
+    for (const mode of CHIP_MODES) {
+      if (mode.metric) {
+        if (!(await page.locator("#heatmap-toggle-button").getAttribute("aria-pressed") === "true")) await page.locator("#heatmap-toggle-button").click();
+        await page.locator("#heatmap-metric-select").selectOption(mode.metric);
+      } else {
+        await page.locator("#heatmap-toggle-button").click();
+        await expect(page.locator("#slot-grid .slot-tile.heatmap-active")).toHaveCount(0);
+      }
+      for (const viewport of ALL_WIDTHS) {
+        await page.setViewportSize(viewport);
+        expect(await page.evaluate(() => window.innerWidth), "actual viewport width").toBe(viewport.width);
+        const chips = await stateChips(page, true);
+        expect(chips).toHaveLength(bays.length);
+        if (mode.hours) {
+          const values = chips.filter((chip) => /^\d{2},\d{3}/.test(chip.value));
+          expect(values.length, `${shape.name} long hours values drawn at ${viewport.width} px`).toBeGreaterThan(0);
+        }
+        if (process.env.HEATMAP_BANDS_SCREENSHOT_DIR) {
+          await page.mouse.move(0, 0);
+          await page.locator(".enclosure-face").screenshot({
+            path: path.join(process.env.HEATMAP_BANDS_SCREENSHOT_DIR, `chips-${shape.name.replace(/\W+/g, "-")}-${mode.name.replace(/\W+/g, "-")}-${viewport.width}.png`),
+          });
+        }
+        for (const chip of chips) {
+          const where = `${shape.name} ${mode.name} at ${viewport.width} px, bay ${chip.slot} chip ${JSON.stringify(chip.chip)}`;
+          if (chip.content === "none") failures.push(`${where} is not drawn`);
+          if (chip.hits.length) failures.push(`${where} covers ${chip.hits.join(", ")}`);
+          if (!chip.inside) failures.push(`${where} leaves the bay`);
+        }
+      }
+    }
+    expect(failures).toEqual([]);
     expect(errors).toEqual([]);
   });
 }

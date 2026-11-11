@@ -7295,7 +7295,12 @@
   // #913: the state chip (a bay's 24px ::after) defaults to the top-right
   // corner, where many bays draw an LED or latch. Pick one spot per face that
   // clears every bay: corner, beside the latch, under the LED, mid-sled, foot,
-  // top-left; else the spot with fewest overlaps.
+  // top-left. #1150/#1151: else the first free place, scanned from the top
+  // right, that clears every part of every bay: a full chip, then a smaller
+  // one (20, 16 px: the glyph still fits), then a 12 px dot (colour and
+  // border only; the bay's name carries the state). Bay number, value, LED,
+  // latch and labels always win; only when even a dot has no free place does
+  // the face fall back to the spot with the fewest overlaps.
   function chooseStateChipSpot(bays, size = 24, inset = 6) {
     const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
     // #1145: a chip grazing a part by under a pixel still clears it.
@@ -7331,10 +7336,38 @@
         hits += bay.parts.filter((part) => covers(chip, part)).length;
       });
       if (!best || hits < best.hits) {
-        best = { spot, hits, right, top };
+        best = { spot, hits, right, top, size };
       }
       if (!hits) {
-        break;
+        return best;
+      }
+    }
+    // Free places touch a part's edge or the bay's 2px margin; one geometry
+    // per distinct bay keeps the scan short on big faces.
+    const shapes = [...new Map(bays.map((bay) => [JSON.stringify(bay), bay])).values()];
+    for (const chipSize of [size, 20, 16, 12].filter((value) => value <= size)) {
+      const tops = new Set([2]);
+      const rights = new Set([2]);
+      shapes.forEach((bay) => {
+        tops.add(Math.floor(bay.height) - 2 - chipSize);
+        rights.add(Math.floor(bay.width) - 2 - chipSize);
+      });
+      shapes.forEach((bay) => bay.parts.forEach((part) => {
+        tops.add(Math.ceil(part.bottom)).add(Math.floor(part.top) - chipSize);
+        rights.add(Math.ceil(bay.width - part.left)).add(Math.floor(bay.width - part.right) - chipSize);
+      }));
+      const order = (values) => [...values].filter((value) => value >= 2).sort((a, b) => a - b);
+      for (const chipTop of order(tops)) {
+        for (const chipRight of order(rights)) {
+          const clear = shapes.every((bay) => {
+            const left = bay.width - chipRight - chipSize;
+            const chip = { left, top: chipTop, right: left + chipSize, bottom: chipTop + chipSize };
+            return left >= 2 && chip.bottom <= bay.height - 2 && !bay.parts.some((part) => overlaps(chip, part));
+          });
+          if (clear) {
+            return { spot: "free", hits: 0, right: chipRight, top: chipTop, size: chipSize };
+          }
+        }
       }
     }
     return best;
@@ -7427,12 +7460,15 @@
     });
     if (!bays.length) {
       delete chassisShell.dataset.chipSpot;
+      delete chassisShell.dataset.chipSize;
       return;
     }
     const choice = chooseStateChipSpot(bays);
     chassisShell.style.setProperty("--chip-right", `${choice.right}px`);
     chassisShell.style.setProperty("--chip-top", `${choice.top}px`);
+    chassisShell.style.setProperty("--chip-size", `${choice.size}px`);
     chassisShell.dataset.chipSpot = choice.spot;
+    chassisShell.dataset.chipSize = choice.size;
   }
 
   function scheduleStateChipPlacement() {

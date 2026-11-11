@@ -88,15 +88,24 @@ def slow_prefetch_settings() -> Settings:
 
 # #1145: the demo's first 24 disks as one row of 2.5-inch top-latched sleds
 # (a 24-bay 2U front), whose narrow bays once stacked a heat value such as
-# "+0.22 C" one character per line.
+# "+0.22 C" one character per line. #1151: every third sled is empty, as on
+# a part-filled shelf; there the state chip once covered a rotated hours value.
 DENSE_SLED_BAYS = 24
+DENSE_SLED_EMPTY_EVERY = 3
+
+_EMPTY_BAY = {
+    "present": False, "state": "empty", "device_name": None, "serial": None, "gptid": None, "model": None,
+    "size_bytes": None, "size_human": None, "pool_name": None, "vdev_name": None, "vdev_class": None,
+    "topology_label": None, "health": None, "temperature_c": None, "smart_device_names": [],
+    "persistent_id_label": None, "logical_unit_id": None, "sas_address": None, "notes": None,
+}
 
 
 def dense_sled_snapshot(bundle):
     data = _dump(live_snapshot(bundle))
     layout = [list(range(DENSE_SLED_BAYS))]
     data["slots"] = [
-        {**slot, "row_index": 0, "column_index": index}
+        {**slot, "row_index": 0, "column_index": index, **(_EMPTY_BAY if index % DENSE_SLED_EMPTY_EVERY == 1 else {})}
         for index, slot in enumerate(data["slots"][:DENSE_SLED_BAYS])
     ]
     data.update(layout_rows=layout, layout_slot_count=DENSE_SLED_BAYS, layout_columns=DENSE_SLED_BAYS)
@@ -117,7 +126,8 @@ def dense_sled_snapshot(bundle):
     data["enclosures"][0].update(
         profile_id="synthetic-dense-sleds-24", rows=1, columns=DENSE_SLED_BAYS, slot_count=DENSE_SLED_BAYS, slot_layout=layout
     )
-    data["summary"].update(disk_count=DENSE_SLED_BAYS, mapped_slot_count=DENSE_SLED_BAYS)
+    disks = sum(1 for slot in data["slots"] if slot["state"] != "empty")
+    data["summary"].update(disk_count=disks, mapped_slot_count=disks)
     return InventorySnapshot.model_validate(data)
 
 

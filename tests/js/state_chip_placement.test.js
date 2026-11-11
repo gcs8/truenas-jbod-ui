@@ -111,13 +111,56 @@ test("a chip that only touches a part, under a pixel, still clears it (#1145)", 
   // "beside" sends it to the clear middle of narrow-valued bays.
   const wideNumber = rearRight(31.69);
   wideNumber.parts[1] = { ...wideNumber.parts[1], right: 38.5 };
-  assert.deepEqual(choose([wideNumber]), { spot: "middle", hits: 0, right: 31, top: 130 });
+  assert.deepEqual(choose([wideNumber]), { spot: "middle", hits: 0, right: 31, top: 130, size: 24 });
+});
+
+// #1150 / #1151: when no named spot clears every bay, the chip goes to the
+// first free place (from the top right) that does, shrinking from 24 px
+// through 20 and 16 to a 12 px dot; it never lands on a part.
+const clearOfEveryPart = (choice, bays) => bays.every((layout) => {
+  const left = layout.width - choice.right - choice.size;
+  const chip = { left, top: choice.top, right: left + choice.size, bottom: choice.top + choice.size };
+  return left >= 0 && chip.bottom <= layout.height
+    && layout.parts.every((part) => chip.right <= part.left || part.right <= chip.left || chip.bottom <= part.top || part.bottom <= chip.top);
+});
+
+test("a 3.5-inch right-latched bay at 390 px gets a free place off the number (#1150)", () => {
+  // SCALE 24-bay front at 390 px: LED, number pill, temperature badge,
+  // device and serial lines, full-height latch. "beside" sat on the number.
+  const scale390 = bay(70, 134, [[52, 8, 10, 10], [8, 10, 28.5, 22], [6, 48, 32.9, 24], [8, 88, 28.7, 15], [8, 109, 32, 15], [44, 8, 18, 118]]);
+  const choice = choose([scale390]);
+  assert.equal(choice.spot, "free");
+  assert.equal(choice.hits, 0);
+  assert.ok(choice.size < 24, "no full chip fits; a smaller one does");
+  assert.ok(clearOfEveryPart(choice, [scale390]), JSON.stringify(choice));
+  // With the heat map off the gap under the number holds a full chip.
+  const scaleOff = bay(70, 134, [[52, 8, 10, 10], [8, 10, 28.5, 22], [8, 88, 28.7, 15], [8, 109, 32, 15], [44, 8, 18, 118]]);
+  const off = choose([scaleOff]);
+  assert.deepEqual([off.spot, off.size], ["free", 24]);
+  assert.ok(clearOfEveryPart(off, [scaleOff]), JSON.stringify(off));
+});
+
+test("dense sleds with a rotated hours value and empty bays keep the chip off the value (#1151)", () => {
+  // 1x24 top-latched 2.5-inch sleds: a bay with "52,345" up the sled and
+  // an empty bay with "--". The foot spot sat on the value's first digit.
+  const hours = bay(41, 134, [[23, 8, 10, 10], [8, 30, 28.5, 22], [8, 8, 9.3, 18], [6, 58, 16.7, 51.4]]);
+  const empty = bay(41, 134, [[23, 8, 10, 10], [8, 30, 28.5, 22], [8, 8, 9.3, 18], [6, 58.8, 16.7, 22.4]]);
+  const choice = choose([hours, empty, hours]);
+  assert.equal(choice.hits, 0);
+  assert.ok(clearOfEveryPart(choice, [hours, empty]), JSON.stringify(choice));
+});
+
+test("a bay with no free place for even a dot keeps the fewest-overlap spot", () => {
+  const full = bay(30, 30, [[0, 0, 30, 30]]);
+  const choice = choose([full]);
+  assert.ok(choice.hits > 0);
+  assert.notEqual(choice.spot, "free");
 });
 
 test("M.2 cards put the chip beside the gold latch, or top-left when a short card is mounted", () => {
   // 2280 card on the Hyper M.2 board: hole, slot label, size tag, gold latch.
   const card2280 = bay(334, 86, [[5, 37, 12, 12], [33, 12, 36, 15], [77, 11, 111, 18], [319, 21, 10, 44], [33, 35, 270, 17], [33, 57, 270, 17]]);
-  assert.deepEqual(choose([card2280]), { spot: "beside", hits: 0, right: 19, top: 69 });
+  assert.deepEqual(choose([card2280]), { spot: "beside", hits: 0, right: 19, top: 69, size: 24 });
   // A 2230 card is 150px wide and its size tag runs to the edge, so no
   // right-hand spot is clear on both; above the screw hole is.
   const card2230 = bay(150, 86, [[5, 37, 12, 12], [33, 12, 36, 15], [77, 11, 73, 18], [135, 21, 10, 44], [33, 35, 90, 17], [33, 57, 90, 17]]);

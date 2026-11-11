@@ -8,7 +8,8 @@
 // slipped past beta.6 review (#1102, #1103): text squeezed to a few characters
 // per line or broken inside a word, empty layout tracks beside a squeezed
 // sibling, horizontal overflow, clipped or overlapping controls, heat colours
-// that turn a 1-degree spread into an alarm, and unreadable tile text.
+// that turn a 1-degree spread into an alarm, unreadable tile text, and a
+// bay's state chip painted over its number, value, LED or latch (#1151).
 
 function pageChecks(options) {
   const opts = Object.assign({
@@ -271,6 +272,52 @@ function pageChecks(options) {
       // A label that wraps its own input is one control.
       if (a.element.closest("label") && a.element.closest("label") === b.element.closest("label")) continue;
       push("control-overlap", "error", a.element, { other: describe(b.element), overlapPx: Math.round(w * h) });
+    }
+  }
+
+  // ---- bay state chip (#1150, #1151) -------------------------------------
+  // A bay's state chip is its ::after, placed by the app. Its painted box
+  // must stay inside the bay and off every text line the bay draws (by the
+  // text's own Range, clipped to its element: ellipsis hides the rest, and a
+  // rotated value counts as painted) and off the bay's LED and latch.
+  // Computed from the offsets the chip's spot rule sets: Chromium can keep a
+  // stale resolved left/top for a pseudo-element after a resize.
+  const px = (value) => parseFloat(value) || 0;
+  for (const tile of Array.from(document.querySelectorAll(".chassis-shell .slot-tile[data-slot]")).filter(visible)) {
+    const after = getComputedStyle(tile, "::after");
+    if (!after.content || after.content === "none" || after.display === "none") continue;
+    const width = px(after.width) + px(after.borderLeftWidth) + px(after.borderRightWidth) + px(after.paddingLeft) + px(after.paddingRight);
+    const height = px(after.height) + px(after.borderTopWidth) + px(after.borderBottomWidth) + px(after.paddingTop) + px(after.paddingBottom);
+    const spot = tile.closest(".chassis-shell").dataset.chipSpot || "corner";
+    const shift = new DOMMatrixReadOnly(after.transform === "none" ? undefined : after.transform);
+    const x = ["middle", "foot"].includes(spot) ? tile.clientWidth / 2 : spot === "start" ? px(after.left) : tile.clientWidth - px(after.right) - width;
+    const y = spot === "middle" ? tile.clientHeight / 2 : spot === "foot" ? tile.clientHeight - px(after.bottom) - height : px(after.top);
+    const box = tile.getBoundingClientRect();
+    const left = box.left + tile.clientLeft + x + shift.e;
+    const top = box.top + tile.clientTop + y + shift.f;
+    const chip = { left, top, right: left + width, bottom: top + height };
+    const hit = (r) => Math.min(chip.right, r.right) - Math.max(chip.left, r.left) > 0.5 && Math.min(chip.bottom, r.bottom) - Math.max(chip.top, r.top) > 0.5;
+    const covered = [];
+    for (const element of tile.querySelectorAll("*")) {
+      if (!visible(element)) continue;
+      if (/(^|[-\s])(led|latch)(\s|$)/.test(element.getAttribute("class") || "")) {
+        if (hit(element.getBoundingClientRect())) covered.push(describe(element).split(" > ").pop());
+        continue;
+      }
+      const textNodes = Array.from(element.childNodes).filter((n) => n.nodeType === 3 && n.textContent.trim());
+      if (!textNodes.length) continue;
+      const own = element.getBoundingClientRect();
+      const painted = textNodes.some((node) => {
+        range.selectNodeContents(node);
+        return Array.from(range.getClientRects()).some((r) => hit({
+          left: Math.max(r.left, own.left), right: Math.min(r.right, own.right), top: Math.max(r.top, own.top), bottom: Math.min(r.bottom, own.bottom),
+        }));
+      });
+      if (painted) covered.push(`${describe(element).split(" > ").pop()} "${element.textContent.trim().slice(0, 16)}"`);
+    }
+    const outside = chip.left < box.left - 0.5 || chip.right > box.right + 0.5 || chip.top < box.top - 0.5 || chip.bottom > box.bottom + 0.5;
+    if (covered.length || outside) {
+      push("state-chip-overlap", "error", tile, { spot, chip: [x, y, width, height].map(Math.round), covered, outside });
     }
   }
 
