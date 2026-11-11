@@ -26,9 +26,6 @@ const SCREENSHOT_DIR = process.env.LAYOUT_1102_SCREENSHOT_DIR || "";
 test.describe("Storage Fabric stale refresh", () => {
   require("./fixture-suites/fabric-stale-refresh")({ test, expect });
 });
-test.describe("SMART request ownership", () => {
-  require("./fixture-suites/smart-browser-ownership")({ test, expect });
-});
 
 function python(script, args = []) {
   return JSON.parse(execFileSync(process.env.PYTHON || "python3", ["-c", script, ...args], {

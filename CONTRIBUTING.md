@@ -379,11 +379,10 @@ npx playwright test qa/chassis-row-overflow.spec.js qa/connections-clear-selecti
 ```
 
 `qa/header-and-disk-path-layout.spec.js` also registers the Storage Fabric
-stale-refresh and SMART request-ownership suites from `qa/fixture-suites/`.
-Their standalone entry points are `qa/fabric-stale-refresh.spec.js` and
-`qa/smart-browser-ownership.spec.js`, so each can run alone locally without
-changing CI's workflow list. Run either the combined entry point or its
-standalone suites, not both, to avoid duplicate execution.
+stale-refresh suite from `qa/fixture-suites/`. Its standalone entry point is
+`qa/fabric-stale-refresh.spec.js`, so it can run alone locally without changing
+CI's workflow list. Run either the combined entry point or the standalone
+suite, not both, to avoid duplicate execution.
 
 ### UI coverage
 
