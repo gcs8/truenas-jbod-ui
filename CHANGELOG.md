@@ -66,6 +66,8 @@ This prerelease follows `v0.24.0-beta.7` with the state-chip correction in
   Complete-blob version checks and replacement-free Git reject hidden runtime
   changes, every extra Deferred row is checked, and reviewed image-excluded
   release tools remain narrow (#1155).
+- The release-wrap compatibility test compares only pre-mode wraps with the
+  legacy rules, leaving declared release modes to their own validation (#1156).
 
 ## v0.24.0-beta.7 - 2026-11-09
 
