@@ -58,6 +58,7 @@
     "test_inventory": 607,
     "test_inventory_registry_routes": 15,
     "test_jbod_runner_trial": 15,
+    "test_log_noise": 17,
     "test_logging_config": 17,
     "test_mapping_routes": 21,
     "test_mapping_store": 116,

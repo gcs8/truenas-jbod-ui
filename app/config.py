@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 
 from app.config_errors import ConfigurationError, describe_validation_error, format_location
 from app.env_values import annotation_is_text, env_is_set
+from app.log_limiter import RepeatedLogLimiter
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
@@ -988,6 +990,27 @@ def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = N
     return f"{config_path.name}: unknown key `{key}` is ignored."
 
 
+# Admin routes reload settings on many requests; warn about a config file's
+# unknown or retired keys once per config generation (its parsed content), not
+# on every reload (#1171). The admin banner still lists them on every read.
+_CONFIG_KEY_WARNING_GENERATIONS = RepeatedLogLimiter(repeat_interval_seconds=None, max_keys=64)
+
+
+def _config_generation(yaml_config: Mapping[str, Any]) -> str:
+    canonical = json.dumps(yaml_config, sort_keys=True, default=repr, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _warn_unknown_config_keys_once(config_path: Path, yaml_config: Mapping[str, Any]) -> None:
+    unknown = collect_unknown_config_key_suggestions(yaml_config)
+    if not unknown:
+        return
+    if _CONFIG_KEY_WARNING_GENERATIONS.admit(str(config_path), _config_generation(yaml_config)) is None:
+        return
+    for key, suggestion in unknown:
+        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
+
+
 def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]]:
     """Describe config file keys the app does not read, for the admin warning banner."""
     config_path = Path(settings.config_file)
@@ -1700,8 +1723,7 @@ def load_settings(
                 ]
             ) from None
 
-    for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
-        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
+    _warn_unknown_config_keys_once(config_path, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():

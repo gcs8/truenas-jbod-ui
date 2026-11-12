@@ -185,6 +185,7 @@ from app.services.ssh_probe import (
     redact_ssh_command,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
@@ -8015,6 +8016,13 @@ class InventoryService:
                     if result is None:
                         continue
                     summary = parse_primary(result)
+                    if summary is not None:
+                        # Keep smartctl's status bits on the result: they are
+                        # SMART data, not a failed SSH command (#1171).
+                        summary.smartctl_exit_status = result.exit_code
+                        summary.smartctl_status_flags = (
+                            None if result.exit_code is None else smartctl_exit_flags(result.exit_code)
+                        )
                     if summary is None:
                         detail = (
                             result.stderr.strip()

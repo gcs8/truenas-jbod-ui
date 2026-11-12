@@ -26,6 +26,17 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Quieted repeated log lines: smartctl status bits (such as exit 4 or 64) no
+  longer log as failed SSH commands and are kept on the SMART result instead,
+  logging once per device and status; channel-limit changes log once per
+  change with paramiko's per-channel errors lowered to debug; config.yaml
+  key warnings log once per file change; and identical command failures are
+  summarized with a count. Real failures still log (#PR).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
