@@ -15,7 +15,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
