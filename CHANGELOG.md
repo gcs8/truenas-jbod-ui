@@ -26,6 +26,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- Gave the history collector's fresh SMART reads and forced inventory and
+  storage-view reads their own deadline, `HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS`
+  (default 120 s, 60-900; the larger of it and `HISTORY_REQUEST_TIMEOUT_SECONDS`
+  applies), so a large CORE system's slow answer is recorded instead of dropped
+  and an old `HISTORY_REQUEST_TIMEOUT_SECONDS=20` no longer cuts them short.
+  After one times out, that shelf gets no second fresh read until one more
+  deadline has passed (refs #1168).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
