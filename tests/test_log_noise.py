@@ -345,14 +345,32 @@ class LegacyConfigWarningTests(unittest.TestCase):
                 warnings = config_module.build_unknown_config_key_warnings(get_settings())
                 self.assertEqual([warning["key"] for warning in warnings], ["app.verify_ssl"])
 
-    def test_config_generation_accepts_mixed_key_types(self) -> None:
-        mixed = {1: "a", "app": {"verify_ssl": True}}
-        self.assertEqual(config_module._config_generation(mixed), config_module._config_generation(dict(mixed)))
-        self.assertNotEqual(config_module._config_generation(mixed), config_module._config_generation({1: "b"}))
+    def test_config_generation_does_not_expand_yaml_aliases(self) -> None:
+        # Each level references the previous one ten times; serializing the
+        # parsed graph would expand it to 10**7 leaves.
+        lines = ["a0: &a0 [x]"]
+        for level in range(1, 8):
+            refs = ", ".join([f"*a{level - 1}"] * 10)
+            lines.append(f"a{level}: &a{level} [{refs}]")
+        lines.append("app:\n  verify_ssl: true")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            import yaml
+
+            parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            with (
+                patch.object(config_module.json, "dumps", side_effect=AssertionError("serialized the YAML graph")),
+                self.assertLogs("app.config", level="WARNING") as logs,
+            ):
+                config_module._warn_unknown_config_keys_once(config_path, parsed)
+                config_module._warn_unknown_config_keys_once(config_path, parsed)
+        self.assertIn("unknown key `app.verify_ssl`", "\n".join(logs.output))
+        self.assertEqual(sum("app.verify_ssl" in line for line in logs.output), 1, logs.output)
 
 
 class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
-    async def summary_for_exit(self, exit_code: int):
+    async def summary_for_exit(self, exit_code: int, stdout: str = SMART_JSON):
         class DummyTrueNASClient:
             async def fetch_disk_smartctl(self, *_args, **_kwargs):
                 raise AssertionError("This test uses the SSH smartctl path.")
@@ -360,7 +378,7 @@ class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
         class DummySSHProbe:
             async def run_command(self, command: str) -> SSHCommandResult:
                 if " -j " in command:
-                    return SSHCommandResult(command=command, ok=False, stdout=SMART_JSON, exit_code=exit_code)
+                    return SSHCommandResult(command=command, ok=False, stdout=stdout, exit_code=exit_code)
                 return SSHCommandResult(command=command, ok=False, stdout="", exit_code=exit_code)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -391,6 +409,12 @@ class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
             summary.smartctl_status_flags,
             ["smart_command_failed", "smart_status_failing", "error_log_has_errors"],
         )
+
+    async def test_exit_metadata_alone_does_not_make_smart_available(self) -> None:
+        summary = await self.summary_for_exit(
+            2, '{"smartctl":{"exit_status":2,"messages":[{"string":"open failed","severity":"error"}]}}',
+        )
+        self.assertFalse(summary.available)
 
     async def test_clean_exit_records_no_status_flags(self) -> None:
         summary = await self.summary_for_exit(0)

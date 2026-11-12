@@ -505,10 +505,13 @@ STABLE_SMART_DETAIL_FIELDS = (
     "attached_sas_address",
     "negotiated_link_rate",
 )
+# smartctl exit metadata describes the read, not a SMART measurement, so it
+# must not make a summary count as available (#1171).
+SMART_SUMMARY_READ_METADATA_FIELDS = frozenset({"smartctl_exit_status", "smartctl_status_flags"})
 SMART_SUMMARY_VALUE_FIELDS = tuple(
     field_name
     for field_name in SmartSummaryView.model_fields
-    if field_name not in {"available", "message"}
+    if field_name not in {"available", "message", *SMART_SUMMARY_READ_METADATA_FIELDS}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.

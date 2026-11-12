@@ -997,21 +997,30 @@ _CONFIG_KEY_WARNING_GENERATIONS_LIMIT = 64
 _CONFIG_KEY_WARNING_LOCK = threading.Lock()
 
 
-def _config_generation(yaml_config: Mapping[str, Any]) -> str:
+def _config_generation(config_path: Path, unknown: list[tuple[str, str | None]]) -> str:
+    """Identify one config generation without re-serializing the parsed YAML.
+
+    The file's size and modification time mark an edit; the reported keys mark
+    a different document read through the same path (an imported backup).
+    Serializing the parsed document instead would expand YAML aliases.
+    """
     try:
-        canonical = json.dumps(yaml_config, sort_keys=True, default=repr, separators=(",", ":"))
-    except (TypeError, ValueError):
-        # Mixed key types cannot be sorted; the parsed order is still stable
-        # for one file's content.
-        canonical = repr(yaml_config)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        stat = config_path.stat()
+        file_marker = f"{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        file_marker = "missing"
+    digest = hashlib.sha256(file_marker.encode("utf-8"))
+    for key, suggestion in unknown:
+        digest.update(b"\0" + key.encode("utf-8", "backslashreplace"))
+        digest.update(b"\1" + (suggestion or "").encode("utf-8", "backslashreplace"))
+    return digest.hexdigest()
 
 
 def _warn_unknown_config_keys_once(config_path: Path, yaml_config: Mapping[str, Any]) -> None:
     unknown = collect_unknown_config_key_suggestions(yaml_config)
     if not unknown:
         return
-    generation = _config_generation(yaml_config)
+    generation = _config_generation(config_path, unknown)
     with _CONFIG_KEY_WARNING_LOCK:
         key = str(config_path)
         if _CONFIG_KEY_WARNING_GENERATIONS.get(key) == generation:
