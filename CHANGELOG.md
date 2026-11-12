@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- With a storage view selected, Connections now traces the bay that backs the
+  selected view slot, and says plainly when the device (an NVMe carrier slot
+  or a SATADOM, for example) is not on the SAS fabric, instead of tracing the
+  enclosure bay that shares the view slot's number (#1166).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
