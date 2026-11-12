@@ -36,7 +36,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   ERROR many times a day; the stale view stays and the next poll refreshes
   it. Busy refusals now name their reason in the log, and the new
   `inventory_background_snapshot_refreshes_total` metric counts each
-  background refresh by outcome and reason (#PR).
+  background refresh by outcome and reason (#1176).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
