@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import re
+import sqlite3
 import stat
 import threading
 import time
@@ -164,6 +166,109 @@ def _is_missing_route(exc: HistorySourceError) -> bool:
     return exc.kind == "source_rejected" and exc.status_code in {404, 405}
 
 
+# Structured fields for the "History collection pass failed" record (#1170).
+# The safe formatters keep only the exception class, never its message, so the
+# record names the failing stage and a coarse error class from fixed values.
+COLLECTION_FAILURE_EVENT = "history_collection_failed"
+COLLECTION_FAILURE_STAGES = frozenset(
+    {
+        "pass_start",
+        "inventory_read",
+        "scope_enumeration",
+        "slot_state_write",
+        "smart_read",
+        "metric_write",
+        "backup",
+        "retention",
+        "completion",
+        "post_pass_status",
+    }
+)
+COLLECTION_FAILURE_CONTEXT_ATTRIBUTE = "_history_collection_failure_context"
+_SQLITE_PRIMARY_CODE_CLASSES = {
+    sqlite3.SQLITE_BUSY: "busy_locked",
+    sqlite3.SQLITE_LOCKED: "busy_locked",
+    sqlite3.SQLITE_FULL: "full",
+    sqlite3.SQLITE_IOERR: "io",
+    sqlite3.SQLITE_CORRUPT: "corrupt",
+    sqlite3.SQLITE_NOTADB: "corrupt",
+}
+# Only for errors raised without SQLite's codes; the message itself is never logged.
+_SQLITE_MESSAGE_CLASSES = (
+    ("database is locked", "busy_locked"),
+    ("database table is locked", "busy_locked"),
+    ("database or disk is full", "full"),
+    ("disk i/o error", "io"),
+    ("database disk image is malformed", "corrupt"),
+    ("file is not a database", "corrupt"),
+)
+_SAFE_SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+_SAFE_SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,48}")
+_SAFE_SOURCE_ERROR_KIND = re.compile(r"[a-z][a-z_]{0,47}")
+_FAILURE_CHAIN_LIMIT = 16
+
+
+def _failure_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < _FAILURE_CHAIN_LIMIT:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _sqlite_error_class(error: sqlite3.Error, code: int | None) -> str:
+    if code is not None:
+        return _SQLITE_PRIMARY_CODE_CLASSES.get(code & 0xFF, "other")
+    message = str(error).lower()
+    for fragment, error_class in _SQLITE_MESSAGE_CLASSES:
+        if fragment in message:
+            return error_class
+    return "other"
+
+
+def collection_failure_log_fields(
+    exc: BaseException,
+    *,
+    stage: str | None,
+    scope_id: str | None,
+) -> dict[str, str | int]:
+    """Allowlisted log fields for a failed collection pass.
+
+    Every value is an int, a fixed vocabulary word, or an identifier matching
+    a narrow pattern. Exception messages, SQL text, paths and host names never
+    leave this function.
+    """
+
+    fields: dict[str, str | int] = {
+        "event": COLLECTION_FAILURE_EVENT,
+        "component": HISTORY_METRICS_SERVICE_NAME,
+        "failure_stage": stage if stage in COLLECTION_FAILURE_STAGES else "unknown",
+    }
+    if isinstance(scope_id, str) and _SAFE_SCOPE_ID.fullmatch(scope_id):
+        fields["scope_id"] = scope_id
+    chain = _failure_chain(exc)
+    source_error = next((item for item in chain if isinstance(item, HistorySourceError)), None)
+    if source_error is not None:
+        kind = getattr(source_error, "kind", None)
+        if isinstance(kind, str) and _SAFE_SOURCE_ERROR_KIND.fullmatch(kind):
+            fields["source_error_kind"] = kind
+    sqlite_error = next((item for item in chain if isinstance(item, sqlite3.Error)), None)
+    if sqlite_error is not None:
+        code = getattr(sqlite_error, "sqlite_errorcode", None)
+        if isinstance(code, bool) or not isinstance(code, int):
+            code = None
+        name = getattr(sqlite_error, "sqlite_errorname", None)
+        if code is not None:
+            fields["sqlite_errorcode"] = code
+        if isinstance(name, str) and _SAFE_SQLITE_ERRORNAME.fullmatch(name):
+            fields["sqlite_errorname"] = name
+        fields["sqlite_error_class"] = _sqlite_error_class(sqlite_error, code)
+    return fields
+
+
 class HistoryCollector:
     def __init__(self, settings: HistorySettings, store: HistoryStore) -> None:
         self.settings = settings
@@ -209,6 +314,8 @@ class HistoryCollector:
         self.current_collection_activity: str | None = None
         self.current_collection_inventory_forced: bool | None = None
         self.current_collection_stage_timings: list[dict[str, Any]] = []
+        self._failure_stage: str | None = None
+        self._failure_scope_id: str | None = None
         self.last_collection_inventory_forced: bool | None = None
         self.last_collection_duration_seconds: float | None = None
         self.last_background_overrun_seconds: float = 0.0
@@ -304,6 +411,7 @@ class HistoryCollector:
         self.current_collection_activity = "starting collection"
         self.current_collection_inventory_forced = None
         self.current_collection_stage_timings = []
+        self._enter_failure_stage("pass_start")
         try:
             asyncio.run(
                 self._run_once_unlocked(
@@ -314,6 +422,7 @@ class HistoryCollector:
                 )
             )
         except Exception as exc:
+            self._attach_failure_context(exc)
             if is_database_corruption_error(exc):
                 self._pause_for_damage(exc)
             raise
@@ -378,7 +487,9 @@ class HistoryCollector:
         if cached_root_only and not force_inventory:
             enumerate_kwargs["cached_root_only"] = True
         self._scope_enumeration_complete = True
+        self._enter_failure_stage("inventory_read")
         scopes = await self._enumerate_scopes(**enumerate_kwargs)
+        self._enter_failure_stage("scope_enumeration")
         # Resolve eligibility once, before any durable writes. Command warning
         # tiers alone cannot prove that a degraded SSH bay map kept its disks.
         skip_reasons = [self._scope_history_skip_reason(scope) for scope in scopes]
@@ -414,6 +525,7 @@ class HistoryCollector:
 
         for scope_index, scope in enumerate(scopes, start=1):
             self._raise_if_stopping()
+            self._enter_failure_stage("slot_state_write", scope.system_id)
             scope_label = self._scope_activity_label(scope)
             self._set_collection_activity(f"recording {scope_label} ({scope_index}/{len(scopes)})")
             skip_reason = skip_reasons[scope_index - 1]
@@ -466,6 +578,7 @@ class HistoryCollector:
                 smart_evidence_expected.add(self._smart_evidence_disk_key(record))
             self._set_collection_activity(f"collecting SMART metrics for {scope_label} ({scope_index}/{len(scopes)})")
             smart_started = time.perf_counter()
+            self._enter_failure_stage("smart_read", scope.system_id)
             try:
                 summaries = await self._fetch_smart_summaries(scope, present_slots, force_fresh=collect_slow)
             except HistoryCollectionStopping:
@@ -490,6 +603,7 @@ class HistoryCollector:
                 )
                 continue
             self._raise_if_stopping()
+            self._enter_failure_stage("metric_write", scope.system_id)
             self._record_collection_stage(
                 "smart.fresh" if collect_slow else "smart.cached",
                 time.perf_counter() - smart_started,
@@ -560,6 +674,7 @@ class HistoryCollector:
                     self.last_temperature_evidence_at,
                 )
 
+        self._enter_failure_stage("backup")
         backup_succeeded = False
         retention_backup_at: datetime | None = None
         if collect_fast:
@@ -648,11 +763,13 @@ class HistoryCollector:
                         exc,
                     )
         self._raise_if_stopping()
+        self._enter_failure_stage("retention")
         self._run_retention_if_due(
             run_started,
             backup_succeeded=backup_succeeded,
             backup_at=retention_backup_at,
         )
+        self._enter_failure_stage("completion")
         self.last_success_at = observed_at
         if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
             self._scope_collection_degraded_reason = None
@@ -994,6 +1111,7 @@ class HistoryCollector:
                     pass
                 continue
             started_monotonic = time.perf_counter()
+            pass_finished = False
             try:
                 force_startup_collection = (
                     self.last_success_at is None and not self._startup_collection_attempted
@@ -1018,6 +1136,7 @@ class HistoryCollector:
                     **run_kwargs,
                     collection_kind="background",
                 )
+                pass_finished = True
                 observe_history_collection_run(
                     service_name=HISTORY_METRICS_SERVICE_NAME,
                     result="success",
@@ -1033,7 +1152,10 @@ class HistoryCollector:
                 logger.info("Stopping the scheduled history collection at a safe stage boundary.")
                 break
             except Exception as exc:  # noqa: BLE001 - keep the collector alive across transient appliance errors.
-                logger.exception("History collection pass failed")
+                logger.exception(
+                    "History collection pass failed",
+                    extra=self._collection_failure_log_fields(exc, pass_finished=pass_finished),
+                )
                 self.last_error = str(exc)
                 self.record_failure_diagnostics(exc)
                 self._record_background_failure(utcnow())
@@ -1061,6 +1183,18 @@ class HistoryCollector:
                 await asyncio.wait_for(self._stopping.wait(), timeout=sleep_for)
             except asyncio.TimeoutError:
                 continue
+
+    @staticmethod
+    def _collection_failure_log_fields(exc: BaseException, *, pass_finished: bool) -> dict[str, str | int]:
+        context = getattr(exc, COLLECTION_FAILURE_CONTEXT_ATTRIBUTE, None)
+        stage: str | None = None
+        scope_id: str | None = None
+        if isinstance(context, tuple) and len(context) == 2:
+            stage, scope_id = context
+        elif pass_finished:
+            # The pass itself completed; reading status or counts afterwards failed.
+            stage = "post_pass_status"
+        return collection_failure_log_fields(exc, stage=stage, scope_id=scope_id)
 
     def _record_background_failure(self, now: datetime) -> None:
         self.background_consecutive_failures += 1
@@ -1129,6 +1263,26 @@ class HistoryCollector:
 
     def _set_collection_activity(self, message: str) -> None:
         self.current_collection_activity = message
+
+    def _enter_failure_stage(self, stage: str, scope_id: str | None = None) -> None:
+        """Remember which stage a failure would interrupt, for the failure log (#1170)."""
+
+        self._failure_stage = stage
+        self._failure_scope_id = scope_id
+
+    def _attach_failure_context(self, exc: BaseException) -> None:
+        # Bind the stage to this exception so the scheduler logs it even if
+        # another pass starts before it does. Attribute-less objects keep none.
+        if getattr(exc, COLLECTION_FAILURE_CONTEXT_ATTRIBUTE, None) is not None:
+            return
+        try:
+            setattr(
+                exc,
+                COLLECTION_FAILURE_CONTEXT_ATTRIBUTE,
+                (self._failure_stage, self._failure_scope_id),
+            )
+        except (AttributeError, TypeError):
+            pass
 
     def _record_collection_stage(self, stage: str, duration_seconds: float, **metadata: Any) -> None:
         entry: dict[str, Any] = {

@@ -26,6 +26,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- A failed history collection pass now logs which stage failed, the source
+  failure kind and scope, and SQLite's error code, name and coarse class
+  (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
+  paths or host names (#PRNUM).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
