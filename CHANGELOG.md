@@ -33,6 +33,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The admin orphaned-history preview kept exact per-system hot-database
   counts current from new rows and retention edges instead of recounting
   the whole hot database on every request (#1175).
+### Fixed
+
+- Fixed Connections tracing the enclosure bay that shares a storage-view slot's
+  number; it now traces only the backing bay, distinguishes unknown placement
+  from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 
 ## v0.24.0-rc.1 - 2026-11-11
 

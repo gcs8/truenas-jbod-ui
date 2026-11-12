@@ -93,7 +93,7 @@ test("an unselected grid opens Connections without auto-selecting a failed path"
     "sasFabricList",
     "sasFabricClassToken",
     "defaultSasFabricTraceId",
-  ], { state });
+  ], { state, sasFabricBayForViewSlot: (slot) => (Number.isInteger(slot) ? slot : null) });
 
   assert.equal(defaultSasFabricTraceId(), null);
   state.selectedSlot = 0;
