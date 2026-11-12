@@ -785,6 +785,15 @@ class SSHProbe:
             summary.suffix(),
         )
 
+    def _forget_logged_exit(self, command: str, safe_command: str) -> None:
+        # A clean exit ends the logged condition: the next failure, or the next
+        # failing SMART status on this device path (perhaps a replaced disk),
+        # logs again instead of counting as a repeat of the old one.
+        SSH_COMMAND_FAILURE_LOG.forget((self.config.host, self.config.port, safe_command))
+        device_path = smartctl_device_path(command)
+        if device_path is not None:
+            SMARTCTL_STATUS_LOG.forget((self.config.host, self.config.port, device_path))
+
     def _log_nonzero_exit(self, command: str, safe_command: str, exit_code: int) -> None:
         device_path = smartctl_device_path(command)
         if device_path is not None and not smartctl_exit_failed(exit_code):
@@ -1004,7 +1013,9 @@ class SSHProbe:
             output = output_bytes.decode("utf-8", errors="replace")
             error = error_bytes.decode("utf-8", errors="replace")
             ok = exit_code == 0
-            if not ok:
+            if ok:
+                self._forget_logged_exit(command, safe_command)
+            else:
                 self._log_nonzero_exit(command, safe_command, exit_code)
             return SSHCommandResult(
                 command=command,

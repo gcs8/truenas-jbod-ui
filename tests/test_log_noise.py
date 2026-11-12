@@ -77,6 +77,24 @@ class RepeatedLogLimiterTests(unittest.TestCase):
         self.assertIn("last", summary.suffix())
         self.assertIsNone(limiter.admit("key"))
 
+    def test_forgotten_key_logs_again(self) -> None:
+        limiter = RepeatedLogLimiter(repeat_interval_seconds=None)
+        self.assertIsNotNone(limiter.admit("key", 8))
+        self.assertIsNone(limiter.admit("key", 8))
+        limiter.forget("key")
+        limiter.forget("never-seen")
+        self.assertIsNotNone(limiter.admit("key", 8))
+
+    def test_long_remote_identifiers_are_not_retained(self) -> None:
+        limiter = RepeatedLogLimiter(repeat_interval_seconds=None, max_keys=8)
+        for index in range(32):
+            self.assertIsNotNone(limiter.admit(("host", f"/dev/{index}" + "x" * 65536), "s" * 65536))
+        self.assertEqual(len(limiter), 8)
+        for key, entry in limiter._entries.items():
+            self.assertLessEqual(len(key), 32)
+            self.assertLessEqual(len(entry.state), 32)
+        self.assertIsNone(limiter.admit(("host", "/dev/31" + "x" * 65536), "s" * 65536))
+
     def test_tracked_keys_stay_bounded(self) -> None:
         limiter = RepeatedLogLimiter(repeat_interval_seconds=None, max_keys=3)
         for index in range(10):
@@ -177,6 +195,22 @@ class SSHCommandExitLoggingTests(unittest.TestCase):
         self.assertEqual(len(logs.output), 1, logs.output)
         self.assertIn("smart_status_failing", logs.output[0])
         self.assertNotIn("SSH command failed", logs.output[0])
+
+    def test_a_clean_read_resets_the_device_so_a_new_failure_logs(self) -> None:
+        command = "sudo -n /usr/sbin/smartctl -x -j /dev/sdd"
+        with self.assertLogs("app.services.ssh_probe", level="WARNING") as logs:
+            self.run_with_status(command, 8)
+            self.run_with_status(command, 8)
+            self.run_with_status(command, 0)
+            self.run_with_status(command, 8)
+            self.run_with_status("sudo -n /usr/bin/sg_ses --join /dev/sg2", 1)
+            self.run_with_status("sudo -n /usr/bin/sg_ses --join /dev/sg2", 0)
+            self.run_with_status("sudo -n /usr/bin/sg_ses --join /dev/sg2", 1)
+        self.assertEqual(
+            [("smart_status_failing" in line, "SSH command failed" in line) for line in logs.output],
+            [(True, False), (True, False), (False, True), (False, True)],
+            logs.output,
+        )
 
     def test_smartctl_command_line_and_open_failures_still_log(self) -> None:
         for status in (1, 2, 3 | 64):

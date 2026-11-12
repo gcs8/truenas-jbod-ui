@@ -9,6 +9,7 @@ the count with the first and last suppressed times.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from collections import OrderedDict
@@ -40,9 +41,13 @@ def _utc(timestamp: float | None) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _digest(value: Hashable) -> bytes:
+    return hashlib.blake2b(repr(value).encode("utf-8", "backslashreplace"), digest_size=16).digest()
+
+
 @dataclass
 class _Entry:
-    state: Hashable
+    state: bytes
     emitted_at: float
     count: int = 0
     first: float | None = None
@@ -56,8 +61,13 @@ class RepeatedLogLimiter:
     or a ``SuppressedRepeats`` describing the lines withheld before it. A line
     is admitted the first time its key is seen, whenever its state differs from
     the last admitted state, and, when ``repeat_interval_seconds`` is set, once
-    that interval has passed since the key last logged. The oldest keys are
-    forgotten beyond ``max_keys``; a forgotten key simply logs again.
+    that interval has passed since the key last logged. ``forget(key)`` drops a
+    key whose condition cleared, so its next occurrence logs again. The oldest
+    keys are forgotten beyond ``max_keys``; a forgotten key simply logs again.
+
+    Keys and states can carry remote-supplied text (device names, commands),
+    so only fixed-size digests of them are retained: memory stays bounded by
+    ``max_keys`` regardless of how long the identifiers are.
     """
 
     def __init__(
@@ -72,7 +82,7 @@ class RepeatedLogLimiter:
         self.max_keys = max(1, int(max_keys))
         self._clock = clock
         self._wall_clock = wall_clock
-        self._entries: OrderedDict[Hashable, _Entry] = OrderedDict()
+        self._entries: OrderedDict[bytes, _Entry] = OrderedDict()
         self._lock = threading.Lock()
 
     def __len__(self) -> int:
@@ -83,8 +93,15 @@ class RepeatedLogLimiter:
         with self._lock:
             self._entries.clear()
 
+    def forget(self, key: Hashable) -> None:
+        digest = _digest(key)
+        with self._lock:
+            self._entries.pop(digest, None)
+
     def admit(self, key: Hashable, state: Hashable = None) -> SuppressedRepeats | None:
         now = self._clock()
+        key = _digest(key)
+        state = _digest(state)
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None:
