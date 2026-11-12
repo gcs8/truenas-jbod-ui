@@ -36,7 +36,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   applies), so a large CORE system's slow answer is recorded instead of dropped
   and an old `HISTORY_REQUEST_TIMEOUT_SECONDS=20` no longer cuts them short.
   After one times out, that shelf gets no second fresh read until one more
-  deadline has passed (refs #1168).
+  deadline has passed (#1173, refs #1168).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
