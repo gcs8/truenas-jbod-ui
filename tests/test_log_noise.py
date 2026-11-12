@@ -311,6 +311,11 @@ class LegacyConfigWarningTests(unittest.TestCase):
                 warnings = config_module.build_unknown_config_key_warnings(get_settings())
                 self.assertEqual([warning["key"] for warning in warnings], ["app.verify_ssl"])
 
+    def test_config_generation_accepts_mixed_key_types(self) -> None:
+        mixed = {1: "a", "app": {"verify_ssl": True}}
+        self.assertEqual(config_module._config_generation(mixed), config_module._config_generation(dict(mixed)))
+        self.assertNotEqual(config_module._config_generation(mixed), config_module._config_generation({1: "b"}))
+
 
 class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
     async def summary_for_exit(self, exit_code: int):

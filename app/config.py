@@ -997,7 +997,12 @@ _CONFIG_KEY_WARNING_GENERATIONS = RepeatedLogLimiter(repeat_interval_seconds=Non
 
 
 def _config_generation(yaml_config: Mapping[str, Any]) -> str:
-    canonical = json.dumps(yaml_config, sort_keys=True, default=repr, separators=(",", ":"))
+    try:
+        canonical = json.dumps(yaml_config, sort_keys=True, default=repr, separators=(",", ":"))
+    except (TypeError, ValueError):
+        # Mixed key types cannot be sorted; the parsed order is still stable
+        # for one file's content.
+        canonical = repr(yaml_config)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
