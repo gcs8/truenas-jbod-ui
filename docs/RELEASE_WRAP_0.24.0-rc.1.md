@@ -45,8 +45,8 @@ Changelog coverage: pass (3 PRs)
 | Snapshot/export/offline artifact gate | yes | Fresh source and live restored-stack estimate, Auto HTML and explicit ZIP exports passed. Offline browser rendering showed the expected bay tiles and offline badge, no external requests or console errors, and no private IPv4 addresses or host paths. Two lexical credential-pattern matches are exact sign-in-field code already in shipping JavaScript, not exported secret values. Partial redaction remains explicit; raw artifacts remain private | Pass |  |
 | Docs/wiki/public-demo gate | yes | CHANGELOG, release notes, wrap and public text reviewed. Public-doc, screenshot-manifest, checked-in public-demo, note rendering and prerelease demo-policy checks passed. Current-source demo browser rendering is separate from the unchanged checked-in stable public demo. No demo rebuild or external wiki push is required by this prerelease; owner-only wiki publication remains pending | Pass |  |
 | Docs/wiki/public-demo publication | yes | Pending owner publication: external wiki | Blocked |  |
-| GHCR publish verification | yes | No tag or registry publication in phase A. Fixed rc.1 tags and `dev` will require separately admitted publication and immutable registry readback; `latest` remains excluded | Blocked |  |
-| Deployment refresh/sniff tests | yes | No rc.1 deployment in phase A. The existing beta twin was temporarily parked for disposable QA, then restored with its original IDs/image and independently read back healthy. This is recovery, not rc.1 adoption. Published-image helper deployment and readback belong to phase B | Blocked |  |
+| GHCR publish verification | yes | [Release publication run](https://github.com/gcs8/truenas-jbod-ui/actions/runs/43104893636) completed successfully on merge `5e65a992afaa73ade4c9f926d113d615b6a0f85f`. Annotated tag `v0.24.0-rc.1` targets that merge, whose tree equals reviewed head `81a30d4b`. GHCR `v0.24.0-rc.1`, `0.24.0-rc.1` and `dev` resolve to `ghcr.io/gcs8/truenas-jbod-ui@sha256:f428f1c5a5886d91c6c74dd500c258c64dd0ee4e1df40ea21251941cb189cfe7`, with matching OCI revision/version. GitHub prerelease is published, not draft; both stable/latest pointers remain v0.23.0 | Pass |  |
+| Deployment refresh/sniff tests | yes | Published-image, image-only helper update and independent verify passed on both authorized validation installations. Exact digest/revision/version, healthy UI/history and applicable Admin, zero restarts/OOM, writer-fence locks, preserved Compose inputs/operator overlay, retained disk placement and intact durable history were independently checked. Both prior images and private verified backups remain available; rollback was not required. API sweeps matched their accepted baselines. The deployed-twin full read-only crawl completed 42 chunks at all four prescribed widths with no new error identities. Delayed idle observation is recorded in the phase-B section below. Production remains outside this authorization | Pass |  |
 | Post-release reopen | yes | Blocked until separately admitted publication, deployment and final-validator gates complete. Stable promotion and production remain outside this lane | Blocked |  |
 
 ## Coverage and residual findings
@@ -104,7 +104,7 @@ The history collector uses the UI inventory HTTP path, so the sampled UI role
 includes its appliance work; an empty history-service middleware metric list
 is not a separately measured history-role peak.
 
-Archive observations occurred before work and at two idle checkpoints after
+Appliance observations occurred before work and at two idle checkpoints after
 cleanup, more than five minutes apart. Alert class/level counts, job count and
 net retained-session categories were unchanged, with no new alert-check mail.
 One API-key session row appeared at each snapshot time, but raw `current` was
@@ -118,7 +118,7 @@ missing transport-preload environment. The latter three refused before their
 claimed gate began. Corrected unchanged-source complete runs passed. No
 product code was changed to make a gate pass.
 
-## Phase-A boundary
+## Phase-A attribution
 
 The final wrap update changes documentation only. Its changed-input proof and
 focused release/document tests are recorded separately before readiness; all
@@ -126,7 +126,106 @@ runtime, browser and image results remain attributed to `8888083d` above.
 Exact-head CI and Codex results belong to the final PR head, not this earlier
 runtime commit. Read those external results before parent admission.
 
-Do not merge, tag, publish, deploy or push the wiki from this phase. No
-production installation was contacted. The existing stable channel and public
-demo remain unchanged. Phase B must independently admit the final release PR,
-then perform its authorized publication, helper deployment and twin crawl.
+The phase-A results above remain attributed to their executed source, not
+to a later documentation commit. Phase B independently admitted the final
+release PR and performed the authorized prerelease publication, helper
+adoptions and deployed-twin crawl. Production, stable promotion and external
+wiki publication remain outside this authorization.
+
+
+## Phase-B publication and live acceptance
+
+[PR #1164](https://github.com/gcs8/truenas-jbod-ui/pull/1164) merged as
+`5e65a992afaa73ade4c9f926d113d615b6a0f85f`. Its tree equals the admitted
+`81a30d4b8f000ec9ba10ea8fa4d7f77d499b4389` tree,
+`afb92c16caf2d10c20ca0ca667c6c4fa70d481bd`. Exact-merge main CI and CodeQL
+completed successfully before the annotated rc.1 tag and
+[GitHub prerelease](https://github.com/gcs8/truenas-jbod-ui/releases/tag/v0.24.0-rc.1).
+The fixed rc.1 image tags and `dev` share the immutable digest recorded above.
+`latest`, GitHub latest and the checked-in public demo remain on their
+accepted stable release. Publication and the first validation deployment were
+not replayed when an external observer needed correction.
+
+The deployed-twin crawl used the shipping inventory, generated per-state
+reads, strict target bindings and request guard from the tagged source.
+All 42 native chunk exits and the merge passed. There were 40 targets,
+989 records, 818 done, 130 not applicable, two confirmation previews and
+39 listed states. Exactly 442 captured target/state pairs each have all
+four widths, 390/1600/1920/3840, for 1,768 captures with no duplicate or
+missing capture identities. Every unit finished below seven minutes. Admin
+started only for the final chunk and its prior absent state was restored
+and independently verified. No retry, live app write, LED actuation,
+appliance-load permission or heavy-download permission was used.
+
+The 302 automated findings were known: 104 accessible-name errors under
+#1110; 56 contrast errors and 56 small-range spread errors under #1103;
+74 healthy-temperature alarm warnings and 12 spread warnings under #1103.
+There were zero unexplained errors, blocked requests or admitted writes,
+and no new product issue was filed. #1114 did not emit an automated overlap
+finding in this run. Selected native storage-view crops showed intentional
+horizontal scrolling, which is not proof that every affected layout and
+scroll endpoint is fixed; that issue remains open.
+
+Listed Admin/account/configuration/runtime/restore actions, history refresh,
+mapping restore and the release notice were not executed. Not-applicable
+states reflect absent capabilities, empty/fault/unknown selections, hidden
+panels or disabled controls rather than successful interactions. Disk sync
+had two confirmation previews and 14 disabled/not-applicable records. The
+three HA saved views completed. The stock metric-option expansion remains
+first-scope-only for each configured system; this full application crawl does
+not claim every metric on every secondary view. The earlier broader metric
+matrix is separate supplemental evidence, not substituted for these chunks.
+
+Native-scale review covered the populated platform families, right/top/bottom
+latched bays, selected SMART details, Fabric, history and Admin. On the
+ESXi view, the 390-pixel screenshot is only a scrolling slice and does not
+establish whole-bay readability. Exact-source synthetic supplements cover
+all UniFi variants, ENVR Core normal/long labels, dense rotated long-hour
+values and remaining face shapes. Those are layout fixtures, not physical
+hardware qualification. No new number, heat-value, state-chip, LED, latch
+collision or vertical label clipping was found in complete reviewed bays.
+
+For #1158, an actual young stale-hit rendered green `STORAGE OK` with an
+informational background-refresh message. The corrected observer reused the
+repository guard and generated reads, including automatic selected-disk
+SMART; raw results were saved before assertions. Its earlier hand-written
+guard failure remains recorded as an observer failure, not a product defect.
+For #1161, deployed application JavaScript matched the reviewed source and
+populated SMART summary/details rendered during the crawl. Deliberately hung
+request recovery is proved by the exact-source browser regression, not by
+hanging a real appliance. ENVR Core label-height acceptance combines the
+matching deployed stylesheet with the exact-source fixture review.
+
+Private helper receipts retain installation identity, retention and recovery
+metadata. The second installation preserved its operator overlay and changed
+only the image pin, after shared-host coordination cleared. Its API and
+1920/3840 browser checks passed with zero HTTP, console, failed-request or
+blocked-request diagnostics. Existing degraded-pool and saved-order warnings
+remain; neither the application VM upgrade nor this report changes hardware.
+
+The crawl logs have no Traceback. Background collection retained known
+source/SSH failures, two retryable SMART HTTP 503 responses and three SMART
+timeout skips matching retained predecessor categories. These are not browser
+crawl errors, but are not described as clean logs or repaired collection.
+Anonymous history memory and middleware concurrency remained separately
+measured; charged memory includes reclaimable cache and is not anonymous
+memory. Final delayed idle observation and resource reconciliation are retained
+privately. The post-crawl snapshot ran while middleware was idle and more
+than 30 minutes after the final chunk. Retained QA-host, internal and total
+session counts, alert distributions, failed-alert mail and mail-job totals
+were unchanged; zero new failed-alert messages and no confirmation snapshot
+were required. The renewed window had zero metric-read failures and zero
+OOM kills.
+
+Release comments were read back on #1157, #1158 and #1161, and each was
+closed completed with the evidence boundaries above. #1103 and #1110 were
+re-observed and remain open. #1114 received a non-reproduction/coverage-limit
+comment and remains open. No issue waiting on production was closed.
+
+The post-publish change is this wrap only. Canonical `dev_check.py --safe`
+passed before the evidence edit, with a full before/after source manifest
+excluding only this wrap: 5,108 Python tests run, six skipped, no failures;
+JavaScript 1,576 total, 1,571 passed and five skipped. Local promtool remained
+unavailable, explicitly skipped; exact-head CI supplies that check. Focused
+release/document/privacy tests qualify the final wrap bytes. Exact-head CI,
+clean Codex and gated-queue admission remain separate remote requirements.
