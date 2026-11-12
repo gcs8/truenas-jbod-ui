@@ -35,7 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   logging once per device and status; channel-limit changes log once per
   change with paramiko's per-channel errors lowered to debug; config.yaml
   key warnings log once per file change; and identical command failures are
-  summarized with a count. Real failures still log (#PR).
+  summarized with a count. Real failures still log (#1174).
 
 ## v0.24.0-rc.1 - 2026-11-11
 

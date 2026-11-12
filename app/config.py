@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 
 from app.config_errors import ConfigurationError, describe_validation_error, format_location
 from app.env_values import annotation_is_text, env_is_set
-from app.log_limiter import RepeatedLogLimiter
 from app.secret_files import load_secret_environment_value
 from app.slot_layout import normalize_slot_layout, validate_slot_layout
 
@@ -993,7 +992,9 @@ def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = N
 # Admin routes reload settings on many requests; warn about a config file's
 # unknown or retired keys once per config generation (its parsed content), not
 # on every reload (#1171). The admin banner still lists them on every read.
-_CONFIG_KEY_WARNING_GENERATIONS = RepeatedLogLimiter(repeat_interval_seconds=None, max_keys=64)
+_CONFIG_KEY_WARNING_GENERATIONS: dict[str, str] = {}
+_CONFIG_KEY_WARNING_GENERATIONS_LIMIT = 64
+_CONFIG_KEY_WARNING_LOCK = threading.Lock()
 
 
 def _config_generation(yaml_config: Mapping[str, Any]) -> str:
@@ -1010,8 +1011,15 @@ def _warn_unknown_config_keys_once(config_path: Path, yaml_config: Mapping[str, 
     unknown = collect_unknown_config_key_suggestions(yaml_config)
     if not unknown:
         return
-    if _CONFIG_KEY_WARNING_GENERATIONS.admit(str(config_path), _config_generation(yaml_config)) is None:
-        return
+    generation = _config_generation(yaml_config)
+    with _CONFIG_KEY_WARNING_LOCK:
+        key = str(config_path)
+        if _CONFIG_KEY_WARNING_GENERATIONS.get(key) == generation:
+            return
+        _CONFIG_KEY_WARNING_GENERATIONS.pop(key, None)
+        _CONFIG_KEY_WARNING_GENERATIONS[key] = generation
+        while len(_CONFIG_KEY_WARNING_GENERATIONS) > _CONFIG_KEY_WARNING_GENERATIONS_LIMIT:
+            del _CONFIG_KEY_WARNING_GENERATIONS[next(iter(_CONFIG_KEY_WARNING_GENERATIONS))]
     for key, suggestion in unknown:
         logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
 
