@@ -97,6 +97,7 @@ function mixedView() {
 function satadomView() {
   return {
     id: "boot-satadoms",
+    template_id: "satadom-pair-2",
     kind: "boot_devices",
     source: "inventory_binding",
     slots: [
@@ -268,6 +269,67 @@ test("topology pills name physical bays and select the view slot that bay backs"
   assert.doesNotMatch(body, /\bselectSlot\(slotNumber\)/);
 });
 
+test("Connections reserves off-fabric wording for known non-SAS transport", () => {
+  const cases = [
+    // An unresolved foreign bay is still not a backing bay for this view.
+    { device_name: "nvme0n1", bus: "nvme", snapshot_slot: 2, snapshot_enclosure_id: "rear" },
+    { device_name: "nvd2", bus: "UNKNOWN" },
+    { device_name: "nvme0n1", bus: null },
+    { device_name: "nvd2", bus: "PCIe" },
+    { device_name: "ada0", bus: "SATA", template_id: "satadom-pair-2" },
+  ];
+  for (const { template_id, ...slot } of cases) {
+    const view = mixedView();
+    view.template_id = template_id || "generic";
+    view.slots[2] = { slot_index: 2, occupied: true, source: "inventory_candidate", ...slot };
+    const loaded = load({ view, selectedSlot: 0, selectedTraceId: "bay:2" });
+    loaded.selectSlot(2);
+    assert.equal(loaded.state.sasFabric.selectedTraceId, null);
+    assert.equal(loaded.state.sasFabric.selectedNodeId, null);
+    loaded.renderSasFabricInspector(loaded.state.sasFabric.data);
+    assert.equal(loaded.context.sasFabricInspectorBody.innerHTML,
+      `<p class="sas-fabric-view-slot-note">${slot.device_name} is not on the SAS fabric, so no bay path is shown.</p>`, JSON.stringify(slot));
+  }
+});
+
+test("Connections reports unknown placement for SAS, SATA or unknown transport without a bay", () => {
+  const cases = [
+    // Linux inventory preserves bus=SAS with slot=None; serialization retains
+    // bus and emits snapshot_slot=null, not evidence of a non-SAS disk.
+    { device_name: "sda", bus: "SAS", snapshot_slot: null, snapshot_enclosure_id: null },
+    { device_name: "sdb", bus: null },
+    { device_name: "sdc", bus: "UNKNOWN" },
+    { device_name: "sdd", bus: "SATA" }, // SATA can be behind a SAS expander.
+    { device_name: "nvd2", bus: "SAS" }, // Reported transport beats a name heuristic.
+    { device_name: "ada0", bus: "SAS", template_id: "satadom-pair-2" },
+    { device_name: "sde", bus: "SATA", sas_address: "synthetic-sas-address" },
+  ];
+  for (const { template_id, ...slot } of cases) {
+    const view = mixedView();
+    view.template_id = template_id || "generic";
+    view.slots[2] = { slot_index: 2, occupied: true, source: "inventory_candidate", ...slot };
+    const loaded = load({ view, selectedSlot: 0, selectedTraceId: "bay:2" });
+    loaded.selectSlot(2);
+    assert.equal(loaded.state.sasFabric.selectedTraceId, null);
+    assert.equal(loaded.state.sasFabric.selectedNodeId, null);
+    loaded.renderSasFabricInspector(loaded.state.sasFabric.data);
+    assert.equal(loaded.context.sasFabricInspectorBody.innerHTML,
+      `<p class="sas-fabric-view-slot-note">No enclosure bay is mapped for ${slot.device_name}, so no bay path is shown.</p>`, JSON.stringify(slot));
+  }
+});
+
+test("Connections uses a neutral note for an empty placeholder without a bay", () => {
+  const view = mixedView();
+  view.slots[2] = { slot_index: 2, slot_label: "M2-3", occupied: false, state: "empty", source: "placeholder",
+    device_name: null, snapshot_slot: null, bus: null };
+  const loaded = load({ view, selectedSlot: 0, selectedTraceId: "bay:2" });
+  loaded.selectSlot(2);
+  assert.equal(loaded.state.sasFabric.selectedTraceId, null);
+  assert.equal(loaded.state.sasFabric.selectedNodeId, null);
+  loaded.renderSasFabricInspector(loaded.state.sasFabric.data);
+  assert.equal(loaded.context.sasFabricInspectorBody.innerHTML, '<p class="sas-fabric-view-slot-note">This slot is empty.</p>');
+});
+
 test("Connections says plainly when the selected view slot is not on the SAS fabric", () => {
   const offFabric = load({ selectedSlot: 2 });
   offFabric.renderSasFabricInspector(offFabric.state.sasFabric.data);
@@ -276,7 +338,7 @@ test("Connections says plainly when the selected view slot is not on the SAS fab
 
   const manualOnly = load({ selectedSlot: 3 });
   manualOnly.renderSasFabricInspector(manualOnly.state.sasFabric.data);
-  assert.match(manualOnly.context.sasFabricInspectorBody.innerHTML, /sdd has no known bay/);
+  assert.match(manualOnly.context.sasFabricInspectorBody.innerHTML, /No enclosure bay is mapped for sdd/);
 
   const onBay = load({ selectedSlot: 0, selectedTraceId: "bay:2" });
   onBay.renderSasFabricInspector(onBay.state.sasFabric.data);

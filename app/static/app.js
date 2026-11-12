@@ -2242,11 +2242,20 @@
     if (!slot) {
       return "";
     }
-    const name = slot.device_name || `Slot ${slot.slot_label ?? state.selectedSlot}`;
-    if (Number.isInteger(slot.snapshot_slot) || storageViewSlotIsManualOnly(slot)) {
-      return `${name} has no known bay in this connection map, so no bay path is shown.`;
+    if (!slot.device_name && !slot.occupied) {
+      return "This slot is empty.";
     }
-    return `${name} is not on the SAS fabric, so no bay path is shown.`;
+    const name = slot.device_name || `Slot ${slot.slot_label ?? state.selectedSlot}`;
+    // Runtime slots carry bus, not the inventory record's raw.transport.
+    // SATA alone is not off-fabric evidence: it can sit behind a SAS expander.
+    const bus = String(slot.bus || "").trim().toLowerCase();
+    const nvme = bus === "nvme" || bus === "pcie"
+      || ((!bus || bus === "unknown") && /^(?:nvd\d+|nvme\d+(?:n\d+)?)$/.test(slot.device_name || ""));
+    const satadom = bus === "sata" && getSelectedStorageViewRuntime().template_id === "satadom-pair-2";
+    if (!slot.sas_address && !slot.attached_sas_address && (nvme || satadom)) {
+      return `${name} is not on the SAS fabric, so no bay path is shown.`;
+    }
+    return `No enclosure bay is mapped for ${name}, so no bay path is shown.`;
   }
 
   // Topology pills name physical bays of the rendered snapshot; select the

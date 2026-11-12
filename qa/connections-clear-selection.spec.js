@@ -115,7 +115,7 @@ def view_slot(index, label, device, bay=None, bus="SAS"):
     return row
 
 def view(view_id, label, kind, slots, **extra):
-    return dict(id=view_id, label=label, kind=kind, template_id=view_id, enabled=True, order=10,
+    return dict(id=view_id, label=label, kind=kind, template_id=extra.pop("template_id", view_id), enabled=True, order=10,
                 render=dict(show_in_main_ui=True), binding=dict(mode="auto"), source="inventory_binding",
                 slot_layout=[[slot["slot_index"] for slot in slots]], slot_count=len(slots),
                 matched_count=len(slots), slots=slots, **extra)
@@ -123,10 +123,12 @@ def view(view_id, label, kind, slots, **extra):
 views = [
     view("mixed-shelf", "Mixed Shelf", "ses_enclosure", [
         view_slot(0, "00", "sdc", bay=2), view_slot(1, "01", "sda", bay=0), view_slot(2, "M2-3", "nvd2", bus="PCIe"),
+        view_slot(3, "Unmapped", "sde", bus="SAS"),
+        dict(slot_index=4, slot_label="Empty", occupied=False, state="empty", source="placeholder"),
     ], backing_enclosure_id="enc-a", backing_enclosure_label="Live Shelf", face_style="generic", bay_size="3.5"),
     view("boot-satadoms", "Boot SATADOMs", "boot_devices", [
         view_slot(0, "DOM-A", "ada0", bus="SATA"), view_slot(1, "DOM-B", "ada1", bus="SATA"),
-    ]),
+    ], template_id="satadom-pair-2"),
 ]
 out = {}
 for key, default in (("mixed", "view:mixed-shelf"), ("satadom", "view:boot-satadoms")):
@@ -309,6 +311,19 @@ test("storage-view slots select their backing fabric bay, or none, on every path
   await tile(1).click();
   await page.locator("#sas-fabric-toggle-button").click();
   await expectFabricBay(page, 0);
+  expect(errors).toEqual([]);
+});
+
+test("unmapped SAS and empty view slots do not imply non-SAS transport", async ({ page }) => {
+  const errors = await openViewPage(page, "mixed");
+  await page.locator("#sas-fabric-toggle-button").click();
+  await expectFabricBay(page, 2);
+  await page.locator('#slot-grid .slot-tile[data-slot="3"]').click();
+  await expect(inspectorBody(page)).toHaveText("No enclosure bay is mapped for sde, so no bay path is shown.");
+  await expect(litChips(page)).toHaveCount(0);
+  await page.locator('#slot-grid .slot-tile[data-slot="4"]').click();
+  await expect(inspectorBody(page)).toHaveText("This slot is empty.");
+  await expect(litChips(page)).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 

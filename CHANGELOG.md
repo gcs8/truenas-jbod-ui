@@ -31,9 +31,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
-  number; it now traces the bay backing that slot, or says the device (an NVMe
-  carrier slot or a SATADOM, for example) is not on the SAS fabric (#1166,
-  #1167).
+  number; it now traces only the backing bay, distinguishes unknown placement
+  from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
