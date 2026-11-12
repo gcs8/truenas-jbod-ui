@@ -33,7 +33,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
-  paths or host names (#PRNUM).
+  paths or host names (#1172).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
