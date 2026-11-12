@@ -32,7 +32,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - The admin orphaned-history preview kept exact per-system hot-database
   counts current from new rows and retention edges instead of recounting
-  the whole hot database on every request (#PR).
+  the whole hot database on every request (#1175).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
