@@ -203,10 +203,19 @@ class HotSystemSummaryCounts:
         cache = _TableCache(identity=identity, high_id=int(high or 0))
         if low is None or high is None:
             return cache
-        for chunk in range(int(low) >> self.chunk_bits, (int(high) >> self.chunk_bits) + 1):
-            counts = self._chunk_rows(connection, table_name, *self._chunk_bounds(chunk, int(high)))
+        next_id: int | None = int(low)
+        while next_id is not None and next_id <= int(high):
+            # Seek to the next live id, so sparse ids (a restored or edited
+            # file) cost one query per non-empty chunk, never per empty one.
+            chunk = next_id >> self.chunk_bits
+            chunk_low, chunk_high = self._chunk_bounds(chunk, int(high))
+            counts = self._chunk_rows(connection, table_name, chunk_low, chunk_high)
             if counts:
                 cache.chunks[chunk] = counts
+            following = connection.execute(
+                f"SELECT MIN(id) FROM {table_name} WHERE id > ?", (chunk_high,)
+            ).fetchone()[0]
+            next_id = None if following is None else int(following)
         return cache
 
     @staticmethod

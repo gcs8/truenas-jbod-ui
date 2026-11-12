@@ -3388,6 +3388,28 @@ class HotSummaryCountCacheTests(unittest.TestCase):
             newer.replace(path)
             self._assert_equivalent(store, path, "replaced file")
 
+    def test_sparse_ids_cost_queries_per_live_chunk_not_per_id_span(self) -> None:
+        # A restored or edited file can hold ids far apart; building the cache
+        # must not walk every empty chunk between them.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            self._append(path, events=2, samples=2)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE metric_samples SET id = 1 << 44 WHERE id = 2")
+                connection.execute("UPDATE slot_events SET id = 1 << 40 WHERE id = 2")
+            statements: list[str] = []
+            original_connect = sqlite3.connect
+
+            def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+                connection = original_connect(*args, **kwargs)
+                connection.set_trace_callback(statements.append)
+                return connection
+
+            with patch("history_service.store.sqlite3.connect", side_effect=connect):
+                self._assert_equivalent(store, path, "sparse ids")
+            self.assertLess(len(statements), 200, f"{len(statements)} statements for sparse ids")
+
     def test_segmented_hot_counts_match_the_uncached_reader(self) -> None:
         from history_service.segment_sealer import seal_history_segment
 
