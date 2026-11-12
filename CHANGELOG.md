@@ -30,10 +30,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- With a storage view selected, Connections now traces the bay that backs the
-  selected view slot, and says plainly when the device (an NVMe carrier slot
-  or a SATADOM, for example) is not on the SAS fabric, instead of tracing the
-  enclosure bay that shares the view slot's number (#1166).
+- Fixed Connections tracing the enclosure bay that shares a storage-view slot's
+  number; it now traces the bay backing that slot, or says the device (an NVMe
+  carrier slot or a SATADOM, for example) is not on the SAS fabric (#1166,
+  #1167).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
