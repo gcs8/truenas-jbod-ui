@@ -37,6 +37,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   it. Busy refusals now name their reason in the log, and the new
   `inventory_background_snapshot_refreshes_total` metric counts each
   background refresh by outcome and reason (#1176).
+- Fixed Connections tracing the enclosure bay that shares a storage-view slot's
+  number; it now traces only the backing bay, distinguishes unknown placement
+  from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
