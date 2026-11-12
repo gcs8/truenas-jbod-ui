@@ -3206,3 +3206,322 @@ class HistorySystemSummaryLayoutContractTests(unittest.TestCase):
                 segmented.list_history_system_summaries(excluded),
                 unsegmented.list_history_system_summaries(excluded),
             )
+
+
+class HotSummaryCountCacheTests(unittest.TestCase):
+    """The orphaned-history preview keeps hot counts current without full rescans (#664).
+
+    Every check compares the cached path with the full ``GROUP BY`` query the
+    store used before, on the same database, after each kind of change the
+    hot database sees.
+    """
+
+    SYSTEMS = (
+        ("system-a", "Alpha Shelf"),
+        ("system-b", "Bravo Shelf"),
+        ("system-c", None),
+        (" system-d ", "Delta Shelf"),  # stripped after grouping, like the full query
+        ("   ", "Blank"),  # blank after stripping: dropped
+    )
+
+    @staticmethod
+    def _create(path: Path) -> HistoryStore:
+        # Initialisation seeds history_table_counts, as on every real install.
+        return HistoryStore(str(path), recover_unreadable_database=False)
+
+    def _append(self, path: Path, *, events: int, samples: int, rollups: int = 0, start: int = 0,
+                label_suffix: str = "") -> None:
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.executemany(
+                """INSERT INTO slot_events (
+                    observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                    event_type, details_json
+                ) VALUES ('2026-01-01T00:00:00+00:00', ?, ?, 'enclosure-1', ?, 'slot', 'state', '{}')""",
+                [
+                    (system_id, label and label + label_suffix, index % 24)
+                    for index in range(events)
+                    for system_id, label in (self.SYSTEMS[(start + index) % len(self.SYSTEMS)],)
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO metric_samples (
+                    observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                    metric_name, value_integer, disk_identity_key
+                ) VALUES ('2026-01-01T00:00:00+00:00', ?, ?, 'enclosure-1', ?, 'slot',
+                          'temperature', 30, 'disk-a')""",
+                [
+                    (system_id, label and label + label_suffix, index % 24)
+                    for index in range(samples)
+                    for system_id, label in (self.SYSTEMS[(start + index * 7) % len(self.SYSTEMS)],)
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO metric_rollups (
+                    bucket_start, bucket_seconds, system_id, system_label, enclosure_key, slot,
+                    slot_label, metric_name, sample_count, value_sum, value_min, value_max,
+                    last_value, last_observed_at, disk_identity_key
+                ) VALUES (?, 3600, ?, ?, 'enclosure-1', 1, 'slot', 'temperature', 1, 30, 30, 30,
+                          30, '2026-01-01T00:00:00+00:00', 'disk-a')""",
+                [
+                    (f"bucket-{start}-{index}", system_id, label)
+                    for index in range(rollups)
+                    for system_id, label in (self.SYSTEMS[index % len(self.SYSTEMS)],)
+                ],
+            )
+
+    @staticmethod
+    def _full_summaries(path: Path, excludes: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        """The pre-#664 answer: one full GROUP BY over every table."""
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            return HistoryStore._list_history_system_summaries(connection, exclude_system_ids=excludes)
+
+    def _assert_equivalent(self, store: HistoryStore, path: Path, step: str) -> None:
+        for excludes in ((), ("system-a",), ("system-b", " system-d ")):
+            with self.subTest(step=step, excludes=excludes):
+                # The store strips exclusions before the full query, as before.
+                normalized = tuple(sorted({system_id.strip() for system_id in excludes}))
+                self.assertEqual(
+                    store.list_history_system_summaries(list(excludes)),
+                    self._full_summaries(path, normalized),
+                )
+
+    def test_cached_counts_equal_full_counts_through_every_kind_of_change(self) -> None:
+        from history_service.hot_summary_counts import HotSystemSummaryCounts
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            counts = HotSystemSummaryCounts(chunk_bits=6)  # many small chunks
+            store._hot_summary_counts = counts
+            self._assert_equivalent(store, path, "empty")
+            self._append(path, events=300, samples=900, rollups=40)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """INSERT INTO slot_state_current (
+                        system_id, system_label, enclosure_key, slot, slot_label,
+                        present, identify_active, last_seen_at
+                    ) VALUES ('system-e', 'Echo Shelf', 'enclosure-1', 1, 'slot', 1, 0,
+                              '2026-01-01T00:00:00+00:00')"""
+                )
+            self._assert_equivalent(store, path, "first build")
+            builds = counts.full_counts
+
+            # Collector appends, including a relabelled system whose new label sorts higher.
+            self._append(path, events=40, samples=130, start=3, label_suffix=" (renamed)")
+            self._assert_equivalent(store, path, "append")
+            # Retention removes the oldest rows; only the chunks it touched are recounted.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DELETE FROM metric_samples WHERE id <= 200")
+                connection.execute("DELETE FROM slot_events WHERE id <= 75")
+            recounts = counts.chunk_recounts
+            self._assert_equivalent(store, path, "prefix retention")
+            self.assertGreater(counts.chunk_recounts, recounts)
+            # Deletions scattered through the table, and a whole system removed
+            # by another process.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DELETE FROM metric_samples WHERE id % 11 = 0")
+                connection.execute("DELETE FROM slot_events WHERE system_id = 'system-b'")
+            self._assert_equivalent(store, path, "scattered deletes")
+            # Rollups and current slots are rewritten in place and counted in full.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE metric_rollups SET system_label = 'Zulu' WHERE system_id = 'system-c'")
+                connection.execute("DELETE FROM slot_state_current")
+            self._assert_equivalent(store, path, "in-place rollup label")
+            # Deleting everything, then appending again.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DELETE FROM metric_samples")
+            self._assert_equivalent(store, path, "emptied samples")
+            self._append(path, events=5, samples=70, start=1)
+            self._assert_equivalent(store, path, "refilled")
+            # None of those steps needed another full build of the append-only tables.
+            # 6 steps x 3 exclusion variants: only the two in-place tables were
+            # re-read in full each time, never the append-only ones.
+            self.assertEqual(counts.full_counts - builds, 6 * 3 * 2)
+
+            # Adoption rewrites ids and labels in place; the store drops the cache.
+            store.adopt_system_history("system-a", "system-f", target_system_label="Foxtrot Shelf")
+            self._assert_equivalent(store, path, "adoption")
+            store.purge_orphaned_history(["system-f", "system-c"])
+            self._assert_equivalent(store, path, "purge")
+
+    def test_counter_that_disagrees_is_never_trusted(self) -> None:
+        from history_service.hot_summary_counts import HotSystemSummaryCounts
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            store._hot_summary_counts = HotSystemSummaryCounts(chunk_bits=6)
+            self._append(path, events=50, samples=200)
+            self._assert_equivalent(store, path, "built")
+            # An edited or restored counter can say anything (#1093). Rows
+            # deleted while the counter overstates the table by the same amount
+            # must not pass as unchanged.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DROP TRIGGER count_metric_samples_delete")
+                connection.execute("DELETE FROM metric_samples WHERE id IN (17, 90, 150)")
+            self._assert_equivalent(store, path, "counter left stale")
+            # A file whose counter is wrong from the start is counted exactly every time.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE history_table_counts SET row_count = 7 WHERE table_name = 'slot_events'")
+            fresh = self._create(path)
+            for attempt in range(2):
+                self._assert_equivalent(fresh, path, f"wrong counter {attempt}")
+            # Restoring an older backup in place keeps the inode, but its
+            # AUTOINCREMENT sequence went backwards, so the cache is rebuilt.
+            store._hot_summary_counts.clear()
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("UPDATE history_table_counts SET row_count = "
+                                   "(SELECT COUNT(*) FROM slot_events) WHERE table_name = 'slot_events'")
+            self._assert_equivalent(store, path, "rebuilt")
+            older = Path(directory) / "older.sqlite3"
+            self._create(older)
+            self._append(older, events=10, samples=20, start=2)
+            with closing(sqlite3.connect(older)) as source, closing(sqlite3.connect(path)) as target:
+                source.backup(target)
+            self._assert_equivalent(store, path, "restored in place")
+            # A replaced file is a new inode.
+            newer = Path(directory) / "newer.sqlite3"
+            self._create(newer)
+            self._append(newer, events=3, samples=4, start=4)
+            newer.replace(path)
+            self._assert_equivalent(store, path, "replaced file")
+
+    def test_segmented_hot_counts_match_the_uncached_reader(self) -> None:
+        from history_service.segment_sealer import seal_history_segment
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite3"
+            self._create(source)
+            with closing(sqlite3.connect(source)) as connection, connection:
+                connection.execute(
+                    """INSERT INTO slot_events (
+                        observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                        event_type, details_json
+                    ) VALUES ('2025-01-01T00:00:00+00:00', 'system-old', 'Old Shelf', 'enclosure-1',
+                              1, 'slot', 'state', '{}')"""
+                )
+            sealed = seal_history_segment(
+                source=source, output_directory=root / "segments", segment_id="segment-0001",
+                cutoff="2025-06-01T00:00:00+00:00", key_id="synthetic-key",
+            )
+            catalog = root / "segments" / "catalog.json"
+            _write_covering_catalog(catalog, [Path(sealed["path"])])
+            hot = root / "hot.sqlite3"
+            self._create(hot)
+            store = HistoryStore(
+                str(hot), initialize=False, recover_unreadable_database=False, segment_catalog_path=catalog,
+            )
+
+            def uncached() -> list[dict[str, Any]]:
+                return SegmentedHistoryReader.from_catalog(
+                    hot_path=hot, catalog_path=catalog,
+                ).list_history_system_summaries()
+
+            for step in range(4):
+                if step:
+                    self._append(hot, events=20 * step, samples=60 * step, rollups=step, start=step,
+                                 label_suffix=f" v{step}")
+                if step == 3:
+                    with closing(sqlite3.connect(hot)) as connection, connection:
+                        connection.execute("DELETE FROM metric_samples WHERE id <= 40")
+                with self.subTest(step=step):
+                    self.assertEqual(store.list_history_system_summaries(), uncached())
+                    self.assertEqual(
+                        store.list_history_system_summaries(["system-a"]),
+                        [summary for summary in uncached() if summary["system_id"] != "system-a"],
+                    )
+
+
+class HotSummaryCountPerformanceTests(unittest.TestCase):
+    """A repeated orphaned-history preview does not recount the hot database (#664).
+
+    Work is measured in SQLite VM instructions, which is deterministic, so the
+    bound holds on slow CI runners too.
+    """
+
+    SAMPLES = 120_000
+
+    @staticmethod
+    def _vm_work(run: Any) -> tuple[Any, int]:
+        work = 0
+        original_connect = sqlite3.connect
+
+        def progress() -> int:
+            nonlocal work
+            work += 1_000
+            return 0
+
+        def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            connection = original_connect(*args, **kwargs)
+            connection.set_progress_handler(progress, 1_000)
+            return connection
+
+        with patch("history_service.store.sqlite3.connect", side_effect=connect):
+            result = run()
+        return result, work
+
+    def test_warm_preview_reads_only_new_and_retained_edge_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = HistoryStore(str(path), recover_unreadable_database=False)
+            systems = [(f"system-{index}", f"Shelf {index}") for index in range(6)]
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("PRAGMA synchronous=OFF")
+                connection.executemany(
+                    """INSERT INTO metric_samples (
+                        observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                        metric_name, value_integer, serial, disk_identity_key
+                    ) VALUES ('2026-01-01T00:00:00+00:00', ?, ?, 'enclosure-1', ?, 'slot',
+                              'temperature', 30, 'SYNTHETIC', 'disk-a')""",
+                    ((*systems[index % 6], index % 60) for index in range(self.SAMPLES)),
+                )
+                connection.executemany(
+                    """INSERT INTO slot_events (
+                        observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                        event_type, details_json
+                    ) VALUES ('2026-01-01T00:00:00+00:00', ?, ?, 'enclosure-1', ?, 'slot', 'state', '{}')""",
+                    ((*systems[index % 6], index % 60) for index in range(self.SAMPLES // 8)),
+                )
+
+            def full() -> list[dict[str, Any]]:
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    return HistoryStore._list_history_system_summaries(connection)
+
+            expected, full_work = self._vm_work(full)
+            first, _first_work = self._vm_work(store.list_history_system_summaries)
+            self.assertEqual(first, expected)
+
+            # A collector tick: a few new rows.
+            def collector_tick(start: int, rows: int) -> None:
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.executemany(
+                        """INSERT INTO metric_samples (
+                            observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                            metric_name, value_integer, disk_identity_key
+                        ) VALUES ('2026-01-02T00:00:00+00:00', ?, ?, 'enclosure-1', 1, 'slot',
+                                  'temperature', 31, 'disk-a')""",
+                        (systems[(start + index) % 6] for index in range(rows)),
+                    )
+
+            collector_tick(0, 240)
+            warm, warm_work = self._vm_work(store.list_history_system_summaries)
+            self.assertEqual(warm, self._vm_work(full)[0])
+            self.assertLess(
+                warm_work * 20, full_work,
+                f"warm preview work {warm_work} vs full count {full_work}: the hot database was recounted",
+            )
+
+            # A retention pass removes the oldest rows; only the edge chunk is reread.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DELETE FROM metric_samples WHERE id <= 5000")
+            collector_tick(3, 240)
+            retained, retained_work = self._vm_work(store.list_history_system_summaries)
+            self.assertEqual(retained, self._vm_work(full)[0])
+            self.assertLess(
+                retained_work * 4, full_work,
+                f"post-retention preview work {retained_work} vs full count {full_work}",
+            )

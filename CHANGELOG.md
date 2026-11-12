@@ -26,6 +26,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Performance
+
+- The admin orphaned-history preview kept exact per-system hot-database
+  counts current from new rows and retention edges instead of recounting
+  the whole hot database on every request (#PR).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
