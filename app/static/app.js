@@ -1980,7 +1980,9 @@
   function openSasFabricPanel() {
     state.sasFabric.open = true;
     state.sasFabric.selectionCleared = false;
-    syncSasFabricTraceToSlot(state.selectedSlot);
+    if (Number.isInteger(state.selectedSlot)) {
+      syncSasFabricTraceToSlot(sasFabricBayForViewSlot(state.selectedSlot));
+    }
     renderAll();
     if (sasFabricPanel) {
       sasFabricPanel.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2057,8 +2059,12 @@
     if (state.sasFabric.selectionCleared || !Number.isInteger(state.selectedSlot)) {
       return null;
     }
+    const bayNumber = sasFabricBayForViewSlot(state.selectedSlot);
+    if (bayNumber === null) {
+      return null;
+    }
     const traces = sasFabricList(fabric?.traces);
-    const bayTraceId = `bay:${state.selectedSlot}`;
+    const bayTraceId = `bay:${bayNumber}`;
     return traces.some((trace) => trace.id === bayTraceId) ? bayTraceId : null;
   }
 
@@ -2092,16 +2098,15 @@
     return new Set();
   }
 
-  function syncSasFabricTraceToSlot(slotNumber) {
-    if (!Number.isInteger(slotNumber)) {
-      return;
-    }
+  // Takes a physical bay number, or null for a selected slot with no bay (a
+  // storage-view slot off the SAS fabric), which clears any bay trace.
+  function syncSasFabricTraceToSlot(bayNumber) {
     state.sasFabric.selectionCleared = false;
     if (!state.sasFabric.data) {
       return;
     }
-    const traceId = `bay:${slotNumber}`;
-    state.sasFabric.selectedTraceId = sasFabricTraceById(traceId) ? traceId : null;
+    const traceId = Number.isInteger(bayNumber) ? `bay:${bayNumber}` : null;
+    state.sasFabric.selectedTraceId = traceId && sasFabricTraceById(traceId) ? traceId : null;
     state.sasFabric.selectedNodeId = null;
   }
 
@@ -2207,6 +2212,60 @@
     const slotIndex = matches[0].slot_index;
     return Number.isInteger(slotIndex) && slots.filter((slot) => slot?.slot_index === slotIndex).length === 1
       ? slotIndex : null;
+  }
+
+  // The inverse of sasFabricViewSlotForBay (#1166). While a storage view is
+  // selected, state.selectedSlot is a view slot_index, never a bay number.
+  // Return the enclosure bay backing that view slot, or null when it has none
+  // (NVMe carrier, M.2, SATADOM) or its bay identity is unknown or ambiguous.
+  function sasFabricBayForViewSlot(slotNumber) {
+    if (!Number.isInteger(slotNumber)) {
+      return null;
+    }
+    const storageView = getSelectedStorageViewRuntime();
+    if (!storageView) {
+      return slotNumber;
+    }
+    const matches = sasFabricList(storageView.slots).filter((slot) => slot?.slot_index === slotNumber);
+    const bayNumber = matches.length === 1 ? matches[0].snapshot_slot : null;
+    // Round-trip through the chip direction so both apply the same identity rules.
+    return Number.isInteger(bayNumber) && sasFabricViewSlotForBay(bayNumber) === slotNumber ? bayNumber : null;
+  }
+
+  // Explains an empty Connections selection for a view slot with no bay.
+  function sasFabricViewSlotNote() {
+    if (!getSelectedStorageViewRuntime() || !Number.isInteger(state.selectedSlot)
+      || sasFabricBayForViewSlot(state.selectedSlot) !== null) {
+      return "";
+    }
+    const slot = getSelectedStorageViewRuntimeSlot(state.selectedSlot);
+    if (!slot) {
+      return "";
+    }
+    if (!slot.device_name && !slot.occupied) {
+      return "This slot is empty.";
+    }
+    const name = slot.device_name || `Slot ${slot.slot_label ?? state.selectedSlot}`;
+    // Runtime slots carry bus, not the inventory record's raw.transport.
+    // SATA alone is not off-fabric evidence: it can sit behind a SAS expander.
+    const bus = String(slot.bus || "").trim().toLowerCase();
+    const nvme = bus === "nvme" || bus === "pcie"
+      || ((!bus || bus === "unknown") && /^(?:nvd\d+|nvme\d+(?:n\d+)?)$/.test(slot.device_name || ""));
+    const satadom = bus === "sata" && getSelectedStorageViewRuntime().template_id === "satadom-pair-2";
+    if (!slot.sas_address && !slot.attached_sas_address && (nvme || satadom)) {
+      return `${name} is not on the SAS fabric, so no bay path is shown.`;
+    }
+    return `No enclosure bay is mapped for ${name}, so no bay path is shown.`;
+  }
+
+  // Topology pills name physical bays of the rendered snapshot; select the
+  // view slot that bay backs while a storage view is selected.
+  function selectSlotForBay(bayNumber) {
+    if (!Number.isInteger(bayNumber)) {
+      return false;
+    }
+    const viewSlot = sasFabricViewSlotForBay(bayNumber);
+    return viewSlot === null ? false : selectSlot(viewSlot, { sasFabricSlot: bayNumber });
   }
 
   function selectSasFabricSlot(slotNumber) {
@@ -2640,7 +2699,10 @@
       return;
     }
     sasFabricInspectorTitle.textContent = "Fabric Inspector";
-    sasFabricInspectorBody.innerHTML = "Pick a controller, cable path, or bay.";
+    const viewSlotNote = sasFabricViewSlotNote();
+    sasFabricInspectorBody.innerHTML = viewSlotNote
+      ? `<p class="sas-fabric-view-slot-note">${escapeHtml(viewSlotNote)}</p>`
+      : "Pick a controller, cable path, or bay.";
   }
 
   function renderSasFabric() {
@@ -9974,7 +10036,7 @@
       button.addEventListener("click", () => {
         const slotNumber = Number(button.dataset.topologySlot);
         if (!Number.isNaN(slotNumber)) {
-          selectSlot(slotNumber);
+          selectSlotForBay(slotNumber);
         }
       });
     });
@@ -11184,7 +11246,8 @@
     renderStorageViewRuntimeStatus();
   }
 
-  function selectSlot(slotNumber, { sasFabricSlot = slotNumber } = {}) {
+  // `sasFabricSlot` is a physical bay; by default the selected slot's bay.
+  function selectSlot(slotNumber, { sasFabricSlot } = {}) {
     if (!inventoryScopeMatchesSelection() || (state.selectedStorageViewRuntimeId
       && (state.storageViewsRuntimeLoading || state.storageViewsRuntimeError))) return false;
     if (state.selectedSlot !== slotNumber && !confirmMappingDraftDiscard()) {
@@ -11193,7 +11256,7 @@
     if (state.selectedSlot !== slotNumber) state.selectionEpoch = (state.selectionEpoch || 0) + 1;
     state.selectedSlot = slotNumber;
     state.history.panelError = null;
-    syncSasFabricTraceToSlot(sasFabricSlot);
+    syncSasFabricTraceToSlot(sasFabricSlot === undefined ? sasFabricBayForViewSlot(slotNumber) : sasFabricSlot);
     refreshGridSelectionState();
     renderSasFabric();
     renderDetail();

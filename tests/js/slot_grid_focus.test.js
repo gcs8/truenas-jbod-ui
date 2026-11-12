@@ -90,6 +90,7 @@ test("slot selection updates targeted domains without rebuilding the grid", () =
     state,
     confirmMappingDraftDiscard: () => true,
     syncSasFabricTraceToSlot(slot) { calls.push(`sync:${slot}`); },
+    sasFabricBayForViewSlot: (slot) => slot,
     refreshGridSelectionState() { calls.push("grid-state"); },
     renderSasFabric() { calls.push("fabric"); },
     renderDetail() { calls.push("detail"); },
