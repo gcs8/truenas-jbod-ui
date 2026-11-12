@@ -26,6 +26,18 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   Highlights and Upgrade notes prepended via scripts/render_release_notes.py.
 -->
 
+## Unreleased
+
+### Fixed
+
+- A background inventory refresh that another enclosure's newer refresh
+  overtakes while it saves bay details now ends quietly as superseded, as
+  #928 intended, instead of logging "Background snapshot refresh failed" at
+  ERROR many times a day; the stale view stays and the next poll refreshes
+  it. Busy refusals now name their reason in the log, and the new
+  `inventory_background_snapshot_refreshes_total` metric counts each
+  background refresh by outcome and reason (#PR).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
