@@ -16,6 +16,9 @@ from app.secret_files import load_secret_environment_value
 
 DEFAULT_BACKUP_RETENTION_COUNT = 7
 DEFAULT_BACKUP_INTERVAL_SECONDS = 86400
+DEFAULT_FRESH_REQUEST_TIMEOUT_SECONDS = 120
+MIN_FRESH_REQUEST_TIMEOUT_SECONDS = 60
+MAX_FRESH_REQUEST_TIMEOUT_SECONDS = 900
 
 
 def _history_runtime_root() -> Path:
@@ -68,6 +71,15 @@ class HistorySettings(BaseModel):
     fast_interval_seconds: int = 300
     slow_interval_seconds: int = 3600
     request_timeout_seconds: int = 45
+    # Deadline for fresh SMART batches and forced inventory/storage-view reads
+    # (#1168). A large CORE system can take over a minute to answer one; the
+    # collector uses the larger of this and request_timeout_seconds, so an old
+    # HISTORY_REQUEST_TIMEOUT_SECONDS=20 cannot cut fresh reads short.
+    fresh_request_timeout_seconds: int = Field(
+        default=DEFAULT_FRESH_REQUEST_TIMEOUT_SECONDS,
+        ge=MIN_FRESH_REQUEST_TIMEOUT_SECONDS,
+        le=MAX_FRESH_REQUEST_TIMEOUT_SECONDS,
+    )
     failure_backoff_initial_seconds: int = 30
     failure_backoff_max_seconds: int = 900
     smart_batch_size: int = 24
@@ -192,6 +204,7 @@ ENV_OVERRIDES: dict[str, str] = {
     "HISTORY_FAST_INTERVAL_SECONDS": "fast_interval_seconds",
     "HISTORY_SLOW_INTERVAL_SECONDS": "slow_interval_seconds",
     "HISTORY_REQUEST_TIMEOUT_SECONDS": "request_timeout_seconds",
+    "HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS": "fresh_request_timeout_seconds",
     "HISTORY_FAILURE_BACKOFF_INITIAL_SECONDS": "failure_backoff_initial_seconds",
     "HISTORY_FAILURE_BACKOFF_MAX_SECONDS": "failure_backoff_max_seconds",
     "HISTORY_SMART_BATCH_SIZE": "smart_batch_size",

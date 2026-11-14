@@ -15295,7 +15295,8 @@ Enclosure Status diagnostic page:
     def test_smart_summary_value_field_contract_tracks_the_model(self) -> None:
         self.assertEqual(
             set(getattr(inventory_module, "SMART_SUMMARY_VALUE_FIELDS", ())),
-            set(SmartSummaryView.model_fields) - {"available", "message"},
+            set(SmartSummaryView.model_fields)
+            - {"available", "message", "smartctl_exit_status", "smartctl_status_flags"},
         )
 
 
@@ -26511,3 +26512,179 @@ class SupermicroBMCDiscoveryBoundTests(unittest.TestCase):
         with self.assertRaises(TrueNASAPIError):
             service._populate_web_inventory(inventory)
         self.assertEqual(inventory.drives, [])
+
+
+class BackgroundSnapshotRefreshSupersessionTests(unittest.IsolatedAsyncioTestCase):
+    """#1169: a background refresh overtaken while it saves bay details.
+
+    Real collection, correlation, detail-store I/O and publication. The fake
+    source only returns synthetic shelves; the detail save of the first
+    background refresh is held in its worker thread while another enclosure's
+    refresh (a history-style forced read, or the next background tick) runs to
+    completion and publishes newer canonical topology.
+    """
+
+    SHELVES = ("shelf-a", "shelf-b")
+
+    def service(self):
+        directory = tempfile.TemporaryDirectory(prefix="")
+        self.addCleanup(directory.cleanup)
+        system = SystemConfig(id="supersession", truenas=TrueNASConfig(platform="core"),
+                              ssh=SSHConfig(enabled=False))
+        api = AsyncMock()
+        api.fetch_all.side_effect = lambda *args, **kwargs: self.raw()
+        return build_inventory_service(Settings(), system, api, AsyncMock(), directory.name)
+
+    def raw(self):
+        return TrueNASRawData(
+            enclosures=[{"id": shelf, "name": "Synthetic shelf", "elements": [
+                {"slot": 1, "descriptor": "Slot 1", "dev": f"da{index}", "status": "OK"}]}
+                for index, shelf in enumerate(self.SHELVES)],
+            disks=[{"name": f"da{index}", "serial": f"SANITIZED-{index}", "size": 1000,
+                    "enclosure": {"id": shelf, "slot": 0}} for index, shelf in enumerate(self.SHELVES)],
+            pools=[], disk_temperatures={}, smart_test_results=[])
+
+    async def published_and_expired(self, service):
+        for shelf in self.SHELVES:
+            await service.get_snapshot(force_refresh=True, selected_enclosure_id=shelf)
+        for shelf in self.SHELVES:
+            service._cache_until[shelf] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        return {shelf: service._cache[shelf] for shelf in self.SHELVES}
+
+    def hold_first_detail_save(self, service):
+        """Hold shelf-a's next detail save in its worker thread until released.
+
+        Another shelf's save waits until shelf-a's has started, so the other
+        shelf publishes while shelf-a is mid-save, never before it.
+        """
+        started, release = threading.Event(), threading.Event()
+        original = service.slot_detail_store.save_entries
+        held = []
+
+        def save(entries, **kwargs):
+            if not held and any(entry.enclosure_id == "shelf-a" for entry in entries):
+                held.append(True)
+                started.set()
+                release.wait(5)
+            elif not held:
+                started.wait(5)
+            return original(entries, **kwargs)
+
+        service.slot_detail_store.save_entries = save
+        return started, release
+
+    def background_refresh_outcomes(self, service):
+        import app.metrics as metrics_module
+        counter = getattr(metrics_module, "INVENTORY_BACKGROUND_SNAPSHOT_REFRESHES_TOTAL", None)
+        if counter is None:
+            return {}
+        return {
+            labels: sample
+            for labels, sample in (
+                ((sample.labels["outcome"], sample.labels["reason"]), sample.value)
+                for metric in counter.collect()
+                for sample in metric.samples
+                if sample.name.endswith("_total") and sample.labels.get("system_id") == service.system.id
+            )
+        }
+
+    async def overtake_during_detail_save(self, service, follow):
+        """Start shelf-a's background refresh, overtake it from ``follow``, return its task."""
+        stale_a = (await self.published_and_expired(service))["shelf-a"]
+        started, release = self.hold_first_detail_save(service)
+        self.assertIs(await service.get_snapshot(selected_enclosure_id="shelf-a", allow_stale_cache=True), stale_a)
+        task = service._snapshot_refresh_tasks["shelf-a"]
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            await follow()
+        finally:
+            release.set()
+        await asyncio.wait_for(task, 5)
+        return stale_a
+
+    async def forced_history_read_of_b(self, service):
+        await service.get_snapshot(force_refresh=True, selected_enclosure_id="shelf-b")
+
+    async def next_background_tick_for_b(self, service):
+        await service.get_snapshot(selected_enclosure_id="shelf-b", allow_stale_cache=True)
+        await asyncio.wait_for(service._snapshot_refresh_tasks["shelf-b"], 5)
+
+    async def test_overtaken_detail_save_is_a_quiet_supersession_and_the_next_tick_publishes(self):
+        for follow_name in ("forced_history_read_of_b", "next_background_tick_for_b"):
+            with self.subTest(follow=follow_name):
+                service = self.service()
+                follow = getattr(self, follow_name)
+                with patch.dict("os.environ", {"METRICS_ENABLED": "true"}, clear=False), \
+                        patch.object(inventory_module.logger, "exception") as error_log, \
+                        patch.object(inventory_module.logger, "debug") as debug_log:
+                    before = self.background_refresh_outcomes(service)
+                    stale_a = await self.overtake_during_detail_save(service, lambda: follow(service))
+                    after = self.background_refresh_outcomes(service)
+
+                # The ERROR from the issue: "Background snapshot refresh failed for shelf-a".
+                error_log.assert_not_called()
+                self.assertTrue(any("superseded" in str(call.args[0]) for call in debug_log.call_args_list))
+                key = ("superseded", "newer-topology")
+                self.assertEqual(after.get(key, 0) - before.get(key, 0), 1)
+                # The overtaken candidate was not published; the public value stays.
+                self.assertTrue(service._cache["shelf-a"] is stale_a)
+                self.assertNotIn("shelf-a", service._snapshot_refresh_tasks)
+                # No work is lost: the next poll serves the stale value and
+                # schedules a refresh, which builds from the newer sources and
+                # publishes.
+                self.assertIs(await service.get_snapshot(selected_enclosure_id="shelf-a", allow_stale_cache=True),
+                              stale_a)
+                await asyncio.wait_for(service._snapshot_refresh_tasks["shelf-a"], 5)
+                self.assertFalse(service._cache["shelf-a"] is stale_a)
+                self.assertGreater(service._cache_until["shelf-a"], datetime.now(timezone.utc))
+
+    async def test_two_background_ticks_sharing_one_source_flight_stay_quiet(self):
+        # The small-install shape: a cached history pass serves the default
+        # shelf and the other shelf stale, so both background refreshes join
+        # one source flight; the second publishes while the first still saves
+        # its bay details.
+        service = self.service()
+        stale = await self.published_and_expired(service)
+        reads_before = service.truenas_client.fetch_all.call_count
+        started, release = self.hold_first_detail_save(service)
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true"}, clear=False), \
+                patch.object(inventory_module.logger, "exception") as error_log:
+            before = self.background_refresh_outcomes(service)
+            # The pass's root read (default selection) and its read of the
+            # other shelf; only the default-selection build can be superseded
+            # by a same-source publication of another enclosure.
+            self.assertIs(await service.get_snapshot(allow_stale_cache=True), stale["shelf-a"])
+            self.assertIs(await service.get_snapshot(selected_enclosure_id="shelf-b", allow_stale_cache=True),
+                          stale["shelf-b"])
+            tasks = [service._snapshot_refresh_tasks[shelf] for shelf in self.SHELVES]
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                await asyncio.wait_for(tasks[1], 5)
+            finally:
+                release.set()
+            await asyncio.wait_for(tasks[0], 5)
+            after = self.background_refresh_outcomes(service)
+        error_log.assert_not_called()
+        self.assertEqual(service.truenas_client.fetch_all.call_count - reads_before, 1)
+        self.assertTrue(service._cache["shelf-a"] is stale["shelf-a"])
+        self.assertFalse(service._cache["shelf-b"] is stale["shelf-b"])
+        key = ("superseded", "newer-topology")
+        self.assertEqual(after.get(key, 0) - before.get(key, 0), 1)
+
+    async def test_genuine_busy_background_refresh_logs_its_reason_and_is_counted(self):
+        service = self.service()
+        await self.published_and_expired(service)
+        service._get_snapshot_result = AsyncMock(
+            side_effect=inventory_module.SnapshotStateBusyError(reason="detail-owner-conflict"))
+        with patch.dict("os.environ", {"METRICS_ENABLED": "true"}, clear=False), \
+                patch.object(inventory_module.logger, "exception") as error_log:
+            before = self.background_refresh_outcomes(service)
+            await service._background_snapshot_refresh("shelf-a")
+            after = self.background_refresh_outcomes(service)
+        error_log.assert_called_once()
+        self.assertIn("detail-owner-conflict", error_log.call_args.args[0] % error_log.call_args.args[1:])
+        key = ("busy", "detail-owner-conflict")
+        self.assertEqual(after.get(key, 0) - before.get(key, 0), 1)
+        # The public 503 text is unchanged.
+        self.assertEqual(str(inventory_module.SnapshotStateBusyError(reason="x")),
+                         "The server is busy. Try again in a moment.")

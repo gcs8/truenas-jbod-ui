@@ -226,6 +226,12 @@ class SmartSummaryView(BaseModel):
     # None means no supported port log was reported, not an empty measurement.
     sas_ports: list[SasPortView] | None = None
     sata_phy_events: list[SataPhyEventView] | None = None
+    # smartctl's exit status bit mask and the names of its set bits, when the
+    # summary came from smartctl over SSH. Bits 3-7 are drive health (failing
+    # status, attributes at threshold, error/self-test log entries); bit 2 is a
+    # SMART command or checksum problem with output still read (#1171).
+    smartctl_exit_status: int | None = None
+    smartctl_status_flags: list[str] | None = None
     message: str | None = None
 
 

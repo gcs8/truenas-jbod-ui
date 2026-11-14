@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -988,6 +989,50 @@ def _unknown_key_message(config_path: Path, key: str, suggestion: str | None = N
     return f"{config_path.name}: unknown key `{key}` is ignored."
 
 
+# Admin routes reload settings on many requests; warn about a config file's
+# unknown or retired keys once per config generation (its parsed content), not
+# on every reload (#1171). The admin banner still lists them on every read.
+_CONFIG_KEY_WARNING_GENERATIONS: dict[str, str] = {}
+_CONFIG_KEY_WARNING_GENERATIONS_LIMIT = 64
+_CONFIG_KEY_WARNING_LOCK = threading.Lock()
+
+
+def _config_generation(config_path: Path, unknown: list[tuple[str, str | None]]) -> str:
+    """Identify one config generation without re-serializing the parsed YAML.
+
+    The file's size and modification time mark an edit; the reported keys mark
+    a different document read through the same path (an imported backup).
+    Serializing the parsed document instead would expand YAML aliases.
+    """
+    try:
+        stat = config_path.stat()
+        file_marker = f"{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        file_marker = "missing"
+    digest = hashlib.sha256(file_marker.encode("utf-8"))
+    for key, suggestion in unknown:
+        digest.update(b"\0" + key.encode("utf-8", "backslashreplace"))
+        digest.update(b"\1" + (suggestion or "").encode("utf-8", "backslashreplace"))
+    return digest.hexdigest()
+
+
+def _warn_unknown_config_keys_once(config_path: Path, yaml_config: Mapping[str, Any]) -> None:
+    unknown = collect_unknown_config_key_suggestions(yaml_config)
+    if not unknown:
+        return
+    generation = _config_generation(config_path, unknown)
+    with _CONFIG_KEY_WARNING_LOCK:
+        key = str(config_path)
+        if _CONFIG_KEY_WARNING_GENERATIONS.get(key) == generation:
+            return
+        _CONFIG_KEY_WARNING_GENERATIONS.pop(key, None)
+        _CONFIG_KEY_WARNING_GENERATIONS[key] = generation
+        while len(_CONFIG_KEY_WARNING_GENERATIONS) > _CONFIG_KEY_WARNING_GENERATIONS_LIMIT:
+            del _CONFIG_KEY_WARNING_GENERATIONS[next(iter(_CONFIG_KEY_WARNING_GENERATIONS))]
+    for key, suggestion in unknown:
+        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
+
+
 def build_unknown_config_key_warnings(settings: Settings) -> list[dict[str, str]]:
     """Describe config file keys the app does not read, for the admin warning banner."""
     config_path = Path(settings.config_file)
@@ -1700,8 +1745,7 @@ def load_settings(
                 ]
             ) from None
 
-    for key, suggestion in collect_unknown_config_key_suggestions(yaml_config):
-        logger.warning("%s", _unknown_key_message(config_path, key, suggestion))
+    _warn_unknown_config_keys_once(config_path, yaml_config)
     merged = _deep_merge(merged, runtime_overrides)
 
     for env_name, target_path in ENV_OVERRIDES.items():
