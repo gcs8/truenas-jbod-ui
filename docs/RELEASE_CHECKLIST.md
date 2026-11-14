@@ -669,6 +669,10 @@ owner-approved `workflow_dispatch`.
   - `ghcr.io/gcs8/truenas-jbod-ui:X.Y.Z`
   - `ghcr.io/gcs8/truenas-jbod-ui:latest` for a stable release, or `:dev` for a
     prerelease
+- a manual `Publish GHCR Image` run publishes branch, sha or custom tags from
+  any ref for QA; it refuses `latest` unless it runs from `main` or a stable
+  release tag, `dev` unless it runs from `main` or a release tag, and a version
+  tag unless it runs from the matching git tag
 - after the new image is available, update the real long-running deployments
   cleanly and record a final sniff test for each one:
   - local Windows Docker stack

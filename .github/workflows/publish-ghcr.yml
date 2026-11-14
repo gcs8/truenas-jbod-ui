@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       image_tags:
-        description: Comma-separated image tags to publish. Leave blank to use branch and sha tags.
+        description: Comma-separated image tags to publish. Leave blank to use branch and sha tags. Version tags need the matching git tag.
         required: false
         type: string
       make_latest:
-        description: Also publish the latest tag for this manual run.
+        description: Also publish the latest tag for this manual run (main or a stable release tag only).
         required: false
         default: false
         type: boolean
@@ -131,6 +131,34 @@ jobs:
             if [ "$INPUT_LATEST" = "true" ]; then
               tags+=("$image:latest")
             fi
+
+            # A manual run may publish any ref under its own branch, sha or
+            # custom tags. The tags a deployment follows stay with the ref
+            # they describe, so a branch build cannot replace them by mistake:
+            # `latest` needs main or a stable release tag, `dev` needs main or
+            # a release tag, and a version tag needs its own git tag.
+            for tag in "${tags[@]}"; do
+              name="${tag##*:}"
+              allowed=true
+              if [ "$name" = "latest" ]; then
+                if [ "$GITHUB_REF" != "refs/heads/main" ] && [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  allowed=false
+                fi
+              elif [ "$name" = "dev" ]; then
+                if [ "$GITHUB_REF" != "refs/heads/main" ] && [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                  allowed=false
+                fi
+              elif [[ "$name" =~ ^v?[0-9]+\.[0-9]+ ]]; then
+                if [ "$GITHUB_REF" != "refs/tags/v${name#v}" ]; then
+                  allowed=false
+                fi
+              fi
+              if [ "$allowed" != "true" ]; then
+                echo "Refusing to publish the reserved tag '$name' from $GITHUB_REF."
+                echo "Run this workflow from main or the matching release tag, or choose a branch-specific tag."
+                exit 1
+              fi
+            done
 
             if [ -f app/__init__.py ]; then
               version="$(python -c "from pathlib import Path; import re; text = Path('app/__init__.py').read_text(encoding='utf-8'); match = re.search(r'__version__\\s*=\\s*\\\"([^\\\"]+)\\\"', text); print(match.group(1) if match else '')")"
