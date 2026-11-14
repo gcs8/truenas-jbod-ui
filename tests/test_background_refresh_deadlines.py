@@ -31,6 +31,7 @@ from app.models.domain import ManualMapping, SourceStatus
 from app.services import inventory as inventory_module
 from app.services.parsers import ParsedSSHData
 from app.services.truenas_ws import MiddlewareCallLimiter, TrueNASRawData
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 from tests.test_background_refresh_busy_routes import (
     SHELF,
     SSH_OUTPUTS,
@@ -44,6 +45,8 @@ from tests.test_background_refresh_busy_routes import (
 USER_WAIT_SECONDS = 0.3
 REFRESH_DEADLINE_SECONDS = 0.6
 # Generous ceiling for "answered within the bound" on a loaded CI runner.
+# Waits for work that must happen eventually (a worker reaching a point, a
+# released refresh finishing) use HANG_TIMEOUT_SECONDS instead (#1177).
 ANSWER_CEILING_SECONDS = 3.0
 LATE_MARKER = "synthetic late appliance read"
 
@@ -112,7 +115,7 @@ class HungAppliance:
     async def settle(self) -> None:
         self.answer.set()
         if self.calls:
-            await asyncio.wait_for(asyncio.gather(*self.calls, return_exceptions=True), timeout=5)
+            await asyncio.wait_for(asyncio.gather(*self.calls, return_exceptions=True), timeout=HANG_TIMEOUT_SECONDS)
 
 
 class RefreshDeadlineTests(unittest.IsolatedAsyncioTestCase):
@@ -181,14 +184,14 @@ class RefreshDeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.expire_sources()
         self.appliance.hang_next = True
         await self.service.get_snapshot(selected_enclosure_id=SHELF, allow_stale_cache=True)
-        await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.hung.wait(), timeout=HANG_TIMEOUT_SECONDS)
 
     async def start_hung_source_refresh(self) -> None:
         """The page's shared source refresh is running, and its appliance call hangs."""
         self.expire_sources()
         self.appliance.hang_next = True
         self.service._schedule_background_source_bundle_refresh()
-        await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.hung.wait(), timeout=HANG_TIMEOUT_SECONDS)
 
     def assert_budget_respected(self) -> None:
         self.assertLessEqual(self.appliance.limiter.peak_active, self.appliance.limiter.limit)
@@ -1096,12 +1099,33 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
             await wait_for_condition(
                 lambda: SHELF not in self.service._snapshot_refresh_tasks
                 and self.service._source_bundle_refresh_task is None,
-                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+                timeout=HANG_TIMEOUT_SECONDS,
             )
         self.assertTrue(any("did not finish" in line for line in logs.output), logs.output)
         self.assertFalse(self.appliance.answer.is_set())
         # The unanswered call still holds its permit.
         self.assertEqual(self.appliance.limiter.active, 1)
+
+        # Record every refresh the next read starts, so the check does not
+        # depend on whether that refresh is still running when the read
+        # returns on a loaded host (#1177).
+        started: list[tuple[str, asyncio.Task]] = []
+        start_background_refresh = self.service._start_background_refresh
+
+        def record_start(label, work, **kwargs):
+            task = start_background_refresh(label, work, **kwargs)
+            started.append((label, task))
+            return task
+
+        self.service._start_background_refresh = record_start
+        # The deadline under test has already fired above. The next refresh
+        # gets a bound that only a hang reaches, so a slow host cannot abandon
+        # it as well; it must still run and publish.
+        deadline = patch.object(
+            inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", HANG_TIMEOUT_SECONDS, create=True,
+        )
+        deadline.start()
+        self.addCleanup(deadline.stop)
 
         # The next stale read is told why the view is old, and starts a new
         # refresh that completes on the remaining permit.
@@ -1112,9 +1136,10 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         self.assertEqual(status, 200, content[:300])
         warnings = json.loads(content)["warnings"]
         self.assertTrue(any("did not finish" in warning for warning in warnings), warnings)
-        next_refresh = self.service._snapshot_refresh_tasks.get(SHELF)
-        self.assertIsNotNone(next_refresh, "the next refresh did not start")
-        await asyncio.wait_for(asyncio.shield(next_refresh), timeout=ANSWER_CEILING_SECONDS)
+        next_refreshes = [task for label, task in started if label == f"snapshot {SHELF}"]
+        self.assertEqual(len(next_refreshes), 1, "the next refresh did not start")
+        await asyncio.wait_for(asyncio.shield(next_refreshes[0]), timeout=HANG_TIMEOUT_SECONDS)
+        self.assertFalse(next_refreshes[0].cancelled(), "the next refresh was abandoned")
         self.assertEqual(self.appliance.reads, 3)
         refreshed = self.service._cache[SHELF]
         self.assertNotIn(LATE_MARKER, refreshed.warnings)
@@ -1139,7 +1164,7 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         self.expire_snapshot()
         self.appliance.hang_next = True
         self.service._schedule_background_snapshot_refresh(SHELF)
-        await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.hung.wait(), timeout=HANG_TIMEOUT_SECONDS)
         await asyncio.sleep(REFRESH_DEADLINE_SECONDS * 1.5)
 
         # A reader after the deadline publishes a newer snapshot from the cached sources.
@@ -1151,7 +1176,7 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
 
         # The abandoned call answers late; its result must not be published.
         self.appliance.answer.set()
-        await asyncio.wait_for(self.appliance.late_finished.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.late_finished.wait(), timeout=HANG_TIMEOUT_SECONDS)
         await self.settle()
         for _ in range(20):
             await asyncio.sleep(0)
@@ -1187,10 +1212,10 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         cached_before = self.service._cache[SHELF]
         with self.assertLogs(inventory_module.logger, "WARNING"):
             self.service._schedule_background_snapshot_refresh(SHELF)
-            await asyncio.wait_for(building.wait(), timeout=2)
+            await asyncio.wait_for(building.wait(), timeout=HANG_TIMEOUT_SECONDS)
             await wait_for_condition(
                 lambda: SHELF not in self.service._snapshot_refresh_tasks,
-                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+                timeout=HANG_TIMEOUT_SECONDS,
             )
 
         # A reader that needs a current view is answered within the bound.
@@ -1202,7 +1227,7 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
 
         # The rebuild finishes late; it learns and publishes nothing.
         release.set()
-        await wait_for_condition(lambda: not self.service._snapshot_activity.get(SHELF), timeout=ANSWER_CEILING_SECONDS)
+        await wait_for_condition(lambda: not self.service._snapshot_activity.get(SHELF), timeout=HANG_TIMEOUT_SECONDS)
         self.assertTrue(self.service._cache.get(SHELF) is cached_before, "the late rebuild was published")
         self.assertEqual(self.service._snapshot_published_sequence[SHELF], published_before)
         # The refresh's own source read only.
@@ -1232,7 +1257,7 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
 
         def held_save(entries, *, expected_entries=None, commit_guard=None):
             entered.set()
-            if not release.wait(8):
+            if not release.wait(HANG_TIMEOUT_SECONDS):
                 raise AssertionError("the held save was never released")
             assert commit_guard is not None
             with commit_guard() as valid:
@@ -1244,16 +1269,16 @@ class AbandonedRefreshTests(RefreshDeadlineTests):
         with self.assertLogs(inventory_module.logger, "WARNING"):
             self.service._schedule_background_snapshot_refresh(SHELF)
             refresh = self.service._snapshot_refresh_tasks[SHELF]
-            await wait_for_condition(entered.is_set, timeout=ANSWER_CEILING_SECONDS)
+            await wait_for_condition(entered.is_set, timeout=HANG_TIMEOUT_SECONDS)
             # The deadline passes while the thread is still saving.
             await wait_for_condition(
                 lambda: SHELF not in self.service._snapshot_refresh_tasks,
-                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+                timeout=HANG_TIMEOUT_SECONDS,
             )
         self.assertFalse(refresh.done(), "the save thread should still be held")
 
         release.set()
-        await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), timeout=ANSWER_CEILING_SECONDS)
+        await asyncio.wait_for(asyncio.gather(refresh, return_exceptions=True), timeout=HANG_TIMEOUT_SECONDS)
         # The commit itself refuses, in the worker thread, after the deadline.
         self.assertEqual(guard_results, [False])
         self.assertEqual(store.load_all(), rows_before, "an abandoned refresh saved slot details late")
@@ -1278,7 +1303,7 @@ class StartupPrewarmTests(RefreshDeadlineTests):
         self.appliance.hang_next = True
         with patch.object(inventory_module, "BACKGROUND_REFRESH_DEADLINE_SECONDS", 60.0, create=True):
             warm = asyncio.create_task(service.prewarm_cache())
-            await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+            await asyncio.wait_for(self.appliance.hung.wait(), timeout=HANG_TIMEOUT_SECONDS)
             requests = [
                 call_app(
                     self.application, "GET", "/" if index % 2 else "/api/inventory",
@@ -1299,7 +1324,7 @@ class StartupPrewarmTests(RefreshDeadlineTests):
 
         # Once the appliance answers, the prewarm finishes and publishes.
         self.appliance.answer.set()
-        await asyncio.wait_for(warm, timeout=ANSWER_CEILING_SECONDS)
+        await asyncio.wait_for(warm, timeout=HANG_TIMEOUT_SECONDS)
         self.assertIn(SHELF, service._cache)
         self.assertFalse(service._background_refresh_workers)
         self.assertEqual(self.appliance.limiter.active, 0)
@@ -1330,10 +1355,10 @@ class StartupPrewarmTests(RefreshDeadlineTests):
         self.appliance.hang_next = True
         with self.assertLogs(inventory_module.logger, "WARNING") as logs:
             warm = asyncio.create_task(service.prewarm_cache())
-            await asyncio.wait_for(self.appliance.hung.wait(), timeout=2)
+            await asyncio.wait_for(self.appliance.hung.wait(), timeout=HANG_TIMEOUT_SECONDS)
             await wait_for_condition(
                 lambda: service._background_refresh_abandoned_at is not None,
-                timeout=REFRESH_DEADLINE_SECONDS + ANSWER_CEILING_SECONDS,
+                timeout=HANG_TIMEOUT_SECONDS,
             )
         self.assertTrue(any("did not finish" in line for line in logs.output), logs.output)
         self.assertFalse(warm.done(), "the prewarm's read should still be running")
@@ -1348,7 +1373,7 @@ class StartupPrewarmTests(RefreshDeadlineTests):
 
         # The read answers late. The prewarm ends quietly and publishes nothing.
         self.appliance.answer.set()
-        self.assertIsNone(await asyncio.wait_for(warm, timeout=ANSWER_CEILING_SECONDS))
+        self.assertIsNone(await asyncio.wait_for(warm, timeout=HANG_TIMEOUT_SECONDS))
         self.assertFalse(service._cache)
         self.assertIsNone(service._source_bundle)
         self.assertFalse(service._background_refresh_workers)
@@ -1356,7 +1381,7 @@ class StartupPrewarmTests(RefreshDeadlineTests):
 
         # The next read is the first to publish.
         snapshot = await asyncio.wait_for(
-            service.get_snapshot(selected_enclosure_id=SHELF), timeout=ANSWER_CEILING_SECONDS,
+            service.get_snapshot(selected_enclosure_id=SHELF), timeout=HANG_TIMEOUT_SECONDS,
         )
         self.assertNotIn(LATE_MARKER, snapshot.warnings)
         self.assertEqual(self.appliance.reads, 3)

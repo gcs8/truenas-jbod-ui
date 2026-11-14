@@ -53,6 +53,7 @@ from history_service.store import (
     SlotStateUpdate,
 )
 from history_service.startup import HistoryStartupError, open_history_store_with_retries
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 
 
 @contextmanager
@@ -8895,13 +8896,13 @@ class HistoryCollectorTests(unittest.TestCase):
 
         async def exercise_stop() -> bool:
             await collector.start()
-            started = await asyncio.to_thread(worker_started.wait, 1.0)
+            started = await asyncio.to_thread(worker_started.wait, HANG_TIMEOUT_SECONDS)
             self.assertTrue(started)
             stop_task = asyncio.create_task(collector.stop())
             await asyncio.sleep(0.05)
             returned_before_worker = stop_task.done()
             release_worker.set()
-            await asyncio.wait_for(stop_task, timeout=1.0)
+            await asyncio.wait_for(stop_task, timeout=HANG_TIMEOUT_SECONDS)
             return returned_before_worker
 
         returned_before_worker = asyncio.run(exercise_stop())
@@ -8942,18 +8943,18 @@ class HistoryCollectorTests(unittest.TestCase):
             written_scopes.append(records[0].system_id if records else scopes[len(written_scopes)].system_id)
             if len(written_scopes) == 1:
                 first_write_started.set()
-                release_first_write.wait(timeout=1.0)
+                release_first_write.wait(timeout=HANG_TIMEOUT_SECONDS)
 
         collector._record_slot_changes = record_slot_changes  # type: ignore[method-assign]
 
         async def exercise_stop() -> None:
             await collector.start()
-            started = await asyncio.to_thread(first_write_started.wait, 1.0)
+            started = await asyncio.to_thread(first_write_started.wait, HANG_TIMEOUT_SECONDS)
             self.assertTrue(started)
             stop_task = asyncio.create_task(collector.stop())
             await asyncio.sleep(0.02)
             release_first_write.set()
-            await asyncio.wait_for(stop_task, timeout=1.0)
+            await asyncio.wait_for(stop_task, timeout=HANG_TIMEOUT_SECONDS)
 
         with patch("history_service.collector.observe_history_collection_run"):
             asyncio.run(exercise_stop())
@@ -8985,7 +8986,7 @@ class HistoryCollectorTests(unittest.TestCase):
             manual_task = asyncio.create_task(
                 collector.run_once(collection_kind="manual")
             )
-            started = await asyncio.to_thread(worker_started.wait, 1.0)
+            started = await asyncio.to_thread(worker_started.wait, HANG_TIMEOUT_SECONDS)
             self.assertTrue(started)
             await collector.start()
             stop_task = asyncio.create_task(collector.stop())
@@ -8993,8 +8994,8 @@ class HistoryCollectorTests(unittest.TestCase):
             returned_before_worker = stop_task.done()
             release_worker.set()
             with self.assertRaises(HistoryCollectionStopping):
-                await asyncio.wait_for(manual_task, timeout=1.0)
-            await asyncio.wait_for(stop_task, timeout=1.0)
+                await asyncio.wait_for(manual_task, timeout=HANG_TIMEOUT_SECONDS)
+            await asyncio.wait_for(stop_task, timeout=HANG_TIMEOUT_SECONDS)
             return returned_before_worker
 
         returned_before_worker = asyncio.run(exercise_stop())

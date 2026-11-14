@@ -51,6 +51,7 @@ from app.services.snapshot_export import (
 from history_service import main as history_main
 from history_service.store import HistoryStore
 from tests import test_history_bulk_bounds
+from tests import wait_bounds
 from history_service.operation_bounds import (
     MAX_EVENT_ROWS,
     MAX_REQUEST_BYTES,
@@ -1675,13 +1676,13 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             nonlocal build_calls
             build_calls += 1
             started.set()
-            if not release.wait(timeout=1):
+            if not release.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS):
                 raise AssertionError("Concurrent ZIP test did not release compression")
             return original_builder(html_filename, html_content)
 
         exporter._build_zip_archive = controlled_builder  # type: ignore[method-assign]
         first = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
-        self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+        self.assertTrue(await asyncio.to_thread(started.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         second = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
         await asyncio.sleep(0)
         release.set()
@@ -1712,13 +1713,13 @@ class SnapshotExportServiceTests(unittest.IsolatedAsyncioTestCase):
             nonlocal build_calls
             build_calls += 1
             started.set()
-            if not release.wait(timeout=1):
+            if not release.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS):
                 raise AssertionError("Concurrent oversized ZIP test did not release compression")
             return b"oversized-zip"
 
         exporter._build_zip_archive = controlled_builder  # type: ignore[method-assign]
         first = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
-        self.assertTrue(await asyncio.to_thread(started.wait, 0.5))
+        self.assertTrue(await asyncio.to_thread(started.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         second = asyncio.create_task(exporter._build_zip_archive_cached(rendered, html_bytes))
         await asyncio.sleep(0)
         release.set()
@@ -2696,10 +2697,10 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             render_calls += 1
             if render_calls == 1:
                 first_started.set()
-                release_first.wait(timeout=2)
+                release_first.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
             else:
                 second_started.set()
-                release_second.wait(timeout=2)
+                release_second.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
             return f"<html>render {render_calls}</html>"
 
         with patch.object(snapshot_export, "EXPORT_WORK_COORDINATOR", coordinator):
@@ -2719,7 +2720,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         first = asyncio.create_task(
             first_exporter.build_enclosure_snapshot_html(**common, history_panel_open=False)
         )
-        self.assertTrue(await asyncio.to_thread(first_started.wait, 1))
+        self.assertTrue(await asyncio.to_thread(first_started.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         second = asyncio.create_task(
             second_exporter.build_enclosure_snapshot_html(**common, history_panel_open=True)
         )
@@ -2735,7 +2736,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(render_calls, 1)
         release_first.set()
-        self.assertTrue(await asyncio.to_thread(second_started.wait, 1))
+        self.assertTrue(await asyncio.to_thread(second_started.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         release_second.set()
         await asyncio.gather(first, second)
         self.assertEqual(coordinator.pending_key_count, 0)
@@ -2753,7 +2754,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             nonlocal render_calls
             render_calls += 1
             started.set()
-            release.wait(timeout=2)
+            release.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
             return "<html>one semantic render</html>"
 
         exporter._render_template_with_assets = controlled_render  # type: ignore[method-assign]
@@ -2773,7 +2774,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
                 configured_hostnames=["node-a.example.test"],
             )
         )
-        self.assertTrue(await asyncio.to_thread(started.wait, 1))
+        self.assertTrue(await asyncio.to_thread(started.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         second = asyncio.create_task(
             exporter.build_enclosure_snapshot_html(
                 request=build_request(),
@@ -2859,7 +2860,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
 
         def worker() -> str:
             entered.set()
-            release.wait(timeout=2)
+            release.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
             finished.set()
             return "done"
 
@@ -2869,7 +2870,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         caller = asyncio.create_task(
             coordinator.run(key="running", retained_bytes=7, work=work)
         )
-        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+        self.assertTrue(await asyncio.to_thread(entered.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
         caller.cancel()
         await asyncio.sleep(0)
         caller.cancel()
@@ -2881,11 +2882,10 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(snapshot_export.SnapshotExportBusyError):
             await coordinator.run(key="replacement", retained_bytes=1, work=work)
         release.set()
-        self.assertTrue(await asyncio.to_thread(finished.wait, 1))
-        for _ in range(100):
-            if coordinator.pending_key_count == 0:
-                break
-            await asyncio.sleep(0)
+        self.assertTrue(await asyncio.to_thread(finished.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
+        # The executor reports the finished worker to the loop from its own
+        # thread, so wait for the release rather than a fixed loop count (#1177).
+        await wait_bounds.wait_until(lambda: coordinator.pending_key_count == 0)
         self.assertEqual(coordinator.pending_key_count, 0)
         self.assertEqual(coordinator.active_count, 0)
 
@@ -2897,7 +2897,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
 
         def worker() -> None:
             entered.set()
-            release.wait(timeout=2)
+            release.wait(timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
             raise RuntimeError("synthetic late export failure")
 
         async def work() -> None:
@@ -2910,7 +2910,7 @@ class SnapshotExportPendingWorkTests(unittest.IsolatedAsyncioTestCase):
             caller = asyncio.create_task(
                 coordinator.run(key="late-failure", retained_bytes=1, work=work)
             )
-            self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+            self.assertTrue(await asyncio.to_thread(entered.wait, wait_bounds.HANG_TIMEOUT_SECONDS))
             operation = next(iter(coordinator._pending.values())).task
             self.assertIsNotNone(operation)
             caller.cancel()
