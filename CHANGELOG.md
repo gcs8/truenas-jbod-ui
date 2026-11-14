@@ -30,6 +30,27 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A failed history collection pass now logs which stage failed, the source
+  failure kind and scope, and SQLite's error code, name and coarse class
+  (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
+  paths or host names (#1172).
+- A background inventory refresh that another enclosure's newer refresh
+  overtakes while it saves bay details now ends quietly as superseded, as
+  #928 intended, instead of logging "Background snapshot refresh failed" at
+  ERROR many times a day; the stale view stays and the next poll refreshes
+  it. Busy refusals now name their reason in the log, and the new
+  `inventory_background_snapshot_refreshes_total` metric counts each
+  background refresh by outcome and reason (#1176).
+- Quieted repeated log lines: smartctl status bits (such as exit 4 or 64) no
+  longer log as failed SSH commands and are kept on the SMART result instead,
+  logging once per device and status; channel-limit changes log once per
+  change with paramiko's per-channel errors lowered to debug; config.yaml
+  key warnings log once per file change; and identical command failures are
+  summarized with a count. Recovery resets remembered failures, SSH log keys
+  use fixed-size digests with idle expiry, and oversized SMART paths are
+  refused. SMART read metadata survives enrichment without implying available
+  measurements; config warning generations do not expand YAML aliases.
+  Real failures still log (#1174).
 - Gave the history collector's fresh SMART reads and forced inventory and
   storage-view reads their own deadline, `HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS`
   (default 120 s, 60-900; the larger of it and `HISTORY_REQUEST_TIMEOUT_SECONDS`

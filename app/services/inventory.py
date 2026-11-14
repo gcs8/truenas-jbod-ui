@@ -56,6 +56,7 @@ from app.models.domain import (
     SystemLocatorStatusView,
 )
 from app.metrics import (
+    observe_inventory_background_snapshot_refresh,
     observe_inventory_cache_sizes,
     observe_inventory_snapshot_build,
     observe_inventory_snapshot_request,
@@ -185,6 +186,7 @@ from app.services.ssh_probe import (
     redact_ssh_command,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
@@ -504,10 +506,13 @@ STABLE_SMART_DETAIL_FIELDS = (
     "attached_sas_address",
     "negotiated_link_rate",
 )
+# smartctl exit metadata describes the read, not a SMART measurement, so it
+# must not make a summary count as available (#1171).
+SMART_SUMMARY_READ_METADATA_FIELDS = frozenset({"smartctl_exit_status", "smartctl_status_flags"})
 SMART_SUMMARY_VALUE_FIELDS = tuple(
     field_name
     for field_name in SmartSummaryView.model_fields
-    if field_name not in {"available", "message"}
+    if field_name not in {"available", "message", *SMART_SUMMARY_READ_METADATA_FIELDS}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
@@ -1185,18 +1190,30 @@ class SplitEnclosureError(UnknownEnclosureError):
 
 
 class SnapshotStateBusyError(Exception):
-    """Raised when every bounded snapshot-state entry is active."""
+    """A snapshot request could not be served or published safely right now.
 
-    def __init__(self) -> None:
+    ``reason`` names the branch that refused, for logs and metrics only; the
+    public message stays the same (#1169).
+    """
+
+    reason = "busy"
+
+    def __init__(self, reason: str | None = None) -> None:
         super().__init__("The server is busy. Try again in a moment.")
+        if reason is not None:
+            self.reason = reason
 
 
 class SupersededSnapshotRefreshError(SnapshotStateBusyError):
     """A newer topology publication superseded this build and no current value can stand in."""
 
+    reason = "newer-topology"
+
 
 class SnapshotRefreshWaitTimeout(SnapshotStateBusyError):
     """A user request waited its full bound on a background refresh (#1125)."""
+
+    reason = "wait-timeout"
 
     def __init__(self, *, first_read: bool = False) -> None:
         Exception.__init__(
@@ -1822,6 +1839,16 @@ class InventoryService:
             cache_state=cache_state,
         )
 
+    def _observe_background_snapshot_refresh(self, outcome: str, reason: str) -> None:
+        labels = self._metrics_labels()
+        observe_inventory_background_snapshot_refresh(
+            service_name=str(labels["service_name"]),
+            system_id=str(labels["system_id"]),
+            platform=str(labels["platform"]),
+            outcome=outcome,
+            reason=reason,
+        )
+
     def _observe_inventory_snapshot_build(
         self,
         *,
@@ -2104,8 +2131,13 @@ class InventoryService:
                         topology_generation != self._snapshot_topology_generation
                         or self._snapshot_invalidated_since(cache_key, candidate_fence)
                     ):
-                        raise SnapshotStateBusyError()
+                        raise SnapshotStateBusyError(reason="discovery-invalidated")
                     discovery_candidate = discovered_snapshot
+
+                    def discovery_publication_is_fenced():
+                        return (topology_generation != self._snapshot_topology_generation
+                                or _ticket_abandoned(refresh_ticket)
+                                or self._snapshot_invalidated_since(cache_key, candidate_fence))
 
                     def discovery_publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
@@ -2123,10 +2155,11 @@ class InventoryService:
                             and discovery_publication_is_current()):
                         # Discovery details belong to this candidate, not merely
                         # to the canonical options learned before admission.
-                        for commit_details in discovery_detail_commits:
-                            await commit_details(discovery_publication_is_current)
-                        if not discovery_publication_is_current():
-                            raise SnapshotStateBusyError()
+                        await self._commit_snapshot_details(
+                            discovery_detail_commits,
+                            discovery_publication_is_current,
+                            discovery_publication_is_fenced,
+                        )
                     discovered_snapshot, published = self._publish_snapshot_locked(
                         cache_key,
                         discovered_snapshot,
@@ -2184,7 +2217,7 @@ class InventoryService:
                     topology_generation != self._snapshot_topology_generation
                     and self._snapshot_invalidated_since(cache_key, invalidation_fence)
                 ):
-                    raise SnapshotStateBusyError()
+                    raise SnapshotStateBusyError(reason="invalidated")
                 if not force_refresh and cached and now < cache_until:
                     self._touch_snapshot_key(cache_key)
                     add_perf_metadata(snapshot_cache="hit-after-wait", snapshot_cache_key=cache_key)
@@ -2223,7 +2256,7 @@ class InventoryService:
                         _snapshot_build_source_publications.reset(source_token)
                         _snapshot_detail_commits.reset(detail_token)
                     if retry_bundle is not None and retry_generation != self._source_bundle_generation:
-                        raise SnapshotStateBusyError()
+                        raise SnapshotStateBusyError(reason="source-invalidated")
                     # A background warm-up can collect S2 while this forced
                     # request is correlating S1. Re-correlate once from the exact
                     # published S2, never publish S1 or start another source flight.
@@ -2252,10 +2285,10 @@ class InventoryService:
                 if _background_refresh_abandoned():
                     # Neither publish nor learn topology from a refresh past
                     # its deadline that finished late (#1125).
-                    raise SnapshotStateBusyError()
+                    raise SnapshotStateBusyError(reason="abandoned")
                 topology_changed = topology_generation != self._snapshot_topology_generation
                 if topology_changed and self._snapshot_invalidated_since(cache_key, invalidation_fence):
-                    raise SnapshotStateBusyError()
+                    raise SnapshotStateBusyError(reason="invalidated")
                 self._observe_inventory_snapshot_build(
                     trigger=refresh_trigger,
                     snapshot=snapshot,
@@ -2328,8 +2361,14 @@ class InventoryService:
                         or self._snapshot_invalidated_since(cache_key, invalidation_fence)
                         or self._snapshot_invalidated_since(publication_key, invalidation_fence)
                     ):
-                        raise SnapshotStateBusyError()
+                        raise SnapshotStateBusyError(reason="invalidated")
                     candidate = snapshot
+
+                    def publication_is_fenced():
+                        return (topology_generation != self._snapshot_topology_generation
+                                or _ticket_abandoned(refresh_ticket)
+                                or self._snapshot_invalidated_since(cache_key, invalidation_fence)
+                                or self._snapshot_invalidated_since(publication_key, invalidation_fence))
 
                     def publication_is_current():
                         return (topology_generation == self._snapshot_topology_generation
@@ -2348,10 +2387,9 @@ class InventoryService:
                         # Observe only an eligible view while holding its actual
                         # destination lock. Retain every writer through caller
                         # cancellation and recheck at the final file commit.
-                        for commit_details in detail_commits:
-                            await commit_details(publication_is_current)
-                        if not publication_is_current():
-                            raise SnapshotStateBusyError()
+                        await self._commit_snapshot_details(
+                            detail_commits, publication_is_current, publication_is_fenced,
+                        )
                     snapshot, published = self._publish_snapshot_locked(
                         publication_key,
                         snapshot,
@@ -2381,6 +2419,32 @@ class InventoryService:
             return CacheResult(snapshot, cache_state)
         finally:
             self._finish_snapshot_activity(cache_key)
+
+    @staticmethod
+    async def _commit_snapshot_details(
+        detail_commits: list[Callable[[Callable[[], bool]], Awaitable[None]]],
+        is_current: Callable[[], bool],
+        is_fenced: Callable[[], bool],
+    ) -> None:
+        """Run a candidate's detail commits; leave a supersession to publication.
+
+        A newer publication (another enclosure's canonical topology, or a newer
+        value for this key) can land while the details save in a worker thread.
+        That is the supersession `_publish_snapshot_locked` already resolves:
+        it never publishes this candidate, serves a current value that can stand
+        in, and otherwise raises `SupersededSnapshotRefreshError`. Only an
+        invalidation, a topology change or an abandoned refresh (a fence), or a
+        detail-specific refusal while still current, stays a plain busy (#1169).
+        """
+        try:
+            for commit_details in detail_commits:
+                await commit_details(is_current)
+        except SnapshotStateBusyError:
+            if is_current() or is_fenced():
+                raise
+            return
+        if not is_current() and is_fenced():
+            raise SnapshotStateBusyError(reason="fenced-during-detail-commit")
 
     def _snapshot_state_keys(self) -> set[str]:
         return (
@@ -2545,7 +2609,7 @@ class InventoryService:
     ) -> tuple[InventorySnapshot, bool]:
         if _background_refresh_abandoned():
             # Past its deadline a refresh may finish late; never publish it (#1125).
-            raise SnapshotStateBusyError()
+            raise SnapshotStateBusyError(reason="abandoned")
         if self._snapshot_published_sequence.get(cache_key, -1) > request_sequence:
             current = self._cache.get(cache_key)
             if current is not None and self._snapshot_meets_source_requirement(
@@ -2554,7 +2618,7 @@ class InventoryService:
             ):
                 self._touch_snapshot_key(cache_key)
                 return current, False
-            raise SnapshotStateBusyError()
+            raise SnapshotStateBusyError(reason="newer-publication-unusable")
         if not self._publication_not_superseded(
             request_sequence,
             snapshot,
@@ -2677,7 +2741,7 @@ class InventoryService:
                 None,
             )
             if victim is None:
-                raise SnapshotStateBusyError()
+                raise SnapshotStateBusyError(reason="state-full")
             self._remove_snapshot_state_key(victim)
         self._touch_snapshot_key(cache_key)
 
@@ -2718,7 +2782,7 @@ class InventoryService:
                         _snapshot_detail_commits.reset(detail_token)
                     if _background_refresh_abandoned():
                         # Learn nothing from a refresh past its deadline (#1125).
-                        raise SnapshotStateBusyError()
+                        raise SnapshotStateBusyError(reason="abandoned")
                     if generation != self._snapshot_topology_generation:
                         continue
                     discovered_snapshot = candidate
@@ -4656,7 +4720,7 @@ class InventoryService:
                 # Never label a pre-mutation observation fresh. Reject this
                 # attempt; the next caller recollects under the same single flight.
                 # An abandoned refresh's late read is never published (#1125).
-                raise SnapshotStateBusyError()
+                raise SnapshotStateBusyError(reason="source-invalidated")
             if bundle.raw_data.enclosure_query_failed and previous_bundle is not None:
                 previous_api = previous_bundle.sources.get("api")
                 if previous_api is not None and previous_api.enabled and previous_bundle.raw_data.enclosures:
@@ -5925,6 +5989,8 @@ class InventoryService:
             if source_bundle is None and joined_stale_read:
                 source_bundle = await _await_retained(self._schedule_background_source_bundle_refresh())
             if source_bundle is None:
+                # The source refresh already logged its own failure.
+                self._observe_background_snapshot_refresh("source-unavailable", "source-refresh-failed")
                 return
             minimum_source_publication = source_bundle.publication
             if (
@@ -5934,26 +6000,34 @@ class InventoryService:
                 and self._snapshot_meets_source_requirement(cache_key, minimum_source_publication)
             ):
                 logger.debug("Background snapshot refresh reused newer publication for %s.", cache_key)
+                self._observe_background_snapshot_refresh("reused", "newer-publication")
                 return
-            await self._get_snapshot_result(
+            result = await self._get_snapshot_result(
                 force_refresh=True,
                 selected_enclosure_id=None if default_selection or cache_key == SNAPSHOT_NO_ENCLOSURE_KEY else cache_key,
                 force_source_refresh=False,
                 minimum_source_publication=minimum_source_publication,
             )
-        except SupersededSnapshotRefreshError:
-            # Another enclosure published newer topology first and the cached
-            # value cannot stand in; the next request schedules another
-            # refresh. Not an error (#928).
-            logger.debug("Background snapshot refresh for %s was superseded.", cache_key)
-        except SnapshotStateBusyError:
+            self._observe_background_snapshot_refresh("completed", str(getattr(result, "cache_state", "unknown")))
+        except SupersededSnapshotRefreshError as exc:
+            # Another enclosure published newer topology first, possibly while
+            # this build saved its bay details, and the cached value cannot
+            # stand in. No work is lost: the stale value stays public and the
+            # next request schedules another refresh from the newer sources.
+            # Not an error (#928, #1169).
+            logger.debug("Background snapshot refresh for %s was superseded (reason=%s).", cache_key, exc.reason)
+            self._observe_background_snapshot_refresh("superseded", exc.reason)
+        except SnapshotStateBusyError as exc:
             if not _background_refresh_abandoned():
-                logger.exception("Background snapshot refresh failed for %s", cache_key)
+                logger.exception("Background snapshot refresh failed for %s (reason=%s)", cache_key, exc.reason)
+                self._observe_background_snapshot_refresh("busy", exc.reason)
             else:
                 # Already reported when it was abandoned (#1125).
                 logger.info("Discarded the late result of an abandoned snapshot refresh for %s.", cache_key)
+                self._observe_background_snapshot_refresh("abandoned", exc.reason)
         except Exception:  # noqa: BLE001 - background refreshes should stay best-effort.
             logger.exception("Background snapshot refresh failed for %s", cache_key)
+            self._observe_background_snapshot_refresh("failed", "unexpected")
         finally:
             _snapshot_background_refresh.reset(background_token)
 
@@ -6089,7 +6163,7 @@ class InventoryService:
             keys = [self._smart_cache_key(slot) for slot in slots]
             with self._smart_persistence_lock:
                 if any(key[:4] in self._snapshot_detail_owners for key in keys):
-                    raise SnapshotStateBusyError()
+                    raise SnapshotStateBusyError(reason="detail-owner-conflict")
                 for key in keys:
                     identities[key[:4]] = self._smart_disk_identities.get(key[:4])
                     generations.append((key, self._smart_cache_generation_token(key)))
@@ -6101,7 +6175,7 @@ class InventoryService:
                 # A refused write, newer identity owner, invalidation or cancelled
                 # waiter cannot observe this candidate. No rollback is needed.
                 if not ownership_is_current():
-                    raise SnapshotStateBusyError()
+                    raise SnapshotStateBusyError(reason="detail-not-current")
                 # Observe the admitted, backfilled view on the loop. There is no
                 # suspension between this ownership check and observation.
                 self._mark_slot_identity_states(slots)
@@ -7912,7 +7986,13 @@ class InventoryService:
             ]
         ] = []
         for candidate in candidates:
+            # Remote inventory names are not trusted. Refuse oversized paths
+            # before building commands or passing identifiers to log limiters.
+            if len(candidate) > 4096:
+                continue
             device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            if len(device_path.encode("utf-8", "surrogatepass")) > 4096:
+                continue
             for smartctl_binary in self._smartctl_binary_candidates():
                 command_parts = ["sudo", "-n", smartctl_binary]
                 if device_type:
@@ -8015,6 +8095,13 @@ class InventoryService:
                     if result is None:
                         continue
                     summary = parse_primary(result)
+                    if summary is not None:
+                        # Keep smartctl's status bits on the result: they are
+                        # SMART data, not a failed SSH command (#1171).
+                        summary.smartctl_exit_status = result.exit_code
+                        summary.smartctl_status_flags = (
+                            None if result.exit_code is None else smartctl_exit_flags(result.exit_code)
+                        )
                     if summary is None:
                         detail = (
                             result.stderr.strip()
@@ -17879,7 +17966,7 @@ class InventoryService:
         primary: SmartSummaryView,
         supplement: SmartSummaryView,
     ) -> SmartSummaryView:
-        for field_name in SMART_SUMMARY_VALUE_FIELDS:
+        for field_name in (*SMART_SUMMARY_VALUE_FIELDS, *SMART_SUMMARY_READ_METADATA_FIELDS):
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
 
