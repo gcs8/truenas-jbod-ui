@@ -88,6 +88,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
+- The self-hosted Renovate run now owns Python dependency updates: it bumps a
+  pin in `requirements.txt` and regenerates `requirements.lock` in the same
+  commit. Dependabot no longer opens Python updates (#TBD).
 - Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
   tags unless it runs from `main` or the matching release tag, so a branch
   build cannot replace the image a deployment follows; manual inputs are split
