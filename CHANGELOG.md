@@ -71,6 +71,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   query fallback, and prevented restore races from caching replaced-file counts
   (#1175).
 
+### Internal
+
+- Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
+  tags unless it runs from `main` or the matching release tag, so a branch
+  build cannot replace the image a deployment follows; branch, sha and custom
+  tags are unchanged (#1179).
+
 ## v0.24.0-rc.1 - 2026-11-11
 
 This release candidate includes the changes since `v0.24.0-beta.8` below.
