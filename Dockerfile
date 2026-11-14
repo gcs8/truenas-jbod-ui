@@ -15,12 +15,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
+COPY requirements.lock /app/requirements.lock
 RUN apt-get update \
     # nfs-common provides mount.nfs for opt-in NFS archive targets
     # (docker-compose.backup-nfs.yml); about 1.1 MB plus small libraries.
     && apt-get install -y --no-install-recommends 7zip nfs-common \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r /app/requirements.txt
+    # requirements.lock pins every package, direct and transitive, by version
+    # and hash, so the image never resolves a dependency at build time. It is
+    # generated from requirements.txt (CONTRIBUTING.md, "Things that must move
+    # together").
+    && pip install --no-cache-dir --require-hashes -r /app/requirements.lock
 
 COPY app /app/app
 COPY history_service /app/history_service

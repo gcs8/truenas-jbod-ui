@@ -598,6 +598,64 @@ class ContainerResourceContractTests(unittest.TestCase):
                 )
         self.assertNotIn("COPY scripts /app/scripts", dockerfile)
 
+    @staticmethod
+    def _locked_requirements() -> dict[str, tuple[str, int]]:
+        """Each locked package: normalized name to (version, sha256 hash count)."""
+
+        text = (REPO_ROOT / "requirements.lock").read_text(encoding="utf-8")
+        locked: dict[str, tuple[str, int]] = {}
+        for entry in re.split(r"\n(?=\S)", text.replace("\\\n", " ")):
+            entry = "\n".join(line for line in entry.splitlines() if not line.lstrip().startswith("#"))
+            if not entry.strip():
+                continue
+            match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)", entry)
+            if match is None:
+                raise AssertionError(f"requirements.lock entry is not an exact pin: {entry.split()[0]}")
+            name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+            if name in locked:
+                raise AssertionError(f"requirements.lock pins {name} more than once")
+            locked[name] = (match.group(2), len(re.findall(r"--hash=sha256:[0-9a-f]{64}\b", entry)))
+        return locked
+
+    def test_production_image_installs_only_hash_locked_requirements(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn("COPY requirements.lock /app/requirements.lock", dockerfile)
+        installs = re.findall(r"pip install[^\n&]*", dockerfile)
+        self.assertEqual(
+            [install.strip() for install in installs],
+            ["pip install --no-cache-dir --require-hashes -r /app/requirements.lock"],
+        )
+
+    def test_requirements_lock_pins_every_package_with_a_hash(self) -> None:
+        locked = self._locked_requirements()
+
+        self.assertGreater(len(locked), 12)
+        for name, (_version, hash_count) in locked.items():
+            with self.subTest(package=name):
+                self.assertGreaterEqual(hash_count, 1)
+
+    def test_requirements_lock_matches_every_direct_requirement(self) -> None:
+        locked = self._locked_requirements()
+        direct = [
+            line.strip()
+            for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+        self.assertTrue(direct)
+        for requirement in direct:
+            with self.subTest(requirement=requirement):
+                match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)", requirement)
+                self.assertIsNotNone(match, "requirements.txt entries must be exact pins")
+                name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+                self.assertIn(name, locked, "regenerate requirements.lock (see its first lines)")
+                self.assertEqual(
+                    locked[name][0],
+                    match.group(2),
+                    "requirements.lock is stale; regenerate it with the command in its first lines",
+                )
+
     def test_segmented_history_runbook_uses_compose_cli_invocations(self) -> None:
         runbook = (REPO_ROOT / "docs/SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
         history_command_prefix = "docker compose run --rm --entrypoint python enclosure-history "
