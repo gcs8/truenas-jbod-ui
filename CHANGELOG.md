@@ -62,12 +62,6 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 
-### Internal
-
-- Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
-  tags unless it runs from `main` or the matching release tag, so a branch
-  build cannot replace the image a deployment follows; branch, sha and custom
-  tags are unchanged (#1179).
 ### Performance
 
 - The admin orphaned-history preview kept exact per-system hot-database
@@ -76,6 +70,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   chunks, capped retained chunks and per-system count bytes with an exact full
   query fallback, and prevented restore races from caching replaced-file counts
   (#1175).
+
+### Internal
+
+- Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
+  tags unless it runs from `main` or the matching release tag, so a branch
+  build cannot replace the image a deployment follows; branch, sha and custom
+  tags are unchanged (#1179).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
