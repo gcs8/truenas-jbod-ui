@@ -134,20 +134,49 @@ class AtomicWriteHelperTests(unittest.TestCase):
     def test_requested_mode_is_never_exceeded_when_chmod_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             target = Path(raw) / "id_example"
-            seen: list[int] = []
+            events: list[tuple[str, int, int]] = []
+
+            def refuse_chmod(descriptor: int, mode: int) -> None:
+                events.append(("fchmod", mode, stat.S_IMODE(os.fstat(descriptor).st_mode)))
+                raise PermissionError(errno.EPERM, "refused")
 
             def write(handle) -> None:
-                seen.append(stat.S_IMODE(os.fstat(handle.fileno()).st_mode))
+                events.append(("write", 0o640, stat.S_IMODE(os.fstat(handle.fileno()).st_mode)))
                 handle.write(b"new")
 
-            previous = os.umask(0o022)
+            previous = os.umask(0o077)
             try:
-                with patch("app.services.atomic_write.os.fchmod", side_effect=PermissionError(errno.EPERM, "refused")):
+                with patch("app.services.atomic_write.os.fchmod", side_effect=refuse_chmod):
                     write_atomically(target, write, binary=True, mode=0o640)
             finally:
                 os.umask(previous)
 
-            self.assertEqual(seen, [0o640])
+            self.assertEqual(events, [("fchmod", 0o640, 0o600), ("write", 0o640, 0o600)])
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX path semantics")
+    def test_requested_mode_never_reuses_or_follows_existing_temporary_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            target = directory / "id_example"
+            occupied = directory / "occupied.tmp"
+            occupied.write_bytes(b"occupied")
+            os.chmod(occupied, 0o666)
+            symlink_target = directory / "symlink-target"
+            symlink_target.write_bytes(b"guard")
+            symlink = directory / "preplanted-symlink.tmp"
+            symlink.symlink_to(symlink_target)
+            fresh = directory / "fresh.tmp"
+            candidates = iter((occupied, symlink, fresh))
+
+            with patch("app.services.atomic_write.temporary_path_for", side_effect=lambda _path: next(candidates)):
+                write_atomically(target, lambda handle: handle.write(b"secret"), binary=True, mode=0o640)
+
+            self.assertEqual(occupied.read_bytes(), b"occupied")
+            self.assertEqual(stat.S_IMODE(occupied.stat().st_mode), 0o666)
+            self.assertTrue(symlink.is_symlink())
+            self.assertEqual(symlink_target.read_bytes(), b"guard")
+            self.assertEqual(target.read_bytes(), b"secret")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
 
     def test_requested_mode_keeps_the_text_and_failure_contract(self) -> None:
