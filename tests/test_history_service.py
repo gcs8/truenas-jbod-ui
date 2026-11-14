@@ -10832,7 +10832,8 @@ class HistoryCollectorTests(unittest.TestCase):
             collector._fetch_json.await_args.kwargs["method"],  # type: ignore[attr-defined]
             "POST",
         )
-        self.assertIsNone(collector._fetch_json.await_args.kwargs["timeout_seconds"])  # type: ignore[attr-defined]
+        # #1168: fresh reads get their own deadline instead of the generic one.
+        self.assertEqual(collector._fetch_json.await_args.kwargs["timeout_seconds"], 120)  # type: ignore[attr-defined]
 
     def test_fetch_smart_summaries_uses_short_timeout_for_cached_batch(self) -> None:
         collector = HistoryCollector(

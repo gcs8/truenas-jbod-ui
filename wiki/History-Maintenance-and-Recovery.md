@@ -74,6 +74,18 @@ service logs.
 | `Cleanup resumes by` | The deadline after which retention prunes anyway. |
 | `Full refresh available` | When the next manual full refresh is allowed, instead of a refusal after the fact. |
 
+The collector waits `HISTORY_REQUEST_TIMEOUT_SECONDS` (default 45) for
+ordinary reads from the main UI. Fresh SMART reads and forced inventory or
+storage-view reads wait on the appliance itself and get their own deadline,
+`HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS` (default 120, 60 to 900), because a
+large CORE system can take over a minute to answer one. The larger of the two
+is used, so an older `.env` that still sets `HISTORY_REQUEST_TIMEOUT_SECONDS=20`
+does not cut fresh reads short. When a fresh read times out, the log says
+`Skipping history SMART metrics for <shelf>: ... timed out after 120s`, and that
+shelf gets no second fresh read for one more deadline while the main UI may
+still be working on the first; a forced inventory read of that system or shelf
+reads the cached inventory instead until then.
+
 The history service `/healthz` answers HTTP 503 with `status: down` only when
 the history database could not be opened at startup (for example an unwritable
 `./history` folder); `reason` carries the plain line from the log. Otherwise it
