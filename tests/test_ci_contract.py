@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -1316,6 +1317,17 @@ class RenovatePolicyContractTests(unittest.TestCase):
                     self.rules, "ruff", update_type, "pypi", manager="pip_requirements", file_name="requirements-dev.txt"
                 )
                 self.assertNotIn("enabled", dev)
+
+    def test_uv_lock_resolution_refuses_dependency_build_code(self) -> None:
+        # Hashes are emitted after metadata resolution. A PEP 517 sdist can
+        # run its backend before any dependency PR is available for review.
+        # Renovate 44.206.0 rejects --no-build in the command header, so uv
+        # must pick up this repository policy while rerunning that command.
+        policy_path = ROOT / "uv.toml"
+        self.assertTrue(policy_path.is_file(), "uv.toml must refuse source builds during lock resolution")
+        policy = tomllib.loads(policy_path.read_text(encoding="utf-8"))
+        self.assertIs(policy.get("no-build"), True)
+        self.assertIs(policy.get("pip", {}).get("no-build", True), True)
 
     def test_dependabot_no_longer_updates_python(self) -> None:
         config = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))

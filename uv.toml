@@ -1,0 +1,4 @@
+# Lock resolution runs in the credential-bearing Renovate worker before PR review.
+# Refuse sdists that need build-backend execution to obtain their metadata.
+# Renovate 44.206.0 cannot accept --no-build in the pip-compile command header.
+no-build = true
