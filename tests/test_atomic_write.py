@@ -106,6 +106,66 @@ class AtomicWriteHelperTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), mode)
 
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_requested_mode_applies_from_creation_whatever_the_umask_is(self) -> None:
+        for umask in (0o000, 0o022, 0o077):
+            with self.subTest(umask=f"{umask:03o}"), tempfile.TemporaryDirectory() as raw:
+                target = Path(raw) / "id_example"
+                target.write_bytes(b"old")
+                os.chmod(target, 0o666)
+                seen: list[int] = []
+
+                def write(handle) -> None:
+                    seen.append(stat.S_IMODE(os.fstat(handle.fileno()).st_mode))
+                    handle.write(b"new")
+
+                previous = os.umask(umask)
+                try:
+                    write_atomically(target, write, binary=True, mode=0o640)
+                finally:
+                    os.umask(previous)
+
+                self.assertEqual(seen, [0o640])
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+                self.assertEqual(target.read_bytes(), b"new")
+                self.assertEqual(_temporaries(Path(raw)), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_requested_mode_is_never_exceeded_when_chmod_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "id_example"
+            seen: list[int] = []
+
+            def write(handle) -> None:
+                seen.append(stat.S_IMODE(os.fstat(handle.fileno()).st_mode))
+                handle.write(b"new")
+
+            previous = os.umask(0o022)
+            try:
+                with patch("app.services.atomic_write.os.fchmod", side_effect=PermissionError(errno.EPERM, "refused")):
+                    write_atomically(target, write, binary=True, mode=0o640)
+            finally:
+                os.umask(previous)
+
+            self.assertEqual(seen, [0o640])
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+
+    def test_requested_mode_keeps_the_text_and_failure_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "note.txt"
+            self.assertTrue(write_atomically(target, lambda handle: handle.write("one\n"), newline="\n", mode=0o600))
+            self.assertEqual(target.read_bytes(), b"one\n")
+
+            def fail(handle) -> None:
+                handle.write("partial")
+                raise RuntimeError("stop")
+
+            with self.assertRaises(RuntimeError):
+                write_atomically(target, fail, mode=0o600)
+            self.assertEqual(target.read_bytes(), b"one\n")
+            self.assertEqual(_temporaries(Path(raw)), [])
+
+
 class ConcurrentStoreWriterTests(unittest.TestCase):
     """Separate store instances share no lock, as separate admin requests do."""
 
