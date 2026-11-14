@@ -115,17 +115,19 @@ class RepeatedLogLimiterTests(unittest.TestCase):
 
     def test_remote_key_retention_stays_within_allocation_budget(self) -> None:
         usage = _allocation_probe('''
-            import gc, json, tracemalloc
+            import gc, json
+            from tests import heap_probe
             from app.log_limiter import RepeatedLogLimiter
             limiter = RepeatedLogLimiter(repeat_interval_seconds=None)
-            tracemalloc.start()
+            heap_probe.start()
             for index in range(64):
                 device = "/dev/" + str(index) + "x" * 32768
                 limiter.admit(("host.example.test", device), 8)
                 limiter.admit(("host.example.test", "smartctl -x " + device), 2)
             del device
             gc.collect()
-            current, peak = tracemalloc.get_traced_memory()
+            current, peak = heap_probe.get_traced_memory()
+            heap_probe.stop()
             print(json.dumps({"current": current, "peak": peak}))
         ''')
         self.assertLess(usage["current"], 256 * 1024, usage)
@@ -431,7 +433,8 @@ class LegacyConfigWarningTests(unittest.TestCase):
 
     def test_alias_generation_stays_within_real_allocation_budget(self) -> None:
         usage = _allocation_probe('''
-            import json, tempfile, tracemalloc
+            import json, tempfile
+            from tests import heap_probe
             from pathlib import Path
             import yaml
             from app import config
@@ -445,9 +448,10 @@ class LegacyConfigWarningTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.yaml"
                 path.write_text(source, encoding="utf-8")
-                tracemalloc.start()
+                heap_probe.start()
                 config._warn_unknown_config_keys_once(path, parsed)
-                current, peak = tracemalloc.get_traced_memory()
+                current, peak = heap_probe.get_traced_memory()
+                heap_probe.stop()
             print(json.dumps({"current": current, "peak": peak}))
         ''')
         self.assertLess(usage["peak"], 2 * 1024 * 1024, usage)
