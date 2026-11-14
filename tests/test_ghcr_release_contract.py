@@ -27,6 +27,7 @@ def _run_release_step(
     manual_ref: str | None = None,
     input_tags: str = "",
     make_latest: bool = False,
+    fixture_files: tuple[str, ...] = (),
 ) -> tuple[int, str, list[str], bool]:
     """Run one publish-workflow step's own bash for a ``release`` event.
 
@@ -39,6 +40,8 @@ def _run_release_step(
     step = next(s for s in workflow["jobs"]["publish"]["steps"] if s.get("name") == name)
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
+        for filename in fixture_files:
+            (root / filename).touch()
         stub = root / "bin" / "python"
         stub.parent.mkdir()
         stub.write_text(f'#!/bin/sh\necho "$@" > "{root}/validator-called"\n', encoding="utf-8")
@@ -107,7 +110,7 @@ class GHCRReleaseContractTests(unittest.TestCase):
             "Resolve publish tags", "", False,
             manual_ref=ref, input_tags=input_tags, make_latest=make_latest,
         )
-        return code, out, [tag.rsplit(":", 1)[1] for tag in tags]
+        return code, out, [tag.removeprefix("ghcr.io/gcs8/truenas-jbod-ui:") for tag in tags]
 
     def test_manual_branch_run_publishes_only_its_branch_and_sha_tags(self) -> None:
         code, _out, tags = self._run_manual("refs/heads/fix/example-change")
@@ -176,6 +179,114 @@ class GHCRReleaseContractTests(unittest.TestCase):
                 self.assertEqual(tags, [])
                 self.assertIn("Refusing to publish the reserved tag", out)
                 self.assertIn(f"from {ref}.", out)
+
+    def test_manual_dev_rejects_incomplete_and_suffixed_release_ref_prefixes(self) -> None:
+        for ref in (
+            "refs/tags/v0.24.0notes",
+            "refs/tags/v0.24.0/feature",
+            "refs/tags/v0.24",
+            "refs/tags/v0.24.0-",
+            "refs/tags/v0.24.0-rc..1",
+            "refs/tags/0.24.0",
+            "refs/heads/v0.24.0",
+            "refs/heads/v0.24.0-rc.1",
+            "refs/heads/main/feature",
+        ):
+            with self.subTest(ref=ref):
+                code, out, tags = self._run_manual(ref, input_tags="qa-one, dev")
+                self.assertNotEqual(code, 0)
+                self.assertEqual(tags, [])
+                self.assertIn("Refusing to publish the reserved tag 'dev'", out)
+
+        for ref in (
+            "refs/tags/v0.24.0-rc.1",
+            "refs/tags/v0.24.0-beta.2",
+            "refs/tags/v0.24.0-beta-one.2",
+            "refs/tags/v0.24.0+build.1",
+        ):
+            with self.subTest(ref=ref):
+                code, out, tags = self._run_manual(ref, input_tags="dev")
+                self.assertEqual((code, tags), (0, ["dev"]), out)
+
+    def test_manual_latest_rejects_prereleases_and_nonstable_refs(self) -> None:
+        for ref in (
+            "refs/tags/v0.24.0-rc.1",
+            "refs/tags/v0.24.0-beta.1",
+            "refs/tags/v0.24.0+build.1",
+            "refs/tags/v0.24.0notes",
+            "refs/tags/0.24.0",
+            "refs/tags/main",
+            "refs/heads/v0.24.0",
+        ):
+            for input_tags, make_latest in (("qa, latest", False), ("qa", True)):
+                with self.subTest(ref=ref, input_tags=input_tags, make_latest=make_latest):
+                    code, out, tags = self._run_manual(ref, input_tags, make_latest)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(tags, [])
+                    self.assertIn("Refusing to publish the reserved tag 'latest'", out)
+
+    def test_manual_version_aliases_require_the_full_matching_tag_ref(self) -> None:
+        for suffix in ("", "-rc.1", "-beta.2"):
+            names = [f"v0.24.0{suffix}", f"0.24.0{suffix}"]
+            for ref in (
+                f"refs/heads/v0.24.0{suffix}",
+                f"refs/tags/0.24.0{suffix}",
+                "refs/heads/main",
+                "refs/tags/v0.24.1",
+            ):
+                for name in names:
+                    with self.subTest(ref=ref, name=name):
+                        code, out, tags = self._run_manual(ref, input_tags=name)
+                        self.assertNotEqual(code, 0)
+                        self.assertEqual(tags, [])
+                        self.assertIn("Refusing to publish the reserved tag", out)
+            code, out, tags = self._run_manual(f"refs/tags/{names[0]}", input_tags=",".join(names))
+            self.assertEqual((code, tags), (0, names), out)
+
+    def test_manual_empty_and_separated_inputs_keep_defaults_and_deduplicate(self) -> None:
+        for input_tags in ("", " , , \t\n\r "):
+            with self.subTest(input_tags=input_tags):
+                code, out, tags = self._run_manual("refs/heads/fix/example-change", input_tags)
+                self.assertEqual((code, tags), (0, ["fix-example-change", "sha-0123456"]), out)
+        code, out, tags = self._run_manual(
+            "refs/heads/fix/example-change", "qa-one, qa-two\tsha-abc1234\nqa-one\rqa-three"
+        )
+        self.assertEqual((code, tags), (0, ["qa-one", "qa-two", "sha-abc1234", "qa-three"]), out)
+
+    def test_manual_input_tags_do_not_expand_checkout_filenames(self) -> None:
+        code, out, tags, _ = _run_release_step(
+            "Resolve publish tags", "", False, manual_ref="refs/heads/feature",
+            input_tags="qa-*", fixture_files=("qa-one", "qa-two"),
+        )
+        self.assertEqual((code, tags), (0, ["ghcr.io/gcs8/truenas-jbod-ui:qa-*"]), out)
+
+    def test_manual_input_tags_remain_literal_shell_data(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            marker = Path(scratch) / "injected"
+            for payload in (
+                f"$(touch${{IFS}}{marker})",
+                f"`touch${{IFS}}{marker}`",
+                f"qa;touch${{IFS}}{marker}",
+                f'qa\";touch${{IFS}}{marker};#',
+            ):
+                with self.subTest(payload=payload):
+                    code, out, tags = self._run_manual("refs/heads/feature", input_tags=payload)
+                    self.assertEqual((code, tags), (0, [payload]), out)
+                    self.assertFalse(marker.exists(), "image_tags executed as shell code")
+
+        workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+        publish = workflow["jobs"]["publish"]
+        self.assertIn("inputs.image_tags", publish["env"]["INPUT_TAGS"])
+        step = next(s for s in publish["steps"] if s.get("name") == "Resolve publish tags")
+        self.assertNotIn("${{", step["run"], "Pass inputs through env, never interpolate into bash")
+
+    def test_release_candidate_event_keeps_the_exact_release_tags_and_dev(self) -> None:
+        code, out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0-rc.1", prerelease=True)
+        self.assertEqual(
+            (code, tags),
+            (0, [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-rc.1", "0.24.0-rc.1", "dev")]),
+            out,
+        )
 
     def test_demo_gate_runs_for_stable_and_waits_for_a_prerelease(self) -> None:
         gate = "Require a public demo rebuilt for this release"

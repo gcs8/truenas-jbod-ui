@@ -114,8 +114,12 @@ jobs:
             fi
           else
             if [ -n "$INPUT_TAGS" ]; then
+              # Split only on input separators, never on checkout filenames.
               normalized="${INPUT_TAGS//,/ }"
-              for tag in $normalized; do
+              normalized="${normalized//$'\n'/ }"
+              normalized="${normalized//$'\r'/ }"
+              IFS=$' \t' read -r -a input_tags <<< "$normalized"
+              for tag in "${input_tags[@]}"; do
                 if [ -n "$tag" ]; then
                   tags+=("$image:$tag")
                 fi
@@ -145,7 +149,7 @@ jobs:
                   allowed=false
                 fi
               elif [ "$name" = "dev" ]; then
-                if [ "$GITHUB_REF" != "refs/heads/main" ] && [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                if [ "$GITHUB_REF" != "refs/heads/main" ] && [[ ! "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
                   allowed=false
                 fi
               elif [[ "$name" =~ ^v?[0-9]+\.[0-9]+ ]]; then

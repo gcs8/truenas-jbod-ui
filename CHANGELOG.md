@@ -75,8 +75,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
   tags unless it runs from `main` or the matching release tag, so a branch
-  build cannot replace the image a deployment follows; branch, sha and custom
-  tags are unchanged (#1179).
+  build cannot replace the image a deployment follows; manual inputs are split
+  without filename expansion, and branch, sha and custom tags are unchanged
+  (#1179).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
