@@ -123,6 +123,17 @@ The raw Uvicorn access log is disabled to avoid duplicate records with unnormali
 
 For an unhandled exception, the service writes an `http_request_error` record at `ERROR` immediately before the completion record. This error record contains the stack trace and the same request ID as the `500` response. The completion record remains free of stack traces.
 
+## History collection failures
+
+When a background history collection pass fails, the history sidecar logs `History collection pass failed` with `event=history_collection_failed` and these fields:
+
+- `failure_stage`: one of `pass_start`, `inventory_read`, `scope_enumeration`, `slot_state_write`, `smart_read`, `metric_write`, `backup`, `retention`, `completion`, or `post_pass_status` (the pass finished but reading its status or row counts afterwards failed)
+- `scope_id`: the saved system ID being recorded, when the stage belongs to one system
+- `source_error_kind`: for a main-UI request failure, such as `source_timeout` or `source_rejected`
+- `sqlite_errorcode`, `sqlite_errorname` and `sqlite_error_class`: for a SQLite error, its numeric code, its name (for example `SQLITE_BUSY`), and `busy_locked`, `full`, `io`, `corrupt` or `other`
+
+The record still omits the exception message, SQL text, file paths and host names.
+
 ## Ship logs to syslog
 
 To send container logs to a syslog receiver, create a local Compose override:

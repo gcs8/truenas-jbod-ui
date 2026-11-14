@@ -19,6 +19,12 @@ from typing import Any, Callable, Iterable, Iterator
 
 from app.services.storage_writability import host_repair_path
 from history_service.domain import MetricSample, SlotEvent, SlotStateRecord
+from history_service.hot_summary_counts import (
+    SUMMARY_TABLE_KEYS,
+    HotSystemSummaryCounts,
+    sqlite_max,
+    sqlite_order,
+)
 from history_service.operation_bounds import validate_store_scope_request
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
@@ -628,6 +634,8 @@ class HistoryStore:
         self._segment_reader_lock = threading.Lock()
         self._segment_reader_identity: tuple[int, int, int, int] | None = None
         self._segment_reader_cache: SegmentedHistoryReader | None = None
+        # Exact per-system hot counts, kept current without full rescans (#664).
+        self._hot_summary_counts = HotSystemSummaryCounts()
         # Deferred index builds and exact-count scans do not overlap (#1092).
         self._index_maintenance_condition = threading.Condition()
         self._index_maintenance_depth = 0
@@ -2841,8 +2849,11 @@ class HistoryStore:
 
     def restore_backup(self, source_path: str | Path) -> None:
         self._require_unsegmented_operation("v1 restore")
-        with history_write_lock(self.file_path, blocking=False):
-            self._restore_backup_locked(source_path)
+        try:
+            with history_write_lock(self.file_path, blocking=False):
+                self._restore_backup_locked(source_path)
+        finally:
+            self._hot_summary_counts.clear()
 
     @staticmethod
     def _backup_stamp(snapshot_label: str | None) -> str:
@@ -4349,11 +4360,71 @@ class HistoryStore:
         )
         segmented_reader = self._segmented_reader()
         if segmented_reader is not None:
-            return segmented_reader.list_history_system_summaries(normalized_excludes)
+            return segmented_reader.list_history_system_summaries(
+                normalized_excludes, hot_counts=self._hot_summary_counts
+            )
         if not self.file_path.exists():
             return []
+        opened_identity = self._hot_summary_counts.file_identity(self.file_path)
         with closing(self._connect()) as connection:
-            return self._list_history_system_summaries(connection, exclude_system_ids=normalized_excludes)
+            table_counts = self._hot_summary_counts.table_counts(
+                connection, self.file_path, opened_identity=opened_identity,
+            )
+        return self._summaries_from_table_counts(table_counts, exclude_system_ids=normalized_excludes)
+
+    @staticmethod
+    def _summaries_from_table_counts(
+        table_counts: dict[str, dict[str, tuple[int, Any]]],
+        *,
+        exclude_system_ids: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Shape per-table counts exactly as ``_list_history_system_summaries`` does.
+
+        That query excludes raw ids, takes ``MAX(system_label)`` over every
+        table, orders by raw id, then strips ids and drops blank ones.
+        """
+
+        excluded = set(exclude_system_ids)
+        merged: dict[str, dict[str, Any]] = {}
+        for table_name, key in SUMMARY_TABLE_KEYS:
+            for system_id, (count, label) in table_counts.get(table_name, {}).items():
+                if system_id in excluded:
+                    continue
+                entry = merged.setdefault(
+                    system_id,
+                    {
+                        "system_label": None,
+                        "tracked_slots": 0,
+                        "event_count": 0,
+                        "metric_sample_count": 0,
+                        "metric_rollup_count": 0,
+                    },
+                )
+                entry[key] += int(count)
+                entry["system_label"] = sqlite_max(entry["system_label"], label)
+        summaries: list[dict[str, Any]] = []
+        for raw_system_id in sorted(merged, key=sqlite_order):
+            system_id = str(raw_system_id or "").strip()
+            if not system_id:
+                continue
+            entry = merged[raw_system_id]
+            summaries.append(
+                {
+                    "system_id": system_id,
+                    "system_label": entry["system_label"],
+                    "tracked_slots": entry["tracked_slots"],
+                    "event_count": entry["event_count"],
+                    "metric_sample_count": entry["metric_sample_count"],
+                    "metric_rollup_count": entry["metric_rollup_count"],
+                    "total_rows": (
+                        entry["tracked_slots"]
+                        + entry["event_count"]
+                        + entry["metric_sample_count"]
+                        + entry["metric_rollup_count"]
+                    ),
+                }
+            )
+        return summaries
 
     def delete_system_history(self, system_id: str) -> dict[str, Any]:
         self._require_unsegmented_operation("system deletion")
@@ -4366,7 +4437,10 @@ class HistoryStore:
             summary["removed_system_ids"] = [normalized_system_id] if summary["total_rows"] else []
             return summary
 
-        return self._execute_write(operation)
+        try:
+            return self._execute_write(operation)
+        finally:
+            self._hot_summary_counts.clear()
 
     def purge_orphaned_history(
         self, valid_system_ids: list[str] | tuple[str, ...], *,
@@ -4392,7 +4466,10 @@ class HistoryStore:
             summary["removed_system_ids"] = orphan_ids
             return summary
 
-        return self._execute_write(operation)
+        try:
+            return self._execute_write(operation)
+        finally:
+            self._hot_summary_counts.clear()
 
     def adopt_system_history(
         self,
@@ -4519,7 +4596,12 @@ class HistoryStore:
                 "slot_state_conflicts": max(source_slot_count - max(inserted_slot_count, 0), 0),
             }
 
-        return self._execute_write(operation)
+        try:
+            return self._execute_write(operation)
+        finally:
+            # Adoption rewrites ids and labels in place, which the cached
+            # counts cannot detect.
+            self._hot_summary_counts.clear()
 
     def _execute_write(self, operation: Any, *, migration_lock_held: bool = False) -> Any:
         lock_context = (

@@ -26,6 +26,7 @@ from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
 from app.services.truenas_ws import MiddlewareCallLimiter, TrueNASRawData
 from tests import core_ses_fixtures as fx
+from tests import wait_bounds
 
 SHELF = "500cccc00000110"
 SYSTEM_ID = "synthetic-scale"
@@ -145,12 +146,10 @@ async def call_app(
     return start["status"], response_headers, content
 
 
-async def wait_until(condition, *, steps: int = 400) -> None:
-    for _ in range(steps):
-        if condition():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition was not reached")
+async def wait_until(condition) -> None:
+    # The save reaches its readback through worker-thread hops, so a fixed
+    # number of loop turns is not enough on a loaded host (#1177).
+    await wait_bounds.wait_until(condition)
 
 
 class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
@@ -200,7 +199,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         # A stale page read is served from cache and starts the page's own
         # background refresh, which is now reading the appliance.
         await self.service.get_snapshot(selected_enclosure_id=SHELF, allow_stale_cache=True)
-        await asyncio.wait_for(self.appliance.holding.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.holding.wait(), timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
 
         revision = editor_revision(self.service, 0)
         save = asyncio.create_task(call_app(
@@ -214,7 +213,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF))
         self.assertFalse(save.done())
         release.set()
-        status, headers, content = await asyncio.wait_for(save, timeout=5)
+        status, headers, content = await asyncio.wait_for(save, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
 
         self.assertEqual(status, 200, content)
         self.assertNotIn("retry-after", headers)
@@ -240,7 +239,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         # The page's own refresh (as after a locate press) is rebuilding the
         # shelf while the snapshot the save reads first is still fresh.
         self.service._schedule_background_snapshot_refresh(SHELF)
-        await asyncio.wait_for(building.wait(), timeout=2)
+        await asyncio.wait_for(building.wait(), timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
         self.assertTrue(self.service._snapshot_activity.get(SHELF))
 
         revision = editor_revision(self.service, 0)
@@ -253,7 +252,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         ))
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF, 0) >= 2)
         release.set()
-        status, headers, content = await asyncio.wait_for(save, timeout=5)
+        status, headers, content = await asyncio.wait_for(save, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
 
         self.assertEqual(status, 200, content)
         bay = next(slot for slot in json.loads(content)["snapshot"]["slots"] if slot["slot"] == 0)
@@ -268,7 +267,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         readback = asyncio.create_task(
             self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF)
         )
-        await asyncio.wait_for(self.appliance.holding.wait(), timeout=2)
+        await asyncio.wait_for(self.appliance.holding.wait(), timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
         # ... when the name is saved back, invalidating that shelf again.
         self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.rename", enclosure_id=SHELF)
 
@@ -280,7 +279,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         ))
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF, 0) >= 2)
         release.set()
-        status, headers, content = await asyncio.wait_for(reload, timeout=5)
+        status, headers, content = await asyncio.wait_for(reload, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
         # The readback began before the second save; it must not publish.
         with self.assertRaises(inventory_module.SnapshotStateBusyError):
             await readback
@@ -309,7 +308,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.service._build_snapshot = hold_first_build
         older = asyncio.create_task(self.service.get_snapshot(force_refresh=True, selected_enclosure_id=SHELF))
-        await asyncio.wait_for(building.wait(), timeout=2)
+        await asyncio.wait_for(building.wait(), timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
         self.service.invalidate_physical_enclosure_snapshot_cache(reason="test.save", enclosure_id=SHELF)
         release.set()
         with self.assertRaises(inventory_module.SnapshotStateBusyError):

@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import __version__
 # Must precede admin_service.main, which builds its app at import time.
 from tests.admin_test_env import ADMIN_TEST_PUBLIC_ORIGIN
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 from admin_service.config import AdminSettings
 from admin_service.services.backup_receipts import BackupInspectionReceiptStore
 from admin_service.services.account_bootstrap import ServiceAccountBootstrapService
@@ -306,7 +307,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(self._maintenance(first, receipts))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         samples = list(runtime.samples)
                         await self._busy(self._maintenance(second, receipts, stop=contender_stop))
                         self.assertEqual(runtime.samples, samples, "busy contender sampled runtime")
@@ -346,7 +347,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(self._maintenance("export", receipts))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         await self._busy(self._maintenance("export", receipts))
                         self.assertEqual(runtime.calls, [])
                         self.assertEqual(backup.operations, [])
@@ -373,7 +374,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(self._maintenance("export", receipts))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         calls = list(runtime.calls)
                         await self._busy(control(key))
                         self.assertEqual(runtime.calls, calls)
@@ -404,7 +405,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(control("ui"))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         for _ in range(2):
                             owner.cancel()
                             await self._turn()
@@ -437,7 +438,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(self._maintenance(kind, receipts))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         for _ in range(2):
                             owner.cancel()
                             await self._turn()
@@ -477,7 +478,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(self._maintenance("export", receipts))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         await self._busy(self._maintenance("import", receipts))
                         await self._busy(self._endpoint(
                             "/api/admin/runtime/containers/{container_key}/start")("ui"))
@@ -520,7 +521,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                 with self._patches(runtime, backup, service, receipts):
                     owner = asyncio.create_task(control("ui"))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         self.assertEqual((await asyncio.wait_for(control("history"), 2)).status_code, 200)
                         await self._busy(self._endpoint(
                             "/api/admin/runtime/containers/{container_key}/start")("ui"))
@@ -658,7 +659,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                     kwargs = {"stop_services": True, "restart_services": True} if kind == "import" else {}
                     owner = asyncio.create_task(endpoint("a" * 32, request, **kwargs))
                     try:
-                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        self.assertTrue(await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS))
                         for _ in range(2):
                             owner.cancel()
                             await self._turn()
@@ -675,7 +676,7 @@ class AdminLifecycleOwnershipTests(unittest.TestCase):
                                      workspace.exists(), asyncio.all_tasks() - tasks_before)
                         # Teardown also drains broken-baseline workers; acceptance
                         # uses the snapshot at request return, never this later wait.
-                        await asyncio.to_thread(finished.wait, 2)
+                        await asyncio.to_thread(finished.wait, HANG_TIMEOUT_SECONDS)
                     self.assertTrue(owner.cancelled())
                     self.assertEqual(at_return, (True, True, False, set()))
                     admission = receipts.begin_admission(issued["receipt"], expected_encryption_mode="plaintext")
@@ -1859,7 +1860,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                         restart_services=True,
                     )
                 )
-                started = await asyncio.to_thread(worker_started.wait, 1.0)
+                started = await asyncio.to_thread(worker_started.wait, HANG_TIMEOUT_SECONDS)
                 self.assertTrue(started)
                 export_task.cancel()
                 release_worker.set()
@@ -1910,7 +1911,7 @@ class MainAppBoundaryTests(unittest.TestCase):
                         restart_services=True,
                     )
                 )
-                started = await asyncio.to_thread(worker_started.wait, 1.0)
+                started = await asyncio.to_thread(worker_started.wait, HANG_TIMEOUT_SECONDS)
                 self.assertTrue(started)
                 export_task.cancel()
                 await asyncio.sleep(0)

@@ -158,6 +158,16 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
             self._append_event(source, "generation-2-hot", "2025-01-03T12:00:00+00:00")
             backup_directory, backup_status_path = self._create_full_backup_evidence(root)
             rotation = self._rotation_module()
+            store = HistoryStore(
+                str(source), recover_unreadable_database=False,
+                segment_catalog_path=segments_directory / "catalog.json",
+            )
+            # Keep the offline rotation fixture in DELETE mode, with no live
+            # WAL reader, while retaining one store and its warmed caches.
+            with closing(sqlite3.connect(source)) as connection:
+                connection.execute("PRAGMA journal_mode=DELETE")
+            before = store.list_history_system_summaries()
+            self.assertTrue(store._hot_summary_counts._tables)
 
             receipt = rotation.rotate_segmented_history(
                 source=source,
@@ -188,6 +198,15 @@ class LaterGenerationRotationRedTests(unittest.TestCase):
                 ["generation-1-hot", "generation-2-sealed"],
             )
             self.assertEqual(self._event_types(source), ["generation-2-hot"])
+            # Rotation replaces both hot file and catalog. The existing store
+            # must reload segment metadata and never double-count moved rows.
+            self.assertEqual(store.list_history_system_summaries(), before)
+            self.assertEqual(
+                store.list_history_system_summaries(),
+                SegmentedHistoryReader.from_catalog(
+                    hot_path=source, catalog_path=segments_directory / "catalog.json",
+                ).list_history_system_summaries(),
+            )
             self.assertEqual(stat.S_IMODE(segments_directory.stat().st_mode), 0o750)
             for name in ("segment-0002.sqlite3", "catalog.json"):
                 with self.subTest(name=name):
