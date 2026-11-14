@@ -28,6 +28,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Changed
+
+- The image now installs every Python package, direct and transitive, from
+  `requirements.lock` by exact version and sha256 hash, so a release build no
+  longer resolves dependencies from PyPI on its own. After changing a pin in
+  `requirements.txt`, regenerate the lock with the command in its first lines
+  (#1181).
+
 ### Fixed
 
 - A background inventory refresh that another enclosure's newer refresh
