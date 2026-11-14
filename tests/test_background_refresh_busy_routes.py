@@ -213,7 +213,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF))
         self.assertFalse(save.done())
         release.set()
-        status, headers, content = await asyncio.wait_for(save, timeout=5)
+        status, headers, content = await asyncio.wait_for(save, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
 
         self.assertEqual(status, 200, content)
         self.assertNotIn("retry-after", headers)
@@ -252,7 +252,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         ))
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF, 0) >= 2)
         release.set()
-        status, headers, content = await asyncio.wait_for(save, timeout=5)
+        status, headers, content = await asyncio.wait_for(save, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
 
         self.assertEqual(status, 200, content)
         bay = next(slot for slot in json.loads(content)["snapshot"]["slots"] if slot["slot"] == 0)
@@ -279,7 +279,7 @@ class UserActionsDuringBackgroundRefreshTests(unittest.IsolatedAsyncioTestCase):
         ))
         await wait_until(lambda: self.service._snapshot_activity.get(SHELF, 0) >= 2)
         release.set()
-        status, headers, content = await asyncio.wait_for(reload, timeout=5)
+        status, headers, content = await asyncio.wait_for(reload, timeout=wait_bounds.HANG_TIMEOUT_SECONDS)
         # The readback began before the second save; it must not publish.
         with self.assertRaises(inventory_module.SnapshotStateBusyError):
             await readback
