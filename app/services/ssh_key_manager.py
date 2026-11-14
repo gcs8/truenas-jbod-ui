@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -54,10 +53,14 @@ class SSHKeyManager:
             format=serialization.PublicFormat.OpenSSH,
         ).decode("ascii")
 
-        self._write_bytes_atomic(private_path, private_bytes)
-        self._write_bytes_atomic(public_path, f"{public_text} truenas-jbod-ui:{normalized_name}\n".encode("utf-8"))
-        self._set_permissions(private_path, 0o640)
-        self._set_permissions(public_path, 0o644)
+        # The private key is created group-readable for the app group and never
+        # broader: it does not pass through the umask default on the way in.
+        self._write_bytes_atomic(private_path, private_bytes, mode=0o640)
+        self._write_bytes_atomic(
+            public_path,
+            f"{public_text} truenas-jbod-ui:{normalized_name}\n".encode("utf-8"),
+            mode=0o644,
+        )
         return self._describe_private_key(private_path)
 
     @staticmethod
@@ -117,13 +120,6 @@ class SSHKeyManager:
         return f"SHA256:{base64.b64encode(digest).decode('ascii').rstrip('=')}"
 
     @staticmethod
-    def _write_bytes_atomic(path: Path, content: bytes) -> None:
+    def _write_bytes_atomic(path: Path, content: bytes, *, mode: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(path, lambda handle: handle.write(content), binary=True)
-
-    @staticmethod
-    def _set_permissions(path: Path, mode: int) -> None:
-        try:
-            os.chmod(path, mode)
-        except OSError:
-            pass
+        write_atomically(path, lambda handle: handle.write(content), binary=True, mode=mode)

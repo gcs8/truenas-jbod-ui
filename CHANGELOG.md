@@ -28,6 +28,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Security
+
+- A generated SSH private key is now created with its final `0640` mode
+  instead of taking its name under `config/ssh/` at the umask default
+  (usually `0644`) and being narrowed afterwards, and it can no longer stay
+  world-readable when the host refuses the mode change (#1180).
+
 ### Fixed
 
 - A background inventory refresh that another enclosure's newer refresh
