@@ -39,7 +39,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - The admin orphaned-history preview kept exact per-system hot-database
   counts current from new rows and retention edges instead of recounting
   the whole hot database on every request, bounded sparse-ID scans to populated
-  chunks, and prevented restore races from caching replaced-file counts (#1175).
+  chunks, capped retained chunks and per-system count bytes with an exact full
+  query fallback, and prevented restore races from caching replaced-file counts
+  (#1175).
 
 ## v0.24.0-rc.1 - 2026-11-11
 

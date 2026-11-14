@@ -3419,6 +3419,121 @@ class HotSummaryCountCacheTests(unittest.TestCase):
                 self.assertEqual(store.list_history_system_summaries(), self._full_summaries(path))
             self.assertLess(len(statements), 200, f"{len(statements)} statements for sparse ids")
 
+    def _append_sparse_chunks(self, path: Path, *, start: int, rows: int) -> None:
+        with closing(sqlite3.connect(path)) as connection, connection:
+            for table in ("slot_events", "metric_samples"):
+                columns, values = (
+                    ("event_type, details_json", "'state', '{}'") if table == "slot_events"
+                    else ("metric_name, value_integer, disk_identity_key", "'temperature', 30, 'disk-a'")
+                )
+                connection.executemany(
+                    f"""INSERT INTO {table} (
+                        id, observed_at, system_id, system_label, enclosure_key, slot, slot_label,
+                        {columns}
+                    ) VALUES (?, '2026-01-01T00:00:00+00:00', ?, ?, 'enclosure-1', 1, 'slot', {values})""",
+                    (((index << 14) + 1, *self.SYSTEMS[index % len(self.SYSTEMS)])
+                     for index in range(start, start + rows)),
+                )
+
+    def _assert_cache_bounded(self, store: HistoryStore) -> None:
+        # This counts retained objects, not process RSS or allocations. Include
+        # labels and dictionary/tuple overhead so long imported text cannot hide
+        # behind the chunk-entry limit. Shared objects are counted conservatively.
+        import sys
+
+        for cache in store._hot_summary_counts._tables.values():
+            self.assertLessEqual(len(cache.chunks), 256, "too many retained live chunks")
+            entries = sum(len(counts) for counts in cache.chunks.values())
+            self.assertLessEqual(entries, 8192, "too many retained per-system entries")
+            size = sys.getsizeof(cache.chunks)
+            for chunk, counts in cache.chunks.items():
+                size += sys.getsizeof(chunk) + sys.getsizeof(counts)
+                for system_id, value in counts.items():
+                    size += sys.getsizeof(system_id) + sys.getsizeof(value)
+                    size += sum(sys.getsizeof(part) for part in value)
+            self.assertLessEqual(size, 2 * 1024 * 1024, "retained cache exceeded two MiB")
+
+    def test_sparse_live_chunks_over_cap_use_exact_uncached_counts(self) -> None:
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "history.sqlite3"
+                store = self._create(path)
+                self._append_sparse_chunks(path, start=0, rows=4096)
+                reader = SegmentedHistoryReader(hot_path=path)
+                with patch.object(store, "_segmented_reader", return_value=reader if segmented else None):
+                    for attempt in range(2):
+                        if segmented:
+                            for excludes in ((), ("system-a",)):
+                                expected = SegmentedHistoryReader(hot_path=path).list_history_system_summaries(
+                                    exclude_system_ids=excludes,
+                                )
+                                self.assertEqual(store.list_history_system_summaries(list(excludes)), expected)
+                        else:
+                            self._assert_equivalent(store, path, f"over cap {attempt}")
+                        self._assert_cache_bounded(store)
+                    self.assertFalse(store._hot_summary_counts._tables)
+
+    def test_incremental_sparse_append_over_cap_drops_existing_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            self._append_sparse_chunks(path, start=0, rows=256)
+            self._assert_equivalent(store, path, "exactly at chunk cap")
+            self.assertEqual([len(cache.chunks) for cache in store._hot_summary_counts._tables.values()],
+                             [256, 256])
+            self._assert_cache_bounded(store)
+            self._append_sparse_chunks(path, start=256, rows=3840)
+            self._assert_equivalent(store, path, "incremental admission over cap")
+            self._assert_cache_bounded(store)
+            self.assertFalse(store._hot_summary_counts._tables)
+            # Retention may make the file cacheable again; admission is not a
+            # permanent negative cache and must keep exact counts and labels.
+            with closing(sqlite3.connect(path)) as connection, connection:
+                for table in ("slot_events", "metric_samples"):
+                    connection.execute(f"DELETE FROM {table} WHERE id >= ?", (256 << 14,))
+            self._assert_equivalent(store, path, "retained back under cap")
+            self.assertEqual(len(store._hot_summary_counts._tables), 2)
+            self._assert_cache_bounded(store)
+
+    def test_per_system_entry_cap_applies_inside_one_live_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            self._append(path, events=8192, samples=8192)
+
+            def unique_systems() -> None:
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    for table in ("slot_events", "metric_samples"):
+                        connection.execute(f"UPDATE {table} SET system_id = 'system-' || id, system_label = NULL")
+
+            unique_systems()
+            self.assertEqual(store.list_history_system_summaries(), self._full_summaries(path))
+            self._assert_cache_bounded(store)
+            self.assertEqual(len(store._hot_summary_counts._tables), 2)
+            self._append(path, events=1, samples=1)
+            unique_systems()
+            for attempt in range(2):
+                self.assertEqual(store.list_history_system_summaries(), self._full_summaries(path))
+                self._assert_cache_bounded(store)
+                self.assertFalse(store._hot_summary_counts._tables)
+
+    def test_long_labels_cannot_bypass_cache_byte_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            self._append_sparse_chunks(path, start=0, rows=1)
+            self._assert_equivalent(store, path, "warm before oversized label")
+            self._append_sparse_chunks(path, start=1, rows=1)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                for table in ("slot_events", "metric_samples"):
+                    connection.execute(f"UPDATE {table} SET system_label = ? WHERE id > 1", ("z" * (2 * 1024 * 1024),))
+            self._assert_equivalent(store, path, "oversized appended label")
+            self._assert_cache_bounded(store)
+            self.assertFalse(store._hot_summary_counts._tables)
+            self._assert_equivalent(store, path, "oversized label cold fallback")
+            self._assert_cache_bounded(store)
+            self.assertFalse(store._hot_summary_counts._tables)
+
     def test_restore_after_connection_open_does_not_cache_old_rows_as_new_file(self) -> None:
         # A read opened before a restore may finish on the old SQLite snapshot.
         # It must not publish those counts under the replacement file's inode.

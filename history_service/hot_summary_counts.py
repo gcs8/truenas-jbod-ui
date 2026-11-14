@@ -32,6 +32,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
+import sys
 from typing import Any, Iterator
 from contextlib import contextmanager
 
@@ -44,6 +45,13 @@ SUMMARY_TABLE_KEYS: tuple[tuple[str, str], ...] = (
 )
 APPEND_ONLY_TABLES = frozenset({"slot_events", "metric_samples"})
 DEFAULT_CHUNK_BITS = 14
+# Per append-only table, hence at most 512 chunks / 4 MiB for one hot DB.
+# 256 dense chunks span about four million ids. Larger or sparse imports still
+# receive exact results from the uncached GROUP BY, without retaining per-row
+# dictionaries. The entry and byte limits also cover many systems / long labels.
+MAX_CACHED_CHUNKS = 256
+MAX_CACHED_SYSTEM_COUNTS = 8192
+MAX_CACHED_BYTES = 2 * 1024 * 1024
 
 # {system_id: (row_count, MAX(system_label), normally text or None)}
 SystemCounts = dict[str, tuple[int, Any]]
@@ -84,6 +92,71 @@ def _merge(target: SystemCounts, system_id: Any, count: int, label: Any) -> None
         target[system_id] = (int(count), label)
     else:
         target[system_id] = (previous[0] + int(count), sqlite_max(previous[1], label))
+
+
+class _BoundedChunks:
+    """Account dictionary overhead and payload without copying imported text.
+
+    Shared keys/labels are deliberately counted more than once. Each builder
+    and incremental candidate is bounded independently, so temporary copies
+    add a fixed multiple of the budget, never a factor based on imported ids.
+    """
+
+    def __init__(self, chunks: dict[int, SystemCounts]) -> None:
+        self.chunks = chunks
+        self.entries = sum(len(counts) for counts in chunks.values())
+        self.size = sys.getsizeof(chunks) + sum(
+            sys.getsizeof(chunk) + self._counts_size(counts)
+            for chunk, counts in chunks.items()
+        )
+        self._check()
+
+    @staticmethod
+    def _value_size(value: tuple[int, Any]) -> int:
+        return sys.getsizeof(value) + sum(sys.getsizeof(part) for part in value)
+
+    @classmethod
+    def _counts_size(cls, counts: SystemCounts) -> int:
+        return sys.getsizeof(counts) + sum(
+            sys.getsizeof(system_id) + cls._value_size(value)
+            for system_id, value in counts.items()
+        )
+
+    def _check(self) -> None:
+        if (len(self.chunks) > MAX_CACHED_CHUNKS
+                or self.entries > MAX_CACHED_SYSTEM_COUNTS
+                or self.size > MAX_CACHED_BYTES):
+            raise _Uncacheable("hot summary cache budget exceeded")
+
+    def set_chunk(self, chunk: int, counts: SystemCounts) -> None:
+        old = self.chunks.get(chunk)
+        before = sys.getsizeof(self.chunks)
+        if old is None:
+            self.size += sys.getsizeof(chunk)
+        else:
+            self.entries -= len(old)
+            self.size -= self._counts_size(old)
+        self.chunks[chunk] = counts
+        self.entries += len(counts)
+        self.size += sys.getsizeof(self.chunks) - before + self._counts_size(counts)
+        self._check()
+
+    def merge(self, chunk: int, system_id: Any, count: int, label: Any) -> None:
+        if not isinstance(system_id, str):
+            raise _Uncacheable("non-text system id")
+        if chunk not in self.chunks:
+            self.set_chunk(chunk, {})
+        target = self.chunks[chunk]
+        old = target.get(system_id)
+        before = sys.getsizeof(target)
+        if old is None:
+            self.entries += 1
+            self.size += sys.getsizeof(system_id)
+        else:
+            self.size -= self._value_size(old)
+        _merge(target, system_id, count, label)
+        self.size += sys.getsizeof(target) - before + self._value_size(target[system_id])
+        self._check()
 
 
 @dataclass
@@ -189,7 +262,7 @@ class HotSystemSummaryCounts:
     def _chunk_rows(
         self, connection: sqlite3.Connection, table_name: str, low: int, high: int
     ) -> SystemCounts:
-        counts: SystemCounts = {}
+        bounded = _BoundedChunks({})
         # NOT INDEXED keeps the rowid range scan; a scope index would read the
         # whole index to group by system_id.
         for system_id, label, count in connection.execute(
@@ -201,8 +274,8 @@ class HotSystemSummaryCounts:
             """,
             (low, high),
         ):
-            _merge(counts, system_id, count, label)
-        return counts
+            bounded.merge(0, system_id, count, label)
+        return bounded.chunks.get(0, {})
 
     def _chunk_bounds(self, chunk: int, high_id: int) -> tuple[int, int]:
         return chunk << self.chunk_bits, min(((chunk + 1) << self.chunk_bits) - 1, high_id)
@@ -216,14 +289,17 @@ class HotSystemSummaryCounts:
         if low is None or high is None:
             return cache
         next_id: int | None = int(low)
+        bounded = _BoundedChunks(cache.chunks)
         while next_id is not None and next_id <= int(high):
+            if len(cache.chunks) >= MAX_CACHED_CHUNKS:
+                raise _Uncacheable("too many populated hot summary chunks")
             # Seek to the next live id, so sparse ids (a restored or edited
             # file) cost one query per non-empty chunk, never per empty one.
             chunk = next_id >> self.chunk_bits
             chunk_low, chunk_high = self._chunk_bounds(chunk, int(high))
             counts = self._chunk_rows(connection, table_name, chunk_low, chunk_high)
             if counts:
-                cache.chunks[chunk] = counts
+                bounded.set_chunk(chunk, counts)
             following = connection.execute(
                 f"SELECT MIN(id) FROM {table_name} WHERE id > ?", (chunk_high,)
             ).fetchone()[0]
@@ -283,6 +359,7 @@ class HotSystemSummaryCounts:
                 del chunks[chunk]
         new_high = max(cache.high_id, int(high or 0))
         added: dict[int, SystemCounts] = {}
+        added_budget = _BoundedChunks(added)
         if new_high > cache.high_id:
             for chunk, system_id, label, count in connection.execute(
                 f"""
@@ -293,7 +370,7 @@ class HotSystemSummaryCounts:
                 """,
                 (self.chunk_bits, cache.high_id),
             ):
-                _merge(added.setdefault(int(chunk), {}), system_id, count, label)
+                added_budget.merge(int(chunk), system_id, count, label)
 
         excess = self._total(chunks) + self._total(added) - expected_total
         if excess:
@@ -311,13 +388,14 @@ class HotSystemSummaryCounts:
                     chunks[chunk] = actual
                 else:
                     del chunks[chunk]
+                _BoundedChunks(chunks)
         if excess != 0:
             raise _Uncacheable("cached counts do not reconcile with the tracked total")
 
+        candidate_budget = _BoundedChunks(chunks)
         for chunk, counts in added.items():
-            target = chunks.setdefault(chunk, {})
             for system_id, (count, label) in counts.items():
-                _merge(target, system_id, count, label)
+                candidate_budget.merge(chunk, system_id, count, label)
         self._tables[cache_key] = _TableCache(identity=identity, high_id=new_high, chunks=chunks)
         return self._flatten(chunks)
 
