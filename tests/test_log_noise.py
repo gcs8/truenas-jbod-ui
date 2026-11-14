@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import paramiko
@@ -44,6 +49,19 @@ class Clock:
 
     def __call__(self) -> float:
         return self.now
+
+
+def _allocation_probe(source: str) -> dict[str, int]:
+    # Run the real implementation, not a json.dumps mock. A vulnerable version
+    # must fail the allocation assertion without risking the unittest process.
+    prelude = "import resource; resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)\n"
+    result = subprocess.run(
+        [sys.executable, "-c", prelude + textwrap.dedent(source)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode:
+        raise AssertionError(f"Allocation probe failed: {result.stderr}")
+    return json.loads(result.stdout)
 
 
 class RepeatedLogLimiterTests(unittest.TestCase):
@@ -94,6 +112,37 @@ class RepeatedLogLimiterTests(unittest.TestCase):
             self.assertLessEqual(len(key), 32)
             self.assertLessEqual(len(entry.state), 32)
         self.assertIsNone(limiter.admit(("host", "/dev/31" + "x" * 65536), "s" * 65536))
+
+    def test_remote_key_retention_stays_within_allocation_budget(self) -> None:
+        usage = _allocation_probe('''
+            import gc, json, tracemalloc
+            from app.log_limiter import RepeatedLogLimiter
+            limiter = RepeatedLogLimiter(repeat_interval_seconds=None)
+            tracemalloc.start()
+            for index in range(64):
+                device = "/dev/" + str(index) + "x" * 32768
+                limiter.admit(("host.example.test", device), 8)
+                limiter.admit(("host.example.test", "smartctl -x " + device), 2)
+            del device
+            gc.collect()
+            current, peak = tracemalloc.get_traced_memory()
+            print(json.dumps({"current": current, "peak": peak}))
+        ''')
+        self.assertLess(usage["current"], 256 * 1024, usage)
+        self.assertLess(usage["peak"], 2 * 1024 * 1024, usage)
+
+    def test_idle_keys_expire_without_waiting_for_count_eviction(self) -> None:
+        clock = Clock()
+        limiter = RepeatedLogLimiter(repeat_interval_seconds=None, max_idle_seconds=60, clock=clock)
+        limiter.admit("old", 8)
+        clock.now += 30
+        limiter.admit("active", 8)
+        clock.now += 31
+        self.assertIsNone(limiter.admit("active", 8))
+        self.assertEqual(len(limiter), 1)
+        self.assertIsNotNone(limiter.admit("old", 8))
+        clock.now += 61
+        self.assertEqual(len(limiter), 0)
 
     def test_tracked_keys_stay_bounded(self) -> None:
         limiter = RepeatedLogLimiter(repeat_interval_seconds=None, max_keys=3)
@@ -212,8 +261,20 @@ class SSHCommandExitLoggingTests(unittest.TestCase):
             logs.output,
         )
 
+    def test_transport_failures_still_log_even_after_smart_advisories(self) -> None:
+        command = "sudo -n /usr/sbin/smartctl -x -j /dev/sda"
+        self.run_with_status(command, 4)
+        client = _fake_ssh_client()
+        client.exec_command.side_effect = paramiko.SSHException("synthetic transport failure")
+        with self.assertLogs("app.services.ssh_probe", level="WARNING") as logs:
+            result = self.probe._run_single_command(client, command)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code, 255)
+        self.assertIn("SSH command execution failed", logs.output[0])
+        self.assertIn("synthetic transport failure", logs.output[0])
+
     def test_smartctl_command_line_and_open_failures_still_log(self) -> None:
-        for status in (1, 2, 3 | 64):
+        for status in (1, 2, 3 | 64, 127, 255):
             with self.subTest(status=status), self.assertLogs("app.services.ssh_probe", level="WARNING") as logs:
                 self.run_with_status(f"sudo -n /usr/sbin/smartctl -x -j /dev/sd{status}", status)
             self.assertEqual(len(logs.output), 1, logs.output)
@@ -368,9 +429,34 @@ class LegacyConfigWarningTests(unittest.TestCase):
         self.assertIn("unknown key `app.verify_ssl`", "\n".join(logs.output))
         self.assertEqual(sum("app.verify_ssl" in line for line in logs.output), 1, logs.output)
 
+    def test_alias_generation_stays_within_real_allocation_budget(self) -> None:
+        usage = _allocation_probe('''
+            import json, tempfile, tracemalloc
+            from pathlib import Path
+            import yaml
+            from app import config
+            lines = ["a0: &a0 [x]"]
+            for level in range(1, 7):
+                refs = ", ".join([f"*a{level - 1}"] * 10)
+                lines.append(f"a{level}: &a{level} [{refs}]")
+            lines.append("app: {verify_ssl: true}")
+            source = "\\n".join(lines)
+            parsed = yaml.safe_load(source)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(source, encoding="utf-8")
+                tracemalloc.start()
+                config._warn_unknown_config_keys_once(path, parsed)
+                current, peak = tracemalloc.get_traced_memory()
+            print(json.dumps({"current": current, "peak": peak}))
+        ''')
+        self.assertLess(usage["peak"], 2 * 1024 * 1024, usage)
+
 
 class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
-    async def summary_for_exit(self, exit_code: int, stdout: str = SMART_JSON):
+    async def summary_for_exit(
+        self, exit_code: int, stdout: str = SMART_JSON, *, platform: Literal["linux", "quantastor"] = "linux",
+    ):
         class DummyTrueNASClient:
             async def fetch_disk_smartctl(self, *_args, **_kwargs):
                 raise AssertionError("This test uses the SSH smartctl path.")
@@ -384,7 +470,7 @@ class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             system = SystemConfig(
                 id="synthetic",
-                truenas=TrueNASConfig(platform="linux"),
+                truenas=TrueNASConfig(platform=platform),
                 ssh=SSHConfig(enabled=True),
             )
             service = build_inventory_service(Settings(), system, DummyTrueNASClient(), DummySSHProbe(), temp_dir)
@@ -399,7 +485,40 @@ class SmartResultExitStatusTests(unittest.IsolatedAsyncioTestCase):
             service.get_snapshot = AsyncMock(
                 return_value=InventorySnapshot(slots=[slot], refresh_interval_seconds=30)
             )
-            return await service.get_slot_smart_summary(0)
+            summary = await service.get_slot_smart_summary(0)
+            cached = await service.get_slot_smart_summary(0)
+            self.assertEqual(cached.model_dump(), summary.model_dump())
+            return summary
+
+    async def test_quantastor_enrichment_keeps_exit_metadata_in_cached_result(self) -> None:
+        for status in (0, 4 | 8 | 64):
+            with self.subTest(status=status):
+                summary = await self.summary_for_exit(status, platform="quantastor")
+                self.assertTrue(summary.available)
+                self.assertEqual(summary.smartctl_exit_status, status)
+                self.assertEqual(summary.smartctl_status_flags, smartctl_exit_flags(status))
+
+    async def test_quantastor_metadata_without_measurements_stays_unavailable(self) -> None:
+        summary = await self.summary_for_exit(2, '{"smartctl":{"exit_status":2}}', platform="quantastor")
+        self.assertFalse(summary.available)
+        self.assertEqual(summary.smartctl_exit_status, 2)
+        self.assertEqual(summary.smartctl_status_flags, ["device_open_failed"])
+
+    async def test_oversized_device_identifier_never_reaches_ssh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = AsyncMock()
+            system = SystemConfig(id="synthetic", truenas=TrueNASConfig(platform="linux"),
+                                  ssh=SSHConfig(enabled=True))
+            service = build_inventory_service(Settings(), system, AsyncMock(), probe, temp_dir)
+            service._run_ssh_planned_commands = AsyncMock(return_value=[])
+            for candidate in ("x" * 4097, "é" * 2048):
+                with self.subTest(length=len(candidate)):
+                    summary, _error = await service._fetch_smart_summary_over_ssh([candidate])
+                    self.assertIsNone(summary)
+            service._run_ssh_planned_commands.assert_not_awaited()
+            # A normal synthetic device still reaches the planner.
+            await service._fetch_smart_summary_over_ssh(["sda"])
+            service._run_ssh_planned_commands.assert_awaited_once()
 
     async def test_smart_status_bits_stay_visible_on_the_smart_result(self) -> None:
         summary = await self.summary_for_exit(4 | 8 | 64)

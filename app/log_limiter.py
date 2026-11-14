@@ -49,6 +49,7 @@ def _digest(value: Hashable) -> bytes:
 class _Entry:
     state: bytes
     emitted_at: float
+    seen_at: float
     count: int = 0
     first: float | None = None
     last: float | None = None
@@ -62,8 +63,9 @@ class RepeatedLogLimiter:
     is admitted the first time its key is seen, whenever its state differs from
     the last admitted state, and, when ``repeat_interval_seconds`` is set, once
     that interval has passed since the key last logged. ``forget(key)`` drops a
-    key whose condition cleared, so its next occurrence logs again. The oldest
-    keys are forgotten beyond ``max_keys``; a forgotten key simply logs again.
+    key whose condition cleared, so its next occurrence logs again. Idle keys
+    expire on the next use after ``max_idle_seconds``. The oldest keys are
+    forgotten beyond ``max_keys``; a forgotten key simply logs again.
 
     Keys and states can carry remote-supplied text (device names, commands),
     so only fixed-size digests of them are retained: memory stays bounded by
@@ -75,18 +77,29 @@ class RepeatedLogLimiter:
         *,
         repeat_interval_seconds: float | None,
         max_keys: int = 4096,
+        max_idle_seconds: float = 3600.0,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.repeat_interval_seconds = repeat_interval_seconds
         self.max_keys = max(1, int(max_keys))
+        self.max_idle_seconds = max(1.0, float(max_idle_seconds))
         self._clock = clock
         self._wall_clock = wall_clock
         self._entries: OrderedDict[bytes, _Entry] = OrderedDict()
         self._lock = threading.Lock()
 
+    def _expire(self, now: float) -> None:
+        # Entries are ordered by their last observation. Expire lazily on use,
+        # without a background thread or scanning every active key.
+        while self._entries:
+            if now - next(iter(self._entries.values())).seen_at < self.max_idle_seconds:
+                break
+            self._entries.popitem(last=False)
+
     def __len__(self) -> int:
         with self._lock:
+            self._expire(self._clock())
             return len(self._entries)
 
     def reset(self) -> None:
@@ -99,13 +112,15 @@ class RepeatedLogLimiter:
             self._entries.pop(digest, None)
 
     def admit(self, key: Hashable, state: Hashable = None) -> SuppressedRepeats | None:
-        now = self._clock()
         key = _digest(key)
         state = _digest(state)
         with self._lock:
+            now = self._clock()
+            self._expire(now)
             entry = self._entries.get(key)
             if entry is not None:
                 self._entries.move_to_end(key)
+                entry.seen_at = now
                 interval = self.repeat_interval_seconds
                 due = interval is not None and now - entry.emitted_at >= interval
                 if entry.state == state and not due:
@@ -117,7 +132,7 @@ class RepeatedLogLimiter:
                 summary = SuppressedRepeats(entry.count, entry.first, entry.last)
             else:
                 summary = SuppressedRepeats()
-            self._entries[key] = _Entry(state=state, emitted_at=now)
+            self._entries[key] = _Entry(state=state, emitted_at=now, seen_at=now)
             while len(self._entries) > self.max_keys:
                 self._entries.popitem(last=False)
             return summary

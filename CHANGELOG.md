@@ -35,7 +35,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   logging once per device and status; channel-limit changes log once per
   change with paramiko's per-channel errors lowered to debug; config.yaml
   key warnings log once per file change; and identical command failures are
-  summarized with a count. Real failures still log (#1174).
+  summarized with a count. Recovery resets remembered failures, SSH log keys
+  use fixed-size digests with idle expiry, and oversized SMART paths are
+  refused. SMART read metadata survives enrichment without implying available
+  measurements; config warning generations do not expand YAML aliases.
+  Real failures still log (#1174).
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).

@@ -7916,7 +7916,13 @@ class InventoryService:
             ]
         ] = []
         for candidate in candidates:
+            # Remote inventory names are not trusted. Refuse oversized paths
+            # before building commands or passing identifiers to log limiters.
+            if len(candidate) > 4096:
+                continue
             device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            if len(device_path.encode("utf-8", "surrogatepass")) > 4096:
+                continue
             for smartctl_binary in self._smartctl_binary_candidates():
                 command_parts = ["sudo", "-n", smartctl_binary]
                 if device_type:
@@ -17890,7 +17896,7 @@ class InventoryService:
         primary: SmartSummaryView,
         supplement: SmartSummaryView,
     ) -> SmartSummaryView:
-        for field_name in SMART_SUMMARY_VALUE_FIELDS:
+        for field_name in (*SMART_SUMMARY_VALUE_FIELDS, *SMART_SUMMARY_READ_METADATA_FIELDS):
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
 
