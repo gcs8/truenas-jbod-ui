@@ -35,6 +35,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   longer resolves dependencies from PyPI on its own. After changing a pin in
   `requirements.txt`, regenerate the lock with the command in its first lines
   (#1181).
+
 ### Security
 
 - A generated SSH private key is now created with its final `0640` mode
