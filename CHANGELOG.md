@@ -30,6 +30,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A background inventory refresh that another enclosure's newer refresh
+  overtakes while it saves bay details now ends quietly as superseded, as
+  #928 intended, instead of logging "Background snapshot refresh failed" at
+  ERROR many times a day; the stale view stays and the next poll refreshes
+  it. Busy refusals now name their reason in the log, and the new
+  `inventory_background_snapshot_refreshes_total` metric counts each
+  background refresh by outcome and reason (#1176).
 - Quieted repeated log lines: smartctl status bits (such as exit 4 or 64) no
   longer log as failed SSH commands and are kept on the SMART result instead,
   logging once per device and status; channel-limit changes log once per

@@ -234,6 +234,12 @@ INVENTORY_SNAPSHOT_REQUESTS_TOTAL = Counter(
     labelnames=("service", "system_id", "platform", "cache_state"),
     namespace=METRICS_NAMESPACE,
 )
+INVENTORY_BACKGROUND_SNAPSHOT_REFRESHES_TOTAL = Counter(
+    "inventory_background_snapshot_refreshes_total",
+    "Background inventory snapshot refreshes by outcome and the branch that decided it.",
+    labelnames=("service", "system_id", "platform", "outcome", "reason"),
+    namespace=METRICS_NAMESPACE,
+)
 INVENTORY_SNAPSHOT_BUILD_DURATION_SECONDS = Histogram(
     "inventory_snapshot_build_duration_seconds",
     "Inventory snapshot rebuild duration in seconds.",
@@ -684,6 +690,25 @@ def observe_inventory_snapshot_request(
         system_id=_normalize_metric_label(system_id),
         platform=_normalize_metric_label(platform),
         cache_state=_normalize_metric_label(cache_state),
+    ).inc()
+
+
+def observe_inventory_background_snapshot_refresh(
+    *,
+    service_name: str,
+    system_id: str | None,
+    platform: str | None,
+    outcome: str,
+    reason: str,
+) -> None:
+    if not metrics_enabled():
+        return
+    INVENTORY_BACKGROUND_SNAPSHOT_REFRESHES_TOTAL.labels(
+        service=service_name,
+        system_id=_normalize_metric_label(system_id),
+        platform=_normalize_metric_label(platform),
+        outcome=_normalize_metric_label(outcome),
+        reason=_normalize_metric_label(reason),
     ).inc()
 
 
