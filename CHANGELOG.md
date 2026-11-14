@@ -30,6 +30,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A failed history collection pass now logs which stage failed, the source
+  failure kind and scope, and SQLite's error code, name and coarse class
+  (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
+  paths or host names (#1172).
 - A background inventory refresh that another enclosure's newer refresh
   overtakes while it saves bay details now ends quietly as superseded, as
   #928 intended, instead of logging "Background snapshot refresh failed" at

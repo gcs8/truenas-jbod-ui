@@ -23,6 +23,14 @@ OBSERVABILITY_FIELDS = (
     "operation",
     "outcome",
     "exception_class",
+    # History collection failure diagnostics (#1170). Callers emit only fixed
+    # vocabulary words, integers and pattern-checked identifiers here.
+    "failure_stage",
+    "scope_id",
+    "source_error_kind",
+    "sqlite_errorcode",
+    "sqlite_errorname",
+    "sqlite_error_class",
 )
 
 # Formatters suppress stack traces by default so the bounded observability
