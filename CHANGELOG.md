@@ -37,6 +37,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   and an old `HISTORY_REQUEST_TIMEOUT_SECONDS=20` no longer cuts them short.
   After one times out, that shelf gets no second fresh read until one more
   deadline has passed (#1173, refs #1168).
+- Fixed Connections tracing the enclosure bay that shares a storage-view slot's
+  number; it now traces only the backing bay, distinguishes unknown placement
+  from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
