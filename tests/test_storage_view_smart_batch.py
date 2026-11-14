@@ -247,7 +247,7 @@ class CollectorStorageViewBatchTests(unittest.TestCase):
             self.assertEqual(call.kwargs["params"], {"system_id": "archive-core", "enclosure_id": "enc-a"})
         self.assertEqual([len(json.loads(call.kwargs["body"])["slots"]) for call in calls], [24, 24, 12])
 
-    def test_fresh_collection_passes_fresh_and_no_short_timeout(self) -> None:
+    def test_fresh_collection_passes_fresh_and_the_fresh_deadline(self) -> None:
         collector = self._collector()
         collector._fetch_json = AsyncMock(return_value={"summaries": []})  # type: ignore[method-assign]
 
@@ -255,7 +255,9 @@ class CollectorStorageViewBatchTests(unittest.TestCase):
 
         call = collector._fetch_json.await_args  # type: ignore[attr-defined]
         self.assertEqual(call.kwargs["params"]["fresh"], "true")
-        self.assertIsNone(call.kwargs["timeout_seconds"])
+        # #1168: the fresh deadline, not the 5 s cached-read cap.
+        self.assertEqual(call.kwargs["timeout_seconds"], 120)
+        self.assertTrue(call.kwargs["fresh_read"])
 
     def test_an_older_main_ui_without_the_batch_route_falls_back_to_per_slot_requests(self) -> None:
         collector = self._collector()
