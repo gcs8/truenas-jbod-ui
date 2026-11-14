@@ -4,6 +4,10 @@
     "Repository rules for the self-hosted Renovate run. They are appended after the global packageRules, so they win for the updates they match.",
     "Pins and digests that CI can prove still land in the grouped routine PR; tests/test_ci_contract.py (RenovatePolicyContractTests) guards these rules."
   ],
+  "pip-compile": {
+    "description": "requirements.lock is compiled from requirements.txt by the uv command in its first lines. Renovate reads that command, edits requirements.txt and reruns it, so a pin and the hash-locked image install move in one commit. The command must use --option=value; Renovate rejects -o and space-separated values.",
+    "managerFilePatterns": ["/^requirements\\.lock$/"]
+  },
   "packageRules": [
     {
       "description": "This project's own published image. docker-compose.yml keeps ':latest' as the operator-facing compatibility default; a digest pin would freeze fresh installs on an old build, and releases publish the image, not Renovate.",
@@ -25,6 +29,12 @@
       "groupName": "playwright capture toolchain",
       "groupSlug": "playwright-capture",
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "requirements.txt is the pip-compile source for requirements.lock, so pip-compile updates its pins and regenerates the lock. pip_requirements keeps requirements-dev.txt; without this rule both managers would edit the same line of requirements.txt in one branch.",
+      "matchManagers": ["pip_requirements"],
+      "matchFileNames": ["requirements.txt"],
+      "enabled": false
     }
   ]
 }
