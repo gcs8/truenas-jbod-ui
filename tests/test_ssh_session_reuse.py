@@ -34,6 +34,7 @@ from app.services.ssh_probe import (
     SSHCommandResult,
     SSHProbe,
 )
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 
 HOST = "192.0.2.44"
 OTHER_HOST = "192.0.2.45"
@@ -533,7 +534,8 @@ class OwnedSSHWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.loop_errors, [])
 
     async def wait_until(self, predicate):
-        async with asyncio.timeout(2):
+        # Predicates track worker threads; on a loaded host they may run late (#1177).
+        async with asyncio.timeout(HANG_TIMEOUT_SECONDS):
             while not predicate():
                 await asyncio.sleep(0.001)
 
@@ -861,7 +863,8 @@ class InventoryOwnedSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.loop_errors, [])
 
     async def wait_until(self, predicate):
-        async with asyncio.timeout(2):
+        # Predicates track worker threads; on a loaded host they may run late (#1177).
+        async with asyncio.timeout(HANG_TIMEOUT_SECONDS):
             while not predicate():
                 await asyncio.sleep(0.001)
 
