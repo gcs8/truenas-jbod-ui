@@ -234,6 +234,12 @@ class HistoryCollector:
             tuple[tuple[str | None, str | None, str | None], int],
         ] = {}
         self._run_lock = threading.Lock()
+        # Fresh/forced reads that timed out here but that the main UI may still
+        # be working on, keyed by request scope: (abandoned_at, hold_until) on
+        # time.monotonic(). No second fresh read of a scope starts before then
+        # (#1168).
+        self._abandoned_fresh_reads: dict[tuple[Any, ...], tuple[float, float]] = {}
+        self._abandoned_fresh_reads_lock = threading.Lock()
         # (st_dev, st_ino) of the hot database whose indexes are complete. An
         # online restore publishes a new file, so its indexes are checked again.
         self._chronological_indexes_identity: tuple[int, int] | None = None
@@ -2295,13 +2301,11 @@ class HistoryCollector:
         force: bool = True,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {}
-        if force:
-            params["force"] = "true"
         if system_id:
             params["system_id"] = system_id
         if enclosure_id:
             params["enclosure_id"] = enclosure_id
-        return await self._fetch_json("/api/inventory", params=params)
+        return await self._fetch_enumeration("/api/inventory", params, force=force)
 
     async def _fetch_storage_views(
         self,
@@ -2311,11 +2315,29 @@ class HistoryCollector:
         force: bool = False,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"system_id": system_id}
-        if force:
-            params["force"] = "true"
         if enclosure_id:
             params["enclosure_id"] = enclosure_id
-        return await self._fetch_json("/api/storage-views", params=params)
+        return await self._fetch_enumeration("/api/storage-views", params, force=force)
+
+    async def _fetch_enumeration(self, path: str, params: dict[str, Any], *, force: bool) -> dict[str, Any]:
+        if force:
+            held_for = self._abandoned_fresh_read_age(self._fresh_read_key(path, params))
+            if held_for is None:
+                return await self._fetch_json(
+                    path,
+                    params={**params, "force": "true"},
+                    timeout_seconds=self._fresh_request_timeout_seconds(),
+                    fresh_read=True,
+                )
+            # The main UI may still be enumerating for the read that timed out;
+            # a second forced read would only queue behind it (#1168).
+            logger.info(
+                "Reading cached %s for %s: the previous forced read timed out %.0fs ago and may still be running.",
+                path,
+                params.get("enclosure_id") or params.get("system_id") or "the default system",
+                held_for,
+            )
+        return await self._fetch_json(path, params=params)
 
     async def _enumerate_storage_view_scopes(
         self,
@@ -2431,6 +2453,7 @@ class HistoryCollector:
                     f"/api/storage-views/{quoted_view_id}/slots/{slot_number}/smart",
                     params=params,
                     timeout_seconds=self._smart_request_timeout_seconds(force_fresh=force_fresh),
+                    fresh_read=force_fresh,
                 )
                 if isinstance(payload, dict):
                     summaries[slot_number] = payload
@@ -2470,6 +2493,7 @@ class HistoryCollector:
                 body=json.dumps({"slots": chunk}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 timeout_seconds=self._smart_request_timeout_seconds(force_fresh=force_fresh),
+                fresh_read=force_fresh,
             )
             for item in payload.get("summaries", []):
                 try:
@@ -2481,10 +2505,50 @@ class HistoryCollector:
                     summaries[slot_number] = summary
         return summaries
 
-    def _smart_request_timeout_seconds(self, *, force_fresh: bool) -> int | None:
+    def _smart_request_timeout_seconds(self, *, force_fresh: bool) -> int:
         if force_fresh:
-            return None
+            return self._fresh_request_timeout_seconds()
         return min(self.settings.request_timeout_seconds, CACHED_SMART_REQUEST_TIMEOUT_SECONDS)
+
+    def _fresh_request_timeout_seconds(self) -> int:
+        # Fresh SMART batches and forced enumeration wait on the appliance
+        # itself; a large CORE system can take over a minute (#1168). The
+        # generic timeout only ever raises this deadline, never lowers it.
+        return max(self.settings.fresh_request_timeout_seconds, self.settings.request_timeout_seconds)
+
+    @staticmethod
+    def _fresh_read_key(path: str, params: dict[str, Any]) -> tuple[Any, ...]:
+        scope = tuple(
+            sorted(
+                (str(key), str(value))
+                for key, value in params.items()
+                if key not in {"fresh", "force"} and value not in {None, ""}
+            )
+        )
+        return (path, scope)
+
+    def _abandoned_fresh_read_age(self, key: tuple[Any, ...]) -> float | None:
+        """Seconds since a fresh read of this scope timed out, while it is held."""
+        now = time.monotonic()
+        with self._abandoned_fresh_reads_lock:
+            entry = self._abandoned_fresh_reads.get(key)
+            if entry is None:
+                return None
+            abandoned_at, hold_until = entry
+            if now >= hold_until:
+                del self._abandoned_fresh_reads[key]
+                return None
+            return max(0.0, now - abandoned_at)
+
+    def _note_fresh_read_outcome(self, key: tuple[Any, ...], *, timed_out: bool) -> None:
+        with self._abandoned_fresh_reads_lock:
+            if timed_out:
+                # The main UI keeps working after we stop waiting. Give it one
+                # more fresh deadline before asking the same scope again.
+                now = time.monotonic()
+                self._abandoned_fresh_reads[key] = (now, now + self._fresh_request_timeout_seconds())
+            else:
+                self._abandoned_fresh_reads.pop(key, None)
 
     async def _fetch_json(
         self,
@@ -2495,10 +2559,20 @@ class HistoryCollector:
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
+        fresh_read: bool = False,
     ) -> dict[str, Any]:
         self._raise_if_stopping()
+        fresh_key = self._fresh_read_key(path, params or {}) if fresh_read else None
+        if fresh_key is not None:
+            held_for = self._abandoned_fresh_read_age(fresh_key)
+            if held_for is not None:
+                raise HistorySourceError.timeout(
+                    f"{method} {path} skipped: the previous fresh read for this scope timed out "
+                    f"{held_for:.0f}s ago and may still be running",
+                    timeout_seconds=timeout_seconds or self._fresh_request_timeout_seconds(),
+                )
         try:
-            return await asyncio.to_thread(
+            payload = await asyncio.to_thread(
                 self._fetch_json_sync,
                 path,
                 params or {},
@@ -2507,10 +2581,17 @@ class HistoryCollector:
                 headers or {},
                 timeout_seconds,
             )
+        except HistorySourceError as exc:
+            if fresh_key is not None and exc.kind == "source_timeout":
+                self._note_fresh_read_outcome(fresh_key, timed_out=True)
+            raise
         finally:
             # Finish the in-flight request, but do not start another request or
             # treat shutdown as a recoverable failure of this source.
             self._raise_if_stopping()
+        if fresh_key is not None:
+            self._note_fresh_read_outcome(fresh_key, timed_out=False)
+        return payload
 
     def _fetch_json_sync(
         self,

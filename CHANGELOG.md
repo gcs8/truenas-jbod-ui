@@ -40,6 +40,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   refused. SMART read metadata survives enrichment without implying available
   measurements; config warning generations do not expand YAML aliases.
   Real failures still log (#1174).
+- Gave the history collector's fresh SMART reads and forced inventory and
+  storage-view reads their own deadline, `HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS`
+  (default 120 s, 60-900; the larger of it and `HISTORY_REQUEST_TIMEOUT_SECONDS`
+  applies), so a large CORE system's slow answer is recorded instead of dropped
+  and an old `HISTORY_REQUEST_TIMEOUT_SECONDS=20` no longer cuts them short.
+  After one times out, that shelf gets no second fresh read until one more
+  deadline has passed (#1173, refs #1168).
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
