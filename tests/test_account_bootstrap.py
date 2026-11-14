@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import json
+import os
 import re
 import shlex
 import shutil
@@ -103,6 +104,34 @@ class ServiceAccountBootstrapServiceTests(unittest.TestCase):
 
             private_path = Path(generated_key["private_path"])
             self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o640)
+
+    @unittest.skipUnless(sys.platform != "win32", "POSIX permission bits")
+    def test_generated_private_key_is_never_published_world_readable(self) -> None:
+        for umask in (0o000, 0o022, 0o077):
+            with self.subTest(umask=f"{umask:03o}"), tempfile.TemporaryDirectory() as temp_dir:
+                published: dict[str, int] = {}
+                real_replace = Path.replace
+
+                def recording_replace(source: Path, target: Path) -> Path:
+                    published[Path(target).name] = stat.S_IMODE(source.stat().st_mode)
+                    return real_replace(source, target)
+
+                config_file = Path(temp_dir) / "config" / "config.yaml"
+                config_file.parent.mkdir(parents=True, exist_ok=True)
+
+                previous = os.umask(umask)
+                try:
+                    with patch.object(Path, "replace", autospec=True, side_effect=recording_replace):
+                        generated_key = SSHKeyManager(str(config_file)).generate_keypair("id_truenas")
+                finally:
+                    os.umask(previous)
+
+                private_path = Path(generated_key["private_path"])
+                public_path = Path(generated_key["public_path"])
+                # The mode at the moment each file takes its final name, not after.
+                self.assertEqual(published, {"id_truenas": 0o640, "id_truenas.pub": 0o644})
+                self.assertEqual(stat.S_IMODE(private_path.stat().st_mode), 0o640)
+                self.assertEqual(stat.S_IMODE(public_path.stat().st_mode), 0o644)
 
     def test_bootstrap_uses_managed_key_without_sudo_for_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -44,13 +44,32 @@ def _existing_mode(path: Path) -> int | None:
         return None
 
 
-def _create_temporary(path: Path, open_mode: str, open_kwargs: dict[str, Any]) -> tuple[Path, IO[Any]]:
+def _create_temporary(
+    path: Path,
+    open_mode: str,
+    open_kwargs: dict[str, Any],
+    create_mode: int | None = None,
+) -> tuple[Path, IO[Any]]:
     for _attempt in range(_CREATE_ATTEMPTS):
         candidate = temporary_path_for(path)
         try:
-            return candidate, candidate.open(open_mode, **open_kwargs)
+            if create_mode is None:
+                return candidate, candidate.open(open_mode, **open_kwargs)
+            # The requested bits apply from creation, so the file is never
+            # broader than them, even before the exact fchmod below.
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0),
+                create_mode,
+            )
         except FileExistsError:
             continue
+        try:
+            return candidate, os.fdopen(descriptor, open_mode.replace("x", "w"), **open_kwargs)
+        except BaseException:
+            os.close(descriptor)
+            _remove_quietly(candidate)
+            raise
     raise FileExistsError(f"Could not create a unique temporary file beside {path.name}.")
 
 
@@ -70,6 +89,7 @@ def write_atomically(
     encoding: str = "utf-8",
     newline: str | None = None,
     commit_guard: Callable[[], AbstractContextManager[bool]] | None = None,
+    mode: int | None = None,
 ) -> bool:
     """Write ``path`` through a private temporary file and replace it.
 
@@ -81,6 +101,10 @@ def write_atomically(
     existing file keeps its permission bits: the replacement is set to the
     old mode before it is published. Hosts that refuse ``chmod`` on the
     temporary file keep the ordinary new-file mode, as before this helper.
+
+    ``mode`` sets the published file's permission bits instead. The temporary
+    file is created with them, so content that must not be world-readable
+    (a private key) never passes through the umask default on its way in.
     """
 
     path = Path(path)
@@ -88,8 +112,8 @@ def write_atomically(
         open_mode, open_kwargs = "xb", {}
     else:
         open_mode, open_kwargs = "x", {"encoding": encoding, "newline": newline}
-    preserved_mode = _existing_mode(path)
-    temp_path, handle = _create_temporary(path, open_mode, open_kwargs)
+    preserved_mode = mode if mode is not None else _existing_mode(path)
+    temp_path, handle = _create_temporary(path, open_mode, open_kwargs, create_mode=mode)
     try:
         with handle:
             if preserved_mode is not None and hasattr(os, "fchmod"):
