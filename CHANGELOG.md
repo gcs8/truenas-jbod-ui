@@ -30,6 +30,16 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Quieted repeated log lines: smartctl status bits (such as exit 4 or 64) no
+  longer log as failed SSH commands and are kept on the SMART result instead,
+  logging once per device and status; channel-limit changes log once per
+  change with paramiko's per-channel errors lowered to debug; config.yaml
+  key warnings log once per file change; and identical command failures are
+  summarized with a count. Recovery resets remembered failures, SSH log keys
+  use fixed-size digests with idle expiry, and oversized SMART paths are
+  refused. SMART read metadata survives enrichment without implying available
+  measurements; config warning generations do not expand YAML aliases.
+  Real failures still log (#1174).
 - Gave the history collector's fresh SMART reads and forced inventory and
   storage-view reads their own deadline, `HISTORY_FRESH_REQUEST_TIMEOUT_SECONDS`
   (default 120 s, 60-900; the larger of it and `HISTORY_REQUEST_TIMEOUT_SECONDS`

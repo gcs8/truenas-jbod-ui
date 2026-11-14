@@ -185,6 +185,7 @@ from app.services.ssh_probe import (
     redact_ssh_command,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
+from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
 from app.services.tls_context import certificate_verification_failure_reason
 from app.services.truenas_ws import (
@@ -504,10 +505,13 @@ STABLE_SMART_DETAIL_FIELDS = (
     "attached_sas_address",
     "negotiated_link_rate",
 )
+# smartctl exit metadata describes the read, not a SMART measurement, so it
+# must not make a summary count as available (#1171).
+SMART_SUMMARY_READ_METADATA_FIELDS = frozenset({"smartctl_exit_status", "smartctl_status_flags"})
 SMART_SUMMARY_VALUE_FIELDS = tuple(
     field_name
     for field_name in SmartSummaryView.model_fields
-    if field_name not in {"available", "message"}
+    if field_name not in {"available", "message", *SMART_SUMMARY_READ_METADATA_FIELDS}
 )
 OPTIONAL_SSH_BATCH_FAILURE_BACKOFF_SECONDS = 30
 # Loop turns a per-host SSH round waits before choosing its plans.
@@ -7912,7 +7916,13 @@ class InventoryService:
             ]
         ] = []
         for candidate in candidates:
+            # Remote inventory names are not trusted. Refuse oversized paths
+            # before building commands or passing identifiers to log limiters.
+            if len(candidate) > 4096:
+                continue
             device_path = candidate if candidate.startswith("/dev/") else f"/dev/{candidate}"
+            if len(device_path.encode("utf-8", "surrogatepass")) > 4096:
+                continue
             for smartctl_binary in self._smartctl_binary_candidates():
                 command_parts = ["sudo", "-n", smartctl_binary]
                 if device_type:
@@ -8015,6 +8025,13 @@ class InventoryService:
                     if result is None:
                         continue
                     summary = parse_primary(result)
+                    if summary is not None:
+                        # Keep smartctl's status bits on the result: they are
+                        # SMART data, not a failed SSH command (#1171).
+                        summary.smartctl_exit_status = result.exit_code
+                        summary.smartctl_status_flags = (
+                            None if result.exit_code is None else smartctl_exit_flags(result.exit_code)
+                        )
                     if summary is None:
                         detail = (
                             result.stderr.strip()
@@ -17879,7 +17896,7 @@ class InventoryService:
         primary: SmartSummaryView,
         supplement: SmartSummaryView,
     ) -> SmartSummaryView:
-        for field_name in SMART_SUMMARY_VALUE_FIELDS:
+        for field_name in (*SMART_SUMMARY_VALUE_FIELDS, *SMART_SUMMARY_READ_METADATA_FIELDS):
             if getattr(primary, field_name) is None and getattr(supplement, field_name) is not None:
                 setattr(primary, field_name, getattr(supplement, field_name))
 
