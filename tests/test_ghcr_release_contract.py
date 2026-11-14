@@ -19,17 +19,29 @@ RELEASE_CHECKLIST_PATH = REPO_ROOT / "docs/RELEASE_CHECKLIST.md"
 DEPLOY_HELPER_PATH = REPO_ROOT / "scripts/update_immutable_deployment.py"
 
 
-def _run_release_step(name: str, tag: str, prerelease: bool) -> tuple[int, str, list[str], bool]:
+def _run_release_step(
+    name: str,
+    tag: str,
+    prerelease: bool,
+    *,
+    manual_ref: str | None = None,
+    input_tags: str = "",
+    make_latest: bool = False,
+    fixture_files: tuple[str, ...] = (),
+) -> tuple[int, str, list[str], bool]:
     """Run one publish-workflow step's own bash for a ``release`` event.
 
     Returns the exit code, output, resolved image tags and whether the step
     called the public-demo validator (a stub ``python`` records the call).
+    With ``manual_ref`` the step runs as a ``workflow_dispatch`` from that ref.
     """
 
     workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
     step = next(s for s in workflow["jobs"]["publish"]["steps"] if s.get("name") == name)
     with tempfile.TemporaryDirectory() as scratch:
         root = Path(scratch)
+        for filename in fixture_files:
+            (root / filename).touch()
         stub = root / "bin" / "python"
         stub.parent.mkdir()
         stub.write_text(f'#!/bin/sh\necho "$@" > "{root}/validator-called"\n', encoding="utf-8")
@@ -48,6 +60,18 @@ def _run_release_step(name: str, tag: str, prerelease: bool) -> tuple[int, str, 
             "RELEASE_TAG": tag,
             "PRERELEASE": "true" if prerelease else "false",
         }
+        if manual_ref is not None:
+            env.update(
+                {
+                    "GITHUB_EVENT_NAME": "workflow_dispatch",
+                    "GITHUB_REF": manual_ref,
+                    "GITHUB_REF_NAME": manual_ref.split("/", 2)[2],
+                    "INPUT_TAGS": input_tags,
+                    "INPUT_LATEST": "true" if make_latest else "false",
+                    "RELEASE_TAG": "",
+                    "PRERELEASE": "",
+                }
+            )
         result = subprocess.run(
             [shutil.which("bash") or "/bin/bash", "-c", step["run"]],
             cwd=root, env=env, capture_output=True, text=True, check=False,
@@ -79,6 +103,189 @@ class GHCRReleaseContractTests(unittest.TestCase):
         self.assertEqual(
             tags,
             [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-beta.1", "0.24.0-beta.1", "dev")],
+        )
+
+    def _run_manual(self, ref: str, input_tags: str = "", make_latest: bool = False) -> tuple[int, str, list[str]]:
+        code, out, tags, _ = _run_release_step(
+            "Resolve publish tags", "", False,
+            manual_ref=ref, input_tags=input_tags, make_latest=make_latest,
+        )
+        return code, out, [tag.removeprefix("ghcr.io/gcs8/truenas-jbod-ui:") for tag in tags]
+
+    def test_manual_branch_run_publishes_only_its_branch_and_sha_tags(self) -> None:
+        code, _out, tags = self._run_manual("refs/heads/fix/example-change")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(tags, ["fix-example-change", "sha-0123456"])
+
+        code, _out, tags = self._run_manual("refs/heads/fix/example-change", input_tags="qa-one, qa-two")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(tags, ["qa-one", "qa-two"])
+
+    def test_manual_run_moves_latest_only_from_main_or_a_stable_release_tag(self) -> None:
+        for ref in ("refs/heads/main", "refs/tags/v0.24.0"):
+            with self.subTest(ref=ref):
+                code, _out, tags = self._run_manual(ref, make_latest=True)
+                self.assertEqual(code, 0)
+                self.assertEqual(tags[-1], "latest")
+
+        refused = (
+            ("refs/heads/fix/example-change", "", True),
+            ("refs/heads/fix/example-change", "latest", False),
+            ("refs/heads/latest", "", False),
+            ("refs/tags/v0.24.0-beta.1", "", True),
+            ("refs/heads/mainline", "", True),
+        )
+        for ref, input_tags, make_latest in refused:
+            with self.subTest(ref=ref, input_tags=input_tags, make_latest=make_latest):
+                code, out, tags = self._run_manual(ref, input_tags=input_tags, make_latest=make_latest)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(tags, [])
+                self.assertIn(f"Refusing to publish the reserved tag 'latest' from {ref}.", out)
+
+    def test_manual_run_moves_dev_only_from_main_or_a_release_tag(self) -> None:
+        for ref in ("refs/heads/main", "refs/tags/v0.24.0-beta.1", "refs/tags/v0.24.0"):
+            with self.subTest(ref=ref):
+                code, _out, tags = self._run_manual(ref, input_tags="dev")
+                self.assertEqual((code, tags), (0, ["dev"]))
+
+        for ref in ("refs/heads/fix/example-change", "refs/heads/dev"):
+            with self.subTest(ref=ref):
+                code, out, tags = self._run_manual(ref, input_tags="" if ref.endswith("/dev") else "dev")
+                self.assertNotEqual(code, 0)
+                self.assertEqual(tags, [])
+                self.assertIn(f"Refusing to publish the reserved tag 'dev' from {ref}.", out)
+
+    def test_manual_run_publishes_a_version_tag_only_from_its_own_git_tag(self) -> None:
+        code, _out, tags = self._run_manual("refs/tags/v0.24.0", input_tags="v0.24.0,0.24.0")
+        self.assertEqual((code, tags), (0, ["v0.24.0", "0.24.0"]))
+
+        code, _out, tags = self._run_manual("refs/tags/v0.24.0-beta.1")
+        self.assertEqual((code, tags), (0, ["v0.24.0-beta.1", "sha-0123456"]))
+
+        refused = (
+            ("refs/heads/main", "v0.23.0"),
+            ("refs/heads/fix/example-change", "0.24.0"),
+            ("refs/tags/v0.24.0", "v0.23.0"),
+            ("refs/tags/v0.24.0", "qa-one,0.24.1"),
+            ("refs/heads/main", "0.24"),
+            ("refs/heads/v0.24.0", ""),
+        )
+        for ref, input_tags in refused:
+            with self.subTest(ref=ref, input_tags=input_tags):
+                code, out, tags = self._run_manual(ref, input_tags=input_tags)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(tags, [])
+                self.assertIn("Refusing to publish the reserved tag", out)
+                self.assertIn(f"from {ref}.", out)
+
+    def test_manual_dev_rejects_incomplete_and_suffixed_release_ref_prefixes(self) -> None:
+        for ref in (
+            "refs/tags/v0.24.0notes",
+            "refs/tags/v0.24.0/feature",
+            "refs/tags/v0.24",
+            "refs/tags/v0.24.0-",
+            "refs/tags/v0.24.0-rc..1",
+            "refs/tags/0.24.0",
+            "refs/heads/v0.24.0",
+            "refs/heads/v0.24.0-rc.1",
+            "refs/heads/main/feature",
+        ):
+            with self.subTest(ref=ref):
+                code, out, tags = self._run_manual(ref, input_tags="qa-one, dev")
+                self.assertNotEqual(code, 0)
+                self.assertEqual(tags, [])
+                self.assertIn("Refusing to publish the reserved tag 'dev'", out)
+
+        for ref in (
+            "refs/tags/v0.24.0-rc.1",
+            "refs/tags/v0.24.0-beta.2",
+            "refs/tags/v0.24.0-beta-one.2",
+            "refs/tags/v0.24.0+build.1",
+        ):
+            with self.subTest(ref=ref):
+                code, out, tags = self._run_manual(ref, input_tags="dev")
+                self.assertEqual((code, tags), (0, ["dev"]), out)
+
+    def test_manual_latest_rejects_prereleases_and_nonstable_refs(self) -> None:
+        for ref in (
+            "refs/tags/v0.24.0-rc.1",
+            "refs/tags/v0.24.0-beta.1",
+            "refs/tags/v0.24.0+build.1",
+            "refs/tags/v0.24.0notes",
+            "refs/tags/0.24.0",
+            "refs/tags/main",
+            "refs/heads/v0.24.0",
+        ):
+            for input_tags, make_latest in (("qa, latest", False), ("qa", True)):
+                with self.subTest(ref=ref, input_tags=input_tags, make_latest=make_latest):
+                    code, out, tags = self._run_manual(ref, input_tags, make_latest)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(tags, [])
+                    self.assertIn("Refusing to publish the reserved tag 'latest'", out)
+
+    def test_manual_version_aliases_require_the_full_matching_tag_ref(self) -> None:
+        for suffix in ("", "-rc.1", "-beta.2"):
+            names = [f"v0.24.0{suffix}", f"0.24.0{suffix}"]
+            for ref in (
+                f"refs/heads/v0.24.0{suffix}",
+                f"refs/tags/0.24.0{suffix}",
+                "refs/heads/main",
+                "refs/tags/v0.24.1",
+            ):
+                for name in names:
+                    with self.subTest(ref=ref, name=name):
+                        code, out, tags = self._run_manual(ref, input_tags=name)
+                        self.assertNotEqual(code, 0)
+                        self.assertEqual(tags, [])
+                        self.assertIn("Refusing to publish the reserved tag", out)
+            code, out, tags = self._run_manual(f"refs/tags/{names[0]}", input_tags=",".join(names))
+            self.assertEqual((code, tags), (0, names), out)
+
+    def test_manual_empty_and_separated_inputs_keep_defaults_and_deduplicate(self) -> None:
+        for input_tags in ("", " , , \t\n\r "):
+            with self.subTest(input_tags=input_tags):
+                code, out, tags = self._run_manual("refs/heads/fix/example-change", input_tags)
+                self.assertEqual((code, tags), (0, ["fix-example-change", "sha-0123456"]), out)
+        code, out, tags = self._run_manual(
+            "refs/heads/fix/example-change", "qa-one, qa-two\tsha-abc1234\nqa-one\rqa-three"
+        )
+        self.assertEqual((code, tags), (0, ["qa-one", "qa-two", "sha-abc1234", "qa-three"]), out)
+
+    def test_manual_input_tags_do_not_expand_checkout_filenames(self) -> None:
+        code, out, tags, _ = _run_release_step(
+            "Resolve publish tags", "", False, manual_ref="refs/heads/feature",
+            input_tags="qa-*", fixture_files=("qa-one", "qa-two"),
+        )
+        self.assertEqual((code, tags), (0, ["ghcr.io/gcs8/truenas-jbod-ui:qa-*"]), out)
+
+    def test_manual_input_tags_remain_literal_shell_data(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            marker = Path(scratch) / "injected"
+            for payload in (
+                f"$(touch${{IFS}}{marker})",
+                f"`touch${{IFS}}{marker}`",
+                f"qa;touch${{IFS}}{marker}",
+                f'qa\";touch${{IFS}}{marker};#',
+            ):
+                with self.subTest(payload=payload):
+                    code, out, tags = self._run_manual("refs/heads/feature", input_tags=payload)
+                    self.assertEqual((code, tags), (0, [payload]), out)
+                    self.assertFalse(marker.exists(), "image_tags executed as shell code")
+
+        workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+        publish = workflow["jobs"]["publish"]
+        self.assertIn("inputs.image_tags", publish["env"]["INPUT_TAGS"])
+        step = next(s for s in publish["steps"] if s.get("name") == "Resolve publish tags")
+        self.assertNotIn("${{", step["run"], "Pass inputs through env, never interpolate into bash")
+
+    def test_release_candidate_event_keeps_the_exact_release_tags_and_dev(self) -> None:
+        code, out, tags, _ = _run_release_step("Resolve publish tags", "v0.24.0-rc.1", prerelease=True)
+        self.assertEqual(
+            (code, tags),
+            (0, [f"ghcr.io/gcs8/truenas-jbod-ui:{tag}" for tag in ("v0.24.0-rc.1", "0.24.0-rc.1", "dev")]),
+            out,
         )
 
     def test_demo_gate_runs_for_stable_and_waits_for_a_prerelease(self) -> None:
