@@ -15295,7 +15295,8 @@ Enclosure Status diagnostic page:
     def test_smart_summary_value_field_contract_tracks_the_model(self) -> None:
         self.assertEqual(
             set(getattr(inventory_module, "SMART_SUMMARY_VALUE_FIELDS", ())),
-            set(SmartSummaryView.model_fields) - {"available", "message"},
+            set(SmartSummaryView.model_fields)
+            - {"available", "message", "smartctl_exit_status", "smartctl_status_flags"},
         )
 
 

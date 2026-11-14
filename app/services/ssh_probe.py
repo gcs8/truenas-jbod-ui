@@ -17,9 +17,57 @@ from pathlib import Path
 import paramiko
 
 from app.config import SSHConfig
+from app.log_limiter import RepeatedLogLimiter
 from app.services.core_expander_counters import SMP_MAX_OUTPUT_BYTES_PER_COMMAND, mask_smp_identity, smp_output_key
+from app.services.smartctl_status import (
+    smartctl_device_path,
+    smartctl_exit_failed,
+    smartctl_exit_flags,
+    smartctl_reports_failing,
+)
 
 logger = logging.getLogger(__name__)
+
+# Background refreshes repeat the same commands every few seconds (#1171).
+# A failing command logs when first seen and whenever its exit status changes;
+# identical repeats are counted and summarized at most this often.
+SSH_COMMAND_FAILURE_REPEAT_SECONDS = 900.0
+SSH_COMMAND_FAILURE_LOG = RepeatedLogLimiter(repeat_interval_seconds=SSH_COMMAND_FAILURE_REPEAT_SECONDS)
+# smartctl health/status bits per device, and the channel count a host's
+# sessions settle on: logged only when they change.
+SMARTCTL_STATUS_LOG = RepeatedLogLimiter(repeat_interval_seconds=None)
+CHANNEL_LIMIT_LOG = RepeatedLogLimiter(repeat_interval_seconds=None)
+SSH_LOG_LIMITERS = (SSH_COMMAND_FAILURE_LOG, SMARTCTL_STATUS_LOG, CHANNEL_LIMIT_LOG)
+
+_PARAMIKO_CHANNEL_OPEN_FAILED = re.compile(r"^Secsh channel \d+ open FAILED: ")
+
+
+class _DemoteChannelOpenFailure(logging.Filter):
+    """Lower paramiko's per-channel open refusal from ERROR to DEBUG.
+
+    Paramiko logs every refused channel open from its transport thread before
+    the caller sees the exception. Every exec here handles that exception: a
+    planned session lowers its channel limit and retries (logged once per
+    change), and a command that still cannot open a channel logs a warning
+    with the server's reason. The per-channel ERROR is therefore duplicate
+    noise; it stays available at DEBUG.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno > logging.DEBUG and _PARAMIKO_CHANNEL_OPEN_FAILED.match(str(record.msg)):
+            record.levelno = logging.DEBUG
+            record.levelname = logging.getLevelName(logging.DEBUG)
+            return logging.getLogger(record.name).isEnabledFor(logging.DEBUG)
+        return True
+
+
+def _install_paramiko_channel_filter() -> None:
+    transport_logger = logging.getLogger("paramiko.transport")
+    if not any(isinstance(existing, _DemoteChannelOpenFailure) for existing in transport_logger.filters):
+        transport_logger.addFilter(_DemoteChannelOpenFailure())
+
+
+_install_paramiko_channel_filter()
 
 # Bound each command's combined stdout/stderr before it can enter synchronous
 # parser paths. Four MiB still covers the largest supported SES page.
@@ -619,6 +667,7 @@ class SSHProbe:
         batch_counts: list[int] = [0] * len(groups)
         width = max(1, min(int(max_parallel_channels), len(pending)))
         gate = _ChannelGate(width)
+        refusals = [0]
 
         def run_one(command: str) -> SSHCommandResult:
             while True:
@@ -627,14 +676,23 @@ class SSHProbe:
                     _cancel.check()
                     result = self._run_single_command(client, command, raise_channel_refusal=True, _cancel=_cancel)
                 except paramiko.ChannelException as exc:
+                    refusals[0] += 1
                     if gate.refused():
-                        logger.info(
+                        logger.debug(
                             "SSH server %s refused a session channel; running at most %s at once",
                             self.config.host,
                             gate.limit,
                         )
                         continue
-                    return self._failure_result(command, str(exc) or exc.__class__.__name__)
+                    reason = str(exc) or exc.__class__.__name__
+                    logger.warning(
+                        "SSH command could not open an SSH channel on %s@%s: %s (%s)",
+                        self.config.user,
+                        self.config.host,
+                        redact_ssh_command(command),
+                        reason,
+                    )
+                    return self._failure_result(command, reason)
                 except BaseException:
                     # An exception escaping command cleanup is not proof of a
                     # closed channel. Keep its capacity charged and stop reuse.
@@ -695,6 +753,8 @@ class SSHProbe:
             reusable = not gate.stopped
         finally:
             self._return_client(client, _cancel, reusable=reusable)
+            if refusals[0]:
+                self._log_channel_limit(width, gate.limit, refusals[0])
 
         results_count = sum(len(outcomes[index]) for index, _commands, _seen in pending)
         logger.info(
@@ -709,6 +769,52 @@ class SSHProbe:
             time.perf_counter() - started,
         )
         return outcomes
+
+    def _log_channel_limit(self, width: int, limit: int, refusals: int) -> None:
+        # One line per change of the limit this host's sessions settle on, not
+        # one per refused channel; each session starts at full width again.
+        summary = CHANNEL_LIMIT_LOG.admit((self.config.host, self.config.port), (width, limit))
+        if summary is None:
+            return
+        logger.info(
+            "SSH server %s refused %s session channel(s); running at most %s of %s at once%s",
+            self.config.host,
+            refusals,
+            limit,
+            width,
+            summary.suffix(),
+        )
+
+    def _forget_logged_exit(self, command: str, safe_command: str) -> None:
+        # A clean exit ends the logged condition: the next failure, or the next
+        # failing SMART status on this device path (perhaps a replaced disk),
+        # logs again instead of counting as a repeat of the old one.
+        SSH_COMMAND_FAILURE_LOG.forget((self.config.host, self.config.port, safe_command))
+        device_path = smartctl_device_path(command)
+        if device_path is not None:
+            SMARTCTL_STATUS_LOG.forget((self.config.host, self.config.port, device_path))
+
+    def _log_nonzero_exit(self, command: str, safe_command: str, exit_code: int) -> None:
+        device_path = smartctl_device_path(command)
+        if device_path is not None and not smartctl_exit_failed(exit_code):
+            # smartctl read the device; the set bits are SMART data that the
+            # SMART result keeps (smartctl_exit_status/smartctl_status_flags).
+            summary = SMARTCTL_STATUS_LOG.admit((self.config.host, self.config.port, device_path), exit_code)
+            if summary is None:
+                return
+            logger.log(
+                logging.WARNING if smartctl_reports_failing(exit_code) else logging.INFO,
+                "smartctl reported SMART status for %s on %s: exit=%s (%s)%s",
+                device_path,
+                self.config.host,
+                exit_code,
+                ", ".join(smartctl_exit_flags(exit_code)),
+                summary.suffix(),
+            )
+            return
+        summary = SSH_COMMAND_FAILURE_LOG.admit((self.config.host, self.config.port, safe_command), exit_code)
+        if summary is not None:
+            logger.warning("SSH command failed: %s (exit=%s)%s", safe_command, exit_code, summary.suffix())
 
     def _run_command_sync(
         self,
@@ -907,8 +1013,10 @@ class SSHProbe:
             output = output_bytes.decode("utf-8", errors="replace")
             error = error_bytes.decode("utf-8", errors="replace")
             ok = exit_code == 0
-            if not ok:
-                logger.warning("SSH command failed: %s (exit=%s)", safe_command, exit_code)
+            if ok:
+                self._forget_logged_exit(command, safe_command)
+            else:
+                self._log_nonzero_exit(command, safe_command, exit_code)
             return SSHCommandResult(
                 command=command,
                 ok=ok,
