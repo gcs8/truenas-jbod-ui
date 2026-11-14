@@ -35,6 +35,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   longer resolves dependencies from PyPI on its own. After changing a pin in
   `requirements.txt`, regenerate the lock with the command in its first lines
   (#1181).
+### Security
+
+- A generated SSH private key is now created with its final `0640` mode
+  instead of taking its name under `config/ssh/` at the umask default
+  (usually `0644`) and being narrowed afterwards, and it can no longer stay
+  world-readable when the host refuses the mode change (#1180).
 
 ### Fixed
 
@@ -78,6 +84,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   chunks, capped retained chunks and per-system count bytes with an exact full
   query fallback, and prevented restore races from caching replaced-file counts
   (#1175).
+
+### Internal
+
+- Made a manual `Publish GHCR Image` run refuse `latest`, `dev` and version
+  tags unless it runs from `main` or the matching release tag, so a branch
+  build cannot replace the image a deployment follows; manual inputs are split
+  without filename expansion, and branch, sha and custom tags are unchanged
+  (#1179).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
