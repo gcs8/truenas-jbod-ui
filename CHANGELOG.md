@@ -30,6 +30,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A failed history collection pass now logs which stage failed, the source
+  failure kind and scope, and SQLite's error code, name and coarse class
+  (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
+  paths or host names (#1172).
 - A background inventory refresh that another enclosure's newer refresh
   overtakes while it saves bay details now ends quietly as superseded, as
   #928 intended, instead of logging "Background snapshot refresh failed" at
@@ -64,6 +68,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   tags unless it runs from `main` or the matching release tag, so a branch
   build cannot replace the image a deployment follows; branch, sha and custom
   tags are unchanged (#1179).
+### Performance
+
+- The admin orphaned-history preview kept exact per-system hot-database
+  counts current from new rows and retention edges instead of recounting
+  the whole hot database on every request, bounded sparse-ID scans to populated
+  chunks, capped retained chunks and per-system count bytes with an exact full
+  query fallback, and prevented restore races from caching replaced-file counts
+  (#1175).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
