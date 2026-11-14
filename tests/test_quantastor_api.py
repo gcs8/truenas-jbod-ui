@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 from app.config import TrueNASConfig
 from app.services.quantastor_api import QuantastorRESTClient
 from app.services.truenas_ws import TrueNASAPIError
+from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 
 
 ENDPOINT_FIELDS = {
@@ -60,6 +61,7 @@ class SyntheticTransport:
         self.calls = []
         self.lock = threading.Lock()
         self.finished = threading.Event()
+        self.all_opened = threading.Event()
         self.completed = 0
         self.read_entered = threading.Event()
         self.release_read = threading.Event()
@@ -76,6 +78,8 @@ class SyntheticTransport:
             raise AssertionError(f"Unexpected endpoint: {endpoint}")
         with self.lock:
             self.calls.append(endpoint)
+            if len(self.calls) == len(ENDPOINT_FIELDS):
+                self.all_opened.set()
         targeted = endpoint == self.endpoint
         if targeted and self.phase == "open":
             self.complete()
@@ -89,7 +93,7 @@ class SyntheticTransport:
             def read(self, *args):
                 if targeted:
                     transport.read_entered.set()
-                    if transport.phase == "blocked" and not transport.release_read.wait(2):
+                    if transport.phase == "blocked" and not transport.release_read.wait(HANG_TIMEOUT_SECONDS):
                         raise AssertionError("Synthetic read was not released")
                     if transport.error is not None:
                         raise transport.error
@@ -131,7 +135,9 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
                 # where the client does not close it. Clean up the test fixture.
                 if transport.status is not None and transport.endpoint in transport.responses:
                     transport.responses[transport.endpoint].close()
-                self.assertTrue(await asyncio.to_thread(transport.finished.wait, 2))
+                # Every read runs in its own worker thread; on a loaded host the
+                # cancelled read's thread may be scheduled late (#1177).
+                self.assertTrue(await asyncio.to_thread(transport.finished.wait, HANG_TIMEOUT_SECONDS))
                 self.assertCountEqual(transport.calls, ENDPOINT_FIELDS)
                 self.assertTrue(all(response.closed for response in transport.responses.values()))
 
@@ -238,7 +244,11 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
         transport = SyntheticTransport("hwDiskEnum", phase="blocked")
         task = asyncio.create_task(self.fetch_transport(transport))
         try:
-            self.assertTrue(await asyncio.to_thread(transport.read_entered.wait, 2))
+            self.assertTrue(await asyncio.to_thread(transport.read_entered.wait, HANG_TIMEOUT_SECONDS))
+            # Cancel only once every read has started. A read still queued in a
+            # busy executor is dropped by the cancellation and never runs, so
+            # the fixture could not see all seven finish (#1177).
+            self.assertTrue(await asyncio.to_thread(transport.all_opened.wait, HANG_TIMEOUT_SECONDS))
             task.cancel()
         finally:
             transport.release_read.set()
