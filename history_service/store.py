@@ -4365,8 +4365,11 @@ class HistoryStore:
             )
         if not self.file_path.exists():
             return []
+        opened_identity = self._hot_summary_counts.file_identity(self.file_path)
         with closing(self._connect()) as connection:
-            table_counts = self._hot_summary_counts.table_counts(connection, self.file_path)
+            table_counts = self._hot_summary_counts.table_counts(
+                connection, self.file_path, opened_identity=opened_identity,
+            )
         return self._summaries_from_table_counts(table_counts, exclude_system_ids=normalized_excludes)
 
     @staticmethod

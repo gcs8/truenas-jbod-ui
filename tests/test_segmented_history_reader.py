@@ -3401,14 +3401,88 @@ class HotSummaryCountCacheTests(unittest.TestCase):
             statements: list[str] = []
             original_connect = sqlite3.connect
 
+            class BudgetConnection(sqlite3.Connection):
+                def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+                    # A regressed empty-chunk walk must fail promptly, not run
+                    # billions of queries or retain an unbounded trace in CI.
+                    if sql == "ROLLBACK":
+                        return super().execute(sql, parameters)
+                    if len(statements) >= 200:
+                        raise AssertionError("sparse cache build exceeded 200 SQL statements")
+                    statements.append(sql)
+                    return super().execute(sql, parameters)
+
             def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
-                connection = original_connect(*args, **kwargs)
-                connection.set_trace_callback(statements.append)
-                return connection
+                return original_connect(*args, **kwargs, factory=BudgetConnection)
 
             with patch("history_service.store.sqlite3.connect", side_effect=connect):
-                self._assert_equivalent(store, path, "sparse ids")
+                self.assertEqual(store.list_history_system_summaries(), self._full_summaries(path))
             self.assertLess(len(statements), 200, f"{len(statements)} statements for sparse ids")
+
+    def test_restore_after_connection_open_does_not_cache_old_rows_as_new_file(self) -> None:
+        # A read opened before a restore may finish on the old SQLite snapshot.
+        # It must not publish those counts under the replacement file's inode.
+        for segmented in (False, True):
+            with self.subTest(segmented=segmented), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path, backup = root / "hot.sqlite3", root / "backup.sqlite3"
+                store = self._create(path)
+                self._append(path, events=30, samples=90)
+                self._create(backup)
+                self._append(backup, events=30, samples=90)
+                with closing(sqlite3.connect(backup)) as connection, connection:
+                    for table in ("slot_events", "metric_samples"):
+                        connection.execute(f"UPDATE {table} SET system_id = 'restored-system', system_label = 'Restored'")
+                reader = SegmentedHistoryReader(hot_path=path)
+                read = reader.list_history_system_summaries if segmented else lambda: self._full_summaries(path)
+                expected = read()
+                original_counts = store._hot_summary_counts.table_counts
+                restored = False
+
+                def restore_during_read(connection: sqlite3.Connection, *args: Any, **kwargs: Any) -> Any:
+                    nonlocal restored
+                    if not restored:
+                        connection.execute("BEGIN")
+                        connection.execute("SELECT COUNT(*) FROM slot_events").fetchone()
+                        store.restore_backup(backup)
+                        restored = True
+                    return original_counts(connection, *args, **kwargs)
+
+                with patch.object(store, "_segmented_reader", return_value=reader if segmented else None):
+                    with patch.object(store._hot_summary_counts, "table_counts", side_effect=restore_during_read):
+                        self.assertEqual(store.list_history_system_summaries(), expected)
+                    self.assertTrue(restored)
+                    expected = read()
+                    self.assertEqual(store.list_history_system_summaries(), expected)
+                    self.assertEqual(store.list_history_system_summaries(), expected)
+
+    def test_concurrent_append_and_retention_share_one_read_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.sqlite3"
+            store = self._create(path)
+            self._append(path, events=40, samples=120)
+            before = self._full_summaries(path)
+            counts = store._hot_summary_counts
+            original_incremental = counts._incremental
+            changed = False
+
+            def write_between_tables(*args: Any, **kwargs: Any) -> Any:
+                nonlocal changed
+                result = original_incremental(*args, **kwargs)
+                if not changed:
+                    self._append(path, events=10, samples=30, start=3, label_suffix=" new")
+                    with closing(sqlite3.connect(path)) as writer, writer:
+                        writer.execute("DELETE FROM slot_events WHERE id <= 12")
+                        writer.execute("DELETE FROM metric_samples WHERE id <= 36")
+                    changed = True
+                return result
+
+            # The writer commits between the two cached-table queries, while
+            # the first query has already pinned the request's read snapshot.
+            with patch.object(counts, "_incremental", side_effect=write_between_tables):
+                self.assertEqual(store.list_history_system_summaries(), before)
+            self.assertTrue(changed)
+            self._assert_equivalent(store, path, "writer committed during scan")
 
     def test_segmented_hot_counts_match_the_uncached_reader(self) -> None:
         from history_service.segment_sealer import seal_history_segment
@@ -3474,7 +3548,8 @@ class HotSummaryCountPerformanceTests(unittest.TestCase):
         def progress() -> int:
             nonlocal work
             work += 1_000
-            return 0
+            # Bound a regressed scan's work too, not just the fixture size.
+            return int(work > 5_000_000)
 
         def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
             connection = original_connect(*args, **kwargs)

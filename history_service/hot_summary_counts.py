@@ -110,17 +110,28 @@ class HotSystemSummaryCounts:
         with self._lock:
             self._tables.clear()
 
-    def table_counts(self, connection: sqlite3.Connection, path: Path) -> dict[str, SystemCounts]:
+    def table_counts(
+        self, connection: sqlite3.Connection, path: Path, *,
+        opened_identity: tuple[int, int] | None,
+    ) -> dict[str, SystemCounts]:
         """Return ``{table: {system_id: (count, max_label)}}`` for the summary tables.
 
         Every value equals ``SELECT system_id, COUNT(*), MAX(system_label)
         FROM <table> GROUP BY system_id`` on one read snapshot of
-        ``connection``.
+        ``connection``. The caller captures ``opened_identity`` before opening
+        the connection, so an old connection cannot seed a replacement's cache.
         """
 
-        identity = self._identity(path)
         key_path = str(Path(path).absolute())
         with self._lock, self._read_snapshot(connection):
+            identity = opened_identity
+            if identity is None or self.file_identity(path) != identity:
+                # Restore/rotation may replace the path after connection open.
+                # Answer from that connection, but neither use nor publish cache
+                # entries for a file it may not have opened.
+                for table_name in APPEND_ONLY_TABLES:
+                    self._tables.pop((key_path, table_name), None)
+                identity = None
             result: dict[str, SystemCounts] = {}
             for table_name, _key in SUMMARY_TABLE_KEYS:
                 if table_name in APPEND_ONLY_TABLES and identity is not None:
@@ -132,14 +143,15 @@ class HotSystemSummaryCounts:
                     except _Uncacheable:
                         self._tables.pop((key_path, table_name), None)
                 result[table_name] = self._full(connection, table_name)
-            if identity is not None and self._identity(path) != identity:
+            if identity is not None and self.file_identity(path) != identity:
                 # The file was replaced while it was read; trust nothing cached.
                 for table_name in APPEND_ONLY_TABLES:
                     self._tables.pop((key_path, table_name), None)
             return result
 
     @staticmethod
-    def _identity(path: Path) -> tuple[int, int] | None:
+    def file_identity(path: Path) -> tuple[int, int] | None:
+        """Capture the path's identity before opening its SQLite connection."""
         try:
             metadata = os.stat(path)
         except OSError:

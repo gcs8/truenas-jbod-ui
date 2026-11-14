@@ -829,6 +829,10 @@ class SegmentedHistoryReader:
         }
         summaries: dict[str, dict[str, Any]] = {}
         for path in (self.hot_path, *self._selected_segment_paths(since=None)):
+            opened_identity = (
+                hot_counts.file_identity(path)
+                if path == self.hot_path and hot_counts is not None else None
+            )
             with self._query_connection(path) as connection:
                 # Always enter the guarded connection first: cached counts do
                 # not authenticate a segment, bypass sidecars/activation, or
@@ -846,7 +850,9 @@ class SegmentedHistoryReader:
                 elif path == self.hot_path and hot_counts is not None:
                     # The hot database changes under the reader; its exact
                     # counts are kept current incrementally (#664).
-                    hot_table_counts = hot_counts.table_counts(connection, path)
+                    hot_table_counts = hot_counts.table_counts(
+                        connection, path, opened_identity=opened_identity,
+                    )
                     table_rows = tuple(
                         (key, {"system_id": system_id, "system_label": label, "row_count": count})
                         for table_name, key in SUMMARY_TABLE_KEYS
