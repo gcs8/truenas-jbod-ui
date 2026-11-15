@@ -51,8 +51,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   marked unverified, the plan is worked out again and the next copy is tried,
   at most three reads per class and location. A copy that cannot be read, a
   spent read budget or too little scratch space stops deletion at that
-  location with a named reason. History sidecar snapshots are replaced only by
-  FULLs that pass the same fresh check, at most 14 reads per run (#1195).
+  location with a named reason, and a clean-up that marked copies unverified
+  says so on the backup page. History sidecar snapshots are replaced only by
+  FULLs that pass the same fresh check, at most 14 local FULL content checks per
+  backup run including the kept-copy check (#1195).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

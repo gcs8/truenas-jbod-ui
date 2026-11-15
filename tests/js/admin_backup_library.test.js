@@ -803,6 +803,31 @@ test("clean up reports a partial run and a stale plan plainly", async () => {
   assert.match(mounted.elements.dialog.textContent, /The list changed since this plan was made, so nothing was deleted/);
 });
 
+test("clean up that kept copies after a failed keeper check says so, not plain success (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: [], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["full-new"], kept_after_replan: ["cfg-old", "full-part"] }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "Deleted 0 copies. 1 kept copy failed the size and SHA-256 check and was marked unverified. "
+    + "2 planned deletions were skipped.";
+  assert.match(elements.dialog.textContent, new RegExp(text.replace(/[.()]/g, "\\$&")));
+  assert.deepEqual(banners.at(-1), [text, "error"]);
+});
+
+test("the status line shows a clean-up that finished but marked copies unverified (#1188)", async () => {
+  const api = fakeApi();
+  api.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 0,
+    detail: "1 kept backup copy/copies failed the size and SHA-256 check and were marked unverified.", failed_locations: {} };
+  const { elements, library } = mount({ api });
+  await library.load();
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-ok"), null);
+  assert.equal(elements.status.querySelector("span.backup-run-status.is-bad").textContent,
+    "Last clean-up: T(2026-09-24T12:00:00Z), 0 removed. 1 kept backup copy/copies failed the size and SHA-256 check and were marked unverified.");
+});
+
 test("clean up with nothing to do, or without a token, never applies", async () => {
   const empty = fakeApi({ "GET /api/admin/backups/lifecycle/plan": () => ({ plan_token: "t", items: [] }) });
   let mounted = mount({ api: empty });

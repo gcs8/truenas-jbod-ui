@@ -299,7 +299,10 @@
     if (!grooming || typeof grooming !== "object") return null;
     const when = grooming.at ? formatTime(grooming.at) : "";
     if (grooming.ok) {
-      return { tone: "is-ok", text: `Last clean-up: ${when || "-"}, ${Number(grooming.deleted) || 0} removed.` };
+      const text = `Last clean-up: ${when || "-"}, ${Number(grooming.deleted) || 0} removed.`;
+      // A finished clean-up can still have found damaged kept copies (#1188).
+      if (grooming.detail) return { tone: "is-bad", text: `${text} ${scrubText(grooming.detail)}` };
+      return { tone: "is-ok", text };
     }
     const failed = grooming.failed_locations && typeof grooming.failed_locations === "object" ? grooming.failed_locations : {};
     const places = Object.keys(failed).map((location) => `${locationLabel(location, targets)}: ${scrubText(failed[location] || "no detail")}`);
@@ -1346,11 +1349,20 @@
           const deleted = count(payload.deleted) + count(payload.already_missing);
           const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false;
           const failedDetail = payload.failed?.error || payload.error;
-          const text = stopped
+          const summary = stopped
             ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
             : `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.`;
+          // #1188: kept copies that failed their check, and deletions skipped because of it.
+          const downgraded = count(payload.downgraded);
+          const skipped = count(payload.kept_after_replan);
+          const notes = [];
+          if (downgraded) {
+            notes.push(`${downgraded} kept ${downgraded === 1 ? "copy" : "copies"} failed the size and SHA-256 check and ${downgraded === 1 ? "was" : "were"} marked unverified.`);
+          }
+          if (skipped) notes.push(`${skipped} planned ${skipped === 1 ? "deletion was" : "deletions were"} skipped.`);
+          const text = [summary, ...notes].join(" ");
           scope.result(text);
-          setBanner(text, stopped ? "error" : "success");
+          setBanner(text, stopped || notes.length ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
           const text = error?.status === 409

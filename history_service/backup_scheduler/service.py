@@ -94,6 +94,9 @@ HISTORY_REPLACEMENT_COPIES = 14
 # Grooming's remote keeper readback stages one copy under the state directory
 # (#1188). It is refused unless the copy plus this much stays free there.
 KEEPER_SCRATCH_PREFIX = "keeper-check-"
+# Local FULL reads made by grooming's keeper check in one run, by artifact id:
+# (size, sha256), or None for a read that did not complete.
+_LocalReads = dict[str, tuple[int, str] | None]
 KEEPER_SCRATCH_HEADROOM_BYTES = 64 * 1024 * 1024
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
@@ -863,9 +866,10 @@ class BackupScheduler:
             RunRecord(at=_iso(started) or "", ok=True, detail=detail, artifact_id=record.artifact_id),
         )
         grooming_succeeded = False
-        # Local payload reads made by grooming's keeper check in this run, so
-        # the sidecar credit below does not hash the same files twice.
-        local_digests: dict[str, tuple[int, str]] = {}
+        # Local FULL payload reads made by grooming's keeper check in this run
+        # (None when the read did not complete). The sidecar credit below
+        # reuses them and counts them against its own 14-read allowance.
+        local_digests: _LocalReads = {}
         try:
             grooming = self._groom_locked(local_digests)
             grooming_succeeded = grooming is None or grooming.location_complete(LOCAL_LOCATION)
@@ -951,36 +955,45 @@ class BackupScheduler:
             metadata.st_ctime_ns,
         )
 
-    def _verified_local_full_count(
-        self, digests: dict[str, tuple[int, str]] | None = None
-    ) -> int:
+    def _verified_local_full_count(self, digests: _LocalReads | None = None) -> int:
         """Local FULLs with history whose bytes match the catalog right now (#1188).
 
         Candidates are checked newest first with a bounded size-and-SHA-256
-        read. At most ``HISTORY_REPLACEMENT_COPIES`` candidates are checked,
-        counting every attempt whether or not it earns credit, so corrupt or
-        unreadable copies cannot make this read every FULL. ``digests`` may
-        carry reads made earlier in the same run (grooming's keeper check);
-        those count as attempts too. A copy that is missing or does not match
-        is marked unverified and earns no credit; a copy that cannot be read
+        read. ``digests`` carries the local FULL reads grooming's keeper check
+        already made in this run (``None`` for a read that did not complete).
+        Those count against ``HISTORY_REPLACEMENT_COPIES`` first and are
+        reused, never repeated, so the keeper check and this check together
+        read at most that many local FULLs in one run. Every attempt counts,
+        whether or not it earns credit, so corrupt or unreadable copies cannot
+        make this read every FULL. A copy that is missing or does not match is
+        marked unverified and earns no credit; a copy that cannot be read
         earns no credit either. After a downgrade the status is published
         again so a ``verified_full`` receipt for that copy is withdrawn.
         """
 
         metadata = self._metadata_snapshot()
         local = LocalBackupDirectory(self.paths.local_dir)
+        prior = dict(digests or {})
+        unused = set(prior)
         count = 0
-        attempts = 0
+        attempts = len(prior)
         downgraded = False
         for artifact in reversed(self.catalog.list(backup_class="full", location=LOCAL_LOCATION)):
-            if attempts >= HISTORY_REPLACEMENT_COPIES:
-                break
+            reused = artifact.artifact_id in prior
+            unused.discard(artifact.artifact_id)
+            if not reused and attempts >= HISTORY_REPLACEMENT_COPIES:
+                if not unused:
+                    break
+                continue
             meta = metadata.get(artifact.artifact_id) or {}
             if meta.get("history_replacement") is not True or self._artifact_state(artifact, meta) != "ok":
                 continue
-            attempts += 1
-            observed = (digests or {}).get(artifact.artifact_id)
-            if observed is None:
+            if reused:
+                observed = prior[artifact.artifact_id]
+                if observed is None:
+                    continue  # grooming could not read it; already counted
+            else:
+                attempts += 1
                 try:
                     observed = local_payload_digest(artifact, local)
                 except FileNotFoundError:
@@ -1240,12 +1253,12 @@ class BackupScheduler:
                 )
         return rules
 
-    def _manager(self, local_digests: dict[str, tuple[int, str]] | None = None) -> LifecycleManager:
+    def _manager(self, local_digests: _LocalReads | None = None) -> LifecycleManager:
         return LifecycleManager(
             self.catalog, self.retention_rules(), payload_digest=self._keeper_digest(local_digests)
         )
 
-    def _keeper_digest(self, local_digests: dict[str, tuple[int, str]] | None = None) -> PayloadDigest:
+    def _keeper_digest(self, local_digests: _LocalReads | None = None) -> PayloadDigest:
         """How grooming re-reads a kept copy before it deletes anything (#1188).
 
         Local copies are hashed in place. A remote copy is read back through
@@ -1266,9 +1279,14 @@ class BackupScheduler:
 
         def digest(record: ArtifactRecord, target: GroomableTarget) -> tuple[int, str]:
             if record.location == LOCAL_LOCATION:
+                # Record local FULL attempts before reading, so a failed read
+                # still counts against the run's sidecar-credit allowance.
+                reads = local_digests if record.backup_class == "full" else None
+                if reads is not None:
+                    reads[record.artifact_id] = None
                 observed = local_payload_digest(record, target)
-                if local_digests is not None:
-                    local_digests[record.artifact_id] = observed
+                if reads is not None:
+                    reads[record.artifact_id] = observed
                 return observed
             get: Any = getattr(target, "get", None)
             if not callable(get):
@@ -1318,7 +1336,7 @@ class BackupScheduler:
 
             yield local_target_resolver(self.paths.local_dir, remote)
 
-    def _groom_locked(self, local_digests: dict[str, tuple[int, str]] | None = None) -> Any:
+    def _groom_locked(self, local_digests: _LocalReads | None = None) -> Any:
         manager = self._manager(local_digests)
         plan = manager.plan(self._clock())
         if not plan.items:

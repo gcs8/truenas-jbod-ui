@@ -3048,7 +3048,10 @@ class SchedulerApiTests(SchedulerTestBase):
         self.assertEqual(set(plan), {"plan_token", "expires_at", "items", "guarded"})
         status, body = asgi_call(app, "POST", "/internal/backups/lifecycle/apply", {"plan_token": plan["plan_token"]})
         self.assertEqual(status, 200)
-        self.assertEqual(set(json.loads(body)), {"ok", "deleted", "already_missing", "failed", "not_attempted"})
+        self.assertEqual(
+            set(json.loads(body)),
+            {"ok", "deleted", "already_missing", "failed", "not_attempted", "downgraded", "kept_after_replan"},
+        )
         self.assertEqual(asgi_call(app, "POST", "/internal/backups/lifecycle/apply", {"plan_token": plan["plan_token"]})[0], 409)
         status, body = asgi_call(app, "POST", "/internal/backups/targets/nas/test")
         self.assertEqual(status, 200)

@@ -385,10 +385,11 @@ backups:
 A scheduled FULL includes the history database and keeps `14` local copies by
 default (one daily copy for two weeks). Local FULLs that still match their
 catalogued size and SHA-256 when the scheduler re-reads them gradually replace
-the standalone daily, weekly and monthly history-sidecar snapshots. The
-scheduler reads at most the 14 newest eligible FULLs, newest first, and every
-read counts toward that limit whether or not it matches, so damaged copies
-lower the credit instead of causing more reads. A FULL that is missing or has
+the standalone daily, weekly and monthly history-sidecar snapshots. In one
+backup run the scheduler content-checks at most 14 local FULLs, newest first,
+counting the ones grooming's kept-copy check (below) already read in that run;
+those are reused, not read again. Every check counts toward that limit whether or not it
+matches, so damaged copies lower the credit instead of causing more reads. A FULL that is missing or has
 the wrong size earns no credit; one whose SHA-256 no longer matches also earns
 none and is marked unverified, and the status file stops naming it as the
 verified FULL. The
@@ -489,8 +490,10 @@ copy that stays and checks its size and SHA-256 against the catalog. If that
 copy matches, the check ends and the deletions go ahead. If it is missing or no
 longer matches, it is marked unverified, the plan is worked out again (which
 can only remove deletions, never add one), and the next newest verified copy is
-read. The check stops as soon as nothing is left to delete. The grooming status
-says how many copies were marked unverified.
+read. The check stops as soon as nothing is left to delete. The clean-up result
+and the backup page's status line say how many copies were marked unverified
+(and how many planned deletions were skipped), even when the clean-up
+otherwise finished.
 
 Grooming refuses to delete anything more at that location for that run, and
 the status names the reason, when:

@@ -29,7 +29,7 @@ from history_service.backup_archive.lifecycle import (
 from history_service.backup_archive.transport import ArchiveTransportError, LocalDirectoryTarget
 from history_service.backup_scheduler import service as scheduler_service
 from tests.test_backup_archive_lifecycle import NOW, CatalogCase
-from tests.test_backup_integration import TARGET, SchedulerTestBase
+from tests.test_backup_integration import TARGET, SchedulerTestBase, asgi_call
 from tests.wait_bounds import HANG_TIMEOUT_SECONDS
 
 BUDGET_REASON = "keeper-check-budget-exhausted"
@@ -256,6 +256,67 @@ class SchedulerKeeperCheckTests(SchedulerTestBase):
 
         self.assertEqual([item.record.artifact_id for item in result.deleted], [older.artifact_id])
         self.assertEqual(self.scratch_dirs(), [])
+
+    def test_apply_response_reports_a_safety_replan(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2}})
+        older = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        newest = scheduler.run_now("full")
+        (self._paths.local_dir / newest.name).unlink()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 1}})
+        app = build_app(scheduler)
+        plan = json.loads(asgi_call(app, "GET", "/internal/backups/lifecycle/plan")[1])
+
+        status, body = asgi_call(app, "POST", "/internal/backups/lifecycle/apply", {"plan_token": plan["plan_token"]})
+
+        self.assertEqual(status, 200)
+        response = json.loads(body)
+        # The safe replan is still a complete run, but it says what it found.
+        self.assertTrue(response["ok"])
+        self.assertIn("downgraded", response, "the safety replan is not reported")
+        self.assertEqual(response["deleted"], [])
+        self.assertEqual(response["downgraded"], [newest.artifact_id])
+        self.assertEqual(response["kept_after_replan"], [older.artifact_id])
+        self.assertTrue((self._paths.local_dir / older.name).exists())
+
+    def test_one_full_run_reads_at_most_fourteen_full_copies(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 100}})
+        for _ in range(17):
+            scheduler.run_now("full")
+            self.now += timedelta(days=1)
+        prior_newest = scheduler.catalog.list(backup_class="full", location="local")[-1]
+        (self._paths.local_dir / prior_newest.name).write_bytes(b"X" * prior_newest.size)
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 14}})
+        real_ship = scheduler._ship
+        reads: list[str] = []
+
+        def ship_then_corrupt(record):
+            failures = real_ship(record)
+            (self._paths.local_dir / record.name).write_bytes(b"X" * record.size)
+            return failures
+
+        def counting(record, target):
+            reads.append(record.artifact_id)
+            return local_payload_digest(record, target)
+
+        with patch.object(scheduler, "_ship", side_effect=ship_then_corrupt), patch.object(
+            scheduler_service, "local_payload_digest", side_effect=counting
+        ):
+            new = scheduler.run_now("full")
+
+        # Keeper check and sidecar credit together stay within one 14-read
+        # allowance; a copy read by the keeper check is not read again.
+        self.assertLessEqual(len(reads), scheduler_service.HISTORY_REPLACEMENT_COPIES)
+        self.assertEqual(len(reads), len(set(reads)))
+        self.assertEqual(reads[:2], [new.artifact_id, prior_newest.artifact_id])
+        self.assertFalse(scheduler.catalog.get(new.artifact_id).verified)
+        self.assertFalse(scheduler.catalog.get(prior_newest.artifact_id).verified)
+        self.assertTrue((self._paths.local_dir / new.name).exists())
+        self.assertTrue((self._paths.local_dir / prior_newest.name).exists())
 
     def test_remote_check_refuses_when_scratch_space_is_short(self) -> None:
         older, newest = self.two_remote_fulls()
