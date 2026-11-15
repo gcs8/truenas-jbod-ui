@@ -15884,7 +15884,16 @@ class InventoryService:
 
         if isinstance(enclosure, dict):
             enclosure_id = normalize_text(enclosure.get("id") or enclosure.get("name"))
-            raw_slot = enclosure.get("slot") or enclosure.get("number") or enclosure.get("slot_number")
+            # First present coordinate, not first truthy: zero is a real bay
+            # under zero-based API numbering (issue #1215).
+            raw_slot = next(
+                (
+                    enclosure[key]
+                    for key in ("slot", "number", "slot_number")
+                    if enclosure.get(key) not in (None, "")
+                ),
+                None,
+            )
         elif isinstance(enclosure, str):
             enclosure_id = normalize_text(enclosure)
 
@@ -15894,7 +15903,7 @@ class InventoryService:
 
         if isinstance(raw_slot, str) and raw_slot.isdigit():
             raw_slot = int(raw_slot)
-        if isinstance(raw_slot, int):
+        if isinstance(raw_slot, int) and not isinstance(raw_slot, bool):
             return enclosure_id, raw_slot - self.settings.layout.api_slot_number_base
         return enclosure_id, None
 

@@ -58,6 +58,7 @@
     "test_image_upgrade_contract": 121,
     "test_immutable_deployment": 92,
     "test_inventory": 610,
+    "test_inventory_nested_slot_zero": 11,
     "test_inventory_registry_routes": 15,
     "test_jbod_runner_trial": 15,
     "test_log_noise": 29,

@@ -187,6 +187,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_schema_version_gate",
             "tests.test_history_service",
             "tests.test_inventory",
+            "tests.test_inventory_nested_slot_zero",
             "tests.test_inventory_registry_routes",
             "tests.test_log_noise",
             "tests.test_mapping_routes",
