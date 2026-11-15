@@ -38,8 +38,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
-- Replaced provider and transport exception text in inventory source status and
-  BMC collection warnings with fixed failure categories (#1263).
+- Replaced provider and transport exception text in inventory source status,
+  SMART responses, BMC collection warnings and locator status with fixed failure
+  categories, while keeping value-safe operation and cause categories in logs
+  (#1263).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay

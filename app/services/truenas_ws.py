@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any, Awaitable, Callable, Iterator
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -62,11 +63,13 @@ class TrueNASAPIError(RuntimeError):
         errname: str | None = None,
         reason: str | None = None,
         code: int | None = None,
+        category: str | None = None,
     ) -> None:
         super().__init__(*args)
         self.errname = errname
         self.reason = reason
         self.code = code
+        self.category = category
 
 
 class TrueNASAPIBusyError(TrueNASAPIError):
@@ -83,6 +86,69 @@ class _LimiterBusyError(TrueNASAPIBusyError):
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_TOO_MANY_CONCURRENT_CALLS = -32000
 JSONRPC_METHOD_CALL_ERROR = -32001
+REMOTE_FAILURE_CATEGORIES = frozenset(
+    {
+        "authentication_failed",
+        "busy",
+        "certificate_verification",
+        "method_unavailable",
+        "remote_error",
+        "response_invalid",
+        "timeout",
+        "unreachable",
+    }
+)
+MAX_PUBLIC_REMOTE_ERROR_CODE = 99999
+
+
+def bounded_remote_error_code(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) <= MAX_PUBLIC_REMOTE_ERROR_CODE:
+        return value
+    return None
+
+
+def classify_remote_failure(exc: BaseException) -> tuple[str, int | None]:
+    """Return a fixed category and bounded numeric code without remote free text."""
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    fallback_code: int | None = None
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return "certificate_verification", bounded_remote_error_code(getattr(current, "verify_code", None))
+        if isinstance(current, TrueNASAPIBusyError):
+            return "busy", bounded_remote_error_code(current.code)
+        if isinstance(current, TrueNASAPIError):
+            code = bounded_remote_error_code(current.code)
+            fallback_code = code if code is not None else fallback_code
+            if current.category in REMOTE_FAILURE_CATEGORIES:
+                return current.category, code
+            if code == JSONRPC_METHOD_NOT_FOUND:
+                return "method_unavailable", code
+            if code == JSONRPC_TOO_MANY_CONCURRENT_CALLS:
+                return "busy", code
+        if isinstance(current, HTTPError):
+            code = bounded_remote_error_code(current.code)
+            return ("authentication_failed" if code in {401, 403} else "remote_error"), code
+        if isinstance(current, URLError):
+            if isinstance(current.reason, BaseException):
+                pending.append(current.reason)
+            else:
+                return "unreachable", None
+        elif isinstance(current, (TimeoutError, asyncio.TimeoutError)):
+            return "timeout", None
+        elif isinstance(current, ConnectionError):
+            return "unreachable", None
+        elif isinstance(current, OSError):
+            return "unreachable", None
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return "remote_error", fallback_code
 
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
@@ -95,11 +161,28 @@ _DDP_BUSY_ERRNOS = frozenset({59, 109})
 
 def build_ddp_error(method: str, error: Any) -> TrueNASAPIError:
     busy = False
+    code: int | None = None
     if isinstance(error, dict):
         reason = str(error.get("reason") or "").lower()
-        busy = _DDP_BUSY_REASON in reason or (not reason and error.get("error") in _DDP_BUSY_ERRNOS)
+        code = bounded_remote_error_code(error.get("error"))
+        busy = _DDP_BUSY_REASON in reason or (not reason and code in _DDP_BUSY_ERRNOS)
     error_class = TrueNASAPIBusyError if busy else TrueNASAPIError
-    return error_class(f"{method} failed: {error}")
+    method_unavailable = (
+        isinstance(error, dict)
+        and str(error.get("reason") or "").strip().upper() == "ENOMETHOD"
+    )
+    if busy:
+        category, detail = "busy", "busy"
+    elif method_unavailable:
+        category, detail = "method_unavailable", "ENOMETHOD"
+    else:
+        category = "remote_error"
+        detail = f"remote error{f' code {code}' if code is not None else ''}"
+    return error_class(
+        f"{method} failed ({detail}).",
+        code=code,
+        category=category,
+    )
 
 
 class MiddlewareCallLimiter:
@@ -317,17 +400,12 @@ REGISTRY.register(MiddlewareCallLimitCollector())
 
 
 def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
-    """Map a JSON-RPC error object onto the app's API error.
+    """Map a JSON-RPC error object onto the app's typed API error."""
 
-    `data.trace` is middleware internals and is deliberately never carried into
-    the message the UI shows; `errname` and `reason` are what an operator acts on.
-    """
     code: int | None = None
     errname = reason = message_text = ""
     if isinstance(error, dict):
-        raw_code = error.get("code")
-        if isinstance(raw_code, int) and not isinstance(raw_code, bool):
-            code = raw_code
+        code = bounded_remote_error_code(error.get("code"))
         message_text = str(error.get("message") or "").strip()
         data = error.get("data")
         if isinstance(data, dict):
@@ -339,12 +417,19 @@ def build_jsonrpc_error(method: str, error: Any) -> TrueNASAPIError:
     detail = ": ".join(part for part in (errname, reason) if part) or message_text
     if not detail:
         detail = f"code {code}" if code is not None else "unspecified middleware error"
-    error_class = TrueNASAPIBusyError if code == JSONRPC_TOO_MANY_CONCURRENT_CALLS else TrueNASAPIError
+    if code == JSONRPC_METHOD_NOT_FOUND or errname.upper() == "ENOMETHOD":
+        category = "method_unavailable"
+    elif code == JSONRPC_TOO_MANY_CONCURRENT_CALLS or errname.upper() == "EBUSY":
+        category = "busy"
+    else:
+        category = "remote_error"
+    error_class = TrueNASAPIBusyError if category == "busy" else TrueNASAPIError
     return error_class(
         f"{method} failed: {detail}",
         errname=errname or None,
         reason=reason or None,
         code=code,
+        category=category,
     )
 
 
@@ -800,7 +885,10 @@ class TrueNASWebsocketClient:
                     ) from exc
                 raise
             if not isinstance(result, str):
-                raise TrueNASAPIError(f"disk.smartctl returned unexpected payload type for {disk_name!r}.")
+                raise TrueNASAPIError(
+                    "disk.smartctl returned an unexpected payload type.",
+                    category="response_invalid",
+                )
             return result
 
     async def smartctl_batch(
@@ -928,7 +1016,8 @@ class TrueNASWebsocketClient:
                     continue
                 if not isinstance(result, str):
                     payload_error = TrueNASAPIError(
-                        f"disk.smartctl returned unexpected payload type for {disk!r}."
+                        "disk.smartctl returned an unexpected payload type.",
+                        category="response_invalid",
                     )
                     if not return_exceptions:
                         raise payload_error
@@ -1004,10 +1093,16 @@ class TrueNASWebsocketClient:
             await ws.send(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
             response = json.loads(await ws.recv())
             if response.get("msg") != "connected":
-                raise TrueNASAPIError(f"Unexpected websocket handshake response: {response}")
+                raise TrueNASAPIError(
+                    "Unexpected websocket handshake response.",
+                    category="response_invalid",
+                )
         # JSON-RPC 2.0 has no session handshake; authentication is the first call.
         if await self._login(ws, login) is not True:
-            raise TrueNASAPIError("TrueNAS API authentication failed.")
+            raise TrueNASAPIError(
+                "TrueNAS API authentication failed.",
+                category="authentication_failed",
+            )
 
     async def _login(self, ws: ClientConnection, login: _PendingLogin) -> Any:
         """Authenticate, remembering a login that is still in flight.
@@ -1317,7 +1412,10 @@ class TrueNASWebsocketClient:
                     raise build_ddp_error(method, message["error"])
                 return message.get("result")
 
-            raise TrueNASAPIError(f"Unexpected response for {method}: {message}")
+            raise TrueNASAPIError(
+                f"Unexpected response for {method}.",
+                category="response_invalid",
+            )
 
     @staticmethod
     def _ensure_list(value: Any) -> list[dict[str, Any]]:

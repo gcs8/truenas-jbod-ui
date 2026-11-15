@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import shlex
+import ssl
 import time
 import threading
 import weakref
@@ -194,6 +195,7 @@ from app.services.truenas_ws import (
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
+    classify_remote_failure,
     normalize_disk_inventory_rows,
 )
 from websockets.exceptions import ConnectionClosed
@@ -1575,6 +1577,96 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
     "context_label": "SSH command",
     "criticality": "inventory",
 }
+
+_CERTIFICATE_VERIFY_CODE_LABELS: dict[int, str] = {
+    9: "certificate not yet valid",
+    10: "certificate expired",
+    18: "self-signed certificate",
+    19: "self-signed certificate chain",
+    20: "certificate issuer not trusted",
+    62: "certificate name mismatch",
+}
+
+
+def _certificate_verify_code_label(exc: BaseException) -> str | None:
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            code = getattr(current, "verify_code", None)
+            if isinstance(code, int) and not isinstance(code, bool):
+                return _CERTIFICATE_VERIFY_CODE_LABELS.get(code)
+            return None
+        for linked in (getattr(current, "reason", None), current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return None
+
+
+def _public_api_failure_message(label: str, exc: BaseException) -> str:
+    category, code = classify_remote_failure(exc)
+    if category == "authentication_failed":
+        return f"{label} authentication failed."
+    if category == "timeout":
+        return f"{label} collection timed out."
+    if category == "unreachable":
+        return f"{label} could not be reached."
+    if category == "method_unavailable":
+        return f"{label} does not support a required API method."
+    if category == "response_invalid":
+        return f"{label} returned an unusable response."
+    if category == "remote_error":
+        code_context = f" (code {code})" if code is not None else ""
+        return f"{label} reported a collection error{code_context}."
+    return f"{label} collection failed."
+
+
+def _public_smart_failure_message(exc: BaseException) -> str:
+    category, _code = classify_remote_failure(exc)
+    return {
+        "authentication_failed": "SMART data authentication failed.",
+        "certificate_verification": "SMART data certificate verification failed.",
+        "method_unavailable": "SMART data is unavailable through this API.",
+        "response_invalid": "The SMART data source returned an unusable response.",
+        "timeout": "SMART data collection timed out.",
+        "unreachable": "The SMART data source could not be reached.",
+    }.get(category, "SMART data collection failed.")
+
+
+def _public_smart_ssh_failure_message(message: str, service_user: str) -> str:
+    permission_suffix = "Re-run the SSH access setup in the admin console to fix the sudo permissions."
+    permission_start = message.find("The SSH user ")
+    permission_message = message[permission_start:] if permission_start >= 0 else ""
+    permission_pattern = re.compile(
+        rf"^The SSH user {re.escape(service_user)} is not allowed to run smartctl on "
+        rf"/dev/[A-Za-z0-9._/-]{{1,256}}\. {re.escape(permission_suffix)}$"
+    )
+    if permission_pattern.fullmatch(permission_message):
+        return permission_message
+    password_message = (
+        "smartctl needs a sudo password on this host. "
+        + permission_suffix
+    )
+    password_start = message.find("smartctl needs a sudo password on this host.")
+    if password_start >= 0 and message[password_start:] == password_message:
+        return password_message
+    return "SMART data collection failed."
+
+
+def _log_remote_failure(operation: str, exc: BaseException) -> None:
+    category, code = classify_remote_failure(exc)
+    code_context = f", code={code}" if code is not None else ""
+    logger.warning(
+        "%s failed (category=%s%s, exception=%s)",
+        operation,
+        category,
+        code_context,
+        type(exc).__name__,
+    )
 
 
 def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
@@ -3854,7 +3946,11 @@ class InventoryService:
                             bypass_negative_cache=bypass_negative_cache,
                         )
                     except TrueNASAPIError as exc:
-                        summary = self._fallback_smart_summary(slot_view, str(exc))
+                        _log_remote_failure("Storage-view SMART collection", exc)
+                        summary = self._fallback_smart_summary(
+                            slot_view,
+                            _public_smart_failure_message(exc),
+                        )
                 return slot_index, summary
 
             for slot_index, summary in await asyncio.gather(*(load(slot_index) for slot_index in synthetic)):
@@ -5779,16 +5875,18 @@ class InventoryService:
             try:
                 api_result = await api_task
             except Exception as exc:
-                logger.exception("Failed to fetch platform API data")
+                _log_remote_failure("Platform API collection", exc)
                 certificate_failure = certificate_verification_failure_reason(exc)
                 if certificate_failure is not None:
-                    # #954: name a failed certificate check instead of "unreachable".
-                    # The verifier's free-form text stays in server diagnostics;
-                    # public snapshots carry only this fixed failure category.
-                    certificate_message = f"{api_label} certificate verification failed."
+                    # #954: keep the failure actionable without publishing the
+                    # verifier's free-form text. Reviewed verify codes recover
+                    # stable categories such as expiry and name mismatch.
+                    certificate_label = _certificate_verify_code_label(exc)
+                    certificate_detail = f" ({certificate_label})" if certificate_label else ""
+                    certificate_message = f"{api_label} certificate verification failed{certificate_detail}."
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=certificate_message)
                     warnings.append(
-                        f"{api_label} certificate verification failed. "
+                        f"{certificate_message} "
                         "Slot details may be partial or unavailable."
                     )
                 elif isinstance(exc, TrueNASAPIBusyError):
@@ -5805,15 +5903,16 @@ class InventoryService:
                     )
                 else:
                     # Adapter exceptions can contain response bodies, traces,
-                    # URLs, or remote reasons. They are logged above but never
-                    # copied into the public snapshot or its exports.
+                    # URLs, or remote reasons. The value-safe log above keeps
+                    # only operation, category, bounded code, and exception type.
+                    public_message = _public_api_failure_message(api_label, exc)
                     sources["api"] = SourceStatus(
                         enabled=True,
                         ok=False,
-                        message=f"{api_label} collection failed.",
+                        message=public_message,
                     )
                     warnings.append(
-                        f"{api_label} could not be collected. "
+                        f"{public_message} "
                         "Slot details may be partial or unavailable."
                     )
             else:
@@ -5834,8 +5933,8 @@ class InventoryService:
         if ssh_task is not None:
             try:
                 ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
-            except Exception:
-                logger.exception("Failed to collect SSH diagnostics")
+            except Exception as exc:
+                _log_remote_failure("SSH diagnostics collection", exc)
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=False,
@@ -5852,8 +5951,8 @@ class InventoryService:
         if bmc_task is not None:
             try:
                 bmc_inventory = await bmc_task
-            except Exception:
-                logger.exception("Failed to collect BMC / IPMI diagnostics")
+            except Exception as exc:
+                _log_remote_failure("BMC diagnostics collection", exc)
                 sources["bmc"] = SourceStatus(
                     enabled=True,
                     ok=False,
@@ -6918,12 +7017,13 @@ class InventoryService:
 
         try:
             active = await asyncio.to_thread(self.bmc_service.get_uid_status)
-        except Exception as exc:  # noqa: BLE001 - surface operational failure in-band.
+        except Exception as exc:  # noqa: BLE001 - normalize operational failure in-band.
+            _log_remote_failure("BMC locator status read", exc)
             return SystemLocatorStatusView(
                 supported=True,
                 active=False,
                 backend="supermicro_bmc",
-                reason=str(exc),
+                reason="BMC locator status unavailable.",
             )
 
         return SystemLocatorStatusView(
@@ -7684,10 +7784,16 @@ class InventoryService:
                 self._observe_smart_summary_request("ssh-live")
                 return summary
 
+            if error_message:
+                logger.warning("SMART SSH collection failed (category=remote_error)")
             fallback = self._fallback_smart_summary(
                 slot_view,
-                error_message
-                or (
+                _public_smart_ssh_failure_message(
+                    error_message,
+                    normalize_text(self.system.ssh.user) or "the SSH service account",
+                )
+                if error_message
+                else (
                     "TrueNAS did not return SMART data; turn on SSH for full SMART details."
                     if self.system.truenas.platform == "scale"
                     else "No SMART data is available for this bay."
@@ -7708,7 +7814,8 @@ class InventoryService:
                     else:
                         payload = await self._fetch_disk_smartctl_bounded(candidate, ["-a", "-j"])
             except TrueNASAPIError as exc:
-                last_error = str(exc)
+                _log_remote_failure("SMART API collection", exc)
+                last_error = _public_smart_failure_message(exc)
                 continue
 
             api_summary = self._merge_smart_summary(
@@ -7728,7 +7835,8 @@ class InventoryService:
                         else:
                             enrichment_payload = await self._fetch_disk_smartctl_bounded(api_candidate, ["-x"])
                 except TrueNASAPIError as exc:
-                    last_error = str(exc)
+                    _log_remote_failure("SMART API enrichment", exc)
+                    last_error = _public_smart_failure_message(exc)
                 else:
                     api_summary = self._merge_missing_smart_fields(
                         api_summary,
@@ -7778,7 +7886,11 @@ class InventoryService:
                 self._observe_smart_summary_request("ssh-live")
                 return ssh_summary
             if ssh_error:
-                last_error = ssh_error
+                logger.warning("SMART SSH collection failed (category=remote_error)")
+                last_error = _public_smart_ssh_failure_message(
+                    ssh_error,
+                    normalize_text(self.system.ssh.user) or "the SSH service account",
+                )
 
         fallback = self._fallback_smart_summary(
             slot_view,
@@ -7954,7 +8066,11 @@ class InventoryService:
                                 "admitted": admissions[slot]} if core_cohort is not None else {}),
                         )
                     except TrueNASAPIError as exc:
-                        summary = self._fallback_smart_summary(slot_lookup.get(slot), str(exc))
+                        _log_remote_failure("SMART batch collection", exc)
+                        summary = self._fallback_smart_summary(
+                            slot_lookup.get(slot),
+                            _public_smart_failure_message(exc),
+                        )
                     return SmartBatchItem(slot=slot, summary=summary)
 
             async def complete_batch() -> list[SmartBatchItem]:

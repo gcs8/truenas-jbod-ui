@@ -1427,11 +1427,15 @@ class InventoryApiCertificateFailureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(bundle.sources["api"].ok)
         self.assertIn(
-            "TrueNAS API certificate verification failed. Slot details may be partial or unavailable.",
+            "TrueNAS API certificate verification failed (certificate expired). "
+            "Slot details may be partial or unavailable.",
             bundle.warnings,
         )
         self.assertFalse(any("unreachable" in warning for warning in bundle.warnings), bundle.warnings)
-        self.assertEqual(bundle.sources["api"].message, "TrueNAS API certificate verification failed.")
+        self.assertEqual(
+            bundle.sources["api"].message,
+            "TrueNAS API certificate verification failed (certificate expired).",
+        )
         self.assertNotIn("certificate has expired", str(bundle.sources["api"].model_dump()))
 
     async def test_wrapped_certificate_failure_is_found_in_the_exception_chain(self):
@@ -1448,7 +1452,8 @@ class InventoryApiCertificateFailureTests(unittest.IsolatedAsyncioTestCase):
         bundle = await self._bundle(error, platform="quantastor")
 
         self.assertIn(
-            "Quantastor API certificate verification failed. Slot details may be partial or unavailable.",
+            "Quantastor API certificate verification failed (certificate expired). "
+            "Slot details may be partial or unavailable.",
             bundle.warnings,
         )
         self.assertNotIn("certificate has expired", str(bundle.sources["api"].model_dump()))
@@ -1457,10 +1462,10 @@ class InventoryApiCertificateFailureTests(unittest.IsolatedAsyncioTestCase):
         bundle = await self._bundle(ConnectionRefusedError("synthetic refusal"))
 
         self.assertIn(
-            "TrueNAS API could not be collected. Slot details may be partial or unavailable.",
+            "TrueNAS API could not be reached. Slot details may be partial or unavailable.",
             bundle.warnings,
         )
-        self.assertEqual(bundle.sources["api"].message, "TrueNAS API collection failed.")
+        self.assertEqual(bundle.sources["api"].message, "TrueNAS API could not be reached.")
         self.assertNotIn("synthetic refusal", str(bundle.sources["api"].model_dump()))
 
 

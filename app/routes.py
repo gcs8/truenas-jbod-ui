@@ -114,7 +114,7 @@ from app.services.snapshot_export import (
 )
 from app.services.storage_writability import StorageDirectoryUnwritable
 from app.services.tls_context import TlsTrustConfigurationError
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import TrueNASAPIError, classify_remote_failure
 from history_service.operation_bounds import (
     ALLOWED_HISTORY_METRICS,
     HISTORY_READ_BUSY_DETAIL,
@@ -223,6 +223,21 @@ def _is_smart_batch_transport_failure(exc: BaseException) -> bool:
     if isinstance(exc, SMART_BATCH_TRANSPORT_EXCEPTIONS):
         return True
     return isinstance(exc, OSError) and exc.errno in SMART_BATCH_TRANSPORT_ERRNOS
+
+
+SMART_REMOTE_FAILURE_DETAIL = "SMART data could not be loaded."
+
+
+def _smart_remote_http_exception(exc: TrueNASAPIError) -> HTTPException:
+    category, code = classify_remote_failure(exc)
+    code_context = f", code={code}" if code is not None else ""
+    _routes_logger.warning(
+        "SMART request failed (category=%s%s, exception=%s)",
+        category,
+        code_context,
+        type(exc).__name__,
+    )
+    return HTTPException(status_code=400, detail=SMART_REMOTE_FAILURE_DETAIL)
 
 
 # The other half of that split: a filesystem failure on the SMART path is the
@@ -971,7 +986,7 @@ def build_router() -> APIRouter:
                 update={"layout_bounds": layout_bounds}
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
 
     @router.get("/api/storage-views/{view_id}/slots/{slot_index}/smart", response_model=SmartSummaryView)
     async def get_storage_view_slot_smart_summary(
@@ -996,7 +1011,7 @@ def build_router() -> APIRouter:
                 bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
 
     @router.get("/api/storage-views/{view_id}/slots/{slot_index}/history")
     async def get_storage_view_slot_history(
@@ -1085,7 +1100,7 @@ def build_router() -> APIRouter:
                     bypass_negative_cache=fresh,
                 )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
         except TlsTrustConfigurationError as exc:
             # Classified before the broad OSError branch below, which
             # would otherwise report a missing CA bundle's ENOENT as a
@@ -1157,7 +1172,7 @@ def build_router() -> APIRouter:
                 bypass_negative_cache=fresh,
             )
         except TrueNASAPIError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise _smart_remote_http_exception(exc) from exc
         except TlsTrustConfigurationError as exc:
             logger.error(
                 "Storage-view SMART batch could not load the TLS CA bundle for view %s: %s",

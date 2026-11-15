@@ -219,10 +219,13 @@ class QuantastorRESTClientTests(unittest.IsolatedAsyncioTestCase):
                     await self.fetch_transport(SyntheticTransport("physicalDiskEnum", error, status=503))
                 self.assertIs(raised.exception.__cause__, error)
 
-    async def test_fetch_all_http_error_with_readable_body_retains_status_and_cause(self):
-        with self.assertRaisesRegex(TrueNASAPIError, r"physicalDiskEnum.*403.*synthetic denial") as raised:
+    async def test_fetch_all_http_error_with_readable_body_retains_status_and_cause_not_body(self):
+        with self.assertRaisesRegex(TrueNASAPIError, r"physicalDiskEnum.*403") as raised:
             await self.fetch_transport(SyntheticTransport("physicalDiskEnum", body=b"synthetic denial", status=403))
         self.assertIsInstance(raised.exception.__cause__, HTTPError)
+        self.assertEqual(raised.exception.code, 403)
+        self.assertEqual(raised.exception.category, "authentication_failed")
+        self.assertNotIn("synthetic denial", str(raised.exception))
 
     async def test_fetch_all_programmer_exceptions_are_not_optional_degradation(self):
         for phase in ("open", "read"):

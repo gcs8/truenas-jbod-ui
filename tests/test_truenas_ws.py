@@ -1256,7 +1256,8 @@ class NormalOperationDeadlineChecks:
                                 task.result()
                             self.assertIs(caught.exception, peer.reader_error)
                         else:
-                            with self.assertRaisesRegex(TrueNASAPIError, "synthetic primary rejection"):
+                            pattern = "remote error" if self.dialect == "ddp" else "synthetic primary rejection"
+                            with self.assertRaisesRegex(TrueNASAPIError, pattern):  # type: ignore[attr-defined]
                                 task.result()
 
     async def test_cancellation_after_method_error_retains_reader_cleanup(self):
@@ -1548,7 +1549,8 @@ class RealWebsocketCloseChecks:
                         transport.acknowledge_close()
                         await self.assert_finished_closed(task, connection, transport, aborted=False)
                         if rejection:
-                            with self.assertRaisesRegex(TrueNASAPIError, "synthetic close-test rejection"):
+                            pattern = "remote error" if self.dialect == "ddp" else "synthetic close-test rejection"
+                            with self.assertRaisesRegex(TrueNASAPIError, pattern):  # type: ignore[attr-defined]
                                 task.result()
                         elif late_error:
                             with self.assertRaises(RuntimeError) as caught:
@@ -1756,7 +1758,8 @@ class CompletedReplyChecks:
                                 with self.assertRaises(ConnectionClosed):
                                     task.result()
                             elif outcome == "application_error":
-                                with self.assertRaisesRegex(TrueNASAPIError, "synthetic primary rejection"):
+                                pattern = "remote error" if self.dialect == "ddp" else "synthetic primary rejection"
+                                with self.assertRaisesRegex(TrueNASAPIError, pattern):  # type: ignore[attr-defined]
                                     task.result()
                             elif outcome == "reader_error":
                                 with self.assertRaises(RuntimeError) as caught:
