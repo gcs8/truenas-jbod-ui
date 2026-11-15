@@ -47,6 +47,12 @@
     missing: "Missing",
   };
   const LONG_TIMEOUT_MS = 15 * 60 * 1000;
+  // #1188: a clean-up outlasted the admin service's wait, or another run held
+  // the scheduler. Neither is a failure of this page's request.
+  const CLEANUP_STILL_RUNNING = "The clean-up is still running on the backup service and can still delete the copies in its plan. "
+    + "Its result will show in the Last clean-up line when it finishes; reload this page to see it.";
+  const CLEANUP_BUSY = "A backup or clean-up is already running, so this clean-up did not start and deleted nothing. "
+    + "When the running one finishes, its result shows in the Last clean-up line; open Clean up again then.";
   const SENSITIVE_KEY = /path|file|dir|root|password|passphrase|secret|token|credential|key_id|access_key|private|username|user$|host|endpoint|url|share|bucket|export|mount/i;
 
   // ---------------------------------------------------------------- model --
@@ -1345,6 +1351,12 @@
             timeoutMs: LONG_TIMEOUT_MS,
           });
           state.cleanupPlan = null;
+          if (payload?.state === "still_running") {
+            scope.result(CLEANUP_STILL_RUNNING);
+            setBanner(CLEANUP_STILL_RUNNING, "info");
+            await load({ quiet: true });
+            return;
+          }
           const count = (value) => (Array.isArray(value) ? value.length : 0);
           const deleted = count(payload.deleted) + count(payload.already_missing);
           const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false;
@@ -1365,11 +1377,14 @@
           setBanner(text, stopped || notes.length ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
-          const text = error?.status === 409
-            ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
-            : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
+          const busy = error?.status === 409 && /already in progress/i.test(String(error?.message || ""));
+          const text = busy
+            ? CLEANUP_BUSY
+            : error?.status === 409
+              ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
+              : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
           scope.result(text);
-          setBanner(text, "error");
+          setBanner(text, busy ? "info" : "error");
         }
         await load({ quiet: true });
       });

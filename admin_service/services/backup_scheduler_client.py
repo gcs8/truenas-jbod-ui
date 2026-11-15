@@ -21,12 +21,25 @@ from typing import Any, BinaryIO
 DEFAULT_SOCKET = "/app/backup-api/scheduler.sock"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DOWNLOAD_TIMEOUT_SECONDS = 600.0
+# A clean-up apply reads kept copies back before it deletes (#1188); a remote
+# FULL can take minutes. Wait as long as a download may, which is still well
+# inside the page's 15-minute wait for this action, so the page always gets an
+# answer from the admin service rather than its own timeout.
+LIFECYCLE_APPLY_TIMEOUT_SECONDS = 600.0
 MAX_JSON_BYTES = 16 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 
 
 class SchedulerUnavailableError(RuntimeError):
     """The scheduler socket is missing or not answering."""
+
+
+class SchedulerTimeoutError(SchedulerUnavailableError):
+    """The request reached the scheduler, but its answer did not arrive in time.
+
+    The scheduler may still be doing the work. Callers that do not handle this
+    separately still see it as ``SchedulerUnavailableError``.
+    """
 
 
 @dataclass
@@ -74,8 +87,9 @@ class BackupSchedulerClient:
         *,
         body: dict[str, Any] | None = None,
         actor: str | None = None,
+        timeout: float | None = None,
     ) -> SchedulerResponse:
-        connection = self._connection()
+        connection = self._connection(timeout)
         headers = {"Accept": "application/json"}
         data = None
         if body is not None:
@@ -84,11 +98,19 @@ class BackupSchedulerClient:
         if actor:
             headers["X-Backup-Actor"] = actor
         try:
-            connection.request(method, path, body=data, headers=headers)
-            response = connection.getresponse()
-            raw = response.read(MAX_JSON_BYTES + 1)
-        except OSError as exc:
-            raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
+            try:
+                connection.request(method, path, body=data, headers=headers)
+            except OSError as exc:
+                raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
+            # The request was sent: a timeout from here on means the scheduler
+            # may still be working on it, which is not the same as being down.
+            try:
+                response = connection.getresponse()
+                raw = response.read(MAX_JSON_BYTES + 1)
+            except TimeoutError as exc:
+                raise SchedulerTimeoutError("The backup scheduler did not answer in time.") from exc
+            except OSError as exc:
+                raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
         finally:
             connection.close()
         if len(raw) > MAX_JSON_BYTES:

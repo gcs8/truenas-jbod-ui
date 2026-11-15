@@ -817,6 +817,33 @@ test("clean up that kept copies after a failed keeper check says so, not plain s
   assert.deepEqual(banners.at(-1), [text, "error"]);
 });
 
+test("a clean-up still running when the admin wait ends says so in a neutral tone (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({ state: "still_running", detail: "ignored server text" }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "The clean-up is still running on the backup service and can still delete the copies in its plan. "
+    + "Its result will show in the Last clean-up line when it finishes; reload this page to see it.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(elements.dialog.textContent, /Deleted 0 copies/);
+  assert.deepEqual(banners.at(-1), [text, "info"]);
+});
+
+test("a clean-up applied while another run holds the scheduler says why nothing happened (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => Object.assign(
+    new Error("A backup or grooming run is already in progress."), { status: 409 }) });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "A backup or clean-up is already running, so this clean-up did not start and deleted nothing. "
+    + "When the running one finishes, its result shows in the Last clean-up line; open Clean up again then.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(elements.dialog.textContent, /The list changed since this plan was made/);
+  assert.deepEqual(banners.at(-1), [text, "info"]);
+});
+
 test("the status line shows a clean-up that finished but marked copies unverified (#1188)", async () => {
   const api = fakeApi();
   api.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 0,

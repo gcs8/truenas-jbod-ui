@@ -336,5 +336,122 @@ class SchedulerKeeperCheckTests(SchedulerTestBase):
         self.assertIn("keeper-scratch-capacity", grooming["failed_locations"]["nas"])
 
 
+class _LateScheduler:
+    """A Unix socket that reads one request and answers only when released."""
+
+    def __init__(self, path: Path) -> None:
+        import socket
+
+        self.path = path
+        self.release = threading.Event()
+        self.requests: list[bytes] = []
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(path))
+        self.server.listen(1)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        try:
+            connection, _ = self.server.accept()
+        except OSError:
+            return
+        with connection:
+            self.requests.append(connection.recv(65536))
+            self.release.wait(HANG_TIMEOUT_SECONDS)
+            body = b'{"ok": true, "deleted": [], "already_missing": [], "failed": null, "not_attempted": []}'
+            try:
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                    + body
+                )
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.release.set()
+        self.server.close()
+        self.thread.join(HANG_TIMEOUT_SECONDS)
+
+
+class AdminCleanupApplyWaitTests(unittest.TestCase):
+    """A manual clean-up apply that outlasts the admin wait is reported as still running."""
+
+    STILL_RUNNING = (
+        "The clean-up is still running on the backup service and can still delete the copies in its plan. "
+        "Its result will show in the Last clean-up line when it finishes; reload this page to see it."
+    )
+
+    def setUp(self) -> None:
+        import tempfile
+
+        from admin_service import main as admin_main
+        from admin_service import route_support
+        from admin_service import routes as admin_routes
+        from admin_service.services import backup_scheduler_client as client_module
+
+        self.admin_main = admin_main
+        self.admin_routes = admin_routes
+        self.client_module = client_module
+        route_support.get_backup_scheduler_client.cache_clear()
+        self.addCleanup(route_support.get_backup_scheduler_client.cache_clear)
+        # Short directory: Unix socket paths have a small length limit.
+        self.temp = tempfile.TemporaryDirectory(prefix="ka-")
+        self.addCleanup(self.temp.cleanup)
+        self.socket_path = Path(self.temp.name) / "s.sock"
+
+    def call(self, method: str, path: str, body=None):
+        with patch.object(self.admin_main, "_request_origin_allowed", return_value=True), \
+                patch.object(self.admin_main, "_basic_auth_matches", return_value=True):
+            return asgi_call(self.admin_main.app, method, path, body, {"origin": "http://test"})
+
+    def test_apply_wait_is_longer_than_ordinary_calls_and_shorter_than_the_browser(self) -> None:
+        apply_timeout = getattr(self.client_module, "LIFECYCLE_APPLY_TIMEOUT_SECONDS", None)
+        if not isinstance(apply_timeout, float):
+            self.fail("clean-up apply has no wait of its own")
+        browser_ms = 15 * 60 * 1000  # LONG_TIMEOUT_MS in admin_backups.js
+        source = (Path(__file__).resolve().parents[1] / "admin_service/static/admin_backups.js").read_text()
+        self.assertIn("const LONG_TIMEOUT_MS = 15 * 60 * 1000;", source)
+        self.assertGreater(apply_timeout, self.client_module.DEFAULT_TIMEOUT_SECONDS)
+        self.assertLess(apply_timeout * 1000, browser_ms)
+
+    def test_late_scheduler_answer_reports_the_clean_up_as_still_running(self) -> None:
+        late = _LateScheduler(self.socket_path)
+        self.addCleanup(late.close)
+        client = self.client_module.BackupSchedulerClient(str(self.socket_path))
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
+            self.client_module, "LIFECYCLE_APPLY_TIMEOUT_SECONDS", 0.5, create=True
+        ), patch.object(self.client_module, "DEFAULT_TIMEOUT_SECONDS", 0.5), patch.object(client, "timeout", 0.5):
+            status, body = self.call("POST", "/api/admin/backups/lifecycle/apply", {"plan_token": "t"})
+
+        self.assertTrue(late.requests and late.requests[0].startswith(b"POST /internal/backups/lifecycle/apply"))
+        self.assertEqual(status, 202, body)
+        payload = json.loads(body)
+        self.assertEqual(payload, {"state": "still_running", "detail": self.STILL_RUNNING})
+
+    def test_scheduler_answer_inside_the_wait_is_forwarded(self) -> None:
+        late = _LateScheduler(self.socket_path)
+        self.addCleanup(late.close)
+        client = self.client_module.BackupSchedulerClient(str(self.socket_path))
+        threading.Timer(0.3, late.release.set).start()
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
+            client, "timeout", 0.1
+        ):
+            status, body = self.call("POST", "/api/admin/backups/lifecycle/apply", {"plan_token": "t"})
+
+        # The ordinary 0.1 s wait would have given up; the apply wait does not.
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["deleted"], [])
+
+    def test_missing_scheduler_socket_still_reports_unavailable(self) -> None:
+        client = self.client_module.BackupSchedulerClient(str(self.socket_path))
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client):
+            status, body = self.call("POST", "/api/admin/backups/lifecycle/apply", {"plan_token": "t"})
+
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["detail"], "The backup scheduler service is not available.")
+
+
 if __name__ == "__main__":
     unittest.main()

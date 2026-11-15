@@ -63,7 +63,8 @@ from admin_service.services.account_bootstrap import (
     ServiceAccountBootstrapService,
     saved_sudo_commands_for_system,
 )
-from admin_service.services.backup_scheduler_client import SchedulerUnavailableError
+from admin_service.services import backup_scheduler_client
+from admin_service.services.backup_scheduler_client import SchedulerTimeoutError, SchedulerUnavailableError
 from admin_service.services.esxi_host_prep import (
     MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
 )
@@ -1459,6 +1460,10 @@ def build_router(admin_settings: Any) -> APIRouter:
         return artifact_id
 
     scheduler_unavailable_detail = "The backup scheduler service is not available."
+    cleanup_still_running_detail = (
+        "The clean-up is still running on the backup service and can still delete the copies in its plan. "
+        "Its result will show in the Last clean-up line when it finishes; reload this page to see it."
+    )
 
     async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
         client = get_backup_scheduler_client()
@@ -1538,7 +1543,28 @@ def build_router(admin_settings: Any) -> APIRouter:
         token = payload.get("plan_token") if isinstance(payload, dict) else None
         if not isinstance(token, str) or not token or len(token) > 128:
             raise HTTPException(status_code=400, detail="plan_token is required.")
-        return await scheduler_call("POST", "/internal/backups/lifecycle/apply", {"plan_token": token})
+        # #1188: apply reads kept copies back before deleting, so it gets its
+        # own wait. When even that runs out, the scheduler is still working on
+        # it (its job reservation refuses a second apply meanwhile), so say so
+        # instead of reporting the scheduler as unavailable.
+        client = get_backup_scheduler_client()
+        try:
+            response = await asyncio.to_thread(
+                client.request,
+                "POST",
+                "/internal/backups/lifecycle/apply",
+                body={"plan_token": token},
+                actor="admin",
+                timeout=backup_scheduler_client.LIFECYCLE_APPLY_TIMEOUT_SECONDS,
+            )
+        except SchedulerTimeoutError:
+            return JSONResponse({"state": "still_running", "detail": cleanup_still_running_detail}, status_code=202)
+        except SchedulerUnavailableError:
+            raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
+        result = response.payload if isinstance(response.payload, dict) else {"detail": "Unexpected answer."}
+        if response.status >= 400:
+            raise HTTPException(status_code=response.status, detail=str(result.get("detail") or "Backup request failed."))
+        return JSONResponse(result, status_code=response.status)
 
     @router.post("/api/admin/backups/targets/{target_id}/test")
     async def test_backup_target(target_id: str) -> JSONResponse:

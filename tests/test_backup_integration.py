@@ -3196,7 +3196,7 @@ class AdminProxyTests(unittest.TestCase):
         calls: list[tuple[str, str, Any]] = []
 
         class FakeClient:
-            def request(self, method, path, *, body=None, actor=None):
+            def request(self, method, path, *, body=None, actor=None, timeout=None):
                 calls.append((method, path, body))
                 if path.endswith("/run"):
                     return SchedulerResponse(409, {"detail": "A backup or grooming run is already in progress."})

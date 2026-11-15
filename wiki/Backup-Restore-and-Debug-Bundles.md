@@ -491,9 +491,16 @@ copy matches, the check ends and the deletions go ahead. If it is missing or no
 longer matches, it is marked unverified, the plan is worked out again (which
 can only remove deletions, never add one), and the next newest verified copy is
 read. The check stops as soon as nothing is left to delete. The clean-up result
-and the backup page's status line say how many copies were marked unverified
-(and how many planned deletions were skipped), even when the clean-up
-otherwise finished.
+and the backup page's "Last clean-up" status line both say how many copies were
+marked unverified, even when the clean-up otherwise finished; the clean-up
+result also says how many planned deletions were skipped.
+
+Because a clean-up reads kept copies back first, a manual clean-up can take
+minutes. The admin service waits up to 10 minutes for it. If it is still
+running after that, the clean-up dialog says so (it can still delete the copies
+in its plan) and its result appears in the "Last clean-up" line when it
+finishes. A clean-up started while a backup or another clean-up is running
+does not start; the dialog says so.
 
 Grooming refuses to delete anything more at that location for that run, and
 the status names the reason, when:
