@@ -50,7 +50,7 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   says no controller or path data is available. When only the unnumbered
   `mprutil show ...` commands answer, their board and firmware stay on one
   controller, and every link and controller reference names a node that is
-  in the map (#1219).
+  in the map (#1244, refs #1219).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
