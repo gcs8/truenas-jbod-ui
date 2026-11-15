@@ -43,6 +43,17 @@ def _messages(text: str, *, allow_blocked: bool = False) -> list[str]:
     return [issue.message for issue in validate_release_wrap_text(text, allow_blocked=allow_blocked)]
 
 
+def _run_cli(text: str) -> tuple[int, str]:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        (repository / "docs").mkdir()
+        (repository / "docs" / "RELEASE_WRAP_0.20.2.md").write_text(text, encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main(["0.20.2", "--repository", str(repository)])
+    return code, output.getvalue()
+
+
 BLOCKED_PYTHON = _row(PYTHON_GATE, evidence="failed native test run", result="Blocked")
 
 
@@ -128,6 +139,59 @@ class MalformedEvidenceRowTests(unittest.TestCase):
         )
 
 
+class MissingOuterPipeRowTests(unittest.TestCase):
+    """A row missing an outer pipe is part of the table, not the end of it."""
+
+    FIRST_EXTRA_LINE = len(HEADER) + len(REQUIRED_GATES) + 1
+
+    def _missing_pipe_message(self, line_number: int) -> str:
+        return f"malformed checklist evidence row {line_number}: missing outer table pipe"
+
+    def test_duplicate_row_missing_leading_pipe_is_reported(self) -> None:
+        damaged = _row(PYTHON_GATE, "failed native run", "Blocked", "failure").removeprefix("|")
+        self.assertEqual(
+            _messages(_wrap(extra=(damaged,))),
+            [self._missing_pipe_message(self.FIRST_EXTRA_LINE)],
+        )
+
+    def test_duplicate_row_missing_trailing_pipe_is_reported(self) -> None:
+        damaged = _row(PYTHON_GATE, "failed native run", "Blocked", "failure").removesuffix("|")
+        self.assertEqual(
+            _messages(_wrap(extra=(damaged,))),
+            [self._missing_pipe_message(self.FIRST_EXTRA_LINE)],
+        )
+
+    def test_damaged_row_does_not_hide_later_duplicate(self) -> None:
+        damaged = "| Release-specific check | yes | synthetic receipt | Pass | reason"
+        later = _row(PYTHON_GATE, evidence="failed native run", result="Blocked")
+        messages = _messages(_wrap(extra=(damaged, later)))
+        self.assertIn(self._missing_pipe_message(self.FIRST_EXTRA_LINE), messages)
+        self.assertIn(f"duplicate checklist evidence row: {PYTHON_GATE}", messages)
+
+    def test_damaged_first_data_row_is_reported(self) -> None:
+        first_gate = REQUIRED_GATES[0]
+        text = _wrap(overrides={first_gate: _row(first_gate).removeprefix("|")})
+        self.assertIn(self._missing_pipe_message(len(HEADER) + 1), _messages(text))
+
+    def test_genuine_end_of_table_still_ends_the_table(self) -> None:
+        # A blank line ends the table; later prose, even with a pipe, is not evidence.
+        text = _wrap(extra=("", "Notes: run A | run B were both green.", "Done."))
+        self.assertEqual(_messages(text), [])
+
+    def test_separator_without_outer_pipes_is_not_a_row(self) -> None:
+        text = _wrap().replace("| --- | --- | --- | --- | --- |", "--- | --- | --- | --- | ---")
+        self.assertEqual(_messages(text), [])
+
+    def test_damaged_row_never_reaches_complete(self) -> None:
+        damaged = "| Release-specific check | yes | synthetic receipt | Pass | reason"
+        later = _row(PYTHON_GATE, evidence="failed native run", result="Blocked")
+        code, output = _run_cli(_wrap(extra=(damaged, later)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"- {self._missing_pipe_message(self.FIRST_EXTRA_LINE)}", output)
+        self.assertIn(f"- duplicate checklist evidence row: {PYTHON_GATE}", output)
+        self.assertNotIn("checklist evidence is complete", output)
+
+
 class ForbiddenNotApplicableReasonTests(unittest.TestCase):
     def test_not_enough_time_cannot_justify_na(self) -> None:
         for reason in ("Not enough time", "not enough time.", "NOT  ENOUGH TIME", "Not enough time to run it"):
@@ -164,14 +228,7 @@ class ForbiddenNotApplicableReasonTests(unittest.TestCase):
 
 class CommandLineResultTests(unittest.TestCase):
     def _run(self, text: str) -> tuple[int, str]:
-        with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            (repository / "docs").mkdir()
-            (repository / "docs" / "RELEASE_WRAP_0.20.2.md").write_text(text, encoding="utf-8")
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                code = main(["0.20.2", "--repository", str(repository)])
-        return code, output.getvalue()
+        return _run_cli(text)
 
     def test_clean_wrap_reaches_complete(self) -> None:
         code, output = self._run(_wrap())

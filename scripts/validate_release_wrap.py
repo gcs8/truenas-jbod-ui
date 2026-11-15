@@ -178,6 +178,17 @@ def _parse_checklist_evidence_rows(text: str) -> tuple[dict[str, list[str]], lis
     for line_number, line in enumerate(lines[header_index + 1 :], start=header_index + 2):
         cells = _split_markdown_row(line)
         if cells is None:
+            if "|" in line:
+                # A pipe-bearing line missing an outer pipe is still table content.
+                # Ending the table here would hide it and every later row.
+                inner = line.strip().removeprefix("|").removesuffix("|")
+                if _is_separator_row([cell.strip() for cell in inner.split("|")]):
+                    continue
+                started = True
+                issues.append(
+                    ValidationIssue(f"malformed checklist evidence row {line_number}: missing outer table pipe")
+                )
+                continue
             if started:
                 break
             continue

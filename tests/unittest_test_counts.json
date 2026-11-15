@@ -89,7 +89,7 @@
     "test_read_ui_auth": 16,
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
-    "test_release_wrap_evidence_rows": 15,
+    "test_release_wrap_evidence_rows": 22,
     "test_release_wrap_validator": 60,
     "test_route_contracts": 51,
     "test_sas_fabric": 223,

@@ -100,8 +100,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (#1179).
 - The release-wrap validator now fails a checklist table that repeats a gate,
   so a later Pass row can no longer hide an earlier Blocked one. It also
-  reports malformed rows instead of skipping them and rejects "Not enough time"
-  as an N/A reason (#1233).
+  reports malformed rows, including a row missing an outer pipe, instead of
+  skipping them or ending the table there, and rejects "Not enough time" as an
+  N/A reason (#1233).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
