@@ -9911,16 +9911,11 @@ class InventoryService:
         slot_hints = selected_profile.slot_hints or {}
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
         bmc_disk_records = self._build_bmc_disk_records(bmc_inventory)
-        bmc_slot_counts = Counter(disk.slot for disk in bmc_disk_records)
         bmc_serial_counts = Counter(key for disk in bmc_disk_records
                                     for key in self._disk_record_serial_identity_keys(disk))
         host_serial_counts = Counter(key for disk in disk_records
                                      for key in self._disk_record_serial_identity_keys(disk))
-        bmc_disks_by_slot = {
-            disk.slot: disk
-            for disk in bmc_disk_records
-            if isinstance(disk.slot, int) and bmc_slot_counts[disk.slot] == 1
-        }
+        bmc_disks_by_slot, ambiguous_bmc_slots = self._admit_bmc_bays(bmc_disk_records)
         loaded_mappings = frame.loaded_mappings
         slot_views: list[SlotView] = []
         for slot in frame.actual_slot_ids():
@@ -9945,13 +9940,10 @@ class InventoryService:
                 "present": False if isinstance(bmc_slot_number, int) else None,
             }
             bmc_disk = bmc_disks_by_slot.get(bmc_slot_number) if isinstance(bmc_slot_number, int) else None
-            if bmc_disk is None and bmc_slot_counts[bmc_slot_number] > 1:
-                raw_slot_status["bmc_observations"] = [
-                    {"source": "supermicro_bmc", "serial": observed.serial,
-                     "enclosure_id": observed.raw.get("bmc_enclosure_id"), "slot": observed.slot,
-                     "admission": "ambiguous-bay"}
-                    for observed in bmc_disk_records if observed.slot == bmc_slot_number
-                ]
+            ambiguous_rows = ambiguous_bmc_slots.get(bmc_slot_number) if isinstance(bmc_slot_number, int) else None
+            if ambiguous_rows:
+                raw_slot_status["present"] = None
+                self._record_ambiguous_bmc_bay(raw_slot_status, warnings, bmc_slot_number, ambiguous_rows)
             disk = None
             if bmc_disk is not None and isinstance(bmc_disk.slot, int):
                 bmc_enclosure_id = normalize_text(bmc_disk.raw.get("bmc_enclosure_id"))
@@ -10104,16 +10096,15 @@ class InventoryService:
         selected_meta = frame.selected_meta
 
         disk_records = self._build_bmc_disk_records(bmc_inventory)
-        disks_by_key: dict[str, DiskRecord] = {}
-        disks_by_slot: dict[int, DiskRecord] = {}
-        for disk in disk_records:
-            for key in disk.lookup_keys:
-                disks_by_key[key] = disk
-            if isinstance(disk.slot, int):
-                disks_by_slot[disk.slot] = disk
+        # Bay numbers are controller- or shelf-local, so two drives can share
+        # one. Admit only keys and bay numbers a single drive reports; input
+        # order must never choose a bay's disk or its identify target.
+        key_counts = Counter(key for disk in disk_records for key in disk.lookup_keys)
+        disks_by_key = {key: disk for disk in disk_records for key in disk.lookup_keys if key_counts[key] == 1}
+        disks_by_slot, ambiguous_bmc_slots = self._admit_bmc_bays(disk_records)
 
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
-        discovered_slot_numbers = sorted(disks_by_slot)
+        discovered_slot_numbers = sorted({*disks_by_slot, *ambiguous_bmc_slots})
         if not bmc_slot_hints and discovered_slot_numbers:
             warnings.append(
                 "Bays are numbered in the order the BMC reported them; verify against the chassis."
@@ -10132,14 +10123,17 @@ class InventoryService:
             if mapped_bmc_slot is None and ordinal < len(discovered_slot_numbers):
                 mapped_bmc_slot = discovered_slot_numbers[ordinal]
             slot_hint = f"bmc-slot:{mapped_bmc_slot}" if isinstance(mapped_bmc_slot, int) else None
+            ambiguous_rows = ambiguous_bmc_slots.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
             raw_slot_status: dict[str, Any] = {
                 "device_names": [slot_hint] if slot_hint else [],
                 "device_hint": slot_hint,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
-                "present": False if slot_hint else None,
+                "present": False if slot_hint and not ambiguous_rows else None,
             }
+            if ambiguous_rows:
+                self._record_ambiguous_bmc_bay(raw_slot_status, warnings, mapped_bmc_slot, ambiguous_rows)
             disk = disks_by_slot.get(mapped_bmc_slot) if isinstance(mapped_bmc_slot, int) else None
             if _profile_is_manual_only(frame.selected_profile):
                 # A layout with an unvalidated bay order (#1068) takes no disk
@@ -13855,6 +13849,46 @@ class InventoryService:
                 )
             )
         return records
+
+    @staticmethod
+    def _admit_bmc_bays(
+        bmc_disk_records: Iterable[DiskRecord],
+    ) -> tuple[dict[int, DiskRecord], dict[int, list[DiskRecord]]]:
+        """Split BMC drives into bay numbers one drive owns and bay numbers several report.
+
+        A bare ``bmc-slot:N`` hint names a bay number, not a controller or
+        shelf, so a number reported more than once identifies no single drive.
+        """
+        observed: dict[int, list[DiskRecord]] = {}
+        for disk in bmc_disk_records:
+            if isinstance(disk.slot, int):
+                observed.setdefault(disk.slot, []).append(disk)
+        admitted = {slot: rows[0] for slot, rows in observed.items() if len(rows) == 1}
+        ambiguous = {slot: rows for slot, rows in observed.items() if len(rows) > 1}
+        return admitted, ambiguous
+
+    @staticmethod
+    def _record_ambiguous_bmc_bay(
+        raw_slot_status: dict[str, Any],
+        warnings: list[str],
+        bmc_slot_number: int,
+        rows: list[DiskRecord],
+    ) -> None:
+        # Keep every rejected observation for diagnosis, but no top-level BMC
+        # coordinates: those are what make a bay offer the identify light.
+        raw_slot_status["bmc_observations"] = [
+            {"source": "supermicro_bmc", "serial": observed.serial,
+             "controller_id": observed.raw.get("bmc_controller_id"),
+             "enclosure_id": observed.raw.get("bmc_enclosure_id"), "slot": observed.slot,
+             "admission": "ambiguous-bay"}
+            for observed in rows
+        ]
+        warning = (
+            f"The BMC reported {len(rows)} drives at bay number {bmc_slot_number}, so that number is ambiguous: "
+            "it places no drive and offers no identify light."
+        )
+        if warning not in warnings:
+            warnings.append(warning)
 
     @staticmethod
     def _disk_record_serial_identity_keys(disk: DiskRecord | None) -> set[str]:
