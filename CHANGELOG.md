@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- A history pass where every SMART metric read failed no longer counts as a
+  success: it fails, keeps both metric cadences, and the next pass reads the
+  metrics again. When only some scopes fail, the healthy ones keep their
+  samples and the failed ones are retried on the next pass while the
+  collector reports partial collection (#1241).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
