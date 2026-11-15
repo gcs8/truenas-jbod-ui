@@ -383,8 +383,11 @@ backups:
 | `BACKUP_ARCHIVE_PASSPHRASE_FILE` | passphrase file (falls back to `SCHEDULED_BACKUP_PASSPHRASE_FILE`) |
 
 A scheduled FULL includes the history database and keeps `14` local copies by
-default (one daily copy for two weeks). Catalog-verified local FULLs gradually
-replace the standalone daily, weekly and monthly history-sidecar snapshots. The
+default (one daily copy for two weeks). Local FULLs that still match their
+catalogued size and SHA-256 when the scheduler re-reads them (up to 14, newest
+first) gradually replace the standalone daily, weekly and monthly
+history-sidecar snapshots; a FULL that is missing or no longer matches earns
+no credit and is marked unverified. The
 scheduler retains enough older sidecars that the two sets still provide at least
 14 copies during cutover; after 14 usable local FULLs exist, no sidecar copy is
 needed for that floor. A lower customized FULL retention therefore leaves the
@@ -475,6 +478,26 @@ Some copies are never deleted:
 - The newest verified copy of each class at each location is always kept.
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
+
+Before grooming deletes a copy, it re-reads the copies it is keeping instead
+(the newest verified copy and the newest `local_keep` or `remote_keep` copies)
+and checks their size and SHA-256 against the catalog. A kept copy that is
+missing or no longer matches is marked unverified, the plan is worked out
+again, and the older copy it would have replaced stays. The grooming status
+says how many copies were marked unverified. If a kept copy cannot be read at
+all, grooming stops deleting at that location for that run and the status
+names the reason
+(`keeper-unreadable`, `keeper-unverifiable` or `keeper-readback-failed`).
+
+Local copies are hashed in place. For a remote target, grooming first lists the
+folder once; a kept copy that is not listed or has a different size is marked
+unverified without downloading anything. A listed copy is then read back with
+the same streaming download an explicit verify uses, into a private temporary
+file that is deleted straight away and is capped at the recorded size. This
+happens only when that location has something to delete, and only for the
+kept copies, so remote grooming downloads up to `remote_keep` + 1 archives per
+class each time it deletes. A preview reads only the catalog, so applying it
+can delete fewer copies than it listed.
 
 ### Deploy
 

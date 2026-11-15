@@ -54,9 +54,14 @@ from history_service.backup_archive.cron import CronSchedule
 from history_service.backup_archive.errors import describe_error as _describe_error
 from history_service.backup_archive.journal import ChangeJournal, ConfigBackupCoalescer, CoalescerResult
 from history_service.backup_archive.lifecycle import (
+    GroomableTarget,
     GroomingPlan,
+    KeeperCheckUnavailable,
     LifecycleManager,
+    LocalBackupDirectory,
+    PayloadDigest,
     RetentionRule,
+    local_payload_digest,
     local_target_resolver,
 )
 from history_service.backup_archive.policy import (
@@ -853,13 +858,16 @@ class BackupScheduler:
             RunRecord(at=_iso(started) or "", ok=True, detail=detail, artifact_id=record.artifact_id),
         )
         grooming_succeeded = False
+        # Local payload reads made by grooming's keeper check in this run, so
+        # the sidecar credit below does not hash the same files twice.
+        local_digests: dict[str, tuple[int, str]] = {}
         try:
-            grooming = self._groom_locked()
+            grooming = self._groom_locked(local_digests)
             grooming_succeeded = grooming is None or grooming.location_complete(LOCAL_LOCATION)
         except Exception as exc:  # noqa: BLE001 - grooming failure never fails the backup
             logger.warning("Backup grooming failed after %s backup (%s).", backup_class, type(exc).__name__)
         if can_replace_history and grooming_succeeded:
-            full_copy_count = self._verified_local_full_count()
+            full_copy_count = self._verified_local_full_count(local_digests)
             sidecar_keep = max(0, HISTORY_REPLACEMENT_COPIES - full_copy_count)
             try:
                 removed = self._remove_replaced_history_snapshots(
@@ -875,7 +883,7 @@ class BackupScheduler:
                 if removed:
                     logger.info(
                         "Removed %d replaced history sidecar backup copy/copies; "
-                        "%d catalog-verified local FULL copy/copies remain.",
+                        "%d digest-checked local FULL copy/copies remain.",
                         removed,
                         full_copy_count,
                     )
@@ -938,20 +946,42 @@ class BackupScheduler:
             metadata.st_ctime_ns,
         )
 
-    def _verified_local_full_count(self) -> int:
+    def _verified_local_full_count(
+        self, digests: dict[str, tuple[int, str]] | None = None
+    ) -> int:
+        """Local FULLs with history whose bytes match the catalog right now (#1188).
+
+        Each candidate gets a fresh bounded size-and-SHA-256 read, newest
+        first, and counting stops at ``HISTORY_REPLACEMENT_COPIES`` so no more
+        files are read than the credit can use. ``digests`` may carry reads
+        made earlier in the same run (grooming's keeper check). A copy that is
+        missing or does not match is marked unverified and earns no credit; a
+        copy that cannot be read earns no credit either.
+        """
+
         metadata = self._metadata_snapshot()
-        return sum(
-            1
-            for artifact in self.catalog.list(
-                backup_class="full",
-                location=LOCAL_LOCATION,
-            )
-            if (
-                (metadata.get(artifact.artifact_id) or {}).get("history_replacement")
-                is True
-                and self._artifact_state(artifact, metadata.get(artifact.artifact_id) or {}) == "ok"
-            )
-        )
+        local = LocalBackupDirectory(self.paths.local_dir)
+        count = 0
+        for artifact in reversed(self.catalog.list(backup_class="full", location=LOCAL_LOCATION)):
+            if count >= HISTORY_REPLACEMENT_COPIES:
+                break
+            meta = metadata.get(artifact.artifact_id) or {}
+            if meta.get("history_replacement") is not True or self._artifact_state(artifact, meta) != "ok":
+                continue
+            observed = (digests or {}).get(artifact.artifact_id)
+            if observed is None:
+                try:
+                    observed = local_payload_digest(artifact, local)
+                except FileNotFoundError:
+                    observed = (-1, "")
+                except KeeperCheckUnavailable as exc:
+                    logger.warning("A local FULL earned no history sidecar credit (%s).", exc.reason)
+                    continue
+            if observed != (artifact.size, artifact.sha256):
+                self.catalog.mark_unverified(artifact.artifact_id)
+                continue
+            count += 1
+        return count
 
     @staticmethod
     def _open_snapshot_directory(root: Path) -> int | None:
@@ -1196,8 +1226,66 @@ class BackupScheduler:
                 )
         return rules
 
-    def _manager(self) -> LifecycleManager:
-        return LifecycleManager(self.catalog, self.retention_rules())
+    def _manager(self, local_digests: dict[str, tuple[int, str]] | None = None) -> LifecycleManager:
+        return LifecycleManager(
+            self.catalog, self.retention_rules(), payload_digest=self._keeper_digest(local_digests)
+        )
+
+    def _keeper_digest(self, local_digests: dict[str, tuple[int, str]] | None = None) -> PayloadDigest:
+        """How grooming re-reads a kept copy before it deletes anything (#1188).
+
+        Local copies are hashed in place. A remote copy is first looked up in
+        one listing per location and prefix (a missing name or a different
+        size fails the keeper without a download), then read back through the
+        target's streaming ``get`` into a private scratch file under the state
+        directory with a hard limit of the recorded size, the same bounded
+        readback an explicit verify uses. Nothing is buffered in memory and the
+        scratch file is removed at once. A target without ``get`` or a readback
+        that fails refuses the deletion with a named reason.
+        """
+
+        listings: dict[tuple[str, str], dict[str, int]] = {}
+
+        def digest(record: ArtifactRecord, target: GroomableTarget) -> tuple[int, str]:
+            if record.location == LOCAL_LOCATION:
+                observed = local_payload_digest(record, target)
+                if local_digests is not None:
+                    local_digests[record.artifact_id] = observed
+                return observed
+            get: Any = getattr(target, "get", None)
+            if not callable(get):
+                raise KeeperCheckUnavailable("keeper-unverifiable")
+            prefix = record.name.rpartition("/")[0]
+            prefix = f"{prefix}/" if prefix else ""
+            key = (record.location, prefix)
+            try:
+                if key not in listings:
+                    listings[key] = {obj.name: obj.size for obj in target.list(prefix)}
+            except (ConnectionError, TimeoutError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - refuse, never assume the keeper is there
+                raise KeeperCheckUnavailable("keeper-readback-failed") from exc
+            listed_size = listings[key].get(record.name)
+            if listed_size is None:
+                raise FileNotFoundError(record.name)
+            if listed_size != record.size:
+                return listed_size, ""
+            workspace = Path(tempfile.mkdtemp(prefix="keeper-check-", dir=self.paths.state_dir))
+            try:
+                size, sha256 = get(record.name, workspace / "archive", limit=record.size)
+                return int(size), str(sha256)
+            except ArchiveDownloadTooLargeError:
+                return record.size + 1, ""
+            except (ConnectionError, TimeoutError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - refuse, never delete on an unchecked keeper
+                raise KeeperCheckUnavailable("keeper-readback-failed") from exc
+            finally:
+                for child in workspace.iterdir():
+                    child.unlink(missing_ok=True)
+                workspace.rmdir()
+
+        return digest
 
     @contextlib.contextmanager
     def _resolver(self) -> Iterator[Callable[[str], Any]]:
@@ -1214,8 +1302,8 @@ class BackupScheduler:
 
             yield local_target_resolver(self.paths.local_dir, remote)
 
-    def _groom_locked(self) -> Any:
-        manager = self._manager()
+    def _groom_locked(self, local_digests: dict[str, tuple[int, str]] | None = None) -> Any:
+        manager = self._manager(local_digests)
         plan = manager.plan(self._clock())
         if not plan.items:
             self._record_grooming(ok=True, deleted=0, detail=None, failed_locations={})
@@ -1232,10 +1320,21 @@ class BackupScheduler:
         if result.failed is not None and result.error and result.failed.record.location not in failed_locations:
             # A location that opened but then failed a deletion or claim stopped the run.
             failed_locations[result.failed.record.location] = result.error
+        detail = result.error
+        downgraded = getattr(result, "downgraded", ())
+        if downgraded:
+            # #1188: a kept copy failed its payload check; say so even when the
+            # replanned run otherwise completed.
+            note = (
+                f"{len(downgraded)} kept backup copy/copies failed the size and SHA-256 check "
+                "and were marked unverified."
+            )
+            detail = note if detail is None else f"{detail} {note}"
+            logger.warning("Backup grooming marked %d kept copy/copies unverified.", len(downgraded))
         self._record_grooming(
             ok=not result.error,
             deleted=len(result.deleted) + len(result.already_missing),
-            detail=result.error,
+            detail=detail,
             failed_locations=failed_locations,
         )
 

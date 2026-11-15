@@ -2429,6 +2429,141 @@ class SchedulerTests(SchedulerTestBase):
         problems = backup_archive_problems(self._paths.status_file)
         self.assertTrue(any(p.startswith("Backup grooming stopped: ConnectionRefusedError") for p in problems))
 
+    def test_grooming_keeps_the_older_full_when_the_newest_local_copy_is_missing(self) -> None:
+        # #1188: keep=1 with two local copies; the newest file vanished after
+        # it was verified, while its catalog row still says verified.
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2}})
+        older = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        newest = scheduler.run_now("full")
+        (self._paths.local_dir / newest.name).unlink()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 1}})
+        token, _expires, plan = scheduler.plan()
+        # The preview is catalog-only; the payload check happens before deletion.
+        self.assertEqual([item.record.artifact_id for item in plan.items], [older.artifact_id])
+
+        result = scheduler.apply(token)
+
+        self.assertTrue((self._paths.local_dir / older.name).exists(), "the last good copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertEqual(grooming["deleted"], 0)
+        self.assertIn("marked unverified", grooming["detail"])
+        self.assertEqual(scheduler.plan()[2].items, ())
+
+    def test_remote_grooming_reads_back_kept_copies_before_deleting(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        remote_dir = self.remote_root / "nas"
+        # Same-size corruption of the newest remote copy after its upload readback.
+        (remote_dir / newest.name).write_bytes(b"X" * newest.size)
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+
+        result = scheduler.apply(scheduler.plan()[0])
+
+        self.assertTrue((remote_dir / older.name).exists(), "the last good remote copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        # The readback scratch file never outlives the check.
+        self.assertEqual(
+            [path.name for path in self._paths.state_dir.iterdir() if path.name.startswith("keeper-check-")], []
+        )
+
+    def test_missing_remote_keeper_is_downgraded_from_the_listing_without_a_download(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        remote_dir = self.remote_root / "nas"
+        (remote_dir / newest.name).unlink()
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+        token = scheduler.plan()[0]
+
+        real_get = LocalDirectoryTarget.get
+        with patch.object(LocalDirectoryTarget, "get", autospec=True, side_effect=real_get) as get:
+            result = scheduler.apply(token)
+
+        self.assertTrue((remote_dir / older.name).exists(), "the last good remote copy was groomed")
+        self.assertEqual(result.deleted, ())
+        self.assertEqual(result.failed_locations, {})
+        self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
+        # The listing settles the missing keeper; only the older copy, which
+        # became the keeper after the replan, is read back, and only once.
+        self.assertEqual([call.args[1] for call in get.call_args_list], [older.name])
+        self.assertEqual(get.call_args_list[0].kwargs["limit"], older.size)
+
+    def test_remote_grooming_deletes_after_an_intact_keeper_readback(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+
+        result = scheduler.apply(scheduler.plan()[0])
+
+        self.assertTrue(result.complete)
+        self.assertEqual([item.record.artifact_id for item in result.deleted], [older.artifact_id])
+        self.assertFalse((self.remote_root / "nas" / older.name).exists())
+        self.assertTrue(scheduler.catalog.get(newest.artifact_id).verified)
+
+    def test_remote_keeper_readback_failure_refuses_the_deletion(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        older, newest = scheduler.catalog.list(backup_class="full", location="nas")
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+        token = scheduler.plan()[0]
+
+        with patch.object(LocalDirectoryTarget, "get", side_effect=PermissionError("synthetic denied")):
+            result = scheduler.apply(token)
+
+        self.assertTrue((self.remote_root / "nas" / older.name).exists())
+        self.assertEqual(result.deleted, ())
+        self.assertIn("keeper-readback-failed", result.failed_locations["nas"])
+        self.assertTrue(scheduler.catalog.get(newest.artifact_id).verified, "an unchecked keeper is not downgraded")
+        grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+        self.assertFalse(grooming["ok"])
+        self.assertIn("keeper-readback-failed", grooming["failed_locations"]["nas"])
+        self.assertNotIn("synthetic denied", json.dumps(grooming))
+
+    def test_same_size_corrupt_fulls_earn_no_sidecar_replacement_credit(self) -> None:
+        # #1188: FULL files corrupted without a size change must not stand in
+        # for the last good history sidecar snapshot.
+        scheduler = self.make({"full": {"enabled": True}})
+        earlier = []
+        for _ in range(13):
+            earlier.append(scheduler.run_now("full"))
+            self.now += timedelta(days=1)
+        sidecar = self._paths.history_backup_dir / "history-20260922T030000Z.sqlite3"
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_bytes(b"last good sidecar snapshot")
+        stamp = (self.now - timedelta(days=1)).timestamp()
+        os.utime(sidecar, (stamp, stamp))
+        for record in earlier:
+            path = self._paths.local_dir / record.name
+            path.write_bytes(b"X" * record.size)
+
+        scheduler.run_now("full")
+
+        self.assertTrue(sidecar.exists(), "corrupt FULLs earned sidecar replacement credit")
+        self.assertEqual(scheduler._verified_local_full_count(), 1)
+        for record in earlier:
+            self.assertFalse(scheduler.catalog.get(record.artifact_id).verified)
+
     def test_unverified_remote_copy_is_a_failed_run_and_never_catalogued(self) -> None:
         import dataclasses
 
