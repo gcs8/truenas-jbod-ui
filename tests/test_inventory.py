@@ -1422,13 +1422,17 @@ class InventoryApiCertificateFailureTests(unittest.IsolatedAsyncioTestCase):
         error.verify_message = "certificate has expired"
         return error
 
-    async def test_websocket_certificate_failure_is_named(self):
+    async def test_websocket_certificate_failure_is_named_without_remote_detail(self):
         bundle = await self._bundle(self._expired_error())
 
         self.assertFalse(bundle.sources["api"].ok)
-        self.assertIn("TrueNAS API certificate check failed: certificate has expired.", bundle.warnings)
+        self.assertIn(
+            "TrueNAS API certificate verification failed. Slot details may be partial or unavailable.",
+            bundle.warnings,
+        )
         self.assertFalse(any("unreachable" in warning for warning in bundle.warnings), bundle.warnings)
-        self.assertIn("certificate check failed", bundle.sources["api"].message)
+        self.assertEqual(bundle.sources["api"].message, "TrueNAS API certificate verification failed.")
+        self.assertNotIn("certificate has expired", str(bundle.sources["api"].model_dump()))
 
     async def test_wrapped_certificate_failure_is_found_in_the_exception_chain(self):
         from urllib.error import URLError
@@ -1443,13 +1447,21 @@ class InventoryApiCertificateFailureTests(unittest.IsolatedAsyncioTestCase):
 
         bundle = await self._bundle(error, platform="quantastor")
 
-        self.assertIn("Quantastor API certificate check failed: certificate has expired.", bundle.warnings)
+        self.assertIn(
+            "Quantastor API certificate verification failed. Slot details may be partial or unavailable.",
+            bundle.warnings,
+        )
+        self.assertNotIn("certificate has expired", str(bundle.sources["api"].model_dump()))
 
-    async def test_other_connection_failures_still_say_unreachable(self):
+    async def test_other_connection_failures_use_fixed_collection_reason(self):
         bundle = await self._bundle(ConnectionRefusedError("synthetic refusal"))
 
-        self.assertIn("TrueNAS API is unreachable. Slot details may be partial or unavailable.", bundle.warnings)
-        self.assertEqual(bundle.sources["api"].message, "synthetic refusal")
+        self.assertIn(
+            "TrueNAS API could not be collected. Slot details may be partial or unavailable.",
+            bundle.warnings,
+        )
+        self.assertEqual(bundle.sources["api"].message, "TrueNAS API collection failed.")
+        self.assertNotIn("synthetic refusal", str(bundle.sources["api"].model_dump()))
 
 
 class InventorySSHRequiredCommandTests(unittest.IsolatedAsyncioTestCase):

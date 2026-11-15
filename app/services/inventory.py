@@ -5783,20 +5783,39 @@ class InventoryService:
                 certificate_failure = certificate_verification_failure_reason(exc)
                 if certificate_failure is not None:
                     # #954: name a failed certificate check instead of "unreachable".
-                    certificate_message = f"{api_label} certificate check failed: {certificate_failure}."
+                    # The verifier's free-form text stays in server diagnostics;
+                    # public snapshots carry only this fixed failure category.
+                    certificate_message = f"{api_label} certificate verification failed."
                     sources["api"] = SourceStatus(enabled=True, ok=False, message=certificate_message)
-                    warnings.append(certificate_message)
+                    warnings.append(
+                        f"{api_label} certificate verification failed. "
+                        "Slot details may be partial or unavailable."
+                    )
                 elif isinstance(exc, TrueNASAPIBusyError):
                     # #1072: the appliance answered but is out of capacity, or
                     # the app is backing off after it was. Not "unreachable".
-                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=f"{api_label} is busy; collection will retry.",
+                    )
                     warnings.append(
                         f"{api_label} is busy; the app is backing off before asking again. "
                         "Slot details may be partial until it answers."
                     )
                 else:
-                    sources["api"] = SourceStatus(enabled=True, ok=False, message=str(exc))
-                    warnings.append(f"{api_label} is unreachable. Slot details may be partial or unavailable.")
+                    # Adapter exceptions can contain response bodies, traces,
+                    # URLs, or remote reasons. They are logged above but never
+                    # copied into the public snapshot or its exports.
+                    sources["api"] = SourceStatus(
+                        enabled=True,
+                        ok=False,
+                        message=f"{api_label} collection failed.",
+                    )
+                    warnings.append(
+                        f"{api_label} could not be collected. "
+                        "Slot details may be partial or unavailable."
+                    )
             else:
                 if api_result is not None:
                     raw_data = api_result
@@ -5815,9 +5834,14 @@ class InventoryService:
         if ssh_task is not None:
             try:
                 ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
-            except Exception as exc:
+            except Exception:
                 logger.exception("Failed to collect SSH diagnostics")
-                sources["ssh"] = SourceStatus(enabled=True, ok=False, message=str(exc), required_ok=False)
+                sources["ssh"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message="SSH diagnostics collection failed.",
+                    required_ok=False,
+                )
                 warnings.append("SSH is turned on but no command output came back.")
             else:
                 sources["ssh"] = ssh_status
@@ -5828,9 +5852,13 @@ class InventoryService:
         if bmc_task is not None:
             try:
                 bmc_inventory = await bmc_task
-            except Exception as exc:
+            except Exception:
                 logger.exception("Failed to collect BMC / IPMI diagnostics")
-                sources["bmc"] = SourceStatus(enabled=True, ok=False, message=str(exc))
+                sources["bmc"] = SourceStatus(
+                    enabled=True,
+                    ok=False,
+                    message="BMC / IPMI diagnostics collection failed.",
+                )
                 warnings.append("BMC/IPMI is turned on but the BMC could not be read.")
             else:
                 sources["bmc"] = SourceStatus(enabled=True, ok=True, message="BMC / IPMI inventory reachable.")

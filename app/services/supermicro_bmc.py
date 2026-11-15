@@ -126,14 +126,14 @@ class SupermicroBMCService:
 
         try:
             self._populate_redfish_inventory(inventory)
-        except TrueNASAPIError as exc:
-            inventory.warnings.append(str(exc))
+        except TrueNASAPIError:
+            inventory.warnings.append("BMC Redfish inventory unavailable.")
             inventory.source_details["redfish_ok"] = False
 
         try:
             self._populate_web_inventory(inventory)
-        except TrueNASAPIError as exc:
-            inventory.warnings.append(str(exc))
+        except TrueNASAPIError:
+            inventory.warnings.append("BMC web inventory unavailable.")
             inventory.source_details["web_xml_ok"] = False
             if not inventory.drives:
                 self._populate_redfish_simple_storage_fallback(inventory)
@@ -194,9 +194,9 @@ class SupermicroBMCService:
 
         try:
             self._redfish_get_json("/redfish/v1/Systems/1/Storage")
-        except TrueNASAPIError as exc:
+        except TrueNASAPIError:
             inventory.source_details["redfish_storage_ok"] = False
-            inventory.source_details["redfish_storage_error"] = str(exc)
+            inventory.source_details["redfish_storage_error"] = "BMC Redfish storage inventory unavailable."
         else:
             inventory.source_details["redfish_storage_ok"] = True
 

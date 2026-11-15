@@ -180,6 +180,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_service",
         "test_inventory",
         "test_inventory_registry_routes",
+        "test_inventory_status_error_text",
         "test_nonroot_cli",
         "test_perf_budgets",
         "test_profiles",
