@@ -2594,6 +2594,24 @@ def _merge_control_targets(
     return merged
 
 
+def _ses_candidate_presence(slot: SESMapSlot) -> bool | None:
+    """Occupancy for an inventory candidate: decided evidence or unknown.
+
+    A truncated AES descriptor or a condition-only Enclosure Status record
+    leaves the bay undecided. That stays ``None`` so inventory does not read
+    it as a live empty report (#1218). Only device names are positive
+    evidence and only an explicit not-installed status is absence.
+    """
+
+    if slot.present is not None:
+        return slot.present
+    if "not installed" in (slot.status or "").lower():
+        return False
+    if slot.device_names:
+        return True
+    return None
+
+
 def _merge_candidate_presence(
     target: dict[str, Any],
     incoming: dict[str, Any],
@@ -2862,9 +2880,7 @@ def build_slot_candidates_from_ses_enclosures(
                     "serial_hint": slot.serial,
                     "model_hint": slot.model,
                     "reported_size": slot.size_text,
-                    "present": slot.present
-                    if slot.present is not None
-                    else bool(slot.device_names) and "not installed" not in (slot.status or "").lower(),
+                    "present": _ses_candidate_presence(slot),
                     "presence_source": slot.presence_source,
                     "presence_conflict": slot.presence_conflict,
                     "enclosure_id": enclosure.enclosure_id,

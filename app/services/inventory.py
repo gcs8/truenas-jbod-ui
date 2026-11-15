@@ -16140,6 +16140,19 @@ class InventoryService:
         # Critical onto every empty slot), and used to fabricate a present
         # drive out of them.
         ses_says_empty_without_disk = raw_present is False and disk is None
+        # SES evidence that leaves occupancy undecided (a truncated AES
+        # descriptor, a condition-only Enclosure Status record) and no resolved
+        # disk: neither occupancy nor a drive is known. A condition code alone
+        # is not a drive fault either, so the bay stays unknown (#1218).
+        ses_presence_unknown_without_disk = (
+            raw_present is None
+            and disk is None
+            and not empty
+            and bool(
+                normalize_text(raw_slot_status.get("ses_device"))
+                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
+            )
+        )
         # `_status_contains` is a substring scan, so the positive presence
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
@@ -16153,7 +16166,7 @@ class InventoryService:
             or (not ses_says_empty_without_disk and status_says_populated)
         )
 
-        if faulty and not ses_says_empty_without_disk:
+        if faulty and not ses_says_empty_without_disk and not ses_presence_unknown_without_disk:
             non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
             non_identify_state = SlotState.empty
