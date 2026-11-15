@@ -5902,7 +5902,11 @@
       if (elements.setupBootstrapButton) {
         elements.setupBootstrapButton.disabled = Boolean(state.sessionStopped) || !bootstrapEnabledForSession();
       }
-      for (const control of [elements.setupInspectTlsButton, elements.setupTrustRemoteTlsButton]) {
+      for (const control of [
+        elements.setupInspectTlsButton,
+        elements.setupTrustRemoteTlsButton,
+        elements.setupTlsImportCaButton,
+      ]) {
         if (control) control.disabled = Boolean(state.sessionStopped);
       }
       const selectedId = elements.existingSystemSelect?.value || state.selectedExistingSystemId;
@@ -6949,25 +6953,34 @@
       setBanner("Choose a PEM bundle before importing it into the local trust store.", "error");
       return;
     }
+    const host = collectTlsTargetHost();
+    const systemId = elements.setupSystemId?.value?.trim() || null;
+    const bundleName = suggestedTlsBundleName();
+    const owner = captureTlsEditorOperation("tls-import", host);
+    const fileName = file.name || "the selected file";
     if (elements.setupTlsImportCaButton) {
       elements.setupTlsImportCaButton.disabled = true;
     }
     if (elements.setupTlsImportResult) {
-      elements.setupTlsImportResult.textContent = `Importing ${file.name} into the local TLS trust store...`;
+      elements.setupTlsImportResult.textContent = `Importing ${fileName} into the local TLS trust store...`;
     }
     try {
       const pemText = await readTextFile(file);
+      // The file read is asynchronous too. Retire it before dispatch so an old
+      // editor cannot retarget the request to fields that are open now.
+      if (!owner.owns()) return;
       const payload = await fetchJson("/api/admin/tls/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pem_text: pemText,
-          host: collectTlsTargetHost() || null,
-          system_id: elements.setupSystemId?.value?.trim() || null,
-          bundle_name: suggestedTlsBundleName(),
-          tls_server_name: collectTlsServerName() || null,
+          host: host || null,
+          system_id: systemId,
+          bundle_name: bundleName,
+          tls_server_name: owner.serverName || null,
         }),
       });
+      if (!owner.owns()) return;
       const draftBefore = setupDraftSnapshot();
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
@@ -6979,28 +6992,30 @@
       }
       const leftOff = !validated && !elements.setupVerifySsl?.checked;
       recordSetupDraftChange(draftBefore);
+      owner.advance();
       syncVerifySslHelp();
       syncApiSecretReentry();
       const trusted = syncTlsTrustStatus(payload.validation || null);
       const validationDetail = buildTlsValidationSuggestion(payload.validation);
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = trusted
-          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || collectTlsTargetHost() || "this host"}.`
+          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || host || "this host"}.`
           : `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path}. ${validationDetail || defaultTlsTrustDetail({ bundlePath: payload.bundle_path })}${leftOff ? " Certificate checks were left off." : " Certificate checks are still on, so refreshes will fail until this passes."}`.trim();
       }
       setBanner(
         trusted
-          ? `Imported and verified PEM trust bundle from ${file.name}.`
-          : `Imported PEM trust bundle from ${file.name}.`
+          ? `Imported and verified PEM trust bundle from ${fileName}.`
+          : `Imported PEM trust bundle from ${fileName}.`
       , trusted ? "success" : "info");
     } catch (error) {
+      if (!owner.owns()) return;
       syncTlsTrustStatus();
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = `TLS bundle import failed: ${error.message || error}`;
       }
       setBanner(`TLS bundle import failed: ${error.message || error}`, "error");
     } finally {
-      if (elements.setupTlsImportCaButton) {
+      if (owner.latest() && elements.setupTlsImportCaButton) {
         elements.setupTlsImportCaButton.disabled = Boolean(state.sessionStopped);
       }
     }
