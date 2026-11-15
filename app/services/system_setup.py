@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from app.config import (
-    BMCConfig,
     HANodeConfig,
     SSHConfig,
     StorageViewBindingConfig,
@@ -16,7 +15,6 @@ from app.config import (
     StorageViewLayoutOverridesConfig,
     StorageViewRenderConfig,
     SystemConfig,
-    TrueNASConfig,
     _derive_runtime_layout_paths,
     _normalize_system_id,
     is_placeholder_known_hosts_path,
@@ -231,6 +229,23 @@ def _preserved_known_hosts_path(config_path: str | Path, raw_system: Any) -> str
     if is_placeholder_known_hosts_path(configured, known_hosts_placeholder_paths(config_path)):
         return derived
     return str(configured)
+
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _apply_form_fields(model: _ModelT, updates: dict[str, Any]) -> _ModelT:
+    """A validated copy of ``model`` with only ``updates`` changed.
+
+    Fields not named in ``updates`` keep the saved value, so a field the
+    setup form does not own survives a save (#1192).
+    """
+
+    model_type = type(model)
+    unknown = set(updates) - set(model_type.model_fields)
+    if unknown:
+        raise RuntimeError(f"{model_type.__name__} has no field(s) {sorted(unknown)}")
+    return model_type.model_validate({**model.model_dump(mode="python"), **updates})
 
 
 class SystemSetupService:
@@ -547,106 +562,97 @@ class SystemSetupService:
                     )
                     for storage_view in (payload.storage_views or [])
                 ]
-            system = SystemConfig(
-                id=system_id,
-                label=payload.label,
-                default_profile_id=payload.default_profile_id,
-                enclosure_profiles=dict(existing_system.enclosure_profiles) if existing_system else {},
-                storage_views=storage_views,
-                auto_storage_views=(
-                    payload.auto_storage_views
-                    if payload.auto_storage_views is not None
-                    else (existing_system.auto_storage_views if existing_system else True)
+            # Start from the saved, validated system and apply only the fields
+            # the setup form owns (#1192). Every other saved field, such as
+            # `truenas.max_concurrent_calls` (#1072) or a config-only field
+            # added later, keeps its value instead of returning to the model
+            # default. A new system starts from the model defaults.
+            base = existing_system if existing_system is not None else SystemConfig()
+            truenas_updates: dict[str, Any] = {
+                "host": payload.truenas_host,
+                "api_key": resolve_secret(
+                    payload.api_key,
+                    existing_system.truenas.api_key if existing_system is not None else None,
                 ),
-                view_order=list(
-                    payload.view_order
-                    if payload.view_order is not None
-                    else (existing_system.view_order if existing_system else [])
+                "api_user": payload.api_user or "",
+                "api_password": resolve_secret(
+                    payload.api_password,
+                    existing_system.truenas.api_password if existing_system is not None else None,
                 ),
-                truenas=TrueNASConfig(
-                    host=payload.truenas_host,
-                    api_key=resolve_secret(
-                        payload.api_key,
-                        existing_system.truenas.api_key if existing_system is not None else None,
-                    ),
-                    api_user=payload.api_user or "",
-                    api_password=resolve_secret(
-                        payload.api_password,
-                        existing_system.truenas.api_password if existing_system is not None else None,
-                    ),
-                    platform=payload.platform,
-                    # The setup form does not carry the dialect yet, so a save
+                "platform": payload.platform,
+                "verify_ssl": payload.verify_ssl,
+                "tls_ca_bundle_path": tls_ca_bundle_path,
+                "tls_server_name": tls_server_name,
+                "enclosure_filter": payload.enclosure_filter,
+            }
+            ssh_updates: dict[str, Any] = {
+                "enabled": ssh_enabled,
+                "host": ssh_host or "",
+                "ha_enabled": bool(payload.ha_enabled),
+                "ha_nodes": [
+                    HANodeConfig(
+                        system_id=node.system_id,
+                        label=node.label,
+                        host=node.host or "",
+                    )
+                    for node in payload.ha_nodes
+                ],
+                "port": payload.ssh_port,
+                "user": payload.ssh_user or "",
+                "key_path": payload.ssh_key_path or "",
+                "password": resolve_secret(
+                    payload.ssh_password,
+                    existing_system.ssh.password if existing_system is not None else None,
+                ),
+                "sudo_password": resolve_secret(
+                    payload.ssh_sudo_password,
+                    existing_system.ssh.sudo_password if existing_system is not None else None,
+                ),
+                # The request never chooses the trust file; a path the
+                # operator set on this system in config.yaml is kept.
+                "known_hosts_path": _preserved_known_hosts_path(
+                    self.config_path,
+                    raw_systems[existing_index] if existing_index is not None else None,
+                ),
+                "strict_host_key_checking": payload.ssh_strict_host_key_checking,
+                "commands": list(ssh_commands),
+            }
+            if existing_system is None:
+                # Only a new system takes these from the request; a re-save
+                # keeps the saved values.
+                truenas_updates["timeout_seconds"] = payload.timeout_seconds
+                ssh_updates["timeout_seconds"] = payload.ssh_timeout_seconds
+                ssh_updates["extra_hosts"] = ssh_extra_hosts
+                if dialect_source is not None:
+                    # The setup form does not carry the dialect yet, so a clone
                     # must not silently move a JSON-RPC host back onto DDP.
-                    api_dialect=(
-                        dialect_source.truenas.api_dialect
-                        if dialect_source is not None
-                        else TrueNASConfig.model_fields["api_dialect"].default
-                    ),
-                    api_version=(
-                        dialect_source.truenas.api_version
-                        if dialect_source is not None
-                        else TrueNASConfig.model_fields["api_version"].default
-                    ),
-                    verify_ssl=payload.verify_ssl,
-                    tls_ca_bundle_path=tls_ca_bundle_path,
-                    tls_server_name=tls_server_name,
-                    timeout_seconds=(
-                        existing_system.truenas.timeout_seconds
-                        if existing_system is not None
-                        else payload.timeout_seconds
-                    ),
-                    enclosure_filter=payload.enclosure_filter,
+                    truenas_updates["api_dialect"] = dialect_source.truenas.api_dialect
+                    truenas_updates["api_version"] = dialect_source.truenas.api_version
+            bmc_updates: dict[str, Any] = {
+                "enabled": bool(payload.bmc_enabled),
+                "host": payload.bmc_host or "",
+                "username": payload.bmc_username or "",
+                "password": resolve_secret(
+                    payload.bmc_password,
+                    existing_system.bmc.password if existing_system is not None else None,
                 ),
-                ssh=SSHConfig(
-                    enabled=ssh_enabled,
-                    host=ssh_host or "",
-                    extra_hosts=ssh_extra_hosts,
-                    ha_enabled=bool(payload.ha_enabled),
-                    ha_nodes=[
-                        HANodeConfig(
-                            system_id=node.system_id,
-                            label=node.label,
-                            host=node.host or "",
-                        )
-                        for node in payload.ha_nodes
-                    ],
-                    port=payload.ssh_port,
-                    user=payload.ssh_user or "",
-                    key_path=payload.ssh_key_path or "",
-                    password=resolve_secret(
-                        payload.ssh_password,
-                        existing_system.ssh.password if existing_system is not None else None,
-                    ),
-                    sudo_password=resolve_secret(
-                        payload.ssh_sudo_password,
-                        existing_system.ssh.sudo_password if existing_system is not None else None,
-                    ),
-                    # The request never chooses the trust file; a path the
-                    # operator set on this system in config.yaml is kept.
-                    known_hosts_path=_preserved_known_hosts_path(
-                        self.config_path,
-                        raw_systems[existing_index] if existing_index is not None else None,
-                    ),
-                    strict_host_key_checking=payload.ssh_strict_host_key_checking,
-                    timeout_seconds=(
-                        existing_system.ssh.timeout_seconds
-                        if existing_system is not None
-                        else payload.ssh_timeout_seconds
-                    ),
-                    commands=list(ssh_commands),
-                ),
-                bmc=BMCConfig(
-                    enabled=bool(payload.bmc_enabled),
-                    host=payload.bmc_host or "",
-                    username=payload.bmc_username or "",
-                    password=resolve_secret(
-                        payload.bmc_password,
-                        existing_system.bmc.password if existing_system is not None else None,
-                    ),
-                    verify_ssl=payload.bmc_verify_ssl,
-                    timeout_seconds=payload.bmc_timeout_seconds,
-                ),
-            )
+                "verify_ssl": payload.bmc_verify_ssl,
+                "timeout_seconds": payload.bmc_timeout_seconds,
+            }
+            system_updates: dict[str, Any] = {
+                "id": system_id,
+                "label": payload.label,
+                "default_profile_id": payload.default_profile_id,
+                "storage_views": storage_views,
+                "truenas": _apply_form_fields(base.truenas, truenas_updates),
+                "ssh": _apply_form_fields(base.ssh, ssh_updates),
+                "bmc": _apply_form_fields(base.bmc, bmc_updates),
+            }
+            if payload.auto_storage_views is not None:
+                system_updates["auto_storage_views"] = payload.auto_storage_views
+            if payload.view_order is not None:
+                system_updates["view_order"] = list(payload.view_order)
+            system = _apply_form_fields(base, system_updates)
 
             raw_system = system.model_dump(mode="python", exclude_none=True)
             if system.auto_storage_views:
