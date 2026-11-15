@@ -1657,10 +1657,16 @@ def _public_smart_ssh_failure_message(message: str, service_user: str) -> str:
     return "SMART data collection failed."
 
 
-def _log_remote_failure(operation: str, exc: BaseException) -> None:
+def _log_remote_failure(
+    operation: str,
+    exc: BaseException,
+    *,
+    level: int = logging.WARNING,
+) -> None:
     category, code = classify_remote_failure(exc)
     code_context = f", code={code}" if code is not None else ""
-    logger.warning(
+    logger.log(
+        level,
         "%s failed (category=%s%s, exception=%s)",
         operation,
         category,
@@ -5875,7 +5881,7 @@ class InventoryService:
             try:
                 api_result = await api_task
             except Exception as exc:
-                _log_remote_failure("Platform API collection", exc)
+                _log_remote_failure("Platform API collection", exc, level=logging.ERROR)
                 certificate_failure = certificate_verification_failure_reason(exc)
                 if certificate_failure is not None:
                     # #954: keep the failure actionable without publishing the
@@ -5934,7 +5940,7 @@ class InventoryService:
             try:
                 ssh_outputs, ssh_collected, ssh_failures, ssh_failure_details, ssh_status = await ssh_task
             except Exception as exc:
-                _log_remote_failure("SSH diagnostics collection", exc)
+                _log_remote_failure("SSH diagnostics collection", exc, level=logging.ERROR)
                 sources["ssh"] = SourceStatus(
                     enabled=True,
                     ok=False,
@@ -5952,7 +5958,7 @@ class InventoryService:
             try:
                 bmc_inventory = await bmc_task
             except Exception as exc:
-                _log_remote_failure("BMC diagnostics collection", exc)
+                _log_remote_failure("BMC diagnostics collection", exc, level=logging.ERROR)
                 sources["bmc"] = SourceStatus(
                     enabled=True,
                     ok=False,
