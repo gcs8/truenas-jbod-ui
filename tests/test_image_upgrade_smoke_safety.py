@@ -204,5 +204,210 @@ class RootAdmissionTests(unittest.TestCase):
                 self.assertFalse("root.resolve()" in source, f"{name} resolves --root before admission")
 
 
+def claim(smoke, root: Path) -> None:
+    """Record ``root`` as created by this run, as prepare_root does (no-op where ownership is untracked)."""
+    owned = getattr(smoke, "_OWNED_ROOTS", None)
+    if owned is not None:
+        owned.add(root)
+
+
+def expected_cleanup_commands(root: Path, chain: tuple[str, ...] = (), *, unmount: bool = False) -> list[list[str]]:
+    """The verified cleanup sequence for an owned root with the given ``-f`` chain."""
+    files = [arg for name in chain for arg in ("-f", name)]
+    project = f"label=com.docker.compose.project={root.name.lower()}"
+    return [
+        ["docker", "compose", *files, "--profile", "history", "--profile", "admin",
+         "down", "--volumes", "--remove-orphans"],
+        *([["sudo", "umount", str(root / "history")]] if unmount else []),
+        ["docker", "container", "ls", "--all", "--quiet", "--filter", project],
+        ["docker", "network", "ls", "--quiet", "--filter", project],
+        ["docker", "volume", "ls", "--quiet", "--filter", project],
+        ["sudo", "rm", "-rf", "--", str(root)],
+    ]
+
+
+class CleanupBoundary:
+    """Stateful fake for every command cleanup may run; nothing reaches Docker or sudo."""
+
+    def __init__(self, root: Path, *, down=0, census=None, umount=0, remove=0) -> None:
+        self.root = root
+        self.down = down          # exit status, or an exception instance to raise
+        self.census = census or {}  # kind -> stdout, exit status, or exception
+        self.umount = umount
+        self.remove = remove
+        self.commands: list[list[str]] = []
+        self.kwargs: list[dict] = []
+        self.stdout_at_removal: str | None = None
+        self.stdout = None
+
+    def __call__(self, command, **kwargs):
+        command = list(command)
+        self.commands.append(command)
+        self.kwargs.append(kwargs)
+        if command[:2] == ["docker", "compose"] and "down" in command:
+            outcome = self.down
+        elif command[:1] == ["docker"] and "ls" in command:
+            outcome = self.census.get(command[1], "")
+        elif command[:2] == ["sudo", "umount"]:
+            outcome = self.umount
+        elif command[:3] == ["sudo", "rm", "-rf"]:
+            if self.stdout is not None:
+                self.stdout_at_removal = self.stdout.getvalue()
+            outcome = self.remove
+            if outcome == 0:
+                shutil.rmtree(self.root)
+        else:
+            outcome = 0
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if isinstance(outcome, str):
+            return subprocess.CompletedProcess(command, 0, outcome, "")
+        return subprocess.CompletedProcess(command, outcome, "", "")
+
+    def removal_requested(self) -> bool:
+        return any(command[:3] == ["sudo", "rm", "-rf"] for command in self.commands)
+
+    def census_requested(self) -> list[str]:
+        return [command[1] for command in self.commands if command[:1] == ["docker"] and "ls" in command]
+
+
+class CleanupVerificationTests(unittest.TestCase):
+    """#1225: success needs verified cleanup; failed or unknown cleanup retains the root."""
+
+    def setUp(self) -> None:
+        self.smoke = load_smoke()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name) / "image-upgrade-smoke"
+        self.recovery = self.root / "config" / "config.yaml"
+        self.ensure_root()
+
+    def ensure_root(self) -> None:
+        """A populated owned root for each case, even after an earlier subtest removed it."""
+        self.recovery.parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        self.recovery.write_text("synthetic recovery configuration\n", encoding="utf-8")
+        claim(self.smoke, self.root)
+
+    def cleanup_outcome(self, boundary: CleanupBoundary) -> str:
+        """``verified``, ``refused: <reason>``, or ``returned <value>`` when no failure was reported."""
+        self.ensure_root()
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=boundary), \
+             mock.patch.object(self.smoke.os.path, "ismount", return_value=False):
+            try:
+                returned = self.smoke.cleanup(self.root)
+            except self.smoke.SmokeError as exc:
+                return f"refused: {exc}"
+            except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                return f"unhandled {type(exc).__name__}"
+        if not self.root.exists():
+            return "verified"
+        return f"returned {returned!r} with the root still present"
+
+    def test_verified_cleanup_removes_the_root(self):
+        boundary = CleanupBoundary(self.root)
+        self.assertEqual(self.cleanup_outcome(boundary), "verified")
+        self.assertEqual(boundary.commands, expected_cleanup_commands(self.root))
+
+    def test_every_cleanup_command_has_a_deadline(self):
+        boundary = CleanupBoundary(self.root)
+        self.cleanup_outcome(boundary)
+        self.assertTrue(boundary.kwargs)
+        for command, kwargs in zip(boundary.commands, boundary.kwargs):
+            with self.subTest(command=command[:3]):
+                self.assertIsInstance(kwargs.get("timeout"), (int, float))
+
+    def test_failed_teardown_retains_the_root_and_still_reads_back(self):
+        boundary = CleanupBoundary(self.root, down=1)
+        self.assertRegex(self.cleanup_outcome(boundary), "^refused: .*teardown failed")
+        self.assertFalse(boundary.removal_requested())
+        self.assertEqual(boundary.census_requested(), ["container", "network", "volume"])
+        self.assertTrue(self.recovery.is_file())
+
+    def test_timed_out_teardown_retains_the_root(self):
+        boundary = CleanupBoundary(self.root, down=subprocess.TimeoutExpired(["docker"], 1))
+        self.assertRegex(self.cleanup_outcome(boundary), "^refused: .*teardown failed")
+        self.assertFalse(boundary.removal_requested())
+        self.assertTrue(self.recovery.is_file())
+
+    def test_residual_resources_after_teardown_retain_the_root(self):
+        for kind in ("container", "network", "volume"):
+            with self.subTest(kind=kind):
+                boundary = CleanupBoundary(self.root, census={kind: "0123456789ab\n"})
+                self.assertRegex(self.cleanup_outcome(boundary), "^refused: .*remain")
+                self.assertFalse(boundary.removal_requested())
+                self.assertTrue(self.recovery.is_file())
+
+    def test_unknown_resource_census_retains_the_root(self):
+        for kind, outcome in (("container", 1), ("network", subprocess.TimeoutExpired(["docker"], 1)),
+                              ("volume", OSError("synthetic"))):
+            with self.subTest(kind=kind):
+                boundary = CleanupBoundary(self.root, census={kind: outcome})
+                self.assertRegex(self.cleanup_outcome(boundary), "^refused: .*unknown")
+                self.assertFalse(boundary.removal_requested())
+                self.assertTrue(self.recovery.is_file())
+
+    def test_failed_removal_is_reported(self):
+        for outcome in (1, subprocess.TimeoutExpired(["sudo"], 1)):
+            with self.subTest(outcome=outcome):
+                boundary = CleanupBoundary(self.root, remove=outcome)
+                self.assertRegex(self.cleanup_outcome(boundary), "^refused: .*removal")
+
+    def test_unowned_root_is_never_cleaned(self):
+        stranger = self.root.parent / "not-created-by-this-run"
+        stranger.mkdir()
+        (stranger / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        boundary = CleanupBoundary(stranger)
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=boundary):
+            with self.assertRaisesRegex(self.smoke.SmokeError, "not created by this run"):
+                self.smoke.cleanup(stranger)
+        self.assertEqual(boundary.commands, [])
+        self.assertTrue(stranger.is_dir())
+
+    def run_cli(self, boundary: CleanupBoundary, failure: Exception | None) -> tuple[object, str, str]:
+        import io
+        self.ensure_root()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        boundary.stdout = stdout
+        with mock.patch.object(self.smoke, "smoke", side_effect=failure,
+                               return_value=f"{self.smoke.SUCCESS_PREFIX} scenario=base synthetic"), \
+             mock.patch.object(self.smoke.subprocess, "run", side_effect=boundary), \
+             mock.patch.object(self.smoke.os.path, "ismount", return_value=False), \
+             mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            try:
+                status = self.smoke.main(cli_argv(self.root))
+            except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                status = f"unhandled {type(exc).__name__}"
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_cli_success_waits_for_verified_cleanup(self):
+        boundary = CleanupBoundary(self.root)
+        status, stdout, _ = self.run_cli(boundary, None)
+        self.assertEqual(status, 0)
+        self.assertIn(self.smoke.SUCCESS_PREFIX, stdout)
+        self.assertEqual(boundary.stdout_at_removal, "", "success was printed before cleanup was verified")
+        self.assertFalse(self.root.exists())
+
+    def test_cli_successful_scenario_with_failed_cleanup_fails(self):
+        for outcome in ({"down": 1}, {"census": {"container": "0123456789ab\n"}}, {"remove": 1}):
+            with self.subTest(outcome=outcome):
+                boundary = CleanupBoundary(self.root, **outcome)
+                status, stdout, stderr = self.run_cli(boundary, None)
+                self.assertEqual(status, 1)
+                self.assertNotIn(self.smoke.SUCCESS_PREFIX, stdout)
+                self.assertIn("cleanup", stderr)
+                self.assertTrue(self.root.is_dir())
+
+    def test_cli_failed_cleanup_does_not_hide_the_scenario_failure(self):
+        boundary = CleanupBoundary(self.root, down=1)
+        status, stdout, stderr = self.run_cli(boundary, self.smoke.SmokeError("synthetic scenario refusal"))
+        self.assertEqual(status, 1)
+        self.assertNotIn(self.smoke.SUCCESS_PREFIX, stdout)
+        self.assertIn("synthetic scenario refusal", stderr)
+        self.assertRegex(stderr, "cleanup.*teardown failed")
+        self.assertLess(stderr.index("synthetic scenario refusal"), stderr.index("teardown failed"))
+        self.assertTrue(self.recovery.is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

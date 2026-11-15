@@ -2088,14 +2088,76 @@ def compose_chain(root: Path) -> list[str]:
     return []
 
 
+CLEANUP_COMMAND_TIMEOUT = 180
+CLEANUP_CENSUS_TIMEOUT = 30
+
+
+def compose_project_name(root: Path) -> str:
+    """The Compose project name for a root without COMPOSE_PROJECT_NAME (Compose's own normalization)."""
+    return re.sub(r"[^a-z0-9_-]", "", root.name.lower()).lstrip("_-")
+
+
+def _cleanup_command(command: list[str], *, cwd: Path | None = None,
+                     timeout: int = CLEANUP_COMMAND_TIMEOUT) -> tuple[bool, str]:
+    """Run one bounded cleanup command. A failure, timeout or launch error is (False, "")."""
+    try:
+        result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    if result.returncode != 0:
+        return False, ""
+    return True, result.stdout if isinstance(result.stdout, str) else ""
+
+
+def cleanup_resource_census(project: str) -> list[str]:
+    """Problems found reading back this project's containers, networks and volumes; empty means absent."""
+    if not project:
+        return ["Compose project name is unknown"]
+    label = f"label=com.docker.compose.project={project}"
+    problems = []
+    for kind, command in (
+        ("container", ["docker", "container", "ls", "--all", "--quiet", "--filter", label]),
+        ("network", ["docker", "network", "ls", "--quiet", "--filter", label]),
+        ("volume", ["docker", "volume", "ls", "--quiet", "--filter", label]),
+    ):
+        ok, output = _cleanup_command(command, timeout=CLEANUP_CENSUS_TIMEOUT)
+        if not ok:
+            problems.append(f"{kind} census unknown")
+        elif output.strip():
+            problems.append(f"{kind}s remain")
+    return problems
+
+
 def cleanup(root: Path) -> None:
+    """Tear down, read back absence, and only then remove the root this run created.
+
+    Raises SmokeError naming every problem when teardown fails or times out,
+    resources remain or cannot be listed, or removal fails. The deployment
+    root (configuration, history and Compose files) is then left in place.
+    """
+    root = Path(os.path.abspath(root))
+    expect(owns_root(root), f"deployment root {root} was not created by this run; leaving it untouched")
+    problems = []
+    teardown_ok = True
     if (root / "docker-compose.yml").exists():
-        subprocess.run(["docker", "compose", *compose_chain(root), "down", "--volumes", "--remove-orphans"],
-                       cwd=root, check=False)
-    if (root / ENOSPC_FILES[-1]).exists() and os.path.ismount(root / "history"):
-        result = subprocess.run(["sudo", "umount", str(root / "history")], check=False)
-        expect(result.returncode == 0, "ENOSPC fixture unmount failed; leaving the deployment root intact")
-    subprocess.run(["sudo", "rm", "-rf", str(root)], check=False)
+        teardown_ok, _ = _cleanup_command(
+            ["docker", "compose", *compose_chain(root), *ADMIN_PROFILES, "down", "--volumes", "--remove-orphans"],
+            cwd=root)
+        if not teardown_ok:
+            problems.append("Compose teardown failed or timed out")
+    if teardown_ok and (root / ENOSPC_FILES[-1]).exists() and os.path.ismount(root / "history"):
+        unmounted, _ = _cleanup_command(["sudo", "umount", str(root / "history")])
+        if not unmounted:
+            problems.append("ENOSPC fixture unmount failed")
+    # Independent readback, even after a failed teardown: query failure is unknown, never absence.
+    problems.extend(cleanup_resource_census(compose_project_name(root)))
+    if problems:
+        raise SmokeError(f"cleanup not verified ({'; '.join(problems)}); "
+                         f"teardown failed or is unknown, retaining {root} for recovery")
+    removed, _ = _cleanup_command(["sudo", "rm", "-rf", "--", str(root)])
+    if not removed or os.path.lexists(root):
+        raise SmokeError(f"cleanup removal of {root} failed after verified teardown")
+    _OWNED_ROOTS.discard(root)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2135,18 +2197,35 @@ def main(argv: list[str] | None = None) -> int:
                   + clean_host_failure_message(exc, secrets), file=sys.stderr)
             return 1
     root = args.root.absolute()
+    result: str | None = None
+    cleaned = False
     try:
-        print(smoke(args) + f" seconds={int(time.monotonic() - started)}")
+        result = smoke(args)
     except SmokeError as exc:
         print(f"image upgrade smoke failed: {exc}", file=sys.stderr)
         if owns_root(root):  # never read or act on a directory this run did not create
             chain = compose_chain(root)
-            subprocess.run(["docker", "compose", *chain, "ps", "-a"], cwd=root, check=False)
-            subprocess.run(["docker", "compose", *chain, "logs", "--tail", "80"], cwd=root, check=False)
-        return 1
+            for diagnostic in (["ps", "-a"], ["logs", "--tail", "80"]):
+                try:  # best-effort output to the job log, bounded like every cleanup command
+                    subprocess.run(["docker", "compose", *chain, *diagnostic], cwd=root, check=False,
+                                   timeout=CLEANUP_CENSUS_TIMEOUT)
+                except (OSError, subprocess.SubprocessError):
+                    print(f"diagnostic `docker compose {' '.join(diagnostic)}` failed", file=sys.stderr)
     finally:
+        # Runs on success, scenario failure and any other exception; its own
+        # failure is reported without replacing the scenario's.
         if owns_root(root):
-            cleanup(root)
+            try:
+                cleanup(root)
+                cleaned = True
+            except SmokeError as exc:
+                print(f"image upgrade smoke cleanup failed: {exc}", file=sys.stderr)
+        else:
+            cleaned = not os.path.lexists(root)
+    # Success only after verified cleanup.
+    if result is None or not cleaned:
+        return 1
+    print(result + f" seconds={int(time.monotonic() - started)}")
     return 0
 
 
