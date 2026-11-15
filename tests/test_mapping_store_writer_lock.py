@@ -16,7 +16,7 @@ import textwrap
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -64,13 +64,18 @@ class TwoOwnersInOneProcessTests(unittest.TestCase):
         a document read before the first commit. With one, the second owner
         cannot read until the first has finished, and both waits time out
         harmlessly.
+
+        The second owner is submitted only after the first owner is inside its
+        read, so the first owner is the writer that holds the transaction
+        whatever order the pool starts its threads in.
         """
         first, second = MappingStore(path), MappingStore(path)
-        second_read, first_done = threading.Event(), threading.Event()
+        first_reading, second_read, first_done = threading.Event(), threading.Event(), threading.Event()
         first_load, second_load = first._load_state, second._load_state
 
         def first_read():
             state = first_load()
+            first_reading.set()
             second_read.wait(timeout=1.0)
             return state
 
@@ -99,6 +104,8 @@ class TwoOwnersInOneProcessTests(unittest.TestCase):
             ThreadPoolExecutor(max_workers=2) as pool,
         ):
             first_future = pool.submit(run_first)
+            if not first_reading.wait(timeout=10.0):
+                self.fail("the first owner did not reach its read")
             second_future = pool.submit(second_write, second)
             return outcome(first_future), outcome(second_future)
 
@@ -283,6 +290,7 @@ class WriterLockRefusalTests(unittest.TestCase):
                             with self.assertRaises(StorageDirectoryUnwritable) as raised:
                                 mutate()
                             self.assertEqual(raised.exception.error_code, WRITER_LOCK_UNAVAILABLE)
+                            self.assertEqual(raised.exception.reason, "busy")
                             self.assertEqual(path.read_bytes(), before)
                         finally:
                             # Keep each mutator independent of an unguarded
@@ -307,7 +315,7 @@ class WriterLockRefusalTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
     def test_a_lock_path_that_is_not_a_regular_file_is_refused(self) -> None:
-        for kind in ("symlink", "fifo"):
+        for kind in ("symlink", "fifo", "directory"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 path, store = seeded_store(directory)
                 before = path.read_bytes()
@@ -316,8 +324,10 @@ class WriterLockRefusalTests(unittest.TestCase):
                 self.lock_path(path).unlink(missing_ok=True)
                 if kind == "symlink":
                     self.lock_path(path).symlink_to(elsewhere)
-                else:
+                elif kind == "fifo":
                     os.mkfifo(self.lock_path(path))
+                else:
+                    self.lock_path(path).mkdir()
 
                 with self.assertRaises(StorageDirectoryUnwritable) as raised:
                     store.save_mapping(mapping("a", 1, "first"))
@@ -325,6 +335,14 @@ class WriterLockRefusalTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, "not_regular")
                 self.assertEqual(path.read_bytes(), before)
                 self.assertEqual(elsewhere.read_bytes(), b"")
+
+                # Control: once the obstruction is gone the same save succeeds.
+                if kind == "directory":
+                    self.lock_path(path).rmdir()
+                else:
+                    self.lock_path(path).unlink()
+                store.save_mapping(mapping("a", 1, "first"))
+                self.assertEqual(system_ids(path), ["a", "seed"])
 
     def test_reads_neither_create_nor_wait_for_the_writer_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -354,6 +372,195 @@ class WriterLockRefusalTests(unittest.TestCase):
             self.assertNotEqual(os.stat(path).st_ino, mapping_identity)
             self.assertEqual(list(path.parent.glob(f"{path.name}.*.tmp")), [])
 
+
+
+class StalledInProcessWriterTests(unittest.TestCase):
+    """One owner's stalled writer must not hold up another owner's reads or writes."""
+
+    def stall_first_owner(self, path: Path):
+        """Start a save on a first owner and hold it inside its writer transaction."""
+        owner = MappingStore(path)
+        entered, release = threading.Event(), threading.Event()
+        load = owner._load_state
+
+        def paused_load():
+            state = load()
+            entered.set()
+            release.wait(timeout=30)
+            return state
+
+        owner._load_state = paused_load  # type: ignore[method-assign]
+        return owner, entered, release
+
+    def test_reads_finish_while_another_owner_holds_the_writer_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            owner, entered, release = self.stall_first_owner(path)
+            reader = MappingStore(path)
+            incoming = [mapping("b", 3, "imported")]
+            reads = {
+                "load_read_snapshot": reader.load_read_snapshot,
+                "list_mappings": reader.list_mappings,
+                "save_revision": lambda: reader.save_revision("b", "shelf", 2),
+                "clear_revision": lambda: reader.clear_revision("b", "shelf", 2),
+                "scope_revision": lambda: reader.scope_revision("b", "shelf"),
+                "save_revisions": lambda: reader.save_revisions("b", [("shelf", 2)]),
+                "clear_revisions": lambda: reader.clear_revisions("b", [("shelf", 2)]),
+                "preview_replace_mappings": lambda: reader.preview_replace_mappings("b", "shelf", incoming),
+                # The stalled owner's own store object reads without waiting too.
+                "same_owner_save_revision": lambda: owner.save_revision("b", "shelf", 2),
+            }
+            with ThreadPoolExecutor(max_workers=len(reads) + 1) as pool:
+                stalled = pool.submit(owner.save_mapping, mapping("a", 1, "first"))
+                try:
+                    self.assertTrue(entered.wait(timeout=10), "the first owner did not reach its read")
+                    futures = {name: pool.submit(read) for name, read in reads.items()}
+                    wait(futures.values(), timeout=5)
+                    for name, future in futures.items():
+                        with self.subTest(read=name):
+                            self.assertTrue(future.done(), f"{name} waited for another owner's writer")
+                            self.assertIsNone(future.exception())
+                finally:
+                    release.set()
+                stalled.result(timeout=30)
+            self.assertEqual(system_ids(path), ["a", "seed"])
+
+    def test_a_second_writer_refuses_after_the_bounded_wait_instead_of_waiting_forever(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            owner, entered, release = self.stall_first_owner(path)
+            second = MappingStore(path)
+            second.writer_lock_timeout_seconds = 0.1
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                stalled = pool.submit(owner.save_mapping, mapping("a", 1, "first"))
+                try:
+                    self.assertTrue(entered.wait(timeout=10), "the first owner did not reach its read")
+                    before = path.read_bytes()
+                    started = time.monotonic()
+                    waiting = pool.submit(second.save_mapping, mapping("b", 2, "second"))
+                    wait([waiting], timeout=5)
+                    self.assertTrue(waiting.done(), "the second writer waited without bound for the first")
+                    with self.assertRaises(StorageDirectoryUnwritable) as raised:
+                        waiting.result()
+                    self.assertLess(time.monotonic() - started, 5)
+                    self.assertEqual(raised.exception.error_code, WRITER_LOCK_UNAVAILABLE)
+                    self.assertEqual(raised.exception.reason, "busy")
+                    self.assertEqual(path.read_bytes(), before)
+                finally:
+                    release.set()
+                stalled.result(timeout=30)
+            # Control: with the first owner finished, the same save succeeds.
+            second.save_mapping(mapping("b", 2, "second"))
+            self.assertEqual(system_ids(path), ["a", "b", "seed"])
+
+
+def bare_inventory_service(store: MappingStore):
+    """The real async mapping methods with only their appliance reads replaced."""
+    from app.config import SystemConfig
+    from app.models.domain import InventorySnapshot
+    from app.services.inventory import InventoryService
+
+    service = object.__new__(InventoryService)
+    service.system = SystemConfig(id="a")
+    service.mapping_store = store
+    service._get_pre_write_snapshot = AsyncMock(
+        return_value=InventorySnapshot(
+            slots=[], layout_rows=[], layout_slot_count=0, layout_columns=1, refresh_interval_seconds=30,
+        )
+    )
+    service._read_mapping_import_bays = AsyncMock(return_value={})
+    service.invalidate_physical_enclosure_snapshot_cache = Mock()
+    service.invalidate_snapshot_cache = Mock()
+    return service
+
+
+@unittest.skipIf(fcntl is None, "the cross-process writer lock needs POSIX flock")
+class MappingWritesLeaveTheEventLoopFreeTests(unittest.TestCase):
+    """Waiting for another process's writer lock must not stall the UI event loop."""
+
+    def lock_path(self, path: Path) -> Path:
+        return path.with_name(path.name + ".lock")
+
+    def test_save_clear_and_import_wait_for_the_lock_off_the_event_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.save_mapping(mapping("a", 1, "first"))
+            store.writer_lock_timeout_seconds = 0.6
+            service = bare_inventory_service(store)
+            bundle = MappingBundle(mappings=[mapping("a", 3, "imported")])
+            preview = store.preview_replace_mappings("a", "shelf", service._rewrite_mapping_bundle(bundle, "shelf"))
+            writes = {
+                "save": lambda: service.save_mapping(1, {"notes": "changed"}, selected_enclosure_id="shelf"),
+                "clear": lambda: service.clear_mapping(1, selected_enclosure_id="shelf"),
+                "import": lambda: service.import_mapping_bundle(
+                    bundle,
+                    selected_enclosure_id="shelf",
+                    expected_revision=preview["revision"],
+                    import_digest=preview["import_digest"],
+                ),
+            }
+            before = path.read_bytes()
+
+            async def heartbeat_during(write):
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                ticks: list[float] = []
+                loop.call_later(0.02, lambda: ticks.append(loop.time() - started))
+                with self.assertRaises(StorageDirectoryUnwritable) as raised:
+                    await write()
+                return ticks, raised.exception
+
+            holder = os.open(self.lock_path(path), os.O_RDWR | os.O_CREAT, 0o660)
+            try:
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                for name, write in writes.items():
+                    with self.subTest(write=name):
+                        ticks, refusal = asyncio.run(heartbeat_during(write))
+                        self.assertEqual(refusal.error_code, WRITER_LOCK_UNAVAILABLE)
+                        self.assertEqual(refusal.reason, "busy")
+                        self.assertTrue(ticks, "a timer due during the lock wait never ran")
+                        self.assertLess(ticks[0], 0.3, "the lock wait blocked the event loop")
+                        self.assertEqual(path.read_bytes(), before)
+            finally:
+                os.close(holder)
+
+    def test_a_cancelled_save_still_finishes_and_invalidates_what_it_wrote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, store = seeded_store(directory)
+            store.writer_lock_timeout_seconds = 5.0
+            service = bare_inventory_service(store)
+            holder = os.open(self.lock_path(path), os.O_RDWR | os.O_CREAT, 0o660)
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            # Another owner lets go shortly after the caller has gone away.
+            releaser = threading.Timer(0.3, fcntl.flock, args=(holder, fcntl.LOCK_UN))
+
+            async def cancel_while_waiting():
+                releaser.start()
+                task = asyncio.create_task(
+                    service.save_mapping(
+                        1, {"notes": "first"}, selected_enclosure_id="shelf", invalidate_snapshot=False,
+                    )
+                )
+                await asyncio.sleep(0.05)
+                task.cancel()
+                try:
+                    return await task
+                except asyncio.CancelledError:
+                    return "cancelled"
+                except Exception as exc:  # noqa: BLE001 - reported by the assertion below
+                    return type(exc).__name__
+
+            try:
+                outcome = asyncio.run(cancel_while_waiting())
+            finally:
+                releaser.cancel()
+                releaser.join()
+                os.close(holder)
+            self.assertEqual(outcome, "cancelled")
+            # The write was not abandoned half way: it finished, and the view it
+            # changed was invalidated even though the caller went away.
+            self.assertEqual(system_ids(path), ["a", "seed"])
+            service.invalidate_physical_enclosure_snapshot_cache.assert_called_once()
 
 
 class MappingImportRouteRefusalTests(unittest.TestCase):

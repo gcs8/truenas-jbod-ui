@@ -43,20 +43,29 @@ _DRAWER_SUB_PROFILE_IDS = frozenset(
 Identity: TypeAlias = tuple[str | None, str | None, int]
 ScopeIdentity: TypeAlias = tuple[str | None, int]
 
-# Every MappingStore on one file shares one in-process lock, so two owners in
-# one process serialize exactly as one shared store does (#1228). Entries go
-# away with the last store that uses them.
-_PATH_LOCKS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+# Every MappingStore on one file shares one in-process writer lock, so two
+# owners in one process serialize exactly as one shared store does (#1228).
+# Readers never take it. A second, separate lock is held only for the instant
+# a writer swaps the file in and a reader opens it, so a reader never sees the
+# file change between its identity check and its open. Entries go away with
+# the last store that uses them.
+_PATH_LOCKS: weakref.WeakValueDictionary[tuple[str, str], Any] = weakref.WeakValueDictionary()
 _PATH_LOCKS_GUARD = threading.Lock()
 
 # The filesystem has no flock (for example NFS without a lock manager).
 _UNSUPPORTED_LOCK_ERRNOS = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS})
+# Opening the lock path found a directory (EISDIR), a socket or a device with
+# no reader (ENXIO), or a symlink (ELOOP with O_NOFOLLOW): not a regular file.
+_NOT_REGULAR_LOCK_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
 
 
-def _shared_path_lock(file_path: Path) -> Any:
-    key = os.path.join(
-        os.path.normcase(os.path.realpath(file_path.parent)),
-        os.path.normcase(file_path.name),
+def _shared_path_lock(file_path: Path, role: str = "writer") -> Any:
+    key = (
+        role,
+        os.path.join(
+            os.path.normcase(os.path.realpath(file_path.parent)),
+            os.path.normcase(file_path.name),
+        ),
     )
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.get(key)
@@ -268,9 +277,9 @@ class _SnapshotEntries(_MappingLookupSnapshot):
 class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
-    # Bounded wait for another process's writer lock before refusing (#1228).
-    # Mutators run synchronously on the caller's thread (the UI event loop),
-    # and a mapping write takes milliseconds, so the bound stays short.
+    # Bounded wait for another owner's writer lock, in this process or another,
+    # before refusing (#1228). The inventory service runs mutators on a worker
+    # thread, and a mapping write takes milliseconds, so the bound stays short.
     writer_lock_timeout_seconds = 2.0
     _WRITER_LOCK_POLL_SECONDS = 0.02
 
@@ -278,6 +287,7 @@ class MappingStore:
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _shared_path_lock(self.file_path)
+        self._publication_lock = _shared_path_lock(self.file_path, "publication")
 
     @property
     def writer_lock_path(self) -> Path:
@@ -290,18 +300,24 @@ class MappingStore:
         """Hold one writer across read, revision check, replace and readback.
 
         The shared in-process lock orders owners in this process; the sidecar
-        flock orders owners in other processes (#1228). Reads stay lock-free:
-        replacement is atomic and every mutator rechecks its revision here.
+        flock orders owners in other processes (#1228). One deadline bounds
+        the wait for both. Reads never take the writer lock: replacement is
+        atomic and every mutator rechecks its revision here.
         """
-        with self._lock:
-            descriptor = self._acquire_writer_lock()
+        deadline = time.monotonic() + self.writer_lock_timeout_seconds
+        if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise MappingWriterLockUnavailable(self.writer_lock_path, "busy")
+        try:
+            descriptor = self._acquire_writer_lock(deadline)
             try:
                 yield
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
+        finally:
+            self._lock.release()
 
-    def _acquire_writer_lock(self) -> int | None:
+    def _acquire_writer_lock(self, deadline: float) -> int | None:
         if fcntl is None:
             # No flock on this platform (Windows, best effort): only the
             # shared in-process lock applies.
@@ -315,7 +331,7 @@ class MappingStore:
         try:
             descriptor = os.open(lock_path, flags, 0o660)
         except OSError as exc:
-            if exc.errno == errno.ELOOP:
+            if exc.errno in _NOT_REGULAR_LOCK_ERRNOS:
                 raise MappingWriterLockUnavailable(lock_path, "not_regular") from exc
             capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
             if capacity_reason is not None:
@@ -331,7 +347,6 @@ class MappingStore:
                 raise MappingWriterLockUnavailable(lock_path, "not_regular")
             if not existed:
                 os.chmod(descriptor, 0o660)
-            deadline = time.monotonic() + self.writer_lock_timeout_seconds
             while True:
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -534,17 +549,19 @@ class MappingStore:
         return version, entries
 
     def _read_source_bytes(self) -> bytes | None:
-        try:
-            observed = os.lstat(self.file_path)
-        except FileNotFoundError:
-            return None
-        if not stat.S_ISREG(observed.st_mode):
-            raise OSError("Configured mapping source is not a regular file.")
-
         flags = os.O_RDONLY
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.file_path, flags)
+        # Only this check-and-open excludes an in-process replacement, never a
+        # whole writer transaction, so a stalled writer cannot hold up a read.
+        with self._publication_lock:
+            try:
+                observed = os.lstat(self.file_path)
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(observed.st_mode):
+                raise OSError("Configured mapping source is not a regular file.")
+            descriptor = os.open(self.file_path, flags)
         try:
             opened = os.fstat(descriptor)
             if (
@@ -709,8 +726,8 @@ class MappingStore:
     def _load_scoped_snapshot(self) -> _ScopedStoreSnapshot:
         """Classify once; defer conflict rejection to each exact requested target.
 
-        Revision batches hold the store lock and keep this snapshot local to
-        one call. Unlike mutation validation, unrelated bad rows must not
+        Revision batches read once, without the writer lock, and keep this
+        snapshot local to one call. Unlike mutation validation, unrelated bad rows must not
         prevent scoped revision issuance.
         """
         version, entries = self._read_document()
@@ -814,25 +831,24 @@ class MappingStore:
         failures remain deferred to the display/scope consumer, as before. Every
         mutator still reloads under its own lock and checks the submitted revision.
         """
-        with self._lock:
-            snapshot = self._load_scoped_snapshot()
-            try:
-                display_state = self._classify_entries(snapshot.state.version, snapshot.state.entries)
-            except MappingScopeConflict as exc:
-                if snapshot.state.version == 2:
-                    raise
-                display_state = exc
-            mappings = display_state.mappings if isinstance(display_state, _ClassifiedStore) else {}
-            return _SnapshotEntries(
-                MappingProxyType(
-                    {key: value.model_dump_json() for key, value in snapshot.state.entries.items()}
-                ),
-                MappingProxyType(
-                    {identity: value.model_dump_json() for identity, value in mappings.items()}
-                ),
-                snapshot,
-                display_state,
-            )
+        snapshot = self._load_scoped_snapshot()
+        try:
+            display_state = self._classify_entries(snapshot.state.version, snapshot.state.entries)
+        except MappingScopeConflict as exc:
+            if snapshot.state.version == 2:
+                raise
+            display_state = exc
+        mappings = display_state.mappings if isinstance(display_state, _ClassifiedStore) else {}
+        return _SnapshotEntries(
+            MappingProxyType(
+                {key: value.model_dump_json() for key, value in snapshot.state.entries.items()}
+            ),
+            MappingProxyType(
+                {identity: value.model_dump_json() for identity, value in mappings.items()}
+            ),
+            snapshot,
+            display_state,
+        )
 
     def load_all(self) -> dict[str, ManualMapping]:
         """Load for historical read-only display, tolerating corrupt v1-era stores."""
@@ -1273,26 +1289,24 @@ class MappingStore:
         enclosure_id: str | None,
         mappings: list[ManualMapping],
     ) -> dict[str, Any]:
-        with self._lock:
-            preview, _ = self._preview_from_state(
-                self._load_state_for_scope(system_id, enclosure_id),
-                system_id,
-                enclosure_id,
-                mappings,
-            )
-            return preview
+        preview, _ = self._preview_from_state(
+            self._load_state_for_scope(system_id, enclosure_id),
+            system_id,
+            enclosure_id,
+            mappings,
+        )
+        return preview
 
     def scope_revision(
         self,
         system_id: str | None,
         enclosure_id: str | None,
     ) -> str:
-        with self._lock:
-            return self._scope_revision_from_state(
-                self._load_state_for_scope(system_id, enclosure_id),
-                system_id,
-                enclosure_id,
-            )
+        return self._scope_revision_from_state(
+            self._load_state_for_scope(system_id, enclosure_id),
+            system_id,
+            enclosure_id,
+        )
 
     def clear_revision(
         self,
@@ -1300,13 +1314,12 @@ class MappingStore:
         enclosure_id: str | None,
         slot: int,
     ) -> str:
-        with self._lock:
-            return self._clear_revision_from_state(
-                self._load_state_for_scope(system_id, enclosure_id, slot=slot),
-                system_id,
-                enclosure_id,
-                slot,
-            )
+        return self._clear_revision_from_state(
+            self._load_state_for_scope(system_id, enclosure_id, slot=slot),
+            system_id,
+            enclosure_id,
+            slot,
+        )
 
     def save_revision(
         self,
@@ -1314,13 +1327,12 @@ class MappingStore:
         enclosure_id: str | None,
         slot: int,
     ) -> str:
-        with self._lock:
-            return self._save_revision_from_state(
-                self._load_state_for_scope(system_id, enclosure_id, slot=slot),
-                system_id,
-                enclosure_id,
-                slot,
-            )
+        return self._save_revision_from_state(
+            self._load_state_for_scope(system_id, enclosure_id, slot=slot),
+            system_id,
+            enclosure_id,
+            slot,
+        )
 
     def save_revisions(
         self,
@@ -1329,28 +1341,27 @@ class MappingStore:
         *,
         loaded_entries: _SnapshotEntries | None = None,
     ) -> dict[tuple[str | None, int], str]:
-        with self._lock:
-            if not targets:
-                return {}
-            snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
-            canonical_targets = {
-                target: (resolve_physical_mapping_scope(target[0]), target[1])
-                for target in targets
-            }
-            return {
-                target: self._save_revision_from_state(
-                    state := self._load_state_for_scope(
-                        system_id, canonical[0], slot=canonical[1], snapshot=snapshot
-                    ),
-                    system_id,
-                    canonical[0],
-                    canonical[1],
-                    scope_revision=self._scope_revision_from_state(
-                        state, system_id, canonical[0]
-                    ),
-                )
-                for target, canonical in canonical_targets.items()
-            }
+        if not targets:
+            return {}
+        snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
+        canonical_targets = {
+            target: (resolve_physical_mapping_scope(target[0]), target[1])
+            for target in targets
+        }
+        return {
+            target: self._save_revision_from_state(
+                state := self._load_state_for_scope(
+                    system_id, canonical[0], slot=canonical[1], snapshot=snapshot
+                ),
+                system_id,
+                canonical[0],
+                canonical[1],
+                scope_revision=self._scope_revision_from_state(
+                    state, system_id, canonical[0]
+                ),
+            )
+            for target, canonical in canonical_targets.items()
+        }
 
     def clear_revisions(
         self,
@@ -1359,24 +1370,23 @@ class MappingStore:
         *,
         loaded_entries: _SnapshotEntries | None = None,
     ) -> dict[tuple[str | None, int], str]:
-        with self._lock:
-            if not targets:
-                return {}
-            snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
-            return {
-                target: self._clear_revision_from_state(
-                    self._load_state_for_scope(
-                        system_id,
-                        resolve_physical_mapping_scope(target[0]),
-                        slot=target[1],
-                        snapshot=snapshot,
-                    ),
+        if not targets:
+            return {}
+        snapshot = self._load_scoped_snapshot() if loaded_entries is None else loaded_entries.snapshot
+        return {
+            target: self._clear_revision_from_state(
+                self._load_state_for_scope(
                     system_id,
                     resolve_physical_mapping_scope(target[0]),
-                    target[1],
-                )
-                for target in targets
-            }
+                    slot=target[1],
+                    snapshot=snapshot,
+                ),
+                system_id,
+                resolve_physical_mapping_scope(target[0]),
+                target[1],
+            )
+            for target in targets
+        }
 
     def save_mapping(
         self,
@@ -1686,7 +1696,8 @@ class MappingStore:
             self._fsync_temp_file(handle)
 
     def _replace_temp_file(self, temp_path: Path) -> None:
-        os.replace(temp_path, self.file_path)
+        with self._publication_lock:
+            os.replace(temp_path, self.file_path)
 
     def _fsync_parent_directory(self) -> None:
         descriptor = os.open(self.file_path.parent, os.O_RDONLY)
