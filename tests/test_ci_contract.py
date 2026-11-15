@@ -229,12 +229,12 @@ class CIWorkflowContractTests(unittest.TestCase):
 
         # Existing actions plus the trial's pinned checkout, the dispatch-only
         # screenshot capture workflow's checkout and upload, the unittest
-        # gate job's checkout, Python setup, shard-result download and coverage
-        # upload, the GHCR release workflow's Python setup for the
+        # gate job's checkout, Python setup, shard-result download, test-identity
+        # upload and coverage upload, the GHCR release workflow's Python setup for the
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
         # external-link workflow's checkout and Python setup.
-        self.assertEqual(action_count, 44)
+        self.assertEqual(action_count, 45)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
