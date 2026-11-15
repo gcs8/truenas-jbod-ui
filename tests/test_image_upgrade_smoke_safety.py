@@ -216,7 +216,7 @@ def expected_cleanup_commands(root: Path, chain: tuple[str, ...] = (), *, unmoun
     files = [arg for name in chain for arg in ("-f", name)]
     project = f"label=com.docker.compose.project={root.name.lower()}"
     return [
-        ["docker", "compose", *files, "--profile", "history", "--profile", "admin",
+        ["docker", "compose", "--project-name", root.name.lower(), *files, "--profile", "history", "--profile", "admin",
          "down", "--volumes", "--remove-orphans"],
         *([["sudo", "umount", str(root / "history")]] if unmount else []),
         ["docker", "container", "ls", "--all", "--quiet", "--filter", project],
@@ -310,12 +310,19 @@ class CleanupVerificationTests(unittest.TestCase):
         self.assertEqual(boundary.commands, expected_cleanup_commands(self.root))
 
     def test_every_cleanup_command_has_a_deadline(self):
+        # The ENOSPC overlay makes cleanup unmount its fixture too, so every command kind is covered.
+        self.ensure_root()
+        (self.root / self.smoke.ENOSPC_FILES[-1]).write_text("services: {}\n", encoding="utf-8")
         boundary = CleanupBoundary(self.root)
-        self.cleanup_outcome(boundary)
-        self.assertTrue(boundary.kwargs)
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=boundary), \
+             mock.patch.object(self.smoke.os.path, "ismount", return_value=True):
+            self.smoke.cleanup(self.root)
+        self.assertEqual(boundary.commands,
+                         expected_cleanup_commands(self.root, self.smoke.ENOSPC_FILES, unmount=True))
         for command, kwargs in zip(boundary.commands, boundary.kwargs):
             with self.subTest(command=command[:3]):
                 self.assertIsInstance(kwargs.get("timeout"), (int, float))
+                self.assertGreater(kwargs["timeout"], 0)
 
     def test_failed_teardown_retains_the_root_and_still_reads_back(self):
         boundary = CleanupBoundary(self.root, down=1)
@@ -650,6 +657,46 @@ class CreatedGenerationOwnershipTests(RoundTwoCase):
         self.assertFalse(self.smoke.owns_root(root))
 
 
+class EffectiveProjectTests(RoundTwoCase):
+    """Startup, teardown and the absence readback all use one pinned Compose project."""
+
+    def leftover_after_teardown(self, environment: dict[str, str]) -> tuple[str, ComposeHostFake, Path]:
+        root = self.parent / "smoke-root"
+        host = ComposeHostFake(leave_on_down=True)
+        self.prepare(root, host)
+        with mock.patch.dict(os.environ, environment), \
+             mock.patch.object(self.smoke.subprocess, "run", side_effect=host):
+            self.smoke.Deployment(root).compose("up", "-d")
+            try:
+                self.smoke.cleanup(root)
+                outcome = "verified"
+            except self.smoke.SmokeError as exc:
+                outcome = f"refused: {exc}"
+        return outcome, host, root
+
+    def test_inherited_project_name_cannot_hide_resources_left_by_teardown(self):
+        outcome, host, root = self.leftover_after_teardown({"COMPOSE_PROJECT_NAME": "override-project"})
+        self.assertRegex(outcome, "^refused: .*containers remain")
+        self.assertFalse(host.removal_requested())
+        self.assertTrue((root / "config" / "config.yaml").is_file())
+
+    def test_every_compose_command_and_the_readback_use_the_same_project(self):
+        _, host, _ = self.leftover_after_teardown({"COMPOSE_PROJECT_NAME": "override-project"})
+        used = {ComposeHostFake.effective_project(command, kwargs)
+                for command, kwargs in zip(host.commands, host.kwargs) if command[:2] == ["docker", "compose"]}
+        self.assertEqual(used, {"smoke-root"})
+        self.assertEqual(host.census_projects(), ["smoke-root"] * 3)
+
+    def test_leftover_without_an_override_is_still_refused(self):
+        # Control: the same leftover in the default project.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("COMPOSE_PROJECT_NAME", None)
+            outcome, host, root = self.leftover_after_teardown({})
+        self.assertRegex(outcome, "^refused: .*containers remain")
+        self.assertFalse(host.removal_requested())
+        self.assertTrue(root.is_dir())
+
+
 class AdminPhaseRebuildTests(RoundTwoCase):
     """The admin scenario's phase-one root is removed only through the checked cleanup."""
 
@@ -698,6 +745,75 @@ class AdminPhaseRebuildTests(RoundTwoCase):
         self.assertLess(max(census), removal)
         self.assertFalse((root / "phase-one-recovery").exists())
         self.assertTrue((root / "config" / "config.yaml").is_file())
+
+
+class ScenarioLocalDeadlineTests(unittest.TestCase):
+    """Failure-path diagnostics and one-off container removal are bounded and cannot skip final cleanup."""
+
+    def setUp(self) -> None:
+        self.smoke = load_smoke()
+
+    def test_admin_log_diagnostic_has_a_deadline_and_reports_its_failure(self):
+        for failure in (subprocess.TimeoutExpired(["docker"], 1), OSError("synthetic launch failure")):
+            with self.subTest(failure=type(failure).__name__):
+                calls = []
+
+                def hung(command, **kwargs):
+                    calls.append(kwargs)
+                    raise failure
+
+                with mock.patch.object(self.smoke.subprocess, "run", side_effect=hung), \
+                     mock.patch("sys.stderr"):
+                    try:
+                        self.smoke.print_admin_logs(self.smoke.Deployment(Path("synthetic-root")))
+                        escaped = None
+                    except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                        escaped = type(exc).__name__
+                self.assertIsNone(escaped)
+                self.assertGreater(calls[0].get("timeout") or 0, 0)
+
+    def test_interrupted_startup_container_removal_has_a_deadline(self):
+        import io
+        smoke = self.smoke
+        phase = smoke.KILL_PHASES[0]
+
+        class Process:
+            def __init__(self, command, **kwargs):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(f"{smoke.KILL_MARKER} {phase}\n")
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        removals = []
+
+        def boundary(command, **kwargs):
+            command = list(command)
+            if command[:3] == ["docker", "rm", "-f"]:
+                removals.append(kwargs)
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 0)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(smoke.subprocess, "Popen", Process), \
+             mock.patch.object(smoke.subprocess, "run", side_effect=boundary), \
+             mock.patch("sys.stderr"):
+            try:
+                smoke.kill_during_startup(smoke.Deployment(Path("synthetic-root")), phase, "synthetic-kill")
+                escaped = None
+            except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                escaped = type(exc).__name__
+        self.assertIsNone(escaped)
+        self.assertEqual(len(removals), 1)
+        self.assertGreater(removals[0].get("timeout") or 0, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

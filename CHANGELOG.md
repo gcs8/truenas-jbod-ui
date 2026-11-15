@@ -88,11 +88,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Internal
 
-- Made the image-upgrade smoke script refuse an existing or symlinked `--root`
-  and missing fixtures before running any command, and remove only a root it
-  created; it reports success only after teardown and resource absence are
-  verified, and keeps the root and exits nonzero when cleanup fails or is
-  unknown (#1257).
+- Made the image-upgrade smoke script refuse an existing or symlinked `--root`,
+  a `--root` with `..`, and missing fixtures before running any command. It
+  removes only the directory it created, checked by device and inode for the
+  root and every parent immediately before removal, and pins one Compose
+  project for startup, teardown and the absence readback. It reports success
+  only after teardown and resource absence are verified, also between the admin
+  scenario's two phases, and keeps the root and exits nonzero when cleanup
+  fails or is unknown (#1257).
 - The self-hosted Renovate run now owns Python dependency updates: it bumps a
   pin in `requirements.txt` and regenerates `requirements.lock` in the same
   commit. Dependency lock resolution refuses source builds through `uv.toml`,

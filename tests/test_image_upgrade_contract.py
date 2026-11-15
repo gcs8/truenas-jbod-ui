@@ -2283,8 +2283,8 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
             boundary = cleanup_fakes.CleanupBoundary(root)
             with mock.patch.object(smoke.subprocess, "run", side_effect=boundary):
                 smoke.cleanup(root)
-            self.assertEqual(boundary.commands[0][:6],
-                             ["docker", "compose", "-f", "docker-compose.yml",
+            self.assertEqual(boundary.commands[0][:8],
+                             ["docker", "compose", "--project-name", root.name.lower(), "-f", "docker-compose.yml",
                               "-f", "docker-compose.unavailable-backup.yml"])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2777,16 +2777,17 @@ class UpgradeScenarioContractTests(unittest.TestCase):
     def test_hardened_scenario_runs_every_compose_command_with_the_overlay(self):
         smoke = self.load_smoke()
         deployment = smoke.Deployment(Path("/nonexistent"), smoke.HARDENED_FILES)
+        # The project is pinned so startup and the cleanup readback name the same one.
         self.assertEqual(deployment.file_args(),
-                         ["-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
+                         ["--project-name", "nonexistent", "-f", "docker-compose.yml", "-f", "docker-compose.nonroot.yml"])
         calls = []
         with mock.patch.object(smoke, "run", side_effect=lambda command, **kwargs: calls.append(command) or ""):
             deployment.compose("pull")
             deployment.compose("up", "-d")
-        self.assertEqual(calls[0][:6], ["docker", "compose", "-f", "docker-compose.yml",
+        self.assertEqual(calls[0][:8], ["docker", "compose", "--project-name", "nonexistent", "-f", "docker-compose.yml",
                                         "-f", "docker-compose.nonroot.yml"])
-        self.assertEqual(calls[1][6:], ["up", "-d"])
-        self.assertEqual(smoke.Deployment(Path("/nonexistent")).file_args(), [])
+        self.assertEqual(calls[1][8:], ["up", "-d"])
+        self.assertEqual(smoke.Deployment(Path("/nonexistent")).file_args(), ["--project-name", "nonexistent"])
 
     def test_kill_phases_are_the_history_startup_migration_steps_in_order(self):
         import inspect

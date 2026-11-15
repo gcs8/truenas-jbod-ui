@@ -180,7 +180,11 @@ class Deployment:
         self.environment: dict[str, str] | None = None
 
     def file_args(self) -> list[str]:
-        return [arg for name in self.files for arg in ("-f", name)]
+        # The project is pinned explicitly, so an inherited COMPOSE_PROJECT_NAME,
+        # a `.env` entry or a top-level `name:` can never move startup to a
+        # project the cleanup readback does not check.
+        return ["--project-name", compose_project_name(self.root),
+                *(arg for name in self.files for arg in ("-f", name))]
 
     def compose(self, *args: str, timeout: int = 600) -> str:
         return run(["docker", "compose", *self.file_args(), *args], cwd=self.root, timeout=timeout,
@@ -924,7 +928,11 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+        try:  # bounded, so a hung removal cannot keep the run from its final cleanup
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False,
+                           timeout=CLEANUP_COMMAND_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"interrupted-startup container removal failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def interrupted_migration(args: argparse.Namespace) -> str:
@@ -2063,8 +2071,12 @@ def state_identity(deployment: Deployment, root: Path) -> dict:
 
 
 def print_admin_logs(deployment: Deployment) -> None:
-    subprocess.run(["docker", "compose", *deployment.file_args(), "--profile", "admin", "logs", "--tail", "80",
-                    ADMIN_SERVICE], cwd=deployment.root, check=False)
+    """Best-effort admin logs for the job log, bounded so the final cleanup is always reached."""
+    try:
+        subprocess.run(["docker", "compose", *deployment.file_args(), "--profile", "admin", "logs", "--tail", "80",
+                        ADMIN_SERVICE], cwd=deployment.root, check=False, timeout=CLEANUP_CENSUS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"admin log diagnostic failed: {type(exc).__name__}", file=sys.stderr)
 
 
 def remove_admin_service(deployment: Deployment) -> None:
@@ -2210,6 +2222,11 @@ def cleanup_resource_census(project: str) -> list[str]:
     return problems
 
 
+def compose_args(root: Path, project: str) -> list[str]:
+    """The pinned project and the scenario's `-f` chain for a cleanup or diagnostic command."""
+    return ["--project-name", project, *compose_chain(root)]
+
+
 def cleanup(root: Path) -> None:
     """Tear down, read back absence, and only then remove the root this run created.
 
@@ -2224,7 +2241,8 @@ def cleanup(root: Path) -> None:
     teardown_ok = True
     if (root / "docker-compose.yml").exists():
         teardown_ok, _ = _cleanup_command(
-            ["docker", "compose", *compose_chain(root), *ADMIN_PROFILES, "down", "--volumes", "--remove-orphans"],
+            ["docker", "compose", *compose_args(root, record.project), *ADMIN_PROFILES,
+             "down", "--volumes", "--remove-orphans"],
             cwd=root)
         if not teardown_ok:
             problems.append("Compose teardown failed or timed out")
@@ -2232,7 +2250,8 @@ def cleanup(root: Path) -> None:
         unmounted, _ = _cleanup_command(["sudo", "umount", str(root / "history")])
         if not unmounted:
             problems.append("ENOSPC fixture unmount failed")
-    # Independent readback, even after a failed teardown: query failure is unknown, never absence.
+    # Independent readback of the same pinned project, even after a failed
+    # teardown: query failure is unknown, never absence.
     problems.extend(cleanup_resource_census(record.project))
     if problems:
         raise SmokeError(f"cleanup not verified ({'; '.join(problems)}); "
@@ -2287,12 +2306,12 @@ def main(argv: list[str] | None = None) -> int:
     except SmokeError as exc:
         print(f"image upgrade smoke failed: {exc}", file=sys.stderr)
         # Only directories this run created, still unchanged, are read or acted on.
-        for root in list(_OWNED_ROOTS):
+        for root, record in list(_OWNED_ROOTS.items()):
             if not owns_root(root):
                 continue
             for diagnostic in (["ps", "-a"], ["logs", "--tail", "80"]):
                 try:  # best-effort output to the job log, bounded like every cleanup command
-                    subprocess.run(["docker", "compose", *compose_chain(root), *diagnostic],
+                    subprocess.run(["docker", "compose", *compose_args(root, record.project), *diagnostic],
                                    cwd=root, check=False, timeout=CLEANUP_CENSUS_TIMEOUT)
                 except (OSError, subprocess.SubprocessError):
                     print(f"diagnostic `docker compose {' '.join(diagnostic)}` failed", file=sys.stderr)
