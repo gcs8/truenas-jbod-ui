@@ -1,12 +1,13 @@
 "use strict";
 
-// Backup admin state ownership (#1198, #1199).
+// Backup admin state ownership (#1198, #1199, #1200).
 //
-// The backup settings dialog keeps a model next to the controls it draws.
-// These tests pin that the model belongs to the same dialog generation as the
-// controls a person sees: a class draft survives a target change, and a
-// retired request cannot replace a newer dialog's model.
-// Synthetic data only: example.test names, no real paths.
+// The backup settings dialog and the backup list each keep a model next to
+// the controls they draw. These tests pin that the model belongs to the same
+// dialog generation, or the same post-write read, as the controls a person
+// sees: a class draft survives a target change, a retired request cannot
+// replace a newer dialog's model, and a write's reload is a read started after
+// that write. Synthetic data only: example.test names, no real paths.
 
 const assert = require("node:assert/strict");
 const path = require("node:path");
@@ -420,4 +421,179 @@ test("#1199 Save sends nothing while the open dialog has not loaded its own mode
   pending.resolve(policyView());
   await loading;
   assert.deepEqual(visibleTargetIds(elements), ["alpha"]);
+});
+
+// ------------------------- #1200: a write's reload starts after the write --
+
+test("#1200 Stop keeping reloads with a read that starts after the write", async () => {
+  const before = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups": [
+      listing([artifact({ preserved: true, preserve_reason: "before upgrade" })]),
+      () => before.promise,
+      listing([artifact({ preserved: false })]),
+    ],
+    "DELETE /api/admin/backups/copy-a/preserve": { ok: true },
+  });
+  const { elements, library, banners } = mount(api);
+  await library.load();
+  const refresh = library.load();
+  let changedDone = false;
+  const changed = library.actions.unpreserve("copy-a").then(() => { changedDone = true; });
+  await settle();
+  assert.equal(api.calls.filter((call) => call.method === "DELETE").length, 1);
+  before.resolve(listing([artifact({ preserved: true, preserve_reason: "before upgrade" })]));
+  await refresh;
+  await Promise.all([changed]);
+
+  const deleteIndex = api.calls.findIndex((call) => call.method === "DELETE");
+  const after = api.calls.findIndex((call, index) => index > deleteIndex && call.method === "GET" && call.url === "/api/admin/backups");
+  assert.ok(after > deleteIndex, "a list read starts after the DELETE");
+  assert.equal(listGets(api).length, 3);
+  assert.equal(changedDone, true);
+  assert.equal(library.state.data.artifacts[0].preserved, false);
+  assert.equal(elements.artifacts.querySelector(".backup-kept-badge"), null, "the row no longer shows Kept");
+  assert.equal(elements.artifacts.querySelector('[data-backup-action="unpreserve"]'), null, "the row offers Keep, not Stop keeping");
+  assert.deepEqual(banners.at(-1), ["Backup no longer kept.", "success"]);
+});
+
+test("#1200 the mutation waits for its post-write read, not the read already in flight", async () => {
+  const before = deferred();
+  const fresh = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups": [listing([artifact({ preserved: true })]), () => before.promise, () => fresh.promise],
+    "DELETE /api/admin/backups/copy-a/preserve": { ok: true },
+  });
+  const { library } = mount(api);
+  await library.load();
+  const refresh = library.load();
+  let changedDone = false;
+  const changed = library.actions.unpreserve("copy-a").then(() => { changedDone = true; });
+  await settle();
+  before.resolve(listing([artifact({ preserved: true })]));
+  await refresh;
+  await settle();
+  assert.equal(changedDone, false, "the stale pre-write read does not complete the mutation");
+  assert.equal(listGets(api).length, 3);
+  fresh.resolve(listing([artifact({ preserved: false })]));
+  await changed;
+  assert.equal(library.state.data.artifacts[0].preserved, false);
+});
+
+const SIBLINGS = [
+  {
+    name: "Keep",
+    routes: { "POST /api/admin/backups/copy-a/preserve": { ok: true } },
+    run: async (library, elements) => {
+      library.actions.openPreserve("copy-a");
+      field(elements, "backup-preserve-reason").value = "synthetic reason";
+      return library.actions.submitPreserve();
+    },
+    write: (call) => call.method === "POST" && call.url.endsWith("/preserve"),
+  },
+  {
+    name: "Verify",
+    routes: { "POST /api/admin/backups/copy-a/verify": { ok: true, verified: true } },
+    run: (library) => library.actions.verify("copy-a"),
+    write: (call) => call.url.endsWith("/verify"),
+  },
+  {
+    name: "Back up now",
+    routes: { "POST /api/admin/backups/run": { ok: true, state: "started" } },
+    run: (library) => library.actions.runNow("config"),
+    write: (call) => call.url.endsWith("/run"),
+  },
+  {
+    name: "Clean up",
+    routes: {
+      "GET /api/admin/backups/lifecycle/plan": { plan_token: "plan-token-1", items: [{ id: "copy-a", location: "local", reason: "retention: synthetic" }] },
+      "POST /api/admin/backups/lifecycle/apply": { ok: true, deleted: ["copy-a"], already_missing: [], failed: null, not_attempted: [] },
+    },
+    run: async (library) => {
+      await library.actions.openCleanup();
+      return library.actions.applyCleanup();
+    },
+    write: (call) => call.url.endsWith("/lifecycle/apply"),
+  },
+  {
+    name: "Restore",
+    routes: {
+      "POST /api/admin/backups/copy-a/restore/inspect": { encryption_mode: "plaintext", inspection_receipt: "receipt-1" },
+      "POST /api/admin/backups/copy-a/restore/import": { ok: true, stopped_containers: [], restarted_containers: [], restart_failures: {} },
+    },
+    run: async (library) => {
+      library.actions.openRestore("copy-a");
+      await library.actions.restoreInspect();
+      return library.actions.restoreImport();
+    },
+    write: (call) => call.url.includes("/restore/import"),
+  },
+];
+
+for (const sibling of SIBLINGS) {
+  test(`#1200 ${sibling.name} reloads the list with a read that starts after its write`, async () => {
+    const before = deferred();
+    const api = fakeApi({
+      "GET /api/admin/backups": [listing([artifact()]), () => before.promise, listing([artifact({ id: "copy-a", size: 4096 })])],
+      ...sibling.routes,
+    });
+    const { elements, library } = mount(api);
+    await library.load();
+    const refresh = library.load();
+    const done = Promise.resolve(sibling.run(library, elements));
+    await settle();
+    before.resolve(listing([artifact()]));
+    await refresh;
+    await done;
+    const writeIndex = api.calls.findIndex(sibling.write);
+    assert.ok(writeIndex > 0, "the write was sent");
+    assert.ok(api.calls.some((call, index) => index > writeIndex && call.method === "GET" && call.url === "/api/admin/backups"),
+      "a list read starts after the write");
+    assert.equal(library.state.data.artifacts[0].size, 4096, "the post-write read is the one shown");
+  });
+}
+
+test("#1200 control: plain reloads still share the read in flight", async () => {
+  const before = deferred();
+  const api = fakeApi({ "GET /api/admin/backups": [() => before.promise, listing([])] });
+  const { library } = mount(api);
+  const first = library.load();
+  const second = library.load({ quiet: true });
+  before.resolve(listing([artifact()]));
+  await Promise.all([first, second]);
+  assert.equal(listGets(api).length, 1);
+});
+
+test("#1200 several writes during one read queue exactly one follow-up read", async () => {
+  const before = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups": [listing([artifact({ preserved: true }), artifact({ id: "copy-b", preserved: true })]), () => before.promise, listing([])],
+    "DELETE /api/admin/backups/copy-a/preserve": { ok: true },
+    "DELETE /api/admin/backups/copy-b/preserve": { ok: true },
+  });
+  const { library } = mount(api);
+  await library.load();
+  const refresh = library.load();
+  const changes = [library.actions.unpreserve("copy-a"), library.actions.unpreserve("copy-b")];
+  await settle();
+  before.resolve(listing([]));
+  await Promise.all([refresh, ...changes]);
+  assert.equal(listGets(api).length, 3, "one bounded follow-up read, not one per caller");
+});
+
+test("#1200 a failed post-write read is reported, not hidden behind the earlier read", async () => {
+  const before = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups": [listing([artifact({ preserved: true })]), () => before.promise, () => Object.assign(new Error("synthetic read failure"), { status: 500 })],
+    "DELETE /api/admin/backups/copy-a/preserve": { ok: true },
+  });
+  const { elements, library } = mount(api);
+  await library.load();
+  const refresh = library.load();
+  const changed = library.actions.unpreserve("copy-a");
+  await settle();
+  before.resolve(listing([artifact({ preserved: true })]));
+  await Promise.all([refresh, changed]);
+  assert.equal(listGets(api).length, 3, "the post-write read was sent");
+  assert.match(elements.status.textContent, /Couldn't load backups: synthetic read failure/);
 });

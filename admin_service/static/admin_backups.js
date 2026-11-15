@@ -478,11 +478,26 @@
 
     // ------------------------------------------------------------- load --
 
-    function load({ quiet = false } = {}) {
-      if (state.loadPromise) return state.loadPromise;
+    // One list read at a time: plain callers share the read in flight. A caller
+    // that just changed something (fresh) queues one follow-up read instead, so
+    // it never settles on a reply that started before its write (#1200).
+    function load({ quiet = false, fresh = false } = {}) {
+      if (state.loadQueued) return state.loadQueued;
+      if (state.loadPromise) {
+        if (!fresh) return state.loadPromise;
+        state.loadQueued = state.loadPromise
+          .catch(() => {})
+          .then(() => startLoad({ quiet }));
+        return state.loadQueued;
+      }
+      return startLoad({ quiet });
+    }
+
+    function startLoad({ quiet }) {
+      state.loadQueued = null;
       state.loading = true;
       if (!quiet) setStatus("Loading backups...");
-      state.loadPromise = (async () => {
+      const run = (async () => {
         try {
           const payload = await deps.fetchJson(API_ROOT);
           state.data = {
@@ -518,11 +533,13 @@
           scheduleRunningPoll();
         } finally {
           state.loading = false;
-          state.loadPromise = null;
           render();
         }
-      })();
-      return state.loadPromise;
+      })().finally(() => {
+        if (state.loadPromise === run) state.loadPromise = null;
+      });
+      state.loadPromise = run;
+      return run;
     }
 
     // While a backup runs, re-read the list now and then so the result shows
@@ -1083,7 +1100,7 @@
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1118,7 +1135,7 @@
           });
           if (scope.live()) closeDialog();
           setBanner("Backup kept.", "success");
-          await load({ quiet: true });
+          await load({ quiet: true, fresh: true });
         } catch (error) {
           scope.result(`Couldn't keep it: ${errorText(error)}`);
         }
@@ -1138,7 +1155,7 @@
         } catch (error) {
           setBanner(`Couldn't change it: ${errorText(error)}`, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1162,7 +1179,7 @@
             setBanner(`Backup failed: ${errorText(error)}`, "error");
           }
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
@@ -1291,7 +1308,7 @@
               canPublish: scope.live,
               failureMessage: "Backup restored, but the page could not refresh. Refresh to check the current settings and service status.",
             });
-            await load({ quiet: true });
+            await load({ quiet: true, fresh: true });
           } catch (_) {
             if (scope.live()) {
               setBanner("Backup restored, but the page could not refresh. Refresh to check the current settings and service status.", "error");
@@ -1382,7 +1399,7 @@
           scope.result(text);
           setBanner(text, "error");
         }
-        await load({ quiet: true });
+        await load({ quiet: true, fresh: true });
       });
     }
 
