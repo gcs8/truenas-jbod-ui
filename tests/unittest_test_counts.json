@@ -28,6 +28,7 @@
     "test_compose_runtime_matrix": 51,
     "test_config_example": 9,
     "test_container_contract": 68,
+    "test_core_counter_markers": 12,
     "test_dev_check": 32,
     "test_disk_inventory_sync": 20,
     "test_disk_inventory_sync_grants": 5,
