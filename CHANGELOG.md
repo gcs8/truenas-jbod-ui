@@ -45,6 +45,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Re-saving a system in System Setup no longer resets settings the form does
+  not show, such as the middleware call limit `max_concurrent_calls`, to their
+  defaults; the save now changes only the fields the form owns (#1194).
 - The backup list's Verified column now says what the backup details say: a
   copy uploaded to an FTP-style target, which checks only the remote size,
   reads "Size only at upload" in both places until an explicit Verify reads
