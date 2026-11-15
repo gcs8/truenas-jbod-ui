@@ -2,10 +2,12 @@
 
 A config without a nonempty ``systems`` list still monitors one system built
 from the top-level ``truenas`` and ``ssh`` sections (and their environment
-overrides). Writing a ``systems`` list replaces that implicit system, so an
-add that starts the list from empty silently stops monitoring it. System Setup
-refuses that add before writing and names the migration step; saving the
-legacy system itself under its own id is that migration and stays allowed.
+overrides, on the model's default host when none is set). Writing a
+``systems`` list replaces that implicit system, so an add that starts the list
+from empty silently stops monitoring it. System Setup and demo creation refuse
+that add before writing and name a config.yaml migration step that works when
+followed literally. Saving the system under its own id ``default`` is an
+explicit edit of that system and stays allowed.
 """
 
 from __future__ import annotations
@@ -24,28 +26,39 @@ from fastapi import FastAPI
 
 import admin_service.routes as admin_routes
 from admin_service.config import AdminSettings
-from app.config import get_settings, load_settings
+from app.config import ENV_OVERRIDES, get_settings, load_settings
 from app.models.domain import DemoSystemRequest, SystemSetupRequest
 from app.router_inclusion import include_router_preserving_route_objects
 from app.services.demo_system_factory import DemoSystemFactory
 from app.services.system_setup import SystemSetupService
 
-# The fixed refusal, pinned here so a reworded message is a reviewed change.
+# The fixed refusals, pinned here so a reworded message is a reviewed change.
+# The step is a config.yaml edit that the route test below follows literally.
+LEGACY_SYSTEM_MIGRATION_STEP = (
+    "Move it into config.yaml first: add a systems entry with id 'default', put the "
+    "top-level truenas and ssh sections under it, and copy any TRUENAS_ or SSH_ values "
+    "set in .env into the matching fields of that entry."
+)
 LEGACY_SYSTEM_MIGRATION_DETAIL = (
     "This config still monitors a legacy system ('default') from its top-level "
     "truenas and ssh settings in config.yaml or .env, and adding another system now "
-    "would stop monitoring it. Save the 'default' system in System Setup first so it "
-    "moves into the systems list, then add this one."
+    "would stop monitoring it. " + LEGACY_SYSTEM_MIGRATION_STEP + " Then add this one."
+)
+LEGACY_DEMO_DETAIL = (
+    "This config still monitors a legacy system ('default') from its top-level "
+    "truenas and ssh settings in config.yaml or .env, and adding a demo now would stop "
+    "monitoring it. " + LEGACY_SYSTEM_MIGRATION_STEP + " Then add the demo."
 )
 
-# Environment overrides that feed the implicit legacy system, plus the config
-# path. Each test starts with none of them set so the host shell cannot leak in.
+# Environment overrides that feed the implicit legacy system (every TRUENAS_
+# and SSH_ override and its _FILE form), plus the config path. Each test starts
+# with none of them set so the host shell cannot leak in.
 _SYSTEM_ENV = (
     "APP_CONFIG_PATH",
-    "TRUENAS_HOST",
-    "SSH_HOST",
     "SYSTEM_DEFAULT_ID",
     "BACKUP_CONFIG_ENABLED",
+    *(name for name in ENV_OVERRIDES if name.startswith(("TRUENAS_", "SSH_"))),
+    *(f"{name}_FILE" for name in ENV_OVERRIDES if name.startswith(("TRUENAS_", "SSH_"))),
 )
 
 LEGACY_CONFIG = {
@@ -166,8 +179,9 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(self._effective_system_hosts(), {"default": "https://legacy.example.test"})
 
     def test_saving_the_legacy_system_then_adding_keeps_both_monitored(self) -> None:
-        # Control: the explicit migration (saving the legacy system under its
-        # own id) is accepted, and after it an add keeps both systems.
+        # Control: an explicit save of the legacy system under its own id
+        # (what the form submits, typed in full) is accepted, and after it an
+        # add keeps both systems.
         self._write(LEGACY_CONFIG)
 
         status, response = self._post_setup(
@@ -199,6 +213,96 @@ class LegacySystemAddRouteTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(self._effective_system_hosts(), {"new-host": "https://new.example.test"})
 
 
+    def _post_demo(self) -> tuple[int, dict]:
+        return asyncio.run(_post(self.app, "/api/admin/system-setup/demo", {}))
+
+    def _effective_default(self):
+        settings = load_settings(create_directories=False)
+        return {system.id: system for system in settings.systems}
+
+    def test_credential_on_the_default_host_is_a_legacy_system(self) -> None:
+        # The loader gives the implicit system the model's default host, so a
+        # config that only sets an API key still monitors that host.
+        before_bytes = self._write({"truenas": {"api_key": "synthetic-test-key", "platform": "core"}})
+        systems = self._effective_default()
+        self.assertEqual(list(systems), ["default"])
+        self.assertEqual(systems["default"].truenas.host, "https://truenas.local")
+        self.assertEqual(systems["default"].truenas.api_key, "synthetic-test-key")
+
+        status, response = self._post_setup(
+            {"system_id": "new-host", "label": "New host", "truenas_host": "https://new.example.test"}
+        )
+
+        self.assertEqual(status, 400, response)
+        self.assertEqual(response.get("detail"), LEGACY_SYSTEM_MIGRATION_DETAIL)
+        self.assertEqual(self.config_path.read_bytes(), before_bytes)
+        self.assertEqual(list(self._effective_default()), ["default"])
+
+    def test_demo_route_refuses_a_credential_on_the_default_host(self) -> None:
+        before_bytes = self._write({"truenas": {"api_key": "synthetic-test-key", "platform": "core"}})
+        profile_path = Path(load_settings(create_directories=False).paths.profile_file)
+        profile_before = profile_path.read_bytes() if profile_path.exists() else None
+
+        status, response = self._post_demo()
+
+        self.assertEqual(status, 400, response)
+        self.assertEqual(response.get("detail"), LEGACY_DEMO_DETAIL)
+        self.assertEqual(self.config_path.read_bytes(), before_bytes)
+        self.assertEqual(profile_path.read_bytes() if profile_path.exists() else None, profile_before)
+        self.assertEqual(list(self._effective_default()), ["default"])
+
+    def test_following_the_printed_migration_step_then_adding_keeps_the_legacy_system(self) -> None:
+        # The refusal names a config.yaml edit. Do exactly that on a legacy
+        # system whose API key lives only in .env and whose dialect, call
+        # limit and command list are settings the setup form does not show,
+        # then add through the same route: both are monitored and nothing of
+        # the legacy system is lost.
+        os.environ["TRUENAS_API_KEY"] = "synthetic-env-key"
+        legacy = {
+            "truenas": {
+                "host": "https://legacy.example.test",
+                "platform": "scale",
+                "api_dialect": "jsonrpc",
+                "max_concurrent_calls": 3,
+            },
+            "ssh": {
+                "enabled": True,
+                "host": "legacy.example.test",
+                "user": "jbodmap",
+                "commands": ["zpool status -gP", "lsblk -OJ"],
+            },
+        }
+        self._write(legacy)
+        before = self._effective_default()["default"]
+        self.assertEqual(before.truenas.api_key, "synthetic-env-key")
+
+        status, response = self._post_setup(
+            {"system_id": "new-host", "label": "New host", "truenas_host": "https://new.example.test"}
+        )
+        self.assertEqual(status, 400, response)
+        self.assertEqual(response.get("detail"), LEGACY_SYSTEM_MIGRATION_DETAIL)
+
+        # The step, literally: a systems entry with id 'default' holding the
+        # top-level truenas and ssh sections, plus the .env value it uses.
+        entry = {
+            "id": "default",
+            "truenas": {**legacy["truenas"], "api_key": os.environ["TRUENAS_API_KEY"]},
+            "ssh": dict(legacy["ssh"]),
+        }
+        self._write({**legacy, "systems": [entry]})
+
+        status, response = self._post_setup(
+            {"system_id": "new-host", "label": "New host", "truenas_host": "https://new.example.test"}
+        )
+        self.assertEqual(status, 200, response)
+        self.assertTrue(response["ok"])
+        after = self._effective_default()
+        self.assertEqual(list(after), ["default", "new-host"])
+        migrated = after["default"]
+        self.assertEqual(migrated.truenas.model_dump(), before.truenas.model_dump())
+        self.assertEqual(migrated.ssh.model_dump(), before.ssh.model_dump())
+
+
 class LegacySystemAddServiceTests(_LegacyConfigMixin, unittest.TestCase):
     """Every source of the implicit legacy system is protected, not only truenas.host."""
 
@@ -226,9 +330,35 @@ class LegacySystemAddServiceTests(_LegacyConfigMixin, unittest.TestCase):
         self.assertEqual(self._effective_system_hosts(), {"default": "https://env.example.test"})
         self._assert_refused_unchanged(None)
 
+    def test_credential_from_environment_alone_is_a_legacy_system(self) -> None:
+        # No config file and no host anywhere: the key alone, through the
+        # loader's environment rules, configures the default-host system.
+        os.environ["TRUENAS_API_KEY"] = "synthetic-env-key"
+        settings = load_settings(create_directories=False)
+        self.assertEqual(settings.systems[0].truenas.api_key, "synthetic-env-key")
+        self._assert_refused_unchanged(None)
+
+    def test_ssh_host_from_environment_is_refused(self) -> None:
+        os.environ["SSH_HOST"] = "env-ssh.example.test"
+        self._assert_refused_unchanged(None)
+
+    def test_demo_creation_refuses_an_environment_only_legacy_system(self) -> None:
+        os.environ["TRUENAS_HOST"] = "https://env.example.test"
+        profile_path = self.root / "config" / "profiles.yaml"
+        factory = DemoSystemFactory(str(self.config_path), str(profile_path))
+        with self.assertRaises(ValueError) as caught:
+            factory.create_demo_system(DemoSystemRequest(), load_settings(create_directories=False))
+        self.assertEqual(str(caught.exception), LEGACY_DEMO_DETAIL)
+        self.assertFalse(self.config_path.exists())
+        self.assertFalse(profile_path.exists())
+
     def test_blank_environment_host_is_not_a_legacy_system(self) -> None:
-        # Control: load_settings treats a blank override as unset.
+        # Control: load_settings treats a blank override as unset, and an
+        # unset host, no credential and SSH off is the untouched default.
         os.environ["TRUENAS_HOST"] = "   "
+        os.environ["TRUENAS_API_KEY"] = ""
+        os.environ["SSH_ENABLED"] = "false"
+        os.environ["TRUENAS_VERIFY_SSL"] = "false"
         SystemSetupService(str(self.config_path)).save_system(self._request("new-host"))
         self.assertEqual(self._effective_system_hosts(), {"new-host": "https://new.example.test"})
 
@@ -258,7 +388,7 @@ class LegacySystemAddServiceTests(_LegacyConfigMixin, unittest.TestCase):
         factory = DemoSystemFactory(str(self.config_path), str(profile_path))
         with self.assertRaises(ValueError) as caught:
             factory.create_demo_system(DemoSystemRequest(), load_settings(create_directories=False))
-        self.assertIn("legacy system", str(caught.exception))
+        self.assertEqual(str(caught.exception), LEGACY_DEMO_DETAIL)
         self.assertEqual(self.config_path.read_bytes(), before)
         self.assertFalse(profile_path.exists())
 

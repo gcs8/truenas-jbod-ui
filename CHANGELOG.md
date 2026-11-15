@@ -46,10 +46,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - System Setup no longer stops monitoring a system configured only in the
-  top-level `truenas` and `ssh` settings (in `config.yaml` or `.env`) when
-  another system is added. The add is refused, with nothing written, until
-  that system is saved as `default` so it moves into the systems list; demo
-  creation applies the same check (#1253).
+  top-level `truenas` and `ssh` settings (in `config.yaml` or `.env`, including
+  one that sets only a credential and uses the default host) when another
+  system is added. The add is refused, with nothing written, and the message
+  names the fix: move those settings into a `systems` entry with id `default`
+  in `config.yaml`. Demo creation applies the same check (#1253).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

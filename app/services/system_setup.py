@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from typing import Any, TypeVar
@@ -11,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from app.config import (
     HANodeConfig,
     SSHConfig,
+    TrueNASConfig,
     StorageViewBindingConfig,
     StorageViewConfig,
     StorageViewLayoutOverridesConfig,
@@ -18,6 +18,7 @@ from app.config import (
     SystemConfig,
     _derive_runtime_layout_paths,
     _normalize_system_id,
+    apply_env_overrides,
     is_placeholder_known_hosts_path,
     known_hosts_placeholder_paths,
     normalize_text,
@@ -47,12 +48,27 @@ PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
 # system, built by `_normalize_systems` in app/config.py from the top-level
 # `truenas` and `ssh` sections and their .env overrides, under this id.
 LEGACY_SYSTEM_ID = "default"
-_LEGACY_SYSTEM_HOST_ENV = ("TRUENAS_HOST", "SSH_HOST")
-LEGACY_SYSTEM_MIGRATION_DETAIL = (
+_LEGACY_SYSTEM_SECTIONS = frozenset({"truenas", "ssh"})
+# A step that works when followed literally: a `systems` entry takes the same
+# `truenas` and `ssh` models, so every setting (including ones the setup form
+# does not show) moves with it. .env overrides apply only to the top level,
+# which is why their values must be copied in.
+LEGACY_SYSTEM_MIGRATION_STEP = (
+    "Move it into config.yaml first: add a systems entry with id 'default', put the "
+    "top-level truenas and ssh sections under it, and copy any TRUENAS_ or SSH_ values "
+    "set in .env into the matching fields of that entry."
+)
+_LEGACY_SYSTEM_PREFIX = (
     "This config still monitors a legacy system ('default') from its top-level "
-    "truenas and ssh settings in config.yaml or .env, and adding another system now "
-    "would stop monitoring it. Save the 'default' system in System Setup first so it "
-    "moves into the systems list, then add this one."
+    "truenas and ssh settings in config.yaml or .env, and adding "
+)
+LEGACY_SYSTEM_MIGRATION_DETAIL = (
+    _LEGACY_SYSTEM_PREFIX + "another system now would stop monitoring it. "
+    + LEGACY_SYSTEM_MIGRATION_STEP + " Then add this one."
+)
+LEGACY_DEMO_MIGRATION_DETAIL = (
+    _LEGACY_SYSTEM_PREFIX + "a demo now would stop monitoring it. "
+    + LEGACY_SYSTEM_MIGRATION_STEP + " Then add the demo."
 )
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
@@ -247,18 +263,43 @@ def legacy_system_configured(config: dict[str, Any]) -> bool:
     """True when `config` monitors the implicit legacy system and no saved list.
 
     Writing a `systems` list replaces that implicit system, so a save that
-    starts the list from empty would stop monitoring it (#1227). A host in the
-    top-level `truenas` or `ssh` section, or in the environment overrides
-    that feed them, means an operator configured it. A blank override is
-    unset, as `load_settings` reads it.
+    starts the list from empty would stop monitoring it (#1227). The decision
+    reads the effective top-level `truenas` and `ssh` settings the loader
+    builds: the file sections with the .env overrides applied by the same
+    rules (a blank override is unset), on the model defaults. The system is
+    configured when a host is set for it, or when it holds a credential or has
+    SSH enabled; the latter covers a system that inherits the default API host.
+    Sections the loader could not validate count as configured.
     """
     if config.get("systems"):
         return False
-    for section in ("truenas", "ssh"):
+    explicit: dict[str, Any] = {}
+    for section in _LEGACY_SYSTEM_SECTIONS:
         raw = config.get(section)
-        if isinstance(raw, dict) and normalize_text(str(raw.get("host") or "")):
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
             return True
-    return any((os.getenv(name) or "").strip() for name in _LEGACY_SYSTEM_HOST_ENV)
+        explicit[section] = dict(raw)
+    apply_env_overrides(explicit, sections=_LEGACY_SYSTEM_SECTIONS)
+    if any(
+        normalize_text(str(explicit[section].get("host") or ""))
+        for section in _LEGACY_SYSTEM_SECTIONS
+    ):
+        return True
+    try:
+        truenas = TrueNASConfig.model_validate(explicit["truenas"])
+        ssh = SSHConfig.model_validate(explicit["ssh"])
+    except ValidationError:
+        return True
+    return bool(
+        truenas.api_key
+        or truenas.api_user
+        or truenas.api_password
+        or ssh.enabled
+        or ssh.password
+        or ssh.sudo_password
+    )
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -394,9 +435,9 @@ class SystemSetupService:
             raw_systems = list(config.get("systems") or [])
             next_index = len(raw_systems) + 1
             system_id = _normalize_system_id(payload.system_id or payload.label, next_index)
-            # Saving the legacy system under its own id is the migration into
-            # `systems`; any other id would leave it unmonitored, so refuse
-            # before writing instead of guessing a migration (#1227).
+            # Saving under the legacy id is an explicit edit of that system;
+            # any other id would leave it unmonitored, so refuse before
+            # writing instead of guessing a migration (#1227).
             if system_id != LEGACY_SYSTEM_ID and legacy_system_configured(config):
                 raise ValueError(LEGACY_SYSTEM_MIGRATION_DETAIL)
 
