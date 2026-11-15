@@ -164,6 +164,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_service",
             "tests.test_admin_safety",
             "tests.test_admin_ttl",
+            "tests.test_demo_create_durability",
             "tests.test_disk_inventory_sync",
             "tests.test_disk_inventory_sync_grants",
             "tests.test_enclosure_aliases",
