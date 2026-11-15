@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Restore now refuses a history database whose schema version is outside the
+  range this release supports, in both backup formats and before anything is
+  activated, instead of replacing live history with a database the service
+  then refuses to start on. The message names the found and supported
+  versions, and live history is left unchanged (#1193).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
