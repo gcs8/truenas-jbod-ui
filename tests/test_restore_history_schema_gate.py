@@ -22,6 +22,7 @@ import unittest
 import zipfile
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
 from app import __version__
 from history_service.config import HistorySettings
@@ -37,6 +38,7 @@ from history_service.system_backup import (
     BUNDLE_FORMAT,
     HISTORY_DB_KEY,
     SystemBackupService,
+    _ImportActivationTransaction,
 )
 
 requires_posix_migration_lock = unittest.skipUnless(
@@ -72,7 +74,13 @@ def _tree_digest(root: Path) -> dict[str, str]:
     }
 
 
-def _write_bundle(path: Path, history_bytes: bytes, *, segmented: bool) -> None:
+def _write_bundle(
+    path: Path,
+    history_bytes: bytes,
+    *,
+    segmented: bool,
+    segments: tuple[tuple[str, bytes], ...] = (),
+) -> None:
     metadata = BACKUP_GROUP_METADATA[HISTORY_DB_KEY]
     archive_path = str(metadata["archive_root"])
     manifest: dict[str, object] = {
@@ -113,9 +121,37 @@ def _write_bundle(path: Path, history_bytes: bytes, *, segmented: bool) -> None:
             "segments": [],
             "tombstones": [],
         }
+    members = {archive_path: history_bytes}
+    for segment_id, segment_bytes in segments:
+        segment_path = f"history/segments/{segment_id}.sqlite3"
+        file_entry = {
+            "key": f"history-segment:{segment_id}",
+            "group_key": "history_segments",
+            "archive_path": segment_path,
+            "size_bytes": len(segment_bytes),
+            "sha256": hashlib.sha256(segment_bytes).hexdigest(),
+        }
+        manifest["files"].append(file_entry)  # type: ignore[union-attr]
+        manifest["history_catalog"]["segments"].append(  # type: ignore[index]
+            {
+                "segment_id": segment_id,
+                "member_key": file_entry["key"],
+                "archive_path": segment_path,
+                "sha256": file_entry["sha256"],
+                "size_bytes": file_entry["size_bytes"],
+                "coverage_start": "2025-01-01T00:00:00+00:00",
+                "coverage_end": "2025-01-01T00:00:00+00:00",
+                "sealed_at": "2025-01-02T00:00:00+00:00",
+                "key_id": "synthetic-key",
+                "row_counts": {"slot_events": 0, "metric_samples": 0, "metric_rollups": 0},
+                "supersedes": [],
+            }
+        )
+        members[segment_path] = segment_bytes
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
         archive.writestr("manifest.json", json.dumps(manifest))
-        archive.writestr(archive_path, history_bytes)
+        for member_path, member_bytes in members.items():
+            archive.writestr(member_path, member_bytes)
 
 
 @requires_posix_migration_lock
@@ -209,6 +245,96 @@ class BundleRestoreSchemaGateTests(unittest.TestCase):
         self.assertEqual(
             _read_marker_and_version(fresh.file_path),
             ("candidate", CURRENT_SCHEMA_VERSION),
+        )
+
+    def _segmented_bundle(self, segment_versions: tuple[int, ...]) -> Path:
+        """A segmented bundle: supported hot database plus the given segments."""
+        work = Path(tempfile.mkdtemp(prefix="bundle-", dir=self.temp_dir))
+        hot = work / "candidate.sqlite3"
+        _write_history_database(hot, "candidate", CURRENT_SCHEMA_VERSION)
+        segments = []
+        for index, user_version in enumerate(segment_versions, start=1):
+            segment_id = f"segment-{index:04d}"
+            segment_path = work / f"{segment_id}.sqlite3"
+            _write_history_database(segment_path, segment_id, user_version)
+            segments.append((segment_id, segment_path.read_bytes()))
+        bundle = work / "bundle.zip"
+        _write_bundle(bundle, hot.read_bytes(), segmented=True, segments=tuple(segments))
+        return bundle
+
+    def test_segmented_restore_refuses_a_later_newer_segment_before_activation(self) -> None:
+        # The hot database and the earlier segments are supported; only the
+        # last segment is too new. Refusal must come from the per-segment
+        # check, on both the ordinary import and the matching-digest import
+        # (which skips the integrity check but not the schema check).
+        service = self._service(segmented=True)
+        # Prior rollback material that a refused restore must not touch.
+        (self.state_root / ".history.sqlite3.previous").write_bytes(b"prior rollback copy")
+        rollback_tree = self.state_root / ".segments.previous"
+        rollback_tree.mkdir()
+        (rollback_tree / "catalog.json").write_bytes(b"prior rollback catalog")
+        bundle = self._segmented_bundle(
+            (MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION, FUTURE_SCHEMA_VERSION)
+        )
+        matching_digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        before = _tree_digest(self.state_root)
+
+        attempts = (
+            ("import", {}),
+            ("import with matching digest", {"preflighted_archive_sha256": matching_digest}),
+        )
+        for name, kwargs in attempts:
+            with self.subTest(attempt=name):
+                with mock.patch.object(
+                    _ImportActivationTransaction,
+                    "__init__",
+                    side_effect=AssertionError("activation started"),
+                ) as activation:
+                    with self.assertRaises(ValueError) as refusal:
+                        service.import_bundle_from_file(bundle, **kwargs)
+                activation.assert_not_called()
+                message = str(refusal.exception)
+                self.assertIn(f"schema version {FUTURE_SCHEMA_VERSION}", message)
+                self.assertIn(
+                    f"schema versions {MIN_SUPPORTED_SCHEMA_VERSION} to {CURRENT_SCHEMA_VERSION}",
+                    message,
+                )
+                self.assertIsInstance(refusal.exception.__cause__, HistorySchemaVersionError)
+                # Live history, catalog and rollback material are byte-identical,
+                # and no activation marker or staged copy was left behind.
+                self.assertEqual(_tree_digest(self.state_root), before)
+        self.assertEqual(
+            _read_marker_and_version(self._fresh_store(service).file_path),
+            ("prior", CURRENT_SCHEMA_VERSION),
+        )
+
+    def test_segmented_restore_with_supported_segments_still_restores(self) -> None:
+        # Control for the test above: the same bundle with every segment in
+        # range imports, so the refusal is the schema check and nothing else.
+        service = self._service(segmented=True)
+        bundle = self._segmented_bundle(
+            (MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
+        )
+        matching_digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+        result = service.import_bundle_from_file(
+            bundle, preflighted_archive_sha256=matching_digest
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            _read_marker_and_version(self.history_path),
+            ("candidate", CURRENT_SCHEMA_VERSION),
+        )
+        segment_root = self.state_root / "segments"
+        self.assertEqual(
+            [
+                _read_marker_and_version(segment_root / f"segment-{index:04d}.sqlite3")
+                for index in (1, 2, 3)
+            ],
+            [
+                ("segment-0001", MIN_SUPPORTED_SCHEMA_VERSION),
+                ("segment-0002", CURRENT_SCHEMA_VERSION),
+                ("segment-0003", CURRENT_SCHEMA_VERSION),
+            ],
         )
 
     def test_single_database_restore_refuses_a_newer_schema_before_activation(self) -> None:
