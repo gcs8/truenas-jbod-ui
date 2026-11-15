@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- System Setup no longer stops monitoring a system configured only in the
+  top-level `truenas` and `ssh` settings (in `config.yaml` or `.env`) when
+  another system is added. The add is refused, with nothing written, until
+  that system is saved as `default` so it moves into the systems list; demo
+  creation applies the same check (#1253).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
