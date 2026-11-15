@@ -341,11 +341,59 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
     return controllers
 
 
+_HEX_DIGITS = "0123456789abcdefABCDEF"
+MPR_SENSE_PREFIX = "SCSI sense:"
+# From "SCSI sense:" to the "(" that opens the reason. Kernel sense lines are a
+# sense key of a few words and a two-number ASC, so this is generous.
+MAX_MPR_SENSE_WINDOW_CHARS = 256
+_MPR_SENSE_PATTERN = re.compile(
+    r"SCSI sense:\s*(?P<sense>\S.*?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\("
+)
+
+
+def _match_mpr_controller_line(line: str) -> dict[str, str | None] | None:
+    """Split `mprN: <message>[ tgt N SMID N loginfo X]` on its literal fields.
+
+    Same result as the pattern
+    `^(mpr\\d+):\\s+(.+?)(?:\\s+tgt\\s+(\\d+)\\s+SMID\\s+(\\d+)\\s+loginfo\\s+([0-9a-fA-F]+))?$`
+    on a single line, with work linear in the line (#1216). The optional fields
+    contain no other "tgt", so only the last "tgt" can start them.
+    """
+
+    colon = line.find(":")
+    unit = line[3:colon] if colon > 3 and line.startswith("mpr") else ""
+    if not unit.isdecimal():
+        return None
+    rest = line[colon + 1 :]
+    message = rest.lstrip()
+    if len(message) == len(rest) or (not message and len(rest) < 2):
+        return None
+    fields: dict[str, str | None] = {
+        "controller": line[:colon],
+        "message": message,
+        "target": None,
+        "smid": None,
+        "loginfo": None,
+    }
+    tgt = message.rfind("tgt")
+    if tgt <= 0 or not message[tgt - 1].isspace() or message[-1].isspace():
+        return fields
+    tokens = message[tgt:].split()
+    if (
+        len(tokens) == 6
+        and tokens[0] == "tgt"
+        and tokens[1].isdecimal()
+        and tokens[2] == "SMID"
+        and tokens[3].isdecimal()
+        and tokens[4] == "loginfo"
+        and tokens[5]
+        and not tokens[5].strip(_HEX_DIGITS)
+    ):
+        fields.update(message=message[:tgt].rstrip(), target=tokens[1], smid=tokens[3], loginfo=tokens[5])
+    return fields
+
+
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
-    controller_pattern = re.compile(
-        r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo\s+(?P<loginfo>[0-9a-fA-F]+))?$"
-    )
     disk_pattern = re.compile(
         r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
         r"(?P<target>\d+):(?P<lun>\d+)\):\s+(?P<message>.+)$"
@@ -384,16 +432,16 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             if sense:
                 event.update(sense)
         else:
-            controller_match = controller_pattern.match(source_line)
+            controller_match = _match_mpr_controller_line(source_line)
             if controller_match:
-                message = controller_match.group("message").strip()
-                target = _bounded_numeric_token(controller_match.group("target"))
+                message = str(controller_match["message"]).strip()
+                target = _bounded_numeric_token(controller_match["target"])
                 event = {
                     "source": "controller",
-                    "controller": controller_match.group("controller"),
+                    "controller": controller_match["controller"],
                     "target": target,
-                    "smid": controller_match.group("smid"),
-                    "loginfo": controller_match.group("loginfo"),
+                    "smid": controller_match["smid"],
+                    "loginfo": controller_match["loginfo"],
                     "message": message,
                     "event_type": _mpr_dmesg_event_type(message),
                     "severity": "error",
@@ -513,14 +561,28 @@ def _mpr_dmesg_severity(message: str) -> str:
 
 
 def _parse_mpr_sense_message(message: str) -> dict[str, str]:
-    match = re.search(r"SCSI sense:\s*(?P<sense>.+?)\s+asc:(?P<asc>[0-9a-fA-F]+,[0-9a-fA-F]+)\s+\((?P<reason>.+)\)", message)
+    """Parse `SCSI sense: <key> asc:<a>,<q> (<reason>)` with bounded regex work.
+
+    The regex sees only a short window after the first "SCSI sense:" (#1216).
+    A later occurrence can only match a subset of the same text, so it is not
+    tried. A sense line whose "(" is outside the window, or whose sense key is
+    empty, is not decoded. The reason runs to the last ")" on the line.
+    """
+
+    start = message.find(MPR_SENSE_PREFIX)
+    if start < 0:
+        return {}
+    match = _MPR_SENSE_PATTERN.match(message, start, start + MAX_MPR_SENSE_WINDOW_CHARS)
     if not match:
+        return {}
+    reason_end = message.rfind(")")
+    if reason_end <= match.end():
         return {}
     return {
         "sense": match.group("sense").strip(),
         "sense_key": match.group("sense").strip().upper(),
         "asc": match.group("asc").lower(),
-        "reason": match.group("reason").strip(),
+        "reason": message[match.end() : reason_end].strip(),
     }
 
 

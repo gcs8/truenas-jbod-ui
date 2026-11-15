@@ -477,7 +477,9 @@ _CDB_MESSAGE_PATTERN = re.compile(
     r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)"
 )
 _CDB_OPERATION_PATTERN = re.compile(r"[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?\.\s+\Z")
-_CDB_TEXT_PATTERN = re.compile(r"CDB:\s+[0-9a-fA-F ]+")
+# The CDB text must start with a byte digit: separator whitespace alone is not
+# a CDB.
+_CDB_TEXT_PATTERN = re.compile(r"CDB:\s+[0-9a-fA-F][0-9a-fA-F ]*")
 _CDB_OPERATION_RUN_CHARACTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _/-")
 _CDB_TEXT_CHARACTERS = frozenset("0123456789abcdefABCDEF ")
 
@@ -500,11 +502,15 @@ def _find_cdb_message(message: str) -> re.Match[str] | None:
             ):
                 # The operation run starts before the window: an overlong token.
                 return None
-            text_end = min(len(message), separator + len(CDB_SEPARATOR) + MAX_CDB_TEXT_CHARS)
+            text_start = separator + len(CDB_SEPARATOR)
+            text_end = min(len(message), text_start + MAX_CDB_TEXT_CHARS)
             cdb = _CDB_TEXT_PATTERN.match(message, separator, text_end)
+            if cdb is None and text_end < len(message) and message[text_start:text_end].isspace():
+                # Separator whitespace fills the window: any bytes lie beyond it.
+                return None
             if cdb is not None:
-                if cdb.end() == text_end and text_end < len(message) and message[text_end] in _CDB_TEXT_CHARACTERS:
-                    # The CDB text continues past the longest possible CDB.
+                if cdb.end() == text_end and text_end < len(message):
+                    # The CDB text does not end inside the window.
                     return None
                 # The same match the unbounded pattern found, confined to the
                 # region the two bounded checks just accepted.
