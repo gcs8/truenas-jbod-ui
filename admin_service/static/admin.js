@@ -5880,8 +5880,8 @@
       builderRevision: state.profileBuilderRevision,
       builderDraft: builder ? builderDraft() : null });
     let submitted = snapshot();
-    const sameTarget = () => state.setupEditorGeneration === submitted.generation
-      && target() === submitted.target;
+    const sameEditor = () => state.setupEditorGeneration === submitted.generation;
+    const sameTarget = () => sameEditor() && target() === submitted.target;
     const owns = () => state.adminEditorOperationSeq[name] === sequence
       && sameTarget()
       && state.setupDraftRevision === submitted.revision
@@ -5889,7 +5889,7 @@
         && state.profileBuilderRevision === submitted.builderRevision
         && builderDraft() === submitted.builderDraft));
     // Only call after an admitted, synchronous change made by this operation.
-    return { owns, sameTarget, advance: () => { submitted = snapshot(); } };
+    return { owns, sameEditor, sameTarget, advance: () => { submitted = snapshot(); } };
   }
 
   function retireAdminEditorControls({ builderOnly = false } = {}) {
@@ -6819,7 +6819,14 @@
     // reset) releases editor controls, so a retired request still releases its
     // button unless a newer request of the same kind now holds it.
     const latest = () => state.adminEditorOperationSeq[name] === sequence;
-    return { owns, sameTarget, latest, serverName, advance: operation.advance };
+    return {
+      owns,
+      sameEditor: operation.sameEditor,
+      sameTarget,
+      latest,
+      serverName,
+      advance: operation.advance,
+    };
   }
 
   async function inspectTlsCertificate() {
@@ -6964,6 +6971,33 @@
     };
     const owner = captureTlsEditorOperation("tls-import", requestTarget.host || "");
     const fileName = file.name || "the selected file";
+    const importFor = requestTarget.system_id
+      || elements.setupSystemLabel?.value?.trim()
+      || "the previous system";
+    const reportRetiredImport = (outcome) => {
+      if (!owner.latest()) return;
+      const sameEditor = owner.sameEditor();
+      const messages = {
+        "not-sent": {
+          same: "A certificate import stopped after this form changed, so no request was sent. Import the file again to use it.",
+          changed: `Certificate import for ${importFor} stopped before it was sent because the editor changed. Open ${importFor} and import the file again to use it.`,
+        },
+        finished: {
+          same: "A certificate import finished after this form changed, so its result was not applied. Import the file again to use it.",
+          changed: `Certificate import for ${importFor} finished after the editor changed, so its result was not applied. Open ${importFor} and import the file again to use it.`,
+        },
+        unknown: {
+          same: "A certificate import returned an error after this form changed, so the result is unknown for this form. Import the file again to be sure.",
+          changed: `Certificate import for ${importFor} returned an error after the editor changed, so the result is unknown. Open ${importFor} and import the file again to be sure.`,
+        },
+      };
+      const message = sameEditor ? messages[outcome].same : messages[outcome].changed;
+      if (sameEditor && elements.setupTlsImportResult) {
+        elements.setupTlsImportResult.textContent = message;
+      }
+      setBanner(message, "info");
+    };
+    let requestSent = false;
     if (elements.setupTlsImportCaButton) {
       elements.setupTlsImportCaButton.disabled = true;
     }
@@ -6974,7 +7008,11 @@
       const pemText = await readTextFile(file);
       // The file read is asynchronous too. Retire it before dispatch so an old
       // editor cannot retarget the request to fields that are open now.
-      if (!owner.owns()) return;
+      if (!owner.owns()) {
+        reportRetiredImport("not-sent");
+        return;
+      }
+      requestSent = true;
       const payload = await fetchJson("/api/admin/tls/import", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -6984,13 +7022,7 @@
         }),
       });
       if (!owner.owns()) {
-        if (owner.latest() && owner.sameTarget()) {
-          const message = "Certificate import finished for an earlier draft. Reload this system before using the imported bundle.";
-          if (elements.setupTlsImportResult) {
-            elements.setupTlsImportResult.textContent = message;
-          }
-          setBanner(message, "info");
-        }
+        reportRetiredImport("finished");
         return;
       }
       const draftBefore = setupDraftSnapshot();
@@ -7020,7 +7052,10 @@
           : `Imported PEM trust bundle from ${fileName}.`
       , trusted ? "success" : "info");
     } catch (error) {
-      if (!owner.owns()) return;
+      if (!owner.owns()) {
+        reportRetiredImport(requestSent ? "unknown" : "not-sent");
+        return;
+      }
       syncTlsTrustStatus();
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = `TLS bundle import failed: ${error.message || error}`;

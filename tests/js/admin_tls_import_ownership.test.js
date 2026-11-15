@@ -65,6 +65,12 @@ const ALPHA_REPLY = {
     detail: "Verified synthetic alpha bundle.",
   },
 };
+const IMPORT_NOT_SENT = "A certificate import stopped after this form changed, so no request was sent. Import the file again to use it.";
+const IMPORT_NOT_APPLIED = "A certificate import finished after this form changed, so its result was not applied. Import the file again to use it.";
+const IMPORT_UNKNOWN = "A certificate import returned an error after this form changed, so the result is unknown for this form. Import the file again to be sure.";
+const ALPHA_NOT_SENT_BANNER = "Certificate import for alpha stopped before it was sent because the editor changed. Open alpha and import the file again to use it.";
+const ALPHA_FINISHED_BANNER = "Certificate import for alpha finished after the editor changed, so its result was not applied. Open alpha and import the file again to use it.";
+const ALPHA_UNKNOWN_BANNER = "Certificate import for alpha returned an error after the editor changed, so the result is unknown. Open alpha and import the file again to be sure.";
 
 function importHarness({ deferredRead = false } = {}) {
   const read = deferred();
@@ -188,7 +194,31 @@ test("switching editors during file reading retires the import before dispatch",
   assert.equal(harness.elements.setupTlsImportResult.textContent, "Bravo has no pending import.");
   assert.strictEqual(harness.state.tlsTrustStatus, bravoTrust);
   assert.strictEqual(harness.state.lastTlsValidation, bravoValidation);
-  assert.deepEqual(harness.banners, []);
+  assert.deepEqual(harness.banners, [{ message: ALPHA_NOT_SENT_BANNER, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
+});
+
+test("a same-editor edit during file reading reports that no request was sent", async () => {
+  const harness = importHarness({ deferredRead: true });
+  const pending = harness.importTlsBundle();
+  const trustBefore = harness.state.tlsTrustStatus;
+  harness.state.setupDraftRevision += 1;
+
+  harness.read.resolve("SYNTHETIC ALPHA CERTIFICATE");
+  for (let turn = 0; turn < 5 && harness.requests.length === 0; turn += 1) {
+    await Promise.resolve();
+  }
+  if (harness.requests[0]) harness.requests[0].resolve(ALPHA_REPLY);
+  await pending;
+
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupVerifySsl.checked, false);
+  assert.equal(harness.elements.setupTlsImportResult.textContent, IMPORT_NOT_SENT);
+  assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
+  assert.equal(harness.state.lastTlsValidation, null);
+  assert.deepEqual(harness.banners, [{ message: IMPORT_NOT_SENT, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
 
 test("a stale import success cannot update another editor or its trust cache", async () => {
@@ -212,10 +242,11 @@ test("a stale import success cannot update another editor or its trust cache", a
   assert.equal(harness.elements.setupTlsImportResult.textContent, "Bravo has no pending import.");
   assert.strictEqual(harness.state.tlsTrustStatus, bravoTrust);
   assert.strictEqual(harness.state.lastTlsValidation, bravoValidation);
-  assert.deepEqual(harness.banners, []);
+  assert.deepEqual(harness.banners, [{ message: ALPHA_FINISHED_BANNER, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
 
-test("a completed import for an earlier draft tells the current editor to reload", async () => {
+test("a completed import for an earlier draft tells the current editor to import again", async () => {
   const harness = importHarness();
   const pending = harness.importTlsBundle();
   await requestStarted(harness);
@@ -227,14 +258,11 @@ test("a completed import for an earlier draft tells the current editor to reload
 
   assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
   assert.equal(harness.elements.setupVerifySsl.checked, false);
-  assert.match(harness.elements.setupTlsImportResult.textContent, /finished for an earlier draft/i);
-  assert.match(harness.elements.setupTlsImportResult.textContent, /reload/i);
+  assert.equal(harness.elements.setupTlsImportResult.textContent, IMPORT_NOT_APPLIED);
   assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
   assert.equal(harness.state.lastTlsValidation, null);
-  assert.deepEqual(harness.banners, [{
-    message: "Certificate import finished for an earlier draft. Reload this system before using the imported bundle.",
-    tone: "info",
-  }]);
+  assert.deepEqual(harness.banners, [{ message: IMPORT_NOT_APPLIED, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
 
 test("a stale import failure cannot replace another editor's status", async () => {
@@ -251,7 +279,27 @@ test("a stale import failure cannot replace another editor's status", async () =
   assert.equal(harness.elements.setupTlsImportResult.textContent, "Bravo has no pending import.");
   assert.strictEqual(harness.state.tlsTrustStatus, bravoTrust);
   assert.strictEqual(harness.state.lastTlsValidation, bravoValidation);
-  assert.deepEqual(harness.banners, []);
+  assert.deepEqual(harness.banners, [{ message: ALPHA_UNKNOWN_BANNER, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
+});
+
+test("an error after a same-editor edit reports an unknown result", async () => {
+  const harness = importHarness();
+  const pending = harness.importTlsBundle();
+  await requestStarted(harness);
+  const trustBefore = harness.state.tlsTrustStatus;
+  harness.state.setupDraftRevision += 1;
+
+  harness.requests[0].reject(new Error("synthetic import response error"));
+  await pending;
+
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupVerifySsl.checked, false);
+  assert.equal(harness.elements.setupTlsImportResult.textContent, IMPORT_UNKNOWN);
+  assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
+  assert.equal(harness.state.lastTlsValidation, null);
+  assert.deepEqual(harness.banners, [{ message: IMPORT_UNKNOWN, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
 
 test("changing only the TLS server name retires a pending import", async () => {
@@ -267,11 +315,37 @@ test("changing only the TLS server name retires a pending import", async () => {
 
   assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
   assert.equal(harness.elements.setupVerifySsl.checked, false);
-  assert.equal(harness.elements.setupTlsImportResult.textContent, "Current server-name draft.");
+  assert.equal(harness.elements.setupTlsImportResult.textContent, IMPORT_NOT_APPLIED);
   assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
   assert.equal(harness.state.lastTlsValidation, null);
-  assert.deepEqual(harness.banners, []);
+  assert.deepEqual(harness.banners, [{ message: IMPORT_NOT_APPLIED, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
+
+for (const [label, edit] of [
+  ["HTTPS host", (harness) => { harness.elements.setupTruenasHost.value = BRAVO_HOST; }],
+  ["system ID", (harness) => { harness.elements.setupSystemId.value = "alpha-edited"; }],
+]) {
+  test(`a ${label} edit during the request reports completion without applying it`, async () => {
+    const harness = importHarness();
+    const pending = harness.importTlsBundle();
+    await requestStarted(harness);
+    const trustBefore = harness.state.tlsTrustStatus;
+    edit(harness);
+    harness.state.setupDraftRevision += 1;
+
+    harness.requests[0].resolve(ALPHA_REPLY);
+    await pending;
+
+    assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+    assert.equal(harness.elements.setupVerifySsl.checked, false);
+    assert.equal(harness.elements.setupTlsImportResult.textContent, IMPORT_NOT_APPLIED);
+    assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
+    assert.equal(harness.state.lastTlsValidation, null);
+    assert.deepEqual(harness.banners, [{ message: IMPORT_NOT_APPLIED, tone: "info" }]);
+    assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
+  });
+}
 
 test("returning to the original target does not revive an earlier import", async () => {
   const harness = importHarness();
@@ -293,7 +367,29 @@ test("returning to the original target does not revive an earlier import", async
   assert.equal(harness.elements.setupTlsCaBundlePath.value, "/synthetic/tls/alpha-current.pem");
   assert.equal(harness.elements.setupVerifySsl.checked, false);
   assert.equal(harness.elements.setupTlsImportResult.textContent, "Current alpha editor.");
-  assert.deepEqual(harness.banners, []);
+  assert.deepEqual(harness.banners, [{ message: ALPHA_FINISHED_BANNER, tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
+});
+
+test("an older same-editor import cannot replace a newer import's status", async () => {
+  const harness = importHarness();
+  const first = harness.importTlsBundle();
+  await requestStarted(harness);
+  harness.state.setupDraftRevision += 1;
+  const second = harness.importTlsBundle();
+  for (let turn = 0; turn < 5 && harness.requests.length < 2; turn += 1) await Promise.resolve();
+  assert.equal(harness.requests.length, 2);
+  harness.banners.push({ message: "Newer import is still running.", tone: "info" });
+
+  harness.requests[0].resolve(ALPHA_REPLY);
+  await first;
+  assert.match(harness.elements.setupTlsImportResult.textContent, /^Importing /);
+  assert.deepEqual(harness.banners, [{ message: "Newer import is still running.", tone: "info" }]);
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, true);
+
+  harness.requests[1].resolve(ALPHA_REPLY);
+  await second;
+  assert.equal(harness.elements.setupTlsImportCaButton.disabled, false);
 });
 
 test("an older import cannot release the button held by a newer import", async () => {
