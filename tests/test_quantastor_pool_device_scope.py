@@ -177,6 +177,101 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
                 record = service._build_quantastor_disk_records(raw, "node-a")[0]
                 self.assertIsNone(record.slot)
                 self.assertNotIn("quantastor_pool_device", record.raw)
+                self.assertIs(record.raw.get("quantastor_pool_device_conflict"), True)
+
+    def test_serial_known_only_from_the_hardware_row_still_refuses_a_contradicting_row(self) -> None:
+        # The disk row carries no serial; the matched hardware row does. An
+        # own-node pool-device row at the same local path that names another
+        # serial is another disk, whichever identity source knew the serial.
+        service = _service()
+        pools = [{"id": "pool-a", "name": "HOME-POOL", "storageSystemId": "node-a"}]
+        disk = {**DISK_A, "serialNumber": None}
+        own_row = {**MEMBER_B, "id": "member-own", "storageSystemId": "node-a", "storagePoolId": "pool-a",
+                   "physicalDiskId": None}
+
+        def record(serial_field, member):
+            hw_row = {"id": "hw-a", "physicalDiskId": "disk-a", "storageSystemId": "node-a",
+                      "enclosureId": "shelf-a", "slot": 0, serial_field: "SANITIZED-QS-A"}
+            raw = _raw(disks=[disk], pools=pools, pool_devices=[] if member is None else [member])
+            raw.hw_disks = [hw_row]
+            return service._build_quantastor_disk_records(raw, "node-a")[0]
+
+        for serial_field in ("serialNumber", "serialNum"):
+            with self.subTest(hardware_field=serial_field):
+                # Controls: the hardware row alone places the disk in bay 0, and
+                # a row naming the hardware serial is admitted.
+                self.assertEqual(record(serial_field, None).slot, 0)
+                coherent = {**own_row, "physicalDiskSerialNumber": "SANITIZED-QS-A"}
+                admitted = record(serial_field, coherent)
+                self.assertIs(admitted.raw["quantastor_pool_device"], coherent)
+                self.assertEqual(admitted.slot, 1)
+
+                rejected = record(serial_field, own_row)
+                self.assertNotIn("quantastor_pool_device", rejected.raw)
+                self.assertEqual(rejected.slot, 0)
+
+    def test_disk_and_hardware_rows_that_disagree_on_serial_admit_no_row(self) -> None:
+        # The record's own sources disagree on the serial, so no single row can
+        # be shown to name this disk: membership stays unknown.
+        service = _service()
+        pools = [{"id": "pool-a", "name": "HOME-POOL", "storageSystemId": "node-a"}]
+        hw_row = {"id": "hw-a", "physicalDiskId": "disk-a", "storageSystemId": "node-a",
+                  "enclosureId": "shelf-a", "slot": 0, "serialNumber": "SANITIZED-QS-C"}
+        for serial in ("SANITIZED-QS-A", "SANITIZED-QS-C"):
+            with self.subTest(row_serial=serial):
+                row = {"id": "member-own", "storageSystemId": "node-a", "storagePoolId": "pool-a",
+                       "devicePath": "/dev/sda", "slot": 1, "physicalDiskSerialNumber": serial}
+                raw = _raw(disks=[DISK_A], pools=pools, pool_devices=[row])
+                raw.hw_disks = [hw_row]
+                self.assertNotIn("quantastor_pool_device", service._build_quantastor_disk_records(raw, "node-a")[0].raw)
+
+    def test_equally_ranked_rows_with_conflicting_membership_are_unknown_in_either_order(self) -> None:
+        # Same bay and pool, but a different vdev and member status: a conflict,
+        # not a choice to make by input order. The disk stays in its bay, its
+        # membership is unknown, and the page carries a warning.
+        service = _service()
+        first = self.PEER_ROW
+        second = {**first, "id": "member-other", "raidGroupId": "other-vdev", "status": "FAULTED"}
+        expected_warning = (
+            "QuantaStor reported conflicting pool memberships for 1 disk; "
+            "its pool, vdev and member status are shown as unknown."
+        )
+        # Controls: each row alone is admitted and drawn.
+        for rows, vdev, state in (([first], "shared-vdev", "healthy"), ([second], "other-vdev", "fault")):
+            with self.subTest(single=rows[0]["id"]):
+                warnings: list[str] = []
+                raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=rows)
+                slots, *_ = service._correlate(raw, ParsedSSHData(), warnings, selected_enclosure_id="node-a")
+                bay = next(slot for slot in slots if slot.present)
+                self.assertEqual((bay.slot, bay.vdev_name, bay.state.value), (1, vdev, state))
+                self.assertNotIn(expected_warning, warnings)
+        for rows in ([first, second], [second, first]):
+            with self.subTest(first=rows[0]["id"]):
+                raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=rows)
+                record = service._build_quantastor_disk_records(raw, "node-a")[0]
+                self.assertNotIn("quantastor_pool_device", record.raw)
+                self.assertEqual(record.slot, 0)
+                warnings = []
+                slots, *_ = service._correlate(raw, ParsedSSHData(), warnings, selected_enclosure_id="node-a")
+                bay = next(slot for slot in slots if slot.present)
+                self.assertEqual((bay.slot, bay.pool_name, bay.vdev_name), (0, None, None))
+                self.assertEqual(warnings.count(expected_warning), 1)
+
+    def test_equally_ranked_rows_with_the_same_membership_are_one_answer(self) -> None:
+        # Control: two row IDs that agree on bay, pool, vdev, class and status
+        # are the same membership and are admitted in either order, without a warning.
+        service = _service()
+        twin = {**self.PEER_ROW, "id": "member-twin"}
+        for rows in ([self.PEER_ROW, twin], [twin, self.PEER_ROW]):
+            with self.subTest(first=rows[0]["id"]):
+                warnings: list[str] = []
+                raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=rows)
+                self.assertIn(service._build_quantastor_disk_records(raw, "node-a")[0].raw.get(
+                    "quantastor_pool_device"), rows)
+                slots, *_ = service._correlate(raw, ParsedSSHData(), warnings, selected_enclosure_id="node-a")
+                bay = next(slot for slot in slots if slot.present)
+                self.assertEqual((bay.slot, bay.vdev_name, bay.state.value), (1, "shared-vdev", "healthy"))
+                self.assertFalse([warning for warning in warnings if "conflicting pool" in warning])
 
     def test_a_key_shared_by_many_rows_leaves_membership_unknown_with_bounded_work(self) -> None:
         # Many disks and many rows that all share one serial: each disk must not
@@ -194,6 +289,8 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
             records = service._build_quantastor_disk_records(raw, "node-a")
         self.assertEqual(len(records), 200)
         self.assertEqual(sum("quantastor_pool_device" in record.raw for record in records), 0)
+        # Overloaded keys are reported as conflicts, so the page warns about them.
+        self.assertEqual(sum(bool(record.raw.get("quantastor_pool_device_conflict")) for record in records), 200)
         self.assertLessEqual(checked.call_count, 2 * len(records) * inventory.QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX)
 
         # Control: up to the cap, a shared key still admits its coherent row.
