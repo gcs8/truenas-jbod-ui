@@ -703,9 +703,10 @@ class HistoryCollector:
             for pending_key in list(self._pending_smart_metric_scopes):
                 if pending_key not in census_keys:
                     del self._pending_smart_metric_scopes[pending_key]
-        if (collect_fast or collect_slow) and smart_scopes_failed and not smart_scopes_succeeded:
-            # Every SMART read failed: nothing was collected, so the cadences
-            # stay where they were and the pass fails instead of succeeding.
+        if smart_scopes_failed and not smart_scopes_succeeded:
+            # Every SMART read this pass attempted failed, whether a due cadence
+            # or only a retry debt asked for it: nothing was collected, so the
+            # cadences stay where they were and the pass fails instead of succeeding.
             self._enter_failure_stage("smart_read")
             self._smart_metric_degraded_reason = SMART_METRICS_UNAVAILABLE_REASON
             raise HistorySourceError.error_reply(SMART_METRICS_UNAVAILABLE_REASON)
