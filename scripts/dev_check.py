@@ -160,6 +160,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_auth",
             "tests.test_admin_error_correlation",
             "tests.test_admin_maintenance",
+            "tests.test_admin_runtime_behavior_request_shape",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
             "tests.test_admin_upload_staging_event_loop",

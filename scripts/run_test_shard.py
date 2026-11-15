@@ -100,6 +100,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_truenas_ws",
     ),
     "2": (
+        "test_admin_runtime_behavior_request_shape",
         "test_admin_runtime_routes",
         "test_admin_safety",
         "test_admin_upload_staging_event_loop",
