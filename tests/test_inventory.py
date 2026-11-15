@@ -18677,9 +18677,17 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
 
             returned = await service.get_snapshot(selected_enclosure_id="node-a")
 
-            self.assertIs(returned, trusted_snapshot)
+            # The answer keeps the trusted facts and their read time but says
+            # the latest refresh was incomplete (#1208); the cache is unchanged.
+            self.assertEqual(returned.slots[0].vdev_name, "mirror-0")
+            self.assertEqual(returned.last_updated, trusted_snapshot.last_updated)
+            self.assertTrue(
+                any("latest inventory refresh was incomplete" in warning for warning in returned.warnings),
+                returned.warnings,
+            )
             self.assertIs(service._cache["node-a"], trusted_snapshot)
             self.assertEqual(service._cache["node-a"].slots[0].vdev_name, "mirror-0")
+            self.assertEqual(service._cache["node-a"].warnings, [])
 
     async def test_get_snapshot_reuses_shared_source_bundle_across_enclosure_switches(self) -> None:
         class DummyTrueNASClient:

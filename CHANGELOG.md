@@ -76,6 +76,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- When a refresh returns incomplete topology and the last trusted inventory
+  view is kept, the answer now says so: it keeps the trusted bays and their
+  read time, but shows the latest refresh's source status and warnings under
+  a warning that the view is retained, and the snapshot export reports the
+  same warning instead of the earlier successful status (#1242).
 
 ### Performance
 

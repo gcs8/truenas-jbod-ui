@@ -186,6 +186,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_fresh_deadline",
             "tests.test_history_schema_version_gate",
             "tests.test_history_service",
+            "tests.test_incomplete_refresh_status",
             "tests.test_inventory",
             "tests.test_inventory_registry_routes",
             "tests.test_log_noise",
