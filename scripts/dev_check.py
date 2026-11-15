@@ -129,6 +129,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_quantastor_api",
     "tests.test_release_changelog_coverage",
     "tests.test_release_status",
+    "tests.test_release_wrap_evidence_rows",
     "tests.test_release_wrap_validator",
     "tests.test_scripts_help",
     "tests.test_ssh_connection_keep",
