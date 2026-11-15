@@ -45,6 +45,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Re-saving a system in System Setup no longer resets settings the form does
+  not show, such as the middleware call limit `max_concurrent_calls`, to their
+  defaults; the save now changes only the fields the form owns (#1194).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
