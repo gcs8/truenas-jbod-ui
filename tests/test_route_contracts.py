@@ -24,6 +24,7 @@ from app.models.domain import SystemBackupExportRequest
 from app.services.inventory import SnapshotStateBusyError, UnknownEnclosureError
 from app.services.mapping_store import bind_mapping_revision
 from app.services.snapshot_export import SnapshotExportBusyError
+from tests import wait_bounds
 
 
 APP_ROUTE_MATRIX = [
@@ -293,8 +294,9 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
                 "/" if index % 2 else "/api/storage-views",
                 b"enclosure_id=enc-a&force=true",
             )) for index in range(64))
-            for _ in range(20):
-                await asyncio.sleep(0)
+            # Page requests make worker-thread hops, so wait for the overflow to
+            # answer rather than a fixed loop count.
+            await wait_bounds.wait_until(lambda: sum(not task.done() for task in tasks) <= 9)
             self.assertLessEqual(sum(not task.done() for task in tasks), 9)
             self.assertLessEqual(len(self.service._view_order_recompute_lock._waiters or ()), 8)
             overflow = [task.result() for task in tasks if task.done()]
