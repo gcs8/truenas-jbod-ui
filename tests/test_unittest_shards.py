@@ -643,6 +643,9 @@ class CIShardContractTests(unittest.TestCase):
         compare = next(s for s in gate["steps"] if "run_test_shard.py compare" in str(s.get("run") or ""))
         steps = gate["steps"]
 
+        # The token is used before any pull-request code (checkout, installs,
+        # test imports) has run on the runner, so that code cannot shim `gh`.
+        self.assertIs(steps[0], approval)
         self.assertLess(steps.index(approval), steps.index(compare))
         self.assertEqual(approval["if"], "github.event_name == 'pull_request'")
         self.assertIn('index("tests-removed-ok")', approval["run"])

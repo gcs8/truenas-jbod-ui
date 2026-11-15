@@ -308,6 +308,23 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
+      - name: Read test-removal approval
+        id: removal-approval
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Read live so adding the label and rerunning this job takes effect.
+          # This is the first step: it runs before checkout, dependency
+          # installation or any test import, so no pull-request code has run on
+          # this runner while the token is in use.
+          approved="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | index("tests-removed-ok") != null')"
+          test "$approved" = true || test "$approved" = false
+          echo "approved=${approved}" >> "$GITHUB_OUTPUT"
+
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -358,20 +375,6 @@ jobs:
       # green, so compare with the base. Pull requests fail on a removed or
       # renamed test unless they carry `tests-removed-ok`; pushes to main only
       # report.
-      - name: Read test-removal approval
-        id: removal-approval
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          # Read live so adding the label and rerunning this job takes effect.
-          approved="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | index("tests-removed-ok") != null')"
-          test "$approved" = true || test "$approved" = false
-          echo "approved=${approved}" >> "$GITHUB_OUTPUT"
-
       - name: Compare test identities with the base
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         continue-on-error: ${{ github.event_name != 'pull_request' }}
