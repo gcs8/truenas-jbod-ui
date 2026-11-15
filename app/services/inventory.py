@@ -1586,7 +1586,8 @@ def slot_detail_collection_binding(system: SystemConfig) -> str:
     """Digest of the collection identity that persisted slot details belong to (#1207).
 
     The platform plus every endpoint slot and SMART details are read from: the
-    appliance API host and the SSH hosts. Credentials, timeouts and display
+    appliance API host and the SSH hosts and port (a forwarded port on one host
+    can reach another appliance). Credentials, timeouts and display
     fields are left out, so a rename or key rotation keeps the persisted rows,
     while pointing the same system ID at another appliance does not. Only the
     digest is stored, so the cache file names no endpoint.
@@ -1601,6 +1602,7 @@ def slot_detail_collection_binding(system: SystemConfig) -> str:
         "platform": system.truenas.platform,
         "api_host": endpoint(system.truenas.host),
         "ssh_hosts": sorted(host for host in ssh_hosts if host),
+        "ssh_port": system.ssh.port,
     }
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
     return f"sha256:{digest[:32]}"

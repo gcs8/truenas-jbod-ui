@@ -126,6 +126,16 @@ class PersistedSmartBindingTests(unittest.TestCase):
 
         self.assertIsNone(service.get_cached_slot_smart_summary_without_layout(0, SHELF))
 
+    def test_ssh_port_change_at_same_host_refuses_predecessor_rows(self) -> None:
+        # A forwarded SSH port on the same host can reach another appliance.
+        moved = _system("https://source-a.example.test").model_copy(
+            update={"ssh": SSHConfig(enabled=False, port=2222)},
+        )
+        service = self._reload(moved).get_service(SYSTEM_ID)
+
+        self.assertIsNone(service.get_cached_slot_smart_summary_without_layout(0, SHELF))
+        self.assertIsNone(service._build_persisted_smart_summary(_slot()))
+
     def test_late_predecessor_write_stays_bound_to_the_old_endpoint(self) -> None:
         successor = self._reload(_system("https://source-b.example.test"))
         service = self._layout_unavailable_service(successor)

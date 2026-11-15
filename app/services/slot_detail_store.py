@@ -42,7 +42,7 @@ class SlotDetailCacheEntry(BaseModel):
     # an existing file loads unchanged.
     identity_unknown: bool = False
     # Which collection wrote this row: a digest of the system's platform and
-    # appliance endpoints (#1207). A reload can keep a system ID while pointing
+    # appliance endpoints, SSH port included (#1207). A reload can keep a system ID while pointing
     # it at another appliance, and this store is reused across reloads, so
     # readers serve only rows written under their own binding. A row without
     # one (written before #1207) cannot say which appliance it describes and
