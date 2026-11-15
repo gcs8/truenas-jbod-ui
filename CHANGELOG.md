@@ -45,6 +45,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
+  When days are not reported it shows the reported hours, and leaves the
+  value out when neither is known; a reported zero still shows (#1234).
 - Restore now refuses a history database whose schema version is outside the
   range this release supports, in both backup formats and before anything is
   activated, instead of replacing live history with a database the service
