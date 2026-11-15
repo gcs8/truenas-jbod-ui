@@ -108,6 +108,28 @@ def _is_activation_pending_refusal(exc: sqlite3.OperationalError, sqlite_path: s
     )
 
 
+def _build_store_or_report_activation(
+    build_store: Callable[[], StoreT],
+    sqlite_path: str | Path,
+) -> StoreT:
+    """Call `build_store`, turning only the activation refusal into the startup reason.
+
+    A pending rotation or restore has its own recovery. The store refuses it
+    after its schema and quarantine admission and before it touches the
+    database; reporting that refusal as the startup reason keeps the service
+    up with history stopped (#1206). Every store open goes through here, so a
+    marker that appears after the first existence check is reported the same
+    way. The store has logged its detail; the retry helper logs this reason.
+    Every other error propagates unchanged.
+    """
+    try:
+        return build_store()
+    except sqlite3.OperationalError as exc:
+        if _is_activation_pending_refusal(exc, sqlite_path):
+            raise HistoryStartupError(ACTIVATION_PENDING_REASON) from exc
+        raise
+
+
 def open_history_store_after_recovery(
     *,
     sqlite_path: str | Path,
@@ -130,28 +152,21 @@ def open_history_store_after_recovery(
     reads or writes the database. A pending rotation or restore (activation)
     marker is refused the same way but is not this module's to recover: that
     refusal becomes ``HistoryStartupError(ACTIVATION_PENDING_REASON)``, so the
-    service stays up with history stopped and the marker untouched. Every other
-    refusal -- an unsupported schema version, an unwritable directory, a corrupt
-    file, lock contention -- propagates untouched and recovery never runs. With
-    no marker on disk there is nothing to recover, so the store is simply
-    opened.
+    service stays up with history stopped and the marker untouched, whenever
+    the marker appeared. Every other refusal -- an unsupported schema version,
+    an unwritable directory, a corrupt file, lock contention -- propagates
+    untouched and recovery never runs. With no marker on disk there is nothing
+    to recover, so the store is simply opened.
     """
     if not pending_history_lifecycle_marker(
         sqlite_path=sqlite_path,
         segment_catalog_path=segment_catalog_path,
     ):
-        return build_store()
+        return _build_store_or_report_activation(build_store, sqlite_path)
 
     try:
-        return build_store()
+        return _build_store_or_report_activation(build_store, sqlite_path)
     except sqlite3.OperationalError as exc:
-        if _is_activation_pending_refusal(exc, sqlite_path):
-            # A pending rotation or restore has its own recovery. The store has
-            # already passed its schema and quarantine admission and refused
-            # before touching the database; report that refusal as the startup
-            # reason so the service stays up with history stopped (#1206). The
-            # store has logged its detail; the retry helper logs this reason.
-            raise HistoryStartupError(ACTIVATION_PENDING_REASON) from exc
         # Only the store's explicit lifecycle-marker refusal authorizes
         # recovery. Lock contention and every other operational error remain
         # retryable/diagnostic and must propagate unchanged.
@@ -169,7 +184,7 @@ def open_history_store_after_recovery(
     )
     if failure is not None:
         raise HistoryStartupError(failure)
-    return build_store()
+    return _build_store_or_report_activation(build_store, sqlite_path)
 
 
 def recover_pending_history_migration(
