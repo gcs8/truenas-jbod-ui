@@ -7,6 +7,7 @@ real deployment.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import tempfile
@@ -187,11 +188,12 @@ class RootAdmissionTests(unittest.TestCase):
         self.assertNotIn(["sudo", "rm", "-rf", str(root)], self.fake.commands)
         self.assertNotIn(["sudo", "rm", "-rf", "--", str(root)], self.fake.commands)
         self.assertTrue(self.smoke.owns_root(root))
-        # The admin scenario rebuilds its own root; that is still this run's generation.
+        # prepare_root never removes anything, not even this run's own root: a
+        # rebuild (the admin scenario's second phase) goes through the checked cleanup.
         (root / "left-by-phase-one").write_text("synthetic\n", encoding="utf-8")
-        self.assertEqual(self.admission(root), "admitted")
-        self.assertFalse((root / "left-by-phase-one").exists())
-        self.assertTrue((root / "config" / "config.yaml").is_file())
+        self.assertRegex(self.admission(root), "^refused: .*already exists")
+        self.assertTrue((root / "left-by-phase-one").is_file())
+        self.assertFalse(any(command[:2] == ["sudo", "rm"] for command in self.fake.commands))
         self.assertFalse(self.smoke.owns_root(self.parent / "other"))
 
     def test_scenarios_do_not_resolve_the_supplied_root(self):
@@ -205,10 +207,8 @@ class RootAdmissionTests(unittest.TestCase):
 
 
 def claim(smoke, root: Path) -> None:
-    """Record ``root`` as created by this run, as prepare_root does (no-op where ownership is untracked)."""
-    owned = getattr(smoke, "_OWNED_ROOTS", None)
-    if owned is not None:
-        owned.add(root)
+    """Record the directory now at ``root`` as created by this run, exactly as prepare_root does."""
+    smoke._record_created_root(root)
 
 
 def expected_cleanup_commands(root: Path, chain: tuple[str, ...] = (), *, unmount: bool = False) -> list[list[str]]:
@@ -408,6 +408,296 @@ class CleanupVerificationTests(unittest.TestCase):
         self.assertLess(stderr.index("synthetic scenario refusal"), stderr.index("teardown failed"))
         self.assertTrue(self.recovery.is_file())
 
+
+class ComposeHostFake:
+    """``subprocess.run`` stand-in: plays ``sudo`` on the temporary tree and a Compose host by project.
+
+    The effective project follows Compose's own precedence: ``--project-name``,
+    then ``COMPOSE_PROJECT_NAME`` from the environment, then the working
+    directory's name. ``up`` creates a container in that project and ``down``
+    removes the project's containers unless ``leave_on_down`` keeps them (a
+    teardown that exits 0 but leaves something behind).
+    """
+
+    def __init__(self, *, leave_on_down: bool = False, fail_compose: bool = False, on_down=None) -> None:
+        self.leave_on_down = leave_on_down
+        self.fail_compose = fail_compose
+        self.on_down = on_down
+        self.containers: dict[str, set[str]] = {}
+        self.commands: list[list[str]] = []
+        self.kwargs: list[dict] = []
+
+    @staticmethod
+    def effective_project(command: list[str], kwargs: dict) -> str:
+        if "--project-name" in command:
+            return command[command.index("--project-name") + 1]
+        env = kwargs.get("env")
+        env = os.environ if env is None else env
+        if env.get("COMPOSE_PROJECT_NAME"):
+            return env["COMPOSE_PROJECT_NAME"]
+        return Path(kwargs.get("cwd") or os.getcwd()).name.lower()
+
+    def __call__(self, command, **kwargs):
+        command = list(command)
+        self.commands.append(command)
+        self.kwargs.append(kwargs)
+        stdout = ""
+        status = 0
+        if command[:3] == ["sudo", "install", "-d"]:
+            Path(command[-1]).mkdir(parents=True, exist_ok=True)
+        elif command[:2] == ["sudo", "install"]:
+            shutil.copyfile(command[-2], command[-1])
+        elif command[:3] == ["sudo", "rm", "-rf"]:
+            target = Path(command[-1])
+            if target.is_symlink():
+                target.unlink()
+            elif target.exists():
+                shutil.rmtree(target)
+        elif command[:2] == ["docker", "compose"]:
+            project = self.effective_project(command, kwargs)
+            if self.fail_compose:
+                status = 1
+            elif "up" in command:
+                self.containers.setdefault(project, set()).add(f"{project}-enclosure-ui-1")
+            elif "down" in command:
+                if self.on_down is not None:
+                    self.on_down()
+                if not self.leave_on_down:
+                    self.containers.pop(project, None)
+        elif command[:1] == ["docker"] and "ls" in command:
+            label = next(arg for arg in command if arg.startswith("label=com.docker.compose.project="))
+            project = label.split("=", 2)[2]
+            if command[1] == "container":
+                stdout = "".join(f"{name}\n" for name in sorted(self.containers.get(project, ())))
+        if not kwargs.get("text"):
+            stdout = stdout.encode()
+        return subprocess.CompletedProcess(command, status, stdout, "" if kwargs.get("text") else b"")
+
+    def removal_requested(self) -> bool:
+        return any(command[:3] == ["sudo", "rm", "-rf"] for command in self.commands)
+
+    def compose_commands(self) -> list[list[str]]:
+        return [command for command in self.commands if command[:2] == ["docker", "compose"]]
+
+    def census_projects(self) -> list[str]:
+        return [arg.split("=", 2)[2] for command in self.commands if command[:1] == ["docker"] and "ls" in command
+                for arg in command if arg.startswith("label=com.docker.compose.project=")]
+
+
+class RoundTwoCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.smoke = load_smoke()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.parent = Path(os.path.realpath(directory.name))
+
+    def prepare(self, root: Path, host: ComposeHostFake) -> None:
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=host):
+            self.smoke.prepare_root(root, COMPOSE_FIXTURE, CONFIG_FIXTURE)
+        host.commands.clear()
+        host.kwargs.clear()
+
+    def cleanup_outcome(self, root: Path, host: ComposeHostFake) -> str:
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=host):
+            try:
+                self.smoke.cleanup(root)
+            except self.smoke.SmokeError as exc:
+                return f"refused: {exc}"
+        return "verified"
+
+    def run_cli(self, argv: list[str], host: ComposeHostFake) -> tuple[object, str]:
+        import io
+        stderr = io.StringIO()
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=host), \
+             mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", stderr):
+            try:
+                status = self.smoke.main(argv)
+            except Exception as exc:  # noqa: BLE001 - reported as the observed outcome
+                status = f"unhandled {type(exc).__name__}"
+        return status, stderr.getvalue()
+
+
+class SingleRealRootTests(RoundTwoCase):
+    """Admission and execution address one directory: the real path admitted before any command."""
+
+    def test_parent_traversal_after_a_symlink_is_refused_before_any_command(self):
+        (self.parent / "outside" / "inner").mkdir(parents=True)
+        (self.parent / "link").symlink_to(self.parent / "outside" / "inner", target_is_directory=True)
+        operator = self.parent / "outside" / "operator-install"
+        operator.mkdir()
+        (operator / ".env").write_text("synthetic-operator-env\n", encoding="utf-8")
+        supplied = self.parent / "link" / ".." / "operator-install"
+        host = ComposeHostFake(fail_compose=True)
+        status, stderr = self.run_cli(cli_argv(supplied), host)
+        self.assertEqual(status, 1)
+        self.assertIn("'..'", stderr)
+        self.assertEqual(host.commands, [])
+        self.assertFalse((self.parent / "operator-install").exists(), "a different, lexical root was created")
+        self.assertEqual((operator / ".env").read_text(encoding="utf-8"), "synthetic-operator-env\n")
+        self.assertEqual(sorted(path.name for path in operator.iterdir()), [".env"])
+
+    def test_relative_parent_traversal_is_refused_too(self):
+        (self.parent / "work").mkdir()
+        original = os.getcwd()
+        os.chdir(self.parent / "work")
+        self.addCleanup(os.chdir, original)
+        with mock.patch.object(self.smoke, "run") as run:
+            with self.assertRaisesRegex(self.smoke.SmokeError, "'\\.\\.'"):
+                self.smoke.prepare_root(Path("..") / "smoke-root", COMPOSE_FIXTURE, CONFIG_FIXTURE)
+        run.assert_not_called()
+        self.assertFalse((self.parent / "smoke-root").exists())
+
+    def test_symlinked_ancestor_without_traversal_runs_on_its_one_real_path(self):
+        # Passing control: an ancestor symlink is resolved once, before any
+        # command, and every later command uses that same real directory.
+        real = self.parent / "real"
+        real.mkdir()
+        (self.parent / "alias").symlink_to(real, target_is_directory=True)
+        host = ComposeHostFake(fail_compose=True)
+        status, _ = self.run_cli(cli_argv(self.parent / "alias" / "smoke-root"), host)
+        self.assertEqual(status, 1)  # the synthetic Compose host refuses to start anything
+        resolved = real / "smoke-root"
+        self.assertTrue(resolved.is_dir(), "failed teardown keeps the created root")
+        self.assertTrue(host.compose_commands())
+        for command, kwargs in zip(host.commands, host.kwargs):
+            if command[:2] == ["docker", "compose"]:
+                self.assertEqual(kwargs.get("cwd"), resolved)
+            elif command[:2] == ["sudo", "install"]:
+                self.assertTrue(command[-1].startswith(str(resolved) + os.sep), command)
+        self.assertFalse(host.removal_requested())
+
+
+class CreatedGenerationOwnershipTests(RoundTwoCase):
+    """Deletion authority belongs to the directory this run created, not to its pathname."""
+
+    def test_replaced_root_directory_is_refused_before_any_command(self):
+        root = self.parent / "smoke-root"
+        host = ComposeHostFake()
+        self.prepare(root, host)
+        root.rename(self.parent / "owned-original")
+        root.mkdir()
+        (root / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        marker = root / "operator-kept.txt"
+        marker.write_text("synthetic replacement data\n", encoding="utf-8")
+        self.assertRegex(self.cleanup_outcome(root, host), "^refused: .*no longer the directory this run created")
+        self.assertEqual(host.commands, [])
+        self.assertTrue(marker.is_file())
+        self.assertFalse(self.smoke.owns_root(root))
+
+    def test_retargeted_parent_symlink_does_not_inherit_deletion_authority(self):
+        owned_parent = self.parent / "owned-parent"
+        owned_parent.mkdir()
+        foreign = self.parent / "foreign-parent" / "smoke-root"
+        foreign.mkdir(parents=True)
+        (foreign / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        marker = foreign / "operator-kept.txt"
+        marker.write_text("synthetic foreign data\n", encoding="utf-8")
+        link = self.parent / "link"
+        link.symlink_to(owned_parent, target_is_directory=True)
+        host = ComposeHostFake()
+        # Admitted the way the scenarios admit --root before prepare_root.
+        admit = getattr(self.smoke, "admitted_root", Path.absolute)
+        self.prepare(admit(link / "smoke-root"), host)
+        link.unlink()
+        link.symlink_to(self.parent / "foreign-parent", target_is_directory=True)
+        self.assertRegex(self.cleanup_outcome(link / "smoke-root", host), "^refused: .*not created by this run")
+        self.assertEqual(host.commands, [])
+        self.assertTrue(marker.is_file())
+        # Control: the directory this run really created is still its own to clean up.
+        self.assertEqual(self.cleanup_outcome(owned_parent / "smoke-root", host), "verified")
+        self.assertFalse((owned_parent / "smoke-root").exists())
+        self.assertTrue(marker.is_file())
+
+    def test_ancestor_swapped_for_a_symlink_is_refused(self):
+        holder = self.parent / "holder"
+        holder.mkdir()
+        root = holder / "smoke-root"
+        host = ComposeHostFake()
+        self.prepare(root, host)
+        # The same directory is still reachable, but through a symlink the run
+        # never admitted: the chain changed, so nothing is removed.
+        holder.rename(self.parent / "holder-moved")
+        holder.symlink_to(self.parent / "holder-moved", target_is_directory=True)
+        self.assertRegex(self.cleanup_outcome(root, host), "^refused: ")
+        self.assertFalse(host.removal_requested())
+        self.assertEqual(host.compose_commands(), [])
+        self.assertTrue((self.parent / "holder-moved" / "smoke-root" / "config" / "config.yaml").is_file())
+
+    def test_root_replaced_during_teardown_is_checked_again_before_removal(self):
+        root = self.parent / "smoke-root"
+        replacement_marker = root / "operator-kept.txt"
+
+        def swap() -> None:
+            root.rename(self.parent / "owned-original")
+            root.mkdir()
+            replacement_marker.write_text("synthetic replacement data\n", encoding="utf-8")
+
+        host = ComposeHostFake(on_down=swap)
+        self.prepare(root, host)
+        self.assertRegex(self.cleanup_outcome(root, host), "^refused: .*no longer the directory this run created")
+        self.assertFalse(host.removal_requested())
+        self.assertTrue(replacement_marker.is_file())
+        self.assertTrue((self.parent / "owned-original" / "config" / "config.yaml").is_file())
+
+    def test_unchanged_created_root_is_cleaned_up(self):
+        # Passing control for the three refusals above.
+        root = self.parent / "smoke-root"
+        host = ComposeHostFake()
+        self.prepare(root, host)
+        self.assertTrue(self.smoke.owns_root(root))
+        self.assertEqual(self.cleanup_outcome(root, host), "verified")
+        self.assertFalse(root.exists())
+        self.assertFalse(self.smoke.owns_root(root))
+
+
+class AdminPhaseRebuildTests(RoundTwoCase):
+    """The admin scenario's phase-one root is removed only through the checked cleanup."""
+
+    def exercise(self, host: ComposeHostFake) -> tuple[str, Path, list]:
+        root = self.parent / "admin-root"
+        args = self.smoke.build_parser().parse_args(cli_argv(root, scenario="admin-during-upgrade"))
+        seeds = []
+
+        def seed(deployment, _args):
+            seeds.append(deployment)
+            if len(seeds) == 1:
+                (root / "phase-one-recovery").write_text("synthetic phase one\n", encoding="utf-8")
+                return None
+            raise self.smoke.SmokeError("synthetic stop after the phase-two rebuild")
+
+        with mock.patch.object(self.smoke.subprocess, "run", side_effect=host), \
+             mock.patch.object(self.smoke, "seed_previous_release", side_effect=seed), \
+             mock.patch.object(self.smoke, "check_admin_dormant"), \
+             mock.patch.object(self.smoke, "check_runtime"), \
+             mock.patch.object(self.smoke.Deployment, "pull_and_up"):
+            try:
+                self.smoke.admin_during_upgrade(args)
+                outcome = "completed"
+            except self.smoke.SmokeError as exc:
+                outcome = str(exc)
+        return outcome, root, seeds
+
+    def test_phase_one_resources_left_after_teardown_keep_its_files(self):
+        host = ComposeHostFake(leave_on_down=True)
+        host.containers["admin-root"] = {"admin-root-enclosure-ui-1"}
+        outcome, root, seeds = self.exercise(host)
+        self.assertRegex(outcome, "containers remain")
+        self.assertEqual(len(seeds), 1, "phase two must not start over unverified phase-one resources")
+        self.assertFalse(host.removal_requested())
+        self.assertTrue((root / "phase-one-recovery").is_file())
+
+    def test_phase_one_root_is_removed_only_after_the_readback(self):
+        # Passing control: verified teardown, then a fresh phase-two root.
+        host = ComposeHostFake()
+        outcome, root, seeds = self.exercise(host)
+        self.assertEqual(outcome, "synthetic stop after the phase-two rebuild")
+        self.assertEqual(len(seeds), 2)
+        removal = next(index for index, command in enumerate(host.commands) if command[:3] == ["sudo", "rm", "-rf"])
+        census = [index for index, command in enumerate(host.commands) if command[:1] == ["docker"] and "ls" in command]
+        self.assertEqual(len(census), 3)
+        self.assertLess(max(census), removal)
+        self.assertFalse((root / "phase-one-recovery").exists())
+        self.assertTrue((root / "config" / "config.yaml").is_file())
 
 if __name__ == "__main__":
     unittest.main()

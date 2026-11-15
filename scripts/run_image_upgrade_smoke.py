@@ -83,6 +83,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 UI_PORT = 18180
 HISTORY_PORT = 18181
@@ -239,40 +241,118 @@ class Deployment:
         return json.loads(output.strip().splitlines()[-1])
 
 
-# Deployment roots this invocation created itself (#1224). Only these may be
-# recursively removed again; a --root path alone never grants that authority.
-_OWNED_ROOTS: set[Path] = set()
+# Deployment roots this invocation created itself (#1224), keyed by the one
+# real path admitted for them. Authority belongs to the directory generation
+# that was created (device and inode of the root and of every ancestor), never
+# to a pathname: a replaced root or ancestor is refused, not removed.
+class _OwnedRoot(NamedTuple):
+    identity: tuple[tuple[int, int], ...]
+    project: str
+
+
+_OWNED_ROOTS: dict[Path, _OwnedRoot] = {}
+
+
+def compose_project_name(root: Path) -> str:
+    """The Compose project for a root: its directory name, normalized as Compose does it."""
+    return re.sub(r"[^a-z0-9_-]", "", root.name.lower()).lstrip("_-")
+
+
+def admitted_root(root: Path) -> Path:
+    """The one real path a supplied --root names, before anything is created or removed.
+
+    A ``..`` component is refused: after a symlink it names a different
+    directory than the lexical path does. Ancestor symlinks are resolved once
+    here; the final component is never followed, so a symlinked root is still
+    seen (and refused) as a symlink.
+    """
+    absolute = root if root.is_absolute() else Path.cwd() / root
+    expect(".." not in absolute.parts,
+           f"deployment root {root} contains '..'; pass a path without parent traversal")
+    expect(absolute.name not in ("", ".", ".."), f"deployment root {root} does not name a directory")
+    try:
+        parent = Path(os.path.realpath(absolute.parent, strict=True))
+    except OSError:
+        raise SmokeError(f"deployment root parent {absolute.parent} is not an existing directory") from None
+    expect(parent.is_dir(), f"deployment root parent {absolute.parent} is not an existing directory")
+    return parent / absolute.name
+
+
+def _root_identity(root: Path) -> tuple[tuple[int, int], ...]:
+    """(device, inode) of every component from / down to root, none of them a symlink."""
+    identity = []
+    for path in (*reversed(root.parents), root):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            raise SmokeError(f"{path} cannot be read") from None
+        expect(stat.S_ISDIR(info.st_mode), f"{path} is not a real directory")
+        identity.append((info.st_dev, info.st_ino))
+    return tuple(identity)
+
+
+def _record_created_root(root: Path) -> Path:
+    """Record the directory generation now at root as created by this run."""
+    root = admitted_root(root)
+    project = compose_project_name(root)
+    expect(bool(project), f"deployment root name {root.name!r} does not give a Compose project name")
+    _OWNED_ROOTS[root] = _OwnedRoot(_root_identity(root), project)
+    return root
+
+
+def _owned_root(root: Path) -> tuple[Path, _OwnedRoot]:
+    """The record for root, after checking it is still the generation this run created."""
+    key = Path(os.path.abspath(root))
+    if key not in _OWNED_ROOTS or ".." in Path(root).parts:
+        try:
+            key = admitted_root(root)
+        except SmokeError:
+            key = None
+    record = _OWNED_ROOTS.get(key) if key is not None else None
+    expect(record is not None, f"deployment root {root} was not created by this run; leaving it untouched")
+    try:
+        unchanged = _root_identity(key) == record.identity
+    except SmokeError:
+        unchanged = False
+    expect(unchanged, f"deployment root {key} is no longer the directory this run created "
+                      "(it or a parent was replaced); leaving it untouched")
+    return key, record
 
 
 def owns_root(root: Path) -> bool:
-    """True only for a root this invocation created and that is still not a symlink."""
-    return Path(os.path.abspath(root)) in _OWNED_ROOTS and not root.is_symlink()
+    """True only for a root this invocation created that is still that same directory."""
+    try:
+        _owned_root(root)
+    except SmokeError:
+        return False
+    return True
 
 
-def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroot_fixture: Path | None = None) -> None:
-    """Create a new deployment root, or rebuild one this invocation already owns.
+def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroot_fixture: Path | None = None) -> Path:
+    """Create a new deployment root at its admitted real path and return that path.
 
-    Fixtures are checked first. An existing directory, an existing empty
-    directory and any symlink (dangling or not) are refused before any command
-    runs, so a mistaken --root never acquires recursive-deletion authority.
+    Fixtures are checked first. A path with ``..``, an existing directory, an
+    existing empty directory and any symlink (dangling or not) are refused
+    before any command runs, so a mistaken --root never acquires
+    recursive-deletion authority. Nothing is ever removed here; a scenario
+    that rebuilds its root goes through the checked cleanup first.
     """
     for label, fixture in (("compose", compose_fixture), ("config", config_fixture), ("nonroot", nonroot_fixture)):
         if fixture is not None:
             expect(fixture.is_file(), f"{label} fixture {fixture} is missing or not a regular file")
-    root = Path(os.path.abspath(root))  # absolute without following symlinks
+    admitted = admitted_root(root)
+    expect(admitted == Path(os.path.abspath(root)),
+           f"deployment root {root} is reached through a symlink; pass its real path {admitted}")
+    root = admitted
     expect(not root.is_symlink(), f"deployment root {root} is a symlink; refusing to use or replace it")
-    if root in _OWNED_ROOTS:
-        # A scenario rebuilding the root it created earlier in this run.
-        run(["sudo", "rm", "-rf", "--", str(root)])
-        _OWNED_ROOTS.discard(root)
     expect(not os.path.lexists(root),
            f"deployment root {root} already exists; pass an absent path, the smoke never replaces existing files")
-    expect(root.parent.is_dir(), f"deployment root parent {root.parent} is not an existing directory")
+    expect(bool(compose_project_name(root)), f"deployment root name {root.name!r} does not give a Compose project name")
     try:
         root.mkdir()
     except FileExistsError:
         raise SmokeError(f"deployment root {root} already exists; pass an absent path") from None
-    _OWNED_ROOTS.add(root)
+    _record_created_root(root)
     shutil.copyfile(compose_fixture, root / "docker-compose.yml")
     # Existing installs created these as root; the base Compose must accept
     # them without any ownership migration.
@@ -284,6 +364,7 @@ def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroo
         # hardened install first starts: the documented ownership step, verbatim.
         shutil.copyfile(nonroot_fixture, root / "docker-compose.nonroot.yml")
         run(["bash", "-euo", "pipefail", "-c", "\n".join(HARDENED_OWNERSHIP_PREP)], cwd=root)
+    return root
 
 
 SEED_UI = f"""
@@ -639,7 +720,7 @@ def seed_previous_release(deployment: Deployment, args: argparse.Namespace) -> t
 
 def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
     """Image-only upgrade and rollback on the base file, or the base file plus the nonroot overlay."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture, args.nonroot_fixture if hardened else None)
     deployment = Deployment(root, HARDENED_FILES if hardened else ())
     # Base installs stay root-owned and run as root; the hardened install runs
@@ -735,7 +816,7 @@ def seed_segmented_catalog(
 
 def segmented_catalog_upgrade(args: argparse.Namespace) -> str:
     """Preserve a v0.22.2 segmented catalog byte-for-byte across upgrade and rollback."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_path = root / "config" / "config.yaml"
@@ -848,7 +929,7 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
 
 def interrupted_migration(args: argparse.Namespace) -> str:
     """Kill candidate startup at each schema-initialization seam, then restart normally."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
 
@@ -1080,7 +1161,7 @@ def check_readonly_runtime(deployment: Deployment, args: argparse.Namespace) -> 
 
 def readonly_state(args: argparse.Namespace) -> str:
     """Exercise one literal read-only required-state mount on synthetic released state."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1133,7 +1214,7 @@ def check_enospc_runtime(deployment: Deployment, args: argparse.Namespace) -> di
 
 def enospc_state(args: argparse.Namespace) -> str:
     """Exhaust a disposable required-state filesystem, then explicitly free it."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1255,6 +1336,7 @@ def admit_clean_host_root(root: Path, *, consent: bool) -> None:
            "clean-host root must be an absent nonsymlink jbod-clean-host-* directory below TMPDIR")
     expect(not root.exists(), "clean-host root already exists; refusing to replace recovery files")
     root.mkdir(mode=0o700)
+    _record_created_root(root)
 
 
 def clean_host_absent(project: str, env: dict[str, str]) -> None:
@@ -1407,6 +1489,7 @@ def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = Non
         archive.chmod(0o600)
         del payload, content, request
         clean_host_down(deployment, project, env)
+        _owned_root(deployment.root)  # still the source directory this run created
         run(["sudo", "rm", "-rf", "--", str(deployment.root)], env=env)
         expect(not deployment.root.exists(), "original installation was not removed")
         # New current Compose and bootstrap fixture, never copied source state.
@@ -1443,6 +1526,7 @@ def clean_host_restore(args: argparse.Namespace, secrets: list[str] | None = Non
         # failure, failed teardown, failed list queries, or residual resources.
         clean_host_down(deployment, project, env)
         if completed:
+            _owned_root(root)  # still the clean-host directory this run created
             run(["sudo", "rm", "-rf", "--", str(root)], env=env)
             expect(not root.exists(), "clean-host fixture cleanup failed")
     return (f"{SUCCESS_PREFIX} scenario=clean-host-restore previous={args.previous_version} "
@@ -1786,7 +1870,7 @@ def record_backup_phase_change(deployment: Deployment, notes: str) -> None:
 
 def unavailable_backup_storage(args: argparse.Namespace) -> str:
     """Exercise one unavailable filesystem backup target on synthetic released state."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1993,7 +2077,7 @@ def remove_admin_service(deployment: Deployment) -> None:
 
 def admin_during_upgrade(args: argparse.Namespace) -> str:
     """The admin service across an image-only upgrade, and its dormancy where never enabled."""
-    root = args.root.absolute()
+    root = admitted_root(args.root)
 
     # 1. Never enabled: the literal update must not start the admin profile.
     prepare_root(root, args.compose_fixture, args.config_fixture)
@@ -2004,7 +2088,10 @@ def admin_during_upgrade(args: argparse.Namespace) -> str:
     dormant.pull_and_up()
     check_runtime(dormant, args.candidate_image, args.candidate_version, args.candidate_revision)
     check_admin_dormant(dormant)
-    dormant.compose("down", "--volumes", "--remove-orphans")
+    # Phase one leaves through the same checked boundary as the final cleanup:
+    # teardown, independent absence readback, then removal of this run's own
+    # directory. Unverified teardown fails here and keeps phase one's files.
+    cleanup(root)
 
     # 2. A fresh released install whose operator starts the admin service.
     prepare_root(root, args.compose_fixture, args.config_fixture)
@@ -2092,11 +2179,6 @@ CLEANUP_COMMAND_TIMEOUT = 180
 CLEANUP_CENSUS_TIMEOUT = 30
 
 
-def compose_project_name(root: Path) -> str:
-    """The Compose project name for a root without COMPOSE_PROJECT_NAME (Compose's own normalization)."""
-    return re.sub(r"[^a-z0-9_-]", "", root.name.lower()).lstrip("_-")
-
-
 def _cleanup_command(command: list[str], *, cwd: Path | None = None,
                      timeout: int = CLEANUP_COMMAND_TIMEOUT) -> tuple[bool, str]:
     """Run one bounded cleanup command. A failure, timeout or launch error is (False, "")."""
@@ -2134,9 +2216,10 @@ def cleanup(root: Path) -> None:
     Raises SmokeError naming every problem when teardown fails or times out,
     resources remain or cannot be listed, or removal fails. The deployment
     root (configuration, history and Compose files) is then left in place.
+    The root, and every parent, must still be the directory this run created,
+    checked before any command and again immediately before removal.
     """
-    root = Path(os.path.abspath(root))
-    expect(owns_root(root), f"deployment root {root} was not created by this run; leaving it untouched")
+    root, record = _owned_root(root)
     problems = []
     teardown_ok = True
     if (root / "docker-compose.yml").exists():
@@ -2150,19 +2233,20 @@ def cleanup(root: Path) -> None:
         if not unmounted:
             problems.append("ENOSPC fixture unmount failed")
     # Independent readback, even after a failed teardown: query failure is unknown, never absence.
-    problems.extend(cleanup_resource_census(compose_project_name(root)))
+    problems.extend(cleanup_resource_census(record.project))
     if problems:
         raise SmokeError(f"cleanup not verified ({'; '.join(problems)}); "
                          f"teardown failed or is unknown, retaining {root} for recovery")
+    _owned_root(root)  # checked again immediately before removal
     removed, _ = _cleanup_command(["sudo", "rm", "-rf", "--", str(root)])
     if not removed or os.path.lexists(root):
         raise SmokeError(f"cleanup removal of {root} failed after verified teardown")
-    _OWNED_ROOTS.discard(root)
+    _OWNED_ROOTS.pop(root, None)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--root", type=Path, required=True, help="An absent path to create for this run (never an existing directory or symlink); it is removed only after verified cleanup.")
+    parser.add_argument("--root", type=Path, required=True, help="An absent path to create for this run (never an existing directory or symlink, and without '..'); it is removed only after verified cleanup.")
     parser.add_argument("--compose-fixture", type=Path, required=True, help="The previous release's Compose file.")
     parser.add_argument("--config-fixture", type=Path, required=True)
     parser.add_argument("--previous-image", required=True)
@@ -2196,32 +2280,34 @@ def main(argv: list[str] | None = None) -> int:
             print("clean-host restore failed; recovery files retained: "
                   + clean_host_failure_message(exc, secrets), file=sys.stderr)
             return 1
-    root = args.root.absolute()
     result: str | None = None
     cleaned = False
     try:
         result = smoke(args)
     except SmokeError as exc:
         print(f"image upgrade smoke failed: {exc}", file=sys.stderr)
-        if owns_root(root):  # never read or act on a directory this run did not create
-            chain = compose_chain(root)
+        # Only directories this run created, still unchanged, are read or acted on.
+        for root in list(_OWNED_ROOTS):
+            if not owns_root(root):
+                continue
             for diagnostic in (["ps", "-a"], ["logs", "--tail", "80"]):
                 try:  # best-effort output to the job log, bounded like every cleanup command
-                    subprocess.run(["docker", "compose", *chain, *diagnostic], cwd=root, check=False,
-                                   timeout=CLEANUP_CENSUS_TIMEOUT)
+                    subprocess.run(["docker", "compose", *compose_chain(root), *diagnostic],
+                                   cwd=root, check=False, timeout=CLEANUP_CENSUS_TIMEOUT)
                 except (OSError, subprocess.SubprocessError):
                     print(f"diagnostic `docker compose {' '.join(diagnostic)}` failed", file=sys.stderr)
     finally:
         # Runs on success, scenario failure and any other exception; its own
-        # failure is reported without replacing the scenario's.
-        if owns_root(root):
+        # failure is reported without replacing the scenario's. Cleanup acts
+        # on what this run created, never on the --root pathname itself.
+        owned = list(_OWNED_ROOTS)
+        cleaned = bool(owned)
+        for root in owned:
             try:
                 cleanup(root)
-                cleaned = True
             except SmokeError as exc:
+                cleaned = False
                 print(f"image upgrade smoke cleanup failed: {exc}", file=sys.stderr)
-        else:
-            cleaned = not os.path.lexists(root)
     # Success only after verified cleanup.
     if result is None or not cleaned:
         return 1
