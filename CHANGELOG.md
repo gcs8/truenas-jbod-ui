@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Restore now refuses a history database whose schema version is outside the
+  range this release supports, in both backup formats and before anything is
+  activated, instead of replacing live history with a database the service
+  then refuses to start on. The message names the found and supported
+  versions, and live history is left unchanged (#1193).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
