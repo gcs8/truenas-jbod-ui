@@ -76,6 +76,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Storage Fabric event decoding no longer turns a CDB with a malformed byte
+  token into a different valid command with an invented address and length;
+  it is marked malformed and keeps its raw text. A loginfo value wider than
+  32 bits is no longer labelled as the known fault of its low 32 bits and
+  stays unconfirmed (#1239).
 
 ### Performance
 
