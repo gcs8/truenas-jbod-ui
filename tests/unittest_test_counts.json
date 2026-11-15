@@ -35,6 +35,7 @@
     "test_enclosure_aliases": 3,
     "test_enclosure_option_labels": 16,
     "test_esxi_host_prep": 48,
+    "test_esxi_topology_alias_scope": 4,
     "test_full_backup_benchmark": 32,
     "test_ghcr_release_contract": 22,
     "test_heap_probe": 4,
