@@ -97,6 +97,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_storage_view_smart_batch",
         "test_system_backup",
         "test_system_setup_api_dialect",
+        "test_system_setup_field_ownership",
         "test_system_setup_legacy_add",
         "test_truenas_ws",
     ),
