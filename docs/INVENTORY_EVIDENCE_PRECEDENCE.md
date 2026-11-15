@@ -29,6 +29,7 @@ BMC, StorCLI, appliance APIs, and vendor tools do not enter the SES merge at an 
 - If no sourced boolean exists, a zero SAS hint or `no SAS device attached` counts as empty only when the candidate also contains SES evidence.
 - A presence conflict prevents the empty-slot gate from suppressing correlation.
 - Evidence that decides nothing (a truncated AES descriptor, or an Enclosure Status record with only a condition code such as `Critical` or `Unknown`) leaves `present` unknown in the inventory candidate. It is not empty evidence: a stored mapping still resolves, and a bay with neither occupancy nor a resolved disk reports state `unknown` (`unmapped` when its stored mapping finds no disk), not `empty` and not `fault`.
+- A platform that copies the SES candidate into its own slot status (Quantastor) copies occupancy as one decision: `present` together with `presence_source` and `presence_conflict`, and the SAS address with its source and conflict flag. It never re-infers occupancy from the weaker fields it kept.
 
 ### Device names
 

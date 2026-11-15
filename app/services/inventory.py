@@ -10416,8 +10416,10 @@ class InventoryService:
                 loaded_entries=loaded_mappings,
             )
             ses_candidate = quantastor_ses_candidates.get(slot, {})
+            # Occupancy is unknown until the SES candidate decides it; a
+            # default False here was read as live empty evidence (#1214).
             slot_hints = {
-                "present": False,
+                "present": None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
@@ -13398,6 +13400,9 @@ class InventoryService:
                 target[field_name] = ses_candidate[field_name]
         if ses_candidate.get("sas_address_hint"):
             target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
+            target["sas_address_source"] = ses_candidate.get("sas_address_source")
+        if ses_candidate.get("sas_address_conflict") is True:
+            target["sas_address_conflict"] = True
         if ses_candidate.get("sas_device_type"):
             target["sas_device_type"] = ses_candidate.get("sas_device_type")
         if ses_candidate.get("attached_sas_address"):
@@ -13422,7 +13427,12 @@ class InventoryService:
         if isinstance(ses_candidate.get("identify_active"), bool):
             target["identify_active"] = bool(target.get("identify_active")) or ses_candidate.get("identify_active")
         if isinstance(ses_candidate.get("present"), bool):
+            # Occupancy moves as one decision: the value, its source and any
+            # equal-strength conflict. Without the source and conflict a weaker
+            # zero SAS hint is re-read as live empty evidence (#1214).
             target["present"] = ses_candidate.get("present")
+            target["presence_source"] = ses_candidate.get("presence_source")
+            target["presence_conflict"] = ses_candidate.get("presence_conflict") is True
 
     @staticmethod
     def _build_sg_ses_discovery_command() -> str:
