@@ -183,6 +183,7 @@ from app.services.ssh_probe import (
     SSHCommandResult,
     SSHProbe,
     SSHSession,
+    classify_ssh_failure,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
@@ -288,12 +289,21 @@ _CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS = frozenset(
 )
 _ENCLOSURE_SLOT_NUMBER_KEYS = frozenset({"slot", "slot_number", "slotNumber", "index", "number"})
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
-    r"^SSH command failed \((?:SG SES additional element status|SG SES enclosure status); exit \d+\)\.$"
+    r"^SSH command failed \((?:SG SES additional element status|SG SES enclosure status); "
+    r"[a-z_]+; exit \d+\)\.$"
 )
 QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
+    r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^ ]+) "
+    r"\(retry_backoff; exit 255; retry after (?P<retry_at>[^)]+)\)\."
+)
+LEGACY_QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^:]+): "
     r"Skipping optional SSH command batch after a recent connection startup failure; "
     r"retry after (?P<retry_at>\S+)"
+)
+OPTIONAL_SSH_BACKOFF_DETAIL_REGEX = re.compile(
+    r"^Skipping optional SSH command batch after a recent connection startup failure; "
+    r"retry after (?P<retry_at>\S+?)(?:\.)?$"
 )
 # Raw slot status keys that carry a state word; every other key is free text
 # or an identifier and must not drive presence, fault, or identify detection.
@@ -4884,24 +4894,28 @@ class InventoryService:
         # When the SSH session fails before any command can start, Paramiko
         # produces the same synthetic startup failure for every configured
         # command. Collapse that fan-out into one user-facing warning.
-        unique_stderr = {
-            normalize_text(failure.stderr) or normalize_text(failure.stdout)
+        failure_reasons = {
+            classify_ssh_failure(
+                exit_code=failure.exit_code,
+                stdout=failure.stdout,
+                stderr=failure.stderr,
+            )
             for failure in failures
-            if normalize_text(failure.stderr) or normalize_text(failure.stdout)
         }
         unique_exit_codes = {failure.exit_code for failure in failures}
         transport_level_failure = (
             not outputs
             and len(failures) == len(command_results)
             and unique_exit_codes == {255}
-            and len(unique_stderr) == 1
+            and len(failure_reasons) == 1
         )
         if transport_level_failure:
+            reason = next(iter(failure_reasons))
             return (
                 [
-                    "Could not log in over SSH. Bay details from SSH are missing for this refresh."
+                    f"Could not log in over SSH ({reason}). Bay details from SSH are missing for this refresh."
                 ],
-                "SSH login failed.",
+                f"SSH login failed ({reason}).",
             )
 
         normalized_outputs = {
@@ -4976,25 +4990,38 @@ class InventoryService:
             )
 
         warnings: list[str] = []
-        for failure in failures:
-            canonical = canonicalize_ssh_command(failure.command)
-            context = cls._ssh_command_failure_context(canonical)
-            context_label = context.get("context_label", "SSH command")
-            exit_status = failure.exit_code if failure.exit_code is not None else "unknown"
-            warnings.append(f"SSH command failed ({context_label}; exit {exit_status}).")
+        for detail in failure_details:
+            context_label = detail.get("context_label", "SSH command")
+            exit_status = detail.get("exit_code")
+            if exit_status is None:
+                exit_status = "unknown"
+            reason = detail.get("reason", SSH_COMMAND_FAILURE_REASON)
+            warnings.append(
+                f"SSH command failed ({context_label}; {reason}; exit {exit_status})."
+            )
         return (warnings, "Some SSH commands failed.")
 
     @classmethod
     def _ssh_failure_details(cls, command_results: list[SSHCommandResult]) -> list[dict[str, Any]]:
         details: list[dict[str, Any]] = []
-        for result in command_results:
+        for position, result in enumerate(command_results, start=1):
             if result.ok:
                 continue
             canonical = canonicalize_ssh_command(result.command)
             context = cls._ssh_command_failure_context(canonical)
+            if context.get("context") == DEFAULT_SSH_FAILURE_CONTEXT["context"]:
+                context = {
+                    **context,
+                    "context": f"ssh_command_{position}",
+                    "context_label": f"SSH command {position}",
+                }
             details.append(
                 {
-                    "reason": SSH_COMMAND_FAILURE_REASON,
+                    "reason": classify_ssh_failure(
+                        exit_code=result.exit_code,
+                        stdout=result.stdout,
+                        stderr=result.stderr,
+                    ),
                     "exit_code": result.exit_code,
                     **context,
                 }
@@ -12631,6 +12658,27 @@ class InventoryService:
             "console. Data still comes from the QuantaStor API."
         ]
 
+    @staticmethod
+    def _ssh_failure_public_summary(result: SSHCommandResult) -> str:
+        reason = classify_ssh_failure(
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+        exit_status = result.exit_code if result.exit_code is not None else "unknown"
+        return f"{reason}; exit {exit_status}"
+
+    @staticmethod
+    def _format_optional_ssh_transport_failure(
+        failure: tuple[str, int | None, str | None],
+    ) -> str:
+        reason, exit_code, retry_at = failure
+        exit_status = exit_code if exit_code is not None else "unknown"
+        detail = f"{reason}; exit {exit_status}"
+        if retry_at is not None:
+            detail = f"{detail}; retry after {retry_at}"
+        return detail
+
     async def _fetch_quantastor_cli_overlay(
         self,
         raw_data: TrueNASRawData | None = None,
@@ -12676,18 +12724,21 @@ class InventoryService:
             else:
                 command_results = await self._run_ssh_commands(commands, host, stdin_data=stdin_data)
 
-            transport_detail = self._optional_ssh_transport_failure_detail(command_results)
-            if transport_detail is not None:
+            transport_failure = self._optional_ssh_transport_failure(command_results)
+            if transport_failure is not None:
+                failure_summary = self._format_optional_ssh_transport_failure(transport_failure)
                 failures.append(
-                    f"Quantastor SSH CLI enrichment failed on {host}: {transport_detail}. "
+                    f"Quantastor SSH CLI enrichment failed on {host} ({failure_summary}). "
                     "REST data is still being used."
                 )
                 continue
 
             for (_subcommand, label, target), result in zip(target_specs, command_results):
                 if not result.ok:
-                    detail = normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
-                    host_failures.append(f"Quantastor SSH CLI {label} failed on {host}: {detail}")
+                    failure_summary = self._ssh_failure_public_summary(result)
+                    host_failures.append(
+                        f"Quantastor SSH CLI {label} failed on {host} ({failure_summary})."
+                    )
                     continue
                 payload = self._parse_quantastor_cli_json(result.stdout)
                 if payload is None:
@@ -12830,12 +12881,17 @@ class InventoryService:
             ),
         )
         if not discovery_result.ok:
-            detail = (
-                normalize_text(discovery_result.stderr)
-                or normalize_text(discovery_result.stdout)
-                or f"exit {discovery_result.exit_code}"
+            transport_failure = self._optional_ssh_transport_failure([discovery_result])
+            failure_summary = (
+                self._format_optional_ssh_transport_failure(transport_failure)
+                if transport_failure is not None
+                else self._ssh_failure_public_summary(discovery_result)
             )
-            return [], ParsedSSHData(), [f"{failure_prefix} discovery failed on {host}: {detail}"]
+            return (
+                [],
+                ParsedSSHData(),
+                [f"{failure_prefix} discovery failed on {host} ({failure_summary})."],
+            )
 
         devices = self._parse_sg_ses_discovery_devices(discovery_result.stdout)
         if not devices:
@@ -12886,19 +12942,22 @@ class InventoryService:
             else await self._run_ssh_commands(commands, host)
         )
         results_by_command = {result.command: result for result in result_list}
-        transport_detail = self._optional_ssh_transport_failure_detail(results_by_command.values())
-        if transport_detail is not None:
-            return host_overlay, [f"{failure_prefix} page probes failed on {host}: {transport_detail}."]
+        transport_failure = self._optional_ssh_transport_failure(results_by_command.values())
+        if transport_failure is not None:
+            failure_summary = self._format_optional_ssh_transport_failure(transport_failure)
+            return host_overlay, [
+                f"{failure_prefix} page probes failed on {host} ({failure_summary})."
+            ]
         for device, (aes_command, ec_command, join_command) in device_commands.items():
             aes_result = results_by_command.get(
                 aes_command,
                 SSHCommandResult(command=aes_command, ok=False, stderr="SSH command result missing.", exit_code=255),
             )
             if not aes_result.ok:
-                detail = normalize_text(aes_result.stderr) or normalize_text(aes_result.stdout) or (
-                    f"exit {aes_result.exit_code}"
+                failure_summary = self._ssh_failure_public_summary(aes_result)
+                host_failures.append(
+                    f"{failure_prefix} AES page probe failed on {host} {device} ({failure_summary})."
                 )
-                host_failures.append(f"{failure_prefix} AES page probe failed on {host} {device}: {detail}")
                 continue
 
             outputs = {aes_command: aes_result.stdout}
@@ -17144,6 +17203,8 @@ class InventoryService:
         insertion_index: int | None = None
         for warning in warnings:
             match = QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX.match(warning)
+            if match is None:
+                match = LEGACY_QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX.match(warning)
             if match:
                 if insertion_index is None:
                     insertion_index = len(collapsed)
@@ -17167,19 +17228,37 @@ class InventoryService:
         return collapsed
 
     @staticmethod
-    def _optional_ssh_transport_failure_detail(results: Iterable[SSHCommandResult]) -> str | None:
+    def _optional_ssh_transport_failure(
+        results: Iterable[SSHCommandResult],
+    ) -> tuple[str, int | None, str | None] | None:
         result_list = list(results)
         if not result_list:
             return None
         if not all((not result.ok and result.exit_code == 255) for result in result_list):
             return None
-        details = {
-            normalize_text(result.stderr) or normalize_text(result.stdout) or f"exit {result.exit_code}"
+
+        retry_values: set[str] = set()
+        for result in result_list:
+            detail = normalize_text(result.stderr) or normalize_text(result.stdout) or ""
+            match = OPTIONAL_SSH_BACKOFF_DETAIL_REGEX.match(detail)
+            if match is None:
+                retry_values.clear()
+                break
+            retry_values.add(match.group("retry_at"))
+        if len(retry_values) == 1:
+            return "retry_backoff", 255, next(iter(retry_values))
+
+        reasons = {
+            classify_ssh_failure(
+                exit_code=result.exit_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
             for result in result_list
         }
-        if len(details) != 1:
+        if len(reasons) != 1:
             return None
-        return next(iter(details)).rstrip(".")
+        return next(iter(reasons)), 255, None
 
     @staticmethod
     def _is_ssh_connection_startup_failure(results: list[SSHCommandResult]) -> bool:

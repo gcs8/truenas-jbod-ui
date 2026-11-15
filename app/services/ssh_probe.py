@@ -149,10 +149,9 @@ SENSITIVE_OPTION_NAMES = {
     "--secret",
     "--server",
     "--token",
-    "--user",
-    "-b",
-    "-u",
 }
+AMBIGUOUS_CREDENTIAL_OPTION_NAMES = {"--user", "-b", "-u"}
+HTTP_CREDENTIAL_CLIENTS = {"curl", "http", "httpie", "https", "wget"}
 SENSITIVE_KEY_NAMES = {
     "api_key",
     "apikey",
@@ -182,10 +181,10 @@ URL_USERINFO_RE = re.compile(
 )
 UNPARSED_SENSITIVE_OPTION_RE = re.compile(
     r"(?i)(?P<prefix>(?:--api-key|--apikey|--cookie|--oauth2-bearer|--pass|--password|"
-    r"--proxy-user|--secret|--token|--user|-b|-u)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
+    r"--proxy-user|--secret|--token)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
 )
-BARE_AUTH_VALUE_RE = re.compile(
-    r"(?i)(?P<prefix>\b(?:basic|bearer|digest|negotiate|token)\s+)(?P<value>[^\s'\";]+)"
+UNPARSED_AMBIGUOUS_OPTION_RE = re.compile(
+    r"(?i)(?P<prefix>(?:--user|-b|-u)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
 )
 _KNOWN_HOSTS_LOCKS: dict[str, threading.Lock] = {}
 _KNOWN_HOSTS_LOCKS_GUARD = threading.Lock()
@@ -213,6 +212,46 @@ def _redact_embedded_credentials(value: str) -> str:
     return CREDENTIAL_HEADER_RE.sub(_redact_credential_header, value)
 
 
+def classify_ssh_failure(*, exit_code: int | None, stdout: str = "", stderr: str = "") -> str:
+    """Return a fixed diagnostic category without retaining remote text."""
+
+    detail = f"{stderr} {stdout}".lower()
+    if "host key" in detail or "known_hosts" in detail:
+        return "host_key_rejected"
+    if "a password is required" in detail or "password is required" in detail:
+        return "sudo_password_required"
+    if any(
+        marker in detail
+        for marker in (
+            "authentication failed",
+            "auth failed",
+            "bad authentication type",
+            "no authentication methods available",
+            "permission denied (publickey",
+        )
+    ):
+        return "auth_failed"
+    if "connection refused" in detail:
+        return "connection_refused"
+    if "timed out" in detail or "timeout" in detail:
+        return "timeout"
+    if exit_code == 127 or "command not found" in detail:
+        return "command_not_found"
+    if "permission denied" in detail or "not allowed to execute" in detail:
+        return "permission_denied"
+    if exit_code == 255:
+        return "ssh_transport_failed"
+    return "ssh_command_failed"
+
+
+def _uses_http_credential_options(tokens: list[str]) -> bool:
+    return any(token.rsplit("/", 1)[-1].lower() in HTTP_CREDENTIAL_CLIENTS for token in tokens)
+
+
+def _ambiguous_option_value_is_sensitive(value: str, *, http_client: bool) -> bool:
+    return http_client or ":" in value
+
+
 def redact_ssh_command(command: str) -> str:
     """Mask inline credentials while leaving command shape useful for logs.
 
@@ -228,25 +267,32 @@ def redact_ssh_command(command: str) -> str:
     redacted: list[str] = []
     redact_next_option: str | None = None
     redact_next_header: str | None = None
-    redact_next_auth_value = False
+    http_client = _uses_http_credential_options(tokens)
     for raw_token in tokens:
         token = _redact_embedded_credentials(raw_token)
         lowered_token = token.lower()
         if redact_next_option:
-            redacted.append(_redact_server_spec(token) if redact_next_option == "--server" else "***")
+            if redact_next_option == "--server":
+                redacted.append(_redact_server_spec(token))
+            elif redact_next_option in AMBIGUOUS_CREDENTIAL_OPTION_NAMES and not _ambiguous_option_value_is_sensitive(
+                token, http_client=http_client
+            ):
+                redacted.append(token)
+            else:
+                redacted.append("***")
             redact_next_option = None
             continue
-        if redact_next_auth_value:
+        if redact_next_header == "auth-value":
             redacted.append("***")
-            redact_next_auth_value = False
+            redact_next_header = None
             continue
         if redact_next_header:
             if redact_next_header == "auth" and lowered_token in AUTH_SCHEMES:
                 redacted.append(token)
-                redact_next_auth_value = True
+                redact_next_header = "auth-value"
             else:
                 redacted.append("***")
-            redact_next_header = None
+                redact_next_header = None
             continue
 
         option_name, separator, option_value = token.partition("=")
@@ -265,15 +311,22 @@ def redact_ssh_command(command: str) -> str:
             redacted.append(token)
             redact_next_option = lowered_name
             continue
+        if lowered_name in AMBIGUOUS_CREDENTIAL_OPTION_NAMES and separator:
+            redacted.append(
+                f"{option_name}=***"
+                if _ambiguous_option_value_is_sensitive(option_value, http_client=http_client)
+                else token
+            )
+            continue
+        if lowered_name in AMBIGUOUS_CREDENTIAL_OPTION_NAMES:
+            redacted.append(token)
+            redact_next_option = lowered_name
+            continue
 
         header_name = HEADER_NAME_ONLY_RE.search(token)
         if header_name:
             redacted.append(token)
             redact_next_header = "cookie" if "cookie" in header_name.group("name").lower() else "auth"
-            continue
-        if lowered_token in AUTH_SCHEMES:
-            redacted.append(token)
-            redact_next_auth_value = True
             continue
 
         key, key_separator, value = token.partition("=")
@@ -300,7 +353,19 @@ def _redact_unparsed_command(command: str) -> str:
     )
     redacted = UNPARSED_SENSITIVE_OPTION_RE.sub(lambda match: f"{match.group('prefix')}***", redacted)
     redacted = INLINE_SECRET_RE.sub(lambda match: f"{match.group('key')}=***", redacted)
-    return BARE_AUTH_VALUE_RE.sub(lambda match: f"{match.group('prefix')}***", redacted)
+    http_client = bool(
+        re.search(
+            r"(?i)(?:^|\s)(?:[^\s/]+/)*(?:curl|http|httpie|https|wget)(?=\s|$)",
+            command,
+        )
+    )
+
+    def redact_ambiguous(match: re.Match[str]) -> str:
+        if _ambiguous_option_value_is_sensitive(match.group("value"), http_client=http_client):
+            return f"{match.group('prefix')}***"
+        return match.group(0)
+
+    return UNPARSED_AMBIGUOUS_OPTION_RE.sub(redact_ambiguous, redacted)
 
 
 class AutoPinHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -661,13 +726,14 @@ class SSHProbe:
                     _cancel.check()
                     results.append(self._run_single_command(client, command, stdin_data=stdin_data, _cancel=_cancel))
         except Exception as exc:
+            error_message = str(exc) or exc.__class__.__name__
+            reason = classify_ssh_failure(exit_code=255, stderr=error_message)
             logger.warning(
-                "SSH command batch failed for %s@%s: %s",
+                "SSH command batch failed for %s@%s: reason=%s",
                 self.config.user,
                 self.config.host,
-                exc,
+                reason,
             )
-            error_message = str(exc) or exc.__class__.__name__
             results.extend(
                 self._failure_result(command, error_message)
                 for command in command_list[len(results) :]
@@ -721,13 +787,14 @@ class SSHProbe:
         try:
             client, reused = self._lease_client(_cancel)
         except Exception as exc:
+            error_message = str(exc) or exc.__class__.__name__
+            reason = classify_ssh_failure(exit_code=255, stderr=error_message)
             logger.warning(
-                "SSH planned command session failed for %s@%s: %s",
+                "SSH planned command session failed for %s@%s: reason=%s",
                 self.config.user,
                 self.config.host,
-                exc,
+                reason,
             )
-            error_message = str(exc) or exc.__class__.__name__
             for index, first_commands, _seen in pending:
                 outcomes[index] = [self._failure_result(command, error_message) for command in first_commands]
             return outcomes
@@ -752,15 +819,16 @@ class SSHProbe:
                             gate.limit,
                         )
                         continue
-                    reason = str(exc) or exc.__class__.__name__
+                    error_message = str(exc) or exc.__class__.__name__
+                    reason = classify_ssh_failure(exit_code=255, stderr=error_message)
                     logger.warning(
-                        "SSH command could not open an SSH channel on %s@%s: %s (%s)",
+                        "SSH command could not open an SSH channel on %s@%s: %s (reason=%s)",
                         self.config.user,
                         self.config.host,
                         redact_ssh_command(command),
                         reason,
                     )
-                    return self._failure_result(command, reason)
+                    return self._failure_result(command, error_message)
                 except BaseException:
                     # An exception escaping command cleanup is not proof of a
                     # closed channel. Keep its capacity charged and stop reuse.
@@ -796,13 +864,14 @@ class SSHProbe:
                 if session_error is None:
                     session_error = exc
             if session_error is not None:
+                error_message = str(session_error) or session_error.__class__.__name__
+                reason = classify_ssh_failure(exit_code=255, stderr=error_message)
                 logger.warning(
-                    "SSH planned command session interrupted for %s@%s: %s",
+                    "SSH planned command session interrupted for %s@%s: reason=%s",
                     self.config.user,
                     self.config.host,
-                    session_error,
+                    reason,
                 )
-                error_message = str(session_error) or session_error.__class__.__name__
                 results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
 
         reusable = False
@@ -862,7 +931,15 @@ class SSHProbe:
         if device_path is not None:
             SMARTCTL_STATUS_LOG.forget((self.config.host, self.config.port, device_path))
 
-    def _log_nonzero_exit(self, command: str, safe_command: str, exit_code: int) -> None:
+    def _log_nonzero_exit(
+        self,
+        command: str,
+        safe_command: str,
+        exit_code: int,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
         device_path = smartctl_device_path(command)
         if device_path is not None and not smartctl_exit_failed(exit_code):
             # smartctl read the device; the set bits are SMART data that the
@@ -882,7 +959,14 @@ class SSHProbe:
             return
         summary = SSH_COMMAND_FAILURE_LOG.admit((self.config.host, self.config.port, safe_command), exit_code)
         if summary is not None:
-            logger.warning("SSH command failed: %s (exit=%s)%s", safe_command, exit_code, summary.suffix())
+            reason = classify_ssh_failure(exit_code=exit_code, stdout=stdout, stderr=stderr)
+            logger.warning(
+                "SSH command failed: %s (exit=%s reason=%s)%s",
+                safe_command,
+                exit_code,
+                reason,
+                summary.suffix(),
+            )
 
     def _run_command_sync(
         self,
@@ -903,13 +987,14 @@ class SSHProbe:
                     _cancel=_cancel,
                 )
         except Exception as exc:
+            error_message = str(exc) or exc.__class__.__name__
+            reason = classify_ssh_failure(exit_code=255, stderr=error_message)
             logger.warning(
-                "SSH command failed to start for %s@%s: %s",
+                "SSH command failed to start for %s@%s: reason=%s",
                 self.config.user,
                 self.config.host,
-                exc,
+                reason,
             )
-            error_message = str(exc) or exc.__class__.__name__
             return self._failure_result(command, error_message)
 
     def _client(self, *, _cancel: _WorkerCancellation | None = None):
@@ -1084,7 +1169,13 @@ class SSHProbe:
             if ok:
                 self._forget_logged_exit(command, safe_command)
             else:
-                self._log_nonzero_exit(command, safe_command, exit_code)
+                self._log_nonzero_exit(
+                    command,
+                    safe_command,
+                    exit_code,
+                    stdout=output,
+                    stderr=error,
+                )
             return SSHCommandResult(
                 command=command,
                 ok=ok,
@@ -1101,13 +1192,14 @@ class SSHProbe:
             )
             if raise_channel_refusal and isinstance(effective_error, paramiko.ChannelException):
                 raise
+            error_message = str(effective_error) or effective_error.__class__.__name__
+            reason = classify_ssh_failure(exit_code=255, stderr=error_message)
             logger.warning(
-                "SSH command execution failed for %s@%s: %s",
+                "SSH command execution failed for %s@%s: reason=%s",
                 self.config.user,
                 self.config.host,
-                effective_error,
+                reason,
             )
-            error_message = str(effective_error) or effective_error.__class__.__name__
             return self._failure_result(command, error_message)
         finally:
             # Cancel and join the watchdog before reuse: no late timer may
@@ -1219,13 +1311,15 @@ class SSHSession:
             except Exception as exc:
                 if _cancel is not None:
                     _cancel.check()
+                error_message = str(exc) or exc.__class__.__name__
+                reason = classify_ssh_failure(exit_code=255, stderr=error_message)
                 logger.warning(
-                    "SSH command failed to start for %s@%s: %s",
+                    "SSH command failed to start for %s@%s: reason=%s",
                     self._probe.config.user,
                     self._probe.config.host,
-                    exc,
+                    reason,
                 )
-                return self._probe._failure_result(command, str(exc) or exc.__class__.__name__)
+                return self._probe._failure_result(command, error_message)
             try:
                 if _cancel is not None:
                     _cancel.register(client)

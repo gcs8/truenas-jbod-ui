@@ -353,9 +353,9 @@ python scripts/validate_release_wrap.py "$version" \
     `diagnostics` field name, so event-table evidence is not accidentally
     reported as missing
   - when a SAS Fabric SSH probe warning appears, capture the structured
-    `raw.command_failures` rows for command, canonical command, exit code,
-    stderr/stdout, controller, context, and criticality instead of relying on
-    the shortened UI warning text
+    `raw.command_failures` rows for reason, exit code, context, context label,
+    controller, and criticality instead of relying on the shortened UI warning
+    text
   - run snapshot export estimate and download against the restored Linux QA UI,
     including at least one packaging change such as Auto to Force ZIP, and
     verify the exported offline artifact opens with `qa/offline-snapshot.spec.js`

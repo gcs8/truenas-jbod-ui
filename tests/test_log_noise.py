@@ -273,7 +273,8 @@ class SSHCommandExitLoggingTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.exit_code, 255)
         self.assertIn("SSH command execution failed", logs.output[0])
-        self.assertIn("synthetic transport failure", logs.output[0])
+        self.assertIn("reason=ssh_transport_failed", logs.output[0])
+        self.assertNotIn("synthetic transport failure", logs.output[0])
 
     def test_smartctl_command_line_and_open_failures_still_log(self) -> None:
         for status in (1, 2, 3 | 64, 127, 255):
@@ -362,7 +363,8 @@ class ChannelRefusalLoggingTests(unittest.TestCase):
         self.assertEqual([[result.ok for result in outcome] for outcome in outcomes], [[False]])
         self.assertEqual(len(logs.output), 1, logs.output)
         self.assertIn("could not open an SSH channel", logs.output[0])
-        self.assertIn("Connect failed", logs.output[0])
+        self.assertIn("reason=ssh_transport_failed", logs.output[0])
+        self.assertNotIn("Connect failed", logs.output[0])
 
     def test_paramiko_per_channel_open_error_is_demoted(self) -> None:
         transport_logger = logging.getLogger("paramiko.transport")
