@@ -194,6 +194,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_perf",
             "tests.test_perf_budgets",
             "tests.test_platform_parity_fixtures",
+            "tests.test_quantastor_storage_view_claims",
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",
             "tests.test_sas_fabric",

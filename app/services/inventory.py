@@ -4004,16 +4004,6 @@ class InventoryService:
                 target_system_id=target_system_id,
             )
             runtime_views.append(runtime_view)
-            for slot in runtime_view.slots:
-                if not slot.occupied:
-                    continue
-                candidate_key = (
-                    normalize_text(slot.serial)
-                    or normalize_text(slot.device_name)
-                    or normalize_text(slot.transport_address)
-                )
-                if candidate_key:
-                    claimed_candidate_ids.add(candidate_key)
         return runtime_views
 
     def _manual_only_storage_view_slots(
@@ -4192,6 +4182,13 @@ class InventoryService:
         runtime_slots: list[StorageViewRuntimeSlot] = []
         for assignment_rank, slot_value in enumerate(visible_slots, start=1):
             candidate = ordered_candidates[assignment_rank - 1] if assignment_rank - 1 < len(ordered_candidates) else None
+            if candidate is not None:
+                # Record the claim under the key later views check (#1210): the
+                # source candidate's node-qualified identity, not a key rebuilt
+                # from the displayed serial or device name.
+                candidate_key = self._candidate_identity_key(candidate)
+                if candidate_key:
+                    claimed_candidate_ids.add(candidate_key)
             label = storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
             runtime_slots.append(
                 self._build_candidate_runtime_slot(
