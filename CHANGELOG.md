@@ -45,6 +45,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The CORE Storage Fabric view no longer invents an `mpr-1` controller and
+  reports the map as available when no `mprutil` output was returned; it now
+  says no controller or path data is available. When only the unnumbered
+  `mprutil show ...` commands answer, their board and firmware stay on one
+  controller, and every link and controller reference names a node that is
+  in the map (#1219).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,

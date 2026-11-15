@@ -3199,10 +3199,10 @@ class SasFabricSnapshotTests(unittest.TestCase):
             "core": {
                 "platform": "core",
                 "with_ses": False,
+                # No mprutil output was observed, so no controller is invented (#1219).
                 "node_ids": [
                     "backplane:0",
                     "bay:0",
-                    "controller:mpr-1",
                     "host",
                     "pool:Tank%20Main",
                     "vdev:Tank%20Main/Data%2FMirror",
@@ -3210,7 +3210,7 @@ class SasFabricSnapshotTests(unittest.TestCase):
                 "host_metrics": {"slot_count": 1},
                 "host_evidence": [],
                 "bay_evidence": ["inventory snapshot"],
-                "warnings": [],
+                "warnings": ["No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions."],
                 "raw": {
                     "commands": [],
                     "path_counts": {},

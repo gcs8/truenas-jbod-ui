@@ -437,13 +437,6 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
 
     adapter_summary = parse_mpr_adapter_summary(normalized_outputs.get("mprutil show adapters", ""))
     unit_data = _parse_unit_data(normalized_outputs)
-    if snapshot.slots and all(not slot.physical_location_known for slot in snapshot.slots):
-        # The legacy unit -1 placeholder is not observed controller evidence.
-        if -1 in unit_data and not any(
-            normalized_outputs.get(f"mprutil show {subcommand}", "").strip()
-            for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
-        ):
-            unit_data.pop(-1)
     pci_controllers = parse_pciconf_sas_controllers(normalized_outputs.get("pciconf -lv", ""))
     pcie_slots = parse_dmidecode_slots(normalized_outputs.get("dmidecode slot", ""))
     mpr_sysctl_locations = parse_mpr_sysctl_locations(normalized_outputs.get("mpr sysctl pci locations", ""))
@@ -460,14 +453,19 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             if row.get("unit") is not None
         }
         | set(path_counts)
-        | {f"mpr{unit}" for unit in unit_data}
+        | {_mpr_controller_name_for_unit(unit) for unit in unit_data}
     )
 
     controllers: list[dict[str, Any]] = []
     for controller_name in controller_names:
-        unit = _mpr_unit_from_text(controller_name)
-        summary_row = next((row for row in adapter_summary if row.get("unit") == unit), None)
-        parsed_unit = unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
+        # The unnumbered fallback has no observed unit; never derive one from its name.
+        legacy_unit = controller_name == _LEGACY_MPR_CONTROLLER_NAME and _LEGACY_MPR_UNIT_KEY in unit_data
+        unit = None if legacy_unit else _mpr_unit_from_text(controller_name)
+        summary_row = next((row for row in adapter_summary if row.get("unit") == unit), None) if unit is not None else None
+        if legacy_unit:
+            parsed_unit = unit_data[_LEGACY_MPR_UNIT_KEY]
+        else:
+            parsed_unit = unit_data.get(int(unit)) if unit is not None and unit.isdigit() else None
         detail = parsed_unit.get("adapter_detail", {}) if parsed_unit else {}
         iocfacts = parsed_unit.get("iocfacts", {}) if parsed_unit else {}
         pci_info = pci_inventory.get(controller_name, {})
@@ -475,7 +473,12 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         controller_diagnostics = mpr_kernel_diagnostics.get("by_controller", {}).get(controller_name, {})
         counts = dict(path_counts.get(controller_name, {}))
         related_slots = _dedupe_ints(slot for slots in path_slots.get(controller_name, {}).values() for slot in slots)
-        controller_evidence = [f"mprutil -u {unit} show adapter"] if unit is not None else ["mprutil show adapters"]
+        if unit is not None:
+            controller_evidence = [f"mprutil -u {unit} show adapter"]
+        elif legacy_unit:
+            controller_evidence = _mpr_evidence(_LEGACY_MPR_UNIT_KEY, "adapter")
+        else:
+            controller_evidence = ["mprutil show adapters"]
         if pci_info.get("pci_address"):
             controller_evidence.append("pciconf -lv")
         if pci_info.get("sysctl_pci_location"):
@@ -486,7 +489,7 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
             "id": f"controller:{controller_name}",
             "name": controller_name,
             "unit": int(unit) if unit is not None and unit.isdigit() else None,
-            "device": summary_row.get("device") if summary_row else f"/dev/{controller_name}",
+            "device": summary_row.get("device") if summary_row else (None if legacy_unit else f"/dev/{controller_name}"),
             "board": detail.get("board_name") or (summary_row or {}).get("board"),
             "chip": (summary_row or {}).get("chip"),
             "firmware": detail.get("firmware_revision") or (summary_row or {}).get("firmware"),
@@ -1715,6 +1718,28 @@ def _pci_inventory_by_controller(
     return inventory
 
 
+# Unit-data key for the unnumbered `mprutil show ...` fallback. It is not an MPR
+# unit number: it maps to the controller name below, never to `mpr<unit>`.
+_LEGACY_MPR_UNIT_KEY = -1
+_LEGACY_MPR_CONTROLLER_NAME = "mpr"
+
+
+def _mpr_controller_name_for_unit(unit: int) -> str:
+    return f"mpr{unit}" if unit >= 0 else _LEGACY_MPR_CONTROLLER_NAME
+
+
+def _mpr_controller_ids_by_unit(controllers: list[dict[str, Any]]) -> dict[int, str]:
+    ids: dict[int, str] = {
+        item["unit"]: item["id"]
+        for item in controllers
+        if item.get("unit") is not None
+    }
+    for item in controllers:
+        if item.get("unit") is None and item.get("name") == _LEGACY_MPR_CONTROLLER_NAME:
+            ids.setdefault(_LEGACY_MPR_UNIT_KEY, item["id"])
+    return ids
+
+
 def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
     units: set[int] = set(discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", "")))
     for command in outputs:
@@ -1731,8 +1756,13 @@ def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
             "expanders": parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", "")),
             "iocfacts": parse_mpr_iocfacts(outputs.get(f"mprutil -u {unit} show iocfacts", "")),
         }
-    if not parsed:
-        parsed[-1] = {
+    # The unnumbered fallback is controller evidence only when one of its
+    # commands returned output; an empty fallback must not create a controller.
+    if not parsed and any(
+        outputs.get(f"mprutil show {subcommand}", "").strip()
+        for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
+    ):
+        parsed[_LEGACY_MPR_UNIT_KEY] = {
             "adapter_detail": parse_mpr_adapter_detail(outputs.get("mprutil show adapter", "")),
             "devices": parse_mpr_devices(outputs.get("mprutil show devices", "")),
             "enclosures": parse_mpr_enclosures(outputs.get("mprutil show enclosures", "")),
@@ -2351,11 +2381,7 @@ def _build_mpr_trace_index(
     controllers: list[dict[str, Any]],
     diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    controller_ids_by_unit = {
-        item["unit"]: item["id"]
-        for item in controllers
-        if item.get("unit") is not None
-    }
+    controller_ids_by_unit = _mpr_controller_ids_by_unit(controllers)
     devices: dict[tuple[str, str], dict[str, Any] | None] = {}
     devices_by_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
     devices_by_handle_location: dict[tuple[str, str, int], dict[str, Any] | None] = {}
@@ -2365,7 +2391,7 @@ def _build_mpr_trace_index(
     expanders: dict[tuple[str, str], list[str]] = defaultdict(list)
 
     for unit, payload in sorted(unit_data.items()):
-        controller_id = controller_ids_by_unit.get(unit, f"controller:mpr{unit}" if unit >= 0 else "controller:mpr")
+        controller_id = controller_ids_by_unit.get(unit, f"controller:{_mpr_controller_name_for_unit(unit)}")
         controller_name = controller_id.removeprefix("controller:")
         for enclosure in payload.get("enclosures") or []:
             enc_handle = str(enclosure.get("enc_handle") or "")
@@ -3065,14 +3091,10 @@ def _add_mpr_infrastructure(
     unit_data: dict[int, dict[str, Any]],
     selected_enclosure_keys: set[str] | None = None,
 ) -> None:
-    controller_ids_by_unit = {
-        item["unit"]: item["id"]
-        for item in controllers
-        if item.get("unit") is not None
-    }
+    controller_ids_by_unit = _mpr_controller_ids_by_unit(controllers)
     selected_keys = selected_enclosure_keys or set()
     for unit, payload in sorted(unit_data.items()):
-        controller_id = controller_ids_by_unit.get(unit, f"controller:mpr{unit}" if unit >= 0 else "controller:mpr")
+        controller_id = controller_ids_by_unit.get(unit, f"controller:{_mpr_controller_name_for_unit(unit)}")
         enclosure_counts = Counter(str(device.get("enclosure_handle") or "") for device in payload.get("devices") or [])
         selected_enc_handles = {
             str(enclosure.get("enc_handle") or "")
