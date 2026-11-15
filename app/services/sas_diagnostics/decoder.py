@@ -132,6 +132,8 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "service_action",
         "cdb_hex",
         "byte_count",
+        "cdb_malformed",
+        "cdb_raw",
         "lba",
         "transfer_blocks",
         "allocation_length",

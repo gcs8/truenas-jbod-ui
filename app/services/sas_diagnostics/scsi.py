@@ -464,14 +464,45 @@ SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0004", "name": "PHY reset problem count"},
 ]
 
+CDB_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{2}")
+CDB_HEX_TEXT = re.compile(r"[0-9a-fA-F]+")
+MAX_CDB_RAW_EVIDENCE_LENGTH = 128
+
+
+def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
+    """Return the CDB bytes and, when the byte run is malformed, its raw text.
+
+    A CDB is a run of two-digit hexadecimal byte tokens. Kernel text may follow
+    it (for example ``length 512 SMID 7``). The run is malformed, rather than
+    simply ended, when the token that ends it is itself byte-like (only hex
+    digits, or at most two characters) or is followed directly by another byte
+    token. A malformed run is never compacted: the bytes before the bad token
+    keep their positions and nothing after it is converted.
+    """
+    tokens = text.split()
+    cdb_bytes: list[int] = []
+    for index, token in enumerate(tokens):
+        if CDB_BYTE_TOKEN.fullmatch(token):
+            cdb_bytes.append(int(token, 16))
+            continue
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if CDB_HEX_TEXT.fullmatch(token) or len(token) <= 2 or CDB_BYTE_TOKEN.fullmatch(following):
+            raw = " ".join(tokens)
+            if len(raw) > MAX_CDB_RAW_EVIDENCE_LENGTH:
+                raw = f"{raw[: MAX_CDB_RAW_EVIDENCE_LENGTH - 3]}..."
+            return cdb_bytes, raw
+        break
+    return cdb_bytes, None
+
+
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     match = re.search(
-        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",
+        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>\S[^\r\n]*)",
         message,
     )
     if not match:
         return {}
-    cdb_bytes = [int(token, 16) for token in match.group("cdb").split() if re.fullmatch(r"[0-9a-fA-F]{2}", token)]
+    cdb_bytes, malformed_raw = _split_cdb_tokens(match.group("cdb"))
     reported_operation = match.group("operation").strip()
     opcode = cdb_bytes[0] if cdb_bytes else None
     operation_from_table = opcode in SCSI_CDB_OPCODE_NAMES if opcode is not None else False
@@ -488,7 +519,15 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
     family = _cdb_fault_family(operation)
     confidence = "standard" if operation_from_table else "observed"
     decoder_note = None
-    if opcode in SCSI_SERVICE_ACTION_OPCODES and service_action is not None and not service_action_known:
+    if malformed_raw is not None:
+        # Opcode recognition is kept apart from whole-CDB validity: a known
+        # opcode stays named, but no field is decoded from a malformed run.
+        confidence = "standard-partial" if operation_from_table else "unconfirmed"
+        decoder_note = (
+            "CDB contains a malformed byte token; address and length fields are not decoded "
+            "and the raw CDB text is kept as evidence."
+        )
+    elif opcode in SCSI_SERVICE_ACTION_OPCODES and service_action is not None and not service_action_known:
         confidence = "standard-partial"
         decoder_note = "Opcode is standard, but this service action is not in the current local lookup table."
     elif not operation_from_table:
@@ -499,8 +538,6 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
         "operation": operation,
         "reported_operation": reported_operation,
         "direction": _cdb_direction(operation),
-        "cdb_hex": " ".join(f"{value:02x}" for value in cdb_bytes),
-        "byte_count": len(cdb_bytes),
         "likely_layer": fault_family_likely_layer(family),
         "description": f"{operation} was active when the path error was reported.",
         "decode_confidence": confidence,
@@ -515,6 +552,12 @@ def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
         decoded["service_action"] = f"0x{service_action:02x}"
         if service_action_known:
             decoded["service_action_label"] = operation
+    if malformed_raw is not None:
+        decoded["cdb_malformed"] = True
+        decoded["cdb_raw"] = malformed_raw
+        return decoded
+    decoded["cdb_hex"] = " ".join(f"{value:02x}" for value in cdb_bytes)
+    decoded["byte_count"] = len(cdb_bytes)
 
     address = _decode_cdb_address(cdb_bytes)
     if address:

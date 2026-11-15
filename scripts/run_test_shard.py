@@ -122,6 +122,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_public_demo_deployment",
         "test_public_demo_history_consistency",
         "test_release_status",
+        "test_sas_cdb_malformed_tokens",
         "test_script_json",
         "test_script_platform_guards",
         "test_scripts_help",
