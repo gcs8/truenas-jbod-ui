@@ -45,6 +45,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- The streamed backup import check of the slot mapping, SAS alias and slot
+  detail files no longer builds fields it ignores, so one entry with a large
+  unused value cannot exhaust memory. An entry whose used fields exceed 65,536
+  values or 1 MiB of text is refused as invalid (#1245).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
