@@ -1663,6 +1663,11 @@ class InventoryService:
         self._smart_cache_enclosure_generations: dict[str, int] = {}
         self._smart_load_tasks: dict[SmartCacheKey, asyncio.Task[SmartSummaryView]] = {}
         self._smart_load_batches: dict[asyncio.Task[SmartSummaryView], SmartDetailBatch] = {}
+        # Loaders that may answer from the persisted row instead of reading the
+        # disk, and those that did. A caller that wants live data must not take
+        # a persisted answer from either by joining it (#1209).
+        self._smart_stale_allowed_loaders: weakref.WeakSet[asyncio.Task[SmartSummaryView]] = weakref.WeakSet()
+        self._smart_persisted_loaders: weakref.WeakSet[asyncio.Task[SmartSummaryView]] = weakref.WeakSet()
         self._smart_operation_limit = max(1, self.settings.app.smart_batch_max_concurrency)
         self._smart_operation_semaphore = asyncio.Semaphore(self._smart_operation_limit)
         self._core_grid_reservation_lock = asyncio.Lock()
@@ -7449,6 +7454,7 @@ class InventoryService:
         core_cohort: list | None = None,
         request_semaphore: asyncio.Semaphore | None = None,
         admitted: asyncio.Event | None = None,
+        _after_persisted_answer: bool = False,
     ) -> SmartSummaryView:
         # Admission has no suspension until the per-key owner is registered.
         if admitted is not None:
@@ -7479,6 +7485,14 @@ class InventoryService:
                 return negative_entry[0]
 
         task = self._smart_load_tasks.get(cache_key)
+        if task is not None and not allow_stale_cache and (
+            task in self._smart_persisted_loaders
+            or (_after_persisted_answer and task in self._smart_stale_allowed_loaders)
+        ):
+            # That loader answered, or may still answer, from the persisted
+            # row. This caller (a scheduled refresh included) wants a live
+            # read, so it starts its own and later callers join that (#1209).
+            task = None
         if task is None:
             generation_token = expected_generation or self._smart_cache_generation_token(cache_key)
             detail_batch = _smart_detail_batch.get()
@@ -7501,6 +7515,8 @@ class InventoryService:
                 )
             )
             self._smart_load_tasks[cache_key] = task
+            if allow_stale_cache:
+                self._smart_stale_allowed_loaders.add(task)
             if detail_batch is not None:
                 self._smart_load_batches[task] = detail_batch
             task.add_done_callback(
@@ -7517,6 +7533,17 @@ class InventoryService:
             await _await_retained(owner.saved)
         if not self._smart_request_is_current(cache_key, generation_token):
             return self._replaced_disk_smart_summary()
+        if not allow_stale_cache and task in self._smart_persisted_loaders and not _after_persisted_answer:
+            # Joined a stale-allowed loader before it chose, and it served the
+            # persisted row. Read again, skipping every stale-allowed loader so
+            # this repeats at most once (#1209).
+            return await self._get_slot_smart_summary_for_slot_view(
+                slot_view,
+                bypass_negative_cache=bypass_negative_cache,
+                expected_generation=generation_token,
+                request_semaphore=request_semaphore,
+                _after_persisted_answer=True,
+            )
         return result
 
     def _cleanup_smart_load_task(
@@ -7665,6 +7692,10 @@ class InventoryService:
         persisted = await persisted_summary()
         if persisted is not None and allow_stale_cache:
             add_perf_metadata(smart_cache="persistent-hit")
+            # Mark before scheduling: the refresh must not take this answer.
+            loader = asyncio.current_task()
+            if loader is not None:
+                self._smart_persisted_loaders.add(loader)
             if self._store_smart_summary_cache(
                 slot_view,
                 persisted,
