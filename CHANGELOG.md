@@ -76,6 +76,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Admin uploads (backup inspect and import, ESXi host-prep packages) no longer
+  stop other admin requests while slow storage writes or syncs the staged
+  file, and a cancelled upload keeps its file until the write has finished.
+  The timing settings save now refuses a `values` field that is not a
+  mapping with a 400 instead of reporting success or failing with a 500
+  (#1250).
 
 ### Performance
 
