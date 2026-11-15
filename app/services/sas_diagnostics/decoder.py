@@ -12,7 +12,7 @@ from app.services.sas_diagnostics.common import (
     fault_family_severity,
     severity_rank,
 )
-from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo
+from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo, loginfo_is_over_width
 from app.services.sas_diagnostics.scsi import (
     decode_scsi_cdb_message,
     decode_scsi_sense_event,
@@ -57,6 +57,7 @@ def new_mpr_event_summary() -> dict[str, Any]:
         "devices": set(),
         "targets": set(),
         "loginfo_counts": Counter(),
+        "loginfo_rejected_count": 0,
         "sense_counts": Counter(),
         "cam_status_counts": Counter(),
         "fault_family_counts": Counter(),
@@ -235,7 +236,12 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
     if event.get("target"):
         summary["targets"].add(event["target"])
     if event.get("loginfo"):
-        summary["loginfo_counts"][event["loginfo"]] += 1
+        # An over-width loginfo is never decoded, so it is counted as rejected
+        # instead of becoming an unbounded summary key.
+        if loginfo_is_over_width(event["loginfo"]):
+            summary["loginfo_rejected_count"] += 1
+        else:
+            summary["loginfo_counts"][event["loginfo"]] += 1
     family = str(record.get("family") or "")
     if family:
         summary["fault_family_counts"][family] += 1
@@ -282,6 +288,7 @@ def finalize_mpr_event_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "devices": sorted(summary["devices"]),
         "targets": sorted(summary["targets"], key=_mpr_target_sort_key),
         "loginfo_counts": dict(summary["loginfo_counts"]),
+        "loginfo_rejected_count": summary["loginfo_rejected_count"],
         "sense_counts": dict(summary["sense_counts"]),
         "cam_status_counts": dict(summary["cam_status_counts"]),
         "fault_family_counts": fault_family_counts,

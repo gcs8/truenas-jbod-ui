@@ -285,6 +285,11 @@ def _over_width_loginfo(raw: str) -> dict[str, Any]:
     }
 
 
+def loginfo_is_over_width(loginfo: Any) -> bool:
+    """True when a hex loginfo token has more than 32 bits of digits."""
+    return len(str(loginfo or "").strip().lower().removeprefix("0x")) > MAX_LOGINFO_HEX_DIGITS
+
+
 def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:
     raw = str(loginfo or "").strip().lower().removeprefix("0x")
     if not raw or not re.fullmatch(r"[0-9a-f]+", raw):

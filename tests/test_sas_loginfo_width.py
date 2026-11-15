@@ -9,6 +9,7 @@ from __future__ import annotations
 import unittest
 
 from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo
+from app.services.sas_fabric import _diagnostic_metric_summary
 from app.services.sas_fabric_parsers import parse_mpr_dmesg_events
 
 
@@ -76,6 +77,39 @@ class LoginfoWidthTests(unittest.TestCase):
         self.assertTrue(decoded["loginfo"].endswith("..."))
         row = _pipeline_row(raw)
         self.assertLessEqual(len(row["decoded"]["loginfo"]), 32)
+
+
+class LoginfoSummaryBoundTests(unittest.TestCase):
+    def test_rejected_loginfo_never_becomes_a_summary_key(self) -> None:
+        wide = "3" + "0" * 4095
+        lines = [
+            "mpr0: Controller reported scsi ioc terminated tgt 1 SMID 1 loginfo " + wide,
+            "mpr0: Controller reported scsi ioc terminated tgt 1 SMID 2 loginfo 130010000",
+            "mpr0: Controller reported scsi ioc terminated tgt 1 SMID 3 loginfo 30010000",
+        ]
+        events = parse_mpr_dmesg_events("\n".join(lines))
+
+        for scope, key in (("by_controller", "mpr0"), ("by_controller_target", "mpr0:1")):
+            summary = events[scope][key]
+            with self.subTest(scope=scope):
+                self.assertEqual(summary["loginfo_counts"], {"30010000": 1})
+                self.assertEqual(summary.get("loginfo_rejected_count"), 2)
+                for key in summary["loginfo_counts"]:
+                    self.assertLessEqual(len(key), 10)
+                self.assertEqual(summary["ioc_terminated_count"], 3)
+                # The per-disk and per-controller metric view carries the count.
+                metric = _diagnostic_metric_summary(summary)
+                self.assertEqual(metric["loginfo_rejected_count"], 2)
+                self.assertEqual(metric["loginfo_counts"], {"30010000": 1})
+
+    def test_admitted_loginfo_keeps_its_count_and_no_rejections(self) -> None:
+        events = parse_mpr_dmesg_events(
+            "mpr0: Controller reported scsi ioc terminated tgt 1 SMID 1 loginfo 31120302"
+        )
+        summary = events["by_controller"]["mpr0"]
+
+        self.assertEqual(summary["loginfo_counts"], {"31120302": 1})
+        self.assertEqual(summary.get("loginfo_rejected_count"), 0)
 
 
 if __name__ == "__main__":
