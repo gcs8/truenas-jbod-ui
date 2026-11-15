@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -90,6 +91,10 @@ MAX_DETAIL_CHARS = 300
 BACKUP_CLASSES = ("config", "full")
 HISTORY_GROUP = "history_db"
 HISTORY_REPLACEMENT_COPIES = 14
+# Grooming's remote keeper readback stages one copy under the state directory
+# (#1188). It is refused unless the copy plus this much stays free there.
+KEEPER_SCRATCH_PREFIX = "keeper-check-"
+KEEPER_SCRATCH_HEADROOM_BYTES = 64 * 1024 * 1024
 _COPY_CHUNK = 1024 * 1024
 # Marks the synthetic config run recorded when the change journal cannot be read.
 JOURNAL_CHECK_PREFIX = "Config changes could not be checked: "
@@ -951,23 +956,29 @@ class BackupScheduler:
     ) -> int:
         """Local FULLs with history whose bytes match the catalog right now (#1188).
 
-        Each candidate gets a fresh bounded size-and-SHA-256 read, newest
-        first, and counting stops at ``HISTORY_REPLACEMENT_COPIES`` so no more
-        files are read than the credit can use. ``digests`` may carry reads
-        made earlier in the same run (grooming's keeper check). A copy that is
-        missing or does not match is marked unverified and earns no credit; a
-        copy that cannot be read earns no credit either.
+        Candidates are checked newest first with a bounded size-and-SHA-256
+        read. At most ``HISTORY_REPLACEMENT_COPIES`` candidates are checked,
+        counting every attempt whether or not it earns credit, so corrupt or
+        unreadable copies cannot make this read every FULL. ``digests`` may
+        carry reads made earlier in the same run (grooming's keeper check);
+        those count as attempts too. A copy that is missing or does not match
+        is marked unverified and earns no credit; a copy that cannot be read
+        earns no credit either. After a downgrade the status is published
+        again so a ``verified_full`` receipt for that copy is withdrawn.
         """
 
         metadata = self._metadata_snapshot()
         local = LocalBackupDirectory(self.paths.local_dir)
         count = 0
+        attempts = 0
+        downgraded = False
         for artifact in reversed(self.catalog.list(backup_class="full", location=LOCAL_LOCATION)):
-            if count >= HISTORY_REPLACEMENT_COPIES:
+            if attempts >= HISTORY_REPLACEMENT_COPIES:
                 break
             meta = metadata.get(artifact.artifact_id) or {}
             if meta.get("history_replacement") is not True or self._artifact_state(artifact, meta) != "ok":
                 continue
+            attempts += 1
             observed = (digests or {}).get(artifact.artifact_id)
             if observed is None:
                 try:
@@ -979,8 +990,11 @@ class BackupScheduler:
                     continue
             if observed != (artifact.size, artifact.sha256):
                 self.catalog.mark_unverified(artifact.artifact_id)
+                downgraded = True
                 continue
             count += 1
+        if downgraded:
+            self._write_status()
         return count
 
     @staticmethod
@@ -1239,10 +1253,15 @@ class BackupScheduler:
         state directory with a hard limit of the recorded size, the same
         bounded readback an explicit verify uses; the target is never listed,
         so a large or hostile namespace adds no work. Nothing is buffered in
-        memory and the scratch file is removed at once. A readback that reports
-        the object as absent (ENOENT, directly or as the cause) fails the
-        keeper; a target without ``get`` or any other readback failure refuses
-        the deletion with a named reason and leaves the keeper's flag alone.
+        memory and the scratch file is removed at once. The transports have no
+        digest-only read, so the scratch file stays: leftover ``keeper-check-*``
+        directories from an interrupted run are removed first, and the check
+        is refused with ``keeper-scratch-capacity`` unless the state
+        filesystem has room for the copy plus ``KEEPER_SCRATCH_HEADROOM_BYTES``.
+        A readback that reports the object as absent (ENOENT, directly or as
+        the cause) fails the keeper; a target without ``get`` or any other
+        readback failure refuses the deletion with a named reason and leaves
+        the keeper's flag alone.
         """
 
         def digest(record: ArtifactRecord, target: GroomableTarget) -> tuple[int, str]:
@@ -1254,7 +1273,18 @@ class BackupScheduler:
             get: Any = getattr(target, "get", None)
             if not callable(get):
                 raise KeeperCheckUnavailable("keeper-unverifiable")
-            workspace = Path(tempfile.mkdtemp(prefix="keeper-check-", dir=self.paths.state_dir))
+            try:
+                _remove_stale_keeper_scratch(self.paths.state_dir)
+                free = _scratch_free_bytes(self.paths.state_dir)
+            except OSError as exc:
+                raise KeeperCheckUnavailable("keeper-readback-failed") from exc
+            if free < record.size + KEEPER_SCRATCH_HEADROOM_BYTES:
+                raise KeeperCheckUnavailable("keeper-scratch-capacity")
+            try:
+                workspace = Path(tempfile.mkdtemp(prefix=KEEPER_SCRATCH_PREFIX, dir=self.paths.state_dir))
+            except OSError as exc:
+                # Never read as "keeper missing": that would downgrade a good copy.
+                raise KeeperCheckUnavailable("keeper-readback-failed") from exc
             try:
                 size, sha256 = get(record.name, workspace / "archive", limit=record.size)
                 return int(size), str(sha256)
@@ -1642,6 +1672,34 @@ def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, 
         "packaging": manifest.get("packaging") if isinstance(manifest.get("packaging"), str) else None,
         "groups": list(groups),
     }
+
+
+def _remove_stale_keeper_scratch(state_dir: Path) -> None:
+    """Remove ``keeper-check-*`` directories this service left behind (#1188).
+
+    Keeper checks run one at a time under the job reservation and remove their
+    own scratch directory, so any directory found here was left by a killed or
+    interrupted run. Only plain directories owned by this process's user are
+    removed; symlinks and other owners are left alone.
+    """
+
+    owner = os.geteuid() if hasattr(os, "geteuid") else None
+    for entry in Path(state_dir).iterdir():
+        if not entry.name.startswith(KEEPER_SCRATCH_PREFIX):
+            continue
+        try:
+            metadata = os.lstat(entry)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode) or (owner is not None and metadata.st_uid != owner):
+            continue
+        shutil.rmtree(entry)
+
+
+def _scratch_free_bytes(path: Path) -> int:
+    """Bytes available to unprivileged writers on the filesystem holding ``path``."""
+
+    return shutil.disk_usage(path).free
 
 
 def _reports_absent(exc: BaseException) -> bool:

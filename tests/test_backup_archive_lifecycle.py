@@ -496,7 +496,10 @@ class LifecycleApplyTests(CatalogCase):
         self.assertEqual([i.record.artifact_id for i in plan.items], [record.artifact_id])
         self.catalog.record_deletion("config-solo-0001", reason="manual", actor="op")
         result = manager.apply(plan, lambda _location: FakeTarget({record.name: record.size}))
-        self.assertIn("newest verified", str(result.error))
+        # #1188: no checked copy would stay, so the keeper check keeps the item
+        # before the catalog's newest-verified guard is reached.
+        self.assertEqual(result.deleted, ())
+        self.assertEqual([i.record.artifact_id for i in result.kept_after_replan], [record.artifact_id])
         self.assertIsNotNone(self.catalog.get(record.artifact_id))
 
     def test_pin_during_delete_is_refused_and_object_state_stays_consistent(self) -> None:

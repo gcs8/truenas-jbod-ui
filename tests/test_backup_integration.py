@@ -2499,12 +2499,12 @@ class SchedulerTests(SchedulerTestBase):
         self.assertEqual(result.failed_locations, {})
         self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
         self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
-        # Only the kept copies are read, each once and capped at its recorded
-        # size: the missing newest one, then the older one that became the
-        # keeper after the replan. The target is never listed.
+        # Only the newest kept copy is read, capped at its recorded size. Once
+        # it is downgraded nothing is left to delete, so the check stops there.
+        # The target is never listed.
         self.assertEqual(
             [(call.args[1], call.kwargs["limit"]) for call in get.call_args_list],
-            [(newest.name, newest.size), (older.name, older.size)],
+            [(newest.name, newest.size)],
         )
         self.assertEqual(listed.call_count, 0)
 

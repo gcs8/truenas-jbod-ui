@@ -16,11 +16,13 @@ candidate, oldest first. The guarantees, in order:
 * A (class, location) pair without a rule is left alone entirely.
 * A retention deletion never relies on a kept copy that was not just checked
   (#1188). Before the first retention deletion of a (class, location) pair,
-  ``apply`` re-reads the copies that justify it (the newest verified copy and
-  the ``keep_count`` newest counted copies) and compares size and SHA-256 with
-  the catalog. A missing or mismatching keeper is marked unverified, the pair
-  is replanned and only planned items that are still due are deleted. When a
-  keeper cannot be checked, that location is refused with a named reason.
+  ``apply`` reads back the newest verified kept copy and compares size and
+  SHA-256 with the catalog. One matching copy is enough. A missing or
+  mismatching one is marked unverified, the pair is replanned (only planned
+  items that are still due stay) and the next newest verified copy is tried,
+  at most ``KEEPER_READS_PER_GROUP`` reads per pair, stopping as soon as no
+  deletion remains. A keeper that cannot be checked, or a read budget spent
+  without a match, refuses the location with a named reason.
 
 ``LifecycleManager.plan(now)`` is a dry run that reads only the catalog.
 ``apply(plan, resolver)`` deletes at most the planned items, tombstoning each
@@ -57,6 +59,10 @@ from .errors import describe_error
 DEFAULT_UNVERIFIED_GRACE = timedelta(hours=24)
 DEFAULT_ACTOR = "lifecycle"
 _DIGEST_CHUNK = 1024 * 1024
+# Keeper read attempts per (class, location) pair in one apply. Spending them
+# all without a matching keeper refuses the location; it never permits a delete.
+KEEPER_READS_PER_GROUP = 3
+KEEPER_BUDGET_EXHAUSTED = "keeper-check-budget-exhausted"
 
 PlanKind = Literal["retention", "unverified"]
 
@@ -66,8 +72,11 @@ class KeeperCheckUnavailable(RuntimeError):
 
     ``reason`` is a fixed code shown in grooming status (never provider text):
     ``keeper-unverifiable`` (the target offers no way to read the bytes back),
-    ``keeper-unreadable`` (a local copy exists but cannot be read) or
-    ``keeper-readback-failed`` (a remote readback did not complete).
+    ``keeper-unreadable`` (a local copy exists but cannot be read),
+    ``keeper-readback-failed`` (a remote readback did not complete),
+    ``keeper-scratch-capacity`` (no room to stage a remote readback) or
+    ``keeper-check-budget-exhausted`` (the read budget ran out before a kept
+    copy matched).
     """
 
     def __init__(self, reason: str) -> None:
@@ -279,28 +288,20 @@ class LifecycleManager:
 
     # -- keeper checks -------------------------------------------------------
 
-    def _keepers(
-        self, rule: RetentionRule | None, records: list[ArtifactRecord], pending: set[str]
-    ) -> list[ArtifactRecord]:
-        """The copies that justify deleting ``pending``: guard copy plus keep_count slots."""
+    def _newest_keeper(self, records: list[ArtifactRecord], pending: set[str]) -> ArtifactRecord | None:
+        """The newest verified copy that stays after ``pending`` is deleted."""
 
-        order = lambda record: (record.created_at, record.artifact_id)  # noqa: E731
-        verified = [
-            record
-            for record in records
-            if record.verified
-            and record.artifact_id not in pending
-            and not self.catalog.is_deletion_claimed(record.artifact_id)
-        ]
-        keepers: dict[str, ArtifactRecord] = {}
-        newest = max(verified, key=order, default=None)
-        if newest is not None:
-            keepers[newest.artifact_id] = newest
-        if rule is not None and rule.keep_count:
-            counted = sorted((r for r in verified if not r.preserved), key=order, reverse=True)
-            for record in counted[: rule.keep_count]:
-                keepers[record.artifact_id] = record
-        return sorted(keepers.values(), key=order, reverse=True)
+        return max(
+            (
+                record
+                for record in records
+                if record.verified
+                and record.artifact_id not in pending
+                and not self.catalog.is_deletion_claimed(record.artifact_id)
+            ),
+            key=lambda record: (record.created_at, record.artifact_id),
+            default=None,
+        )
 
     def _keeper_intact(self, record: ArtifactRecord, target: GroomableTarget) -> bool:
         digest = self.payload_digest or local_payload_digest
@@ -319,30 +320,32 @@ class LifecycleManager:
         planned_at: datetime,
         downgraded: list[ArtifactRecord],
     ) -> set[str]:
-        """Check the keepers of one pair; return the planned ids still safe to delete.
+        """Find one kept copy that matches; return the planned ids still safe to delete.
 
-        A keeper that is missing or does not match is marked unverified (and
-        appended to ``downgraded``) and the pair is replanned; the loop ends
-        because every pass downgrades at least one verified record or confirms
-        all keepers. Each keeper is read at most once per run.
-        ``KeeperCheckUnavailable`` and connection errors propagate so the
-        caller refuses the location.
+        The newest verified copy that stays is read first. If it matches, the
+        check ends and ``pending`` may be deleted. If it is missing or does not
+        match, it is marked unverified (and appended to ``downgraded``), the
+        pair is replanned (which can only shrink ``pending``) and the next
+        newest is tried. The check stops as soon as nothing is left to delete,
+        and after ``KEEPER_READS_PER_GROUP`` reads without a match it raises
+        ``KeeperCheckUnavailable`` so the location is refused.
+        ``KeeperCheckUnavailable`` and connection errors from a read propagate
+        the same way.
         """
 
         rule = self._rules.get((backup_class, location))
-        intact: dict[str, bool] = {}
-        while True:
-            records = self.catalog.list(backup_class=backup_class, location=location)
-            bad: list[ArtifactRecord] = []
-            for keeper in self._keepers(rule, records, pending):
-                if keeper.artifact_id not in intact:
-                    intact[keeper.artifact_id] = self._keeper_intact(keeper, target)
-                if not intact[keeper.artifact_id]:
-                    bad.append(keeper)
-            if not bad:
+        for _attempt in range(KEEPER_READS_PER_GROUP):
+            if not pending:
                 return pending
-            for keeper in bad:
-                downgraded.append(self.catalog.mark_unverified(keeper.artifact_id))
+            keeper = self._newest_keeper(
+                self.catalog.list(backup_class=backup_class, location=location), pending
+            )
+            if keeper is None:
+                # Nothing checked stays, so nothing may be deleted.
+                return set()
+            if self._keeper_intact(keeper, target):
+                return pending
+            downgraded.append(self.catalog.mark_unverified(keeper.artifact_id))
             if rule is None:
                 return set()
             replanned, _guarded = self._plan_group(
@@ -350,6 +353,9 @@ class LifecycleManager:
             )
             # Never add a deletion the reviewed plan did not contain.
             pending = pending & {item.record.artifact_id for item in replanned if item.kind == "retention"}
+        if not pending:
+            return pending
+        raise KeeperCheckUnavailable(KEEPER_BUDGET_EXHAUSTED)
 
     # -- applying ------------------------------------------------------------
 
