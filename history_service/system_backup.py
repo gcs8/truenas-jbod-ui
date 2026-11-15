@@ -73,6 +73,7 @@ from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_
 from history_service.segmented_restore import (
     WHOLE_IMPORT_JOURNAL_VERSION,
     file_matches as restore_file_matches,
+    import_seal_path,
     record_file as record_restore_file,
     record_optional_file as record_optional_restore_file,
     record_optional_tree as record_optional_restore_tree,
@@ -707,9 +708,11 @@ class _ImportRollbackEntry:
     backup_path: Path | None = None
     history_store: HistoryStore | None = None
     mutated: bool = False
-    # Recorded staging name; rollback reuses it so recovery can authenticate
-    # and remove a displaced candidate after process loss (#1196).
+    # Recorded staging name and candidate record of a journaled configuration
+    # target; rollback reuses the name so recovery can authenticate and remove
+    # a displaced candidate after process loss (#1196).
     journal_staged_path: Path | None = None
+    journal_candidate_record: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -906,6 +909,13 @@ class _ImportActivationTransaction:
         # target and the commit or rollback decision are recorded in it.
         self._activation_journal: tuple[Path, dict[str, Any]] | None = None
         self._activation_journal_payload: dict[str, Any] | None = None
+        # Journaled configuration artifacts are retired by an authenticated
+        # rename before recursive deletion, so process loss part-way through a
+        # delete never leaves a recorded path half removed.
+        self._recorded_artifacts: dict[Path, tuple[dict[str, Any], Literal["file", "directory"]]] = {}
+        # One seal per configuration folder proves the journal's writer could
+        # write that folder (see segmented_restore.import_seal_path).
+        self._import_seals: dict[Path, tuple[Path, dict[str, Any]]] = {}
         try:
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.rollback_root.mkdir(parents=True, exist_ok=True)
@@ -1029,24 +1039,44 @@ class _ImportActivationTransaction:
     ) -> None:
         """Durably record one target before its live path changes."""
         assert self._activation_journal_payload is not None
+        transaction_id = self._activation_journal_payload["transaction_id"]
         parent = os.stat(target_path.parent, follow_symlinks=False)
+        parent_key = Path(os.path.abspath(target_path.parent))
+        if parent_key not in self._import_seals:
+            seal_path = import_seal_path(parent_key, transaction_id)
+            seal_record = write_restore_journal(
+                seal_path,
+                {"purpose": "restore-import-seal", "transaction_id": transaction_id},
+            )
+            self._import_seals[parent_key] = (seal_path, seal_record)
         targets = list(self._activation_journal_payload.get("targets", []))
         targets.append(
             {
                 "path": os.path.abspath(target_path),
                 "kind": kind,
                 "parent": {"device": parent.st_dev, "inode": parent.st_ino},
+                "seal": self._import_seals[parent_key][1],
                 "staged_name": staged_path.name,
                 "previous_name": previous_path.name,
                 "prior": prior,
                 "candidate": candidate,
             }
         )
+        self._recorded_artifacts[staged_path] = (candidate, kind)
+        if prior.get("kind") != "missing":
+            self._recorded_artifacts[previous_path] = (prior, kind)
         self._update_activation_journal(
             journal_version=WHOLE_IMPORT_JOURNAL_VERSION,
             targets=targets,
             decision=self._activation_journal_payload.get("decision", "pending"),
         )
+
+    def remove_import_seals(self) -> None:
+        """Remove folder seals once the journal that needs them is gone."""
+        for parent_key in sorted(self._import_seals, key=str):
+            seal_path, seal_record = self._import_seals[parent_key]
+            remove_recorded_restore_file(seal_path, seal_record, label="restore import seal")
+        self._import_seals.clear()
 
     @property
     def rollback_completed(self) -> bool:
@@ -1161,6 +1191,7 @@ class _ImportActivationTransaction:
         if prior.get("kind") != entry.kind:
             raise ValueError("Live restore target changed after validation.")
         candidate = record_restore_file(staged_path)
+        entry.journal_candidate_record = candidate
         self._journal_target(
             target_path,
             kind="file",
@@ -1285,8 +1316,6 @@ class _ImportActivationTransaction:
             if self._path_exists(path):
                 raise ValueError("Segmented history restore artifact already exists.")
 
-        hot_entry.journal_staged_path = staged_hot_path
-        segments_entry.journal_staged_path = staged_segments_path
         self._stage_segmented_hot(
             staged_hot_path,
             source_path=self._staged_member(hot_member_key),
@@ -1633,6 +1662,7 @@ class _ImportActivationTransaction:
                 if prior.get("kind") != entry.kind:
                     raise ValueError("Live restore target changed after validation.")
                 candidate = record_restore_tree(staged_dir)
+                entry.journal_candidate_record = candidate
                 self._journal_target(
                     target_dir,
                     kind="directory",
@@ -1820,12 +1850,18 @@ class _ImportActivationTransaction:
                 entry.target_path,
                 expected_kind=entry.expected_kind,
             )
-            if entry.journal_staged_path is not None and not self._path_exists(
-                entry.journal_staged_path
+            if (
+                entry.journal_staged_path is not None
+                and entry.journal_candidate_record is not None
+                and not self._path_exists(entry.journal_staged_path)
             ):
                 # The recorded staging name lets recovery authenticate and
                 # remove the displaced candidate after process loss.
                 displaced_path = entry.journal_staged_path
+                self._recorded_artifacts[displaced_path] = (
+                    entry.journal_candidate_record,
+                    entry.expected_kind,
+                )
             else:
                 displaced_path = self._new_sibling_path(entry.target_path, "restore")
             os.replace(entry.target_path, displaced_path)
@@ -2003,12 +2039,23 @@ class _ImportActivationTransaction:
 
     def _cleanup_sibling_artifact(self, artifact_path: Path) -> None:
         expected_kind = self._sibling_artifacts.get(artifact_path)
+        recorded = self._recorded_artifacts.get(artifact_path)
         if self._path_exists(artifact_path):
             if expected_kind is None:
                 raise RuntimeError("Untracked restore artifact cannot be removed.")
-            self._remove_path(artifact_path, expected_kind=expected_kind)
-            self._fsync_directory(artifact_path.parent)
+            if recorded is not None:
+                record, recorded_kind = recorded
+                remover = (
+                    remove_recorded_restore_file
+                    if recorded_kind == "file"
+                    else remove_recorded_restore_tree
+                )
+                remover(artifact_path, record, label="recorded restore artifact")
+            else:
+                self._remove_path(artifact_path, expected_kind=expected_kind)
+                self._fsync_directory(artifact_path.parent)
         self._sibling_artifacts.pop(artifact_path, None)
+        self._recorded_artifacts.pop(artifact_path, None)
 
     def _cleanup_root(self) -> None:
         if self.root.exists():
@@ -3527,6 +3574,7 @@ class SystemBackupService:
                                 self._remove_segmented_activation_marker(
                                     transaction.activation_journal or marker
                                 )
+                                transaction.remove_import_seals()
                             marker = None
                         raise
                     if marker is not None:
@@ -3535,6 +3583,7 @@ class SystemBackupService:
                         self._remove_segmented_activation_marker(
                             transaction.activation_journal or marker
                         )
+                        transaction.remove_import_seals()
                         marker = None
                     return result
             except Exception:

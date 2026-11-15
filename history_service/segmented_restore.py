@@ -408,6 +408,16 @@ def _journal_update_path(path: Path, transaction_id: str) -> Path:
     return path.with_name(f"{path.name}.next-{transaction_id}")
 
 
+def import_seal_path(folder: Path, transaction_id: str) -> Path:
+    """Seal a restore writes into each configuration folder it journals.
+
+    The journal lives in the history folder, which lower-trust services can
+    write. Requiring a recorded seal inside every target folder means only a
+    writer of that folder can make recovery act on it (#1196).
+    """
+    return folder / f".truenas-jbod-ui-import-seal-{transaction_id}"
+
+
 def replace_restore_journal(
     path: Path,
     payload: dict[str, Any],
@@ -740,6 +750,8 @@ def _configuration_targets(
             and parent["inode"] > 0
         ):
             raise _journal_invalid("a target parent record is malformed.")
+        if not _valid_file_record(item.get("seal")):
+            raise _journal_invalid("a target seal record is malformed.")
         try:
             _artifact_name(
                 item.get("staged_name"),
@@ -755,8 +767,11 @@ def _configuration_targets(
             raise _journal_invalid("a target artifact name is unexpected.") from exc
         staged = path.parent / item["staged_name"]
         previous = path.parent / item["previous_name"]
+        seal = import_seal_path(path.parent, transaction_id)
         for claimed in (path, staged, previous):
-            if any(_paths_overlap(claimed, other) for other in protected):
+            if any(_paths_overlap(claimed, other) for other in protected) or _paths_overlap(
+                claimed, seal
+            ):
                 raise _journal_invalid("a target overlaps history or another target.")
         protected.extend((path, staged, previous))
         targets.append(
@@ -766,6 +781,8 @@ def _configuration_targets(
                 "parent": parent,
                 "staged": staged,
                 "previous": previous,
+                "seal_path": seal,
+                "seal": item["seal"],
                 "prior": prior,
                 "candidate": candidate,
                 "matcher": file_matches if kind == "file" else tree_matches,
@@ -814,6 +831,13 @@ def _configuration_targets(
                 "folder here is not the one the restore used. Run recovery where the "
                 "same configuration volume is mounted (the admin service).",
             )
+        if not file_matches(target["seal_path"], target["seal"]):
+            raise SegmentedRestoreRecoveryRefused(
+                "configuration-target-unsealed",
+                "The restore journal names a configuration file whose folder holds no "
+                "matching restore seal, so it was not written by the restore that "
+                "changed that folder. Recovery changed nothing.",
+            )
         matcher = target["matcher"]
         for location, allowed in (
             (path, (target["prior"], target["candidate"])),
@@ -842,6 +866,15 @@ def _remove_journal_update(journal_path: Path, transaction_id: str) -> None:
         return
     if payload.get("transaction_id") == transaction_id:
         remove_recorded_file(update_path, record, label="activation journal update")
+
+
+def _remove_import_seals(configuration_targets: list[dict[str, Any]]) -> None:
+    removed: set[Path] = set()
+    for target in configuration_targets:
+        if target["seal_path"] in removed:
+            continue
+        removed.add(target["seal_path"])
+        remove_recorded_file(target["seal_path"], target["seal"], label="restore import seal")
 
 
 def recover_segmented_restore(
@@ -992,6 +1025,7 @@ def recover_segmented_restore(
             record=journal_record,
             label="activation journal",
         )
+        _remove_import_seals(configuration_targets)
         return {
             "apply": True,
             "phase": journal["phase"],
@@ -1064,6 +1098,7 @@ def recover_segmented_restore(
         record=journal_record,
         label="activation journal",
     )
+    _remove_import_seals(configuration_targets)
     return {
         "apply": True,
         "phase": journal["phase"],

@@ -25,6 +25,7 @@ from history_service import segment_migration
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
 from history_service.segment_rotation import recover_pending_rotation
+from history_service.segmented_restore import record_file as record_restore_file
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     HISTORY_DB_KEY,
@@ -44,6 +45,7 @@ CANDIDATE_TLS = ["candidate.pem"]
 CRASH_EXIT = 23
 FINISHED_EXIT = 24
 UNEXPECTED_EXIT = 25
+_ORIGINAL_RMTREE = shutil.rmtree
 
 
 class _FixedSettingsBackupService(SystemBackupService):
@@ -266,7 +268,12 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             return "candidate"
         return f"mixed(events={events!r}, catalog={catalog_id!r})"
 
-    def _leftover_restore_artifacts(self, target: _Deployment) -> list[str]:
+    def _leftover_restore_artifacts(
+        self,
+        target: _Deployment,
+        *,
+        history_transaction_id: str | None = None,
+    ) -> list[str]:
         leftovers: list[str] = []
         for directory in (
             target.runtime.parent,
@@ -274,11 +281,25 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             target.hot.parent,
         ):
             for path in directory.iterdir():
+                if (
+                    directory == target.hot.parent
+                    and history_transaction_id is not None
+                    and history_transaction_id not in path.name
+                ):
+                    # An in-process rollback parks a displaced history
+                    # candidate under an unrecorded random name; a crash while
+                    # deleting it can leave it behind. That predates #1196 and
+                    # does not mix generations.
+                    continue
                 # A crash inside authenticated removal can also leave a private
                 # ".segmented-restore-retired-*" quarantine holding an already
                 # retired copy. That predates #1196 and does not mix
                 # generations, so it is not asserted here.
-                if ".previous-" in path.name or ".restore-" in path.name:
+                if (
+                    ".previous-" in path.name
+                    or ".restore-" in path.name
+                    or "-import-seal-" in path.name
+                ):
                     leftovers.append(str(path.relative_to(target.root)))
         return sorted(leftovers)
 
@@ -295,6 +316,7 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         result: dict[str, Any],
         *,
         label: str,
+        history_transaction_id: str | None = None,
     ) -> str:
         config_side = self._config_generation(target)
         history_side = self._history_generation(target)
@@ -309,7 +331,14 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         }[history_side]
         self.assertEqual(result["recovery_state"], expected_state, label)
         self.assertFalse(activation_pending_path(target.hot).exists(), label)
-        self.assertEqual(self._leftover_restore_artifacts(target), [], label)
+        self.assertEqual(
+            self._leftover_restore_artifacts(
+                target,
+                history_transaction_id=history_transaction_id,
+            ),
+            [],
+            label,
+        )
         return history_side
 
     @staticmethod
@@ -390,6 +419,74 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
                 )
         self.assertIn("prior", outcomes.values())
         self.assertIn("candidate", outcomes.values())
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_process_loss_inside_every_recursive_delete_recovers_one_generation(self) -> None:
+        for import_fails in (False, True):
+            with self.subTest(import_fails=import_fails):
+                self._crash_inside_every_recursive_delete(import_fails=import_fails)
+
+    def _crash_inside_every_recursive_delete(self, *, import_fails: bool) -> None:
+        outcomes: dict[int, str] = {}
+        crash_inside = 0
+        while True:
+            crash_inside += 1
+            self.assertLess(crash_inside, 40, "the import never finished")
+            target = self._target(f"target-{int(import_fails)}-{crash_inside:02d}")
+
+            def install_fault(limit: int = crash_inside) -> list[Any]:
+                count = 0
+
+                def fail_commit(_transaction: Any) -> None:
+                    raise RuntimeError("synthetic failure after every target was activated")
+
+                def delete_one_file_then_exit(path: Any, *args: Any, **kwargs: Any) -> None:
+                    nonlocal count
+                    count += 1
+                    if count == limit:
+                        # Model process loss part-way through a recursive
+                        # delete: one child is gone, the rest remain.
+                        for child in sorted(Path(path).rglob("*")):
+                            if child.is_file() and not child.is_symlink():
+                                child.unlink()
+                                break
+                        os._exit(CRASH_EXIT)
+                    _ORIGINAL_RMTREE(path, *args, **kwargs)
+
+                patches = [patch("shutil.rmtree", delete_one_file_then_exit)]
+                if import_fails:
+                    patches.append(
+                        patch.object(_ImportActivationTransaction, "commit", fail_commit)
+                    )
+                return patches
+
+            exit_code = self._import_in_child(target, install_fault)
+            if exit_code in {FINISHED_EXIT, UNEXPECTED_EXIT} and not activation_pending_path(
+                target.hot
+            ).exists():
+                # Finished: committed, or rolled back in process as designed.
+                expected = "prior" if import_fails else "candidate"
+                self.assertEqual(self._config_generation(target), expected)
+                self.assertEqual(self._history_generation(target), expected)
+                break
+            self.assertEqual(exit_code, CRASH_EXIT, f"recursive delete {crash_inside}")
+            with self.subTest(crash_inside_recursive_delete=crash_inside):
+                if not activation_pending_path(target.hot).exists():
+                    side = self._config_generation(target)
+                    self.assertEqual(self._history_generation(target), side)
+                    outcomes[crash_inside] = side
+                    continue
+                transaction_id = json.loads(
+                    activation_pending_path(target.hot).read_text(encoding="utf-8")
+                )["transaction_id"]
+                result = self._recover(target)
+                outcomes[crash_inside] = self._assert_one_generation(
+                    target,
+                    result,
+                    label=f"crash inside recursive delete {crash_inside}",
+                    history_transaction_id=transaction_id,
+                )
+        self.assertTrue(outcomes, "no recursive delete was interrupted")
 
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
     def test_process_loss_during_failed_import_rollback_recovers_one_generation(self) -> None:
@@ -520,6 +617,69 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             self._assert_one_generation(target, result, label="control"),
             "prior",
         )
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_recovery_refuses_a_target_added_by_a_writer_of_history_only(self) -> None:
+        target = self._target()
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(
+                    _ImportActivationTransaction,
+                    "activate_segmented_history",
+                    self._hard_exit,
+                )
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        marker = activation_pending_path(target.hot)
+        journal = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertTrue(
+            journal.get("targets"),
+            "the restore journal must record the configuration targets it activated",
+        )
+        # A service that can write the history folder but not this folder
+        # forges a target that says the victim did not exist before the
+        # restore, so rollback would delete it.
+        protected = target.root / "protected"
+        protected.mkdir()
+        victim = protected / "keep.yaml"
+        victim.write_bytes(b"synthetic protected settings\n")
+        folder = protected.stat()
+        forged_target = dict(journal["targets"][0])
+        forged_target.update(
+            {
+                "path": str(victim),
+                "kind": "file",
+                "parent": {"device": folder.st_dev, "inode": folder.st_ino},
+                "staged_name": f".{victim.name}.restore-{journal['transaction_id']}",
+                "previous_name": f".{victim.name}.previous-{journal['transaction_id']}",
+                "prior": {"kind": "missing"},
+                "candidate": record_restore_file(victim),
+            }
+        )
+        original = marker.read_bytes()
+        forged = json.loads(original)
+        forged["targets"].append(forged_target)
+        marker.write_bytes(json.dumps(forged, sort_keys=True).encode("utf-8"))
+
+        with self.assertRaises(ValueError) as refused:
+            self._recover(target)
+        self.assertEqual(
+            getattr(refused.exception, "reason", None),
+            "configuration-target-unsealed",
+        )
+        self.assertEqual(victim.read_bytes(), b"synthetic protected settings\n")
+        self.assertTrue(marker.exists())
+        self.assertEqual(target.runtime.read_bytes(), CANDIDATE_RUNTIME)
+
+        marker.write_bytes(original)
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="control"),
+            "prior",
+        )
+        self.assertEqual(victim.read_bytes(), b"synthetic protected settings\n")
 
     @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
     def test_recovery_refuses_a_configuration_target_aimed_at_history(self) -> None:

@@ -767,7 +767,15 @@ runtime overrides, profiles, mappings, aliases, slot cache, SSH keys, TLS trust 
 known hosts), the marker becomes a whole-import journal (version 2). Before each
 of those targets changes, the journal durably records its absolute path, the
 identity of its parent folder, its fixed staging and prior names, and the exact
-prior and candidate records. The import then records `commit` before commit
+prior and candidate records. The first time it touches a folder, the import also
+writes a private seal file, `.truenas-jbod-ui-import-seal-<transaction>`, there
+and records it. The journal itself lives in the history folder, which
+lower-trust services can write. Recovery acts on a configuration folder only
+when that folder holds the recorded seal, so a forged journal cannot point
+recovery at files its writer could not change itself. Parked prior and displaced
+configuration copies are retired by an authenticated rename before they are
+deleted, so a crash part-way through a delete never leaves a recorded path half
+removed. The import then records `commit` before commit
 cleanup, or `rollback` before an in-process rollback. Recovery converges every
 recorded target and the history generation to that decision. With no decision it
 finishes forward only when every target already holds the candidate, and
@@ -777,7 +785,8 @@ history agree. Recovery refuses, changes nothing and keeps the journal with a
 named `reason` when the journal is malformed or overlaps history
 (`journal-invalid`), was written by another user (`journal-owner-mismatch`), a
 target's folder is missing or is not the one the restore used
-(`configuration-target-unavailable`), a recorded file changed
+(`configuration-target-unavailable`), the folder lacks the recorded seal
+(`configuration-target-unsealed`), a recorded file changed
 (`configuration-target-divergent`), the prior copy is gone
 (`prior-generation-unavailable`), or a committed import no longer holds the
 candidate (`committed-generation-incomplete`). Builds that only know version 1
