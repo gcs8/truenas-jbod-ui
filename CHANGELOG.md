@@ -76,6 +76,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- The history service no longer fails to start when an interrupted segmented
+  rotation or restore left its activation marker. It now stays up with
+  history stopped, and `/healthz` reports down with the recovery command,
+  leaving the marker and database untouched (#1243).
 
 ### Performance
 
