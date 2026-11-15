@@ -644,7 +644,9 @@ class CIShardContractTests(unittest.TestCase):
         steps = gate["steps"]
 
         # The token is used before any pull-request code (checkout, installs,
-        # test imports) has run on the runner, so that code cannot shim `gh`.
+        # test imports) has run on the runner, so test code cannot shim `gh`.
+        # A pull request can still edit this workflow; the check guards
+        # against unnoticed removal, not against an edit that disables it.
         self.assertIs(steps[0], approval)
         self.assertLess(steps.index(approval), steps.index(compare))
         self.assertEqual(approval["if"], "github.event_name == 'pull_request'")

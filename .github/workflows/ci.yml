@@ -320,7 +320,8 @@ jobs:
           # Read live so adding the label and rerunning this job takes effect.
           # This is the first step: it runs before checkout, dependency
           # installation or any test import, so no pull-request code has run on
-          # this runner while the token is in use.
+          # this runner while the token is in use. That keeps the token away
+          # from test code; it does not stop a pull request editing this step.
           approved="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | index("tests-removed-ok") != null')"
           test "$approved" = true || test "$approved" = false
           echo "approved=${approved}" >> "$GITHUB_OUTPUT"
@@ -374,7 +375,10 @@ jobs:
       # A test deleted and another added keeps every candidate-only check
       # green, so compare with the base. Pull requests fail on a removed or
       # renamed test unless they carry `tests-removed-ok`; pushes to main only
-      # report.
+      # report. This is a guard against unnoticed removal, not a trust
+      # boundary: the job runs this file, scripts/run_test_shard.py and the
+      # test code as the pull request has them, so a pull request that edits
+      # them can switch it off. Review such an edit like a removal.
       - name: Compare test identities with the base
         if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         continue-on-error: ${{ github.event_name != 'pull_request' }}

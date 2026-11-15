@@ -250,6 +250,40 @@ class DiscoveryInventoryTests(unittest.TestCase):
         self.assertIn("unfiltered discovery disagrees", raised.exception.problems[0])
         self.assertIn("nestedpkg.test_inner.A.test_x", raised.exception.problems[0])
 
+    def test_a_nested_module_that_skips_or_fails_import_is_refused_and_named(self) -> None:
+        # unittest turns such a module into a loader placeholder, not a real
+        # test; dropping the placeholder would leave the module unowned and
+        # never run while discovery and verify both passed.
+        cases = {
+            "top-level only": (None, None),
+            "healthy nested": ("", "unfiltered discovery disagrees"),
+            "nested module skip": (
+                "import unittest\nraise unittest.SkipTest('synthetic unavailable')\n",
+                "nestedpkg.test_inner skipped itself at import",
+            ),
+            "nested import error": (
+                "import dependency_that_does_not_exist\n", "nestedpkg.test_inner failed discovery",
+            ),
+        }
+        for label, (prefix, expected) in cases.items():
+            with self.subTest(case=label), _Tree() as tree:
+                tree.write("test_top", ONE_TEST)
+                nested = tree.tests / "nestedpkg"
+                nested.mkdir()
+                (nested / "__init__.py").write_text("", encoding="utf-8")
+                tree._names.update({"nestedpkg", "nestedpkg.test_inner"})
+                if prefix is not None:
+                    (nested / "test_inner.py").write_text(prefix + ONE_TEST, encoding="utf-8")
+                if expected is None:
+                    self.assertEqual(tree.inventory({"1": ("test_top",)})["ids"], ["test_top.A.test_x"])
+                    continue
+                with self.assertRaises(run_test_shard.DiscoveryError) as raised:
+                    tree.inventory({"1": ("test_top",)})
+                self.assertTrue(
+                    any(problem.startswith(expected) for problem in raised.exception.problems),
+                    raised.exception.problems,
+                )
+
     def test_inventory_validation_rejects_malformed_payloads(self) -> None:
         with _Tree() as tree:
             shards = {"1": (tree.write("test_v", _two_tests("b")),)}
@@ -378,10 +412,43 @@ class CommandLineTests(unittest.TestCase):
             completed = self._cli("discover", "--root", str(tree.root), "--output", str(output))
             self.assertEqual(completed.returncode, 0, completed.stderr)
             inventory = run_test_shard.load_inventory(output)
+            written = output.read_text(encoding="utf-8")
             again = self._cli("discover", "--root", str(tree.root), "--output", str(output))
 
         self.assertEqual(inventory["ids"], ["test_iso.T.test_other_root"])
+        self.assertTrue(written.endswith("}\n"), "the inventory ends with one newline")
         self.assertNotEqual(again.returncode, 0, "an existing inventory must not be overwritten")
+
+    def test_a_refused_discovery_writes_no_inventory_and_verify_then_fails(self) -> None:
+        skip = "import unittest\nraise unittest.SkipTest('synthetic unavailable')\n"
+        cases = {
+            "top-level module skip": ("test_bad", skip, "test_bad skipped itself at import"),
+            "top-level import error": (
+                "test_bad", "import dependency_that_does_not_exist\n", "test_bad failed discovery",
+            ),
+            "nested module skip": (
+                "nestedpkg/test_inner", skip, "nestedpkg.test_inner skipped itself at import",
+            ),
+        }
+        for label, (name, prefix, expected) in cases.items():
+            with self.subTest(case=label), _Tree() as tree:
+                tree.write("test_good", ONE_TEST)
+                (tree.tests / "nestedpkg").mkdir()
+                (tree.tests / "nestedpkg" / "__init__.py").write_text("", encoding="utf-8")
+                (tree.tests / f"{name}.py").write_text(prefix + ONE_TEST, encoding="utf-8")
+                output = tree.root / "out" / "inventory.json"
+
+                refused = self._cli("discover", "--root", str(tree.root), "--output", str(output))
+                verify = self._cli(
+                    "verify", "--results-dir", str(tree.results), "--python-version",
+                    BINDING["python_version"], "--inventory", str(output),
+                )
+
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn(f"test discovery: {expected}", refused.stderr)
+                self.assertFalse(output.exists(), "a refused discovery must not leave an inventory")
+                self.assertEqual(verify.returncode, 1)
+                self.assertIn("cannot read inventory", verify.stderr)
 
     def test_compare_fails_on_removals_unless_approved_and_writes_a_summary(self) -> None:
         with _Tree() as tree:
@@ -420,6 +487,21 @@ class CommandLineTests(unittest.TestCase):
             )
         self.assertEqual(completed.returncode, 1)
         self.assertIn("cannot read inventory", completed.stderr)
+
+    def test_the_removal_check_is_described_as_a_guard_a_workflow_edit_can_switch_off(self) -> None:
+        # The comparison runs in the pull request's own workflow with its own
+        # script and imports its test code, so it cannot hold against a pull
+        # request that edits those. Every place that describes it must say so.
+        statements = {
+            "script help": run_test_shard.__doc__ or "",
+            "CONTRIBUTING.md": (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8"),
+            "ci.yml": (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
+        }
+        for label, text in statements.items():
+            with self.subTest(source=label):
+                flat = " ".join(text.replace("#", " ").split())
+                for phrase in ("can switch it off", "unnoticed"):
+                    self.assertTrue(phrase in flat, f"{label} does not say {phrase!r}")
 
     def test_count_manifest_commands_are_gone(self) -> None:
         self.assertFalse((ROOT / "tests" / "unittest_test_counts.json").exists())

@@ -25,8 +25,9 @@ retain the unversioned ``shard-<id>.json`` name.
 ``discover`` builds the expected set independently of ``SHARDS``: it loads every
 ``tests/test_*.py`` module on disk, cross-checks that against one unfiltered
 ``discover`` of the directory, and refuses import errors, module-level
-``SkipTest``, a module with no tests, a duplicate identity and an identity owned
-by another module. The inventory is generated in CI and never committed.
+``SkipTest`` (also in a nested test package the unfiltered pass reaches), a
+module with no tests, a duplicate identity and an identity owned by another
+module. The inventory is generated in CI and never committed.
 
 ``verify`` recursively selects the highest numeric attempt for each shard,
 allowing unaffected shards from earlier attempts of a failed-only rerun;
@@ -41,7 +42,11 @@ scheduled, not platform-dependent outcomes.
 ``compare`` lists identities present in a base inventory but missing from the
 candidate (removed or renamed tests) and those that are new. Removals fail
 unless ``--removals-approved`` is given; CI passes it only when the pull request
-carries the ``tests-removed-ok`` label.
+carries the ``tests-removed-ok`` label. This is a guard against unnoticed
+removal, not a trust boundary: it runs in the pull request's own workflow, with
+this script and the test code from the pull request, so a pull request that
+edits ``.github/workflows/ci.yml``, this script or the test code it imports can
+switch it off. Such an edit needs the same reviewer attention as a removal.
 
 Local full runs keep using discovery (``scripts/dev_check.py --safe``); the shard
 table only serves CI. Rebalance it from a per-test timing run when a shard
@@ -395,12 +400,30 @@ def collect_inventory_ids(tests_dir: Path = TESTS_DIR) -> dict[str, list[str]]:
     if across:
         problems.append(f"test identities collected by more than one module: {_listed(across)}")
 
+    # The unfiltered pass also reaches modules the per-module pass cannot (a
+    # nested test package). A placeholder there is a module that skipped itself
+    # or failed to import: report it by name instead of dropping it, or that
+    # module would be neither listed nor run while every check passed.
     full_loader = unittest.TestLoader()
-    full = Counter(
-        case.id()
-        for case in _iter_cases(full_loader.discover(str(tests_dir), pattern=TEST_MODULE_PATTERN))
-        if not _loader_placeholder(case)
-    )
+    full: Counter = Counter()
+    placeholder_problems: list[str] = []
+    for case in _iter_cases(full_loader.discover(str(tests_dir), pattern=TEST_MODULE_PATTERN)):
+        if not _loader_placeholder(case):
+            full[case.id()] += 1
+            continue
+        name = getattr(case, "_testMethodName", None) or case.id()
+        if name in inventory:
+            continue  # a top-level module, already reported above
+        exception = getattr(case, "_exception", None)
+        if exception is None:
+            placeholder_problems.append(f"{name} skipped itself at import; its real tests cannot be listed")
+        else:
+            placeholder_problems.append(f"{name} failed discovery ({_first_line(str(exception))})")
+    if full_loader.errors and not placeholder_problems and not problems:
+        placeholder_problems.append(
+            f"unfiltered discovery failed ({_first_line(full_loader.errors[0])})"
+        )
+    problems.extend(placeholder_problems)
     if full != union and not problems:
         only_full = sorted((full - union).elements())
         only_modules = sorted((union - full).elements())

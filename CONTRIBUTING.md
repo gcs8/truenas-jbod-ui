@@ -646,7 +646,12 @@ separate worktree, with this checkout kept off the import path) and runs
 request, including a rename or a deletion paired with an addition, fails the check
 and is listed in the job summary. If the removal is intended, a maintainer applies
 the `tests-removed-ok` label and reruns the `Python compile and unittest` jobs; the
-label is read live. Pushes to `main` run the same comparison but only report. Every
+label is read live. Pushes to `main` run the same comparison but only report. The
+comparison is a guard against unnoticed removal, not a trust boundary: it runs in
+the pull request's own workflow with the pull request's `run_test_shard.py` and
+test code, so a pull request that edits `.github/workflows/ci.yml`,
+`scripts/run_test_shard.py` or the test code discovery imports can switch it off.
+Review such an edit with the same attention as a test removal. Every
 `tests/test_*.py` module must sit in exactly one shard; `run` refuses to start
 otherwise and `tests.test_unittest_shards` asserts the same partition. Report-only
 coverage runs on the 3.14 shards with coverage's `sys.monitoring` core and is
@@ -761,6 +766,7 @@ that comment yet; the table below is the authoritative list either way.
 | A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard |
 | An added or generated Python unittest | Nothing else. There is no count file to update | The required gate discovers every test identity on the checked-out commit and fails unless each one completed exactly once across the shards |
 | A removed or renamed Python unittest | The `tests-removed-ok` label on the pull request, applied by a maintainer after reading the removal list in the `Python compile and unittest` job summary | The gate compares the pull request's test identities with its base and fails on any that disappeared, including a deletion paired with an addition that keeps the count the same. The label acknowledges the listed removals; it does not waive the completeness check |
+| `.github/workflows/ci.yml` gate steps, `scripts/run_test_shard.py`, or how test modules load | The same reviewer attention as a test removal | The removal check runs from these files as the pull request has them, so an edit to them can switch it off; it guards against unnoticed removal, not against a change that disables it |
 | Serial numbers, WWNs, hostnames or addresses in any tracked text, including tests and fixtures | Use the synthetic forms the privacy scan accepts (`SANITIZED-` serials, `host.example.test`-style hosts, `192.0.2.x` addresses) or add a reviewed exception in `tests/public_text_privacy_exceptions.json` with a reason | `tests.test_public_doc_privacy` pins every finding by file, category and value hash |
 | A wiki page added or removed | The page count in `scripts/check_public_docs.py`, the page set in `tests/test_public_docs_contract.py`, and `wiki/_Sidebar.md` (the inventory under `docs/archive/` is a historical baseline and is not updated) | `check_public_docs.py` and the docs contract test count and enumerate pages |
 | `.env.example` comment wording that a test quotes (for example the `latest remains the compatibility default` sentence) | The quoting test in `tests/test_ghcr_release_contract.py`, or keep the sentence | The test pins the sentence |
