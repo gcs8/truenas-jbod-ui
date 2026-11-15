@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Malformed controller log or enclosure (SES) output no longer ties up the
+  parser for seconds: a few kilobytes of long letter or whitespace runs made
+  the CDB decoder and the SES element count rescan the same text. Their work
+  now grows linearly with the output, and an operation name or CDB too long to
+  be real is not decoded (#1260).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
