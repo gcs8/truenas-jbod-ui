@@ -212,6 +212,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_snapshot_export",
             "tests.test_storage_view_smart_batch",
             "tests.test_system_backup",
+            "tests.test_system_setup_legacy_add",
         ),
     ),
     WindowsExclusion(

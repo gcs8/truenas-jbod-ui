@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,17 @@ from app.services.sas_fabric import (
 
 _CONFIG_WRITE_LOCK = threading.RLock()
 PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
+# A config without a nonempty `systems` list still monitors one implicit
+# system, built by `_normalize_systems` in app/config.py from the top-level
+# `truenas` and `ssh` sections and their .env overrides, under this id.
+LEGACY_SYSTEM_ID = "default"
+_LEGACY_SYSTEM_HOST_ENV = ("TRUENAS_HOST", "SSH_HOST")
+LEGACY_SYSTEM_MIGRATION_DETAIL = (
+    "This config still monitors a legacy system ('default') from its top-level "
+    "truenas and ssh settings in config.yaml or .env, and adding another system now "
+    "would stop monitoring it. Save the 'default' system in System Setup first so it "
+    "moves into the systems list, then add this one."
+)
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
     "/usr/bin/nvme list-subsys -o json 2>/dev/null || true"
@@ -233,6 +245,24 @@ def _preserved_known_hosts_path(config_path: str | Path, raw_system: Any) -> str
     return str(configured)
 
 
+def legacy_system_configured(config: dict[str, Any]) -> bool:
+    """True when `config` monitors the implicit legacy system and no saved list.
+
+    Writing a `systems` list replaces that implicit system, so a save that
+    starts the list from empty would stop monitoring it (#1227). A host in the
+    top-level `truenas` or `ssh` section, or in the environment overrides
+    that feed them, means an operator configured it. A blank override is
+    unset, as `load_settings` reads it.
+    """
+    if config.get("systems"):
+        return False
+    for section in ("truenas", "ssh"):
+        raw = config.get(section)
+        if isinstance(raw, dict) and normalize_text(str(raw.get("host") or "")):
+            return True
+    return any((os.getenv(name) or "").strip() for name in _LEGACY_SYSTEM_HOST_ENV)
+
+
 class SystemSetupService:
     def __init__(self, config_path: str) -> None:
         self.config_path = Path(config_path)
@@ -349,6 +379,11 @@ class SystemSetupService:
             raw_systems = list(config.get("systems") or [])
             next_index = len(raw_systems) + 1
             system_id = _normalize_system_id(payload.system_id or payload.label, next_index)
+            # Saving the legacy system under its own id is the migration into
+            # `systems`; any other id would leave it unmonitored, so refuse
+            # before writing instead of guessing a migration (#1227).
+            if system_id != LEGACY_SYSTEM_ID and legacy_system_configured(config):
+                raise ValueError(LEGACY_SYSTEM_MIGRATION_DETAIL)
 
             existing_index = next(
                 (

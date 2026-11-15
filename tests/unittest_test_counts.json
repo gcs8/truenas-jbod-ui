@@ -118,6 +118,7 @@
     "test_storage_view_smart_batch": 10,
     "test_system_backup": 282,
     "test_system_setup_api_dialect": 17,
+    "test_system_setup_legacy_add": 8,
     "test_tls_trust": 30,
     "test_truenas_middleware_limits": 35,
     "test_truenas_ws": 66,
