@@ -38,6 +38,7 @@
     "test_full_backup_benchmark": 32,
     "test_ghcr_release_contract": 22,
     "test_heap_probe": 4,
+    "test_history_activation_marker_startup": 7,
     "test_history_backend": 22,
     "test_history_backend_bounds": 10,
     "test_history_backup_coupling": 11,
