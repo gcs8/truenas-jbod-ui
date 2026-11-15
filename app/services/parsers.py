@@ -6,7 +6,7 @@ import shlex
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from typing import Any
 
 from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
@@ -400,17 +400,26 @@ def _coerce_int_like(value: Any) -> int | None:
         return None
 
 
+# A byte total at or above 2**64 is not a plausible drive counter. Refusing it
+# keeps the annualised and endurance estimates (float division) from
+# overflowing, and Decimal-to-int conversion from building an unbounded integer.
+_BYTE_COUNTER_LIMIT = 2**64
+# Largest gigabytes_processed value whose byte total stays under the limit.
+_SCSI_GIGABYTES_LIMIT = Decimal(_BYTE_COUNTER_LIMIT) / Decimal(1_000_000_000)
+
+
+def _bounded_byte_count(byte_count: int | None) -> int | None:
+    if byte_count is None or not 0 <= byte_count < _BYTE_COUNTER_LIMIT:
+        return None
+    return byte_count
+
+
 def _nvme_data_units_to_bytes(value: Any) -> int | None:
     units = _coerce_non_negative_int(value)
     if units is None:
         return None
     # NVMe SMART "data units" are reported in units of 1000 * 512 bytes.
-    return units * 512_000
-
-
-# A byte total at or above 2**64 is not a plausible drive counter; refusing it
-# also keeps Decimal-to-int conversion from building an unbounded integer.
-_SCSI_BYTE_COUNTER_LIMIT = Decimal(2**64)
+    return _bounded_byte_count(units * 512_000)
 
 
 def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
@@ -425,12 +434,14 @@ def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
     if not text:
         return None
     try:
-        byte_count = Decimal(text) * Decimal(1_000_000_000)
-        # Non-finite, negative or implausibly large counters stay unknown.
-        if not byte_count.is_finite() or byte_count < 0 or byte_count >= _SCSI_BYTE_COUNTER_LIMIT:
+        gigabytes = Decimal(text)
+        # Validate before arithmetic: an exponent past the Decimal context
+        # overflows on multiplication, and a tiny negative value rounds to -0.
+        # Non-finite, signed (including -0) or implausibly large counters stay unknown.
+        if not gigabytes.is_finite() or gigabytes.is_signed() or gigabytes >= _SCSI_GIGABYTES_LIMIT:
             return None
-        return int(byte_count)
-    except (InvalidOperation, ValueError, OverflowError):
+        return _bounded_byte_count(int(gigabytes * Decimal(1_000_000_000)))
+    except (DecimalException, ValueError, OverflowError):
         return None
 
 
@@ -445,9 +456,14 @@ def _annualize_bytes(
     return int(byte_count * 24 * 365 / power_on_hours)
 
 
+# NVMe reports composite temperature and its thresholds as 16-bit Kelvin words.
+_NVME_KELVIN_LIMIT = 0xFFFF
+
+
 def _kelvin_to_celsius(value: Any) -> int | None:
     kelvin = _coerce_non_negative_int(value)
-    if kelvin is None or kelvin == 0:
+    # Bounded before float arithmetic: an oversized integer cannot become a float.
+    if kelvin is None or kelvin == 0 or kelvin > _NVME_KELVIN_LIMIT:
         return None
     return int(round(kelvin - 273.15))
 
@@ -488,7 +504,11 @@ def _iter_ata_attribute_entries(payload: dict[str, Any]) -> Iterator[dict[str, A
     )
     if not isinstance(table, list):
         return
-    yield from (entry for entry in table if isinstance(entry, dict))
+    # Only rows with an exact integer id are attributes: a list or object id
+    # cannot be looked up, and a float or boolean id is not an attribute number.
+    yield from (
+        entry for entry in table if isinstance(entry, dict) and type(entry.get("id")) is int
+    )
 
 
 def _extract_ata_attribute_raw_value(payload: dict[str, Any], *attribute_ids: int) -> int | None:
@@ -517,7 +537,7 @@ def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -
     return None
 
 
-def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -> int | None:
+def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int | None) -> int | None:
     raw_value = entry.get("raw")
     parsed_raw_value = None
     if isinstance(raw_value, dict):
@@ -543,9 +563,12 @@ def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -
             "TiB": 1024**4,
         }.get(unit_name)
         if unit_scale is not None:
-            return parsed_raw_value * unit_value * unit_scale
+            return _bounded_byte_count(parsed_raw_value * unit_value * unit_scale)
 
-    return parsed_raw_value * sector_size
+    # A sector count without an admitted sector size has no byte total.
+    if sector_size is None:
+        return None
+    return _bounded_byte_count(parsed_raw_value * sector_size)
 
 
 def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -573,9 +596,11 @@ def _extract_ata_device_stat_int(payload: dict[str, Any], stat_name: str) -> int
     return None
 
 
-def _extract_ata_device_stat_bytes(payload: dict[str, Any], stat_name: str, sector_size: int) -> int | None:
+def _extract_ata_device_stat_bytes(payload: dict[str, Any], stat_name: str, sector_size: int | None) -> int | None:
+    if sector_size is None:
+        return None
     value = _extract_ata_device_stat_int(payload, stat_name)
-    return value * sector_size if value is not None else None
+    return _bounded_byte_count(value * sector_size) if value is not None else None
 
 
 def _parse_enabled_disabled(value: str | None) -> bool | None:
@@ -3395,7 +3420,7 @@ def _finalize_summary(
 def _extract_smartctl_traffic_and_wear(
     payload: dict[str, Any],
     power_on_hours: int | None,
-    sector_size_for_ata: int,
+    sector_size_for_ata: int | None,
 ) -> dict[str, int | None]:
     nvme_health = (
         payload.get("nvme_smart_health_information_log")
@@ -3897,9 +3922,15 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
     power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
     warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(payload, temperature)
+    logical_block_size_reported = "logical_block_size" in payload
     logical_block_size = _json_int(logical_block_size)
+    logical_block_size = logical_block_size if logical_block_size is not None and logical_block_size > 0 else None
     physical_block_size = _json_int(physical_block_size)
-    sector_size_for_ata = logical_block_size if logical_block_size is not None and logical_block_size > 0 else 512
+    physical_block_size = physical_block_size if physical_block_size is not None and physical_block_size > 0 else None
+    # An absent size keeps the long-standing 512-byte sector default. A reported
+    # size that is not a positive integer is rejected, and is never replaced by
+    # that default: sector-valued counters then have no byte total.
+    sector_size_for_ata = logical_block_size if logical_block_size_reported else 512
     traffic_and_wear = _extract_smartctl_traffic_and_wear(
         payload,
         power_on_hours,

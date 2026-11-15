@@ -107,7 +107,7 @@
     "test_slot_bounds_routes": 36,
     "test_slot_detail_store": 20,
     "test_smart_grid_io": 47,
-    "test_smart_json_shapes": 15,
+    "test_smart_json_shapes": 26,
     "test_snapshot_export": 96,
     "test_ssh_connection_keep": 15,
     "test_ssh_failure_contexts": 4,

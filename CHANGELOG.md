@@ -79,8 +79,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - SMART and NVMe JSON with an unexpected shape no longer breaks the SMART
   summary or shows invented readings: a non-object payload reports SMART as
   unavailable, `true`/`false` are no longer read as 1/0 temperatures, hours
-  or byte counts, and infinite, negative or non-numeric counters and
-  non-text fields stay unknown instead of raising (#1249).
+  or byte counts, and infinite, negative, oversized or non-numeric counters,
+  temperatures, attribute ids and non-text fields stay unknown instead of
+  raising. A reported but invalid logical block size no longer falls back to
+  512 bytes, so sector counts give no byte total, and Storage Fabric omits an
+  unknown power-on time instead of showing `0 d` (#1249).
 
 ### Performance
 

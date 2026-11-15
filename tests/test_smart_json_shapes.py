@@ -8,6 +8,7 @@ Valid payloads are the controls: they still produce the same readings.
 
 import json
 import unittest
+from decimal import Decimal
 
 from app.models.domain import SlotView
 from app.services.inventory import InventoryService
@@ -165,6 +166,163 @@ class ScsiByteCounterTests(unittest.TestCase):
                 summary = _summary(self._payload(token))
                 self.assertEqual(summary.bytes_read, expected)
                 self.assertEqual(summary.bytes_written, expected)
+
+
+class ScsiByteCounterBoundaryTests(unittest.TestCase):
+    """Decimal exponents past the arithmetic context are checked before use."""
+
+    @staticmethod
+    def _read(token: str):
+        return _summary({"temperature": {"current": 30},
+                         "scsi_error_counter_log": {"read": {"gigabytes_processed": token}}})
+
+    def test_decimal_exponent_overflow_is_unknown(self) -> None:
+        for token in ("1e1000000", "9e999999999", "1e999999999999999999"):
+            with self.subTest(token=token):
+                summary = self._read(token)
+                self.assertTrue(summary.available)
+                self.assertEqual(summary.temperature_c, 30)
+                self.assertIsNone(summary.bytes_read)
+
+    def test_negative_counter_underflow_is_unknown(self) -> None:
+        # Multiplication rounds these to (negative) zero; the sign is checked first.
+        for token in ("-1e-1000100", "-0", "-0.0", "-1e-30"):
+            with self.subTest(token=token):
+                summary = self._read(token)
+                self.assertEqual(summary.temperature_c, 30)
+                self.assertIsNone(summary.bytes_read)
+
+    def test_counter_cap_boundary_and_controls(self) -> None:
+        limit_gb = Decimal(2**64) / Decimal(10**9)
+        for token, expected in (
+            ("0", 0), ("1.5", 1_500_000_000),
+            (str(limit_gb - Decimal("0.000000001")), 2**64 - 1),
+            (str(limit_gb), None),
+        ):
+            with self.subTest(token=token):
+                self.assertEqual(self._read(token).bytes_read, expected)
+
+
+class SectorSizeAdmissionTests(unittest.TestCase):
+    """A rejected logical block size yields no sector-derived byte total."""
+
+    SECTOR_SOURCES = {
+        "device statistics": {"ata_device_statistics": {"pages": [{"table": [
+            {"name": "Logical Sectors Read", "value": 2},
+            {"name": "Logical Sectors Written", "value": 3},
+        ]}]}},
+        "raw attributes": {"ata_smart_attributes": {"table": [
+            {"id": 242, "name": "Total_LBAs_Read", "raw": {"value": 2}},
+            {"id": 241, "name": "Total_LBAs_Written", "raw": {"value": 3}},
+        ]}},
+    }
+
+    def _read(self, source: str, **extra):
+        return _summary({"temperature": {"current": 30}, **self.SECTOR_SOURCES[source], **extra})
+
+    def test_rejected_sector_size_does_not_invent_bytes(self) -> None:
+        for source in self.SECTOR_SOURCES:
+            for size in (True, False, [], {}, -512, 0, None, "4096", 4096.0):
+                with self.subTest(source=source, size=size):
+                    summary = self._read(source, logical_block_size=size)
+                    self.assertTrue(summary.available)
+                    self.assertEqual(summary.temperature_c, 30)
+                    self.assertIsNone(summary.logical_block_size)
+                    self.assertIsNone(summary.bytes_read)
+                    self.assertIsNone(summary.bytes_written)
+
+    def test_valid_and_absent_sector_size_controls(self) -> None:
+        for source in self.SECTOR_SOURCES:
+            with self.subTest(source=source, size=4096):
+                summary = self._read(source, logical_block_size=4096)
+                self.assertEqual((summary.bytes_read, summary.bytes_written), (8192, 12288))
+            with self.subTest(source=source, size="absent"):
+                # An absent field keeps the long-standing 512-byte default.
+                summary = self._read(source)
+                self.assertEqual((summary.bytes_read, summary.bytes_written), (1024, 1536))
+
+    def test_independent_byte_counters_survive_rejected_size(self) -> None:
+        summary = _summary({
+            "temperature": {"current": 30}, "logical_block_size": True,
+            "scsi_error_counter_log": {"read": {"gigabytes_processed": "1.5"}},
+            "ata_smart_attributes": {"table": [
+                {"id": 241, "name": "Host_Writes_32MiB", "raw": {"value": 2}},
+            ]},
+        })
+        self.assertEqual(summary.bytes_read, 1_500_000_000)
+        self.assertEqual(summary.bytes_written, 2 * 32 * 1024**2)
+
+
+class OversizedIntegerTests(unittest.TestCase):
+    """In-limit JSON integers too large for float arithmetic stay unknown."""
+
+    HUGE = 10**400
+
+    def test_oversized_kelvin_is_unknown(self) -> None:
+        cases = (
+            (parse_nvme_smart_log_summary, "temperature", "temperature_c"),
+            (parse_nvme_id_ctrl_summary, "wctemp", "warning_temperature_c"),
+            (parse_nvme_id_ctrl_summary, "cctemp", "critical_temperature_c"),
+        )
+        for reader, key, field in cases:
+            for value in (self.HUGE, 65536):
+                with self.subTest(field=field, value=str(value)[:8]):
+                    result = reader(json.dumps({key: value, "fr": "FW01", "power_on_hours": 5}))
+                    self.assertIsNone(result[field])
+            with self.subTest(field=field, value="control"):
+                self.assertEqual(reader(json.dumps({key: 348}))[field], 75)
+
+    def test_oversized_byte_counters_are_unknown(self) -> None:
+        huge = self.HUGE
+        payloads = (
+            {"nvme_smart_health_information_log": {"data_units_written": huge, "percentage_used": 3}},
+            {"ata_smart_attributes": {"table": [{"id": 241, "raw": {"value": huge}}]}},
+            {"ata_smart_attributes": {"table": [{"id": 241, "name": "Host_Writes_32MiB", "raw": {"value": huge}}]}},
+            {"ata_device_statistics": {"pages": [{"table": [{"name": "Logical Sectors Written", "value": huge}]}]}},
+            {"logical_block_size": huge,
+             "ata_device_statistics": {"pages": [{"table": [{"name": "Logical Sectors Written", "value": 2}]}]}},
+        )
+        for extra in payloads:
+            with self.subTest(source=next(iter(extra))):
+                summary = _summary({"temperature": {"current": 30}, "power_on_time": {"hours": 1000}, **extra})
+                self.assertEqual(summary.temperature_c, 30)
+                self.assertIsNone(summary.bytes_written)
+                self.assertIsNone(summary.annualized_bytes_written)
+                self.assertIsNone(summary.estimated_lifetime_bytes_written)
+        with self.subTest(source="nvme smart-log"):
+            result = parse_nvme_smart_log_summary(json.dumps(
+                {"temperature": 303, "data_units_written": huge, "power_on_hours": 1000, "percent_used": 3}))
+            self.assertEqual(result["temperature_c"], 30)
+            self.assertIsNone(result["bytes_written"])
+            self.assertIsNone(result["annualized_bytes_written"])
+
+    def test_large_valid_byte_counter_control(self) -> None:
+        summary = _summary({"temperature": {"current": 30}, "power_on_time": {"hours": 8760},
+                            "nvme_smart_health_information_log": {"data_units_written": 10**9, "percentage_used": 50}})
+        self.assertEqual(summary.bytes_written, 10**9 * 512_000)
+        self.assertEqual(summary.annualized_bytes_written, 10**9 * 512_000)
+        self.assertEqual(summary.estimated_lifetime_bytes_written, 2 * 10**9 * 512_000)
+
+
+class AtaAttributeIdentityTests(unittest.TestCase):
+    def test_ata_unhashable_id_keeps_valid_sibling(self) -> None:
+        for bad_id in ([], {}, [12], {"id": 12}, "12", 12.0, True):
+            with self.subTest(bad_id=bad_id):
+                summary = _summary({"temperature": {"current": 30}, "ata_smart_attributes": {"table": [
+                    {"id": bad_id, "raw": {"value": 2}},
+                    {"id": 12, "raw": {"value": 3}},
+                    {"id": bad_id, "name": "Total_LBAs_Written", "raw": {"value": 9}},
+                ]}})
+                self.assertEqual(summary.temperature_c, 30)
+                self.assertEqual(summary.power_cycle_count, 3)
+                self.assertIsNone(summary.bytes_written)
+
+    def test_ata_valid_id_control(self) -> None:
+        summary = _summary({"temperature": {"current": 30}, "ata_smart_attributes": {"table": [
+            {"id": 12, "raw": {"value": 3}},
+            {"id": 241, "name": "Total_LBAs_Written", "raw": {"value": 2}},
+        ]}})
+        self.assertEqual((summary.power_cycle_count, summary.bytes_written), (3, 1024))
 
 
 class SmartctlTextFieldShapeTests(unittest.TestCase):
