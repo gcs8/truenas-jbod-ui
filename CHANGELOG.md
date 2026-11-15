@@ -28,6 +28,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ## Unreleased
 
+### Upgrade notes
+
+- Last-good SMART values saved by earlier versions are not shown after the
+  upgrade, because they do not record which appliance they came from. Each
+  bay shows SMART again after its next successful SMART read (#1261).
+
 ### Changed
 
 - The image now installs every Python package, direct and transitive, from
@@ -45,6 +51,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Changing a system's appliance endpoint or platform while keeping its system
+  ID no longer serves the previous appliance's saved SMART values or bay
+  details: each saved row now records which appliance wrote it, and only that
+  appliance's rows are read. The first SMART read served from saved values
+  after a restart now refreshes from the disk in the background on its own,
+  instead of waiting for a second request (#1261).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
