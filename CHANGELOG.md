@@ -76,6 +76,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- SMART and NVMe JSON with an unexpected shape no longer breaks the SMART
+  summary or shows invented readings: a non-object payload reports SMART as
+  unavailable, `true`/`false` are no longer read as 1/0 temperatures, hours
+  or byte counts, and infinite, negative or non-numeric counters and
+  non-text fields stay unknown instead of raising (#1249).
 
 ### Performance
 
