@@ -38,6 +38,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Storage Fabric SSH failures now retain only a fixed reason, exit status, and
+  reviewed context in public snapshots and status messages; configured command
+  text and remote output stay private, and log command redaction covers
+  credential headers, cookies, URL user information, and authentication schemes
+  (#1259).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
