@@ -45,6 +45,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- When two BMC controllers or shelves report a drive at the same bay number,
+  an IPMI host's bay now shows unknown with a warning, keeps both
+  observations and offers no identify light, instead of showing whichever
+  drive the BMC listed last with that drive's identify target. ESXi hosts,
+  which already refused to choose, now show such a bay as unknown with the
+  same warning instead of empty (#1248).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
