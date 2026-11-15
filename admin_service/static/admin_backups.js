@@ -736,6 +736,7 @@
       const generation = state.dialogGeneration || 0;
       const live = () => generation === (state.dialogGeneration || 0) && Boolean(els.dialog?.open);
       return {
+        generation,
         live,
         result: (text) => (live() ? dialogResult(text) : null),
         actions: (...nodes) => {
@@ -925,9 +926,7 @@
       openDialog("Backup settings", [el("p", { className: "subtle", text: "Loading..." })], [cancelButton("Close")], trigger);
       const scope = dialogScope();
       try {
-        const view = await deps.fetchJson(POLICY_URL);
-        state.policyView = view;
-        showPolicyView(scope, view);
+        adoptPolicyView(scope, await deps.fetchJson(POLICY_URL));
       } catch (error) {
         scope.result(`Couldn't load the backup settings: ${errorText(error)}`);
       }
@@ -940,9 +939,28 @@
       scope.actions(cancelButton(), primary("Save", "policy-save"));
     }
 
-    function editorWithTargets(mutate) {
+    // The editor's model belongs to the dialog generation that loaded it, the
+    // same as its controls (#1199). A reply for a closed or replaced dialog
+    // cannot become the model that the open dialog saves.
+    function adoptPolicyView(scope, view) {
+      if (!scope.live()) return false;
+      state.policyView = view;
+      state.policyViewGeneration = scope.generation;
+      showPolicyView(scope, view);
+      return true;
+    }
+
+    function ownedPolicyView() {
+      const scope = dialogScope();
       const view = state.policyView;
-      if (!view) return;
+      if (!view || !scope.live() || state.policyViewGeneration !== scope.generation) return null;
+      return { scope, view };
+    }
+
+    function editorWithTargets(mutate) {
+      const owned = ownedPolicyView();
+      if (!owned) return;
+      const { scope, view } = owned;
       // Keep what was typed: fold the current form back into the view first,
       // class settings as well as targets (#1198). Locked inputs are never
       // read, so environment values stay as the server sent them.
@@ -957,8 +975,7 @@
         values: { ...edits.targets[index].values },
         pendingSecrets: { ...edits.targets[index].secretChanges },
       }));
-      state.policyView = { ...view, classes, targets: mutate(targets) };
-      showPolicyView(dialogScope(), state.policyView);
+      adoptPolicyView(scope, { ...view, classes, targets: mutate(targets) });
     }
 
     function addPolicyTarget() {
@@ -970,9 +987,9 @@
     }
 
     function savePolicy() {
-      const view = state.policyView;
-      if (!view) return Promise.resolve();
-      const scope = dialogScope();
+      const owned = ownedPolicyView();
+      if (!owned) return Promise.resolve();
+      const { scope, view } = owned;
       const payload = buildPolicyPayload(view, readEdits(view));
       return once("policy-save", async () => {
         scope.result("Saving...");
@@ -982,8 +999,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
           });
-          state.policyView = saved;
-          showPolicyView(scope, saved);
+          adoptPolicyView(scope, saved);
           scope.result(`Saved. Restart the backup scheduler to use the new settings: ${saved.restart_command || "restart enclosure-backup-scheduler"}`);
           setBanner("Backup settings saved. Restart the backup scheduler to apply them.", "success");
         } catch (error) {

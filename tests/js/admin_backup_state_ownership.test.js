@@ -1,10 +1,11 @@
 "use strict";
 
-// Backup admin state ownership (#1198).
+// Backup admin state ownership (#1198, #1199).
 //
 // The backup settings dialog keeps a model next to the controls it draws.
-// These tests pin that an unsaved class draft survives a target change, on
-// screen and in the Save payload.
+// These tests pin that the model belongs to the same dialog generation as the
+// controls a person sees: a class draft survives a target change, and a
+// retired request cannot replace a newer dialog's model.
 // Synthetic data only: example.test names, no real paths.
 
 const assert = require("node:assert/strict");
@@ -334,4 +335,89 @@ test("#1198 control: a class field locked by the environment keeps its value thr
   library.actions.removePolicyTarget(1);
   await library.actions.savePolicy();
   assert.equal("local_keep" in puts(api)[0].classes.config, false, "a locked value is never sent");
+});
+
+// ------------------------------- #1199: a retired request owns nothing --
+
+test("#1199 a retired policy read cannot replace the newer dialog's model", async () => {
+  const retired = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": [() => retired.promise, () => policyView()],
+    "PUT /api/admin/backups/policy": () => policyView({ revision: "rev-2" }),
+  });
+  const { elements, library } = mount(api);
+  const earlier = library.actions.openPolicyEditor(elements.editButton);
+  library.actions.closeDialog();
+  await library.actions.openPolicyEditor(elements.editButton);
+  library.actions.addPolicyTarget();
+  field(elements, "backup-edit-target-1-target_id").value = "bravo";
+  field(elements, "backup-edit-target-1-root").value = "/synthetic/bravo";
+
+  retired.resolve(policyView({ revision: "rev-retired" }));
+  await earlier;
+
+  assert.deepEqual(visibleTargetIds(elements), ["alpha", "bravo"]);
+  await library.actions.savePolicy();
+  const [sent] = puts(api);
+  assert.deepEqual(sent.targets.map((target) => target.values.target_id), ["alpha", "bravo"], "Save sends every visible target");
+  assert.equal(sent.revision, "rev-1", "Save uses the model loaded by the dialog on screen");
+});
+
+test("#1199 a save that completes after its dialog closed cannot replace the newer dialog's model", async () => {
+  const held = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => policyView(),
+    "PUT /api/admin/backups/policy": [() => held.promise, () => policyView({ revision: "rev-3" })],
+  });
+  const { elements, library, banners } = mount(api);
+  await library.actions.openPolicyEditor(elements.editButton);
+  const firstSave = library.actions.savePolicy();
+  library.actions.closeDialog();
+  await library.actions.openPolicyEditor(elements.editButton);
+  library.actions.addPolicyTarget();
+  field(elements, "backup-edit-target-1-target_id").value = "bravo";
+  field(elements, "backup-edit-target-1-root").value = "/synthetic/bravo";
+
+  held.resolve(policyView({ revision: "rev-2" }));
+  await firstSave;
+
+  assert.deepEqual(banners.at(-1), ["Backup settings saved. Restart the backup scheduler to apply them.", "success"], "the finished write is still reported");
+  assert.deepEqual(visibleTargetIds(elements), ["alpha", "bravo"]);
+  assert.doesNotMatch(elements.dialog.textContent, /Saved\./, "the closed dialog's result does not land in the new one");
+  await library.actions.savePolicy();
+  const second = puts(api)[1];
+  assert.deepEqual(second.targets.map((target) => target.values.target_id), ["alpha", "bravo"], "Save sends every visible target");
+  assert.equal(second.revision, "rev-1", "the new dialog keeps the revision it loaded");
+});
+
+test("#1199 control: a save in the dialog that is still open adopts the saved model", async () => {
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": () => policyView(),
+    "PUT /api/admin/backups/policy": [() => policyView({ revision: "rev-2" }), () => policyView({ revision: "rev-3" })],
+  });
+  const { elements, library } = mount(api);
+  await library.actions.openPolicyEditor(elements.editButton);
+  await library.actions.savePolicy();
+  assert.match(elements.dialog.textContent, /Saved\. Restart the backup scheduler/);
+  await library.actions.savePolicy();
+  assert.deepEqual(puts(api).map((sent) => sent.revision), ["rev-1", "rev-2"]);
+});
+
+test("#1199 Save sends nothing while the open dialog has not loaded its own model", async () => {
+  const pending = deferred();
+  const api = fakeApi({
+    "GET /api/admin/backups/policy": [() => policyView(), () => pending.promise],
+    "PUT /api/admin/backups/policy": () => policyView({ revision: "rev-2" }),
+  });
+  const { elements, library } = mount(api);
+  await library.actions.openPolicyEditor(elements.editButton);
+  library.actions.closeDialog();
+  const loading = library.actions.openPolicyEditor(elements.editButton);
+  await library.actions.savePolicy();
+  library.actions.addPolicyTarget();
+  assert.equal(puts(api).length, 0, "an earlier dialog's model is not saved from a dialog still loading");
+  assert.deepEqual(visibleTargetIds(elements), [], "no earlier model is drawn into the loading dialog");
+  pending.resolve(policyView());
+  await loading;
+  assert.deepEqual(visibleTargetIds(elements), ["alpha"]);
 });
