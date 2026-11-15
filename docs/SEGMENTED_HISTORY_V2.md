@@ -762,6 +762,39 @@ the live candidate and parked prior generation. The shared history lock and mark
 remain held through commit cleanup or rollback cleanup, and the marker is removed
 last.
 
+When the same import also restores configuration files or folders (config,
+runtime overrides, profiles, mappings, aliases, slot cache, SSH keys, TLS trust or
+known hosts), the marker becomes a whole-import journal (version 2). Before each
+of those targets changes, the journal durably records its absolute path, the
+identity of its parent folder, its fixed staging and prior names, and the exact
+prior and candidate records. The import then records `commit` before commit
+cleanup, or `rollback` before an in-process rollback. Recovery converges every
+recorded target and the history generation to that decision. With no decision it
+finishes forward only when every target already holds the candidate, and
+otherwise returns every target to the prior generation. It reports
+`prior-generation-restored` or `candidate-finalized` only after configuration and
+history agree. Recovery refuses, changes nothing and keeps the journal with a
+named `reason` when the journal is malformed or overlaps history
+(`journal-invalid`), was written by another user (`journal-owner-mismatch`), a
+target's folder is missing or is not the one the restore used
+(`configuration-target-unavailable`), a recorded file changed
+(`configuration-target-divergent`), the prior copy is gone
+(`prior-generation-unavailable`), or a committed import no longer holds the
+candidate (`committed-generation-incomplete`). Builds that only know version 1
+refuse a version 2 journal rather than recovering history alone (#1196).
+
+The history container does not mount the configuration volume, and in the base
+Compose file the admin service that ran the restore writes the journal as root.
+Recovery from the history container therefore refuses such a journal with
+`journal-owner-mismatch` or `configuration-target-unavailable`. Run the same
+`scripts/rotate_segmented_history.py --source ... --segments-dir ... --recover`
+arguments shown in the rotation section above through the admin service instead:
+`docker compose --profile admin run --rm --no-deps --entrypoint python
+enclosure-admin` with no `--user` override, since that service mounts
+configuration, data and history as the identity that ran the restore. Add
+`--apply` only after reviewing the reported state. A history-only restore keeps
+the version 1 journal and the history-container command unchanged.
+
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2
 FULL backups use the encrypted `tar.zst` stream format (TJBENC02) by default,

@@ -14,6 +14,11 @@ from history_service.segment_catalog import path_entry_exists
 from history_service.segment_reader import SegmentedHistoryReader
 
 ACTIVATION_JOURNAL_VERSION = 1
+# A segmented restore that also activates configuration files records every
+# such target and the whole-import decision. Older builds refuse this version
+# instead of recovering history alone (#1196).
+WHOLE_IMPORT_JOURNAL_VERSION = 2
+WHOLE_IMPORT_DECISIONS = frozenset({"pending", "commit", "rollback"})
 MAX_ACTIVATION_JOURNAL_BYTES = 1024 * 1024
 RESTORE_PHASES = frozenset(
     {
@@ -27,6 +32,14 @@ RESTORE_PHASES = frozenset(
 )
 _TRANSACTION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class SegmentedRestoreRecoveryRefused(ValueError):
+    """Recovery stopped before changing anything; ``reason`` names why."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _fsync_directory(path: Path) -> None:
@@ -329,8 +342,14 @@ def read_activation_journal(path: Path) -> tuple[dict[str, Any], dict[str, Any]]
         raise ValueError("History activation journal is invalid.") from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("journal_version") != ACTIVATION_JOURNAL_VERSION
         or payload.get("operation") not in {"rotate", "segmented-restore"}
+        or type(payload.get("journal_version")) is not int
+        or payload.get("journal_version")
+        not in (
+            {ACTIVATION_JOURNAL_VERSION, WHOLE_IMPORT_JOURNAL_VERSION}
+            if payload.get("operation") == "segmented-restore"
+            else {ACTIVATION_JOURNAL_VERSION}
+        )
     ):
         raise ValueError("History activation journal is invalid.")
     return payload, {
@@ -381,6 +400,37 @@ def write_restore_journal(path: Path, payload: dict[str, Any]) -> dict[str, Any]
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    _fsync_directory(path.parent)
+    return record_file(path)
+
+
+def _journal_update_path(path: Path, transaction_id: str) -> Path:
+    return path.with_name(f"{path.name}.next-{transaction_id}")
+
+
+def replace_restore_journal(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    current_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Durably replace an authenticated restore journal with ``payload``.
+
+    The journal path never disappears: the new content is written and fsynced
+    beside it, then renamed over it, then the directory is fsynced.
+    """
+    if not file_matches(path, current_record):
+        raise ValueError("History activation journal changed before it could be updated.")
+    transaction_id = payload.get("transaction_id")
+    if not isinstance(transaction_id, str) or _TRANSACTION_ID.fullmatch(transaction_id) is None:
+        raise ValueError("Segmented restore transaction ID is invalid.")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_ACTIVATION_JOURNAL_BYTES:
+        # Recovery cannot read a larger journal, so refuse before activation.
+        raise ValueError("The restore touches too many files to record for crash recovery.")
+    update_path = _journal_update_path(path, transaction_id)
+    write_restore_journal(update_path, payload)
+    os.replace(update_path, path)
     _fsync_directory(path.parent)
     return record_file(path)
 
@@ -583,6 +633,217 @@ def _restore_prior_tree(
     _fsync_directory(target.parent)
 
 
+def _restore_prior_target(
+    target: Path,
+    previous: Path,
+    prior: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    matcher: Callable[[Path, Any], bool],
+) -> None:
+    if prior.get("kind") == "missing":
+        _remove_if_present(target, matcher=matcher, record=candidate, label="candidate configuration")
+        return
+    if matcher(target, prior):
+        _remove_if_present(
+            previous,
+            matcher=matcher,
+            record=prior,
+            label="duplicate prior configuration",
+        )
+        return
+    if not matcher(previous, prior):
+        raise SegmentedRestoreRecoveryRefused(
+            "prior-generation-unavailable",
+            "Segmented restore prior configuration is unavailable.",
+        )
+    _remove_if_present(target, matcher=matcher, record=candidate, label="candidate configuration")
+    os.replace(previous, target)
+    _fsync_directory(target.parent)
+
+
+def _journal_invalid(detail: str) -> SegmentedRestoreRecoveryRefused:
+    return SegmentedRestoreRecoveryRefused(
+        "journal-invalid",
+        f"Segmented restore journal is invalid: {detail}",
+    )
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    try:
+        common = os.path.commonpath((str(first), str(second)))
+    except ValueError:
+        return False
+    return common in {str(first), str(second)}
+
+
+def _configuration_targets(
+    *,
+    journal: dict[str, Any],
+    journal_record: dict[str, Any],
+    journal_path: Path,
+    source: Path,
+    segments_directory: Path,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Validate the non-history targets a whole-import journal recorded."""
+    if journal.get("journal_version") != WHOLE_IMPORT_JOURNAL_VERSION:
+        return [], None
+    decision = journal.get("decision")
+    if decision not in WHOLE_IMPORT_DECISIONS:
+        raise _journal_invalid("the import decision is not recognised.")
+    recorded = journal.get("targets")
+    if not isinstance(recorded, list):
+        raise _journal_invalid("the target list is missing.")
+    transaction_id = journal["transaction_id"]
+    protected = [
+        source,
+        Path(f"{source}-wal"),
+        Path(f"{source}-shm"),
+        Path(f"{source}-journal"),
+        segments_directory,
+        journal_path,
+        _journal_update_path(journal_path, transaction_id),
+        source.parent / f".{source.name}.restore-{transaction_id}",
+        source.parent / f".{source.name}.previous-{transaction_id}",
+        segments_directory.parent / f".{segments_directory.name}.restore-{transaction_id}",
+        segments_directory.parent / f".{segments_directory.name}.previous-{transaction_id}",
+    ]
+    targets: list[dict[str, Any]] = []
+    for item in recorded:
+        if not isinstance(item, dict):
+            raise _journal_invalid("a target entry is not an object.")
+        raw_path = item.get("path")
+        if (
+            not isinstance(raw_path, str)
+            or not os.path.isabs(raw_path)
+            or os.path.normpath(raw_path) != raw_path
+            or Path(raw_path).name in {"", ".", ".."}
+        ):
+            raise _journal_invalid("a target path is not a normalized absolute path.")
+        path = Path(raw_path)
+        kind = item.get("kind")
+        if kind not in {"file", "directory"}:
+            raise _journal_invalid("a target kind is not recognised.")
+        validate = _valid_file_record if kind == "file" else _valid_tree_record
+        prior = item.get("prior")
+        candidate = item.get("candidate")
+        if not validate(candidate) or not isinstance(prior, dict):
+            raise _journal_invalid("a target record is malformed.")
+        if prior.get("kind") != "missing" and not validate(prior):
+            raise _journal_invalid("a prior target record is malformed.")
+        parent = item.get("parent")
+        if not (
+            isinstance(parent, dict)
+            and type(parent.get("device")) is int
+            and parent["device"] >= 0
+            and type(parent.get("inode")) is int
+            and parent["inode"] > 0
+        ):
+            raise _journal_invalid("a target parent record is malformed.")
+        try:
+            _artifact_name(
+                item.get("staged_name"),
+                expected=f".{path.name}.restore-{transaction_id}",
+                label="staged configuration path",
+            )
+            _artifact_name(
+                item.get("previous_name"),
+                expected=f".{path.name}.previous-{transaction_id}",
+                label="prior configuration path",
+            )
+        except ValueError as exc:
+            raise _journal_invalid("a target artifact name is unexpected.") from exc
+        staged = path.parent / item["staged_name"]
+        previous = path.parent / item["previous_name"]
+        for claimed in (path, staged, previous):
+            if any(_paths_overlap(claimed, other) for other in protected):
+                raise _journal_invalid("a target overlaps history or another target.")
+        protected.extend((path, staged, previous))
+        targets.append(
+            {
+                "path": path,
+                "kind": kind,
+                "parent": parent,
+                "staged": staged,
+                "previous": previous,
+                "prior": prior,
+                "candidate": candidate,
+                "matcher": file_matches if kind == "file" else tree_matches,
+            }
+        )
+    if not targets:
+        return targets, decision
+    # Only the identity that wrote the journal may follow its configuration
+    # paths; anyone else could otherwise point recovery at files it cannot
+    # write itself.
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or journal_record.get("uid") != geteuid():
+        raise SegmentedRestoreRecoveryRefused(
+            "journal-owner-mismatch",
+            "This interrupted restore also changed configuration files and its "
+            "journal was written by a different user. Run recovery as the user "
+            "that ran the restore (the admin service), with the configuration "
+            "volume mounted.",
+        )
+    for target in targets:
+        path = target["path"]
+        cursor = path.parent
+        try:
+            while True:
+                metadata = os.stat(cursor, follow_symlinks=False)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise OSError("not a directory")
+                if cursor == cursor.parent:
+                    break
+                cursor = cursor.parent
+            parent_metadata = os.stat(path.parent, follow_symlinks=False)
+        except OSError as exc:
+            raise SegmentedRestoreRecoveryRefused(
+                "configuration-target-unavailable",
+                "This interrupted restore also changed configuration files that are "
+                "not reachable here. Run recovery where the configuration volume is "
+                "mounted (the admin service).",
+            ) from exc
+        if (parent_metadata.st_dev, parent_metadata.st_ino) != (
+            target["parent"]["device"],
+            target["parent"]["inode"],
+        ):
+            raise SegmentedRestoreRecoveryRefused(
+                "configuration-target-unavailable",
+                "This interrupted restore also changed configuration files, but their "
+                "folder here is not the one the restore used. Run recovery where the "
+                "same configuration volume is mounted (the admin service).",
+            )
+        matcher = target["matcher"]
+        for location, allowed in (
+            (path, (target["prior"], target["candidate"])),
+            (target["staged"], (target["candidate"],)),
+            (target["previous"], (target["prior"],)),
+        ):
+            if path_entry_exists(location) and not any(
+                matcher(location, record) for record in allowed
+            ):
+                raise SegmentedRestoreRecoveryRefused(
+                    "configuration-target-divergent",
+                    "A configuration file changed after the interrupted restore; "
+                    "recovery kept every file for review.",
+                )
+    return targets, decision
+
+
+def _remove_journal_update(journal_path: Path, transaction_id: str) -> None:
+    update_path = _journal_update_path(journal_path, transaction_id)
+    if not path_entry_exists(update_path):
+        return
+    try:
+        payload, record = read_activation_journal(update_path)
+    except (OSError, ValueError):
+        # A torn update is not authenticated evidence; leave it for review.
+        return
+    if payload.get("transaction_id") == transaction_id:
+        remove_recorded_file(update_path, record, label="activation journal update")
+
+
 def recover_segmented_restore(
     *,
     source: Path,
@@ -600,6 +861,13 @@ def recover_segmented_restore(
         if path_entry_exists(Path(f"{source}{suffix}")):
             raise ValueError("Segmented restore recovery refuses SQLite sidecar artifacts.")
     paths = _restore_paths(source, segments_directory, journal)
+    configuration_targets, decision = _configuration_targets(
+        journal=journal,
+        journal_record=journal_record,
+        journal_path=journal_path,
+        source=source,
+        segments_directory=segments_directory,
+    )
     prior_hot = paths["prior_hot"]
     candidate_hot = paths["candidate_hot"]
     prior_segments = paths["prior_segments"]
@@ -644,7 +912,25 @@ def recover_segmented_restore(
         segments_directory,
         candidate_segments,
     )
-    if candidate_live:
+    configuration_candidate_live = all(
+        target["matcher"](target["path"], target["candidate"])
+        for target in configuration_targets
+    )
+    # A whole-import journal converges every target to its recorded decision.
+    # Without one, only a fully activated candidate is finished forward.
+    if decision == "commit":
+        finish_candidate = True
+    elif decision == "rollback":
+        finish_candidate = False
+    else:
+        finish_candidate = candidate_live and configuration_candidate_live
+    if finish_candidate and not (candidate_live and configuration_candidate_live):
+        raise SegmentedRestoreRecoveryRefused(
+            "committed-generation-incomplete",
+            "The interrupted restore was committed, but not every restored file "
+            "still holds the committed generation; recovery kept every file for review.",
+        )
+    if finish_candidate:
         try:
             reader = SegmentedHistoryReader.from_catalog(
                 hot_path=source,
@@ -686,6 +972,20 @@ def recover_segmented_restore(
             record=candidate_segments,
             label="staged segment tree",
         )
+        for target in configuration_targets:
+            _remove_if_present(
+                target["previous"],
+                matcher=target["matcher"],
+                record=target["prior"],
+                label="prior configuration",
+            )
+            _remove_if_present(
+                target["staged"],
+                matcher=target["matcher"],
+                record=target["candidate"],
+                label="staged configuration",
+            )
+        _remove_journal_update(journal_path, journal["transaction_id"])
         _remove_if_present(
             journal_path,
             matcher=file_matches,
@@ -706,6 +1006,18 @@ def recover_segmented_restore(
     ) or tree_matches(previous_segments, prior_segments)
     if not prior_hot_available or not prior_segments_available:
         raise ValueError("Segmented restore prior generation is unavailable.")
+    for target in configuration_targets:
+        matcher = target["matcher"]
+        if not (
+            target["prior"].get("kind") == "missing"
+            or matcher(target["path"], target["prior"])
+            or matcher(target["previous"], target["prior"])
+        ):
+            raise SegmentedRestoreRecoveryRefused(
+                "prior-generation-unavailable",
+                "The configuration from before the interrupted restore is no longer "
+                "available, so recovery cannot return to it; every file was kept.",
+            )
     if not apply:
         return {
             "apply": False,
@@ -731,6 +1043,21 @@ def recover_segmented_restore(
         record=candidate_segments,
         label="staged segment tree",
     )
+    for target in configuration_targets:
+        _restore_prior_target(
+            target["path"],
+            target["previous"],
+            target["prior"],
+            target["candidate"],
+            matcher=target["matcher"],
+        )
+        _remove_if_present(
+            target["staged"],
+            matcher=target["matcher"],
+            record=target["candidate"],
+            label="staged configuration",
+        )
+    _remove_journal_update(journal_path, journal["transaction_id"])
     _remove_if_present(
         journal_path,
         matcher=file_matches,

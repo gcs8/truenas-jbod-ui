@@ -71,6 +71,7 @@ from history_service.migration_lock import history_write_lock
 from history_service.segment_reader import SegmentedHistoryReader
 from history_service.segment_sealer import SEGMENT_DIRECTORY_MODE, SEGMENT_FILE_MODE
 from history_service.segmented_restore import (
+    WHOLE_IMPORT_JOURNAL_VERSION,
     file_matches as restore_file_matches,
     record_file as record_restore_file,
     record_optional_file as record_optional_restore_file,
@@ -78,6 +79,7 @@ from history_service.segmented_restore import (
     record_tree as record_restore_tree,
     remove_recorded_file as remove_recorded_restore_file,
     remove_recorded_tree as remove_recorded_restore_tree,
+    replace_restore_journal,
     tree_matches as restore_tree_matches,
     write_restore_journal,
 )
@@ -314,6 +316,14 @@ def _segmented_integrity_message(stage: str) -> str:
     logger.error("Segmented history restore integrity check failed at stage: %s.", stage)
     return (
         "The restore was stopped because a history file changed while it was being "
+        "copied or swapped into place."
+    )
+
+
+def _journaled_restore_integrity_message(stage: str) -> str:
+    logger.error("Journaled restore integrity check failed at stage: %s.", stage)
+    return (
+        "The restore was stopped because a restored file changed while it was being "
         "copied or swapped into place."
     )
 
@@ -697,6 +707,9 @@ class _ImportRollbackEntry:
     backup_path: Path | None = None
     history_store: HistoryStore | None = None
     mutated: bool = False
+    # Recorded staging name; rollback reuses it so recovery can authenticate
+    # and remove a displaced candidate after process loss (#1196).
+    journal_staged_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -889,6 +902,10 @@ class _ImportActivationTransaction:
         self._rollback_completed = False
         self._prepared_segmented_restore: _PreparedSegmentedRestore | None = None
         self._preserve_segmented_evidence = False
+        # Durable whole-import journal (#1196): once bound, every activated
+        # target and the commit or rollback decision are recorded in it.
+        self._activation_journal: tuple[Path, dict[str, Any]] | None = None
+        self._activation_journal_payload: dict[str, Any] | None = None
         try:
             self.staging_root.mkdir(parents=True, exist_ok=True)
             self.rollback_root.mkdir(parents=True, exist_ok=True)
@@ -918,6 +935,11 @@ class _ImportActivationTransaction:
                 f"deleted; the files needed to recover are preserved in {self.root}."
             ) from exc
         if exc is not None and not self._committed:
+            if self._records_whole_import():
+                try:
+                    self._update_activation_journal(decision="rollback")
+                except Exception as decision_error:
+                    exc.add_note(f"Recording the rollback decision failed: {decision_error}")
             try:
                 self.rollback()
             except Exception as rollback_error:
@@ -949,7 +971,82 @@ class _ImportActivationTransaction:
         return False
 
     def commit(self) -> None:
+        if self._records_whole_import():
+            self._update_activation_journal(decision="commit")
         self._committed = True
+
+    def bind_activation_journal(
+        self,
+        marker: tuple[Path, dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Record later targets and the import decision in this journal."""
+        self._activation_journal = marker
+        self._activation_journal_payload = json.loads(json.dumps(payload))
+
+    @property
+    def activation_journal(self) -> tuple[Path, dict[str, Any]] | None:
+        return self._activation_journal
+
+    def _records_whole_import(self) -> bool:
+        return (
+            self._activation_journal_payload is not None
+            and self._activation_journal_payload.get("journal_version")
+            == WHOLE_IMPORT_JOURNAL_VERSION
+        )
+
+    def _update_activation_journal(self, **changes: Any) -> None:
+        if self._activation_journal is None or self._activation_journal_payload is None:
+            raise ValueError("Restore activation journal is not bound.")
+        payload = {**self._activation_journal_payload, **changes}
+        journal_path, journal_record = self._activation_journal
+        updated_record = replace_restore_journal(
+            journal_path,
+            payload,
+            current_record=journal_record,
+        )
+        self._activation_journal = (journal_path, updated_record)
+        self._activation_journal_payload = payload
+
+    def _journaled_sibling_paths(self, target_path: Path) -> tuple[Path, Path]:
+        assert self._activation_journal_payload is not None
+        transaction_id = self._activation_journal_payload["transaction_id"]
+        staged_path = target_path.parent / f".{target_path.name}.restore-{transaction_id}"
+        previous_path = target_path.parent / f".{target_path.name}.previous-{transaction_id}"
+        if self._path_exists(staged_path) or self._path_exists(previous_path):
+            raise ValueError("Restore artifact already exists.")
+        return staged_path, previous_path
+
+    def _journal_target(
+        self,
+        target_path: Path,
+        *,
+        kind: Literal["file", "directory"],
+        staged_path: Path,
+        previous_path: Path,
+        prior: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> None:
+        """Durably record one target before its live path changes."""
+        assert self._activation_journal_payload is not None
+        parent = os.stat(target_path.parent, follow_symlinks=False)
+        targets = list(self._activation_journal_payload.get("targets", []))
+        targets.append(
+            {
+                "path": os.path.abspath(target_path),
+                "kind": kind,
+                "parent": {"device": parent.st_dev, "inode": parent.st_ino},
+                "staged_name": staged_path.name,
+                "previous_name": previous_path.name,
+                "prior": prior,
+                "candidate": candidate,
+            }
+        )
+        self._update_activation_journal(
+            journal_version=WHOLE_IMPORT_JOURNAL_VERSION,
+            targets=targets,
+            decision=self._activation_journal_payload.get("decision", "pending"),
+        )
 
     @property
     def rollback_completed(self) -> bool:
@@ -1032,7 +1129,55 @@ class _ImportActivationTransaction:
         cls._fsync_directory(path.parent)
 
     def activate_file(self, target_path: Path, member_key: str) -> None:
+        if self._activation_journal is not None:
+            self._activate_journaled_file(target_path, member_key)
+            return
         self._activate_file(target_path, member_key, allow_history=False)
+
+    def _activate_journaled_file(self, target_path: Path, member_key: str) -> None:
+        entry = self._record_target(target_path, expected_kind="file")
+        staged_member = self._staged_member(member_key)
+        self._ensure_parent_hierarchy(target_path.parent)
+        staged_path, previous_path = self._journaled_sibling_paths(target_path)
+        file_owner = self._existing_owner(
+            target_path if entry.kind == "file" else target_path.parent,
+            directory=entry.kind != "file",
+        )
+        file_mode = (
+            target_path.stat(follow_symlinks=False).st_mode & 0o7777
+            if entry.kind == "file"
+            else self._MISSING_FILE_MODE
+        )
+        self._copy_file_exclusive(
+            staged_member,
+            staged_path,
+            owner=file_owner,
+            mode=file_mode,
+        )
+        self._sibling_artifacts[staged_path] = "file"
+        self._fsync_directory(target_path.parent)
+        entry.journal_staged_path = staged_path
+        prior = record_optional_restore_file(target_path)
+        if prior.get("kind") != entry.kind:
+            raise ValueError("Live restore target changed after validation.")
+        candidate = record_restore_file(staged_path)
+        self._journal_target(
+            target_path,
+            kind="file",
+            staged_path=staged_path,
+            previous_path=previous_path,
+            prior=prior,
+            candidate=candidate,
+        )
+        self._activate_prepared_target(
+            entry,
+            staged_path=staged_path,
+            previous_path=previous_path,
+            prior_record=prior,
+            candidate_record=candidate,
+            matcher=restore_file_matches,
+            integrity_message=_journaled_restore_integrity_message,
+        )
 
     def _activate_file(
         self,
@@ -1140,6 +1285,8 @@ class _ImportActivationTransaction:
             if self._path_exists(path):
                 raise ValueError("Segmented history restore artifact already exists.")
 
+        hot_entry.journal_staged_path = staged_hot_path
+        segments_entry.journal_staged_path = staged_segments_path
         self._stage_segmented_hot(
             staged_hot_path,
             source_path=self._staged_member(hot_member_key),
@@ -1304,6 +1451,7 @@ class _ImportActivationTransaction:
         prior_record: dict[str, Any],
         candidate_record: dict[str, Any],
         matcher: Callable[[Path, Any], bool],
+        integrity_message: Callable[[str], str] = _segmented_integrity_message,
     ) -> None:
         prior_matches = (
             not self._path_exists(entry.target_path)
@@ -1312,7 +1460,7 @@ class _ImportActivationTransaction:
         )
         if not prior_matches or not matcher(staged_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError(_segmented_integrity_message("prepared artifact"))
+            raise ValueError(integrity_message("prepared artifact"))
         if entry.kind != "missing":
             if self._path_exists(previous_path):
                 raise ValueError("Segmented history prior restore artifact already exists.")
@@ -1323,14 +1471,14 @@ class _ImportActivationTransaction:
             self._fsync_directory(entry.target_path.parent)
             if not matcher(previous_path, prior_record):
                 self._preserve_segmented_evidence = True
-                raise ValueError(_segmented_integrity_message("parked prior"))
+                raise ValueError(integrity_message("parked prior"))
         os.replace(staged_path, entry.target_path)
         self._sibling_artifacts.pop(staged_path, None)
         entry.mutated = True
         self._fsync_directory(entry.target_path.parent)
         if not matcher(entry.target_path, candidate_record):
             self._preserve_segmented_evidence = True
-            raise ValueError(_segmented_integrity_message("activated candidate"))
+            raise ValueError(integrity_message("activated candidate"))
 
     def activate_segmented_history(
         self,
@@ -1413,12 +1561,18 @@ class _ImportActivationTransaction:
         entry = self._record_target(target_dir, expected_kind="directory")
         existing_directory = target_dir if entry.kind == "directory" else None
         self._ensure_parent_hierarchy(target_dir.parent)
-        staged_dir = Path(
-            tempfile.mkdtemp(
-                prefix=f".{target_dir.name}.restore-",
-                dir=target_dir.parent,
+        journaled = self._activation_journal is not None
+        if journaled:
+            staged_dir, previous_dir = self._journaled_sibling_paths(target_dir)
+            staged_dir.mkdir(mode=0o700)
+        else:
+            previous_dir = None
+            staged_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{target_dir.name}.restore-",
+                    dir=target_dir.parent,
+                )
             )
-        )
         self._sibling_artifacts[staged_dir] = "directory"
         root_owner = self._existing_owner(
             existing_directory or target_dir.parent,
@@ -1473,13 +1627,39 @@ class _ImportActivationTransaction:
                     ),
                 )
             self._fsync_tree(staged_dir, files_already_synced=True)
-            self._park_original(entry)
-            os.replace(staged_dir, target_dir)
-            self._sibling_artifacts.pop(staged_dir, None)
-            entry.mutated = True
-            self._fsync_directory(target_dir.parent)
+            if previous_dir is not None:
+                entry.journal_staged_path = staged_dir
+                prior = record_optional_restore_tree(target_dir)
+                if prior.get("kind") != entry.kind:
+                    raise ValueError("Live restore target changed after validation.")
+                candidate = record_restore_tree(staged_dir)
+                self._journal_target(
+                    target_dir,
+                    kind="directory",
+                    staged_path=staged_dir,
+                    previous_path=previous_dir,
+                    prior=prior,
+                    candidate=candidate,
+                )
+                self._activate_prepared_target(
+                    entry,
+                    staged_path=staged_dir,
+                    previous_path=previous_dir,
+                    prior_record=prior,
+                    candidate_record=candidate,
+                    matcher=restore_tree_matches,
+                    integrity_message=_journaled_restore_integrity_message,
+                )
+            else:
+                self._park_original(entry)
+                os.replace(staged_dir, target_dir)
+                self._sibling_artifacts.pop(staged_dir, None)
+                entry.mutated = True
+                self._fsync_directory(target_dir.parent)
         finally:
-            self._cleanup_sibling_artifact(staged_dir)
+            # A failed integrity check keeps the staged tree as evidence.
+            if not self._preserve_segmented_evidence:
+                self._cleanup_sibling_artifact(staged_dir)
 
     def activate_history(self, store: HistoryStore, member_key: str) -> None:
         entry = self._record_history(store)
@@ -1640,7 +1820,14 @@ class _ImportActivationTransaction:
                 entry.target_path,
                 expected_kind=entry.expected_kind,
             )
-            displaced_path = self._new_sibling_path(entry.target_path, "restore")
+            if entry.journal_staged_path is not None and not self._path_exists(
+                entry.journal_staged_path
+            ):
+                # The recorded staging name lets recovery authenticate and
+                # remove the displaced candidate after process loss.
+                displaced_path = entry.journal_staged_path
+            else:
+                displaced_path = self._new_sibling_path(entry.target_path, "restore")
             os.replace(entry.target_path, displaced_path)
             self._sibling_artifacts[displaced_path] = entry.expected_kind
             self._fsync_directory(entry.target_path.parent)
@@ -3320,6 +3507,7 @@ class SystemBackupService:
                                     self.store,
                                     marker_payload,
                                 )
+                                transaction.bind_activation_journal(marker, marker_payload)
                             extraction_root = cleanup_root
                             cleanup_root = None
                             self._cleanup_extracted_archive(extraction_root)
@@ -3336,11 +3524,17 @@ class SystemBackupService:
                     except Exception:
                         if marker is not None:
                             if transaction.rollback_completed:
-                                self._remove_segmented_activation_marker(marker)
+                                self._remove_segmented_activation_marker(
+                                    transaction.activation_journal or marker
+                                )
                             marker = None
                         raise
                     if marker is not None:
-                        self._remove_segmented_activation_marker(marker)
+                        # The journal may have been rewritten with each target
+                        # and the commit decision; remove its current record.
+                        self._remove_segmented_activation_marker(
+                            transaction.activation_journal or marker
+                        )
                         marker = None
                     return result
             except Exception:

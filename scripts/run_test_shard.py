@@ -146,6 +146,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_backend_bounds",
         "test_history_bulk_bounds",
         "test_history_runtime_damage_pause",
+        "test_interrupted_restore_recovery",
         "test_mapping_routes",
         "test_nonroot_migration",
         "test_public_demo_deterministic",
