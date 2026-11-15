@@ -2168,12 +2168,17 @@ def _ses_enclosures_share_identity(first: SESMapEnclosure, second: SESMapEnclosu
         return bool(first.ses_device and first.ses_device == second.ses_device)
     # Unkeyed redundant paths need disk and attached-enclosure evidence.
     # Host-local names and sg basenames are never cross-host identity proof.
+    # A zero or missing address, in any spelling, is absence rather than
+    # identity, and a bay the enclosure reports empty is no anchor (#1217).
     def bay_identities(enclosure):
-        addresses = Counter(slot.sas_address for slot in enclosure.slots.values() if slot.sas_address)
-        return {(slot.slot_number, slot.sas_address, slot.attached_sas_address)
-                for slot in enclosure.slots.values()
-                if slot.sas_address not in {None, "0x0"} and addresses[slot.sas_address] == 1
-                and slot.attached_sas_address not in {None, "0x0"}
+        bays = [(slot, normalize_hex_identifier(slot.sas_address),
+                 normalize_hex_identifier(slot.attached_sas_address))
+                for slot in enclosure.slots.values()]
+        addresses = Counter(address for _slot, address, _attached in bays if address not in {None, "0"})
+        return {(slot.slot_number, address, attached)
+                for slot, address, attached in bays
+                if address not in {None, "0"} and addresses[address] == 1
+                and attached not in {None, "0"} and slot.present is not False
                 and not slot.sas_address_conflict and not slot.sas_address_degraded}
     return bool(bay_identities(first) & bay_identities(second))
 
