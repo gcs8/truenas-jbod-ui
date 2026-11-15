@@ -493,7 +493,13 @@ can only remove deletions, never add one), and the next newest verified copy is
 read. The check stops as soon as nothing is left to delete. The clean-up result
 and the backup page's "Last clean-up" status line both say how many copies were
 marked unverified, even when the clean-up otherwise finished; the clean-up
-result also says how many planned deletions were skipped.
+result also says how many planned deletions were not carried out because the
+copies that would have stayed could not be confirmed good, and what to do
+next: run Verify on the copies marked unverified, then clean up again if they
+pass, or back up again to replace them if they do not. In the clean-up dialog
+that result is shown in the problem colour, and the plan's introduction
+changes to say the copies were in the plan rather than that they will be
+deleted.
 
 Because a clean-up reads kept copies back first, a manual clean-up can take
 minutes. The admin service waits up to 10 minutes for it. If it is still

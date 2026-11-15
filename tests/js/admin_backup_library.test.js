@@ -810,11 +810,46 @@ test("clean up that kept copies after a failed keeper check says so, not plain s
   const { elements, library, banners } = mount({ api });
   await library.load();
   await library.actions.openCleanup();
+  assert.match(elements.dialog.textContent, /These 2 copies will be deleted/);
   await library.actions.applyCleanup();
   const text = "Deleted 0 copies. 1 kept copy failed the size and SHA-256 check and was marked unverified. "
-    + "2 planned deletions were skipped.";
+    + "2 planned deletions were not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copy marked unverified: if it passes, clean up again; if not, back up again to replace it.";
   assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
   assert.deepEqual(banners.at(-1), [text, "error"]);
+  // Once a result is shown, the plan's introduction no longer promises deletions.
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\. The result is below\./);
+  // The result carries the same problem tone as the banner, not the muted note colour.
+  const result = elements.dialog.querySelector(".backup-dialog-result");
+  assert.match(result.className, /(^|\s)is-bad(\s|$)/);
+  assert.match(STYLES, /\.backup-dialog-result\.is-bad[\s,{]/, "the problem tone has a style");
+});
+
+test("a plain clean-up result keeps the muted tone and the past-tense introduction (#1188)", async () => {
+  const { elements, library, banners } = mount();
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), ["Deleted 2 copies.", "success"]);
+  assert.doesNotMatch(elements.dialog.querySelector(".backup-dialog-result").className, /is-bad/);
+  assert.doesNotMatch(elements.dialog.textContent, /will be deleted/);
+  assert.match(elements.dialog.textContent, /These 2 copies were in the clean-up plan\. The result is below\./);
+});
+
+test("several kept copies that failed the check read in the plural, with no copy/copies shortcut (#1188)", async () => {
+  const api = fakeApi({ "POST /api/admin/backups/lifecycle/apply": () => ({
+    ok: true, deleted: ["cfg-old"], already_missing: [], failed: null, not_attempted: [],
+    downgraded: ["k1", "k2", "k3"], kept_after_replan: ["full-part"] }) });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  const text = "Deleted 1 copy. 3 kept copies failed the size and SHA-256 check and were marked unverified. "
+    + "1 planned deletion was not carried out, because the copies that would have stayed could not be confirmed good. "
+    + "Run Verify on the copies marked unverified: if they pass, clean up again; if not, back up again to replace them.";
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
+  assert.doesNotMatch(LIBRARY_SOURCE, /copy\/copies|deletion\/deletions/);
 });
 
 test("a clean-up still running when the admin wait ends says so in a neutral tone (#1188)", async () => {
@@ -847,12 +882,12 @@ test("a clean-up applied while another run holds the scheduler says why nothing 
 test("the status line shows a clean-up that finished but marked copies unverified (#1188)", async () => {
   const api = fakeApi();
   api.data.grooming = { at: "2026-09-24T12:00:00Z", ok: true, deleted: 0,
-    detail: "1 kept backup copy/copies failed the size and SHA-256 check and were marked unverified.", failed_locations: {} };
+    detail: "1 kept backup copy failed the size and SHA-256 check and was marked unverified.", failed_locations: {} };
   const { elements, library } = mount({ api });
   await library.load();
   assert.equal(elements.status.querySelector("span.backup-run-status.is-ok"), null);
   assert.equal(elements.status.querySelector("span.backup-run-status.is-bad").textContent,
-    "Last clean-up: T(2026-09-24T12:00:00Z), 0 removed. 1 kept backup copy/copies failed the size and SHA-256 check and were marked unverified.");
+    "Last clean-up: T(2026-09-24T12:00:00Z), 0 removed. 1 kept backup copy failed the size and SHA-256 check and was marked unverified.");
 });
 
 test("clean up with nothing to do, or without a token, never applies", async () => {

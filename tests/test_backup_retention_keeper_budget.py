@@ -318,6 +318,26 @@ class SchedulerKeeperCheckTests(SchedulerTestBase):
         self.assertTrue((self._paths.local_dir / new.name).exists())
         self.assertTrue((self._paths.local_dir / prior_newest.name).exists())
 
+    def test_grooming_detail_counts_downgraded_copies_in_plain_words(self) -> None:
+        from types import SimpleNamespace
+
+        scheduler = self.make({"full": {"enabled": True}})
+        for count, expected in (
+            (1, "1 kept backup copy failed the size and SHA-256 check and was marked unverified."),
+            (3, "3 kept backup copies failed the size and SHA-256 check and were marked unverified."),
+        ):
+            with self.subTest(count=count):
+                result = SimpleNamespace(
+                    failed_locations={}, failed=None, error=None, deleted=(), already_missing=(),
+                    downgraded=tuple(object() for _ in range(count)),
+                )
+                scheduler._record_grooming_result(result)
+                grooming = json.loads(self._paths.status_file.read_text())["grooming"]
+                self.assertTrue(grooming["ok"])
+                self.assertEqual(grooming["detail"], expected)
+        source = (Path(__file__).resolve().parents[1] / "history_service/backup_scheduler/service.py").read_text()
+        self.assertFalse("kept backup copy/copies" in source or "kept copy/copies" in source, "copy/copies shortcut")
+
     def test_remote_check_refuses_when_scratch_space_is_short(self) -> None:
         older, newest = self.two_remote_fulls()
         scheduler = self.remote_keep_one()

@@ -727,9 +727,13 @@
       return dialog;
     }
 
-    function dialogResult(text) {
+    function dialogResult(text, tone = "") {
       const node = els.dialog?.querySelector(".backup-dialog-result");
-      if (node) node.textContent = text;
+      if (node) {
+        node.textContent = text;
+        // A problem result carries the same tone as its banner (#1188).
+        node.className = `subtle action-note backup-dialog-result${tone ? ` ${tone}` : ""}`;
+      }
       return node;
     }
 
@@ -746,7 +750,7 @@
       const live = () => generation === (state.dialogGeneration || 0) && Boolean(els.dialog?.open);
       return {
         live,
-        result: (text) => (live() ? dialogResult(text) : null),
+        result: (text, tone) => (live() ? dialogResult(text, tone) : null),
         actions: (...nodes) => {
           if (live()) setDialogActions(...nodes);
         },
@@ -1318,7 +1322,7 @@
             throw new Error("The plan came back without a token, so it can't be applied safely.");
           }
           body?.replaceChildren(
-            el("p", { text: `These ${plan.items.length} ${plan.items.length === 1 ? "copy" : "copies"} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
+            el("p", { className: "backup-cleanup-intro", text: `These ${plan.items.length} ${plan.items.length === 1 ? "copy" : "copies"} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
             el("ul", { className: "backup-change-list backup-cleanup-list" }, plan.items.map((item) => {
               const artifact = findArtifact(item.id);
               const what = artifact
@@ -1340,6 +1344,18 @@
       const plan = state.cleanupPlan;
       const scope = dialogScope();
       if (!plan || !plan.token) return Promise.resolve();
+      // Once a result is shown, the plan's introduction must not still promise deletions.
+      const planned = plan.items.length;
+      const showResult = (text, bannerTone) => {
+        const intro = scope.body()?.querySelector(".backup-cleanup-intro");
+        if (intro) {
+          intro.textContent = planned === 1
+            ? "This copy was in the clean-up plan. The result is below."
+            : `These ${planned} copies were in the clean-up plan. The result is below.`;
+        }
+        scope.result(text, bannerTone === "error" ? "is-bad" : "");
+        setBanner(text, bannerTone);
+      };
       return once("cleanup", async () => {
         scope.result("Deleting...");
         scope.actions(cancelButton("Close"));
@@ -1352,8 +1368,7 @@
           });
           state.cleanupPlan = null;
           if (payload?.state === "still_running") {
-            scope.result(CLEANUP_STILL_RUNNING);
-            setBanner(CLEANUP_STILL_RUNNING, "info");
+            showResult(CLEANUP_STILL_RUNNING, "info");
             await load({ quiet: true });
             return;
           }
@@ -1364,17 +1379,26 @@
           const summary = stopped
             ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
             : `Deleted ${deleted} ${deleted === 1 ? "copy" : "copies"}.`;
-          // #1188: kept copies that failed their check, and deletions skipped because of it.
+          // #1188: kept copies that failed their check, and deletions not carried out because of it.
           const downgraded = count(payload.downgraded);
           const skipped = count(payload.kept_after_replan);
+          const one = downgraded === 1;
           const notes = [];
           if (downgraded) {
-            notes.push(`${downgraded} kept ${downgraded === 1 ? "copy" : "copies"} failed the size and SHA-256 check and ${downgraded === 1 ? "was" : "were"} marked unverified.`);
+            notes.push(`${downgraded} kept ${one ? "copy" : "copies"} failed the size and SHA-256 check and ${one ? "was" : "were"} marked unverified.`);
           }
-          if (skipped) notes.push(`${skipped} planned ${skipped === 1 ? "deletion was" : "deletions were"} skipped.`);
+          if (skipped) {
+            notes.push(`${skipped} planned ${skipped === 1 ? "deletion was" : "deletions were"} not carried out, because the copies that would have stayed could not be confirmed good.`);
+          }
+          if (downgraded) {
+            // Verify re-reads a copy and marks it verified again when it matches;
+            // a new backup adds a good copy, after which older ones fall due again.
+            notes.push(skipped
+              ? `Run Verify on the ${one ? "copy" : "copies"} marked unverified: if ${one ? "it passes" : "they pass"}, clean up again; if not, back up again to replace ${one ? "it" : "them"}.`
+              : `Run Verify on the ${one ? "copy" : "copies"} marked unverified, or back up again to replace ${one ? "it" : "them"}.`);
+          }
           const text = [summary, ...notes].join(" ");
-          scope.result(text);
-          setBanner(text, stopped || notes.length ? "error" : "success");
+          showResult(text, stopped || notes.length ? "error" : "success");
         } catch (error) {
           state.cleanupPlan = null;
           const busy = error?.status === 409 && /already in progress/i.test(String(error?.message || ""));
@@ -1383,8 +1407,7 @@
             : error?.status === 409
               ? "The list changed since this plan was made, so nothing was deleted. Open Clean up again."
               : `Clean up failed: ${errorText(error)} Some copies may already be gone; the list has been reloaded.`;
-          scope.result(text);
-          setBanner(text, busy ? "info" : "error");
+          showResult(text, busy ? "info" : "error");
         }
         await load({ quiet: true });
       });

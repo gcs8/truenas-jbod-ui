@@ -1949,6 +1949,7 @@ h3 {
 
 .backup-run-status.is-bad,
 .backup-test-result.is-bad,
+.backup-dialog-result.is-bad,
 .backup-state.is-incomplete,
 .backup-state.is-unsupported,
 .backup-state.is-missing {

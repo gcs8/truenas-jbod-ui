@@ -891,10 +891,12 @@ class BackupScheduler:
             else:
                 if removed:
                     logger.info(
-                        "Removed %d replaced history sidecar backup copy/copies; "
-                        "%d digest-checked local FULL copy/copies remain.",
+                        "Removed %d replaced history sidecar backup %s; "
+                        "%d digest-checked local FULL %s remain.",
                         removed,
+                        "copy" if removed == 1 else "copies",
                         full_copy_count,
+                        "copy" if full_copy_count == 1 else "copies",
                     )
         return record
 
@@ -1359,12 +1361,15 @@ class BackupScheduler:
         if downgraded:
             # #1188: a kept copy failed its payload check; say so even when the
             # replanned run otherwise completed.
+            count = len(downgraded)
             note = (
-                f"{len(downgraded)} kept backup copy/copies failed the size and SHA-256 check "
-                "and were marked unverified."
+                f"{count} kept backup {'copy' if count == 1 else 'copies'} failed the size and SHA-256 "
+                f"check and {'was' if count == 1 else 'were'} marked unverified."
             )
             detail = note if detail is None else f"{detail} {note}"
-            logger.warning("Backup grooming marked %d kept copy/copies unverified.", len(downgraded))
+            logger.warning(
+                "Backup grooming marked %d kept %s unverified.", count, "copy" if count == 1 else "copies"
+            )
         self._record_grooming(
             ok=not result.error,
             deleted=len(result.deleted) + len(result.already_missing),
