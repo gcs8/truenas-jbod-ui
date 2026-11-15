@@ -384,10 +384,14 @@ backups:
 
 A scheduled FULL includes the history database and keeps `14` local copies by
 default (one daily copy for two weeks). Local FULLs that still match their
-catalogued size and SHA-256 when the scheduler re-reads them (up to 14, newest
-first) gradually replace the standalone daily, weekly and monthly
-history-sidecar snapshots; a FULL that is missing or no longer matches earns
-no credit and is marked unverified. The
+catalogued size and SHA-256 when the scheduler re-reads them gradually replace
+the standalone daily, weekly and monthly history-sidecar snapshots. The
+scheduler reads at most the 14 newest eligible FULLs, newest first, and every
+read counts toward that limit whether or not it matches, so damaged copies
+lower the credit instead of causing more reads. A FULL that is missing or has
+the wrong size earns no credit; one whose SHA-256 no longer matches also earns
+none and is marked unverified, and the status file stops naming it as the
+verified FULL. The
 scheduler retains enough older sidecars that the two sets still provide at least
 14 copies during cutover; after 14 usable local FULLs exist, no sidecar copy is
 needed for that floor. A lower customized FULL retention therefore leaves the
@@ -479,25 +483,51 @@ Some copies are never deleted:
 - Only catalogued copies are deleted. Files you put in the archive folder
   yourself are left alone.
 
-Before grooming deletes a copy, it re-reads the copies it is keeping instead
-(the newest verified copy and the newest `local_keep` or `remote_keep` copies)
-and checks their size and SHA-256 against the catalog. A kept copy that is
-missing or no longer matches is marked unverified, the plan is worked out
-again, and the older copy it would have replaced stays. The grooming status
-says how many copies were marked unverified. If a kept copy cannot be read at
-all, grooming stops deleting at that location for that run and the status
-names the reason
-(`keeper-unreadable`, `keeper-unverifiable` or `keeper-readback-failed`).
+Before grooming deletes a copy of a class at a location, it makes sure at
+least one copy it is keeping is still good. It reads back the newest verified
+copy that stays and checks its size and SHA-256 against the catalog. If that
+copy matches, the check ends and the deletions go ahead. If it is missing or no
+longer matches, it is marked unverified, the plan is worked out again (which
+can only remove deletions, never add one), and the next newest verified copy is
+read. The check stops as soon as nothing is left to delete. The grooming status
+says how many copies were marked unverified.
+
+Grooming refuses to delete anything more at that location for that run, and
+the status names the reason, when:
+
+- a kept copy cannot be read at all (`keeper-unreadable`,
+  `keeper-unverifiable` or `keeper-readback-failed`);
+- three kept copies of the same class and location in a row were missing or
+  did not match (`keeper-check-budget-exhausted`). Running out of reads never
+  allows a deletion;
+- there is not enough free space to stage a remote readback
+  (`keeper-scratch-capacity`, see below).
 
 Local copies are hashed in place. A remote kept copy is read back with the same
-streaming download an explicit verify uses, into a private temporary file that
-is deleted straight away and is capped at the recorded size; grooming does not
-list the remote folder. A copy the target reports as not found is marked
-unverified, and any other download failure stops deletion at that location
-with `keeper-readback-failed`. This happens only when that location has
-something to delete, and only for the kept copies, so remote grooming downloads
-up to `remote_keep` + 1 archives per class each time it deletes. A preview
-reads only the catalog, so applying it can delete fewer copies than it listed.
+streaming download an explicit verify uses, capped at the recorded size;
+grooming does not list the remote folder. A copy the target reports as not
+found is marked unverified, and any other download failure stops deletion at
+that location with `keeper-readback-failed`. A filesystem or NFS copy that is
+not a regular file (for example a FIFO) is refused without waiting on it.
+
+So on one grooming run, each class at a remote location with something to
+delete downloads one archive when its newest kept copy is good and at most
+three when it is not. Nothing is remembered between runs: every grooming run
+that deletes something reads its keeper again, and grooming also runs after
+configuration backups, so a large FULL keeper can be downloaded many times a
+day.
+
+The download is staged in one private `keeper-check-*` directory under the
+scheduler state directory and deleted as soon as it is hashed, so the extra
+disk space at any moment is one archive. The transports have no way to hash a
+download without storing it. Before each remote readback grooming removes any
+`keeper-check-*` directory a killed run left behind, and refuses with
+`keeper-scratch-capacity` unless the state directory's filesystem has room for
+the archive plus 64 MiB. In the published Compose layout the state directory
+shares a filesystem with the local archives.
+
+A preview reads only the catalog, so applying it can delete fewer copies than
+it listed.
 
 ### Deploy
 

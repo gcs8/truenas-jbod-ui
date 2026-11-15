@@ -46,11 +46,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Backup retention no longer deletes the last good copy on the strength of a
-  kept copy it has not checked. Before deleting, grooming re-reads the copies
-  it keeps and compares size and SHA-256; a missing or corrupt one is marked
-  unverified and the plan is worked out again, and a copy that cannot be read
-  stops deletion at that location with a named reason. History sidecar
-  snapshots are replaced only by FULLs that pass the same fresh check (#1195).
+  kept copy it has not checked. Before deleting, grooming reads back the
+  newest kept copy and compares size and SHA-256; a missing or corrupt one is
+  marked unverified, the plan is worked out again and the next copy is tried,
+  at most three reads per class and location. A copy that cannot be read, a
+  spent read budget or too little scratch space stops deletion at that
+  location with a named reason. History sidecar snapshots are replaced only by
+  FULLs that pass the same fresh check, at most 14 reads per run (#1195).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
