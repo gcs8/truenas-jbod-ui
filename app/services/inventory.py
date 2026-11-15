@@ -1582,6 +1582,30 @@ def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
     return system.model_copy(update={"label": None, "storage_views": [], "view_order": []})
 
 
+def slot_detail_collection_binding(system: SystemConfig) -> str:
+    """Digest of the collection identity that persisted slot details belong to (#1207).
+
+    The platform plus every endpoint slot and SMART details are read from: the
+    appliance API host and the SSH hosts. Credentials, timeouts and display
+    fields are left out, so a rename or key rotation keeps the persisted rows,
+    while pointing the same system ID at another appliance does not. Only the
+    digest is stored, so the cache file names no endpoint.
+    """
+
+    def endpoint(value: str | None) -> str:
+        return (value or "").strip().rstrip("/").lower()
+
+    ssh_hosts = {endpoint(system.ssh.host), *(endpoint(host) for host in system.ssh.extra_hosts)}
+    ssh_hosts.update(endpoint(node.host) for node in system.ssh.ha_nodes)
+    identity = {
+        "platform": system.truenas.platform,
+        "api_host": endpoint(system.truenas.host),
+        "ssh_hosts": sorted(host for host in ssh_hosts if host),
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:32]}"
+
+
 class InventoryService:
     # Class defaults keep partially built services (tests, adapters) readable.
     _smp_counter_capability: str | None = None
@@ -6241,11 +6265,8 @@ class InventoryService:
         if loaded_entries is None:
             loaded_entries = self.slot_detail_store.load_all()
         for slot_view in slots:
-            entry = self.slot_detail_store.get_entry(
-                self.system.id,
-                slot_view.enclosure_id,
-                slot_view.slot,
-                loaded_entries=loaded_entries,
+            entry = self._bound_slot_detail_entry(
+                slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
             )
             if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
                 continue
@@ -6293,14 +6314,35 @@ class InventoryService:
             return
         self.slot_detail_store.save_entries(normalized_entries)
 
+    def _slot_detail_entry_is_bound_here(
+        self, entry: SlotDetailCacheEntry, *, binding: str | None = None,
+    ) -> bool:
+        # A system ID alone does not authorize another appliance's row (#1207).
+        if entry.system_id != self.system.id or entry.collection_binding is None:
+            return False
+        return entry.collection_binding == (binding or slot_detail_collection_binding(self.system))
+
+    def _bound_slot_detail_entry(
+        self, enclosure_id: str | None, slot: int, *,
+        loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
+    ) -> SlotDetailCacheEntry | None:
+        """The stored row for this bay, only when this collection wrote it."""
+        store = self.slot_detail_store
+        if store is None:
+            return None
+        entry = store.get_entry(self.system.id, enclosure_id, slot, loaded_entries=loaded_entries)
+        if entry is None or not self._slot_detail_entry_is_bound_here(entry):
+            return None
+        return entry
+
     def _build_persisted_smart_summary(
         self, slot_view: SlotView,
         *, loaded_entries: Mapping[str, SlotDetailCacheEntry] | None = None,
     ) -> SmartSummaryView | None:
         if not self.slot_detail_store:
             return None
-        entry = self.slot_detail_store.get_entry(
-            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        entry = self._bound_slot_detail_entry(
+            slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
         )
         if entry is None or not self._slot_detail_entry_matches(slot_view, entry):
             return None
@@ -6328,12 +6370,9 @@ class InventoryService:
             # check below: a present bay that offers no identifier at all is
             # the most unknown of the lot, and its decision has to be written
             # down too, or a restart serves the departed disk's SMART for it.
-            store = self.slot_detail_store
-            if store is None:
-                return None
-            stored = store.get_entry(
-                self.system.id, slot_view.enclosure_id, slot_view.slot,
-                loaded_entries=loaded_entries,
+            # A row another collection wrote is not this one's evidence to mark.
+            stored = self._bound_slot_detail_entry(
+                slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
             )
             if stored is None or stored.identity_unknown:
                 return None
@@ -6396,6 +6435,7 @@ class InventoryService:
             smart_fields=smart_fields,
             smart_updated_at=smart_updated_at,
             smart_stale=smart_stale,
+            collection_binding=slot_detail_collection_binding(self.system),
         )
 
     def _previous_slot_detail_entry(
@@ -6404,11 +6444,8 @@ class InventoryService:
         current_identifiers: set[str] | None = None,
     ) -> SlotDetailCacheEntry | None:
         """The stored entry for this bay, only when it describes this same disk."""
-        store = self.slot_detail_store
-        if store is None:
-            return None
-        entry = store.get_entry(
-            self.system.id, slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
+        entry = self._bound_slot_detail_entry(
+            slot_view.enclosure_id, slot_view.slot, loaded_entries=loaded_entries,
         )
         if entry is None or not self._slot_detail_entry_matches(
             slot_view, entry, current_identifiers=current_identifiers,
@@ -7139,8 +7176,12 @@ class InventoryService:
                 cache_candidates[candidate_key] = cache_key
 
         persisted_candidates: dict[tuple[str, int], SlotDetailCacheEntry] = {}
+        binding = slot_detail_collection_binding(self.system)
         for entry in (loaded_slot_entries or {}).values():
-            if entry.system_id != self.system.id:
+            # No layout means no live disk identity to check the row against,
+            # so the collection binding is the only proof it is this
+            # appliance's observation (#1207).
+            if not self._slot_detail_entry_is_bound_here(entry, binding=binding):
                 continue
             enclosure_id = normalize_text(entry.enclosure_id)
             if enclosure_id is None or enclosure_id == UNSCOPED_KEY:

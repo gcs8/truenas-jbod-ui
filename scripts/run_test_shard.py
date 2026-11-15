@@ -148,6 +148,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_runtime_damage_pause",
         "test_mapping_routes",
         "test_nonroot_migration",
+        "test_persisted_smart_binding",
         "test_public_demo_deterministic",
         "test_public_demo_fixture",
         "test_quantastor_api",

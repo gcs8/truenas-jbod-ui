@@ -41,6 +41,13 @@ class SlotDetailCacheEntry(BaseModel):
     # in-memory marker alone outlives nothing. Defaults to the pre-#525 shape so
     # an existing file loads unchanged.
     identity_unknown: bool = False
+    # Which collection wrote this row: a digest of the system's platform and
+    # appliance endpoints (#1207). A reload can keep a system ID while pointing
+    # it at another appliance, and this store is reused across reloads, so
+    # readers serve only rows written under their own binding. A row without
+    # one (written before #1207) cannot say which appliance it describes and
+    # is not served; the next successful refresh writes a bound row.
+    collection_binding: str | None = None
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
     # Set by SlotDetailStore.load_all when the file row still held
     # mapping-owned fields, so the store knows the file needs a rewrite.
