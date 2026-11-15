@@ -120,7 +120,7 @@ class SmartctlNumericAdmissionTests(unittest.TestCase):
         self.assertEqual(summary.interface_crc_errors, 2)
         self.assertEqual(summary.power_on_resets, 2)
         self.assertEqual(summary.last_test_lifetime_hours, 2)
-        self.assertEqual(summary.namespace_eui64, "eui.0000010000000002")
+        self.assertEqual(summary.namespace_eui64, f"eui.{1:06x}{2:010x}")
 
     def test_zero_integer_is_a_reading_not_unknown(self) -> None:
         summary = _summary({"temperature": {"current": 0}, "power_on_time": {"hours": 0}})
@@ -206,12 +206,12 @@ class SmartctlTextFieldShapeTests(unittest.TestCase):
 
     def test_text_controls_still_parse(self) -> None:
         summary = _summary({
-            "firmware_version": " FW01 ", "logical_unit_id": "0x5000c500aaaa0001",
+            "firmware_version": " FW01 ", "logical_unit_id": "0x1234abcd",
             "form_factor": {"name": "3.5 inches"}, "device": {"protocol": "SCSI"},
             "scsi_self_test_0": {"code": {"string": "Background short"}, "result": {"string": "Completed"}},
         })
         self.assertEqual(summary.firmware_version, "FW01")
-        self.assertEqual(summary.logical_unit_id, "0x5000c500aaaa0001")
+        self.assertEqual(summary.logical_unit_id, "0x1234abcd")
         self.assertEqual(summary.form_factor, "3.5 inches")
         self.assertEqual(summary.transport_protocol, "SCSI")
         self.assertEqual(summary.last_test_type, "Background short")
