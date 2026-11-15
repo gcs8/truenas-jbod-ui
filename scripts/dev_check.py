@@ -105,6 +105,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_admin_config",
     "tests.test_admin_secret_models",
     "tests.test_changelog_entry_gate",
+    "tests.test_ci_browser_legs",
     "tests.test_config_example",
     "tests.test_dev_check",
     "tests.test_disk_retention_accounting",

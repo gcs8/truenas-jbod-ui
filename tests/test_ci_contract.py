@@ -183,13 +183,10 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_ci_runs_admin_draft_target_ownership_fixture(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
-        fixture_step = next(
-            step
-            for step in workflow["jobs"]["public-demo-artifact"]["steps"]
-            if step.get("name") == "Run fixture-only browser specs"
-        )
+        legs = workflow["jobs"]["fixture-browser"]["strategy"]["matrix"]["include"]
+        listed = [spec for leg in legs for spec in leg["specs"].split()]
 
-        self.assertIn("qa/admin-draft-target-ownership.spec.js", fixture_step["run"])
+        self.assertEqual(listed.count("qa/admin-draft-target-ownership.spec.js"), 1)
 
     def test_appliance_browser_specs_are_explicit_and_portable(self) -> None:
         contributing = self.read(ROOT / "CONTRIBUTING.md")
@@ -233,8 +230,9 @@ class CIWorkflowContractTests(unittest.TestCase):
         # upload, the GHCR release workflow's Python setup for the
         # public-demo release gate, and the image-upgrade smoke's and the
         # upgrade-scenario job's checkouts, and the pull-request docs
-        # external-link workflow's checkout and Python setup.
-        self.assertEqual(action_count, 44)
+        # external-link workflow's checkout and Python setup, and the fixture
+        # browser legs' failure-only report upload (#1191).
+        self.assertEqual(action_count, 45)
         self.assertEqual(unpinned, [])
         self.assertEqual(uncommented, [])
 
@@ -276,7 +274,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_current_source_fixture_jobs_install_runtime_requirements_before_generation(self) -> None:
         jobs = (
-            (CI_WORKFLOW, "public-demo-artifact"),
+            (CI_WORKFLOW, "fixture-browser"),
             (PUBLISH_PUBLIC_DEMO_WORKFLOW, "verify"),
         )
         for workflow_path, job_name in jobs:
@@ -329,15 +327,21 @@ class CIWorkflowContractTests(unittest.TestCase):
                 if current_source_build in commands and browser_command in commands:
                     validations.append((workflow_path.name, job_name))
 
-        self.assertEqual(validations, [("ci.yml", "public-demo-artifact")])
+        self.assertEqual(validations, [("ci.yml", "fixture-browser")])
         ci = yaml.safe_load(self.read(CI_WORKFLOW))
+        # The browser legs report through the stable required check (#1191).
         self.assertEqual(ci["jobs"]["public-demo-artifact"]["name"], "Checked-in public demo artifact")
+        self.assertIn("fixture-browser", ci["jobs"]["public-demo-artifact"]["needs"])
 
     def test_the_sole_public_demo_validation_always_runs_on_pull_requests(self) -> None:
         # With the publish workflow off pull_request, this job is the only PR
         # browser check of current source, so nothing may route it to skipped.
         ci = yaml.safe_load(self.read(CI_WORKFLOW))
-        self.assertEqual(ci["jobs"]["public-demo-artifact"]["if"], "needs.route.outputs.run == 'true'")
+        self.assertEqual(ci["jobs"]["fixture-browser"]["if"], "needs.route.outputs.run == 'true'")
+        self.assertEqual(
+            ci["jobs"]["public-demo-artifact"]["if"],
+            "${{ !cancelled() && needs.route.outputs.run == 'true' }}",
+        )
         route_script = ci["jobs"]["route"]["steps"][0]["run"]
 
         with tempfile.TemporaryDirectory() as raw:
@@ -695,7 +699,7 @@ class CIWorkflowContractTests(unittest.TestCase):
 
     def test_public_demo_source_revision_jobs_checkout_full_history(self) -> None:
         expected_jobs = {
-            CI_WORKFLOW: ("python-unittest", "python-source", "public-demo-artifact"),
+            CI_WORKFLOW: ("python-unittest", "python-source", "fixture-browser"),
             PUBLISH_PUBLIC_DEMO_WORKFLOW: ("verify",),
         }
 
@@ -976,6 +980,7 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "javascript-source",
             "container-smoke",
             "admin-browser-cleanroom",
+            "fixture-browser",
             "public-demo-artifact",
             "image-upgrade-smoke",
             "image-upgrade-scenarios",
@@ -1028,8 +1033,9 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
 
     def test_fixture_only_browser_specs_run_in_ci(self) -> None:
         workflow = yaml.safe_load(self.read(CI_WORKFLOW))
-        steps = workflow["jobs"]["public-demo-artifact"]["steps"]
-        step = next(step for step in steps if step.get("name") == "Run fixture-only browser specs")
+        job = workflow["jobs"]["fixture-browser"]
+        step = next(step for step in job["steps"] if step.get("name") == "Run fixture-only browser specs")
+        listed = [spec for leg in job["strategy"]["matrix"]["include"] for spec in leg["specs"].split()]
         for spec in (
             "qa/chassis-row-overflow.spec.js",
             "qa/connections-clear-selection.spec.js",
@@ -1040,12 +1046,13 @@ class CIRunsOncePerPullRequestTests(unittest.TestCase):
             "qa/saved-view-selection.spec.js",
             "qa/ui-a11y-narrow-layout.spec.js",
             "qa/ui-coverage.spec.js",
+            "qa/ui-coverage-primary-crawl.spec.js",
             "qa/ui-scope-safety.spec.js",
             "qa/upgrade-notice.spec.js",
         ):
             with self.subTest(spec=spec):
                 self.assertTrue((ROOT / spec).is_file())
-                self.assertIn(spec, step["run"])
+                self.assertEqual(listed.count(spec), 1)
                 self.assertNotIn("PLAYWRIGHT_LIVE_APPLIANCE_QA", self.read(ROOT / spec))
         self.assertIn("--retries=0", step["run"])
         self.assertIn("git status --short", step["run"])
