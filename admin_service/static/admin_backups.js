@@ -943,14 +943,21 @@
     function editorWithTargets(mutate) {
       const view = state.policyView;
       if (!view) return;
-      // Keep what was typed: fold the current form back into the view first.
+      // Keep what was typed: fold the current form back into the view first,
+      // class settings as well as targets (#1198). Locked inputs are never
+      // read, so environment values stay as the server sent them.
       const edits = readEdits(view);
+      const classes = {};
+      Object.keys(view.classes || {}).forEach((backupClass) => {
+        const entry = view.classes[backupClass] || {};
+        classes[backupClass] = { ...entry, values: { ...entry.values, ...edits.classes[backupClass] } };
+      });
       const targets = view.targets.map((target, index) => ({
         ...target,
         values: { ...edits.targets[index].values },
         pendingSecrets: { ...edits.targets[index].secretChanges },
       }));
-      state.policyView = { ...view, targets: mutate(targets) };
+      state.policyView = { ...view, classes, targets: mutate(targets) };
       showPolicyView(dialogScope(), state.policyView);
     }
 
