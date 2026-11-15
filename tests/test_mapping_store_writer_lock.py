@@ -5,7 +5,9 @@ Every test uses a synthetic mapping file in a temporary directory.
 
 from __future__ import annotations
 
+import asyncio
 import errno
+import json
 import os
 import subprocess
 import sys
@@ -16,10 +18,13 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from app.models.domain import ManualMapping
-from app.services.mapping_store import MappingRevisionConflict, MappingStore
+from app import main as app_main
+from app import routes as app_routes
+from app.models.domain import ManualMapping, MappingBundle, MappingImportConfirmation
+from app.services import mapping_store as mapping_store_module
+from app.services.mapping_store import MappingRevisionConflict, MappingStorageUnwritable, MappingStore
 from app.services.storage_writability import StorageDirectoryUnwritable
 
 try:
@@ -158,7 +163,8 @@ CHILD_WRITER = textwrap.dedent(
     def read_then_wait_for_parent():
         state = load()
         (markers / "child-read").touch()
-        deadline = time.monotonic() + 2.0
+        # Shorter than the parent's bounded lock wait.
+        deadline = time.monotonic() + 0.5
         while not (markers / "parent-done").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         return state
@@ -347,6 +353,54 @@ class WriterLockRefusalTests(unittest.TestCase):
             self.assertEqual(os.stat(self.lock_path(path)).st_ino, lock_identity)
             self.assertNotEqual(os.stat(path).st_ino, mapping_identity)
             self.assertEqual(list(path.parent.glob(f"{path.name}.*.tmp")), [])
+
+
+
+class MappingImportRouteRefusalTests(unittest.TestCase):
+    """The import route answers a storage or writer-lock refusal like a save does."""
+
+    def test_import_route_returns_the_named_503_instead_of_a_generic_500(self) -> None:
+        route = next(
+            route for route in app_main.app.routes if getattr(route, "path", None) == "/api/mappings/import"
+        )
+        payload = MappingImportConfirmation(
+            bundle=MappingBundle(mappings=[]),
+            expected_revision="a" * 64,
+            import_digest="b" * 64,
+            confirmed=True,
+        )
+
+        def lock_refusal() -> Exception:
+            refusal = getattr(mapping_store_module, "MappingWriterLockUnavailable", None)
+            if refusal is None:
+                self.fail("the mapping store has no named writer-lock refusal")
+            return refusal(Path("/app/data/slot_mappings.json.lock"), "busy")
+
+        refusals = {
+            "data_directory_unwritable": lambda: MappingStorageUnwritable(Path("/app/data")),
+            WRITER_LOCK_UNAVAILABLE: lock_refusal,
+        }
+        for error_code, make_error in refusals.items():
+            with self.subTest(error_code=error_code):
+                error = make_error()
+                service = Mock()
+                service.import_mapping_bundle = AsyncMock(side_effect=error)
+                service.get_snapshot = AsyncMock()
+                registry = Mock()
+                registry.get_service.return_value = service
+                with patch.object(app_routes, "get_inventory_registry", return_value=registry):
+                    try:
+                        response = asyncio.run(
+                            route.endpoint(payload=payload, system_id="system-a", enclosure_id="enc-a")
+                        )
+                    except StorageDirectoryUnwritable:
+                        self.fail("the import route let a named storage refusal escape as a generic 500")
+                self.assertEqual(response.status_code, 503)
+                body = json.loads(response.body)
+                self.assertEqual(body["error"], error_code)
+                self.assertEqual(body["detail"], type(error).public_detail)
+                self.assertNotIn("/app/data", response.body.decode("utf-8"))
+                service.get_snapshot.assert_not_awaited()
 
 
 if __name__ == "__main__":

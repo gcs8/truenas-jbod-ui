@@ -269,7 +269,9 @@ class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
     # Bounded wait for another process's writer lock before refusing (#1228).
-    writer_lock_timeout_seconds = 10.0
+    # Mutators run synchronously on the caller's thread (the UI event loop),
+    # and a mapping write takes milliseconds, so the bound stays short.
+    writer_lock_timeout_seconds = 2.0
     _WRITER_LOCK_POLL_SECONDS = 0.02
 
     def __init__(self, file_path: str | Path) -> None:
