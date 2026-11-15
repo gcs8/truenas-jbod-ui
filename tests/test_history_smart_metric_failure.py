@@ -205,6 +205,38 @@ class SmartMetricFailureTests(unittest.TestCase):
         self.collector._fetch_smart_summaries.assert_not_awaited()  # type: ignore[attr-defined]
         self.assertIsNone(self.collector.degraded_reason())
 
+    def test_quick_refresh_does_not_spend_a_pending_slow_retry(self) -> None:
+        self.collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self.healthy, self.failing]
+        )
+        self.collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
+            side_effect=self._smart_side_effect({"failing-system"})
+        )
+        asyncio.run(self.collector.run_once(force_fast=True, force_slow=True, include_due_intervals=False))
+
+        # A Quick refresh is fast-only and must never request a fresh SMART read.
+        self.collector._fetch_smart_summaries = AsyncMock(side_effect=self._smart_side_effect(set()))  # type: ignore[method-assign]
+        asyncio.run(
+            self.collector.run_once(
+                force_fast=True, force_slow=False, include_due_intervals=False, cached_root_only=True
+            )
+        )
+
+        fetch = self.collector._fetch_smart_summaries
+        self.assertTrue(fetch.await_args_list)  # type: ignore[attr-defined]
+        self.assertTrue(all(not call.kwargs["force_fresh"] for call in fetch.await_args_list))  # type: ignore[attr-defined]
+        # The slow debt is still owed, so the collector stays degraded.
+        self.assertEqual(self.collector.degraded_reason(), PARTIAL_FAILURE_REASON)
+
+        # The next scheduled pass pays the slow debt with a fresh read.
+        fetch.reset_mock()  # type: ignore[attr-defined]
+        asyncio.run(self.collector.run_once(include_due_intervals=True))
+
+        fetch.assert_awaited_once()  # type: ignore[attr-defined]
+        self.assertEqual(fetch.await_args.args[0].system_id, "failing-system")  # type: ignore[attr-defined]
+        self.assertTrue(fetch.await_args.kwargs["force_fresh"])  # type: ignore[attr-defined]
+        self.assertIsNone(self.collector.degraded_reason())
+
     def test_control_healthy_pass_advances_cadence_without_retry(self) -> None:
         self.collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
             return_value=[self.healthy, self.failing]

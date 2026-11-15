@@ -585,8 +585,11 @@ class HistoryCollector:
 
             scope_key = (scope.system_id, scope.enclosure_id)
             pending_kinds = self._pending_smart_metric_scopes.get(scope_key, frozenset())
-            scope_collect_fast = collect_fast or "fast" in pending_kinds
-            scope_collect_slow = collect_slow or "slow" in pending_kinds
+            # Only a scheduled pass pays a retry debt. A manual refresh reads
+            # just what it asked for, so a Quick refresh never turns into a
+            # fresh SMART read; an unpaid debt waits for the next scheduled pass.
+            scope_collect_fast = collect_fast or (include_due_intervals and "fast" in pending_kinds)
+            scope_collect_slow = collect_slow or (include_due_intervals and "slow" in pending_kinds)
             if not scope_collect_fast and not scope_collect_slow:
                 continue
 
@@ -683,7 +686,16 @@ class HistoryCollector:
                     sample_count=len(metric_samples),
                 )
             smart_scopes_succeeded += 1
-            self._pending_smart_metric_scopes.pop(scope_key, None)
+            collected_kinds = {
+                kind
+                for kind, collected in (("fast", scope_collect_fast), ("slow", scope_collect_slow))
+                if collected
+            }
+            remaining_kinds = pending_kinds - collected_kinds
+            if remaining_kinds:
+                self._pending_smart_metric_scopes[scope_key] = frozenset(remaining_kinds)
+            else:
+                self._pending_smart_metric_scopes.pop(scope_key, None)
 
         if not enumeration_failed and not enumerate_kwargs.get("cached_root_only"):
             # A complete census is authoritative: a scope that left it owes nothing.
