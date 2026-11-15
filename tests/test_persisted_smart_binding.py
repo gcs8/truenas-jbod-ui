@@ -10,19 +10,29 @@ appliance client is a mock that always fails, no network is touched.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import tempfile
+import types
+import typing
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlsplit
 
-from app.config import PathConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig
-from app.models.domain import SlotView, SmartSummaryView
+from pydantic import BaseModel, ValidationError
+
+from app import routes as app_routes
+from app.config import BMCConfig, PathConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig, normalize_text
+from app.models.domain import SlotView, SmartBatchRequest, SmartSummaryView
 from app.route_support import ensure_read_slot_bounds
+from app.services import inventory as inventory_module
 from app.services.inventory import slot_detail_collection_binding
 from app.services.inventory_registry import InventoryRegistry
+from app.services.quantastor_api import QuantastorRESTClient, build_quantastor_api_base
 from app.services.slot_detail_store import SlotDetailCacheEntry
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.tls_context import resolve_tls_server_name
+from app.services.truenas_ws import TrueNASAPIError, TrueNASRawData
 
 SYSTEM_ID = "synthetic-system"
 SHELF = "synthetic-shelf"
@@ -136,9 +146,15 @@ class PersistedSmartBindingTests(unittest.TestCase):
 
     def test_ssh_port_change_at_same_host_refuses_predecessor_rows(self) -> None:
         # A forwarded SSH port on the same host can reach another appliance.
-        moved = _system("https://source-a.example.test").model_copy(
-            update={"ssh": SSHConfig(enabled=False, port=2222)},
-        )
+        # The port is a destination while SSH reads are on.
+        ssh_on = _system("https://source-a.example.test", ssh=_ssh("source-a.example.test"))
+        self.original = InventoryRegistry(_settings(self.root, ssh_on), previous=self.original)
+        self.predecessor = self.original.get_service(SYSTEM_ID)
+        self.original.slot_detail_store.save_entries([self.predecessor._build_slot_detail_entry(
+            _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=17),
+        )])
+        self.assertIsNotNone(self.predecessor._build_persisted_smart_summary(_slot()))
+        moved = _system("https://source-a.example.test", ssh=_ssh("source-a.example.test", port=2222))
         service = self._reload(moved).get_service(SYSTEM_ID)
 
         self.assertIsNone(service.get_cached_slot_smart_summary_without_layout(0, SHELF))
@@ -243,6 +259,8 @@ class PersistedSmartDestinationTests(unittest.TestCase):
         service.truenas_client.fetch_all = AsyncMock(side_effect=failure)
         service.ssh_probe.run_commands = AsyncMock(side_effect=failure)
         service.ssh_probe.run_planned_commands = AsyncMock(side_effect=failure)
+        if service.bmc_service is not None:
+            service.bmc_service.fetch_inventory = Mock(side_effect=failure)
         with _QuietInventoryLogs():
             bounds = asyncio.run(ensure_read_slot_bounds(0, service, SHELF))
         self.assertEqual(bounds, "unavailable")
@@ -278,10 +296,11 @@ class PersistedSmartDestinationTests(unittest.TestCase):
         self._assert_refused(service)
 
     def test_unchanged_primary_ssh_host_keeps_rows(self) -> None:
-        # Control: the same primary and extra hosts, written differently.
+        # Control: the same primary and extra hosts, with the surrounding
+        # spaces every read strips before it connects.
         self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")))
         _, service = self._reload_unavailable(
-            _system(self.API, label="Renamed", ssh=_ssh(" Source-A.example.test ", "SOURCE-B.example.test")),
+            _system(self.API, label="Renamed", ssh=_ssh(" source-a.example.test ", " source-b.example.test ")),
         )
         self._assert_served(service)
 
@@ -299,7 +318,7 @@ class PersistedSmartDestinationTests(unittest.TestCase):
         )
         self.assertEqual(
             slot_detail_collection_binding(before),
-            slot_detail_collection_binding(ha("SOURCE-B.example.test", "source-c.example.test")),
+            slot_detail_collection_binding(ha(" source-b.example.test ", "source-c.example.test")),
         )
 
     def test_tls_server_name_change_refuses_predecessor_rows(self) -> None:
@@ -374,6 +393,520 @@ class PersistedSmartDestinationTests(unittest.TestCase):
         self.assertIsNotNone(marked)
         self.assertTrue(marked.identity_unknown)
         self.assertEqual(marked.smart_fields.get("power_on_hours"), 17)
+
+    # One input at a time, every other destination input held fixed.
+
+    def _assert_reload_refuses(self, before: SystemConfig, after: SystemConfig) -> None:
+        self._tmp.cleanup()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._start(before)
+        self.assertNotEqual(slot_detail_collection_binding(after), slot_detail_collection_binding(before))
+        _, service = self._reload_unavailable(after)
+        self._assert_refused(service)
+
+    def _assert_reload_keeps(self, before: SystemConfig, after: SystemConfig) -> None:
+        self._tmp.cleanup()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._start(before)
+        self.assertEqual(slot_detail_collection_binding(after), slot_detail_collection_binding(before))
+        _, service = self._reload_unavailable(after)
+        self._assert_served(service)
+
+    def test_primary_ssh_host_alone_moves_the_binding(self) -> None:
+        for platform in ("core", "scale", "quantastor"):
+            with self.subTest(platform=platform):
+                self._assert_reload_refuses(
+                    _system(self.API, platform=platform, ssh=_ssh("source-a.example.test", "source-b.example.test")),
+                    _system(self.API, platform=platform, ssh=_ssh("source-c.example.test", "source-b.example.test")),
+                )
+
+    def test_extra_ssh_host_alone_moves_the_binding_where_reads_use_extra_hosts(self) -> None:
+        # SCALE SES discovery and QuantaStor reads try the extra hosts in order.
+        before_extras = ("source-b.example.test", "source-c.example.test")
+        edits = {
+            "added": (*before_extras, "source-d.example.test"),
+            "removed": before_extras[:1],
+            "replaced": ("source-b.example.test", "source-d.example.test"),
+            "reordered": tuple(reversed(before_extras)),
+        }
+        for platform in ("scale", "quantastor"):
+            for name, extras in edits.items():
+                with self.subTest(platform=platform, edit=name):
+                    self._assert_reload_refuses(
+                        _system(self.API, platform=platform, ssh=_ssh("source-a.example.test", *before_extras)),
+                        _system(self.API, platform=platform, ssh=_ssh("source-a.example.test", *extras)),
+                    )
+
+    def test_extra_ssh_host_edit_keeps_rows_where_reads_use_only_the_primary(self) -> None:
+        # CORE and Linux reads go to the primary SSH host only, so an edit of
+        # the extra hosts moves no read and the saved data stays.
+        before = ("source-b.example.test", "source-c.example.test")
+        for extras in (("source-b.example.test", "source-d.example.test"), tuple(reversed(before))):
+            with self.subTest(extras=extras):
+                self._assert_reload_keeps(
+                    _system(self.API, ssh=_ssh("source-a.example.test", *before)),
+                    _system(self.API, ssh=_ssh("source-a.example.test", *extras)),
+                )
+                self.assertEqual(
+                    slot_detail_collection_binding(_system(self.API, platform="linux", ssh=_ssh("a.example.test", *before))),
+                    slot_detail_collection_binding(_system(self.API, platform="linux", ssh=_ssh("a.example.test", *extras))),
+                )
+
+    def test_ha_system_id_alone_moves_the_binding(self) -> None:
+        # A read for one controller goes to the host configured for its ID.
+        def ha(node_id: str) -> SystemConfig:
+            return _system(self.API, platform="quantastor", ssh=_ssh(
+                "source-a.example.test", ha_enabled=True,
+                ha_nodes=[{"system_id": node_id, "host": "source-b.example.test"}],
+            ))
+
+        self._assert_reload_refuses(ha("node-1"), ha("node-2"))
+
+    def test_ssh_port_edit_keeps_rows_while_ssh_reads_are_off(self) -> None:
+        # With SSH reads off, the port moves no read.
+        self._assert_reload_keeps(
+            _system(self.API, ssh=SSHConfig(enabled=False, host="source-a.example.test")),
+            _system(self.API, ssh=SSHConfig(enabled=False, host="source-a.example.test", port=2222)),
+        )
+
+    def test_bmc_destination_is_bound_only_while_the_bmc_is_read(self) -> None:
+        # BMC drive data (block sizes) can enter the persisted SMART fields, so
+        # an enabled BMC's endpoint is a destination like any other.
+        def bmc(host: str, *, enabled: bool, platform: str = "core") -> SystemConfig:
+            return _system(self.API, platform=platform, ssh=_ssh("source-a.example.test")).model_copy(
+                update={"bmc": BMCConfig(enabled=enabled, host=host, username="synthetic")},
+            )
+
+        self.assertNotEqual(
+            slot_detail_collection_binding(bmc("bmc-a.example.test", enabled=True, platform="esxi")),
+            slot_detail_collection_binding(bmc("bmc-b.example.test", enabled=True, platform="esxi")),
+        )
+
+        self._assert_reload_refuses(
+            bmc("bmc-a.example.test", enabled=True), bmc("bmc-b.example.test", enabled=True),
+        )
+        self._assert_reload_refuses(
+            bmc("bmc-a.example.test", enabled=False), bmc("bmc-a.example.test", enabled=True),
+        )
+        # Control: a BMC that is not read moves nothing.
+        self._assert_reload_keeps(
+            bmc("bmc-a.example.test", enabled=False), bmc("bmc-b.example.test", enabled=False),
+        )
+
+
+CACHED_UNAVAILABLE = "Cached SMART data is unavailable while the inventory layout cannot be resolved."
+
+
+def _route_endpoint(router, path: str, method: str):
+    return next(
+        route.endpoint for route in router.routes
+        if getattr(route, "path", "") == path and method in (getattr(route, "methods", None) or set())
+    )
+
+
+class QuantastorHaModeTests(unittest.TestCase):
+    """The QuantaStor HA mode decides which SSH hosts a SMART read uses.
+
+    With no HA node configured, turning HA mode on drops the API host from
+    the SSH hosts, so the same host list reaches another machine first.
+    """
+
+    API = "https://api.example.test"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.router = app_routes.build_router()
+        self.single = _route_endpoint(self.router, "/api/slots/{slot}/smart", "GET")
+        self.batch = _route_endpoint(self.router, "/api/slots/smart-batch", "POST")
+
+    def _system(self, *, ha_enabled: bool, ha_nodes: list[dict] | None = None, label: str | None = None):
+        return _system(self.API, platform="quantastor", label=label, ssh=_ssh(
+            "api.example.test", "source-b.example.test", ha_enabled=ha_enabled, ha_nodes=ha_nodes or [],
+        ))
+
+    def _start(self, system: SystemConfig) -> None:
+        self.original = InventoryRegistry(_settings(self.root, system))
+        self.predecessor = self.original.get_service(SYSTEM_ID)
+        self.original.slot_detail_store.save_entries([self.predecessor._build_slot_detail_entry(
+            _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=17),
+        )])
+
+    def _reload(self, system: SystemConfig) -> InventoryRegistry:
+        successor = InventoryRegistry(_settings(self.root, system), previous=self.original)
+        service = successor.get_service(SYSTEM_ID)
+        failure = TrueNASAPIError("Synthetic source unavailable")
+        service.truenas_client.fetch_all = AsyncMock(side_effect=failure)
+        service.ssh_probe.run_commands = AsyncMock(side_effect=failure)
+        service.ssh_probe.run_planned_commands = AsyncMock(side_effect=failure)
+        return successor
+
+    def _routes(self, registry: InventoryRegistry) -> tuple[SmartSummaryView, SmartSummaryView]:
+        """The single and batch answers for slot 0, each after checking the layout was unavailable."""
+        with patch.object(app_routes, "get_inventory_registry", return_value=registry), _QuietInventoryLogs():
+            single = asyncio.run(self.single(slot=0, system_id=SYSTEM_ID, enclosure_id=SHELF, fresh=False))
+            batch = asyncio.run(self.batch(
+                payload=SmartBatchRequest(slots=[0]), system_id=SYSTEM_ID, enclosure_id=SHELF, fresh=False,
+            ))
+        self.assertEqual(single.layout_bounds, "unavailable")
+        self.assertEqual(batch.layout_bounds, "unavailable")
+        self.assertEqual([item.slot for item in batch.summaries], [0])
+        return single, batch.summaries[0].summary
+
+    def _assert_routes_refuse(self, registry: InventoryRegistry) -> None:
+        for answer in self._routes(registry):
+            self.assertFalse(answer.available, "the other destination's saved SMART was served")
+            self.assertIsNone(answer.power_on_hours)
+            self.assertEqual(answer.message, CACHED_UNAVAILABLE)
+
+    def test_ha_mode_toggle_moves_the_read_and_the_binding(self) -> None:
+        for before, after in ((False, True), (True, False)):
+            with self.subTest(ha_enabled_before=before):
+                self._tmp.cleanup()
+                self._tmp = tempfile.TemporaryDirectory()
+                self.root = Path(self._tmp.name)
+                self._start(self._system(ha_enabled=before))
+                successor = self._reload(self._system(ha_enabled=after))
+                service = successor.get_service(SYSTEM_ID)
+                # The read really moves: the API host is tried first only without HA mode.
+                hosts = {
+                    False: ["api.example.test", "source-b.example.test"],
+                    True: ["source-b.example.test"],
+                }
+                self.assertEqual(self.predecessor._build_quantastor_preferred_hosts(_slot()), hosts[before])
+                self.assertEqual(service._build_quantastor_preferred_hosts(_slot()), hosts[after])
+                self._assert_routes_refuse(successor)
+                self.assertNotEqual(
+                    slot_detail_collection_binding(service.system),
+                    slot_detail_collection_binding(self.predecessor.system),
+                )
+                # A SMART read the predecessor started before the reload lands now.
+                successor.slot_detail_store.save_entries([self.predecessor._build_slot_detail_entry(
+                    _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=23),
+                )])
+                self._assert_routes_refuse(successor)
+
+    def test_unchanged_ha_mode_keeps_rows_through_both_routes(self) -> None:
+        # Control: a reload that keeps the HA mode serves the saved row.
+        self._start(self._system(ha_enabled=True))
+        successor = self._reload(self._system(ha_enabled=True, label="Renamed"))
+        for answer in self._routes(successor):
+            self.assertTrue(answer.available)
+            self.assertEqual(answer.power_on_hours, 17)
+
+    def test_ha_mode_toggle_with_configured_nodes_keeps_rows(self) -> None:
+        # Configured HA nodes already take the API host out of the SSH hosts,
+        # so the toggle moves no read and the saved data stays.
+        nodes = [{"system_id": "node-1", "host": "source-c.example.test"}]
+        self._start(self._system(ha_enabled=False, ha_nodes=nodes))
+        successor = self._reload(self._system(ha_enabled=True, ha_nodes=nodes))
+        self.assertEqual(
+            successor.get_service(SYSTEM_ID)._build_quantastor_preferred_hosts(_slot()),
+            self.predecessor._build_quantastor_preferred_hosts(_slot()),
+        )
+        for answer in self._routes(successor):
+            self.assertEqual(answer.power_on_hours, 17)
+
+
+# ---------------------------------------------------------------------------
+# Every field of the system configuration model, one at a time.
+#
+# The cases are generated from ``SystemConfig`` itself, so a field added later
+# is swept without editing this test. For each baseline configuration, each
+# field is changed alone; the test then compares what the registry-built
+# readers would contact (API endpoint and TLS server name, SSH hosts in try
+# order with their port and controller association, BMC endpoint) with the
+# destination plan and the binding.
+
+# Learned hosts sit between the configured ones; reading with them shows
+# where each configured host is tried relative to them.
+_STANDALONE_RAW = TrueNASRawData(
+    enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+    cli_network_ports=[{"storageSystemId": "node-1", "ipAddress": "192.0.2.77", "gateway": "192.0.2.1"}],
+)
+_CLUSTER_RAW = TrueNASRawData(
+    enclosures=[], disks=[], pools=[], disk_temperatures={}, smart_test_results=[],
+    systems=[
+        {"id": "node-1", "storageSystemClusterId": "cluster-1", "sshHost": "learned-1.example.test"},
+        {"id": "node-2", "storageSystemClusterId": "cluster-1", "sshHost": "learned-2.example.test"},
+    ],
+)
+
+
+def _view() -> dict:
+    return {
+        "id": "synthetic-view", "label": "Synthetic view", "kind": "manual", "template_id": "fat-twin-rear-2",
+        "binding": {"mode": "serial", "serials": ["SANITIZED-DISK-A"]},
+    }
+
+
+def _baselines() -> dict[str, SystemConfig]:
+    nodes = [
+        {"system_id": "node-1", "label": "Synthetic left", "host": "source-c.example.test"},
+        {"system_id": "node-2", "label": "Synthetic right", "host": "source-d.example.test"},
+    ]
+
+    def make(platform: str, *, ssh: dict | None = None, bmc: dict | None = None, **truenas) -> SystemConfig:
+        return SystemConfig.model_validate({
+            "id": SYSTEM_ID, "label": "Synthetic", "default_profile_id": None,
+            "enclosure_profiles": {"synthetic-enclosure": "synthetic-profile"},
+            "storage_views": [_view()], "view_order": ["view:synthetic-view"],
+            "truenas": {"platform": platform, "host": "https://api.example.test", **truenas},
+            "ssh": ssh if ssh is not None else {"enabled": False},
+            "bmc": bmc or {"enabled": False},
+        })
+
+    ssh = {"enabled": True, "host": "source-a.example.test",
+           "extra_hosts": ["source-b.example.test", "source-e.example.test"], "user": "synthetic", "ha_nodes": nodes}
+    return {
+        "core": make("core", ssh=ssh, tls_server_name="sni.example.test"),
+        "core-plain-http": make("core", host="http://api.example.test", ssh=ssh),
+        "core-ssh-off": make("core", ssh={**ssh, "enabled": False}),
+        "scale": make("scale", ssh=ssh, api_dialect="jsonrpc"),
+        "linux": make("linux", ssh=ssh),
+        "esxi-bmc": make("esxi", ssh=ssh, bmc={"enabled": True, "host": "bmc.example.test", "username": "synthetic"}),
+        "ipmi-bmc": make("ipmi", bmc={"enabled": True, "host": "https://bmc.example.test:8443"}),
+        "quantastor-standalone": make(
+            "quantastor", ssh={**ssh, "host": "api.example.test", "ha_nodes": [], "ha_enabled": False},
+        ),
+        "quantastor-ha": make("quantastor", ssh={**ssh, "ha_enabled": True}),
+    }
+
+
+# Fields no mechanical change can be made to, with the reason. This is not a
+# place to park a field whose case fails: every entry is checked to really
+# have no accepted change.
+_UNMUTABLE: dict[str, str] = {}
+
+
+def _string_candidates(value: str | None, leaf: str) -> list[str]:
+    # Tried in order; the first one the model accepts and keeps is used. The
+    # later ones satisfy validators of specific fields (a pinned API version,
+    # a view-order entry, an M.2 length).
+    out = [f"{value}-mutated"] if value else []
+    return [*out, f"mutated-{leaf.replace('_', '-')}.example.test", "v99.1.0", "view:mutated", "2280"]
+
+
+def _strip_optional(annotation):
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        inner = [arg for arg in typing.get_args(annotation) if arg is not type(None)]
+        return inner[0] if len(inner) == 1 else annotation, True
+    return annotation, False
+
+
+def _is_model(annotation) -> bool:
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def _scalar_candidates(annotation, value, leaf: str) -> list:
+    annotation, optional = _strip_optional(annotation)
+    origin = typing.get_origin(annotation)
+    out: list = [None] if optional and value is not None else []
+    if origin is typing.Literal:
+        return out + [choice for choice in typing.get_args(annotation) if choice != value]
+    if annotation is bool:
+        return out + [not value]
+    if annotation is int:
+        return out + ([value + 1, value - 1] if isinstance(value, int) else []) + [1, 4]
+    if annotation is float:
+        return out + ([value + 1.5] if isinstance(value, (int, float)) else []) + [2.5]
+    if annotation is str or annotation is typing.Any:
+        return out + _string_candidates(value, leaf)
+    if origin is dict:
+        key_type, value_type = typing.get_args(annotation)
+        key = 0 if key_type is int else f"mutated-{leaf}"
+        return out + [{**(value or {}), key: item} for item in _scalar_candidates(value_type, None, leaf)[:3]]
+    if _is_model(annotation):
+        return out + ([_new_model(annotation, leaf)] if value is None else [])
+    return out
+
+
+def _new_model(model: type[BaseModel], leaf: str) -> dict:
+    """A new element with every field set, so normalisation cannot drop it."""
+    data: dict = {}
+    for name, info in model.model_fields.items():
+        annotation, _ = _strip_optional(info.annotation)
+        if _is_model(annotation) or typing.get_origin(annotation) in (list, dict):
+            continue
+        candidates = _scalar_candidates(annotation, None, f"{leaf}-{name}")
+        if candidates:
+            data[name] = candidates[0]
+    if model.__name__ == "StorageViewConfig":
+        data.update(kind="manual", template_id="fat-twin-rear-2")
+    return data
+
+
+def _field_cases(model: type[BaseModel], data: dict, path: tuple = ()):
+    """Yield (path, operation, candidate values) for every field reachable in ``data``."""
+    for name, info in model.model_fields.items():
+        here = (*path, name)
+        annotation, optional = _strip_optional(info.annotation)
+        value = data.get(name)
+        origin = typing.get_origin(annotation)
+        if _is_model(annotation) and isinstance(value, dict):
+            yield from _field_cases(annotation, value, here)
+            if optional:
+                yield here, "unset", [None]
+            continue
+        if origin is list:
+            (element,) = typing.get_args(annotation)
+            items = list(value or [])
+            new_items = (
+                [_new_model(element, name)] if _is_model(element)
+                else _scalar_candidates(element, None, name)
+            )
+            yield here, "append", [[*items, item] for item in new_items]
+            if items:
+                yield here, "drop-last", [items[:-1]]
+            if len(items) > 1:
+                yield here, "reverse", [list(reversed(items))]
+            for index, item in enumerate(items):
+                if _is_model(element) and isinstance(item, dict):
+                    yield from _field_cases(element, item, (*here, index))
+                elif not _is_model(element):
+                    yield (*here, index), "change", _scalar_candidates(element, item, name)
+            continue
+        yield here, "change", _scalar_candidates(info.annotation, value, name)
+
+
+def _with(data: dict, path: tuple, value) -> dict:
+    changed = copy.deepcopy(data)
+    cursor = changed
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    return changed
+
+
+def _mutations(base: SystemConfig):
+    """Yield (dotted path, operation, mutated config); paths with no accepted change yield None."""
+    data = base.model_dump()
+    for path, operation, candidates in _field_cases(SystemConfig, data):
+        dotted = ".".join(str(part) for part in path)
+        accepted = None
+        for candidate in candidates:
+            try:
+                mutated = SystemConfig.model_validate(_with(data, path, candidate))
+            except (ValidationError, ValueError, TypeError):
+                continue
+            if mutated != base:
+                accepted = mutated
+                break
+        yield dotted, operation, accepted
+
+
+def _endpoint(url: str | None) -> tuple[str, str] | None:
+    if not url:
+        return None
+    parts = urlsplit(url)
+    return parts.scheme, parts.netloc.lower()
+
+
+def _observed_destinations(service, system_ids: set[str]) -> dict:
+    """What the registry-built readers of ``service`` would contact."""
+    system = service.system
+    client = service.truenas_client
+    url = (
+        build_quantastor_api_base(client.config.host) if isinstance(client, QuantastorRESTClient)
+        else client._endpoint_url()
+    )
+    server_name = resolve_tls_server_name(client.config)
+    observed: dict = {
+        # The platform picks which readers run at all.
+        "platform": system.truenas.platform,
+        "api": (_endpoint(url), server_name.lower() if server_name else None),
+        "bmc": _endpoint(service.bmc_service.base_url) if service.bmc_service is not None else None,
+    }
+    if system.ssh.enabled:
+        probe = service.ssh_probe
+        observed["ssh_primary"] = (normalize_text(probe.config.host), probe.config.port)
+        # Each reader below runs only on its own platform (the inventory
+        # collection gates SCALE SES and the QuantaStor overlays by platform).
+        if system.truenas.platform == "scale":
+            observed["scale_hosts"] = service._build_scale_ssh_hosts()
+        if system.truenas.platform == "quantastor":
+            observed["quantastor_hosts"] = [
+                service._build_configured_quantastor_hosts(raw_data=raw)
+                for raw in (None, _STANDALONE_RAW, _CLUSTER_RAW)
+            ]
+            observed["quantastor_node_hosts"] = {
+                system_id: service._configured_quantastor_host_for_system(system_id)
+                for system_id in sorted(system_ids)
+            }
+    return observed
+
+
+class DestinationPlanFieldSweepTests(unittest.TestCase):
+    """Closes the class: no single configuration edit moves a read without the binding."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._tmp.name)
+        cls.cases: list[tuple[str, str, str, SystemConfig, SystemConfig | None]] = []
+        for baseline_name, base in _baselines().items():
+            for dotted, operation, mutated in _mutations(base):
+                cls.cases.append((baseline_name, dotted, operation, base, mutated))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _service(self, system: SystemConfig):
+        return InventoryRegistry(_settings(self.root, system)).get_service(system.id)
+
+    @staticmethod
+    def _system_ids(*systems: SystemConfig) -> set[str]:
+        return {"node-1", "node-2", "node-unconfigured"} | {
+            node.system_id for system in systems for node in system.ssh.ha_nodes if node.system_id
+        }
+
+    def test_every_field_was_swept(self) -> None:
+        unmutable = {dotted for _b, dotted, _op, _base, mutated in self.cases if mutated is None}
+        self.assertEqual(
+            unmutable, set(_UNMUTABLE),
+            "each field must be changed by the sweep or listed with a reason",
+        )
+        swept = {dotted for _b, dotted, _op, _base, _m in self.cases}
+        for name in SystemConfig.model_fields:
+            self.assertTrue(any(dotted.split(".")[0] == name for dotted in swept), name)
+
+    def test_a_field_that_moves_a_read_moves_the_binding(self) -> None:
+        for baseline_name, dotted, operation, base, mutated in self.cases:
+            if mutated is None:
+                continue
+            with self.subTest(baseline=baseline_name, field=dotted, operation=operation):
+                ids = self._system_ids(base, mutated)
+                moved = (
+                    _observed_destinations(self._service(base), ids)
+                    != _observed_destinations(self._service(mutated), ids)
+                )
+                rebound = slot_detail_collection_binding(base) != slot_detail_collection_binding(mutated)
+                self.assertEqual(
+                    rebound, moved,
+                    "the binding moved without the read" if rebound else "the read moved without the binding",
+                )
+
+    def test_binding_moves_exactly_with_the_destination_plan(self) -> None:
+        plan_of = inventory_module.collection_destination_plan
+        for baseline_name, dotted, operation, base, mutated in self.cases:
+            if mutated is None:
+                continue
+            with self.subTest(baseline=baseline_name, field=dotted, operation=operation):
+                ids = self._system_ids(base, mutated)
+                plan_changed = plan_of(base) != plan_of(mutated)
+                self.assertEqual(
+                    slot_detail_collection_binding(base) != slot_detail_collection_binding(mutated), plan_changed,
+                )
+                self.assertEqual(
+                    _observed_destinations(self._service(base), ids)
+                    != _observed_destinations(self._service(mutated), ids),
+                    plan_changed,
+                    "the plan and the readers disagree about whether the read moved",
+                )
 
 
 if __name__ == "__main__":

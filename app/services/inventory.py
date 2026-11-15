@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext
 from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar, copy_context
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generic, Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
@@ -136,7 +136,7 @@ from app.services.core_expander_counters import (
 )
 from app.services.sas_fabric_alias_store import SasFabricAliasStore
 from app.services.quantastor_cli import build_quantastor_cli_invocation
-from app.services.quantastor_api import QuantastorRESTClient
+from app.services.quantastor_api import QuantastorRESTClient, build_quantastor_api_base
 from app.services.parsers import (
     CORE_ZPOOL_STATUS_BY_DEVICE_OPTIONAL_COMMAND,
     fixed_device_sg_ses_note,
@@ -188,12 +188,14 @@ from app.services.ssh_probe import (
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
+from app.services.supermicro_bmc import _normalize_bmc_host as normalize_bmc_host
 from app.services.tls_context import certificate_verification_failure_reason, resolve_tls_server_name
 from app.services.truenas_ws import (
     TrueNASAPIBusyError,
     TrueNASAPIError,
     TrueNASRawData,
     TrueNASWebsocketClient,
+    build_websocket_url,
     normalize_disk_inventory_rows,
 )
 from websockets.exceptions import ConnectionClosed
@@ -1582,38 +1584,152 @@ def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
     return system.model_copy(update={"label": None, "storage_views": [], "view_order": []})
 
 
-def slot_detail_collection_binding(system: SystemConfig) -> str:
-    """Digest of the collection identity that persisted slot details belong to (#1207).
+@dataclass(frozen=True)
+class QuantastorHostOrder:
+    """The configured QuantaStor SSH hosts around the ones a collection learns.
 
-    The platform plus every destination slot and SMART details are read from:
-    the appliance API host and the TLS server name a read presents to it (an
-    SNI-routed endpoint picks the appliance by that name), the primary SSH host,
-    then the extra hosts and HA nodes in the order and roles reads try them, and
-    the SSH port (a forwarded port on one host can reach another appliance).
-    The primary host is kept apart from the rest because SMART reads go to it,
-    so promoting an extra host is a different destination. Credentials,
-    timeouts, trust settings and display fields are left out, so a rename or key
-    rotation keeps the persisted rows, while pointing the same system ID at
-    another appliance does not. Only the digest is stored, so the cache file
-    names no endpoint.
+    Reads try ``before_learned``, then hosts learned from the appliance, then
+    ``after_learned``. With ``skip_api_host`` every host naming the API
+    endpoint is left out (in an HA pair it floats between the nodes).
     """
 
-    def endpoint(value: str | None) -> str:
-        return (value or "").strip().rstrip("/").lower()
+    skip_api_host: bool
+    before_learned: tuple[str, ...]
+    after_learned: tuple[str, ...]
 
-    identity = {
-        "platform": system.truenas.platform,
-        "api_host": endpoint(system.truenas.host),
-        "tls_server_name": endpoint(resolve_tls_server_name(system.truenas)),
-        "ssh_host": endpoint(system.ssh.host),
-        "ssh_extra_hosts": [host for host in (endpoint(value) for value in system.ssh.extra_hosts) if host],
-        "ssh_ha_nodes": [
-            [(node.system_id or "").strip(), endpoint(node.host)]
-            for node in system.ssh.ha_nodes
-            if node.system_id or node.host
-        ],
-        "ssh_port": system.ssh.port,
-    }
+
+@dataclass(frozen=True)
+class CollectionDestinationPlan:
+    """Where the reads of one system go, worked out from its configuration (#1207).
+
+    The SMART and inventory readers take their configured destinations from
+    here, and the persisted-detail binding is a digest of it, so the binding
+    changes exactly when a read would go somewhere else. Credentials,
+    timeouts, trust settings and display fields are not destinations and are
+    not here. Runtime choices (a host that answered before, hosts learned
+    from the appliance) start from these configured ones.
+    """
+
+    platform: str
+    # (scheme, host and port) the API client connects to, and the TLS server
+    # name it presents there (an SNI-routed endpoint picks the appliance by
+    # it). Host names here are compared without case, as DNS does.
+    api_endpoint: tuple[str, str]
+    api_tls_server_name: str | None
+    # SSH, only while SSH reads are on. Hosts are compared as the readers
+    # compare them: exact text after trimming.
+    ssh_port: int | None = None
+    ssh_primary_host: str | None = None
+    # SCALE SES discovery: configured hosts in the order they are tried.
+    scale_ssh_hosts: tuple[str, ...] = ()
+    # QuantaStor: the order without and with cluster peers seen at runtime,
+    # and the host configured for each controller (storage system) ID.
+    quantastor_standalone_hosts: QuantastorHostOrder | None = None
+    quantastor_clustered_hosts: QuantastorHostOrder | None = None
+    quantastor_node_hosts: tuple[tuple[str, str], ...] = ()
+    # The BMC's (scheme, host and port), only while the BMC is read.
+    bmc_endpoint: tuple[str, str] | None = None
+
+    def quantastor_hosts(self, *, clustered: bool) -> QuantastorHostOrder | None:
+        return self.quantastor_clustered_hosts if clustered else self.quantastor_standalone_hosts
+
+    def quantastor_host_for_system(self, system_id: str | None) -> str | None:
+        return dict(self.quantastor_node_hosts).get(normalize_text(system_id) or "")
+
+
+def _url_endpoint(build: Callable[[str], str], host: str) -> tuple[str, str]:
+    try:
+        parts = urlsplit(build(host))
+    except ValueError:
+        # Not a URL any client can connect to; still a distinct destination.
+        return "unparsed", host.strip().lower()
+    return parts.scheme, parts.netloc.lower()
+
+
+def _quantastor_host_order(system: SystemConfig, *, skip_api_host: bool) -> QuantastorHostOrder:
+    ssh = system.ssh
+    explicit_hosts = [node.host for node in ssh.ha_nodes or []]
+    before, after = (
+        (explicit_hosts, [*(ssh.extra_hosts or []), ssh.host])
+        if skip_api_host
+        else ([ssh.host, *explicit_hosts], list(ssh.extra_hosts or []))
+    )
+    api_host = InventoryService._normalize_host_identity(system.truenas.host)
+    seen: set[str] = set()
+
+    def admit(values: list[str | None]) -> tuple[str, ...]:
+        admitted: list[str] = []
+        for value in values:
+            host = normalize_text(value)
+            if not host or host in seen:
+                continue
+            if skip_api_host and InventoryService._quantastor_hosts_match(host, api_host):
+                continue
+            seen.add(host)
+            admitted.append(host)
+        return tuple(admitted)
+
+    return QuantastorHostOrder(skip_api_host, admit(before), admit(after))
+
+
+def collection_destination_plan(system: SystemConfig) -> CollectionDestinationPlan:
+    """The one place that works out where ``system``'s reads go; see `CollectionDestinationPlan`."""
+    platform = system.truenas.platform
+    # The same URL builders the API client and the BMC service connect with.
+    api_url_builder = build_quantastor_api_base if platform == "quantastor" else build_websocket_url
+    try:
+        server_name = resolve_tls_server_name(system.truenas)
+    except ValueError:
+        server_name = None
+    bmc_read = system.bmc.enabled and bool(normalize_bmc_host(system.bmc.host))
+    plan = CollectionDestinationPlan(
+        platform=platform,
+        api_endpoint=_url_endpoint(api_url_builder, system.truenas.host),
+        api_tls_server_name=server_name.lower() if server_name else None,
+        bmc_endpoint=_url_endpoint(normalize_bmc_host, system.bmc.host) if bmc_read else None,
+    )
+    ssh = system.ssh
+    if not ssh.enabled:
+        return plan
+    scale_hosts: list[str] = []
+    if platform == "scale":
+        for value in [ssh.host, *(ssh.extra_hosts or [])]:
+            host = normalize_text(value)
+            if host and host not in scale_hosts:
+                scale_hosts.append(host)
+    node_hosts: dict[str, str] = {}
+    if platform == "quantastor":
+        for node in ssh.ha_nodes or []:
+            node_system_id, node_host = normalize_text(node.system_id), normalize_text(node.host)
+            if node_system_id and node_host:
+                node_hosts.setdefault(node_system_id, node_host)
+    return replace(
+        plan,
+        ssh_port=ssh.port,
+        ssh_primary_host=normalize_text(ssh.host),
+        scale_ssh_hosts=tuple(scale_hosts),
+        quantastor_standalone_hosts=(
+            _quantastor_host_order(system, skip_api_host=bool(ssh.ha_enabled or ssh.ha_nodes))
+            if platform == "quantastor"
+            else None
+        ),
+        quantastor_clustered_hosts=(
+            _quantastor_host_order(system, skip_api_host=True) if platform == "quantastor" else None
+        ),
+        quantastor_node_hosts=tuple(node_hosts.items()),
+    )
+
+
+def slot_detail_collection_binding(system: SystemConfig) -> str:
+    """Digest of the destination plan that persisted slot details belong to (#1207).
+
+    It is derived from `collection_destination_plan` only, so it changes
+    exactly when a read would go somewhere else, and an edit that moves no
+    read (a rename, a key rotation, an extra host a platform never reads)
+    keeps the persisted rows. Only the digest is stored, so the cache file
+    names no endpoint.
+    """
+    identity = asdict(collection_destination_plan(system))
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
     return f"sha256:{digest[:32]}"
 
@@ -13073,7 +13189,8 @@ class InventoryService:
 
     def _build_scale_ssh_hosts(self) -> list[str]:
         hosts: list[str] = []
-        for value in [self._scale_preferred_ses_host, self.system.ssh.host, *(self.system.ssh.extra_hosts or [])]:
+        plan = collection_destination_plan(self.system)
+        for value in [self._scale_preferred_ses_host, *plan.scale_ssh_hosts]:
             host = normalize_text(value)
             if host and host not in hosts:
                 hosts.append(host)
@@ -13126,11 +13243,9 @@ class InventoryService:
         normalized_system_id = normalize_text(system_id)
         if not normalized_system_id:
             return None
-        for node in self.system.ssh.ha_nodes or []:
-            node_system_id = normalize_text(node.system_id)
-            node_host = normalize_text(node.host)
-            if node_system_id == normalized_system_id and node_host:
-                return node_host
+        configured = collection_destination_plan(self.system).quantastor_host_for_system(normalized_system_id)
+        if configured:
+            return configured
         return self._auto_quantastor_host_for_system(normalized_system_id, raw_data)
 
     def _build_configured_quantastor_hosts(
@@ -13140,38 +13255,24 @@ class InventoryService:
         raw_data: TrueNASRawData | None = None,
     ) -> list[str]:
         hosts: list[str] = []
+        # The configured hosts and their order come from the destination plan
+        # the persisted-detail binding is made from (#1207).
+        configured = collection_destination_plan(self.system).quantastor_hosts(
+            clustered=raw_data is not None and self._quantastor_has_cluster_peers(raw_data),
+        )
+        if configured is None:
+            return hosts
         preferred_host = self._configured_quantastor_host_for_system(preferred_system_id, raw_data=raw_data)
-        explicit_hosts = [
-            normalize_text(node.host)
-            for node in (self.system.ssh.ha_nodes or [])
-            if normalize_text(node.host)
-        ]
         auto_hosts = self._auto_quantastor_ssh_hosts(raw_data)
         api_host = self._quantastor_api_endpoint_host()
-        skip_api_host = bool(
-            self.system.ssh.ha_enabled
-            or self.system.ssh.ha_nodes
-            or (raw_data is not None and self._quantastor_has_cluster_peers(raw_data))
-        )
-        ordered_hosts = (
-            [
-                self._quantastor_preferred_ses_host,
-                preferred_host,
-                *explicit_hosts,
-                *auto_hosts,
-                *(self.system.ssh.extra_hosts or []),
-                self.system.ssh.host,
-            ]
-            if skip_api_host
-            else [
-                self._quantastor_preferred_ses_host,
-                preferred_host,
-                self.system.ssh.host,
-                *explicit_hosts,
-                *auto_hosts,
-                *(self.system.ssh.extra_hosts or []),
-            ]
-        )
+        skip_api_host = configured.skip_api_host
+        ordered_hosts = [
+            self._quantastor_preferred_ses_host,
+            preferred_host,
+            *configured.before_learned,
+            *auto_hosts,
+            *configured.after_learned,
+        ]
         for value in ordered_hosts:
             host = normalize_text(value)
             if host and skip_api_host and self._quantastor_hosts_match(host, api_host):
