@@ -767,11 +767,19 @@ def _build_core_mpr_fabric_snapshot(context: SasFabricBuildContext) -> SasFabric
         if node.kind in {"mpr-enclosure", "ses-enclosure"}
     ]
 
-    if not controller_names and not paths:
+    if _mpr_output_unreadable(normalized_outputs, unit_data):
+        fabric_warnings.append(
+            "CORE mprutil output was returned but could not be read as controller data, "
+            "so controller details are unknown."
+        )
+    elif not controller_names and not paths:
         fabric_warnings.append("No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions.")
+    # Without controller data the bays, pools and vdevs the inventory already
+    # knows are still drawn; the warning above says what could not be read.
+    inventory_drawn = any(node.kind in {"bay", "pool", "vdev"} for node in nodes.values())
 
     return _build_sas_fabric_result(
-        available=bool(controller_names or paths or expanders or enclosures),
+        available=bool(controller_names or paths or expanders or enclosures or inventory_drawn),
         system=system,
         snapshot=snapshot,
         nodes=nodes,
@@ -1747,29 +1755,59 @@ def _parse_unit_data(outputs: dict[str, str]) -> dict[int, dict[str, Any]]:
         if match:
             units.add(int(match.group("unit")))
 
+    summary_units = set(discover_mpr_units_from_adapter_summary(outputs.get("mprutil show adapters", "")))
     parsed: dict[int, dict[str, Any]] = {}
     for unit in sorted(units):
-        parsed[unit] = {
-            "adapter_detail": parse_mpr_adapter_detail(outputs.get(f"mprutil -u {unit} show adapter", "")),
-            "devices": parse_mpr_devices(outputs.get(f"mprutil -u {unit} show devices", "")),
-            "enclosures": parse_mpr_enclosures(outputs.get(f"mprutil -u {unit} show enclosures", "")),
-            "expanders": parse_mpr_expanders(outputs.get(f"mprutil -u {unit} show expanders", "")),
-            "iocfacts": parse_mpr_iocfacts(outputs.get(f"mprutil -u {unit} show iocfacts", "")),
-        }
-    # The unnumbered fallback is controller evidence only when one of its
-    # commands returned output; an empty fallback must not create a controller.
-    if not parsed and any(
-        outputs.get(f"mprutil show {subcommand}", "").strip()
-        for subcommand in CORE_MPRUTIL_UNIT_SUBCOMMANDS
-    ):
-        parsed[_LEGACY_MPR_UNIT_KEY] = {
-            "adapter_detail": parse_mpr_adapter_detail(outputs.get("mprutil show adapter", "")),
-            "devices": parse_mpr_devices(outputs.get("mprutil show devices", "")),
-            "enclosures": parse_mpr_enclosures(outputs.get("mprutil show enclosures", "")),
-            "expanders": parse_mpr_expanders(outputs.get("mprutil show expanders", "")),
-            "iocfacts": parse_mpr_iocfacts(outputs.get("mprutil show iocfacts", "")),
-        }
+        payload = _parse_mpr_unit_payload(outputs, f"mprutil -u {unit} show")
+        # A unit listed by the adapter summary was observed. A unit known only
+        # from a command name needs output that parsed as controller data.
+        if unit in summary_units or _mpr_unit_payload_observed(payload):
+            parsed[unit] = payload
+    # The unnumbered fallback is controller evidence only when its output
+    # parsed as controller data; empty or unreadable text creates nothing.
+    if not parsed:
+        payload = _parse_mpr_unit_payload(outputs, "mprutil show")
+        if _mpr_unit_payload_observed(payload):
+            parsed[_LEGACY_MPR_UNIT_KEY] = payload
     return parsed
+
+
+def _parse_mpr_unit_payload(outputs: dict[str, str], prefix: str) -> dict[str, Any]:
+    return {
+        "adapter_detail": parse_mpr_adapter_detail(outputs.get(f"{prefix} adapter", "")),
+        "devices": parse_mpr_devices(outputs.get(f"{prefix} devices", "")),
+        "enclosures": parse_mpr_enclosures(outputs.get(f"{prefix} enclosures", "")),
+        "expanders": parse_mpr_expanders(outputs.get(f"{prefix} expanders", "")),
+        "iocfacts": parse_mpr_iocfacts(outputs.get(f"{prefix} iocfacts", "")),
+    }
+
+
+def _mpr_unit_payload_observed(payload: dict[str, Any]) -> bool:
+    """True only for output that parsed as recognised controller data.
+
+    Free ``key: value`` text alone (generic adapter keys, iocfacts) is not
+    enough: any unrelated text containing a colon would otherwise count.
+    """
+    detail = payload.get("adapter_detail") or {}
+    return bool(
+        detail.get("board_name")
+        or detail.get("firmware_revision")
+        or detail.get("phy_rows")
+        or payload.get("devices")
+        or payload.get("enclosures")
+        or payload.get("expanders")
+    )
+
+
+def _mpr_output_unreadable(outputs: dict[str, str], unit_data: dict[int, dict[str, Any]]) -> bool:
+    """Some mprutil unit command answered, yet no unit was admitted from it."""
+    if unit_data:
+        return False
+    return any(
+        value.strip()
+        for command, value in outputs.items()
+        if re.match(r"mprutil (?:-u \d+ )?show (?:adapter|devices|enclosures|expanders|iocfacts)$", command)
+    )
 
 
 def _path_counts_from_slots(slots: list[SlotView]) -> tuple[dict[str, Counter[str]], dict[str, dict[str, list[int]]]]:

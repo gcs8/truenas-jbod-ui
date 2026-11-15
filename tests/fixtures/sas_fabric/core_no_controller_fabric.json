@@ -1,0 +1,230 @@
+{
+  "aliases": [],
+  "available": true,
+  "controllers": [],
+  "enclosures": [],
+  "expanders": [],
+  "generated_at": "2026-01-01T00:00:00Z",
+  "links": [
+    {
+      "evidence": [
+        "profile slot layout"
+      ],
+      "id": "backplane-bay:backplane:0->bay:0:0",
+      "kind": "backplane-bay",
+      "related_slots": [
+        0
+      ],
+      "reported_lanes": null,
+      "slot": 0,
+      "source": "backplane:0",
+      "status": null,
+      "target": "bay:0"
+    },
+    {
+      "evidence": [],
+      "id": "bay-pool:bay:0->pool:tank:0",
+      "kind": "bay-pool",
+      "related_slots": [
+        0
+      ],
+      "reported_lanes": null,
+      "slot": 0,
+      "source": "bay:0",
+      "status": null,
+      "target": "pool:tank"
+    },
+    {
+      "evidence": [],
+      "id": "pool-vdev:pool:tank->vdev:tank/mirror-0:0",
+      "kind": "pool-vdev",
+      "related_slots": [
+        0
+      ],
+      "reported_lanes": null,
+      "slot": 0,
+      "source": "pool:tank",
+      "status": null,
+      "target": "vdev:tank/mirror-0"
+    }
+  ],
+  "nodes": [
+    {
+      "alias": null,
+      "controller_id": null,
+      "display_label": null,
+      "evidence": [
+        "profile slot layout"
+      ],
+      "id": "backplane:0",
+      "kind": "backplane",
+      "label": "Backplane Zone 1",
+      "metrics": {
+        "slot_count": 1,
+        "slot_range": "Bays 00-00",
+        "zone": 1
+      },
+      "raw": {
+        "id": "backplane:0",
+        "index": 0,
+        "label": "Backplane Zone 1",
+        "range": "Bays 00-00",
+        "slots": [
+          0
+        ]
+      },
+      "raw_id": null,
+      "related_slots": [
+        0
+      ],
+      "slot": null,
+      "status": null
+    },
+    {
+      "alias": null,
+      "controller_id": null,
+      "display_label": null,
+      "evidence": [
+        "inventory snapshot"
+      ],
+      "id": "bay:0",
+      "kind": "bay",
+      "label": "Bay 00",
+      "metrics": {
+        "device_name": "da0",
+        "health": null,
+        "pool_name": "tank",
+        "present": true,
+        "vdev_name": "mirror-0"
+      },
+      "raw": {},
+      "raw_id": null,
+      "related_slots": [
+        0
+      ],
+      "slot": 0,
+      "status": "healthy"
+    },
+    {
+      "alias": null,
+      "controller_id": null,
+      "display_label": null,
+      "evidence": [],
+      "id": "host",
+      "kind": "host",
+      "label": "Synthetic CORE",
+      "metrics": {
+        "slot_count": 1
+      },
+      "raw": {},
+      "raw_id": "synthetic-core",
+      "related_slots": [],
+      "slot": null,
+      "status": null
+    },
+    {
+      "alias": null,
+      "controller_id": null,
+      "display_label": null,
+      "evidence": [],
+      "id": "pool:tank",
+      "kind": "pool",
+      "label": "tank",
+      "metrics": {},
+      "raw": {},
+      "raw_id": null,
+      "related_slots": [
+        0
+      ],
+      "slot": null,
+      "status": null
+    },
+    {
+      "alias": null,
+      "controller_id": null,
+      "display_label": null,
+      "evidence": [],
+      "id": "vdev:tank/mirror-0",
+      "kind": "vdev",
+      "label": "mirror-0",
+      "metrics": {},
+      "raw": {},
+      "raw_id": null,
+      "related_slots": [
+        0
+      ],
+      "slot": null,
+      "status": null
+    }
+  ],
+  "paths": [],
+  "platform": "core",
+  "raw": {
+    "command_failures": [],
+    "commands": [],
+    "mpr_kernel_events": {
+      "controllers": [],
+      "devices": [],
+      "event_count": 0
+    },
+    "mpr_sysctl_locations": {},
+    "path_counts": {},
+    "path_slots": {},
+    "pci_controllers": [],
+    "pcie_slots": [],
+    "selected_bay_slots": [
+      0
+    ],
+    "selected_disk_slots": [
+      0
+    ],
+    "selected_enclosure_keys": []
+  },
+  "selected_enclosure_id": null,
+  "selected_enclosure_label": null,
+  "snapshot_cache_state": "miss",
+  "source_cache_state": "miss",
+  "sources": {},
+  "system_id": "synthetic-core",
+  "system_label": "Synthetic CORE",
+  "traces": [
+    {
+      "alias": null,
+      "display_label": null,
+      "evidence": [
+        "inventory snapshot",
+        "multipath members",
+        "selected enclosure scope"
+      ],
+      "id": "bay:0",
+      "kind": "bay",
+      "label": "Bay 00",
+      "link_ids": [
+        "backplane-bay:backplane:0->bay:0:0",
+        "bay-pool:bay:0->pool:tank:0",
+        "pool-vdev:pool:tank->vdev:tank/mirror-0:0"
+      ],
+      "metrics": {
+        "device_name": "da0",
+        "mpr_devices": [],
+        "path_states": [],
+        "pool_name": "tank",
+        "selected_enclosure_scope": true,
+        "vdev_name": "mirror-0"
+      },
+      "node_ids": [
+        "host",
+        "bay:0",
+        "backplane:0",
+        "pool:tank",
+        "vdev:tank/mirror-0"
+      ],
+      "slots": [
+        0
+      ]
+    }
+  ],
+  "warnings": [
+    "No CORE SAS controller/path data is available yet. Check SSH and mprutil permissions."
+  ]
+}

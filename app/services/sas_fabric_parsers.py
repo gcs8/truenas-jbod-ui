@@ -39,6 +39,7 @@ def parse_mpr_adapter_summary(text: str) -> list[dict[str, str]]:
 
 def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
     detail: dict[str, Any] = {"phy_rows": []}
+    malformed_phy_rows = 0
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -65,12 +66,17 @@ def parse_mpr_adapter_detail(text: str) -> dict[str, Any]:
                         "device": " ".join(parts[7:]),
                     }
                 )
-    detail["phy_count"] = len(detail.get("phy_rows") or [])
-    detail["linked_phy_count"] = sum(
-        1
-        for row in detail.get("phy_rows") or []
-        if row.get("device") and row.get("device") != "No Device"
-    )
+            else:
+                malformed_phy_rows += 1
+    rows = detail["phy_rows"]
+    # Counts come only from a PHY table that was read whole. No table, a
+    # malformed row or a repeated PHY number leaves both counts unknown.
+    if rows and not malformed_phy_rows and len({row["phy"] for row in rows}) == len(rows):
+        detail["phy_count"] = len(rows)
+        detail["linked_phy_count"] = sum(1 for row in rows if row.get("device") and row.get("device") != "No Device")
+    else:
+        detail["phy_count"] = None
+        detail["linked_phy_count"] = None
     return detail
 
 
@@ -175,7 +181,10 @@ def parse_mpr_expanders(text: str) -> list[dict[str, Any]]:
     for expander in expanders:
         counts = Counter(str(row.get("device") or "unknown").strip() for row in expander.get("phys") or [])
         expander["device_counts"] = dict(counts)
-        expander["linked_phys"] = sum(1 for row in expander.get("phys") or [] if row.get("device") != "No Device")
+        # No PHY rows read under this expander: the linked count is unknown, not 0.
+        expander["linked_phys"] = (
+            sum(1 for row in expander["phys"] if row.get("device") != "No Device") if expander.get("phys") else None
+        )
     return expanders
 
 

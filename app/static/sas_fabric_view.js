@@ -1823,7 +1823,27 @@
           extra: "host",
         })}
       </div>
-      <div class="fabric-lane-board">${lanes || '<div class="warning-item muted compact">No controller lanes are available yet.</div>'}</div>
+      <div class="fabric-lane-board">${lanes || renderLanesWithoutController(fabric, copy)}</div>
+    `;
+  }
+
+  // CORE without readable controller output still knows its bays: draw them
+  // instead of an empty board; the status and warning list say why.
+  function renderLanesWithoutController(fabric, copy) {
+    const slots = sortedSlots(list(fabric.nodes)
+      .filter((node) => node.kind === "bay")
+      .flatMap((node) => list(node.related_slots)));
+    if (fabric.platform !== "core" || !slots.length) {
+      return '<div class="warning-item muted compact">No controller lanes are available yet.</div>';
+    }
+    return `
+      <section class="fabric-dedicated-lane">
+        <div class="warning-item muted compact">Controller data could not be read. The bays below come from the inventory.</div>
+        <div class="fabric-stage">
+          <span class="fabric-stage-title">${escapeHtml(copy.laneStages.bays)}</span>
+          <div class="fabric-bay-grid">${renderBayChips(slots, 120)}</div>
+        </div>
+      </section>
     `;
   }
 

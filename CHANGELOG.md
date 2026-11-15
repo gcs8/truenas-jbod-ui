@@ -45,10 +45,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- The CORE Storage Fabric view no longer invents an `mpr-1` controller and
-  reports the map as available when no `mprutil` output was returned; it now
-  says no controller or path data is available. When only the unnumbered
-  `mprutil show ...` commands answer, their board and firmware stay on one
+- The CORE Storage Fabric view no longer invents an `mpr-1` controller when
+  no `mprutil` output was returned; it says no controller or path data is
+  available and still draws the bays, pools and vdevs the inventory knows.
+  Output that cannot be read as controller data no longer creates a
+  controller, an adapter or expander PHY table that was not read shows its
+  PHY counts as unknown instead of 0, and an empty numbered `mprutil -u N`
+  result no longer hides the unnumbered adapter details. When only the
+  unnumbered `mprutil show ...` commands answer, their board and firmware stay on one
   controller, and every link and controller reference names a node that is
   in the map (#1244, refs #1219).
 - Re-saving a system in System Setup no longer resets settings the form does
