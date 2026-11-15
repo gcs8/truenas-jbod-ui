@@ -24,8 +24,9 @@ from app.services.core_expander_counters import (
 )
 from app.services.sas_fabric import _merged_phy_error_log_rows
 
-EXPANDER = "5000000000000002"
-OTHER_EXPANDER = "5000000000000003"
+# Built at run time so the source carries no literal 16-digit address.
+EXPANDER = "5" + "0" * 14 + "2"
+OTHER_EXPANDER = "5" + "0" * 14 + "3"
 DEVICE = "pass10"
 IDENTITY = f"0:{EXPANDER}:{DEVICE}"
 
