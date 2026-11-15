@@ -239,10 +239,40 @@ class Deployment:
         return json.loads(output.strip().splitlines()[-1])
 
 
+# Deployment roots this invocation created itself (#1224). Only these may be
+# recursively removed again; a --root path alone never grants that authority.
+_OWNED_ROOTS: set[Path] = set()
+
+
+def owns_root(root: Path) -> bool:
+    """True only for a root this invocation created and that is still not a symlink."""
+    return Path(os.path.abspath(root)) in _OWNED_ROOTS and not root.is_symlink()
+
+
 def prepare_root(root: Path, compose_fixture: Path, config_fixture: Path, nonroot_fixture: Path | None = None) -> None:
-    if root.exists():
-        run(["sudo", "rm", "-rf", str(root)])
-    root.mkdir(parents=True)
+    """Create a new deployment root, or rebuild one this invocation already owns.
+
+    Fixtures are checked first. An existing directory, an existing empty
+    directory and any symlink (dangling or not) are refused before any command
+    runs, so a mistaken --root never acquires recursive-deletion authority.
+    """
+    for label, fixture in (("compose", compose_fixture), ("config", config_fixture), ("nonroot", nonroot_fixture)):
+        if fixture is not None:
+            expect(fixture.is_file(), f"{label} fixture {fixture} is missing or not a regular file")
+    root = Path(os.path.abspath(root))  # absolute without following symlinks
+    expect(not root.is_symlink(), f"deployment root {root} is a symlink; refusing to use or replace it")
+    if root in _OWNED_ROOTS:
+        # A scenario rebuilding the root it created earlier in this run.
+        run(["sudo", "rm", "-rf", "--", str(root)])
+        _OWNED_ROOTS.discard(root)
+    expect(not os.path.lexists(root),
+           f"deployment root {root} already exists; pass an absent path, the smoke never replaces existing files")
+    expect(root.parent.is_dir(), f"deployment root parent {root.parent} is not an existing directory")
+    try:
+        root.mkdir()
+    except FileExistsError:
+        raise SmokeError(f"deployment root {root} already exists; pass an absent path") from None
+    _OWNED_ROOTS.add(root)
     shutil.copyfile(compose_fixture, root / "docker-compose.yml")
     # Existing installs created these as root; the base Compose must accept
     # them without any ownership migration.
@@ -609,7 +639,7 @@ def seed_previous_release(deployment: Deployment, args: argparse.Namespace) -> t
 
 def upgrade_and_rollback(args: argparse.Namespace, *, hardened: bool) -> str:
     """Image-only upgrade and rollback on the base file, or the base file plus the nonroot overlay."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture, args.nonroot_fixture if hardened else None)
     deployment = Deployment(root, HARDENED_FILES if hardened else ())
     # Base installs stay root-owned and run as root; the hardened install runs
@@ -705,7 +735,7 @@ def seed_segmented_catalog(
 
 def segmented_catalog_upgrade(args: argparse.Namespace) -> str:
     """Preserve a v0.22.2 segmented catalog byte-for-byte across upgrade and rollback."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_path = root / "config" / "config.yaml"
@@ -818,7 +848,7 @@ def kill_during_startup(deployment: Deployment, phase: str, name: str, timeout: 
 
 def interrupted_migration(args: argparse.Namespace) -> str:
     """Kill candidate startup at each schema-initialization seam, then restart normally."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
 
@@ -1050,7 +1080,7 @@ def check_readonly_runtime(deployment: Deployment, args: argparse.Namespace) -> 
 
 def readonly_state(args: argparse.Namespace) -> str:
     """Exercise one literal read-only required-state mount on synthetic released state."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1103,7 +1133,7 @@ def check_enospc_runtime(deployment: Deployment, args: argparse.Namespace) -> di
 
 def enospc_state(args: argparse.Namespace) -> str:
     """Exhaust a disposable required-state filesystem, then explicitly free it."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1756,7 +1786,7 @@ def record_backup_phase_change(deployment: Deployment, notes: str) -> None:
 
 def unavailable_backup_storage(args: argparse.Namespace) -> str:
     """Exercise one unavailable filesystem backup target on synthetic released state."""
-    root = args.root.resolve()
+    root = args.root.absolute()
     prepare_root(root, args.compose_fixture, args.config_fixture)
     deployment = Deployment(root)
     config_digest = sha256(root / "config/config.yaml")
@@ -1963,7 +1993,7 @@ def remove_admin_service(deployment: Deployment) -> None:
 
 def admin_during_upgrade(args: argparse.Namespace) -> str:
     """The admin service across an image-only upgrade, and its dormancy where never enabled."""
-    root = args.root.resolve()
+    root = args.root.absolute()
 
     # 1. Never enabled: the literal update must not start the admin profile.
     prepare_root(root, args.compose_fixture, args.config_fixture)
@@ -2070,7 +2100,7 @@ def cleanup(root: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--root", type=Path, required=True, help="Disposable deployment directory.")
+    parser.add_argument("--root", type=Path, required=True, help="An absent path to create for this run (never an existing directory or symlink); it is removed only after verified cleanup.")
     parser.add_argument("--compose-fixture", type=Path, required=True, help="The previous release's Compose file.")
     parser.add_argument("--config-fixture", type=Path, required=True)
     parser.add_argument("--previous-image", required=True)
@@ -2104,16 +2134,19 @@ def main(argv: list[str] | None = None) -> int:
             print("clean-host restore failed; recovery files retained: "
                   + clean_host_failure_message(exc, secrets), file=sys.stderr)
             return 1
+    root = args.root.absolute()
     try:
         print(smoke(args) + f" seconds={int(time.monotonic() - started)}")
     except SmokeError as exc:
         print(f"image upgrade smoke failed: {exc}", file=sys.stderr)
-        chain = compose_chain(args.root.resolve())
-        subprocess.run(["docker", "compose", *chain, "ps", "-a"], cwd=args.root, check=False)
-        subprocess.run(["docker", "compose", *chain, "logs", "--tail", "80"], cwd=args.root, check=False)
+        if owns_root(root):  # never read or act on a directory this run did not create
+            chain = compose_chain(root)
+            subprocess.run(["docker", "compose", *chain, "ps", "-a"], cwd=root, check=False)
+            subprocess.run(["docker", "compose", *chain, "logs", "--tail", "80"], cwd=root, check=False)
         return 1
     finally:
-        cleanup(args.root.resolve())
+        if owns_root(root):
+            cleanup(root)
     return 0
 
 

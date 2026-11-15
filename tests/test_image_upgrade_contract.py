@@ -1016,6 +1016,8 @@ class ReadOnlyStateScenarioTests(unittest.TestCase):
                 root = Path(directory)
                 (root / "docker-compose.yml").write_text("services: {}")
                 smoke.install_readonly_history_mount(smoke.Deployment(root))
+                # The mocked scenario stands in for prepare_root, which records the root it created.
+                smoke._OWNED_ROOTS.add(root)
                 argv = ["--scenario", "readonly-state", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
@@ -1355,6 +1357,8 @@ class EnospcStateScenarioTests(unittest.TestCase):
                 (root / "docker-compose.yml").write_text("services: {}")
                 with mock.patch.object(smoke, "run"):
                     smoke.install_enospc_history_mount(smoke.Deployment(root))
+                # The mocked scenario stands in for prepare_root, which records the root it created.
+                smoke._OWNED_ROOTS.add(root)
                 argv = ["--scenario", "enospc-state", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
@@ -2349,6 +2353,8 @@ class UnavailableBackupStorageScenarioTests(unittest.TestCase):
                 (root / "docker-compose.yml").write_text("services: {}")
                 with mock.patch.object(smoke, "run"):
                     smoke.install_backup_scheduler_with_target(smoke.Deployment(root))
+                # The mocked scenario stands in for prepare_root, which records the root it created.
+                smoke._OWNED_ROOTS.add(root)
                 argv = ["--scenario", "unavailable-backup-storage", "--root", str(root),
                         "--compose-fixture", "fixture", "--config-fixture", "config-fixture",
                         "--previous-image", "previous", "--previous-version", "1", "--candidate-image", "candidate",
