@@ -6,17 +6,22 @@ An FTP-style target checks only the remote size at upload, so such a copy is
 the same thing, and must switch to the stronger result only after an explicit
 Verify has read the copy back and matched its size and SHA-256.
 
-Synthetic local-directory targets only; nothing leaves the temporary directory.
+Synthetic local-directory targets and an in-memory FTP server only; nothing
+leaves the temporary directory.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
+import threading
 import unittest
 
-from history_service.backup_archive.transport import LocalDirectoryTarget
+from history_service.backup_archive.catalog import new_artifact_id
+from history_service.backup_archive.transport import FtpTarget, LocalDirectoryTarget
 
+import tests.test_backup_archive_transport as archive_transport_fixtures
 import tests.test_backup_integration as backup_fixtures
 
 
@@ -101,6 +106,124 @@ class BackupListAssuranceTests(backup_fixtures.SchedulerTestBase):
         with scheduler._state_lock:
             scheduler._meta[remote.artifact_id]["last_verify"] = "yes"
         self.assertIsNone(self._row(scheduler, remote.artifact_id)["last_verify"])
+        with scheduler._state_lock:
+            scheduler._meta[remote.artifact_id]["last_verify"] = {"at": 1758715200, "ok": True}
+        self.assertEqual(self._row(scheduler, remote.artifact_id)["last_verify"], {"at": None, "ok": True})
+
+    def test_one_container_valued_upload_check_does_not_break_the_list(self) -> None:
+        from history_service.backup_scheduler.api import build_app
+
+        scheduler, local, remote = self._scheduler_with_size_only_copy()
+        for value in ([], {}, ["size"], {"size": True}):
+            with self.subTest(upload_check=value):
+                with scheduler._state_lock:
+                    scheduler._meta[remote.artifact_id]["upload_check"] = value
+                    scheduler._save_meta()
+                    scheduler._meta = scheduler._load_meta()
+                rows = {item["id"]: item for item in scheduler.library()["artifacts"]}
+                self.assertEqual(set(rows), {local.artifact_id, remote.artifact_id})
+                self.assertIsNone(rows[remote.artifact_id]["upload_check"])  # unknown, not size or readback
+                self.assertIsNone(rows[local.artifact_id]["upload_check"])
+                self.assertIsNone(scheduler.detail(remote.artifact_id)["upload_check"])
+                status, body = backup_fixtures.asgi_call(build_app(scheduler), "GET", "/internal/backups")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(json.loads(body)["artifacts"]), 2)
+        # Control: a well-formed value on the same row still lists as recorded.
+        with scheduler._state_lock:
+            scheduler._meta[remote.artifact_id]["upload_check"] = "size"
+        self.assertEqual(self._row(scheduler, remote.artifact_id)["upload_check"], "size")
+
+
+class GatedFTP(archive_transport_fixtures.FakeFTP):
+    """In-memory FTP server that holds STOR until released and counts RETR."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.retr_calls = 0
+
+    def storbinary(self, cmd, fp, blocksize=8192):
+        self.entered.set()
+        if not self.release.wait(10):
+            raise TimeoutError("synthetic upload gate expired")
+        return super().storbinary(cmd, fp, blocksize)
+
+    def retrbinary(self, cmd, callback, blocksize=8192):
+        self.retr_calls += 1
+        return super().retrbinary(cmd, callback, blocksize)
+
+
+class RemoteCopyVerifyIsPerCopyTests(backup_fixtures.SchedulerTestBase):
+    """A Verify of one copy never makes another copy look read back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ftp = GatedFTP()
+        self.ftp.alter_same_length = True  # the stored bytes differ, the size matches
+        self.addCleanup(self.ftp.release.set)
+
+    def open_target(self, settings):
+        @contextlib.contextmanager
+        def opened():
+            yield FtpTarget(self.ftp, "/backups", encrypted=False)
+
+        return opened()
+
+    def test_local_verify_during_upload_does_not_verify_the_remote_copy(self) -> None:
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        worker = scheduler.start_run("full")
+        self.addCleanup(worker.join, 10)
+        self.assertTrue(self.ftp.entered.wait(10), "the upload was not reached")
+        local = next(r for r in scheduler.catalog.list() if r.location == "local")
+        self.assertTrue(scheduler.verify(local.artifact_id)["ok"])
+        self.ftp.release.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        self.assertEqual(self.ftp.retr_calls, 0)  # nobody read the remote copy back
+        row = self._row(scheduler, remote.artifact_id)
+        self.assertEqual(row["upload_check"], "size")
+        self.assertIsNone(row["last_verify"], "the remote copy inherited the local copy's Verify")
+        detail = scheduler.detail(remote.artifact_id)
+        self.assertIsNone(detail["last_verify"])
+        # The archive description still travels with the copy.
+        self.assertEqual(detail["inspect"], scheduler.detail(local.artifact_id)["inspect"])
+        self.assertIsNotNone(detail["inspect"])
+        # Control: the local copy keeps its own successful Verify.
+        self.assertEqual(self._row(scheduler, local.artifact_id)["last_verify"]["ok"], True)
+
+        # The remote copy's own Verify reads it back and finds the altered bytes.
+        result = scheduler.verify(remote.artifact_id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.ftp.retr_calls, 1)
+        self.assertIs(self._row(scheduler, remote.artifact_id)["last_verify"]["ok"], False)
+
+    def test_remote_metadata_carries_only_the_archive_description(self) -> None:
+        scheduler = self.make({"full": {"enabled": True}, "targets": [backup_fixtures.TARGET]})
+        self.ftp.release.set()
+        self.ftp.alter_same_length = False
+        local = scheduler.run_now("full")
+        remote = next(r for r in scheduler.catalog.list() if r.location == "nas")
+        local_meta = scheduler._metadata_snapshot(local.artifact_id)
+        # Per-copy state planted on the source must never reach a new copy.
+        with scheduler._state_lock:
+            scheduler._meta[local.artifact_id]["last_verify"] = {"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "x"}
+            scheduler._meta[local.artifact_id]["publication"] = {"name": "planted"}
+            scheduler._meta[local.artifact_id]["future_per_copy_fact"] = 1
+        copy = dataclasses.replace(remote, artifact_id=new_artifact_id(), location="second")
+        scheduler._catalog_remote(local, copy, upload_check="readback")
+        copy_meta = scheduler._metadata_snapshot(copy.artifact_id)
+        self.assertNotIn("last_verify", copy_meta)
+        self.assertNotIn("publication", copy_meta)
+        self.assertNotIn("future_per_copy_fact", copy_meta)
+        self.assertEqual(copy_meta["upload_check"], "readback")
+        for key in ("app_version", "schema_version", "packaging", "groups"):
+            self.assertEqual(copy_meta.get(key), local_meta.get(key), key)
+
+    def _row(self, scheduler, artifact_id):
+        return next(item for item in scheduler.library()["artifacts"] if item["id"] == artifact_id)
 
 
 if __name__ == "__main__":

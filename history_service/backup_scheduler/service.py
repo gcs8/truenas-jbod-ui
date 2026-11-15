@@ -1117,7 +1117,11 @@ class BackupScheduler:
     ) -> None:
         self.catalog.add(remote_record)
         with self._state_lock:
-            meta = self._metadata_snapshot(source.artifact_id)
+            # Copy only what describes the archive itself. Verify results and
+            # publication intents belong to the source copy: a Verify of the local
+            # file must never make this remote copy look read back (#1202).
+            source_meta = self._metadata_snapshot(source.artifact_id)
+            meta = {key: source_meta[key] for key in _ARCHIVE_DESCRIPTION_KEYS if key in source_meta}
             # #722: remember how the upload was checked, so the detail view can
             # say "size only" until an explicit verify re-reads and hashes it.
             meta["upload_check"] = upload_check
@@ -1554,7 +1558,8 @@ def _target_run(value: Any) -> dict[str, Any] | None:
 
 def _upload_check(meta: Mapping[str, Any]) -> str | None:
     value = meta.get("upload_check")
-    return value if value in {"readback", "size"} else None
+    # A malformed stored value is unknown for that copy; it must not break the list.
+    return value if isinstance(value, str) and value in {"readback", "size"} else None
 
 
 def _list_last_verify(meta: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1570,6 +1575,10 @@ def _list_last_verify(meta: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     at = value.get("at")
     return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
+
+
+# Metadata that describes the archive content and so holds for every copy of it.
+_ARCHIVE_DESCRIPTION_KEYS = ("app_version", "schema_version", "packaging", "groups", "history_replacement")
 
 
 def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, Any]:

@@ -52,7 +52,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   copy uploaded to an FTP-style target, which checks only the remote size,
   reads "Size only at upload" in both places until an explicit Verify reads
   it back and matches its SHA-256. A remote copy whose upload check was never
-  recorded now says so instead of "Yes" (#1255).
+  recorded now says so instead of "Yes". A Verify of the local copy no longer
+  carries over to a remote copy made from it, and one malformed stored upload
+  check no longer stops the whole list from loading (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
