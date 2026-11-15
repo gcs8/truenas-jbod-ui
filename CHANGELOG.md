@@ -45,6 +45,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- SES evidence no longer misplaces or hides disks: zero SAS addresses no longer
+  merge unrelated shelves seen from different hosts or give a bay another
+  host's identify target; a bay whose SES occupancy is unknown keeps its
+  mapped disk and shows as unknown instead of empty; and Quantastor no longer
+  hides a known disk behind a zero SAS address when stronger evidence says the
+  bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
