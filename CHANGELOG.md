@@ -98,6 +98,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   build cannot replace the image a deployment follows; manual inputs are split
   without filename expansion, and branch, sha and custom tags are unchanged
   (#1179).
+- The release-wrap validator now fails a checklist table that repeats a gate,
+  so a later Pass row can no longer hide an earlier Blocked one. It also
+  reports malformed rows instead of skipping them and rejects "Not enough time"
+  as an N/A reason (#1233).
 
 ## v0.24.0-rc.1 - 2026-11-11
 
