@@ -5880,14 +5880,16 @@
       builderRevision: state.profileBuilderRevision,
       builderDraft: builder ? builderDraft() : null });
     let submitted = snapshot();
+    const sameTarget = () => state.setupEditorGeneration === submitted.generation
+      && target() === submitted.target;
     const owns = () => state.adminEditorOperationSeq[name] === sequence
-      && state.setupEditorGeneration === submitted.generation
-      && state.setupDraftRevision === submitted.revision && target() === submitted.target
+      && sameTarget()
+      && state.setupDraftRevision === submitted.revision
       && (!builder || (state.profileBuilderGeneration === submitted.builderGeneration
         && state.profileBuilderRevision === submitted.builderRevision
         && builderDraft() === submitted.builderDraft));
     // Only call after an admitted, synchronous change made by this operation.
-    return { owns, advance: () => { submitted = snapshot(); } };
+    return { owns, sameTarget, advance: () => { submitted = snapshot(); } };
   }
 
   function retireAdminEditorControls({ builderOnly = false } = {}) {
@@ -6809,14 +6811,15 @@
     const operation = captureAdminEditorOperation(name);
     const sequence = state.adminEditorOperationSeq[name];
     const serverName = collectTlsServerName();
-    const owns = () => operation.owns() && collectTlsTargetHost() === host
+    const sameTarget = () => operation.sameTarget() && collectTlsTargetHost() === host
       && collectTlsServerName() === serverName;
+    const owns = () => operation.owns() && sameTarget();
     // This request's button is released by whichever request of this kind is
     // newest. Not every draft change (storage-view delete, duplicate or order
     // reset) releases editor controls, so a retired request still releases its
     // button unless a newer request of the same kind now holds it.
     const latest = () => state.adminEditorOperationSeq[name] === sequence;
-    return { owns, latest, serverName, advance: operation.advance };
+    return { owns, sameTarget, latest, serverName, advance: operation.advance };
   }
 
   async function inspectTlsCertificate() {
@@ -6953,10 +6956,13 @@
       setBanner("Choose a PEM bundle before importing it into the local trust store.", "error");
       return;
     }
-    const host = collectTlsTargetHost();
-    const systemId = elements.setupSystemId?.value?.trim() || null;
-    const bundleName = suggestedTlsBundleName();
-    const owner = captureTlsEditorOperation("tls-import", host);
+    const requestTarget = {
+      host: collectTlsTargetHost() || null,
+      system_id: elements.setupSystemId?.value?.trim() || null,
+      bundle_name: suggestedTlsBundleName(),
+      tls_server_name: collectTlsServerName() || null,
+    };
+    const owner = captureTlsEditorOperation("tls-import", requestTarget.host || "");
     const fileName = file.name || "the selected file";
     if (elements.setupTlsImportCaButton) {
       elements.setupTlsImportCaButton.disabled = true;
@@ -6974,13 +6980,19 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           pem_text: pemText,
-          host: host || null,
-          system_id: systemId,
-          bundle_name: bundleName,
-          tls_server_name: owner.serverName || null,
+          ...requestTarget,
         }),
       });
-      if (!owner.owns()) return;
+      if (!owner.owns()) {
+        if (owner.latest() && owner.sameTarget()) {
+          const message = "Certificate import finished for an earlier draft. Reload this system before using the imported bundle.";
+          if (elements.setupTlsImportResult) {
+            elements.setupTlsImportResult.textContent = message;
+          }
+          setBanner(message, "info");
+        }
+        return;
+      }
       const draftBefore = setupDraftSnapshot();
       if (elements.setupTlsCaBundlePath) {
         elements.setupTlsCaBundlePath.value = payload.bundle_path || "";
@@ -6999,7 +7011,7 @@
       const validationDetail = buildTlsValidationSuggestion(payload.validation);
       if (elements.setupTlsImportResult) {
         elements.setupTlsImportResult.textContent = trusted
-          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || host || "this host"}.`
+          ? `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path} and verified it for ${payload.validation?.host || requestTarget.host || "this host"}.`
           : `Imported ${payload.certificate_count} certificate${payload.certificate_count === 1 ? "" : "s"} into ${payload.bundle_path}. ${validationDetail || defaultTlsTrustDetail({ bundlePath: payload.bundle_path })}${leftOff ? " Certificate checks were left off." : " Certificate checks are still on, so refreshes will fail until this passes."}`.trim();
       }
       setBanner(

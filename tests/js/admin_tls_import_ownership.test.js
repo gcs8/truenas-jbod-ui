@@ -60,8 +60,7 @@ const ALPHA_REPLY = {
   bundle_path: "/synthetic/tls/alpha.pem",
   certificate_count: 1,
   validation: {
-    validated: true,
-    host: ALPHA_HOST,
+    validated: true, host: ALPHA_HOST,
     bundle_path: "/synthetic/tls/alpha.pem",
     detail: "Verified synthetic alpha bundle.",
   },
@@ -216,6 +215,28 @@ test("a stale import success cannot update another editor or its trust cache", a
   assert.deepEqual(harness.banners, []);
 });
 
+test("a completed import for an earlier draft tells the current editor to reload", async () => {
+  const harness = importHarness();
+  const pending = harness.importTlsBundle();
+  await requestStarted(harness);
+  const trustBefore = harness.state.tlsTrustStatus;
+  harness.state.setupDraftRevision += 1;
+
+  harness.requests[0].resolve(ALPHA_REPLY);
+  await pending;
+
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupVerifySsl.checked, false);
+  assert.match(harness.elements.setupTlsImportResult.textContent, /finished for an earlier draft/i);
+  assert.match(harness.elements.setupTlsImportResult.textContent, /reload/i);
+  assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
+  assert.equal(harness.state.lastTlsValidation, null);
+  assert.deepEqual(harness.banners, [{
+    message: "Certificate import finished for an earlier draft. Reload this system before using the imported bundle.",
+    tone: "info",
+  }]);
+});
+
 test("a stale import failure cannot replace another editor's status", async () => {
   const harness = importHarness();
   const pending = harness.importTlsBundle();
@@ -230,6 +251,25 @@ test("a stale import failure cannot replace another editor's status", async () =
   assert.equal(harness.elements.setupTlsImportResult.textContent, "Bravo has no pending import.");
   assert.strictEqual(harness.state.tlsTrustStatus, bravoTrust);
   assert.strictEqual(harness.state.lastTlsValidation, bravoValidation);
+  assert.deepEqual(harness.banners, []);
+});
+
+test("changing only the TLS server name retires a pending import", async () => {
+  const harness = importHarness();
+  const pending = harness.importTlsBundle();
+  await requestStarted(harness);
+  const trustBefore = harness.state.tlsTrustStatus;
+  harness.elements.setupTlsServerName.value = "other-name.example.test";
+  harness.elements.setupTlsImportResult.textContent = "Current server-name draft.";
+
+  harness.requests[0].resolve(ALPHA_REPLY);
+  await pending;
+
+  assert.equal(harness.elements.setupTlsCaBundlePath.value, "");
+  assert.equal(harness.elements.setupVerifySsl.checked, false);
+  assert.equal(harness.elements.setupTlsImportResult.textContent, "Current server-name draft.");
+  assert.strictEqual(harness.state.tlsTrustStatus, trustBefore);
+  assert.equal(harness.state.lastTlsValidation, null);
   assert.deepEqual(harness.banners, []);
 });
 
@@ -268,6 +308,7 @@ test("an older import cannot release the button held by a newer import", async (
 
   harness.requests[0].resolve(ALPHA_REPLY);
   await first;
+  assert.match(harness.elements.setupTlsImportResult.textContent, /^Importing /);
   assert.equal(harness.elements.setupTlsImportCaButton.disabled, true, "the newer import still owns the button");
 
   harness.requests[1].resolve({
