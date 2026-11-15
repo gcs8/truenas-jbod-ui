@@ -162,6 +162,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_admin_maintenance",
             "tests.test_admin_runtime_routes",
             "tests.test_admin_service",
+            "tests.test_admin_upload_staging_event_loop",
             "tests.test_admin_safety",
             "tests.test_admin_ttl",
             "tests.test_disk_inventory_sync",
