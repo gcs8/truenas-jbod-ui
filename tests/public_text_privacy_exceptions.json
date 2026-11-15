@@ -714,5 +714,13 @@
       }
     },
     "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
+  },
+  "tests/test_core_fabric_legacy_controller.py": {
+    "findings": {
+      "sas_wwn_identifier": {
+        "sha256:b0241848d0a8d04d11e7317ca6c440a80d07421b89cda6b027e9ce22fc02885c": 2
+      }
+    },
+    "reason": "Synthetic or adversarial test literal; exact detector counts are pinned."
   }
 }
