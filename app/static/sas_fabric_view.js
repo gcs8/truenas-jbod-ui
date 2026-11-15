@@ -1512,6 +1512,10 @@
   }
 
   function formatInteger(value) {
+    // Number(null), Number(false) and Number("") are 0: an absent value is not a zero reading.
+    if (value === null || value === undefined || value === "" || typeof value === "boolean") {
+      return "";
+    }
     const numberValue = Number(value);
     return Number.isFinite(numberValue) ? numberValue.toLocaleString() : "";
   }
@@ -1535,10 +1539,12 @@
     if (!summary) {
       return "";
     }
-    if (Number.isFinite(Number(summary.power_on_days))) {
+    // Unknown power-on time (null) is omitted like any other unknown SMART field.
+    const isCount = value => Number.isInteger(value) && value >= 0;
+    if (isCount(summary.power_on_days)) {
       return `${formatInteger(summary.power_on_days)} d`;
     }
-    if (Number.isFinite(Number(summary.power_on_hours))) {
+    if (isCount(summary.power_on_hours)) {
       return `${formatInteger(summary.power_on_hours)} h`;
     }
     return "";
