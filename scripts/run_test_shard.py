@@ -79,6 +79,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_released_schema_upgrades",
         "test_jbod_runner_trial",
         "test_mapping_store",
+        "test_mapping_store_writer_lock",
         "test_metrics",
         "test_perf",
         "test_perf_harness",

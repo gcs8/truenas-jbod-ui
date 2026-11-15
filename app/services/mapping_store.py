@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import secrets
 import stat
 import threading
+import time
+import weakref
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +29,11 @@ from app.services.storage_writability import (
     is_unwritable_error,
 )
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows is best effort; containers are Linux
+    fcntl = None  # type: ignore[assignment]
+
 _DRAWER_SUB_PROFILE_IDS = frozenset(
     sub_profile_id
     for sub_profile_ids in ENCLOSURE_SUB_VIEW_PROFILE_IDS.values()
@@ -33,6 +42,28 @@ _DRAWER_SUB_PROFILE_IDS = frozenset(
 
 Identity: TypeAlias = tuple[str | None, str | None, int]
 ScopeIdentity: TypeAlias = tuple[str | None, int]
+
+# Every MappingStore on one file shares one in-process lock, so two owners in
+# one process serialize exactly as one shared store does (#1228). Entries go
+# away with the last store that uses them.
+_PATH_LOCKS: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+_PATH_LOCKS_GUARD = threading.Lock()
+
+# The filesystem has no flock (for example NFS without a lock manager).
+_UNSUPPORTED_LOCK_ERRNOS = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS})
+
+
+def _shared_path_lock(file_path: Path) -> Any:
+    key = os.path.join(
+        os.path.normcase(os.path.realpath(file_path.parent)),
+        os.path.normcase(file_path.name),
+    )
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[key] = lock
+        return lock
 
 
 def resolve_physical_mapping_scope(enclosure_id: str | None) -> str | None:
@@ -114,6 +145,35 @@ class MappingStorageUnwritable(StorageDirectoryUnwritable):
     """The mapping file could not be written because its directory is read-only."""
 
     error_code = "data_directory_unwritable"
+
+
+class MappingWriterLockUnavailable(StorageDirectoryUnwritable):
+    """A mapping change was refused because the writer lock could not be held.
+
+    ``reason`` is ``busy`` (another owner held it past the bounded wait),
+    ``unsupported`` (the filesystem cannot lock files) or ``not_regular`` (the
+    lock path is not a regular file). The mapping file is unchanged.
+    """
+
+    error_code = "mapping_writer_lock_unavailable"
+    public_detail = (
+        "Could not save: another mapping change did not finish in time, "
+        "or the data folder cannot lock files. The mappings were not changed."
+    )
+    _REASONS = {
+        "busy": "another writer held it past the bounded wait",
+        "unsupported": "the filesystem does not support file locks, so concurrent writers cannot be kept apart",
+        "not_regular": "the lock path is not a regular file; remove it",
+    }
+
+    def __init__(self, lock_path: Path, reason: str) -> None:
+        self.directory = lock_path.parent
+        self.reason = reason
+        self.operator_message = (
+            f"Mapping change refused: could not hold the writer lock {lock_path} "
+            f"because {self._REASONS[reason]}. The mapping file was not changed."
+        )
+        RuntimeError.__init__(self, self.operator_message)
 
 
 class MappingDurabilityError(RuntimeError):
@@ -208,10 +268,83 @@ class _SnapshotEntries(_MappingLookupSnapshot):
 class MappingStore:
     """Persist slot-to-disk calibration in a small JSON file on a bind mount."""
 
+    # Bounded wait for another process's writer lock before refusing (#1228).
+    writer_lock_timeout_seconds = 10.0
+    _WRITER_LOCK_POLL_SECONDS = 0.02
+
     def __init__(self, file_path: str | Path) -> None:
         self.file_path = Path(file_path)
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = _shared_path_lock(self.file_path)
+
+    @property
+    def writer_lock_path(self) -> Path:
+        # A stable sidecar: replacement changes the mapping file's inode, so a
+        # lock on the mapping file itself would not exclude the next writer.
+        return self.file_path.with_name(self.file_path.name + ".lock")
+
+    @contextmanager
+    def _writer_transaction(self) -> Iterator[None]:
+        """Hold one writer across read, revision check, replace and readback.
+
+        The shared in-process lock orders owners in this process; the sidecar
+        flock orders owners in other processes (#1228). Reads stay lock-free:
+        replacement is atomic and every mutator rechecks its revision here.
+        """
+        with self._lock:
+            descriptor = self._acquire_writer_lock()
+            try:
+                yield
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    def _acquire_writer_lock(self) -> int | None:
+        if fcntl is None:
+            # No flock on this platform (Windows, best effort): only the
+            # shared in-process lock applies.
+            return None
+        lock_path = self.writer_lock_path
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        existed = os.path.lexists(lock_path)
+        try:
+            descriptor = os.open(lock_path, flags, 0o660)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise MappingWriterLockUnavailable(lock_path, "not_regular") from exc
+            capacity_reason = describe_capacity_failure(exc, self.file_path.parent)
+            if capacity_reason is not None:
+                raise StorageDirectoryCapacityExhausted(self.file_path.parent, capacity_reason) from exc
+            if is_unwritable_error(exc):
+                raise MappingStorageUnwritable(self.file_path.parent) from exc
+            raise
+        try:
+            # os.stat and os.chmod on the descriptor (fstat/fchmod underneath)
+            # keep this separate from the temp file's os.fstat/os.fchmod
+            # proofs, whose fault-injection tests patch those two names.
+            if not stat.S_ISREG(os.stat(descriptor).st_mode):
+                raise MappingWriterLockUnavailable(lock_path, "not_regular")
+            if not existed:
+                os.chmod(descriptor, 0o660)
+            deadline = time.monotonic() + self.writer_lock_timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return descriptor
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise MappingWriterLockUnavailable(lock_path, "busy") from None
+                    time.sleep(self._WRITER_LOCK_POLL_SECONDS)
+                except OSError as exc:
+                    if exc.errno in _UNSUPPORTED_LOCK_ERRNOS:
+                        raise MappingWriterLockUnavailable(lock_path, "unsupported") from exc
+                    raise
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     # Kept as the exact version-1 encoder for historical fixtures and validation.
     def _slot_key(self, system_id: str | None, enclosure_id: str | None, slot: int) -> str:
@@ -1250,7 +1383,7 @@ class MappingStore:
         expected_revision: str | None = None,
         revision_binding: str | None = None,
     ) -> ManualMapping:
-        with self._lock:
+        with self._writer_transaction():
             state = self._load_state()
             mapping = self._canonical_mapping(mapping)
             if expected_revision is not None:
@@ -1292,7 +1425,7 @@ class MappingStore:
         expected_revision: str | None = None,
         revision_binding: str | None = None,
     ) -> bool:
-        with self._lock:
+        with self._writer_transaction():
             state = self._load_state()
             enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             if expected_revision is not None:
@@ -1332,7 +1465,7 @@ class MappingStore:
         enclosure_id: str | None,
         mappings: list[ManualMapping],
     ) -> int:
-        with self._lock:
+        with self._writer_transaction():
             state = self._load_state()
             enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             incoming = self._normalize_incoming(system_id, enclosure_id, mappings)
@@ -1361,7 +1494,7 @@ class MappingStore:
         import_digest: str,
         import_digest_binding: str | None = None,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._writer_transaction():
             state = self._load_state()
             enclosure_id = resolve_physical_mapping_scope(enclosure_id)
             preview, incoming = self._preview_from_state(
