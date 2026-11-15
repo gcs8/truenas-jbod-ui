@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -793,11 +793,28 @@ def _add_ses_device_name(slot: SESMapSlot, name: str) -> None:
     slot.device_names.sort(key=_device_name_sort_key)
 
 
-def _ses_input_exceeds_bounds(output: str, element_pattern: str) -> bool:
+def _ses_input_exceeds_bounds(output: str, element_line: str | Callable[[str], bool]) -> bool:
+    """Count element headers line by line, the way the parsers read them.
+
+    A pattern is matched against each stripped line, never the whole output: a
+    `^\\s*` that can cross line breaks rescans every run of blank lines, which
+    made this pre-count quadratic on small malformed output (#1216).
+    """
+
     if len(output) > MAX_SES_OUTPUT_CHARS:
         return True
+    if isinstance(element_line, str):
+        element_line_pattern = re.compile(element_line, re.IGNORECASE)
+
+        def is_element_line(line: str) -> bool:
+            return element_line_pattern.match(line) is not None
+    else:
+        is_element_line = element_line
     element_count = 0
-    for _match in re.finditer(element_pattern, output, re.MULTILINE | re.IGNORECASE):
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or not is_element_line(stripped):
+            continue
         element_count += 1
         if element_count > MAX_SES_ELEMENTS:
             return True
@@ -1827,6 +1844,82 @@ def parse_sg_ses_enclosure_status(output: str, command: str | None = None) -> SE
     return enclosure
 
 
+SG_SES_JOIN_ELEMENT_TYPE_LABEL = "element type:"
+
+
+def _skip_sg_ses_whitespace(line: str, index: int) -> int:
+    while index < len(line) and line[index].isspace():
+        index += 1
+    return index
+
+
+def _scan_sg_ses_signed_decimal(line: str, index: int) -> int | None:
+    if index < len(line) and line[index] == "-":
+        index += 1
+    digits_start = index
+    while index < len(line) and line[index].isdecimal():
+        index += 1
+    return index if index > digits_start else None
+
+
+def _match_sg_ses_join_element_header(
+    line: str,
+    *,
+    require_type: bool = True,
+) -> tuple[str | None, str, str, str] | None:
+    """Recognize `<descriptor> [<subenclosure>,<element>] Element type: <type>`.
+
+    `line` is already stripped. The regex this replaces paired a lazy
+    descriptor with a whitespace run, so a long run of spaces was rescanned
+    from every position (#1216). This scan reads each character a bounded
+    number of times and keeps the same rules: the first bracket that starts the
+    line or follows whitespace and completes a header wins, and the descriptor
+    is everything before it. Returns (descriptor, subenclosure, element, type),
+    or None. With `require_type=False` the type may be missing.
+    """
+
+    bracket = line.find("[")
+    while bracket >= 0:
+        if bracket == 0 or line[bracket - 1].isspace():
+            subenclosure_end = _scan_sg_ses_signed_decimal(line, bracket + 1)
+            element_end = None
+            if subenclosure_end is not None and line.startswith(",", subenclosure_end):
+                element_end = _scan_sg_ses_signed_decimal(line, subenclosure_end + 1)
+            if element_end is not None and line.startswith("]", element_end):
+                label_start = _skip_sg_ses_whitespace(line, element_end + 1)
+                label_end = label_start + len(SG_SES_JOIN_ELEMENT_TYPE_LABEL)
+                if (
+                    label_start > element_end + 1
+                    and line[label_start:label_end].lower() == SG_SES_JOIN_ELEMENT_TYPE_LABEL
+                ):
+                    type_start = _skip_sg_ses_whitespace(line, label_end)
+                    if not require_type or (label_end < type_start < len(line)):
+                        return (
+                            line[:bracket].rstrip() if bracket else None,
+                            line[bracket + 1 : subenclosure_end],
+                            line[subenclosure_end + 1 : element_end],
+                            line[type_start:].rstrip(),
+                        )
+        bracket = line.find("[", bracket + 1)
+    return None
+
+
+def _is_sg_ses_join_element_header(line: str) -> bool:
+    return _match_sg_ses_join_element_header(line) is not None
+
+
+def _starts_with_sg_ses_slot_bracket(lowered: str) -> bool:
+    """`slot<digits><whitespace>[` at the start of a lowercased line, scanned once."""
+
+    if not lowered.startswith("slot"):
+        return False
+    digits_end = 4
+    while digits_end < len(lowered) and lowered[digits_end].isdecimal():
+        digits_end += 1
+    bracket = _skip_sg_ses_whitespace(lowered, digits_end)
+    return digits_end > 4 and bracket > digits_end and lowered.startswith("[", bracket)
+
+
 def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapEnclosure | None:
     """
     Parse `sg_ses --join --filter /dev/sgN` output into slot metadata.
@@ -1837,10 +1930,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
     through the same SESMapEnclosure model so AES/EC-only hosts keep working.
     """
 
-    if _ses_input_exceeds_bounds(
-        output,
-        r"^\s*(?:.*?)?\[-?\d+,-?\d+\]\s+Element type:",
-    ):
+    if _ses_input_exceeds_bounds(output, _is_sg_ses_join_element_header):
         return None
 
     ses_device = _extract_sg_ses_device(command)
@@ -1863,13 +1953,7 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             enclosure.enclosure_id = common_field[1]
             continue
 
-        element_header_match = re.match(
-            r"^(?:(?P<descriptor>.*?)\s+)?"
-            r"\[(?P<subencl>-?\d+),(?P<element>-?\d+)\]\s+"
-            r"Element type:\s+(?P<element_type>.+?)\s*$",
-            stripped,
-            re.IGNORECASE,
-        )
+        element_header_match = _match_sg_ses_join_element_header(stripped)
         if element_header_match:
             _apply_resolved_ses_descriptor_presence(
                 current_slot,
@@ -1886,13 +1970,14 @@ def parse_sg_ses_join_filter(output: str, command: str | None = None) -> SESMapE
             current_slot = None
             descriptor_slot_number = None
             descriptor_presence_evidence = []
-            element_type = normalize_text(element_header_match.group("element_type")) or ""
+            header_descriptor, _subenclosure, header_element, header_type = element_header_match
+            element_type = normalize_text(header_type) or ""
             if not _is_ses_device_slot_type(element_type):
                 continue
-            element_id = int(element_header_match.group("element"))
+            element_id = int(header_element)
             if element_id < 0:
                 continue
-            descriptor = normalize_text(element_header_match.group("descriptor"))
+            descriptor = normalize_text(header_descriptor)
             descriptor_match = re.search(r"\bSlot(?P<slot>\d+)\b", descriptor or "", re.IGNORECASE)
             if descriptor_match:
                 descriptor_slot_number = int(descriptor_match.group("slot"))
@@ -2027,8 +2112,8 @@ def _extract_sg_ses_enclosure_name(output: str) -> str | None:
         if (
             lowered.startswith(stop_prefixes)
             or lowered.startswith(("element type:", "element index:", "overall descriptor:"))
-            or re.match(r"slot\d+\s+\[", lowered)
-            or re.match(r"(?:.*?\s+)?\[-?\d+,-?\d+\]\s+element type:", lowered)
+            or _starts_with_sg_ses_slot_bracket(lowered)
+            or _match_sg_ses_join_element_header(stripped, require_type=False) is not None
         ):
             break
         if lowered.startswith(ignored_prefixes):

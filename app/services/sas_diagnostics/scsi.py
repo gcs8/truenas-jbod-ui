@@ -464,11 +464,57 @@ SAS_PHY_LOG_PARAMETERS = [
     {"code": "0x0004", "name": "PHY reset problem count"},
 ]
 
+# Kernel text reaches the decoder unvalidated, so a malformed message must be
+# rejected with bounded work (#1216). The decoder finds the literal "CDB:"
+# separator first and gives the regexes only a short window on each side of it.
+# A kernel operation name is a few dozen characters, and the longest CDB (260
+# bytes, variable length) is 779 characters as spaced hex pairs. A message whose
+# operation or CDB does not fit its window is malformed and is not decoded.
+CDB_SEPARATOR = "CDB:"
+MAX_CDB_OPERATION_WINDOW_CHARS = 96
+MAX_CDB_TEXT_CHARS = 1024
+_CDB_MESSAGE_PATTERN = re.compile(
+    r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)"
+)
+_CDB_OPERATION_PATTERN = re.compile(r"[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?\.\s+\Z")
+_CDB_TEXT_PATTERN = re.compile(r"CDB:\s+[0-9a-fA-F ]+")
+_CDB_OPERATION_RUN_CHARACTERS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _/-")
+_CDB_TEXT_CHARACTERS = frozenset("0123456789abcdefABCDEF ")
+
+
+def _find_cdb_message(message: str) -> re.Match[str] | None:
+    """Match `<OPERATION>. CDB: <hex bytes>` with work linear in the message."""
+
+    separator = message.find(CDB_SEPARATOR)
+    while separator >= 0:
+        window_start = max(0, separator - MAX_CDB_OPERATION_WINDOW_CHARS)
+        operation = _CDB_OPERATION_PATTERN.search(message, window_start, separator)
+        if operation is not None:
+            run_start = operation.start()
+            while run_start > window_start and message[run_start - 1] in _CDB_OPERATION_RUN_CHARACTERS:
+                run_start -= 1
+            if (
+                run_start == window_start
+                and window_start > 0
+                and message[window_start - 1] in _CDB_OPERATION_RUN_CHARACTERS
+            ):
+                # The operation run starts before the window: an overlong token.
+                return None
+            text_end = min(len(message), separator + len(CDB_SEPARATOR) + MAX_CDB_TEXT_CHARS)
+            cdb = _CDB_TEXT_PATTERN.match(message, separator, text_end)
+            if cdb is not None:
+                if cdb.end() == text_end and text_end < len(message) and message[text_end] in _CDB_TEXT_CHARACTERS:
+                    # The CDB text continues past the longest possible CDB.
+                    return None
+                # The same match the unbounded pattern found, confined to the
+                # region the two bounded checks just accepted.
+                return _CDB_MESSAGE_PATTERN.match(message, operation.start(), cdb.end())
+        separator = message.find(CDB_SEPARATOR, separator + 1)
+    return None
+
+
 def decode_scsi_cdb_message(message: str) -> dict[str, Any]:
-    match = re.search(
-        r"(?P<operation>[A-Z][A-Z0-9 _/-]*(?:\([A-Z0-9]+\))?)\.\s+CDB:\s+(?P<cdb>[0-9a-fA-F ]+)",
-        message,
-    )
+    match = _find_cdb_message(message)
     if not match:
         return {}
     cdb_bytes = [int(token, 16) for token in match.group("cdb").split() if re.fullmatch(r"[0-9a-fA-F]{2}", token)]
