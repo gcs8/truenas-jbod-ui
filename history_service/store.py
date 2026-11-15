@@ -3329,9 +3329,28 @@ class HistoryStore:
         }
 
     @staticmethod
+    def _retention_bounds(cutoff: str) -> tuple[str, str]:
+        """Return (index scan bound, cutoff) for an absolute-time retention test.
+
+        Stored timestamps may carry any UTC offset, so their text order is not
+        their time order (#1204). julianday() decides expiry. The text bound
+        only keeps the scan on the timestamp index: SQLite reads offsets up to
+        14:59, so a row older than the cutoff has a wall-clock time less than
+        15 hours after it, and its text starts with a date no later than the
+        date of cutoff + 15 hours. Every such row sorts before the next date.
+        """
+
+        scan_bound = (
+            (datetime.fromisoformat(cutoff) + timedelta(hours=15)).date() + timedelta(days=1)
+        ).isoformat()
+        return scan_bound, cutoff
+
+    @staticmethod
     def _expired_rows_subquery(table_name: str, timestamp_column: str) -> str:
+        # Parameters: _retention_bounds(cutoff), then the batch size.
         return (
             f"SELECT id FROM {table_name} WHERE {timestamp_column} < ? "
+            f"AND julianday({timestamp_column}) < julianday(?) "
             f"ORDER BY {timestamp_column}, id LIMIT ?"
         )
 
@@ -3351,7 +3370,7 @@ class HistoryStore:
         return int(
             connection.execute(
                 f"DELETE FROM {table_name} WHERE id IN ({subquery})",
-                (cutoff, batch_size),
+                (*cls._retention_bounds(cutoff), batch_size),
             ).rowcount
         )
 
@@ -3392,7 +3411,7 @@ class HistoryStore:
                     CASE WHEN rollup_rank = 1
                     THEN COALESCE(value_real, CAST(value_integer AS REAL)) END
                 ),
-                MAX(observed_at),
+                MAX(CASE WHEN rollup_rank = 1 THEN observed_at END),
                 MAX(device_name), MAX(serial), MAX(model), MAX(state),
                 MAX(gptid), MAX(persistent_id_label),
                 COALESCE(disk_identity_key, ''), MAX(logical_unit_id), MAX(sas_address)
@@ -3403,7 +3422,7 @@ class HistoryStore:
                         PARTITION BY
                             {bucket_expression}, system_id, enclosure_key, slot,
                             metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY observed_at DESC, id DESC
+                        ORDER BY julianday(observed_at) DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
                 WHERE id IN ({expired_rows})
@@ -3426,14 +3445,17 @@ class HistoryStore:
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
                 last_value = CASE
-                    WHEN excluded.last_observed_at >= metric_rollups.last_observed_at
+                    WHEN julianday(excluded.last_observed_at)
+                        >= julianday(metric_rollups.last_observed_at)
                     THEN excluded.last_value
                     ELSE metric_rollups.last_value
                 END,
-                last_observed_at = MAX(
-                    metric_rollups.last_observed_at,
-                    excluded.last_observed_at
-                ),
+                last_observed_at = CASE
+                    WHEN julianday(excluded.last_observed_at)
+                        >= julianday(metric_rollups.last_observed_at)
+                    THEN excluded.last_observed_at
+                    ELSE metric_rollups.last_observed_at
+                END,
                 device_name = COALESCE(excluded.device_name, metric_rollups.device_name),
                 serial = COALESCE(excluded.serial, metric_rollups.serial),
                 model = COALESCE(excluded.model, metric_rollups.model),
@@ -3446,11 +3468,12 @@ class HistoryStore:
                 logical_unit_id = COALESCE(excluded.logical_unit_id, metric_rollups.logical_unit_id),
                 sas_address = COALESCE(excluded.sas_address, metric_rollups.sas_address)
             """,
-            (bucket_seconds, cutoff, batch_size),
+            (bucket_seconds, *cls._retention_bounds(cutoff), batch_size),
         )
 
-    @staticmethod
+    @classmethod
     def _delete_rollup_batch(
+        cls,
         connection: sqlite3.Connection,
         *,
         bucket_seconds: int,
@@ -3467,16 +3490,18 @@ class HistoryStore:
                     SELECT rowid
                     FROM metric_rollups
                     WHERE bucket_seconds = ? AND bucket_start < ?
+                      AND julianday(bucket_start) < julianday(?)
                     ORDER BY bucket_start
                     LIMIT ?
                 )
                 """,
-                (bucket_seconds, cutoff, batch_size),
+                (bucket_seconds, *cls._retention_bounds(cutoff), batch_size),
             ).rowcount
         )
 
-    @staticmethod
+    @classmethod
     def _retention_rows_exist(
+        cls,
         connection: sqlite3.Connection,
         table_name: str,
         timestamp_column: str,
@@ -3485,13 +3510,15 @@ class HistoryStore:
         if cutoff is None:
             return False
         row = connection.execute(
-            f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE {timestamp_column} < ? LIMIT 1)",
-            (cutoff,),
+            f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE {timestamp_column} < ? "
+            f"AND julianday({timestamp_column}) < julianday(?) LIMIT 1)",
+            cls._retention_bounds(cutoff),
         ).fetchone()
         return bool(row[0])
 
-    @staticmethod
+    @classmethod
     def _rollups_exist(
+        cls,
         connection: sqlite3.Connection,
         bucket_seconds: int,
         cutoff: str | None,
@@ -3504,10 +3531,11 @@ class HistoryStore:
                 SELECT 1
                 FROM metric_rollups
                 WHERE bucket_seconds = ? AND bucket_start < ?
+                  AND julianday(bucket_start) < julianday(?)
                 LIMIT 1
             )
             """,
-            (bucket_seconds, cutoff),
+            (bucket_seconds, *cls._retention_bounds(cutoff)),
         ).fetchone()
         return bool(row[0])
 

@@ -181,6 +181,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_history_backup_coupling",
             "tests.test_history_runtime_damage_pause",
             "tests.test_history_health_states",
+            "tests.test_history_retention_absolute_time",
             "tests.test_history_deferred_indexes",
             "tests.test_history_failure_log_fields",
             "tests.test_history_fresh_deadline",
