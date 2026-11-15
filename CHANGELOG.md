@@ -47,8 +47,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 - SES evidence no longer misplaces or hides disks: zero SAS addresses no longer
   merge unrelated shelves seen from different hosts or give a bay another
-  host's identify target; a bay whose SES occupancy is unknown keeps its
-  mapped disk and shows as unknown instead of empty; and Quantastor no longer
+  host's identify target; a bay whose SES occupancy is unknown, including a
+  CORE `sesutil show` row without a device name, keeps its mapped disk and
+  shows as unknown instead of empty on every platform; and Quantastor no longer
   hides a known disk behind a zero SAS address when stronger evidence says the
   bay is occupied (#1262).
 - Re-saving a system in System Setup no longer resets settings the form does

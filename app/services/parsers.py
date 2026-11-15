@@ -1518,6 +1518,14 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
         serial = normalize_text(columns[3]) if columns[3] != "-" else None
         status_text = normalize_text(columns[4]) or "Unknown"
         status_lower = status_text.lower()
+        # A device name is presence and "Not installed" is absence. A row with
+        # neither reports nothing about occupancy, so it stays unknown (#1218).
+        if "not installed" in status_lower:
+            present: bool | None = False
+        elif device_names:
+            present = True
+        else:
+            present = None
 
         current_enclosure.slots[slot_number] = SESMapSlot(
             slot_number=slot_number,
@@ -1530,8 +1538,8 @@ def parse_sesutil_show_enclosures(output: str) -> list[SESMapEnclosure]:
             serial=serial,
             model=model,
             size_text=None if "not installed" in status_lower else normalize_text(status_text.split(",", 1)[0]),
-            present=bool(device_names) and "not installed" not in status_lower,
-            presence_source="sesutil_show",
+            present=present,
+            presence_source="sesutil_show" if present is not None else None,
         )
 
     parsed = [item for item in enclosures if item.slots]

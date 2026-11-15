@@ -104,7 +104,7 @@
     "test_segmented_history": 13,
     "test_segmented_history_reader": 74,
     "test_segmented_restore_recovery": 18,
-    "test_ses_unknown_presence": 7,
+    "test_ses_unknown_presence": 11,
     "test_ses_zero_address_identity": 5,
     "test_settings_reload": 56,
     "test_slot_bounds_routes": 36,

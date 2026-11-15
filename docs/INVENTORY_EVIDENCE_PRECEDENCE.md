@@ -28,8 +28,8 @@ BMC, StorCLI, appliance APIs, and vendor tools do not enter the SES merge at an 
 - A sourced `present` boolean is final for empty-slot gating. Weaker auxiliary fields such as `sas_address=0` or `no SAS device attached` cannot override `present=true` from `enclosure_sysfs`.
 - If no sourced boolean exists, a zero SAS hint or `no SAS device attached` counts as empty only when the candidate also contains SES evidence.
 - A presence conflict prevents the empty-slot gate from suppressing correlation.
-- Evidence that decides nothing (a truncated AES descriptor, or an Enclosure Status record with only a condition code such as `Critical` or `Unknown`) leaves `present` unknown in the inventory candidate. It is not empty evidence: a stored mapping still resolves, and a bay with neither occupancy nor a resolved disk reports state `unknown` (`unmapped` when its stored mapping finds no disk), not `empty` and not `fault`.
-- A platform that copies the SES candidate into its own slot status (Quantastor) copies occupancy as one decision: `present` together with `presence_source` and `presence_conflict`, and the SAS address with its source and conflict flag. It never re-infers occupancy from the weaker fields it kept.
+- Evidence that decides nothing (a truncated AES descriptor, an Enclosure Status record with only a condition code such as `Critical` or `Unknown`, or a `sesutil show` row with no device name and no `Not installed` status) leaves `present` unknown in the inventory candidate. It is not empty evidence: a stored mapping still resolves, and a bay with neither occupancy nor a resolved disk reports state `unknown` (`unmapped` when its stored mapping finds no disk), not `empty` and not `fault`.
+- A platform that copies the SES candidate into its own slot status (Quantastor) copies occupancy as one decision: `present` together with `presence_source` and `presence_conflict`, and the SAS address with its source and conflict flag. It never re-infers occupancy from the weaker fields it kept, and a disk lookup that finds nothing does not turn undecided SES occupancy into an empty bay.
 
 ### Device names
 

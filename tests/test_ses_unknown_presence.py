@@ -20,7 +20,7 @@ from app.config import Settings, SSHConfig, SystemConfig, TrueNASConfig
 from app.models.domain import ManualMapping
 from app.services.inventory import DiskRecord, InventoryService
 from app.services.mapping_store import MappingStore
-from app.services.parsers import parse_ssh_outputs
+from app.services.parsers import parse_sesutil_show_enclosures, parse_ssh_outputs
 from app.services.profile_registry import ProfileRegistry
 from app.services.slot_detail_store import SlotDetailStore
 
@@ -165,6 +165,83 @@ class UnknownSesPresenceTests(unittest.TestCase):
         resolution, view = self.resolve(service, _candidate(UNKNOWN_INPUTS["ec-critical"]), mapping, _disk())
         self.assertEqual(resolution.source, "manual")
         self.assertEqual(view.state.value, "fault")
+
+
+SHOW_HEADER = (
+    "ses0:  <ExampleCo SynthShelf 0001>; ID: synthetic-shelf\n"
+    "Desc  Device  Model  Serial  Status\n"
+)
+
+
+def _show_candidate(row: str) -> dict:
+    return _candidate({"sesutil show": SHOW_HEADER + row + "\n"})
+
+
+class CoreSesutilShowPresenceTests(unittest.TestCase):
+    """A missing device name in `sesutil show` is not a report of an empty bay."""
+
+    resolve = UnknownSesPresenceTests.resolve
+
+    def service(self) -> InventoryService:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = Settings()
+        system = SystemConfig(id="core-show-presence", truenas=TrueNASConfig(platform="core"),
+                              ssh=SSHConfig(enabled=False))
+        return InventoryService(
+            settings, system, AsyncMock(), AsyncMock(), None,
+            MappingStore(str(Path(directory.name) / "slot_mappings.json")),
+            ProfileRegistry(settings),
+            SlotDetailStore(str(Path(directory.name) / "slot_detail_cache.json")),
+        )
+
+    def test_show_row_without_a_device_name_leaves_presence_unknown(self) -> None:
+        for status in ("Unknown", "OK", "Critical"):
+            with self.subTest(status=status):
+                row = f"Slot 00  -  SANITIZED-MODEL  SANITIZED-MAPPED  {status}"
+                slot = parse_sesutil_show_enclosures(SHOW_HEADER + row)[0].slots[0]
+                self.assertIsNone(slot.present)
+                self.assertIsNone(slot.presence_source)
+                candidate = _show_candidate(row)
+                self.assertIsNone(candidate.get("present"))
+                self.assertIsNone(candidate.get("presence_source"))
+
+    def test_show_row_without_a_device_name_keeps_a_valid_mapping(self) -> None:
+        service = self.service()
+        mapping = ManualMapping(slot=0, serial="SANITIZED-MAPPED")
+        candidate = _show_candidate("Slot 00  -  SANITIZED-MODEL  SANITIZED-MAPPED  Unknown")
+        self.assertFalse(service._slot_has_live_empty_evidence(candidate))
+        disk = _disk()
+        resolution, view = self.resolve(service, candidate, mapping, disk)
+        self.assertEqual(resolution.source, "manual")
+        self.assertIs(resolution.disk, disk)
+        self.assertFalse(resolution.stale_manual_mapping)
+        self.assertEqual(view.state.value, "healthy")
+
+    def test_show_row_without_a_device_name_or_disk_is_unknown(self) -> None:
+        service = self.service()
+        candidate = _show_candidate("Slot 00  -  -  -  Unknown")
+        resolution, view = self.resolve(service, candidate, None, None)
+        self.assertNotEqual(resolution.source, "ses-empty")
+        self.assertEqual(view.state.value, "unknown")
+
+    def test_show_named_device_and_not_installed_controls(self) -> None:
+        service = self.service()
+        mapping = ManualMapping(slot=0, serial="SANITIZED-MAPPED")
+        named = _show_candidate("Slot 00  da0  SANITIZED-MODEL  SANITIZED-MAPPED  Unknown")
+        self.assertIs(named["present"], True)
+        self.assertEqual(named["presence_source"], "sesutil_show")
+        resolution, view = self.resolve(service, named, mapping, _disk())
+        self.assertEqual(resolution.source, "manual")
+        self.assertEqual(view.state.value, "healthy")
+        # Control: the explicit absence report still wins over a stored mapping.
+        empty = _show_candidate("Slot 00  -  -  -  Not installed")
+        self.assertIs(empty["present"], False)
+        self.assertEqual(empty["presence_source"], "sesutil_show")
+        resolution, view = self.resolve(service, empty, mapping, _disk())
+        self.assertEqual(resolution.source, "ses-empty")
+        self.assertTrue(resolution.stale_manual_mapping)
+        self.assertEqual(view.state.value, "empty")
 
 
 if __name__ == "__main__":
