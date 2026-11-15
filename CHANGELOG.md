@@ -76,6 +76,12 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Fixed recovery of a crashed segmented restore that also restored
+  configuration (#1196): recovery now returns configuration and history to the
+  same generation, or refuses with a named reason and keeps its evidence,
+  instead of reporting the prior generation restored while candidate
+  configuration stayed active. Run such a recovery through the admin service,
+  which mounts the configuration volume (#1265).
 
 ### Performance
 
