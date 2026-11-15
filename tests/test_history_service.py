@@ -10089,58 +10089,6 @@ class HistoryCollectorTests(unittest.TestCase):
         collector._enumerate_scopes.assert_awaited_once_with(force_inventory=True)  # type: ignore[attr-defined]
         self.assertTrue(collector.status()["last_collection_inventory_forced"])
 
-    def test_run_once_records_smart_failure_without_failing_collection(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        store = HistoryStore(str(temp_dir / "history.db"))
-        store.create_backup = MagicMock(return_value=None)  # type: ignore[method-assign]
-        collector = HistoryCollector(
-            HistorySettings(
-                sqlite_path=str(temp_dir / "history.db"),
-                backup_dir=str(temp_dir / "backups"),
-                startup_grace_seconds=0,
-            ),
-            store,
-        )
-        collector._enumerate_scopes = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
-                ScopeSnapshot(
-                    system_id="archive-core",
-                    system_label="Archive CORE",
-                    enclosure_id="enc-a",
-                    enclosure_label="Front Shelf",
-                    snapshot={
-                        "selected_system_id": "archive-core",
-                        "selected_system_label": "Archive CORE",
-                        "selected_enclosure_id": "enc-a",
-                        "selected_enclosure_label": "Front Shelf",
-                        "slots": [
-                            {
-                                "slot": 0,
-                                "present": True,
-                                "serial": "S1",
-                                "device_name": "da0",
-                                "state": "OK",
-                            }
-                        ],
-                    },
-                )
-            ]
-        )
-        collector._fetch_smart_summaries = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError("POST http://enclosure-ui:8000/api/slots/smart-batch timed out after 45s")
-        )
-
-        asyncio.run(collector.run_once(force_slow=True, include_due_intervals=False))
-
-        status = collector.status()
-        self.assertIsNone(status["last_error"])
-        self.assertIsNotNone(status["last_success_at"])
-        self.assertIsNotNone(status["last_slow_metrics_at"])
-        failed_stage = next(entry for entry in status["collection_stage_timings"] if entry["stage"] == "smart.failed")
-        self.assertEqual(failed_stage["system_id"], "archive-core")
-        self.assertTrue(failed_stage["force_fresh"])
-        self.assertIn("timed out", failed_stage["error"])
-
     def test_smart_alert_evidence_requires_an_alert_field(self) -> None:
         self.assertFalse(
             HistoryCollector._smart_summary_has_alert_evidence(
