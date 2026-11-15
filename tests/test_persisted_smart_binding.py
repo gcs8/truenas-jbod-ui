@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock
 from app.config import PathConfig, Settings, SSHConfig, SystemConfig, TrueNASConfig
 from app.models.domain import SlotView, SmartSummaryView
 from app.route_support import ensure_read_slot_bounds
+from app.services.inventory import slot_detail_collection_binding
 from app.services.inventory_registry import InventoryRegistry
 from app.services.slot_detail_store import SlotDetailCacheEntry
 from app.services.truenas_ws import TrueNASAPIError
@@ -27,13 +28,20 @@ SYSTEM_ID = "synthetic-system"
 SHELF = "synthetic-shelf"
 
 
-def _system(host: str, *, platform: str = "core", label: str | None = None) -> SystemConfig:
+def _system(
+    api_url: str, *, platform: str = "core", label: str | None = None,
+    tls_server_name: str | None = None, ssh: SSHConfig | None = None, **truenas_fields,
+) -> SystemConfig:
     return SystemConfig(
         id=SYSTEM_ID,
         label=label,
-        truenas=TrueNASConfig(platform=platform, host=host),
-        ssh=SSHConfig(enabled=False),
+        truenas=TrueNASConfig(platform=platform, host=api_url, tls_server_name=tls_server_name, **truenas_fields),
+        ssh=ssh or SSHConfig(enabled=False),
     )
+
+
+def _ssh(primary: str, *extra: str, **fields) -> SSHConfig:
+    return SSHConfig(enabled=True, host=primary, extra_hosts=list(extra), user="synthetic", **fields)
 
 
 def _settings(root: Path, system: SystemConfig) -> Settings:
@@ -201,6 +209,171 @@ class PersistedSmartBindingTests(unittest.TestCase):
 
         self.assertIsNone(service.get_cached_slot_smart_summary_without_layout(0, SHELF))
         self.assertIsNone(service._build_persisted_smart_summary(_slot()))
+
+
+class PersistedSmartDestinationTests(unittest.TestCase):
+    """The binding follows the destination a read would use, not a set of names.
+
+    A row is refused when the primary SSH host changes roles with an extra host
+    or when the effective TLS server name changes; it is kept for edits that do
+    not move the read (credentials, timeouts, an equivalent server name).
+    """
+
+    API = "https://api.example.test"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _start(self, system: SystemConfig, *, slot: SlotView | None = None) -> None:
+        self.original = InventoryRegistry(_settings(self.root, system))
+        self.predecessor = self.original.get_service(SYSTEM_ID)
+        entry = self.predecessor._build_slot_detail_entry(
+            slot or _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=17),
+        )
+        self.assertIsNotNone(entry)
+        self.original.slot_detail_store.save_entries([entry])
+
+    def _reload_unavailable(self, system: SystemConfig):
+        successor = InventoryRegistry(_settings(self.root, system), previous=self.original)
+        self.assertIs(successor.slot_detail_store, self.original.slot_detail_store)
+        service = successor.get_service(SYSTEM_ID)
+        failure = TrueNASAPIError("Synthetic source unavailable")
+        service.truenas_client.fetch_all = AsyncMock(side_effect=failure)
+        service.ssh_probe.run_commands = AsyncMock(side_effect=failure)
+        service.ssh_probe.run_planned_commands = AsyncMock(side_effect=failure)
+        with _QuietInventoryLogs():
+            bounds = asyncio.run(ensure_read_slot_bounds(0, service, SHELF))
+        self.assertEqual(bounds, "unavailable")
+        return successor, service
+
+    def _assert_refused(self, service) -> None:
+        self.assertIsNone(
+            service.get_cached_slot_smart_summary_without_layout(0, SHELF),
+            "a row written for another destination was served",
+        )
+        self.assertEqual(service.get_cached_slot_smart_summaries_without_layout([0], SHELF), {})
+        self.assertIsNone(service._build_persisted_smart_summary(_slot()))
+
+    def _assert_served(self, service) -> None:
+        single = service.get_cached_slot_smart_summary_without_layout(0, SHELF)
+        self.assertIsNotNone(single, "an unchanged destination lost its own row")
+        self.assertEqual(single.power_on_hours, 17)
+        self.assertEqual(service.get_cached_slot_smart_summaries_without_layout([0], SHELF)[0].power_on_hours, 17)
+
+    def test_primary_and_extra_ssh_host_swap_refuses_predecessor_rows(self) -> None:
+        self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")))
+        swapped = _system(self.API, ssh=_ssh("source-b.example.test", "source-a.example.test"))
+        successor, service = self._reload_unavailable(swapped)
+        self._assert_refused(service)
+        self.assertNotEqual(
+            slot_detail_collection_binding(swapped), slot_detail_collection_binding(self.predecessor.system),
+        )
+        # A SMART read the predecessor started before the swap lands afterwards.
+        late = self.predecessor._build_slot_detail_entry(
+            _slot(), smart_summary=SmartSummaryView(available=True, power_on_hours=23),
+        )
+        successor.slot_detail_store.save_entries([late])
+        self._assert_refused(service)
+
+    def test_unchanged_primary_ssh_host_keeps_rows(self) -> None:
+        # Control: the same primary and extra hosts, written differently.
+        self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")))
+        _, service = self._reload_unavailable(
+            _system(self.API, label="Renamed", ssh=_ssh(" Source-A.example.test ", "SOURCE-B.example.test")),
+        )
+        self._assert_served(service)
+
+    def test_ha_node_host_reassignment_refuses_predecessor_rows(self) -> None:
+        # Which controller a host answers for decides where a QuantaStor read goes.
+        def ha(first: str, second: str) -> SystemConfig:
+            return _system(self.API, platform="quantastor", ssh=_ssh(
+                "source-a.example.test", ha_enabled=True,
+                ha_nodes=[{"system_id": "node-1", "host": first}, {"system_id": "node-2", "host": second}],
+            ))
+        before = ha("source-b.example.test", "source-c.example.test")
+        self.assertNotEqual(
+            slot_detail_collection_binding(before),
+            slot_detail_collection_binding(ha("source-c.example.test", "source-b.example.test")),
+        )
+        self.assertEqual(
+            slot_detail_collection_binding(before),
+            slot_detail_collection_binding(ha("SOURCE-B.example.test", "source-c.example.test")),
+        )
+
+    def test_tls_server_name_change_refuses_predecessor_rows(self) -> None:
+        self._start(_system(self.API, tls_server_name="source-a.example.test"))
+        moved = _system(self.API, tls_server_name="source-b.example.test")
+        _, service = self._reload_unavailable(moved)
+        self._assert_refused(service)
+        self.assertNotEqual(
+            slot_detail_collection_binding(moved), slot_detail_collection_binding(self.predecessor.system),
+        )
+
+    def test_equivalent_effective_tls_server_name_keeps_rows(self) -> None:
+        # Control: an override naming the URL's own host selects the same server.
+        self._start(_system(self.API))
+        _, service = self._reload_unavailable(_system(self.API, tls_server_name=" API.example.test "))
+        self._assert_served(service)
+
+    def test_tls_server_name_is_ignored_without_tls(self) -> None:
+        # A plain-HTTP API sends no server name, so the override moves nothing.
+        plain = "http://api.example.test"
+        self.assertEqual(
+            slot_detail_collection_binding(_system(plain, tls_server_name="source-a.example.test")),
+            slot_detail_collection_binding(_system(plain, tls_server_name="source-b.example.test")),
+        )
+
+    def test_credential_and_timeout_edits_keep_rows(self) -> None:
+        self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")))
+        edited = _system(
+            self.API, api_key="synthetic-rotated-key", timeout_seconds=40, verify_ssl=True,
+            ssh=_ssh(
+                "source-a.example.test", "source-b.example.test",
+                password="synthetic-rotated", sudo_password="synthetic-rotated",
+                key_path="/synthetic/rotated-key", timeout_seconds=45,
+            ),
+        )
+        self.assertEqual(
+            slot_detail_collection_binding(edited), slot_detail_collection_binding(self.predecessor.system),
+        )
+        _, service = self._reload_unavailable(edited)
+        self._assert_served(service)
+
+    def test_stable_field_backfill_refuses_a_mismatched_binding(self) -> None:
+        recorded = _slot().model_copy(update={"model": "SANITIZED-MODEL"})
+        self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")), slot=recorded)
+        _, moved = self._reload_unavailable(
+            _system(self.API, ssh=_ssh("source-b.example.test", "source-a.example.test")),
+        )
+        live = _slot()
+        moved._apply_persisted_slot_details([live])
+        self.assertIsNone(live.model, "another destination's stable fields were backfilled")
+
+        # Control: the same destination backfills the missing field.
+        own = self.predecessor
+        live = _slot()
+        own._apply_persisted_slot_details([live])
+        self.assertEqual(live.model, "SANITIZED-MODEL")
+
+    def test_identity_unknown_marking_refuses_a_mismatched_binding(self) -> None:
+        self._start(_system(self.API, ssh=_ssh("source-a.example.test", "source-b.example.test")))
+        _, moved = self._reload_unavailable(
+            _system(self.API, ssh=_ssh("source-b.example.test", "source-a.example.test")),
+        )
+        unknown = _slot().model_copy(update={"serial": None})
+        self.assertEqual(moved._slot_identity_state(unknown), "unknown")
+        self.assertIsNone(
+            moved._build_slot_detail_entry(unknown, smart_summary=None),
+            "another destination's row was marked as this one's evidence",
+        )
+
+        # Control: the writing destination records the withholding decision.
+        marked = self.predecessor._build_slot_detail_entry(unknown, smart_summary=None)
+        self.assertIsNotNone(marked)
+        self.assertTrue(marked.identity_unknown)
+        self.assertEqual(marked.smart_fields.get("power_on_hours"), 17)
 
 
 if __name__ == "__main__":

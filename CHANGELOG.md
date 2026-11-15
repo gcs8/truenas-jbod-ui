@@ -52,9 +52,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 ### Fixed
 
 - Changing a system's appliance endpoint or platform while keeping its system
-  ID no longer serves the previous appliance's saved SMART values or bay
-  details: each saved row now records which appliance wrote it, and only that
-  appliance's rows are read. The first SMART read served from saved values
+  ID (including its TLS server name, or which SSH host is primary) no longer
+  serves the previous appliance's saved SMART values or bay details: each
+  saved row now records which appliance wrote it, and only that appliance's
+  rows are read. The first SMART read served from saved values
   after a restart now refreshes from the disk in the background on its own,
   instead of waiting for a second request (#1261).
 - A failed history collection pass now logs which stage failed, the source

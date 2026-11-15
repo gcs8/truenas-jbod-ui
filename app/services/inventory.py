@@ -188,7 +188,7 @@ from app.services.ssh_probe import (
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
 from app.services.supermicro_bmc import BMCInventory, SupermicroBMCService
-from app.services.tls_context import certificate_verification_failure_reason
+from app.services.tls_context import certificate_verification_failure_reason, resolve_tls_server_name
 from app.services.truenas_ws import (
     TrueNASAPIBusyError,
     TrueNASAPIError,
@@ -1585,23 +1585,33 @@ def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
 def slot_detail_collection_binding(system: SystemConfig) -> str:
     """Digest of the collection identity that persisted slot details belong to (#1207).
 
-    The platform plus every endpoint slot and SMART details are read from: the
-    appliance API host and the SSH hosts and port (a forwarded port on one host
-    can reach another appliance). Credentials, timeouts and display
-    fields are left out, so a rename or key rotation keeps the persisted rows,
-    while pointing the same system ID at another appliance does not. Only the
-    digest is stored, so the cache file names no endpoint.
+    The platform plus every destination slot and SMART details are read from:
+    the appliance API host and the TLS server name a read presents to it (an
+    SNI-routed endpoint picks the appliance by that name), the primary SSH host,
+    then the extra hosts and HA nodes in the order and roles reads try them, and
+    the SSH port (a forwarded port on one host can reach another appliance).
+    The primary host is kept apart from the rest because SMART reads go to it,
+    so promoting an extra host is a different destination. Credentials,
+    timeouts, trust settings and display fields are left out, so a rename or key
+    rotation keeps the persisted rows, while pointing the same system ID at
+    another appliance does not. Only the digest is stored, so the cache file
+    names no endpoint.
     """
 
     def endpoint(value: str | None) -> str:
         return (value or "").strip().rstrip("/").lower()
 
-    ssh_hosts = {endpoint(system.ssh.host), *(endpoint(host) for host in system.ssh.extra_hosts)}
-    ssh_hosts.update(endpoint(node.host) for node in system.ssh.ha_nodes)
     identity = {
         "platform": system.truenas.platform,
         "api_host": endpoint(system.truenas.host),
-        "ssh_hosts": sorted(host for host in ssh_hosts if host),
+        "tls_server_name": endpoint(resolve_tls_server_name(system.truenas)),
+        "ssh_host": endpoint(system.ssh.host),
+        "ssh_extra_hosts": [host for host in (endpoint(value) for value in system.ssh.extra_hosts) if host],
+        "ssh_ha_nodes": [
+            [(node.system_id or "").strip(), endpoint(node.host)]
+            for node in system.ssh.ha_nodes
+            if node.system_id or node.host
+        ],
         "ssh_port": system.ssh.port,
     }
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
