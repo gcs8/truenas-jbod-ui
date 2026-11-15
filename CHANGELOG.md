@@ -80,7 +80,8 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   token into a different valid command with an invented address and length;
   it is marked malformed and keeps its raw text. A loginfo value wider than
   32 bits is no longer labelled as the known fault of its low 32 bits and
-  stays unconfirmed (#1239).
+  stays unconfirmed; summaries count it as rejected instead of listing the
+  raw value (#1239).
 
 ### Performance
 
