@@ -66,13 +66,23 @@ class MalformedCdbTokenTests(unittest.TestCase):
         self.assertNotIn("decoder_note", row)
 
     def test_valid_cdb_followed_by_kernel_text_is_not_malformed(self) -> None:
-        row = _pipeline_row(VALID_READ10 + " length 512 SMID 77 Aborting command")
+        # Trailing kernel fields may carry two-digit decimal values that look
+        # like hex bytes; they must not invalidate the CDB before them.
+        for trailer in (
+            "length 512 SMID 77 Aborting command",
+            "length 16 SMID 77 Aborting command",
+            "length 32 SMID 10 Command timeout",
+            "length 64 SMID 99",
+        ):
+            with self.subTest(trailer=trailer):
+                row = _pipeline_row(f"{VALID_READ10} {trailer}")
 
-        self.assertEqual(row["cdb_hex"], VALID_READ10_HEX)
-        self.assertEqual(row["lba"], 0)
-        self.assertEqual(row["transfer_blocks"], 1)
-        self.assertEqual(row["decode_confidence"], "standard")
-        self.assertNotIn("cdb_malformed", row)
+                self.assertEqual(row["cdb_hex"], VALID_READ10_HEX)
+                self.assertEqual(row["byte_count"], 10)
+                self.assertEqual(row["lba"], 0)
+                self.assertEqual(row["transfer_blocks"], 1)
+                self.assertEqual(row["decode_confidence"], "standard")
+                self.assertNotIn("cdb_malformed", row)
 
     def test_three_digit_token_is_not_compacted_into_the_control(self) -> None:
         raw = "28 000 00 00 00 00 00 00 00 01 00"
@@ -81,6 +91,14 @@ class MalformedCdbTokenTests(unittest.TestCase):
     def test_nonhex_token_inside_the_cdb_is_reported_malformed(self) -> None:
         raw = "28 gg 00 00 00 00 00 00 01 00"
         self.assert_malformed(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
+
+    def test_word_token_inside_the_byte_run_is_reported_malformed(self) -> None:
+        for raw in (
+            "28 ggg 00 00 00 00 00 00 01 00",
+            "28 z9z 00 00 00 00 00 00 01 00",
+        ):
+            with self.subTest(raw=raw):
+                self.assert_malformed(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
 
     def test_single_digit_token_inside_the_cdb_is_reported_malformed(self) -> None:
         raw = "28 0 00 00 00 00 00 00 00 01 00"

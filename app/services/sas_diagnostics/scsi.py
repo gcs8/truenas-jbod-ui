@@ -466,18 +466,22 @@ SAS_PHY_LOG_PARAMETERS = [
 
 CDB_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{2}")
 CDB_HEX_TEXT = re.compile(r"[0-9a-fA-F]+")
+# A word that may legitimately end the byte run, such as the "length" that
+# precedes trailing kernel fields ("length 16 SMID 7 ...").
+CDB_TRAILING_WORD = re.compile(r"\(?[A-Za-z][A-Za-z_-]+[:,.)]?")
 MAX_CDB_RAW_EVIDENCE_LENGTH = 128
 
 
 def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
     """Return the CDB bytes and, when the byte run is malformed, its raw text.
 
-    A CDB is a run of two-digit hexadecimal byte tokens. Kernel text may follow
-    it (for example ``length 512 SMID 7``). The run is malformed, rather than
-    simply ended, when the token that ends it is itself byte-like (only hex
-    digits, or at most two characters) or is followed directly by another byte
-    token. A malformed run is never compacted: the bytes before the bad token
-    keep their positions and nothing after it is converted.
+    A CDB is a run of two-digit hexadecimal byte tokens, and kernel text may
+    follow it (for example ``length 16 SMID 7``). The run ends cleanly only at
+    a word of three or more letters that is not itself hex text and is not
+    followed directly by two more byte tokens (a resumed byte run). Any other
+    token that ends the run (wrong-width hex, a short or mixed token) makes the
+    CDB malformed. A malformed run is never compacted: the bytes before the
+    bad token keep their positions and nothing after it is converted.
     """
     tokens = text.split()
     cdb_bytes: list[int] = []
@@ -485,13 +489,18 @@ def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
         if CDB_BYTE_TOKEN.fullmatch(token):
             cdb_bytes.append(int(token, 16))
             continue
-        following = tokens[index + 1] if index + 1 < len(tokens) else ""
-        if CDB_HEX_TEXT.fullmatch(token) or len(token) <= 2 or CDB_BYTE_TOKEN.fullmatch(following):
-            raw = " ".join(tokens)
-            if len(raw) > MAX_CDB_RAW_EVIDENCE_LENGTH:
-                raw = f"{raw[: MAX_CDB_RAW_EVIDENCE_LENGTH - 3]}..."
-            return cdb_bytes, raw
-        break
+        resumed = tokens[index + 1 : index + 3]
+        clean_end = (
+            CDB_TRAILING_WORD.fullmatch(token) is not None
+            and CDB_HEX_TEXT.fullmatch(token) is None
+            and not (len(resumed) == 2 and all(CDB_BYTE_TOKEN.fullmatch(item) for item in resumed))
+        )
+        if clean_end:
+            break
+        raw = " ".join(tokens)
+        if len(raw) > MAX_CDB_RAW_EVIDENCE_LENGTH:
+            raw = f"{raw[: MAX_CDB_RAW_EVIDENCE_LENGTH - 3]}..."
+        return cdb_bytes, raw
     return cdb_bytes, None
 
 
