@@ -178,6 +178,29 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
                 self.assertIsNone(record.slot)
                 self.assertNotIn("quantastor_pool_device", record.raw)
 
+    def test_a_key_shared_by_many_rows_leaves_membership_unknown_with_bounded_work(self) -> None:
+        # Many disks and many rows that all share one serial: each disk must not
+        # examine every row (work counted in rows checked, not wall time).
+        from unittest import mock
+
+        from app.services import inventory
+
+        service = _service()
+        disks = [{**DISK_A, "id": f"disk-{index}", "devicePath": f"/dev/sd{index}"} for index in range(200)]
+        rows = [{**self.PEER_ROW, "id": f"member-{index}", "physicalDiskId": f"peer-{index}"} for index in range(200)]
+        raw = _raw(disks=disks, pools=[POOL_B], pool_devices=rows)
+        checked = mock.Mock(wraps=InventoryService._quantastor_pool_device_contradicts)
+        with mock.patch.object(InventoryService, "_quantastor_pool_device_contradicts", checked):
+            records = service._build_quantastor_disk_records(raw, "node-a")
+        self.assertEqual(len(records), 200)
+        self.assertEqual(sum("quantastor_pool_device" in record.raw for record in records), 0)
+        self.assertLessEqual(checked.call_count, 2 * len(records) * inventory.QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX)
+
+        # Control: up to the cap, a shared key still admits its coherent row.
+        raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=[self.PEER_ROW])
+        self.assertIs(service._build_quantastor_disk_records(raw, "node-a")[0].raw["quantastor_pool_device"],
+                      self.PEER_ROW)
+
     def test_a_peer_disk_at_the_same_local_path_does_not_make_this_disk_visible_there(self) -> None:
         service = _service()
         context = {"cluster_node_ids": ["node-a", "node-b"], "selected_view_label": "node-a"}

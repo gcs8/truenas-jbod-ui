@@ -281,6 +281,10 @@ def effective_main_view_order(
         return [preferred, *(entry for entry in automatic if entry != preferred)]
     return automatic
 QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
+# A disk normally matches one pool-device row per node. A key that names more
+# rows than this is a conflict, not a choice: membership stays unknown, and
+# per-disk admission work stays bounded by keys times this cap (#1211).
+QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX = 8
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
@@ -911,10 +915,24 @@ class _QuantastorPoolDeviceIndex:
     rows: list[dict[str, Any]] = field(default_factory=list)
     stable: dict[str, list[int]] = field(default_factory=dict)
     paths: dict[tuple[str | None, str], list[int]] = field(default_factory=dict)
+    # Keys that name more rows than QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX.
+    overloaded: set[Any] = field(default_factory=set)
     sole_system_id: str | None = None
 
     def scope_of(self, row: dict[str, Any]) -> str | None:
         return normalize_value_text(row.get("storageSystemId")) or self.sole_system_id
+
+    def post(self, table: dict[Any, list[int]], key: Any, position: int) -> None:
+        if key in self.overloaded:
+            return
+        postings = table.setdefault(key, [])
+        if postings and postings[-1] == position:
+            return
+        if len(postings) >= QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX:
+            del table[key]
+            self.overloaded.add(key)
+            return
+        postings.append(position)
 
 
 @dataclass(frozen=True, slots=True)
@@ -10403,6 +10421,9 @@ class InventoryService:
         # Node-local device paths are not grid-wide keys (#1211): a bay without
         # a disk record sees only the selected node's pool-device rows.
         pool_device_index = self._build_quantastor_pool_device_index(raw_data)
+        # One pass builds every row's member; each bay then looks up its own.
+        topology_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]] = {}
+        self._build_quantastor_topology_members(raw_data, members_by_row=topology_by_row)
         node_topology_members = self._build_quantastor_topology_members(
             raw_data,
             rows=[row for row in pool_device_index.rows if pool_device_index.scope_of(row) == selected_system_id],
@@ -10487,7 +10508,9 @@ class InventoryService:
                 disk=disk,
                 mapping=mapping,
                 ssh_data=empty_ssh,
-                api_topology_members=self._quantastor_bay_topology_members(raw_data, disk, node_topology_members),
+                api_topology_members=self._quantastor_bay_topology_members(
+                    disk, node_topology_members, topology_by_row,
+                ),
                 api_enclosure_ids=set(),
             )
             _warn_unmatched_mapping(warnings, mapping, disk, slot, "Quantastor disk")
@@ -11346,13 +11369,13 @@ class InventoryService:
                 physical_disk.get("scsiId"),
             ):
                 for key in normalize_lookup_keys(normalize_value_text(value)):
-                    index.stable.setdefault(key, []).append(position)
+                    index.post(index.stable, key, position)
             scope = index.scope_of(row)
             if scope is None and len(system_ids) > 1:
                 continue
             for value in (row.get("devicePath"), physical_disk.get("devicePath"), physical_disk.get("altDevicePath")):
                 for key in normalize_lookup_keys(normalize_value_text(value)):
-                    index.paths.setdefault((scope, key), []).append(position)
+                    index.post(index.paths, (scope, key), position)
         return index
 
     @staticmethod
@@ -11391,10 +11414,13 @@ class InventoryService:
 
         Ranking (a row with a slot, then the selected node, then a spare) only
         orders rows already admitted. Admitted rows that tie at the top yet
-        name different bays or pools leave membership unknown.
+        name different bays or pools leave membership unknown, and so does a
+        key shared by more rows than QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX.
         """
         positions: set[int] = set()
         for key in lookup_keys:
+            if key in index.overloaded or (disk_scope, key) in index.overloaded:
+                return None
             positions.update(index.stable.get(key, ()))
             positions.update(index.paths.get((disk_scope, key), ()))
         ranked: list[tuple[tuple[bool, int], int]] = []
@@ -11438,11 +11464,11 @@ class InventoryService:
             return None
         return max(slot_counter, key=lambda slot: (slot_counter[slot], raw_widths.get(slot, 0), slot))
 
+    @staticmethod
     def _quantastor_bay_topology_members(
-        self,
-        raw_data: TrueNASRawData,
         disk: DiskRecord | None,
         node_members: dict[str, ZpoolMember],
+        members_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]],
     ) -> dict[str, ZpoolMember]:
         """Pool topology for one bay (#1211).
 
@@ -11454,18 +11480,18 @@ class InventoryService:
         if disk is None:
             return node_members
         pool_device = disk.raw.get("quantastor_pool_device")
-        if not isinstance(pool_device, dict):
+        entry = members_by_row.get(id(pool_device)) if isinstance(pool_device, dict) else None
+        if entry is None:
             return {}
-        members = self._build_quantastor_topology_members(raw_data, rows=[pool_device])
-        member = next(iter(members.values()), None)
-        if member is None:
-            return {}
-        return {**{key: member for key in disk.lookup_keys}, **members}
+        member, row_keys = entry
+        return {key: member for key in (*disk.lookup_keys, *row_keys)}
 
     def _build_quantastor_topology_members(
         self,
         raw_data: TrueNASRawData,
         rows: list[dict[str, Any]] | None = None,
+        *,
+        members_by_row: dict[int, tuple[ZpoolMember, frozenset[str]]] | None = None,
     ) -> dict[str, ZpoolMember]:
         pool_index = {
             normalize_value_text(pool.get("id")): pool
@@ -11522,9 +11548,11 @@ class InventoryService:
                 raw_name=normalize_value_text(device.get("name") or device.get("devicePath")),
                 raw_path=normalize_value_text(device.get("devicePath")),
             )
+            row_keys: set[str] = set()
             for field_name in ("physicalDiskId", "devicePath", "physicalDiskSerialNumber", "physicalDiskScsiId"):
                 for key in normalize_lookup_keys(normalize_value_text(device.get(field_name))):
                     members[key] = member
+                    row_keys.add(key)
             physical_disk_obj = device.get("physicalDiskObj")
             if isinstance(physical_disk_obj, dict):
                 for value in (
@@ -11536,6 +11564,9 @@ class InventoryService:
                 ):
                     for key in normalize_lookup_keys(str(value) if value is not None else None):
                         members[key] = member
+                        row_keys.add(key)
+            if members_by_row is not None:
+                members_by_row[id(device)] = (member, frozenset(row_keys))
 
         return members
 

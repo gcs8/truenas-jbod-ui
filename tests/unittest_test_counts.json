@@ -86,7 +86,7 @@
     "test_public_docs_contract": 33,
     "test_public_screenshots": 10,
     "test_quantastor_api": 23,
-    "test_quantastor_pool_device_scope": 7,
+    "test_quantastor_pool_device_scope": 8,
     "test_quantastor_storage_view_claims": 3,
     "test_read_ui_auth": 16,
     "test_release_changelog_coverage": 21,
