@@ -8220,9 +8220,11 @@ class InventoryService:
                 # producer payload before any supplement can reach the cache.
                 try:
                     raw = json.loads(result.stdout)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
+                    # The parser below reports the same payload as unavailable.
                     raw = None
-                serial = normalize_text(raw.get("sn")) if isinstance(raw, dict) else None
+                sn = raw.get("sn") if isinstance(raw, dict) else None
+                serial = normalize_text(sn) if isinstance(sn, str) else None
                 expected_serial = normalize_text(slot_view.serial)
                 if expected_serial and serial and expected_serial.lower() != serial.lower():
                     raise _SmartIdentityConflict()
@@ -17766,9 +17768,10 @@ class InventoryService:
         else:
             try:
                 raw = json.loads(payload)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                # The parser above reports the same payload as unavailable.
                 raw = None
-            if isinstance(raw, dict):
+            if isinstance(raw, dict) and isinstance(raw.get("serial_number"), str):
                 serial = normalize_text(raw.get("serial_number"))
         expected_serial = normalize_text(slot_view.serial)
         if (expected_serial and serial and expected_serial.lower() != serial.lower()) or (

@@ -190,6 +190,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_settings_reload",
         "test_slot_detail_store",
         "test_smart_grid_io",
+        "test_smart_json_shapes",
         "test_ssh_probe",
         "test_truenas_middleware_limits",
         "test_truenas_ws_jsonrpc",

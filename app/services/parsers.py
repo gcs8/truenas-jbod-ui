@@ -350,12 +350,38 @@ def _format_scaled_size(size_bytes: int, base: int, suffixes: list[str]) -> str:
 
 
 def _coerce_non_negative_int(value: Any) -> int | None:
-    if isinstance(value, int) and value >= 0:
+    # Exact type: a JSON boolean is not a reading, and bool subclasses int.
+    if type(value) is int and value >= 0:
         return value
     return None
 
 
+def _json_int(value: Any) -> int | None:
+    """An exact JSON integer, or None; booleans and floats are not readings."""
+    return value if type(value) is int else None
+
+
+def _json_text(value: Any) -> str | None:
+    """Reported JSON text, or None when the field is not a string."""
+    return normalize_text(value) if isinstance(value, str) else None
+
+
+def _load_json_object(output: str) -> dict[str, Any] | None:
+    """Decode a JSON object, or None for any other root or undecodable input.
+
+    ``ValueError`` covers ``JSONDecodeError`` and an integer literal past the
+    interpreter's digit limit; deep nesting raises ``RecursionError``.
+    """
+    try:
+        payload = json.loads(output)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _coerce_int_like(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -382,20 +408,29 @@ def _nvme_data_units_to_bytes(value: Any) -> int | None:
     return units * 512_000
 
 
+# A byte total at or above 2**64 is not a plausible drive counter; refusing it
+# also keeps Decimal-to-int conversion from building an unbounded integer.
+_SCSI_BYTE_COUNTER_LIMIT = Decimal(2**64)
+
+
 def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
-    if isinstance(value, (int, float)):
-        try:
-            return int(Decimal(str(value)) * Decimal(1_000_000_000))
-        except (InvalidOperation, ValueError):
-            return None
-    if not isinstance(value, str):
+    if isinstance(value, bool):
         return None
-    text = value.strip()
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
     if not text:
         return None
     try:
-        return int(Decimal(text) * Decimal(1_000_000_000))
-    except (InvalidOperation, ValueError):
+        byte_count = Decimal(text) * Decimal(1_000_000_000)
+        # Non-finite, negative or implausibly large counters stay unknown.
+        if not byte_count.is_finite() or byte_count < 0 or byte_count >= _SCSI_BYTE_COUNTER_LIMIT:
+            return None
+        return int(byte_count)
+    except (InvalidOperation, ValueError, OverflowError):
         return None
 
 
@@ -418,7 +453,7 @@ def _kelvin_to_celsius(value: Any) -> int | None:
 
 
 def _format_nvme_version(value: Any) -> str | None:
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         return None
     major = (value >> 16) & 0xFFFF
     minor = (value >> 8) & 0xFF
@@ -429,6 +464,8 @@ def _format_nvme_version(value: Any) -> str | None:
 
 
 def _format_nvme_eui64(value: Any) -> str | None:
+    if type(value) not in (str, int):
+        return None
     text = normalize_value_text(value)
     if not text:
         return None
@@ -437,6 +474,8 @@ def _format_nvme_eui64(value: Any) -> str | None:
 
 
 def _format_nvme_nguid(value: Any) -> str | None:
+    if type(value) not in (str, int):
+        return None
     text = normalize_value_text(value)
     return text.lower() if text else None
 
@@ -492,7 +531,7 @@ def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -
     if parsed_raw_value is None or parsed_raw_value < 0:
         return None
 
-    attribute_name = normalize_text(entry.get("name")) or ""
+    attribute_name = _json_text(entry.get("name")) or ""
     name_match = re.search(r"_(\d+)(KiB|MiB|GiB|TiB)$", attribute_name)
     if name_match:
         unit_value = int(name_match.group(1))
@@ -526,7 +565,7 @@ def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str,
 
 def _extract_ata_device_stat_int(payload: dict[str, Any], stat_name: str) -> int | None:
     for entry in _iter_ata_device_stat_entries(payload):
-        if normalize_text(entry.get("name")) != stat_name:
+        if _json_text(entry.get("name")) != stat_name:
             continue
         value = _coerce_int_like(entry.get("value"))
         if value is not None and value >= 0:
@@ -3459,21 +3498,21 @@ def _extract_smartctl_latest_test(payload: dict[str, Any]) -> tuple[str | None, 
         code = latest_test.get("code") if isinstance(latest_test.get("code"), dict) else {}
         result = latest_test.get("result") if isinstance(latest_test.get("result"), dict) else {}
         lifetime = latest_test.get("power_on_time") if isinstance(latest_test.get("power_on_time"), dict) else {}
-        latest_test_type = normalize_text(code.get("string")) or normalize_text(code.get("name"))
-        latest_test_status = normalize_text(result.get("string")) or normalize_text(result.get("name"))
-        latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+        latest_test_type = _json_text(code.get("string")) or _json_text(code.get("name"))
+        latest_test_status = _json_text(result.get("string")) or _json_text(result.get("name"))
+        latest_test_lifetime_hours = _coerce_non_negative_int(lifetime.get("hours"))
     else:
         ata_log = payload.get("ata_smart_self_test_log") if isinstance(payload.get("ata_smart_self_test_log"), dict) else {}
         standard = ata_log.get("standard") if isinstance(ata_log.get("standard"), dict) else {}
         table = standard.get("table") if isinstance(standard.get("table"), list) else []
         if table and isinstance(table[0], dict):
             latest_test = table[0]
-            latest_test_type = normalize_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else normalize_text(latest_test.get("type"))
-            latest_test_status = normalize_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else normalize_text(latest_test.get("status"))
+            latest_test_type = _json_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else _json_text(latest_test.get("type"))
+            latest_test_status = _json_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else _json_text(latest_test.get("status"))
             raw_lifetime = latest_test.get("lifetime_hours")
             if isinstance(raw_lifetime, dict):
                 raw_lifetime = raw_lifetime.get("hours")
-            latest_test_lifetime_hours = raw_lifetime if isinstance(raw_lifetime, int) else None
+            latest_test_lifetime_hours = _coerce_non_negative_int(raw_lifetime)
 
     return latest_test_type, latest_test_status, latest_test_lifetime_hours
 
@@ -3493,17 +3532,17 @@ def _extract_smartctl_sas_phy(
         (
             phy
             for phy in sas_port_phys
-            if format_hex_identifier(phy.get("attached_sas_address")) not in {None, "0x0"}
-            or normalize_text(phy.get("attached_device_type")) not in {None, "no device attached"}
+            if format_hex_identifier(_json_text(phy.get("attached_sas_address"))) not in {None, "0x0"}
+            or _json_text(phy.get("attached_device_type")) not in {None, "no device attached"}
         ),
         sas_port_phys[0] if sas_port_phys else None,
     )
     if not selected_phy:
         return None
     return (
-        format_hex_identifier(selected_phy.get("sas_address")),
-        format_hex_identifier(selected_phy.get("attached_sas_address")),
-        normalize_text(selected_phy.get("negotiated_logical_link_rate")),
+        format_hex_identifier(_json_text(selected_phy.get("sas_address"))),
+        format_hex_identifier(_json_text(selected_phy.get("attached_sas_address"))),
+        _json_text(selected_phy.get("negotiated_logical_link_rate")),
     )
 
 
@@ -3797,9 +3836,9 @@ def _extract_smartctl_temperature_thresholds(
 
 
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
+        # The SSH reader tries its next candidate on exactly this message.
         return {"available": False, "message": "SMART JSON parsing failed."}
 
     temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
@@ -3816,37 +3855,37 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     power_on_time = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
     logical_block_size = payload.get("logical_block_size")
     physical_block_size = payload.get("physical_block_size")
-    firmware_version = normalize_text(payload.get("firmware_version"))
+    firmware_version = _json_text(payload.get("firmware_version"))
     protocol_version = (
-        normalize_text(payload.get("nvme_version", {}).get("string"))
+        _json_text(payload.get("nvme_version", {}).get("string"))
         if isinstance(payload.get("nvme_version"), dict)
         else None
     )
     if not protocol_version:
         protocol_version = (
-            normalize_text(payload.get("sata_version", {}).get("string"))
+            _json_text(payload.get("sata_version", {}).get("string"))
             if isinstance(payload.get("sata_version"), dict)
             else None
         )
     smart_status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
-    rotation_rate = payload.get("rotation_rate") if isinstance(payload.get("rotation_rate"), int) else None
+    rotation_rate = _coerce_non_negative_int(payload.get("rotation_rate"))
     form_factor = (
-        normalize_text(payload.get("form_factor", {}).get("name"))
+        _json_text(payload.get("form_factor", {}).get("name"))
         if isinstance(payload.get("form_factor"), dict)
         else None
     )
     transport_protocol = (
-        normalize_text(payload.get("scsi_transport_protocol", {}).get("name"))
+        _json_text(payload.get("scsi_transport_protocol", {}).get("name"))
         if isinstance(payload.get("scsi_transport_protocol"), dict)
         else None
     )
     if not transport_protocol:
         transport_protocol = (
-            normalize_text(payload.get("device", {}).get("protocol"))
+            _json_text(payload.get("device", {}).get("protocol"))
             if isinstance(payload.get("device"), dict)
             else None
     )
-    logical_unit_id = format_hex_identifier(payload.get("logical_unit_id"))
+    logical_unit_id = format_hex_identifier(_json_text(payload.get("logical_unit_id")))
     smart_health_status = None
     if smart_status:
         passed = smart_status.get("passed")
@@ -3854,11 +3893,13 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             smart_health_status = "PASSED"
         elif passed is False:
             smart_health_status = "FAILED"
-    power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
+    power_on_hours = _coerce_non_negative_int(power_on_time.get("hours"))
     power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
     power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
     warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(payload, temperature)
-    sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
+    logical_block_size = _json_int(logical_block_size)
+    physical_block_size = _json_int(physical_block_size)
+    sector_size_for_ata = logical_block_size if logical_block_size is not None and logical_block_size > 0 else 512
     traffic_and_wear = _extract_smartctl_traffic_and_wear(
         payload,
         power_on_hours,
@@ -3896,7 +3937,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     )
     interface_speed = payload.get("interface_speed") if isinstance(payload.get("interface_speed"), dict) else {}
     interface_speed_current = interface_speed.get("current") if isinstance(interface_speed.get("current"), dict) else {}
-    negotiated_link_rate = normalize_text(interface_speed_current.get("string"))
+    negotiated_link_rate = _json_text(interface_speed_current.get("string"))
 
     if rotation_rate is None and transport_protocol and transport_protocol.upper() == "NVME":
         rotation_rate = 0
@@ -3908,7 +3949,7 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
         if isinstance(eui64_payload, dict):
             oui = eui64_payload.get("oui")
             ext_id = eui64_payload.get("ext_id")
-            if isinstance(oui, int) and isinstance(ext_id, int):
+            if _coerce_non_negative_int(oui) is not None and _coerce_non_negative_int(ext_id) is not None:
                 namespace_eui64 = _format_nvme_eui64(f"{oui:06x}{ext_id:010x}")
 
     sas_phy = _extract_smartctl_sas_phy(payload)
@@ -3920,13 +3961,9 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
 
     latest_test_type, latest_test_status, latest_test_lifetime_hours = _extract_smartctl_latest_test(payload)
 
-    current_temperature = (
-        temperature.get("current")
-        if isinstance(temperature.get("current"), int)
-        else environmental_temperature.get("current")
-        if isinstance(environmental_temperature.get("current"), int)
-        else None
-    )
+    current_temperature = _json_int(temperature.get("current"))
+    if current_temperature is None:
+        current_temperature = _json_int(environmental_temperature.get("current"))
 
     return _finalize_summary(
         {
@@ -3987,9 +4024,8 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
 
 
 def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe smart-log JSON parsing failed."}
 
     temperature_c = _kelvin_to_celsius(payload.get("temperature"))
@@ -4059,12 +4095,11 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
 
 
 def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ctrl JSON parsing failed."}
 
-    firmware_version = normalize_text(payload.get("fr"))
+    firmware_version = _json_text(payload.get("fr"))
     protocol_version = _format_nvme_version(payload.get("ver"))
     warning_temperature_c = _kelvin_to_celsius(payload.get("wctemp"))
     critical_temperature_c = _kelvin_to_celsius(payload.get("cctemp"))
@@ -4081,9 +4116,8 @@ def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
 
 
 def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ns JSON parsing failed."}
 
     return _finalize_summary(
