@@ -45,6 +45,10 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Creating the demo builder system no longer deletes its new chassis profile
+  when the config file was already replaced and only the directory fsync
+  failed; the profile is kept and the request reports an uncertain save
+  (#1240).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
