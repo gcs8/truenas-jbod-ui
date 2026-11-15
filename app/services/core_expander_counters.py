@@ -656,6 +656,7 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
     ended = False
     malformed = False
     header_seen = False
+    stopped = False
     rows: list[dict[str, Any]] = []
     current: int | None = None
     lines: list[str] = []
@@ -669,6 +670,14 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
 
     for raw_line in str(stdout or "").splitlines():
         line = raw_line.strip()
+        if ended or (stopped and line and line != "@end"):
+            # One answer per output: after its end marker, or after the PHY
+            # that gave no answer, only blank lines (and then that end marker)
+            # may follow. Anything else, such as a second concatenated
+            # answer, makes the whole output ambiguous (#1220).
+            if line:
+                malformed = True
+            continue
         if line.startswith(f"{SMP_PHY_ERROR_LOG_MARKER}:"):
             # The command prints exactly one header, first.
             parts = line[len(SMP_PHY_ERROR_LOG_MARKER) + 1:].split(":")
@@ -695,18 +704,20 @@ def parse_phy_error_log_output(stdout: str) -> PhyErrorLogResult:
             current = phy
             continue
         if line == "@no-response":
+            if current is None:
+                malformed = True
             flush(no_response=True)
+            stopped = True
             continue
         if line == "@end":
             flush()
             ended = True
-            break
+            continue
         if current is not None and line:
             lines.append(line)
-    else:
+    if not ended and current is not None:
         # No end marker: the batch was cut short; the open PHY is unknown.
-        if current is not None:
-            rows.append(_unknown_row(current, "unknown", "incomplete_output"))
+        rows.append(_unknown_row(current, "unknown", "incomplete_output"))
     return PhyErrorLogResult(identity, rows, phy_range, ended, malformed=malformed)
 
 
@@ -734,8 +745,9 @@ def parse_chunk_output(output_key: str | None, stdout: object) -> PhyErrorLogRes
     None when the key is not a counter key. Output larger than the chunk can
     legitimately print is refused unparsed; so is output whose marker names
     another expander or pass device, that reports a PHY outside the key's
-    range, that repeats or garbles a header or PHY marker, or that lacks its
-    end marker. A refused output's PHYs read as
+    range, that repeats or garbles a header or PHY marker, that carries
+    anything but blank lines after its end marker (such as a second answer),
+    or that lacks its end marker. A refused output's PHYs read as
     ``unknown`` / ``rejected_output``: an error, never counters.
     """
     span = chunk_output_span(output_key)

@@ -128,6 +128,78 @@ class MalformedPhyMarkerTests(unittest.TestCase):
                 self.assertIsNone(row["invalid_dword_count"])
 
 
+class WholeOutputValidationTests(unittest.TestCase):
+    """The whole stdout is one answer: nothing may follow its terminal marker."""
+
+    assert_rejected = MalformedPhyMarkerTests.assert_rejected
+
+    def test_two_concatenated_answers_reject_the_chunk_in_either_order(self):
+        zero = _output(0, 0, ["@phy=00", _frame(0)])
+        nonzero = _output(0, 0, ["@phy=00", _frame(0, 99)])
+        for name, stdout in (("zero-first", zero + nonzero), ("nonzero-first", nonzero + zero)):
+            with self.subTest(order=name):
+                self.assert_rejected(_key(0, 0), stdout, [0])
+
+    def test_marker_or_text_after_the_end_marker_rejects_the_chunk(self):
+        clean = _output(0, 0, ["@phy=00", _frame(0)])
+        for suffix in (
+            f"@phy=00\n{_frame(0, 99)}\n",
+            f"@phy=ff\n{_frame(0, 99)}\n",
+            "@phy=00\n",
+            "@end\n",
+            "@no-response\n",
+            f"{_frame(0, 99)}\n",
+            "camcontrol: error\n",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assert_rejected(_key(0, 0), clean + suffix, [0])
+
+    def test_only_blank_lines_may_follow_the_end_marker(self):
+        parsed = _chunk(_key(0, 0), _output(0, 0, ["@phy=00", _frame(0)]) + "\n  \n\t\n")
+        self.assertFalse(parsed.rejected)
+        self.assertEqual(parsed.rows[0]["counter_state"], "measured")
+
+    def test_frame_or_marker_after_no_response_rejects_the_chunk(self):
+        # The command stops reading at the first PHY that gives no answer.
+        for body in (
+            ["@phy=00", "@no-response", "@phy=01", _frame(1)],
+            ["@phy=00", _frame(0), "@phy=01", "@no-response", _frame(1, 99)],
+            ["@phy=00", "@no-response", "@no-response"],
+            ["@no-response", "@phy=00", _frame(0), "@phy=01", _frame(1)],
+        ):
+            with self.subTest(body=body):
+                self.assert_rejected(_key(0, 1), _output(0, 1, body), [0, 1])
+
+    def test_header_after_a_phy_or_after_a_bad_header_rejects_the_chunk(self):
+        for lines in (
+            ["@phy=00", _header(0, 0), _frame(0), "@end"],
+            ["@phy=00", _frame(0), _header(0, 0), "@end"],
+            [f"{SMP_PHY_ERROR_LOG_MARKER}:garbled", _header(0, 0), "@phy=00", _frame(0), "@end"],
+        ):
+            with self.subTest(lines=lines):
+                self.assert_rejected(_key(0, 0), "\n".join(lines) + "\n", [0])
+
+    def test_collector_keeps_unknown_rows_for_concatenated_answers(self):
+        from app.services.core_expander_counters import SmpTarget, build_phy_error_log_command, smp_output_key
+        from app.services.inventory import InventoryService
+        from app.services.ssh_probe import SSHCommandResult
+
+        command = build_phy_error_log_command(SmpTarget(0, EXPANDER, DEVICE, 1), [0])
+        key = _key(0, 0)
+        self.assertEqual(smp_output_key(command), key)
+        zero = _output(0, 0, ["@phy=00", _frame(0)])
+        nonzero = _output(0, 0, ["@phy=00", _frame(0, 99)])
+        for name, stdout in (("zero-first", zero + nonzero), ("nonzero-first", nonzero + zero)):
+            with self.subTest(order=name):
+                service = object.__new__(InventoryService)
+                setattr(service, "_smp_counter_planned", {key: (0, EXPANDER)})
+                service._record_smp_counter_reads([SSHCommandResult(command=command, ok=True, stdout=stdout)])
+                read = service.expander_counter_reads()[(0, EXPANDER)]
+                self.assertEqual([row[5:] for row in read.rows], [("unknown", "rejected_output")])
+                self.assertEqual(read.rows[0][1:5], (None, None, None, None))
+                self.assertEqual(read.stopped and read.stopped[:2], ("rejected_output", 0))
+
+
 class WellFormedOutputControls(unittest.TestCase):
     def test_single_zero_frame_is_a_measured_clean_reading(self):
         parsed = _chunk(_key(0, 0), _output(0, 0, ["@phy=00", _frame(0)]))
