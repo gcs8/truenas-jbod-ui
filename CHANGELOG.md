@@ -76,6 +76,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- Fixed a lost bay-assignment change when two owners of one mapping file (a
+  second app process, or a second store in one process) both reported a
+  successful save. Saves, clears and imports now hold a writer lock
+  (`slot_mappings.json.lock` beside the file) from the read to the readback,
+  and refuse with `mapping_writer_lock_unavailable` when another writer holds
+  it too long or the filesystem cannot lock files. A refused import now gets
+  the named 503 instead of a generic error (#1256).
 
 ### Performance
 
