@@ -48,6 +48,13 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).
+- QuantaStor: two overlapping storage views on one node no longer both show
+  the same disk, and another node's pool-device row at the same local path
+  (such as `/dev/sda`) no longer moves a disk to that node's bay or gives it
+  that node's pool. A pool-device row must match the disk by stable identity,
+  or by path on the disk's own node, without a contradicting serial; a bay's
+  pool topology comes from that same row, and conflicting rows leave pool
+  membership unknown (#1264).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
