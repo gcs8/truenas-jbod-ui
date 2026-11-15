@@ -276,6 +276,22 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
         self.service._get_opening_order_snapshot.assert_not_awaited()
 
     async def test_forced_order_burst_bounds_waiters_and_falls_back_without_busy(self):
+        await self.exercise_forced_order_burst()
+
+    async def test_forced_order_burst_check_rejects_a_waiter_cap_above_eight(self):
+        # The burst check must still see a queue one past the cap; a wait that
+        # outlives the scoring deadline would let the extra waiter time out.
+        with patch("app.services.inventory.OPENING_ORDER_MAX_WAITERS", 9):
+            with self.assertRaisesRegex(AssertionError, "10 not less than or equal to 9"):
+                await self.exercise_forced_order_burst()
+
+    async def exercise_forced_order_burst(self):
+        # Waiters that time out also leave the queue, which would hide a queue
+        # past the cap. Keep the scoring deadline past the readiness bound so
+        # only the capacity guard answers while the first request holds scoring.
+        self.enterContext(patch(
+            "app.services.inventory.OPENING_ORDER_TIMEOUT_SECONDS", 2 * wait_bounds.HANG_TIMEOUT_SECONDS,
+        ))
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def secondary(enclosure_id, **kwargs):
@@ -294,9 +310,15 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
                 "/" if index % 2 else "/api/storage-views",
                 b"enclosure_id=enc-a&force=true",
             )) for index in range(64))
-            # Page requests make worker-thread hops, so wait for the overflow to
-            # answer rather than a fixed loop count.
-            await wait_bounds.wait_until(lambda: sum(not task.done() for task in tasks) <= 9)
+            # Page requests make worker-thread hops, so wait until every later
+            # request has answered or is counted as a waiter, not a fixed loop
+            # count. That is the peak queue, whatever the cap is.
+            await wait_bounds.wait_until(lambda: (
+                sum(task.done() for task in tasks[1:]) + self.service._view_order_waiters == 64
+            ))
+            # The first request still holds scoring, so nothing left by timeout.
+            self.assertFalse(tasks[0].done())
+            self.assertTrue(self.service._view_order_recompute_lock.locked())
             self.assertLessEqual(sum(not task.done() for task in tasks), 9)
             self.assertLessEqual(len(self.service._view_order_recompute_lock._waiters or ()), 8)
             overflow = [task.result() for task in tasks if task.done()]
@@ -309,7 +331,7 @@ class OpeningOrderRouteTests(unittest.IsolatedAsyncioTestCase):
                     ])
                 else:
                     self.assertIn(b"<!doctype html>", body.lower())
-                    self.assertIn(b"Opening-view scoring was skipped", body)
+                    self.assertIn(b"Opening-view scoring was skipped because opening-order scoring is busy", body)
             release.set()
             responses = await asyncio.wait_for(asyncio.gather(*tasks), 2)
             self.assertTrue(all(status == 200 for status, _ in responses))

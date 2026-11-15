@@ -4181,10 +4181,15 @@ class AdminSudoPreviewRouteTests(unittest.TestCase):
                 await asyncio.sleep(0.05)
                 scans.history_changed()  # each caller now needs its own scan
             # The scans start on worker threads; wait for them, not a fixed time.
-            await wait_until(lambda: running[0] == admin_routes.HISTORY_SCAN_CONCURRENCY)
-            with lock:
-                self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
-            release.set()
+            # Read the count only once every scan is running or queued on the
+            # limit, so a wider limit cannot hide behind a late thread start.
+            limit = scans._limit
+            try:
+                await wait_until(lambda: running[0] + len(limit._waiters or ()) == len(tasks))
+                with lock:
+                    self.assertEqual(running[0], admin_routes.HISTORY_SCAN_CONCURRENCY)
+            finally:
+                release.set()
             await asyncio.gather(*tasks)
 
         with patch("admin_service.routes.get_history_store", return_value=history_store):
