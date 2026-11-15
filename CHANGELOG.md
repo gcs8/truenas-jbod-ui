@@ -45,6 +45,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- Storage Fabric no longer shows an unknown SMART power-on time as "0 d".
+  When days are not reported it shows the reported hours, and leaves the
+  value out when neither is known; a reported zero still shows (#1234).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
