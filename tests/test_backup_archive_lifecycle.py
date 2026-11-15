@@ -653,6 +653,29 @@ class KeeperPayloadCheckTests(CatalogCase):
         self.assertTrue(self.catalog.get(newest.artifact_id).verified, "an unchecked keeper is not downgraded")
         self.assertIsNotNone(self.catalog.get(older.artifact_id))
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs POSIX FIFOs")
+    def test_fifo_in_place_of_a_keeper_is_refused_without_blocking(self) -> None:
+        import threading
+
+        older, older_path = self.add_copy(2, b"older good copy")
+        newest, newest_path = self.add_copy(1, b"newest copy replaced by a FIFO")
+        newest_path.unlink()
+        os.mkfifo(newest_path)
+        outcome: list[ApplyResult] = []
+        worker = threading.Thread(target=lambda: outcome.append(self.groom()), daemon=True)
+        worker.start()
+        worker.join(10)
+        if worker.is_alive():
+            # Unblock the reader so the daemon thread can finish, then fail.
+            with open(os.open(newest_path, os.O_WRONLY | os.O_NONBLOCK), "wb"):
+                pass
+            self.fail("opening a FIFO keeper blocked grooming")
+
+        [result] = outcome
+        self.assertTrue(older_path.exists())
+        self.assertEqual(result.deleted, ())
+        self.assertIn("keeper-unreadable", result.failed_locations["local"])
+
     def test_remote_keeper_that_cannot_be_content_verified_refuses_the_deletion(self) -> None:
         older, _ = self.add_copy(2, b"older remote copy", location="nas-1")
         newest, _ = self.add_copy(1, b"newest remote copy", location="nas-1")

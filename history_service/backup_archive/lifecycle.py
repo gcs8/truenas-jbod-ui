@@ -566,7 +566,14 @@ class LocalBackupDirectory:
         """
 
         path = self._path(name)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK: a FIFO planted under a keeper's name must not block the
+        # open before the regular-file check refuses it.
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         descriptor = os.open(path, flags)
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):

@@ -489,15 +489,15 @@ all, grooming stops deleting at that location for that run and the status
 names the reason
 (`keeper-unreadable`, `keeper-unverifiable` or `keeper-readback-failed`).
 
-Local copies are hashed in place. For a remote target, grooming first lists the
-folder once; a kept copy that is not listed or has a different size is marked
-unverified without downloading anything. A listed copy is then read back with
-the same streaming download an explicit verify uses, into a private temporary
-file that is deleted straight away and is capped at the recorded size. This
-happens only when that location has something to delete, and only for the
-kept copies, so remote grooming downloads up to `remote_keep` + 1 archives per
-class each time it deletes. A preview reads only the catalog, so applying it
-can delete fewer copies than it listed.
+Local copies are hashed in place. A remote kept copy is read back with the same
+streaming download an explicit verify uses, into a private temporary file that
+is deleted straight away and is capped at the recorded size; grooming does not
+list the remote folder. A copy the target reports as not found is marked
+unverified, and any other download failure stops deletion at that location
+with `keeper-readback-failed`. This happens only when that location has
+something to delete, and only for the kept copies, so remote grooming downloads
+up to `remote_keep` + 1 archives per class each time it deletes. A preview
+reads only the catalog, so applying it can delete fewer copies than it listed.
 
 ### Deploy
 

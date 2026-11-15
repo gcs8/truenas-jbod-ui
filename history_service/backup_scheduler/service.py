@@ -1234,17 +1234,16 @@ class BackupScheduler:
     def _keeper_digest(self, local_digests: dict[str, tuple[int, str]] | None = None) -> PayloadDigest:
         """How grooming re-reads a kept copy before it deletes anything (#1188).
 
-        Local copies are hashed in place. A remote copy is first looked up in
-        one listing per location and prefix (a missing name or a different
-        size fails the keeper without a download), then read back through the
-        target's streaming ``get`` into a private scratch file under the state
-        directory with a hard limit of the recorded size, the same bounded
-        readback an explicit verify uses. Nothing is buffered in memory and the
-        scratch file is removed at once. A target without ``get`` or a readback
-        that fails refuses the deletion with a named reason.
+        Local copies are hashed in place. A remote copy is read back through
+        the target's streaming ``get`` into a private scratch file under the
+        state directory with a hard limit of the recorded size, the same
+        bounded readback an explicit verify uses; the target is never listed,
+        so a large or hostile namespace adds no work. Nothing is buffered in
+        memory and the scratch file is removed at once. A readback that reports
+        the object as absent (ENOENT, directly or as the cause) fails the
+        keeper; a target without ``get`` or any other readback failure refuses
+        the deletion with a named reason and leaves the keeper's flag alone.
         """
-
-        listings: dict[tuple[str, str], dict[str, int]] = {}
 
         def digest(record: ArtifactRecord, target: GroomableTarget) -> tuple[int, str]:
             if record.location == LOCAL_LOCATION:
@@ -1255,21 +1254,6 @@ class BackupScheduler:
             get: Any = getattr(target, "get", None)
             if not callable(get):
                 raise KeeperCheckUnavailable("keeper-unverifiable")
-            prefix = record.name.rpartition("/")[0]
-            prefix = f"{prefix}/" if prefix else ""
-            key = (record.location, prefix)
-            try:
-                if key not in listings:
-                    listings[key] = {obj.name: obj.size for obj in target.list(prefix)}
-            except (ConnectionError, TimeoutError):
-                raise
-            except Exception as exc:  # noqa: BLE001 - refuse, never assume the keeper is there
-                raise KeeperCheckUnavailable("keeper-readback-failed") from exc
-            listed_size = listings[key].get(record.name)
-            if listed_size is None:
-                raise FileNotFoundError(record.name)
-            if listed_size != record.size:
-                return listed_size, ""
             workspace = Path(tempfile.mkdtemp(prefix="keeper-check-", dir=self.paths.state_dir))
             try:
                 size, sha256 = get(record.name, workspace / "archive", limit=record.size)
@@ -1279,6 +1263,8 @@ class BackupScheduler:
             except (ConnectionError, TimeoutError):
                 raise
             except Exception as exc:  # noqa: BLE001 - refuse, never delete on an unchecked keeper
+                if _reports_absent(exc):
+                    raise FileNotFoundError(record.name) from exc
                 raise KeeperCheckUnavailable("keeper-readback-failed") from exc
             finally:
                 for child in workspace.iterdir():
@@ -1656,6 +1642,17 @@ def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, 
         "packaging": manifest.get("packaging") if isinstance(manifest.get("packaging"), str) else None,
         "groups": list(groups),
     }
+
+
+def _reports_absent(exc: BaseException) -> bool:
+    """True when a readback failed because the object does not exist (ENOENT)."""
+
+    for candidate in (exc, exc.__cause__):
+        if isinstance(candidate, FileNotFoundError) or (
+            isinstance(candidate, OSError) and candidate.errno == errno.ENOENT
+        ):
+            return True
+    return False
 
 
 def _require_match(record: ArtifactRecord, size: int, digest: str) -> None:

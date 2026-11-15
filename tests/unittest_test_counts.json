@@ -18,7 +18,7 @@
     "test_background_refresh_busy_routes": 4,
     "test_background_refresh_deadlines": 51,
     "test_backup_archive_journal": 35,
-    "test_backup_archive_lifecycle": 45,
+    "test_backup_archive_lifecycle": 46,
     "test_backup_archive_transport": 78,
     "test_backup_integration": 142,
     "test_bash_ci_contract": 6,

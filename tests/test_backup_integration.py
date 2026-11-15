@@ -2477,7 +2477,7 @@ class SchedulerTests(SchedulerTestBase):
             [path.name for path in self._paths.state_dir.iterdir() if path.name.startswith("keeper-check-")], []
         )
 
-    def test_missing_remote_keeper_is_downgraded_from_the_listing_without_a_download(self) -> None:
+    def test_missing_remote_keeper_is_downgraded_without_listing_the_target(self) -> None:
         scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
         scheduler.run_now("full")
         self.now += timedelta(hours=1)
@@ -2490,17 +2490,23 @@ class SchedulerTests(SchedulerTestBase):
         token = scheduler.plan()[0]
 
         real_get = LocalDirectoryTarget.get
-        with patch.object(LocalDirectoryTarget, "get", autospec=True, side_effect=real_get) as get:
+        with patch.object(LocalDirectoryTarget, "get", autospec=True, side_effect=real_get) as get, \
+                patch.object(LocalDirectoryTarget, "list", autospec=True, side_effect=AssertionError("listed")) as listed:
             result = scheduler.apply(token)
 
         self.assertTrue((remote_dir / older.name).exists(), "the last good remote copy was groomed")
         self.assertEqual(result.deleted, ())
         self.assertEqual(result.failed_locations, {})
         self.assertFalse(scheduler.catalog.get(newest.artifact_id).verified)
-        # The listing settles the missing keeper; only the older copy, which
-        # became the keeper after the replan, is read back, and only once.
-        self.assertEqual([call.args[1] for call in get.call_args_list], [older.name])
-        self.assertEqual(get.call_args_list[0].kwargs["limit"], older.size)
+        self.assertTrue(scheduler.catalog.get(older.artifact_id).verified)
+        # Only the kept copies are read, each once and capped at its recorded
+        # size: the missing newest one, then the older one that became the
+        # keeper after the replan. The target is never listed.
+        self.assertEqual(
+            [(call.args[1], call.kwargs["limit"]) for call in get.call_args_list],
+            [(newest.name, newest.size), (older.name, older.size)],
+        )
+        self.assertEqual(listed.call_count, 0)
 
     def test_remote_grooming_deletes_after_an_intact_keeper_readback(self) -> None:
         scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
