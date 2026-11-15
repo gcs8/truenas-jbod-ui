@@ -4,9 +4,10 @@ Migration, imports and history reads accept ISO-8601 timestamps with any UTC
 offset. Retention must never expire a row whose absolute time is not older
 than the cutoff, whatever offset it was stored with, and must keep distinct
 microseconds apart. A row stored with a positive offset whose text still sorts
-after the cutoff is expired on a later pass, never early; that keeps every
-batch bounded by its size. All rows here are synthetic and live in a temporary
-directory.
+after the cutoff is expired on a later pass, never early, so a batch never
+reads rows newer than the cutoff by text. One batch reads at most its size
+plus the rows whose text lies in the day before the cutoff. All rows here are
+synthetic and live in a temporary directory.
 """
 
 from __future__ import annotations
@@ -347,12 +348,12 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
             HistoryStore._register_retention_functions(connection)
             for query, index_name in cases:
                 with self.subTest(index=index_name):
-                    parameters = (*HistoryStore._retention_bounds(cutoff), 10)
+                    parameters = (*HistoryStore._retention_parameters(cutoff, None), 10)
                     plan = " ".join(
                         str(row[3])
                         for row in connection.execute(f"EXPLAIN QUERY PLAN {query}", parameters)
                     )
-                    self.assertIn(f"INDEX {index_name} (observed_at<?)", plan)
+                    self.assertIn(f"INDEX {index_name} (observed_at>? AND observed_at<?)", plan)
                     self.assertNotIn("USE TEMP B-TREE", plan)
 
 
@@ -472,7 +473,13 @@ class RetentionPrecisionTests(unittest.TestCase):
 
 
 class RetentionBatchWorkTests(unittest.TestCase):
-    """One retention batch does work bounded by its size, not by the table."""
+    """Where one retention batch's work comes from.
+
+    Rows whose text sorts at or after the cutoff are never visited. Rows whose
+    text sorts before the settled bound (the day before the cutoff) are taken
+    in index order. So one batch visits at most its size plus the rows whose
+    text lies in the day before the cutoff; only those window rows grow it.
+    """
 
     SMALL = 200
     LARGE = 4000
@@ -536,6 +543,229 @@ class RetentionBatchWorkTests(unittest.TestCase):
             self.assertTrue(result["has_more"])
 
         self.assertLessEqual(work[self.LARGE] - work[self.SMALL], self.SLACK, work)
+
+    def test_old_rows_beyond_the_batch_size_do_not_grow_the_work_of_a_batch(self) -> None:
+        cutoffs = {"metric": CUTOFF, "event": CUTOFF, "hourly": CUTOFF, "daily": CUTOFF}
+        work = {}
+        for count in (self.SMALL, self.LARGE):
+            path = self._database(f"old-{count}.db")
+            self._fill(path, "2026-11-01T00:00:00+00:00", count, metrics=True)
+            work[count], result = _batch_work(path, cutoffs)
+            self.assertEqual(result["metric_samples_removed"], 1)
+            self.assertEqual(result["events_removed"], 1)
+            self.assertEqual(result["hourly_rollups_removed"], 1)
+            self.assertTrue(result["has_more"])
+
+        self.assertLessEqual(work[self.LARGE] - work[self.SMALL], self.SLACK, work)
+
+    def test_only_rows_in_the_day_before_the_cutoff_grow_the_work_of_a_batch(self) -> None:
+        # Valid rows newer than the cutoff whose -05:00 text sorts before it,
+        # and recent rows whose time cannot be read, both sit in the window.
+        # A batch reads each of them once, so its work grows linearly with the
+        # window rows. That is the documented bound, not a size-only bound.
+        cases = (
+            ("negative-offset", "2026-11-14T08:00:00-05:00", True,
+             {"metric": CUTOFF, "event": CUTOFF, "hourly": CUTOFF, "daily": CUTOFF}),
+            ("recent-unreadable", "2026-11-14T00:00:00+25:00", False, {"event": CUTOFF}),
+        )
+        for name, observed_at, metrics, cutoffs in cases:
+            with self.subTest(name):
+                work = {}
+                for count in (self.SMALL, self.LARGE):
+                    path = self._database(f"{name}-{count}.db")
+                    self._fill(path, observed_at, count, metrics=metrics)
+                    work[count], result = _batch_work(path, cutoffs)
+                    self.assertEqual(result["events_removed"], 0)
+                    self.assertFalse(result["has_more"])
+                growth = work[self.LARGE] / work[self.SMALL]
+                self.assertGreater(growth, 5, work)
+                self.assertLessEqual(growth, 1.1 * self.LARGE / self.SMALL, work)
+
+    def test_a_full_pass_reads_each_window_row_a_bounded_number_of_times(self) -> None:
+        # Expired UTC rows interleaved with -05:00 rows that are newer than the
+        # cutoff, all inside the window, deleted ten rows per batch. Without a
+        # lower bound for the pass, every batch re-reads the rejected rows
+        # before it and the pass grows with the square of the window.
+        work = {}
+        for count in (200, 800):
+            path = self._database(f"interleaved-{count}.db")
+            store = HistoryStore(str(path))
+            _insert_events(path, _interleaved_window_events(count))
+            steps = _count_store_work(store)
+            result = store.maintain_retention(
+                now=NOW,
+                raw_metric_retention_days=0,
+                event_retention_days=1,
+                hourly_rollup_retention_days=0,
+                daily_rollup_retention_days=0,
+                batch_size=10,
+                max_batches=1000,
+            )
+            work[count] = steps[0]
+            self.assertEqual(result["events_removed"], count)
+            self.assertFalse(result["has_more"])
+            self.assertEqual(_event_labels(path), ["kept"] * count)
+
+        self.assertLessEqual(work[800] / work[200], 1.5 * 800 / 200, work)
+
+
+def _interleaved_window_events(count: int) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for index in range(count):
+        minute, second = divmod(index, 60)
+        moment = f"2026-11-14T08:{minute % 60:02d}:{second:02d}"
+        rows.append((f"{moment}+00:00", "expired"))  # 08:xx UTC
+        rows.append((f"{moment}-05:00", "kept"))  # 13:xx UTC
+    return rows
+
+
+def _count_store_work(store: HistoryStore) -> list[int]:
+    """Count SQLite VM steps on every connection the store opens from now on."""
+
+    steps = [0]
+    connect = store._connect_locked
+
+    def counting_connect() -> sqlite3.Connection:
+        connection = connect()
+
+        def progress() -> int:
+            steps[0] += 1
+            return 0
+
+        connection.set_progress_handler(progress, 1)
+        return connection
+
+    store._connect_locked = counting_connect  # type: ignore[method-assign]
+    return steps
+
+
+class RetentionScanFloorTests(unittest.TestCase):
+    """The pass's in-memory lower bound can only delay a deletion."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="retention-floor-")
+        self.addCleanup(self._temporary.cleanup)
+        self.path = Path(self._temporary.name) / "history.db"
+        self.store = HistoryStore(str(self.path))
+
+    def test_a_row_added_behind_the_floor_waits_for_the_next_pass(self) -> None:
+        _insert_events(self.path, _interleaved_window_events(30))
+        checks = [0]
+
+        def add_old_row_after_first_batch() -> bool:
+            checks[0] += 1
+            if checks[0] == 2:
+                # Expired, and sorts before every row the first batch read.
+                _insert_events(self.path, [("2026-11-14T07:00:00+00:00", "late-expired")])
+            return True
+
+        first = self.store.maintain_retention(
+            now=NOW,
+            raw_metric_retention_days=0,
+            event_retention_days=1,
+            hourly_rollup_retention_days=0,
+            daily_rollup_retention_days=0,
+            batch_size=10,
+            max_batches=100,
+            should_continue=add_old_row_after_first_batch,
+        )
+        self.assertEqual(first["events_removed"], 30)
+        self.assertIn("late-expired", _event_labels(self.path))
+
+        second = _retain(self.store, event_retention_days=1)
+
+        self.assertEqual(second["events_removed"], 1)
+        self.assertFalse(second["has_more"])
+        self.assertEqual(_event_labels(self.path), ["kept"] * 30)
+
+    def test_rollups_cover_exactly_the_samples_deleted_across_floored_batches(self) -> None:
+        samples = []
+        for index in range(25):
+            minute, second = divmod(index, 60)
+            moment = f"2026-11-14T08:{minute:02d}:{second:02d}"
+            samples.append(_sample(f"{moment}+00:00", 1))  # expired
+            samples.append(_sample(f"{moment}-05:00", 2))  # newer than the cutoff
+        self.store.insert_metric_samples(samples)
+
+        result = _retain(
+            self.store,
+            raw_metric_retention_days=1,
+            hourly_rollup_retention_days=365,
+            daily_rollup_retention_days=365,
+            batch_size=4,
+            max_batches=100,
+        )
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            remaining = [row[0] for row in connection.execute("SELECT value_integer FROM metric_samples")]
+            rolled = connection.execute(
+                "SELECT bucket_seconds, SUM(sample_count), SUM(value_sum) FROM metric_rollups "
+                "GROUP BY bucket_seconds ORDER BY bucket_seconds"
+            ).fetchall()
+        self.assertEqual(result["metric_samples_removed"], 25)
+        self.assertFalse(result["has_more"])
+        self.assertEqual(remaining, [2] * 25)
+        self.assertEqual(rolled, [(3600, 25, 25.0), (86400, 25, 25.0)])
+
+
+class RetentionQueryPlanTests(unittest.TestCase):
+    """Every retention statement reads the tables through the timestamp index."""
+
+    TABLES = ("metric_samples", "slot_events", "metric_rollups")
+
+    def test_every_retention_statement_searches_the_timestamp_index(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="retention-plan-") as temporary:
+            path = Path(temporary) / "history.db"
+            store = HistoryStore(str(path))
+            _insert_events(path, _interleaved_window_events(12))
+            store.insert_metric_samples(
+                [_sample(observed_at, 1) for observed_at, _ in _interleaved_window_events(12)]
+            )
+            statements: list[str] = []
+            connect = store._connect_locked
+
+            def tracing_connect() -> sqlite3.Connection:
+                connection = connect()
+                connection.set_trace_callback(statements.append)
+                return connection
+
+            store._connect_locked = tracing_connect  # type: ignore[method-assign]
+            _retain(
+                store,
+                raw_metric_retention_days=1,
+                event_retention_days=1,
+                hourly_rollup_retention_days=1,
+                daily_rollup_retention_days=1,
+                batch_size=5,
+                max_batches=10,
+            )
+            retention = [
+                sql for sql in statements
+                if "_history_utc_instant" in sql and not sql.lstrip().upper().startswith("EXPLAIN")
+            ]
+            kinds = {" ".join(sql.split()[:3]) for sql in retention}
+            self.assertGreaterEqual(len(retention), 9 * 2, kinds)
+            with closing(sqlite3.connect(path)) as connection:
+                HistoryStore._register_retention_functions(connection)
+                for sql in retention:
+                    plan = [row[3] for row in connection.execute(f"EXPLAIN QUERY PLAN {sql}")]
+                    with self.subTest(statement=" ".join(sql.split())[:60]):
+                        for line in plan:
+                            for table in self.TABLES:
+                                self.assertFalse(line.startswith(f"SCAN {table}"), plan)
+                        searches = [line for line in plan if line.startswith("SEARCH")]
+                        self.assertTrue(
+                            any(
+                                "idx_metric_samples_observed_at (observed_at" in line
+                                or "idx_slot_events_observed_at (observed_at" in line
+                                or "idx_metric_rollups_retention (bucket_seconds=? AND bucket_start" in line
+                                for line in searches
+                            ),
+                            plan,
+                        )
+                        if not sql.lstrip().upper().startswith("INSERT"):
+                            # The rollup insert sorts only the selected batch.
+                            self.assertFalse(any("TEMP B-TREE" in line for line in plan), plan)
 
 
 if __name__ == "__main__":
