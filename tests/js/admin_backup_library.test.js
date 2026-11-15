@@ -813,7 +813,7 @@ test("clean up that kept copies after a failed keeper check says so, not plain s
   await library.actions.applyCleanup();
   const text = "Deleted 0 copies. 1 kept copy failed the size and SHA-256 check and was marked unverified. "
     + "2 planned deletions were skipped.";
-  assert.match(elements.dialog.textContent, new RegExp(text.replace(/[.()]/g, "\\$&")));
+  assert.ok(elements.dialog.textContent.includes(text), elements.dialog.textContent);
   assert.deepEqual(banners.at(-1), [text, "error"]);
 });
 
