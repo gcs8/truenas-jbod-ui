@@ -264,10 +264,33 @@ LSI_SAS_PL_ENCLOSURE_MGMT_ERRORS = {
 }
 
 
+MAX_LOGINFO_HEX_DIGITS = 8
+MAX_REJECTED_LOGINFO_LENGTH = 32
+
+
+def _over_width_loginfo(raw: str) -> dict[str, Any]:
+    # A loginfo is a 32-bit value. Masking a wider token to its low 32 bits
+    # would select a known fault from a suffix, so it stays raw evidence.
+    bounded = raw
+    if len(bounded) > MAX_REJECTED_LOGINFO_LENGTH:
+        bounded = f"{bounded[: MAX_REJECTED_LOGINFO_LENGTH - 3]}..."
+    return {
+        "label": "Controller terminated SCSI IO",
+        "family": "controller_terminated_io",
+        "likely_layer": fault_family_likely_layer("controller_terminated_io"),
+        "description": "The HBA reported an IO terminated before normal completion; its loginfo value was not decoded.",
+        "loginfo": bounded,
+        "decode_confidence": "unconfirmed",
+        "decoder_note": "Loginfo value is wider than 32 bits, so it was not decoded against the LSI reference table.",
+    }
+
+
 def decode_lsi_loginfo(loginfo: str) -> dict[str, Any] | None:
     raw = str(loginfo or "").strip().lower().removeprefix("0x")
     if not raw or not re.fullmatch(r"[0-9a-f]+", raw):
         return None
+    if len(raw) > MAX_LOGINFO_HEX_DIGITS:
+        return _over_width_loginfo(raw)
     value = int(raw, 16)
     type_bits = value & 0xF0000000
     origin_bits = value & 0x0F000000

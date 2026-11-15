@@ -93,6 +93,7 @@
     "test_route_contracts": 51,
     "test_sas_cdb_malformed_tokens": 8,
     "test_sas_fabric": 223,
+    "test_sas_loginfo_width": 5,
     "test_scheduled_backup": 27,
     "test_script_json": 13,
     "test_script_platform_guards": 3,

@@ -131,6 +131,7 @@ WINDOWS_PORTABLE_TEST_MODULES = (
     "tests.test_release_status",
     "tests.test_release_wrap_validator",
     "tests.test_sas_cdb_malformed_tokens",
+    "tests.test_sas_loginfo_width",
     "tests.test_scripts_help",
     "tests.test_ssh_connection_keep",
     "tests.test_ssh_failure_contexts",
