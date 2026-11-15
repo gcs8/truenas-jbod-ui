@@ -45,11 +45,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
-- History retention now expires a row only when its absolute time is older
-  than the cutoff. A migrated or imported row stored with a non-UTC offset
-  could be deleted while still newer than the cutoff, or kept after it
-  expired, and rollups could keep an earlier counter value as the latest
-  (#1247).
+- History retention no longer deletes a migrated or imported row stored with
+  a non-UTC offset while it is still newer than the retention cutoff, and
+  rollups keep the truly latest counter value across offsets (#1247).
 - Re-saving a system in System Setup no longer resets settings the form does
   not show, such as the middleware call limit `max_concurrent_calls`, to their
   defaults; the save now changes only the fields the form owns (#1194).

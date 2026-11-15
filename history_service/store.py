@@ -596,6 +596,25 @@ class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
 
+def _history_utc_instant(value: object) -> str | None:
+    """Exact UTC instant of an offset-aware ISO-8601 timestamp, or None.
+
+    Fixed-width text (microseconds, four-digit year), so text order is time
+    order. Retention uses it instead of julianday(), which rounds to the
+    millisecond and would merge distinct samples (#1204).
+    """
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="microseconds")
+    except (ValueError, OverflowError):
+        return None
+
+
 class HistoryStore:
     def __init__(
         self,
@@ -3271,6 +3290,7 @@ class HistoryStore:
         # The same ordered, bounded subquery selects the batch for both rollups and
         # the delete, so the rows aggregated are exactly the rows removed and the
         # batch size never turns into one SQL variable per row.
+        cls._register_retention_functions(connection)
         metric_samples_removed = 0
         if cutoffs["metric"] is not None:
             cls._roll_up_metric_rows(
@@ -3329,28 +3349,51 @@ class HistoryStore:
         }
 
     @staticmethod
-    def _retention_bounds(cutoff: str) -> tuple[str, str]:
-        """Return (index scan bound, cutoff) for an absolute-time retention test.
-
-        Stored timestamps may carry any UTC offset, so their text order is not
-        their time order (#1204). julianday() decides expiry. The text bound
-        only keeps the scan on the timestamp index: SQLite reads offsets up to
-        14:59, so a row older than the cutoff has a wall-clock time less than
-        15 hours after it, and its text starts with a date no later than the
-        date of cutoff + 15 hours. Every such row sorts before the next date.
-        """
-
-        scan_bound = (
-            (datetime.fromisoformat(cutoff) + timedelta(hours=15)).date() + timedelta(days=1)
-        ).isoformat()
-        return scan_bound, cutoff
+    def _register_retention_functions(connection: sqlite3.Connection) -> None:
+        connection.create_function(
+            "_history_utc_instant",
+            1,
+            _history_utc_instant,
+            deterministic=True,
+        )
 
     @staticmethod
-    def _expired_rows_subquery(table_name: str, timestamp_column: str) -> str:
+    def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
+        """Return (cutoff, settled bound, cutoff instant) for a retention predicate.
+
+        Stored timestamps may carry any UTC offset, so their text order is not
+        their time order (#1204). A row is expired when its text sorts before
+        the cutoff AND either its text sorts before the settled bound or its
+        exact UTC instant is before the cutoff's.
+
+        The settled bound is the date one day before the cutoff. A UTC offset
+        is less than 24 hours, so a row whose text starts with an earlier date
+        is older than the cutoff whatever its offset; those rows need no parse,
+        exactly as before. Only rows in the last day or so before the cutoff
+        are parsed, so a batch never reads the rows newer than the cutoff, and
+        a row whose time cannot be read is kept only until it ages past the
+        settled bound. A row stored with a positive offset whose text still
+        sorts after the cutoff is expired on a later pass, never early.
+        """
+
+        settled = (datetime.fromisoformat(cutoff) - timedelta(days=1)).date().isoformat()
+        return cutoff, settled, _history_utc_instant(cutoff)
+
+    @staticmethod
+    def _expired_timestamp_predicate(timestamp_column: str) -> str:
+        # Parameters: _retention_bounds(cutoff). The first comparison keeps the
+        # scan on the timestamp index and bounded by the cutoff.
+        return (
+            f"{timestamp_column} < ? AND ({timestamp_column} < ? "
+            f"OR _history_utc_instant({timestamp_column}) < ?)"
+        )
+
+    @classmethod
+    def _expired_rows_subquery(cls, table_name: str, timestamp_column: str) -> str:
         # Parameters: _retention_bounds(cutoff), then the batch size.
         return (
-            f"SELECT id FROM {table_name} WHERE {timestamp_column} < ? "
-            f"AND julianday({timestamp_column}) < julianday(?) "
+            f"SELECT id FROM {table_name} "
+            f"WHERE {cls._expired_timestamp_predicate(timestamp_column)} "
             f"ORDER BY {timestamp_column}, id LIMIT ?"
         )
 
@@ -3422,7 +3465,7 @@ class HistoryStore:
                         PARTITION BY
                             {bucket_expression}, system_id, enclosure_key, slot,
                             metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY julianday(observed_at) DESC, id DESC
+                        ORDER BY _history_utc_instant(observed_at) DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
                 WHERE id IN ({expired_rows})
@@ -3445,14 +3488,14 @@ class HistoryStore:
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
                 last_value = CASE
-                    WHEN julianday(excluded.last_observed_at)
-                        >= julianday(metric_rollups.last_observed_at)
+                    WHEN _history_utc_instant(excluded.last_observed_at)
+                        >= _history_utc_instant(metric_rollups.last_observed_at)
                     THEN excluded.last_value
                     ELSE metric_rollups.last_value
                 END,
                 last_observed_at = CASE
-                    WHEN julianday(excluded.last_observed_at)
-                        >= julianday(metric_rollups.last_observed_at)
+                    WHEN _history_utc_instant(excluded.last_observed_at)
+                        >= _history_utc_instant(metric_rollups.last_observed_at)
                     THEN excluded.last_observed_at
                     ELSE metric_rollups.last_observed_at
                 END,
@@ -3484,13 +3527,13 @@ class HistoryStore:
             return 0
         return int(
             connection.execute(
-                """
+                f"""
                 DELETE FROM metric_rollups
                 WHERE rowid IN (
                     SELECT rowid
                     FROM metric_rollups
-                    WHERE bucket_seconds = ? AND bucket_start < ?
-                      AND julianday(bucket_start) < julianday(?)
+                    WHERE bucket_seconds = ?
+                      AND {cls._expired_timestamp_predicate('bucket_start')}
                     ORDER BY bucket_start
                     LIMIT ?
                 )
@@ -3510,8 +3553,8 @@ class HistoryStore:
         if cutoff is None:
             return False
         row = connection.execute(
-            f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE {timestamp_column} < ? "
-            f"AND julianday({timestamp_column}) < julianday(?) LIMIT 1)",
+            f"SELECT EXISTS(SELECT 1 FROM {table_name} "
+            f"WHERE {cls._expired_timestamp_predicate(timestamp_column)} LIMIT 1)",
             cls._retention_bounds(cutoff),
         ).fetchone()
         return bool(row[0])
@@ -3526,12 +3569,12 @@ class HistoryStore:
         if cutoff is None:
             return False
         row = connection.execute(
-            """
+            f"""
             SELECT EXISTS(
                 SELECT 1
                 FROM metric_rollups
-                WHERE bucket_seconds = ? AND bucket_start < ?
-                  AND julianday(bucket_start) < julianday(?)
+                WHERE bucket_seconds = ?
+                  AND {cls._expired_timestamp_predicate('bucket_start')}
                 LIMIT 1
             )
             """,
