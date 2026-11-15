@@ -42,6 +42,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay
   world-readable when the host refuses the mode change (#1180).
+- Certificate imports now keep asynchronous file reads and responses bound to
+  the editor and TLS target that started them, so later editor state cannot
+  receive an earlier import's trust result (#1252).
 
 ### Fixed
 
