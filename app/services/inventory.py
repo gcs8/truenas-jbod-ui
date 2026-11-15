@@ -183,7 +183,6 @@ from app.services.ssh_probe import (
     SSHCommandResult,
     SSHProbe,
     SSHSession,
-    redact_ssh_command,
 )
 from app.services.slot_detail_store import SlotDetailCacheEntry, SlotDetailStore
 from app.services.smartctl_status import smartctl_exit_flags
@@ -289,7 +288,7 @@ _CACHED_ENCLOSURE_RUNTIME_EVIDENCE_KEYS = frozenset(
 )
 _ENCLOSURE_SLOT_NUMBER_KEYS = frozenset({"slot", "slot_number", "slotNumber", "index", "number"})
 SCALE_CONFIGURED_SG_SES_FAILURE_REGEX = re.compile(
-    r"^SSH command failed: .*\bsg_ses\b\s+-p\s+(?:aes|ec)\s+/dev/sg\d+\s+\(exit\s+\d+\)$"
+    r"^SSH command failed \((?:SG SES additional element status|SG SES enclosure status); exit \d+\)\.$"
 )
 QUANTASTOR_OPTIONAL_SSH_BACKOFF_WARNING_REGEX = re.compile(
     r"^Quantastor SSH (?:CLI enrichment|SES discovery) failed on (?P<host>[^:]+): "
@@ -1539,6 +1538,24 @@ SSH_FAILURE_CONTEXTS_BY_PREFIX: tuple[tuple[str, dict[str, str]], ...] = (
             "criticality": "enrichment",
         },
     ),
+    # These configured page reads remain required unless a successful SES
+    # rediscovery supersedes their fixed, value-free failure messages below.
+    (
+        "sg_ses aes ",
+        {
+            "context": "storage_fabric_sg_ses_aes",
+            "context_label": "SG SES additional element status",
+            "criticality": "inventory",
+        },
+    ),
+    (
+        "sg_ses ec ",
+        {
+            "context": "storage_fabric_sg_ses_ec",
+            "context_label": "SG SES enclosure status",
+            "criticality": "inventory",
+        },
+    ),
     (
         "sg_ses join ",
         {
@@ -1575,6 +1592,7 @@ DEFAULT_SSH_FAILURE_CONTEXT: dict[str, str] = {
     "context_label": "SSH command",
     "criticality": "inventory",
 }
+SSH_COMMAND_FAILURE_REASON = "ssh_command_failed"
 
 
 def _system_without_display_fields(system: SystemConfig) -> SystemConfig:
@@ -4879,10 +4897,9 @@ class InventoryService:
             and len(unique_stderr) == 1
         )
         if transport_level_failure:
-            detail = next(iter(unique_stderr)).rstrip(".")
             return (
                 [
-                    f"Could not log in over SSH: {detail}. Bay details from SSH are missing for this refresh."
+                    "Could not log in over SSH. Bay details from SSH are missing for this refresh."
                 ],
                 "SSH login failed.",
             )
@@ -4903,7 +4920,6 @@ class InventoryService:
             and unique_exit_codes == {127}
         )
         if storcli_commands_missing:
-            detail = next(iter(unique_stderr)).rstrip(".") if len(unique_stderr) == 1 else None
             vib_output = (normalized_outputs.get("esxcli software vib list") or "").lower()
             broadcom_stack_detected = any(
                 token in vib_output
@@ -4932,8 +4948,6 @@ class InventoryService:
                     f"{warning} ESXi 8 needs Broadcom's ESXi 8 StorCLI package and a host reboot "
                     "after installing it; the app then reads it through `esxcli storcli`."
                 )
-            if detail:
-                warning = f"{warning} Detail: {detail}."
             return ([warning], "StorCLI commands unavailable.")
 
         failure_details = cls._ssh_failure_details(command_results)
@@ -4955,19 +4969,20 @@ class InventoryService:
             return (
                 [
                     f"Some SSH commands failed ({context_text}). The bay map still works; "
-                    "see Debug for the command output."
+                    "see Debug for failure context."
                 ],
                 # The SSH chip's tooltip names the failed optional read (#1066).
                 f"Some optional SSH reads failed ({context_text}). The bay map is complete.",
             )
 
-        return (
-            [
-                f"SSH command failed: {redact_ssh_command(failure.command)} (exit {failure.exit_code})"
-                for failure in failures
-            ],
-            "Some SSH commands failed.",
-        )
+        warnings: list[str] = []
+        for failure in failures:
+            canonical = canonicalize_ssh_command(failure.command)
+            context = cls._ssh_command_failure_context(canonical)
+            context_label = context.get("context_label", "SSH command")
+            exit_status = failure.exit_code if failure.exit_code is not None else "unknown"
+            warnings.append(f"SSH command failed ({context_label}; exit {exit_status}).")
+        return (warnings, "Some SSH commands failed.")
 
     @classmethod
     def _ssh_failure_details(cls, command_results: list[SSHCommandResult]) -> list[dict[str, Any]]:
@@ -4979,26 +4994,16 @@ class InventoryService:
             context = cls._ssh_command_failure_context(canonical)
             details.append(
                 {
-                    "command": redact_ssh_command(result.command),
-                    "canonical_command": redact_ssh_command(canonical),
+                    "reason": SSH_COMMAND_FAILURE_REASON,
                     "exit_code": result.exit_code,
-                    "stderr": cls._trim_command_failure_text(result.stderr),
-                    "stdout": cls._trim_command_failure_text(result.stdout),
                     **context,
                 }
             )
         return details
 
     @staticmethod
-    def _trim_command_failure_text(value: str | None, limit: int = 500) -> str:
-        cleaned = normalize_text(value) or ""
-        if len(cleaned) <= limit:
-            return cleaned
-        return f"{cleaned[:limit].rstrip()}..."
-
-    @staticmethod
     def _ssh_command_failure_context(canonical_command: str) -> dict[str, str]:
-        """What a failed command was being used for, for the debug output.
+        """Describe a failed command with fixed public failure context.
 
         `criticality` says what breaks without it: `topology` and `inventory`
         failures cost structure, `enrichment` failures only cost detail.

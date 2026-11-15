@@ -1376,7 +1376,8 @@ class InventoryOverlayStatusTests(unittest.IsolatedAsyncioTestCase):
                 service._fetch_quantastor_ses_overlay = self.overlay("success", "Quantastor SES")
                 bundle = await service._collect_inventory_source_bundle()
                 self.assertFalse(bundle.sources["ssh"].ok)
-                self.assertTrue(any("synthetic-failed-base" in warning for warning in bundle.warnings))
+                self.assertIn("SSH command failed (SSH command; exit 1).", bundle.warnings)
+                self.assertEqual(bundle.ssh_failure_details[0]["reason"], "ssh_command_failed")
                 self.assertTrue(bundle.sources["api"].ok)
                 self.assertTrue(bundle.sources["bmc"].ok)
 
@@ -1570,7 +1571,11 @@ class InventorySSHRequiredCommandTests(unittest.IsolatedAsyncioTestCase):
         ssh = bundle.sources["ssh"]
         self.assertFalse(ssh.ok)
         self.assertIs(ssh.required_ok, True)
-        details = [detail for detail in bundle.ssh_failure_details if detail.get("canonical_command") == "gpio debug"]
+        details = [
+            detail
+            for detail in bundle.ssh_failure_details
+            if detail.get("context") == "unifi_led_gpio_state"
+        ]
         self.assertEqual([detail.get("criticality") for detail in details], ["enrichment"])
 
     async def test_failed_bay_map_command_is_a_required_failure(self):
@@ -2725,8 +2730,7 @@ class InventoryHelpersTests(unittest.TestCase):
         self.assertEqual(
             warnings,
             [
-                "Could not log in over SSH: Authentication failed. "
-                "Bay details from SSH are missing for this refresh."
+                "Could not log in over SSH. Bay details from SSH are missing for this refresh."
             ],
         )
         self.assertEqual(status_message, "SSH login failed.")
@@ -2762,7 +2766,7 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings,
             [
                 "StorCLI is not available on this ESXi host, so drive details behind the RAID controller "
-                "are missing for this refresh. Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+                "are missing for this refresh."
             ],
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
@@ -2804,8 +2808,7 @@ class InventoryHelpersTests(unittest.TestCase):
             [
                 "StorCLI is not installed on this ESXi host, so drive details behind the RAID "
                 "controller are missing. The Broadcom driver packages alone (lsi-mr3, "
-                "lsuv2-lsiv2-drivers-plugin) do not provide them; install the Broadcom StorCLI VIB. "
-                "Detail: sh: /opt/lsi/storcli64/storcli64: not found."
+                "lsuv2-lsiv2-drivers-plugin) do not provide them; install the Broadcom StorCLI VIB."
             ],
         )
         self.assertEqual(status_message, "StorCLI commands unavailable.")
@@ -2831,11 +2834,11 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings,
             [
                 "Some SSH commands failed (IOC facts). The bay map still works; "
-                "see Debug for the command output."
+                "see Debug for failure context."
             ],
         )
         self.assertEqual(status_message, "Some optional SSH reads failed (IOC facts). The bay map is complete.")
-        self.assertEqual(details[0]["canonical_command"], "mprutil -u 10 show iocfacts")
+        self.assertEqual(details[0]["reason"], "ssh_command_failed")
         self.assertEqual(details[0]["controller"], "mpr10")
         self.assertEqual(details[0]["context"], "sas_fabric_mprutil_iocfacts")
 
@@ -2883,20 +2886,20 @@ class InventoryHelpersTests(unittest.TestCase):
             warnings,
             [
                 "Some SSH commands failed (Linux NVMe subsystem detail). The bay map still works; "
-                "see Debug for the command output."
+                "see Debug for failure context."
             ],
         )
         self.assertEqual(
             status_message,
             "Some optional SSH reads failed (Linux NVMe subsystem detail). The bay map is complete.",
         )
-        self.assertEqual(details[0]["canonical_command"], "nvme list-subsys -o json")
+        self.assertEqual(details[0]["reason"], "ssh_command_failed")
         self.assertEqual(details[0]["context"], "storage_fabric_linux_nvme_subsystems")
         self.assertEqual(details[0]["criticality"], "enrichment")
         self.assertEqual(details[0]["exit_code"], 127)
-        self.assertIn("command not found", details[0]["stderr"])
+        self.assertNotIn("stderr", details[0])
 
-    def test_ssh_failure_warnings_and_details_redact_inline_command_secrets(self) -> None:
+    def test_ssh_failure_warnings_and_details_omit_command_and_remote_text(self) -> None:
         command_results = [
             SSHCommandResult(
                 command="/usr/bin/qs disk-list --json '--server=localhost,jbodmap,super-secret'",
@@ -2909,18 +2912,24 @@ class InventoryHelpersTests(unittest.TestCase):
         warnings, status_message = InventoryService._summarize_ssh_failures(command_results, {})
         details = InventoryService._ssh_failure_details(command_results)
 
-        warning_text = "\n".join(warnings)
         self.assertEqual(status_message, "Some SSH commands failed.")
-        self.assertIn("--server=localhost,jbodmap,***", warning_text)
-        self.assertNotIn("super-secret", warning_text)
-        self.assertIn("--server=localhost,jbodmap,***", details[0]["command"])
-        self.assertIn("--server=localhost,jbodmap,***", details[0]["canonical_command"])
-        self.assertNotIn("super-secret", details[0]["command"])
-        self.assertNotIn("super-secret", details[0]["canonical_command"])
+        self.assertEqual(warnings, ["SSH command failed (SSH command; exit 27)."])
+        self.assertEqual(
+            details,
+            [
+                {
+                    "reason": "ssh_command_failed",
+                    "exit_code": 27,
+                    "context": "ssh_command",
+                    "context_label": "SSH command",
+                    "criticality": "inventory",
+                }
+            ],
+        )
 
     def test_suppress_scale_configured_sg_ses_failures_keeps_other_ssh_warnings(self) -> None:
-        sg_ses_failure = "SSH command failed: sudo -n /usr/bin/sg_ses -p aes /dev/sg27 (exit 5)"
-        smart_failure = "SSH command failed: smartctl -x -j /dev/sda (exit 2)"
+        sg_ses_failure = "SSH command failed (SG SES additional element status; exit 5)."
+        smart_failure = "SSH command failed (SMART detail; exit 2)."
 
         warnings, failures = InventoryService._suppress_scale_configured_sg_ses_failures(
             [sg_ses_failure, smart_failure],
@@ -18343,11 +18352,13 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
                 ssh=SSHConfig(enabled=True, host="192.0.2.32", user="root", commands=[vib, binary]),
             )
             probe = AsyncMock()
+            executed_commands: list[str] = []
 
             async def run_planned_commands(planner, *, initial_commands=None):
                 results: list[SSHCommandResult] = []
                 batch = list(initial_commands or [])
                 while batch:
+                    executed_commands.extend(batch)
                     results.extend(answers[command] for command in batch)
                     batch = list(planner(list(results)))
                 return results
@@ -18358,7 +18369,19 @@ class InventoryServiceMutationRefreshTests(unittest.IsolatedAsyncioTestCase):
             bundle = await service._get_inventory_source_bundle(force_refresh=True)
 
             self.assertEqual(set(bundle.ssh_outputs), {vib})
-            self.assertEqual([detail["command"] for detail in bundle.ssh_failure_details], [plugin])
+            self.assertIn(plugin, executed_commands)
+            self.assertEqual(
+                bundle.ssh_failure_details,
+                [
+                    {
+                        "reason": "ssh_command_failed",
+                        "exit_code": 1,
+                        "context": "ssh_command",
+                        "context_label": "SSH command",
+                        "criticality": "inventory",
+                    }
+                ],
+            )
             self.assertTrue(bundle.warnings)
             self.assertFalse(service._esxi_storcli_swapped)
 

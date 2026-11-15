@@ -141,11 +141,17 @@ class _ChannelGate:
 SENSITIVE_OPTION_NAMES = {
     "--api-key",
     "--apikey",
+    "--cookie",
+    "--oauth2-bearer",
     "--pass",
     "--password",
+    "--proxy-user",
     "--secret",
     "--server",
     "--token",
+    "--user",
+    "-b",
+    "-u",
 }
 SENSITIVE_KEY_NAMES = {
     "api_key",
@@ -156,10 +162,31 @@ SENSITIVE_KEY_NAMES = {
     "secret",
     "token",
 }
+AUTH_SCHEMES = {"basic", "bearer", "digest", "negotiate", "token"}
 INLINE_SECRET_RE = re.compile(
     r"(?i)\b(?P<key>api[_-]?key|pass(?:wd|word)?|secret|token)=(?P<value>[^\s'\";]+)"
 )
 SERVER_SPEC_RE = re.compile(r"(?i)(?P<prefix>--server=)(?P<value>[^\s'\"]+)")
+CREDENTIAL_HEADER_RE = re.compile(
+    r"(?is)(?P<prefix>\b(?:authorization|proxy-authorization|x-api-key|x-auth-token)\s*:\s*)"
+    r"(?:(?P<scheme>basic|bearer|digest|negotiate|token)\s+)?(?P<value>.+)$"
+)
+COOKIE_HEADER_RE = re.compile(
+    r"(?is)(?P<prefix>\b(?:cookie|set-cookie)\s*:\s*)(?P<value>.+)$"
+)
+HEADER_NAME_ONLY_RE = re.compile(
+    r"(?i)(?:^|=)(?P<name>authorization|proxy-authorization|x-api-key|x-auth-token|cookie|set-cookie):$"
+)
+URL_USERINFO_RE = re.compile(
+    r"(?i)(?P<prefix>\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)(?P<value>[^@\s/]+)(?=@)"
+)
+UNPARSED_SENSITIVE_OPTION_RE = re.compile(
+    r"(?i)(?P<prefix>(?:--api-key|--apikey|--cookie|--oauth2-bearer|--pass|--password|"
+    r"--proxy-user|--secret|--token|--user|-b|-u)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
+)
+BARE_AUTH_VALUE_RE = re.compile(
+    r"(?i)(?P<prefix>\b(?:basic|bearer|digest|negotiate|token)\s+)(?P<value>[^\s'\";]+)"
+)
 _KNOWN_HOSTS_LOCKS: dict[str, threading.Lock] = {}
 _KNOWN_HOSTS_LOCKS_GUARD = threading.Lock()
 
@@ -172,6 +199,18 @@ def _known_hosts_lock(path_value: str) -> threading.Lock:
             lock = threading.Lock()
             _KNOWN_HOSTS_LOCKS[normalized_path] = lock
         return lock
+
+
+def _redact_credential_header(match: re.Match[str]) -> str:
+    scheme = match.group("scheme")
+    scheme_prefix = f"{scheme} " if scheme else ""
+    return f"{match.group('prefix')}{scheme_prefix}***"
+
+
+def _redact_embedded_credentials(value: str) -> str:
+    value = URL_USERINFO_RE.sub(lambda match: f"{match.group('prefix')}***", value)
+    value = COOKIE_HEADER_RE.sub(lambda match: f"{match.group('prefix')}***", value)
+    return CREDENTIAL_HEADER_RE.sub(_redact_credential_header, value)
 
 
 def redact_ssh_command(command: str) -> str:
@@ -188,10 +227,26 @@ def redact_ssh_command(command: str) -> str:
 
     redacted: list[str] = []
     redact_next_option: str | None = None
-    for token in tokens:
+    redact_next_header: str | None = None
+    redact_next_auth_value = False
+    for raw_token in tokens:
+        token = _redact_embedded_credentials(raw_token)
+        lowered_token = token.lower()
         if redact_next_option:
             redacted.append(_redact_server_spec(token) if redact_next_option == "--server" else "***")
             redact_next_option = None
+            continue
+        if redact_next_auth_value:
+            redacted.append("***")
+            redact_next_auth_value = False
+            continue
+        if redact_next_header:
+            if redact_next_header == "auth" and lowered_token in AUTH_SCHEMES:
+                redacted.append(token)
+                redact_next_auth_value = True
+            else:
+                redacted.append("***")
+            redact_next_header = None
             continue
 
         option_name, separator, option_value = token.partition("=")
@@ -211,6 +266,16 @@ def redact_ssh_command(command: str) -> str:
             redact_next_option = lowered_name
             continue
 
+        header_name = HEADER_NAME_ONLY_RE.search(token)
+        if header_name:
+            redacted.append(token)
+            redact_next_header = "cookie" if "cookie" in header_name.group("name").lower() else "auth"
+            continue
+        if lowered_token in AUTH_SCHEMES:
+            redacted.append(token)
+            redact_next_auth_value = True
+            continue
+
         key, key_separator, value = token.partition("=")
         if key_separator and key.lower().replace("-", "_") in SENSITIVE_KEY_NAMES:
             redacted.append(f"{key}=***")
@@ -228,11 +293,14 @@ def _redact_server_spec(value: str) -> str:
 
 
 def _redact_unparsed_command(command: str) -> str:
+    redacted = _redact_embedded_credentials(command)
     redacted = SERVER_SPEC_RE.sub(
         lambda match: f"{match.group('prefix')}{_redact_server_spec(match.group('value'))}",
-        command,
+        redacted,
     )
-    return INLINE_SECRET_RE.sub(lambda match: f"{match.group('key')}=***", redacted)
+    redacted = UNPARSED_SENSITIVE_OPTION_RE.sub(lambda match: f"{match.group('prefix')}***", redacted)
+    redacted = INLINE_SECRET_RE.sub(lambda match: f"{match.group('key')}=***", redacted)
+    return BARE_AUTH_VALUE_RE.sub(lambda match: f"{match.group('prefix')}***", redacted)
 
 
 class AutoPinHostKeyPolicy(paramiko.MissingHostKeyPolicy):
