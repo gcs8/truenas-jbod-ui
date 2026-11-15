@@ -465,23 +465,23 @@ SAS_PHY_LOG_PARAMETERS = [
 ]
 
 CDB_BYTE_TOKEN = re.compile(r"[0-9a-fA-F]{2}")
-CDB_HEX_TEXT = re.compile(r"[0-9a-fA-F]+")
-# A word that may legitimately end the byte run, such as the "length" that
-# precedes trailing kernel fields ("length 16 SMID 7 ...").
-CDB_TRAILING_WORD = re.compile(r"\(?[A-Za-z][A-Za-z_-]+[:,.)]?")
+CDB_DECIMAL_TOKEN = re.compile(r"[0-9]+")
+# The only text the kernel prints after the CDB bytes is its transfer-length
+# trailer, "length <decimal>" (followed by "SMID <n>" and free text).
+CDB_TRAILER_WORD = "length"
 MAX_CDB_RAW_EVIDENCE_LENGTH = 128
 
 
 def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
     """Return the CDB bytes and, when the byte run is malformed, its raw text.
 
-    A CDB is a run of two-digit hexadecimal byte tokens, and kernel text may
-    follow it (for example ``length 16 SMID 7``). The run ends cleanly only at
-    a word of three or more letters that is not itself hex text and is not
-    followed directly by two more byte tokens (a resumed byte run). Any other
-    token that ends the run (wrong-width hex, a short or mixed token) makes the
-    CDB malformed. A malformed run is never compacted: the bytes before the
-    bad token keep their positions and nothing after it is converted.
+    A CDB is a run of two-digit hexadecimal byte tokens. The run ends cleanly
+    only at the end of the text or at the kernel trailer ``length <decimal>``
+    (for example ``length 16 SMID 7``). Any other token that ends the run (a
+    short, wrong-width or non-hex token, or any other word) makes the CDB
+    malformed, as does an empty run. A malformed run is never compacted: the
+    bytes before the bad token keep their positions and nothing after it is
+    converted.
     """
     tokens = text.split()
     cdb_bytes: list[int] = []
@@ -489,13 +489,8 @@ def _split_cdb_tokens(text: str) -> tuple[list[int], str | None]:
         if CDB_BYTE_TOKEN.fullmatch(token):
             cdb_bytes.append(int(token, 16))
             continue
-        resumed = tokens[index + 1 : index + 3]
-        clean_end = (
-            CDB_TRAILING_WORD.fullmatch(token) is not None
-            and CDB_HEX_TEXT.fullmatch(token) is None
-            and not (len(resumed) == 2 and all(CDB_BYTE_TOKEN.fullmatch(item) for item in resumed))
-        )
-        if clean_end:
+        trailer_value = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if cdb_bytes and token == CDB_TRAILER_WORD and CDB_DECIMAL_TOKEN.fullmatch(trailer_value):
             break
         raw = " ".join(tokens)
         if len(raw) > MAX_CDB_RAW_EVIDENCE_LENGTH:

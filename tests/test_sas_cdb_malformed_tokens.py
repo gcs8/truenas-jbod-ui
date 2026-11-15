@@ -120,8 +120,11 @@ class MalformedCdbTokenTests(unittest.TestCase):
         row = _pipeline_row(f"READ(10). CDB: {raw}")
 
         self.assertIs(row.get("cdb_malformed"), True)
-        self.assertLessEqual(len(row.get("cdb_raw", "")), 384)
-        self.assertLessEqual(len(row["decoded"].get("cdb_raw", "")), 384)
+        for source in (row, row["decoded"]):
+            evidence = source.get("cdb_raw", "")
+            self.assertTrue(evidence.startswith("28 000 00"))
+            self.assertLessEqual(len(evidence), 128)
+            self.assertTrue(evidence.endswith("..."))
         self.assertNotIn("cdb_hex", row)
 
     def test_truncated_read10_keeps_bytes_and_withholds_fields(self) -> None:
@@ -132,6 +135,100 @@ class MalformedCdbTokenTests(unittest.TestCase):
         self.assertNotIn("lba", row)
         self.assertNotIn("transfer_blocks", row)
         self.assertNotIn("cdb_malformed", row)
+
+
+class CdbTrailerGrammarTests(unittest.TestCase):
+    """The byte run ends cleanly only at the end of the text or at the kernel's
+    ``length <decimal>`` trailer. Every other token ends it as malformed."""
+
+    def assert_refused(self, row: dict, raw_cdb: str, fields: tuple[str, ...] = NUMERIC_FIELDS) -> None:
+        decoded = row["decoded"]
+        for source in (row, decoded):
+            self.assertIs(source.get("cdb_malformed"), True)
+            self.assertEqual(source.get("cdb_raw"), raw_cdb)
+            self.assertNotIn("cdb_hex", source)
+            self.assertNotIn("byte_count", source)
+            self.assertNotEqual(source.get("decode_confidence"), "standard")
+            self.assertIn("malformed", source.get("decoder_note", ""))
+            for field in fields:
+                self.assertNotIn(field, source)
+
+    def test_valid_controls_still_decode(self) -> None:
+        for message, cdb_hex in (
+            ("INQUIRY. CDB: 12 00 00 00 24 00", "12 00 00 00 24 00"),
+            ("INQUIRY. CDB: 12 00 00 00 24 00 ", "12 00 00 00 24 00"),
+            ("LOG SENSE. CDB: 4d 00 58 00 00 00 00 00 40 00", "4d 00 58 00 00 00 00 00 40 00"),
+            (f"{VALID_READ10} length 16 SMID 77", VALID_READ10_HEX),
+            (
+                f"{VALID_READ10} length 4096 SMID 1234 Command timeout on target 1(0x000a) 60000 set",
+                VALID_READ10_HEX,
+            ),
+        ):
+            with self.subTest(message=message):
+                row = _pipeline_row(message)
+                self.assertEqual(row["cdb_hex"], cdb_hex)
+                self.assertEqual(row["decode_confidence"], "standard")
+                self.assertNotIn("cdb_malformed", row)
+
+    def test_short_invalid_last_token_is_malformed(self) -> None:
+        raw = "12 00 00 00 24 gg"
+        row = _pipeline_row(f"INQUIRY. CDB: {raw}")
+
+        self.assert_refused(row, raw)
+        self.assertEqual(row["decoded"]["opcode"], "0x12")
+        self.assertEqual(row["decoded"]["decode_confidence"], "standard-partial")
+
+    def test_short_invalid_penultimate_token_is_malformed_for_log_sense(self) -> None:
+        raw = "4d 00 58 00 00 00 00 00 gg 00"
+        row = _pipeline_row(f"LOG SENSE. CDB: {raw}")
+
+        self.assert_refused(row, raw, NUMERIC_FIELDS + ("log_page_control", "log_page_control_label"))
+        self.assertEqual(row["decoded"]["opcode"], "0x4d")
+
+    def test_consecutive_invalid_tokens_are_malformed(self) -> None:
+        for raw in (
+            "28 00 00 00 00 00 00 00 01 zz yy",
+            "28 gg hh 00 00 00 00 00 01 00",
+            "28 00 00 00 00 00 00 00 01 00 zzz 00",
+        ):
+            with self.subTest(raw=raw):
+                self.assert_refused(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
+
+    def test_word_that_is_not_the_kernel_trailer_is_malformed(self) -> None:
+        for raw in (
+            "28 00 00 00 00 00 00 00 01 00 xyz",
+            "28 00 00 00 00 00 00 00 01 00 length",
+            "28 00 00 00 00 00 00 00 01 00 length abc",
+            "28 00 00 00 00 00 00 00 01 00 (bogus)",
+        ):
+            with self.subTest(raw=raw):
+                self.assert_refused(_pipeline_row(f"READ(10). CDB: {raw}"), raw)
+
+    def test_malformed_first_token_keeps_the_kernel_operation(self) -> None:
+        raw = "gg 00 00 00 24 00"
+        row = _pipeline_row(f"INQUIRY. CDB: {raw}")
+
+        self.assert_refused(row, raw)
+        self.assertNotIn("opcode", row["decoded"])
+        self.assertEqual(row["decoded"]["operation"], "INQUIRY")
+        self.assertEqual(row["decoded"]["decode_confidence"], "unconfirmed")
+
+    def test_empty_byte_run_before_the_trailer_is_malformed(self) -> None:
+        raw = "length 512 SMID 7"
+        row = _pipeline_row(f"READ(10). CDB: {raw}")
+
+        self.assert_refused(row, raw)
+        self.assertEqual(row["decoded"]["operation"], "READ(10)")
+
+    def test_service_action_before_a_malformed_token_is_kept(self) -> None:
+        raw = "9e 10 00 00 00 00 00 00 00 00 00 00 00 20 gg 00"
+        row = _pipeline_row(f"SERVICE ACTION IN(16). CDB: {raw}")
+
+        self.assert_refused(row, raw)
+        decoded = row["decoded"]
+        self.assertEqual(decoded["opcode"], "0x9e")
+        self.assertEqual(decoded["service_action"], "0x10")
+        self.assertEqual(decoded["decode_confidence"], "standard-partial")
 
 
 if __name__ == "__main__":
