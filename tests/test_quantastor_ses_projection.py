@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from app.config import Settings, SystemConfig, TrueNASConfig
+from app.models.domain import ManualMapping
 from app.services.inventory import InventoryService
 from app.services.mapping_store import MappingStore
 from app.services.parsers import (
@@ -144,6 +145,59 @@ class QuantastorSesProjectionTests(unittest.TestCase):
         self.assertNotEqual(slot.mapping_source, "ses-empty")
         self.assertEqual(slot.serial, "SANITIZED-A")
         self.assertEqual(slot.state.value, "healthy")
+
+    def bay_zero_without_api_disk(self, service: InventoryService, overlay: ParsedSSHData):
+        raw = _raw()
+        raw.disks = []
+        slots, *_rest = service._correlate_quantastor(raw, [], "node-a", overlay)
+        return slots[0]
+
+    def test_unknown_ses_presence_without_a_disk_stays_unknown_in_the_final_status(self) -> None:
+        # The final QuantaStor slot status must not turn undecided SES
+        # occupancy into "Empty" because no disk matched the bay.
+        for status in (None, "Critical", "Unknown"):
+            with self.subTest(status=status):
+                bay = _bay("unknown-presence")
+                bay.status = status
+                enclosure = SESMapEnclosure(enclosure_id=SHELF_ID, ses_device="/dev/sg2", slots={0: bay})
+                candidates, _meta = build_slot_candidates_from_ses_enclosures([enclosure], 2, None)
+                overlay = ParsedSSHData(ses_enclosures=[enclosure], ses_slot_candidates=candidates)
+                self.assertIsNone(candidates[0].get("present"))
+                self.assertEqual(candidates[0].get("status"), status)
+                slot = self.bay_zero_without_api_disk(self.service(), overlay)
+                self.assertIsNone(slot.raw_status.get("present"))
+                self.assertNotEqual(slot.raw_status.get("status"), "Empty")
+                self.assertNotEqual(slot.mapping_source, "ses-empty")
+                self.assertEqual(slot.state.value, "unknown")
+                self.assertFalse(slot.raw_status.get("stale_manual_mapping"))
+
+    def test_unknown_ses_presence_with_an_unresolved_mapping_is_unmapped(self) -> None:
+        service = self.service()
+        service.mapping_store.get_mapping.return_value = ManualMapping(  # type: ignore[attr-defined]
+            slot=0, serial="SANITIZED-MAPPED"
+        )
+        overlay, _candidate = _overlay("unknown-presence")
+        slot = self.bay_zero_without_api_disk(service, overlay)
+        self.assertIsNone(slot.raw_status.get("present"))
+        self.assertNotEqual(slot.mapping_source, "ses-empty")
+        self.assertEqual(slot.state.value, "unmapped")
+        self.assertFalse(slot.raw_status.get("stale_manual_mapping"))
+
+    def test_explicit_empty_without_a_disk_stays_empty(self) -> None:
+        # Control: sourced SES absence still renders the bay empty.
+        overlay, _candidate = _overlay("explicit-empty")
+        slot = self.bay_zero_without_api_disk(self.service(), overlay)
+        self.assertIs(slot.raw_status.get("present"), False)
+        self.assertEqual(slot.mapping_source, "ses-empty")
+        self.assertEqual(slot.state.value, "empty")
+
+    def test_api_only_bay_without_a_disk_stays_empty(self) -> None:
+        # Control: with no SES candidate the appliance disk list is the only
+        # occupancy source, and a bay it lists no disk for stays empty.
+        slot = self.bay_zero_without_api_disk(self.service(), ParsedSSHData())
+        self.assertIs(slot.raw_status.get("present"), False)
+        self.assertEqual(slot.raw_status.get("status"), "Empty")
+        self.assertEqual(slot.state.value, "empty")
 
 
 if __name__ == "__main__":

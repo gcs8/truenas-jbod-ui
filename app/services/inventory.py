@@ -10439,9 +10439,18 @@ class InventoryService:
             disk = resolution.disk
             slot_hints["mapping_resolution_source"] = resolution.source
             slot_hints["stale_manual_mapping"] = resolution.stale_manual_mapping
+            # A failed disk match is not an empty report when SES reached this
+            # bay and left occupancy undecided: the final status keeps it
+            # unknown. Without SES, the appliance disk list decides (#1218).
+            occupancy_undecided = (
+                disk is None
+                and bool(ses_candidate)
+                and not isinstance(ses_candidate.get("present"), bool)
+                and not self._slot_has_live_empty_evidence(slot_hints)
+            )
             raw_slot_status = {
-                "present": disk is not None,
-                "status": disk.health if disk else "Empty",
+                "present": None if occupancy_undecided else disk is not None,
+                "status": disk.health if disk else (None if occupancy_undecided else "Empty"),
                 "device_hint": disk.path_device_name if disk else None,
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,

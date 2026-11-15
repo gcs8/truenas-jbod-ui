@@ -86,7 +86,7 @@
     "test_public_docs_contract": 33,
     "test_public_screenshots": 10,
     "test_quantastor_api": 23,
-    "test_quantastor_ses_projection": 5,
+    "test_quantastor_ses_projection": 9,
     "test_read_ui_auth": 16,
     "test_release_changelog_coverage": 21,
     "test_release_status": 37,
