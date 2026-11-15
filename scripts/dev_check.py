@@ -198,6 +198,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_read_ui_auth",
             "tests.test_route_contracts",
             "tests.test_sas_fabric",
+            "tests.test_restore_history_schema_gate",
             "tests.test_scheduled_backup",
             "tests.test_script_json",
             "tests.test_segment_census",
@@ -213,6 +214,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_snapshot_export",
             "tests.test_storage_view_smart_batch",
             "tests.test_system_backup",
+            "tests.test_system_setup_field_ownership",
         ),
     ),
     WindowsExclusion(
