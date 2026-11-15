@@ -285,8 +285,8 @@ class SesPreCountWorkTests(BoundedWorkAssertions):
             "descriptor run": lambda size: "Slot01" + " " * size + "X",
             "bracket run": lambda size: "[0,1]" + " " * size + "X",
             "label run": lambda size: "Slot01 [0,1] Element type:" + " " * size,
-            "after logical id": lambda size: (
-                "Primary enclosure logical identifier (hex): 500000000000000a\n" + "Slot01" + " " * size + "X"
+            "after page title": lambda size: (
+                "Enclosure Status diagnostic page:\n" + "Slot01" + " " * size + "X"
             ),
         }
         for shape_name, build in shapes.items():
