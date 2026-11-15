@@ -45,6 +45,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Fixed
 
+- History retention now expires a row only when its absolute time is older
+  than the cutoff. A migrated or imported row stored with a non-UTC offset
+  could be deleted while still newer than the cutoff, or kept after it
+  expired, and rollups could keep an earlier counter value as the latest
+  (#1247).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
