@@ -720,6 +720,98 @@ test("a size-only copy that passed an explicit Verify shows Yes", async () => {
   assert.doesNotMatch(elements.dialog.textContent, /Size only at upload/);
 });
 
+// #1202: the list's Verified column and the details' Verified fact must make
+// the same claim. The list row carries the upload check and the outcome of the
+// last explicit Verify (without its text); the details carry the full result.
+const SIZE_ONLY_TEXT = "Size only at upload; Verify re-reads and hashes it";
+
+function verifiedColumn(elements, id) {
+  const headers = elements.artifacts.querySelectorAll("th").map((cell) => cell.textContent);
+  const row = rowFor(elements, id);
+  const columns = row.children.filter((cell) => cell.tagName === "TD");
+  return columns[headers.indexOf("Verified")].textContent;
+}
+
+function verifiedFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Verified");
+  assert.notEqual(index, -1, "details dialog has a Verified fact");
+  return facts[index + 1].textContent;
+}
+
+async function listAndDetails(listFields, detailFields = listFields) {
+  const api = fakeApi();
+  Object.assign(api.data.artifacts[4], listFields);
+  const detail = { ...api.data.artifacts[4], ...detailFields };
+  const { elements, library } = mount({
+    api: { ...api, fetchJson: (url, options) => (url === "/api/admin/backups/full-odd" ? Promise.resolve(detail) : api.fetchJson(url, options)) },
+  });
+  await library.load();
+  const column = verifiedColumn(elements, "full-odd");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  return { column, fact: verifiedFact(elements) };
+}
+
+test("a size-only copy reads as size only in the list and the details until Verify (#1202)", async () => {
+  const before = await listAndDetails(
+    { upload_check: "size", last_verify: null },
+  );
+  assert.deepEqual(before, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // A failed or unreachable explicit Verify does not upgrade the claim either.
+  const failed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false } },
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false, detail: "target unreachable" } },
+  );
+  assert.deepEqual(failed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // Only a boolean true counts as a passed Verify, in both views.
+  const malformed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: "true" } },
+  );
+  assert.deepEqual(malformed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+});
+
+test("a successful explicit Verify turns the list and the details to Yes together (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/full-odd/verify": () => {
+      api.data.artifacts[4].last_verify = { at: "2026-09-21T10:05:00Z", ok: true };
+      return { ok: true, artifact: api.data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." };
+    },
+    "GET /api/admin/backups/full-odd": () => ({ ...api.data.artifacts[4], last_verify: { ...api.data.artifacts[4].last_verify, detail: "" } }),
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  assert.equal(verifiedColumn(elements, "full-odd"), SIZE_ONLY_TEXT);
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup verified.", "success"]);
+  assert.equal(verifiedColumn(elements, "full-odd"), "Yes");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(verifiedFact(elements), "Yes");
+});
+
+const NOT_RECORDED_TEXT = "Upload check not recorded; Verify re-reads and hashes it";
+
+test("rows without upload-check provenance say so, the same way in both views (#1202)", async () => {
+  // A remote copy catalogued before #722 has no recorded upload check: unknown,
+  // not Yes, until an explicit Verify reads it back.
+  assert.deepEqual(await listAndDetails({}), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(await listAndDetails({ upload_check: null, last_verify: null }), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(
+    await listAndDetails({ upload_check: null, last_verify: { at: "2026-09-21T10:05:00Z", ok: true } }),
+    { column: "Yes", fact: "Yes" },
+  );
+  // A remote copy read back at upload, and a local copy, are plainly verified.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+  assert.deepEqual(await listAndDetails({ location: "local", upload_check: null, last_verify: null }), { column: "Yes", fact: "Yes" });
+  // A copy that is not verified stays "Not yet", whatever the upload check was.
+  assert.deepEqual(await listAndDetails({ verified: false }), { column: "Not yet", fact: "Not yet" });
+  assert.deepEqual(await listAndDetails({ verified: false, upload_check: "size", last_verify: null }), { column: "Not yet", fact: "Not yet" });
+});
+
 test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
   const { elements, library, api, banners, refreshes } = mount();
   await library.load();

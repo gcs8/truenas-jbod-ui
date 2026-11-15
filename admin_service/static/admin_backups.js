@@ -273,11 +273,18 @@
 
   // #722: an FTP copy was checked by size only at upload. Until an explicit
   // Verify downloads it and matches size and SHA-256, say exactly that.
+  // #1202: the list's Verified column uses this too, so both views agree. A
+  // copy on a target whose upload check was never recorded (catalogued before
+  // #722) says so rather than claiming a readback nobody saw.
   function verifiedDetailText(item) {
     if (!item?.verified) return "Not yet";
-    const explicitlyVerified = Boolean(item.last_verify && typeof item.last_verify === "object" && item.last_verify.ok);
-    if (item.upload_check === "size" && !explicitlyVerified) {
+    const explicitlyVerified = Boolean(item.last_verify && typeof item.last_verify === "object" && item.last_verify.ok === true);
+    if (explicitlyVerified) return "Yes";
+    if (item.upload_check === "size") {
       return "Size only at upload; Verify re-reads and hashes it";
+    }
+    if (item.location !== "local" && item.upload_check !== "readback") {
+      return "Upload check not recorded; Verify re-reads and hashes it";
     }
     return "Yes";
   }
@@ -689,7 +696,7 @@
         el("td", { text: fmtTime(artifact.created_at) }),
         el("td", { text: fmtBytes(artifact.size) }),
         el("td", { text: locationLabel(artifact.location, targets()) }),
-        el("td", { text: artifact.verified ? "Yes" : "Not yet" }),
+        el("td", { text: verifiedDetailText(artifact) }),
         el("td", { className: `backup-state is-${STATE_LABELS[artifact.state] ? artifact.state : "unknown"}`, text: stateLabel(artifact) }),
         el("td", {}, kept, keptReason),
         el("td", {}, actions));

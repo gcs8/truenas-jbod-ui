@@ -2758,7 +2758,8 @@ class SchedulerTests(SchedulerTestBase):
             "enabled", "schedule", "next_run_at", "local_keep", "remote_keep", "remote_max_age_days", "last_run"})
         self.assertEqual(set(library["targets"][0]), {"id", "label", "provider", "transport_encrypted", "enabled", "last_run"})
         artifact_keys = {"id", "backup_class", "location", "created_at", "size", "sha256", "verified", "restorable",
-                         "state", "preserved", "preserve_reason", "preserved_by", "change_count", "app_version"}
+                         "state", "preserved", "preserve_reason", "preserved_by", "change_count", "app_version",
+                         "upload_check", "last_verify"}
         for artifact in library["artifacts"]:
             self.assertEqual(set(artifact), artifact_keys)
             self.assertNotIn("/", artifact["id"])

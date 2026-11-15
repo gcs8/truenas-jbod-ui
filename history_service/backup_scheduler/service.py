@@ -1332,6 +1332,10 @@ class BackupScheduler:
             "preserved_by": record.preserved_by or None,
             "change_count": len(record.change_ids),
             "app_version": meta.get("app_version"),
+            # #1202: the list says what the details say. None for local copies
+            # and copies catalogued before #722.
+            "upload_check": _upload_check(meta),
+            "last_verify": _list_last_verify(meta),
         }
 
     def detail(self, artifact_id: str) -> dict[str, Any]:
@@ -1366,8 +1370,6 @@ class BackupScheduler:
             else None
         )
         payload["last_verify"] = meta.get("last_verify")
-        # None for local copies and copies catalogued before #722.
-        payload["upload_check"] = meta.get("upload_check") if meta.get("upload_check") in {"readback", "size"} else None
         return payload
 
     def library(self) -> dict[str, Any]:
@@ -1548,6 +1550,26 @@ def _target_run(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     return {"at": value.get("at"), "ok": bool(value.get("ok")), "detail": value.get("detail")}
+
+
+def _upload_check(meta: Mapping[str, Any]) -> str | None:
+    value = meta.get("upload_check")
+    return value if value in {"readback", "size"} else None
+
+
+def _list_last_verify(meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """When the last explicit Verify ran and whether it passed, without its text.
+
+    Only a boolean ``True`` counts as passed, so a malformed record never
+    upgrades a size-only copy. The full result, detail text included, stays in
+    the artifact details.
+    """
+
+    value = meta.get("last_verify")
+    if not isinstance(value, Mapping):
+        return None
+    at = value.get("at")
+    return {"at": at if isinstance(at, str) else None, "ok": value.get("ok") is True}
 
 
 def _manifest_meta(manifest: Mapping[str, Any], groups: list[str]) -> dict[str, Any]:
