@@ -327,8 +327,9 @@ class VerifyResultIsBoundToItsCopyTests(backup_fixtures.SchedulerTestBase):
         self.assertIs(row["last_verify"]["ok"], True)
         self.assertEqual(row["last_verify"], result["artifact"]["last_verify"])
         detail = scheduler.detail(remote.artifact_id)["last_verify"]
-        self.assertEqual(set(detail), {"at", "ok", "detail"})
+        self.assertEqual(set(detail), {"at", "ok", "outcome", "detail"})
         self.assertIs(detail["ok"], True)
+        self.assertEqual(detail["outcome"], "matched")
         # The stored result names the copy it read.
         self.assertEqual(scheduler._metadata_snapshot(remote.artifact_id)["last_verify"]["artifact_id"], remote.artifact_id)
 
@@ -362,6 +363,8 @@ class VerifyResultIsBoundToItsCopyTests(backup_fixtures.SchedulerTestBase):
             ({"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "y"}, {"at": "2026-09-24T12:00:00Z", "ok": True, "detail": "y"}),
             ({"at": "2026-09-24T12:00:00Z", "ok": False, "detail": "z"}, {"at": "2026-09-24T12:00:00Z", "ok": False, "detail": "z"}),
         )
+        # Results from earlier releases carry no outcome.
+        cases = tuple((stored, {**expected, "outcome": None}) for stored, expected in cases)
         for stored, expected in cases:
             with self.subTest(stored=stored):
                 with scheduler._state_lock:
@@ -639,10 +642,10 @@ class VerifyFailureResponseShapeTests(backup_fixtures.SchedulerTestBase):
         app = build_app(scheduler)
         path = f"/internal/backups/{remote.artifact_id}/verify"
         cases = (
-            ("unreachable", "ConnectionRefusedError", True),
-            ("mismatch", "Readback does not match the catalogued size and SHA-256.", False),
+            ("unreachable", "ConnectionRefusedError", True, "not_read"),
+            ("mismatch", "Readback does not match the catalogued size and SHA-256.", False, "mismatch"),
         )
-        for case, detail, flag in cases:
+        for case, detail, flag, outcome in cases:
             with self.subTest(case=case):
                 if case == "unreachable":
                     self.broken_targets = {"nas"}
@@ -653,16 +656,204 @@ class VerifyFailureResponseShapeTests(backup_fixtures.SchedulerTestBase):
                 status, body = backup_fixtures.asgi_call(app, "POST", path, {})
                 payload = json.loads(body)
                 self.assertEqual(status, 200)
-                self.assertEqual(set(payload), {"ok", "artifact", "detail"})
+                self.assertEqual(set(payload), {"ok", "outcome", "artifact", "detail"})
                 self.assertIs(payload["ok"], False)
+                self.assertEqual(payload["outcome"], outcome)
                 self.assertEqual(payload["detail"], detail)
                 self.assertIs(payload["artifact"]["verified"], flag)
                 self.assertNotIn("nas.example.test", body.decode())
                 admin_status, admin_payload = _admin_call(app, "/api/admin/backups/{artifact_id}/verify", remote.artifact_id)
                 self.assertEqual(admin_status, 200)
-                self.assertEqual(set(admin_payload), {"ok", "artifact", "detail"})
+                self.assertEqual(set(admin_payload), {"ok", "outcome", "artifact", "detail"})
                 self.assertIs(admin_payload["ok"], False)
                 self.assertEqual(admin_payload["detail"], detail)
+
+
+class ReadFailsTarget(LocalDirectoryTarget):
+    """Opens fine, then the read of the copy fails part way."""
+
+    def get(self, name, local_path, *, limit=None):
+        import errno
+
+        local_path.write_bytes(b"partial")
+        # The text is deliberately misleading: the outcome must not come from it.
+        raise OSError(errno.EIO, "Readback does not match the catalogued size and SHA-256.")
+
+
+class VerifyOutcomeTests(backup_fixtures.SchedulerTestBase):
+    """A Verify says which of three things happened, decided by where it stopped.
+
+    Read and matched; read and did not match; or the copy could not be opened
+    or read, so nothing was checked and its catalogue status stays as it was.
+    One copy of each kind: read back at upload, size only at upload, and the
+    provider's checksum at upload.
+    """
+
+    KINDS = (("nas", "readback"), ("ftp", "size"), ("cloud", "provider_checksum"))
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.client = archive_transport_fixtures.FakeS3Client()
+        self.read_fails: set[str] = set()
+
+    _copies = ProviderChecksumIsNotAReadbackTests._copies
+
+    def open_target(self, settings):
+        if settings.provider == "s3" and settings.target_id not in self.broken_targets:
+            return ProviderChecksumIsNotAReadbackTests.open_target(self, settings)
+
+        @contextlib.contextmanager
+        def opened():
+            if settings.target_id in self.broken_targets:
+                raise ConnectionRefusedError("connection refused by nas.example.test")
+            root = self.remote_root / settings.target_id
+            if settings.target_id in self.read_fails:
+                yield ReadFailsTarget(root)
+            elif settings.target_id == "ftp":
+                yield SizeOnlyTarget(root)
+            else:
+                yield LocalDirectoryTarget(root)
+
+        return opened()
+
+    def _config(self, *, with_s3: bool = True):
+        config = ProviderChecksumIsNotAReadbackTests._config(self, with_s3=with_s3)
+        config["targets"].append({**backup_fixtures.TARGET, "target_id": "ftp", "label": "Size-only share", "root": "/unused-ftp"})
+        return config
+
+    def _verify(self, scheduler, artifact_id):
+        """Verify through the scheduler's HTTP app and the admin route; both must agree."""
+
+        from history_service.backup_scheduler.api import build_app
+
+        app = build_app(scheduler)
+        status, body = backup_fixtures.asgi_call(app, "POST", f"/internal/backups/{artifact_id}/verify", {})
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertNotIn("nas.example.test", body.decode())
+        self.assertEqual(set(payload), {"ok", "outcome", "artifact", "detail"})
+        admin_status, admin_payload = _admin_call(app, "/api/admin/backups/{artifact_id}/verify", artifact_id)
+        self.assertEqual(admin_status, 200)
+        self.assertEqual(admin_payload["outcome"], payload["outcome"])
+        self.assertEqual(admin_payload["ok"], payload["ok"])
+        return payload
+
+    def _detail(self, scheduler, artifact_id):
+        from history_service.backup_scheduler.api import build_app
+
+        status, body = backup_fixtures.asgi_call(build_app(scheduler), "GET", f"/internal/backups/{artifact_id}")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def _corrupt(self, location, record):
+        if location == "cloud":
+            self.client.corrupt_get = True
+        else:
+            path = self.remote_root / location / record.name
+            path.write_bytes(b"X" * len(path.read_bytes()))
+
+    def test_each_outcome_for_each_kind_of_copy(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        copies = self._copies(scheduler)
+        for location, upload_check in self.KINDS:
+            with self.subTest(copy=upload_check):
+                record = copies[location]
+                self.assertEqual(scheduler._metadata_snapshot(record.artifact_id)["upload_check"], upload_check)
+
+                # Read and matched.
+                passed = self._verify(scheduler, record.artifact_id)
+                self.assertEqual((passed["ok"], passed["outcome"]), (True, "matched"))
+                self.assertEqual(self._detail(scheduler, record.artifact_id)["last_verify"]["outcome"], "matched")
+
+                # Could not be read: nothing checked, catalogue status unchanged.
+                before = self._detail(scheduler, record.artifact_id)
+                gets = self.client.get_calls
+                self.broken_targets = {location}
+                unread = self._verify(scheduler, record.artifact_id)
+                self.broken_targets = set()
+                self.assertEqual((unread["ok"], unread["outcome"]), (False, "not_read"))
+                self.assertEqual(unread["detail"], "ConnectionRefusedError")
+                self.assertEqual(self.client.get_calls, gets)  # nothing was read
+                self.assertTrue(scheduler.get(record.artifact_id).verified)
+                after = self._detail(scheduler, record.artifact_id)
+                for key in ("verified", "restorable", "state", "upload_check"):
+                    self.assertEqual(after[key], before[key], key)
+                self.assertEqual(
+                    after["last_verify"],
+                    {"at": after["last_verify"]["at"], "ok": False, "outcome": "not_read", "detail": "ConnectionRefusedError"},
+                )
+
+                # Read and did not match: the flag is cleared, as before.
+                self._corrupt(location, record)
+                mismatch = self._verify(scheduler, record.artifact_id)
+                self.client.corrupt_get = False
+                self.assertEqual((mismatch["ok"], mismatch["outcome"]), (False, "mismatch"))
+                self.assertEqual(mismatch["detail"], "Readback does not match the catalogued size and SHA-256.")
+                self.assertIs(mismatch["artifact"]["verified"], False)
+                self.assertEqual(self._detail(scheduler, record.artifact_id)["last_verify"]["outcome"], "mismatch")
+
+    def test_a_read_that_fails_part_way_checked_nothing(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        self.read_fails = {"nas"}
+        result = self._verify(scheduler, nas.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertEqual(result["detail"], "OSError: Input/output error")
+        self.assertTrue(scheduler.get(nas.artifact_id).verified)
+
+    def test_a_local_copy_that_cannot_be_opened_is_not_read_and_a_missing_one_fails(self) -> None:
+        from unittest import mock
+
+        scheduler = self.make(self._config())
+        local = scheduler.run_now("full")
+        with mock.patch.object(scheduler, "_local_path", side_effect=PermissionError(13, "denied")):
+            result = self._verify(scheduler, local.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "not_read"))
+        self.assertTrue(scheduler.get(local.artifact_id).verified)
+        # A local copy that is gone is a completed check with a negative result,
+        # and clears the flag as it did before.
+        scheduler._local_path(local).unlink()
+        result = self._verify(scheduler, local.artifact_id)
+        self.assertEqual((result["ok"], result["outcome"]), (False, "mismatch"))
+        self.assertFalse(scheduler.get(local.artifact_id).verified)
+
+    def test_a_failure_after_the_comparison_is_not_called_unread(self) -> None:
+        from unittest import mock
+
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        with mock.patch.object(scheduler.catalog, "mark_verified", side_effect=RuntimeError("busy")):
+            result = self._verify(scheduler, nas.artifact_id)
+        # The copy was read and matched, but the result was not recorded: no outcome is claimed.
+        self.assertIs(result["ok"], False)
+        self.assertIsNone(result["outcome"])
+        self.assertIsNone(self._detail(scheduler, nas.artifact_id)["last_verify"]["outcome"])
+
+    def test_a_stored_outcome_is_shown_only_when_it_is_well_formed(self) -> None:
+        scheduler = self.make(self._config())
+        scheduler.run_now("full")
+        nas = self._copies(scheduler)["nas"]
+        cases = (
+            ({"ok": False, "detail": "x"}, None),  # earlier releases: no outcome, today's wording
+            ({"ok": False, "outcome": "not_read", "detail": "x"}, "not_read"),
+            ({"ok": True, "outcome": "not_read", "detail": "x"}, None),
+            ({"ok": False, "outcome": "matched", "detail": "x"}, None),
+            ({"ok": True, "outcome": "matched", "detail": "x"}, "matched"),
+            ({"ok": False, "outcome": ["not_read"], "detail": "x"}, None),
+            ({"ok": False, "outcome": "unread", "detail": "x"}, None),
+        )
+        for stored, presented in cases:
+            with self.subTest(stored=stored):
+                with scheduler._state_lock:
+                    scheduler._meta[nas.artifact_id]["last_verify"] = {
+                        "at": "2026-09-24T12:00:00+00:00", "artifact_id": nas.artifact_id, **stored,
+                    }
+                last_verify = self._detail(scheduler, nas.artifact_id)["last_verify"]
+                self.assertIn("outcome", last_verify, "the details carry no Verify outcome")
+                self.assertEqual(last_verify["outcome"], presented)
 
 
 if __name__ == "__main__":

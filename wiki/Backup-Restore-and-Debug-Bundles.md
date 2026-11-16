@@ -552,6 +552,14 @@ Artifact and library routes use opaque backup ids; they do not accept or return
 an artifact file path. Policy routes accept target paths and secret-file paths,
 but secret-file paths and credential contents are never returned.
 
+A Verify answer and the backup's details carry an `outcome`: `matched` (the
+copy was read back and matched its size and SHA-256), `mismatch` (it was read
+and did not match, or a local copy is gone; it stops counting as verified), or
+`not_read` (the copy could not be opened or read, so nothing was checked and
+its verified status, restore and clean-up treatment are unchanged). The page
+words the last case as "could not read the copy, nothing checked". Results
+saved by earlier versions have no outcome.
+
 ## Create a debug bundle
 
 Use `Debug Bundle` to capture selected local state for support inspection. It creates a standard archive and cannot be imported as a backup. Capture can stop and restart the UI and history sidecar.

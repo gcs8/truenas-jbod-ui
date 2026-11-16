@@ -309,6 +309,17 @@
     };
   }
 
+  // #1202: a Verify that could not open or read the copy checked nothing and
+  // changed nothing; it is not a failed check. A result with no outcome (from
+  // an earlier release) keeps the Worked/Failed wording.
+  function lastCheckSummary(lastVerify) {
+    if (lastVerify.outcome === "not_read" && lastVerify.ok !== true) {
+      const reason = lastVerify.detail ? `: ${scrubText(lastVerify.detail)}` : "";
+      return { tone: "", text: `Could not read the copy, nothing checked${reason}; earlier status unchanged`, at: lastVerify.at || "" };
+    }
+    return lastRunSummary(lastVerify);
+  }
+
   // The last scheduled clean-up, for the status line: a summary when it
   // worked, otherwise each place it could not finish and why.
   function cleanupSummary(grooming, targets, formatTime = (value) => String(value)) {
@@ -1037,7 +1048,7 @@
           if (groups.length) facts.push(["Contains", groups.map((group) => scrubText(typeof group === "object" ? group.label || group.key : group)).join(", ")]);
         }
         if (item.last_verify && typeof item.last_verify === "object") {
-          const verify = lastRunSummary(item.last_verify);
+          const verify = lastCheckSummary(item.last_verify);
           facts.push(["Last check", verify.at ? `${verify.text} (${fmtTime(verify.at)})` : verify.text]);
         }
         const body = [
@@ -1075,7 +1086,12 @@
           // The operation's own result: a copy the catalogue still counts as
           // verified was not read back when the Verify could not reach it.
           const ok = payload?.ok === true;
-          setBanner(ok ? "Backup verified." : `Backup did not verify${payload.detail ? `: ${scrubText(payload.detail)}` : "."}`, ok ? "success" : "error");
+          const detail = payload?.detail ? `: ${scrubText(payload.detail)}` : "";
+          if (!ok && payload?.outcome === "not_read") {
+            setBanner(`This Verify could not read the copy, so nothing was checked${detail}. Its earlier status is unchanged.`, "error");
+          } else {
+            setBanner(ok ? "Backup verified." : `Backup did not verify${detail || "."}`, ok ? "success" : "error");
+          }
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
         }

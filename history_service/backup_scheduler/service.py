@@ -1517,22 +1517,30 @@ class BackupScheduler:
     def verify(self, artifact_id: str) -> dict[str, Any]:
         at = _iso(self._clock())
         ok = False
+        # Which of three things happened (#1202), decided by where the attempt
+        # stopped and never by an error's text: "matched", "mismatch" (the
+        # comparison ran and failed, or the local copy is gone), or "not_read"
+        # (opening or reading the copy failed, so nothing was checked).
+        outcome: str | None = "not_read"
         record = self.get(artifact_id)
         try:
             with self.materialize(artifact_id):
-                pass  # materialize re-hashes and compares with the catalogue
+                outcome = None  # read and matched; a later failure claims no outcome
             self.catalog.mark_verified(artifact_id, sha256=record.sha256, size=record.size, now=self._clock())
             ok = True
+            outcome = "matched"
             detail = "Readback matched the catalogued size and SHA-256."
         except (ArchiveIntegrityError, ArchiveDownloadTooLargeError) as exc:
             # A copy that no longer matches must stop counting as verified, so it is
             # neither offered for restore nor protected as the newest verified copy.
             self.catalog.mark_unverified(artifact_id)
+            outcome = "mismatch"
             detail = str(exc)
         except ArtifactNotFoundError as exc:
             if record.location != LOCAL_LOCATION:
                 raise
             self.catalog.mark_unverified(artifact_id)
+            outcome = "mismatch"
             detail = str(exc)
         except Exception as exc:  # noqa: BLE001 - e.g. target unreachable; state unknown, keep flag
             detail = describe_error(exc)
@@ -1540,12 +1548,14 @@ class BackupScheduler:
             meta = self._meta.setdefault(artifact_id, {})
             # The result names the copy it read, so it never counts for another (#1202).
             meta["last_verify"] = {"at": at, "ok": ok, "detail": detail, "artifact_id": artifact_id}
+            if outcome is not None:
+                meta["last_verify"]["outcome"] = outcome
             self._save_meta()
         # Re-publish (or clear) verified_full from the catalog's current flag so
         # the history sidecar never suppresses its own copy after a failed
         # readback of the replacement artifact.
         self._write_status()
-        return {"ok": ok, "artifact": self.serialize(self.get(artifact_id)), "detail": detail}
+        return {"ok": ok, "outcome": outcome, "artifact": self.serialize(self.get(artifact_id)), "detail": detail}
 
     def test_target(self, target_id: str) -> dict[str, Any]:
         target = self.policy.target(target_id)
@@ -1619,7 +1629,15 @@ def _detail_last_verify(record: ArtifactRecord, meta: Mapping[str, Any]) -> dict
     if value is None:
         return None
     detail = value.get("detail")
-    return {**_list_last_verify(record, meta), "detail": detail if isinstance(detail, str) else None}
+    summary = _list_last_verify(record, meta)
+    # Absent in results from earlier releases; shown only when it agrees with ``ok``.
+    outcome = value.get("outcome")
+    if not (isinstance(outcome, str) and (outcome == "matched") is summary["ok"] and outcome in _VERIFY_OUTCOMES):
+        outcome = None
+    return {**summary, "outcome": outcome, "detail": detail if isinstance(detail, str) else None}
+
+
+_VERIFY_OUTCOMES = frozenset({"matched", "mismatch", "not_read"})
 
 
 # Metadata that describes the archive content and so holds for every copy of it.

@@ -959,6 +959,76 @@ test("a failed Verify shows its own result through the page's real transport (#1
   assert.match(mounted.banners.at(-1)[0], /^Verify failed: Artifact not found\./);
 });
 
+function lastCheckFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+  return index === -1 ? null : facts[index + 1].textContent;
+}
+
+// #1202: a Verify has three outcomes and the page says which one happened.
+// These are the scheduler's real response shapes (VerifyOutcomeTests in
+// tests/test_backup_list_assurance.py), delivered through the real transport.
+const NOT_READ_BANNER = "This Verify could not read the copy, so nothing was checked: ConnectionRefusedError. Its earlier status is unchanged.";
+
+test("a Verify says whether the copy was read and matched, read and did not match, or could not be read (#1202)", async () => {
+  const at = "2026-09-24T12:00:00+00:00";
+  const notReadLastCheck = `Could not read the copy, nothing checked: ConnectionRefusedError; earlier status unchanged (T(${at}))`;
+  const kinds = [["readback", "Yes"], ["size", SIZE_ONLY_TEXT], ["provider_checksum", PROVIDER_CHECKSUM_TEXT]];
+  for (const [uploadCheck, uploadText] of kinds) {
+    const outcomes = [
+      ["matched", true, true, "Readback matched the catalogued size and SHA-256.",
+        ["Backup verified.", "success"], "Yes", `Worked (T(${at}))`],
+      ["not_read", false, true, "ConnectionRefusedError",
+        [NOT_READ_BANNER, "error"], uploadText, notReadLastCheck],
+      ["mismatch", false, false, "Readback does not match the catalogued size and SHA-256.",
+        ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet",
+        `Failed: Readback does not match the catalogued size and SHA-256. (T(${at}))`],
+    ];
+    for (const [outcome, ok, verified, detail, banner, column, lastCheck] of outcomes) {
+      const name = `${uploadCheck}/${outcome}`;
+      const api = realTransportApi({
+        "POST /api/admin/backups/full-odd/verify": (data) => {
+          Object.assign(data.artifacts[4], { verified, upload_check: uploadCheck, last_verify: { at, ok } });
+          return [200, { ok, outcome, artifact: data.artifacts[4], detail }];
+        },
+        "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok, outcome, detail } }],
+      });
+      Object.assign(api.data.artifacts[4], { upload_check: uploadCheck, last_verify: null });
+      const { elements, library, banners } = mount({ api });
+      await library.load();
+      await library.actions.verify("full-odd");
+      assert.deepEqual(banners.at(-1), banner, name);
+      assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+      await library.actions.showDetails("full-odd");
+      await settle();
+      assert.equal(verifiedFact(elements), column, name);
+      assert.equal(lastCheckFact(elements), lastCheck, name);
+    }
+  }
+  // Control: a result from an earlier release carries no outcome and keeps today's wording.
+  const api = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: false, artifact: data.artifacts[4], detail: "ConnectionRefusedError" }],
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: false, detail: "ConnectionRefusedError" } }],
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: { at, ok: false } });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup did not verify: ConnectionRefusedError", "error"]);
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(elements), `Failed: ConnectionRefusedError (T(${at}))`);
+  // A not-read outcome beside a passed result is malformed and never reads as unread.
+  const odd = realTransportApi({
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: true, outcome: "not_read", detail: "" } }],
+  });
+  const mounted = mount({ api: odd });
+  await mounted.library.load();
+  await mounted.library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(mounted.elements), `Worked (T(${at}))`);
+});
+
 test("a clean-up refused by its guard shows the refusal through the page's real transport (#1202)", async () => {
   const refusal = "CatalogError: Artifact is the newest copy of its class at this location that passed its last completed check (the upload check or a later Verify), so it is kept.";
   const api = realTransportApi({

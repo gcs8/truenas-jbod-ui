@@ -67,11 +67,15 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   passed its last completed check, which can be a size check, and the
   clean-up refusal for that copy says the same instead of "the newest verified
   copy". An S3 upload whose ETag matched is no longer recorded or shown as read
-  back: it says it was checked by the provider's checksum. An S3 copy recorded
-  as read back, which earlier versions also recorded for a matching ETag, says
-  provider's checksum or read-back. Both hold until the copy's own Verify
-  passes. A Verify or clean-up that stopped now shows its own result on the
-  page instead of a generic request failure (#1255).
+  back: it says it was checked by the provider's checksum. A copy recorded as
+  read back, which earlier versions also recorded for a matching S3 ETag, says
+  provider's checksum or read-back when its target is S3 or no longer
+  configured. Both hold until the copy's own Verify passes. A Verify or
+  clean-up that stopped now shows its own result on the page instead of a
+  generic request failure. A Verify now reports whether the copy was read and
+  matched, read and did not match, or could not be read; one that could not
+  read the copy says nothing was checked and its earlier status is unchanged,
+  instead of reading as a failed check (#1255).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
