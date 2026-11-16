@@ -44,6 +44,23 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 
 ### Security
 
+- Storage Fabric SSH failures now retain fixed reason categories, exit status,
+  and reviewed context in public snapshots and status messages; configured
+  command text and remote output stay private, while logs keep value-safe cause
+  and redacted command context. Connection, host-key, key-file,
+  authentication, refused-destination and internal failures are categorised
+  from the local error itself, and the service log records its type and errno;
+  the service's own refusal sentence stays in the warning, an internal error is
+  reported as one even beside successful reads, and its log record lists frames
+  by file name, function and line only. An SG device path found by discovery
+  is used only in the `/dev/sgN` form, and a QuantaStor-reported node address
+  only when it reads, as reported, as an IP address or a host name (plain
+  spaces at either end are trimmed; any other whitespace or control character
+  makes it unusable); other values are dropped and counted, never shown.
+  Discovery keeps up to 16,384 SG devices per host (lowest numbers first) and
+  256 addresses per reported address list; reaching either limit, or
+  dropping a reported address, is shown in Storage Fabric warnings with the
+  counts (#1259).
 - A generated SSH private key is now created with its final `0640` mode
   instead of taking its name under `config/ssh/` at the umask default
   (usually `0644`) and being narrowed afterwards, and it can no longer stay

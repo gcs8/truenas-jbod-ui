@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import errno
 import functools
 import logging
 import re
 import shlex
+import socket
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from types import TracebackType
 
 import paramiko
 
@@ -141,12 +146,17 @@ class _ChannelGate:
 SENSITIVE_OPTION_NAMES = {
     "--api-key",
     "--apikey",
+    "--cookie",
+    "--oauth2-bearer",
     "--pass",
     "--password",
+    "--proxy-user",
     "--secret",
     "--server",
     "--token",
 }
+AMBIGUOUS_CREDENTIAL_OPTION_NAMES = {"--user", "-b", "-u"}
+HTTP_CREDENTIAL_CLIENTS = {"curl", "http", "httpie", "https", "wget"}
 SENSITIVE_KEY_NAMES = {
     "api_key",
     "apikey",
@@ -156,10 +166,31 @@ SENSITIVE_KEY_NAMES = {
     "secret",
     "token",
 }
+AUTH_SCHEMES = {"basic", "bearer", "digest", "negotiate", "token"}
 INLINE_SECRET_RE = re.compile(
     r"(?i)\b(?P<key>api[_-]?key|pass(?:wd|word)?|secret|token)=(?P<value>[^\s'\";]+)"
 )
 SERVER_SPEC_RE = re.compile(r"(?i)(?P<prefix>--server=)(?P<value>[^\s'\"]+)")
+CREDENTIAL_HEADER_RE = re.compile(
+    r"(?is)(?P<prefix>\b(?:authorization|proxy-authorization|x-api-key|x-auth-token)\s*:\s*)"
+    r"(?:(?P<scheme>basic|bearer|digest|negotiate|token)\s+)?(?P<value>.+)$"
+)
+COOKIE_HEADER_RE = re.compile(
+    r"(?is)(?P<prefix>\b(?:cookie|set-cookie)\s*:\s*)(?P<value>.+)$"
+)
+HEADER_NAME_ONLY_RE = re.compile(
+    r"(?i)(?:^|=)(?P<name>authorization|proxy-authorization|x-api-key|x-auth-token|cookie|set-cookie):$"
+)
+URL_USERINFO_RE = re.compile(
+    r"(?i)(?P<prefix>\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)(?P<value>[^@\s/]+)(?=@)"
+)
+UNPARSED_SENSITIVE_OPTION_RE = re.compile(
+    r"(?i)(?P<prefix>(?:--api-key|--apikey|--cookie|--oauth2-bearer|--pass|--password|"
+    r"--proxy-user|--secret|--token)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
+)
+UNPARSED_AMBIGUOUS_OPTION_RE = re.compile(
+    r"(?i)(?P<prefix>(?:--user|-b|-u)(?:=|\s+)[\"']?)(?P<value>[^\s\"';]+)"
+)
 _KNOWN_HOSTS_LOCKS: dict[str, threading.Lock] = {}
 _KNOWN_HOSTS_LOCKS_GUARD = threading.Lock()
 
@@ -172,6 +203,183 @@ def _known_hosts_lock(path_value: str) -> threading.Lock:
             lock = threading.Lock()
             _KNOWN_HOSTS_LOCKS[normalized_path] = lock
         return lock
+
+
+def _redact_credential_header(match: re.Match[str]) -> str:
+    scheme = match.group("scheme")
+    scheme_prefix = f"{scheme} " if scheme else ""
+    return f"{match.group('prefix')}{scheme_prefix}***"
+
+
+def _redact_embedded_credentials(value: str) -> str:
+    value = URL_USERINFO_RE.sub(lambda match: f"{match.group('prefix')}***", value)
+    value = COOKIE_HEADER_RE.sub(lambda match: f"{match.group('prefix')}***", value)
+    return CREDENTIAL_HEADER_RE.sub(_redact_credential_header, value)
+
+
+# Fixed failure categories. A local category is set by this process from the
+# exception type, its errno, or the code path that refused; an executed
+# command's category comes from its exit status and stderr only. Remote text
+# never selects a local category and is never copied into one.
+SSH_INTERNAL_ERROR_REASON = "internal_error"
+SSH_COMMAND_FAILURE_REASON = "ssh_command_failed"
+_KEY_FILE_LOAD_FRAMES = frozenset(
+    {
+        ("paramiko.client", "_key_from_filepath"),
+        ("paramiko.pkey", "from_private_key_file"),
+        ("paramiko.pkey", "_read_private_key_file"),
+        ("paramiko.pkey", "from_path"),
+    }
+)
+_UNKNOWN_HOST_KEY_FRAMES = frozenset({("paramiko.client", "missing_host_key")})
+_FAILURE_LOG_FRAME_LIMIT = 20
+_FRAME_FILE_NAME_RE = re.compile(r"[A-Za-z0-9_.<>-]{1,80}")
+_FRAME_FUNCTION_NAME_RE = re.compile(r"[A-Za-z0-9_.<>]{1,80}")
+SSH_DISABLED_MESSAGE = "SSH fallback is disabled."
+
+
+@dataclass(frozen=True, slots=True)
+class SSHLocalFailure:
+    """Why this process produced a failed result without a remote exit status."""
+
+    reason: str
+    exception_type: str | None = None
+    errno: int | None = None
+    retry_after: datetime | None = None
+
+
+def _raised_in(exc: BaseException, frames: frozenset[tuple[str, str]]) -> bool:
+    traceback_entry = exc.__traceback__
+    while traceback_entry is not None:
+        frame = traceback_entry.tb_frame
+        if (frame.f_globals.get("__name__"), frame.f_code.co_name) in frames:
+            return True
+        traceback_entry = traceback_entry.tb_next
+    return False
+
+
+def _socket_error_reason(error_number: int | None) -> str:
+    if error_number == errno.ECONNREFUSED:
+        return "connection_refused"
+    if error_number in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+        return "host_unreachable"
+    if error_number == errno.ETIMEDOUT:
+        return "timeout"
+    return "ssh_transport_failed"
+
+
+def classify_ssh_exception(exc: BaseException) -> SSHLocalFailure:
+    """Map a local SSH exception to a fixed category by type, errno and origin frame."""
+
+    type_name = type(exc).__name__
+    error_number = exc.errno if isinstance(exc, OSError) and isinstance(exc.errno, int) else None
+    expected_type = isinstance(exc, (OSError, EOFError, paramiko.SSHException))
+    if isinstance(exc, (OSError, ValueError, paramiko.SSHException)) and _raised_in(exc, _KEY_FILE_LOAD_FRAMES):
+        # Raised while this process read the configured private key file.
+        if isinstance(exc, OSError):
+            reason = "key_file_missing" if error_number in (errno.ENOENT, errno.ENOTDIR) else "key_file_unreadable"
+        else:
+            reason = "key_file_invalid"
+    elif not expected_type:
+        reason = SSH_INTERNAL_ERROR_REASON
+    elif isinstance(exc, paramiko.BadHostKeyException) or (
+        isinstance(exc, paramiko.SSHException) and _raised_in(exc, _UNKNOWN_HOST_KEY_FRAMES)
+    ):
+        reason = "host_key_rejected"
+    elif isinstance(exc, paramiko.AuthenticationException):
+        reason = "auth_failed"
+    elif isinstance(exc, paramiko.ChannelException):
+        reason = "channel_refused"
+    elif isinstance(exc, paramiko.ssh_exception.NoValidConnectionsError):
+        error_numbers = {
+            error.errno for error in exc.errors.values() if isinstance(getattr(error, "errno", None), int)
+        }
+        error_number = next(iter(error_numbers)) if len(error_numbers) == 1 else None
+        reason = _socket_error_reason(error_number)
+    elif isinstance(exc, socket.gaierror):
+        reason = "dns_failed"
+    elif isinstance(exc, TimeoutError):
+        reason = "timeout"
+    elif isinstance(exc, OSError):
+        reason = _socket_error_reason(error_number)
+    else:
+        reason = "protocol_error"
+    return SSHLocalFailure(reason=reason, exception_type=type_name, errno=error_number)
+
+
+def classify_ssh_command_failure(*, exit_code: int | None, stderr: str = "") -> str:
+    """Category of a command that ran remotely: its exit status and stderr only."""
+
+    detail = (stderr or "").lower()
+    if exit_code == 127 or "command not found" in detail:
+        return "command_not_found"
+    if "password is required" in detail:
+        return "sudo_password_required"
+    if "permission denied" in detail or "not allowed to execute" in detail:
+        return "permission_denied"
+    return SSH_COMMAND_FAILURE_REASON
+
+
+def ssh_failure_reason(result: SSHCommandResult) -> str:
+    """The fixed category of a failed result: local when this process set one."""
+
+    local_failure = getattr(result, "local_failure", None)
+    if isinstance(local_failure, SSHLocalFailure):
+        return local_failure.reason
+    return classify_ssh_command_failure(exit_code=result.exit_code, stderr=result.stderr)
+
+
+def _frame_fact(value: object, pattern: re.Pattern[str], placeholder: str) -> str:
+    text = value if isinstance(value, str) else ""
+    return text if pattern.fullmatch(text) else placeholder
+
+
+def format_value_safe_frames(tb: TracebackType | None) -> str:
+    """The innermost frames as ``base name:line in function``, one per line.
+
+    At most ``_FAILURE_LOG_FRAME_LIMIT`` frames; no directory, no source text,
+    no locals. A name outside the short allowed form becomes a placeholder.
+    """
+
+    frames = list(traceback.walk_tb(tb))[-_FAILURE_LOG_FRAME_LIMIT:]
+    lines: list[str] = []
+    for frame, line_number in frames:
+        code = frame.f_code
+        file_name = _frame_fact(
+            code.co_filename.replace("\\", "/").rsplit("/", 1)[-1], _FRAME_FILE_NAME_RE, "<file>"
+        )
+        function_name = _frame_fact(code.co_name, _FRAME_FUNCTION_NAME_RE, "<function>")
+        lines.append(f"  {file_name}:{int(line_number or 0)} in {function_name}")
+    return "\n".join(lines)
+
+
+def _log_local_failure(template: str, args: tuple[object, ...], failure: SSHLocalFailure, exc: BaseException) -> None:
+    """Log a local SSH failure with value-safe facts, never the exception message."""
+
+    if failure.reason == SSH_INTERNAL_ERROR_REASON:
+        logger.error(
+            template.replace("{detail}", "reason=%s type=%s") + "\nStack (exception message omitted):\n%s",
+            *args,
+            failure.reason,
+            failure.exception_type,
+            format_value_safe_frames(exc.__traceback__),
+        )
+        return
+    logger.warning(
+        template.replace("{detail}", "reason=%s type=%s errno=%s"),
+        *args,
+        failure.reason,
+        failure.exception_type,
+        "-" if failure.errno is None else failure.errno,
+    )
+
+
+def _uses_http_credential_options(tokens: list[str]) -> bool:
+    return any(token.rsplit("/", 1)[-1].lower() in HTTP_CREDENTIAL_CLIENTS for token in tokens)
+
+
+def _ambiguous_option_value_is_sensitive(value: str, *, http_client: bool) -> bool:
+    return http_client or ":" in value
 
 
 def redact_ssh_command(command: str) -> str:
@@ -188,10 +396,33 @@ def redact_ssh_command(command: str) -> str:
 
     redacted: list[str] = []
     redact_next_option: str | None = None
-    for token in tokens:
+    redact_next_header: str | None = None
+    http_client = _uses_http_credential_options(tokens)
+    for raw_token in tokens:
+        token = _redact_embedded_credentials(raw_token)
+        lowered_token = token.lower()
         if redact_next_option:
-            redacted.append(_redact_server_spec(token) if redact_next_option == "--server" else "***")
+            if redact_next_option == "--server":
+                redacted.append(_redact_server_spec(token))
+            elif redact_next_option in AMBIGUOUS_CREDENTIAL_OPTION_NAMES and not _ambiguous_option_value_is_sensitive(
+                token, http_client=http_client
+            ):
+                redacted.append(token)
+            else:
+                redacted.append("***")
             redact_next_option = None
+            continue
+        if redact_next_header == "auth-value":
+            redacted.append("***")
+            redact_next_header = None
+            continue
+        if redact_next_header:
+            if redact_next_header == "auth" and lowered_token in AUTH_SCHEMES:
+                redacted.append(token)
+                redact_next_header = "auth-value"
+            else:
+                redacted.append("***")
+                redact_next_header = None
             continue
 
         option_name, separator, option_value = token.partition("=")
@@ -209,6 +440,23 @@ def redact_ssh_command(command: str) -> str:
         if lowered_name in SENSITIVE_OPTION_NAMES:
             redacted.append(token)
             redact_next_option = lowered_name
+            continue
+        if lowered_name in AMBIGUOUS_CREDENTIAL_OPTION_NAMES and separator:
+            redacted.append(
+                f"{option_name}=***"
+                if _ambiguous_option_value_is_sensitive(option_value, http_client=http_client)
+                else token
+            )
+            continue
+        if lowered_name in AMBIGUOUS_CREDENTIAL_OPTION_NAMES:
+            redacted.append(token)
+            redact_next_option = lowered_name
+            continue
+
+        header_name = HEADER_NAME_ONLY_RE.search(token)
+        if header_name:
+            redacted.append(token)
+            redact_next_header = "cookie" if "cookie" in header_name.group("name").lower() else "auth"
             continue
 
         key, key_separator, value = token.partition("=")
@@ -228,11 +476,26 @@ def _redact_server_spec(value: str) -> str:
 
 
 def _redact_unparsed_command(command: str) -> str:
+    redacted = _redact_embedded_credentials(command)
     redacted = SERVER_SPEC_RE.sub(
         lambda match: f"{match.group('prefix')}{_redact_server_spec(match.group('value'))}",
-        command,
+        redacted,
     )
-    return INLINE_SECRET_RE.sub(lambda match: f"{match.group('key')}=***", redacted)
+    redacted = UNPARSED_SENSITIVE_OPTION_RE.sub(lambda match: f"{match.group('prefix')}***", redacted)
+    redacted = INLINE_SECRET_RE.sub(lambda match: f"{match.group('key')}=***", redacted)
+    http_client = bool(
+        re.search(
+            r"(?i)(?:^|\s)(?:[^\s/]+/)*(?:curl|http|httpie|https|wget)(?=\s|$)",
+            command,
+        )
+    )
+
+    def redact_ambiguous(match: re.Match[str]) -> str:
+        if _ambiguous_option_value_is_sensitive(match.group("value"), http_client=http_client):
+            return f"{match.group('prefix')}***"
+        return match.group(0)
+
+    return UNPARSED_AMBIGUOUS_OPTION_RE.sub(redact_ambiguous, redacted)
 
 
 class AutoPinHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -279,6 +542,8 @@ class SSHCommandResult:
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
+    # Set only by local code: the result did not come from a remote exit.
+    local_failure: SSHLocalFailure | None = None
 
 
 CommandPlanner = Callable[[list[SSHCommandResult]], Iterable[str]]
@@ -452,7 +717,10 @@ class SSHProbe:
         if not self.config.enabled:
             if commands is None:
                 return []
-            return [self._failure_result(command, "SSH fallback is disabled.") for command in commands]
+            return [
+                self._failure_result(command, SSH_DISABLED_MESSAGE, SSHLocalFailure("ssh_disabled"))
+                for command in commands
+            ]
         command_list = self._command_list(commands)
         if not command_list:
             return []
@@ -547,8 +815,9 @@ class SSHProbe:
             return SSHCommandResult(
                 command=command,
                 ok=False,
-                stderr="SSH fallback is disabled.",
+                stderr=SSH_DISABLED_MESSAGE,
                 exit_code=1,
+                local_failure=SSHLocalFailure("ssh_disabled"),
             )
         return await self._run_owned(
             self._run_command_sync,
@@ -567,8 +836,9 @@ class SSHProbe:
             return SSHCommandResult(
                 command=command,
                 ok=False,
-                stderr="SSH fallback is disabled.",
+                stderr=SSH_DISABLED_MESSAGE,
                 exit_code=1,
+                local_failure=SSHLocalFailure("ssh_disabled"),
             )
         return self._run_command_sync(command, stdin_data=stdin_data, timeout_seconds=timeout_seconds)
 
@@ -593,15 +863,16 @@ class SSHProbe:
                     _cancel.check()
                     results.append(self._run_single_command(client, command, stdin_data=stdin_data, _cancel=_cancel))
         except Exception as exc:
-            logger.warning(
-                "SSH command batch failed for %s@%s: %s",
-                self.config.user,
-                self.config.host,
+            error_message = str(exc) or exc.__class__.__name__
+            failure = classify_ssh_exception(exc)
+            _log_local_failure(
+                "SSH command batch failed for %s@%s: {detail}",
+                (self.config.user, self.config.host),
+                failure,
                 exc,
             )
-            error_message = str(exc) or exc.__class__.__name__
             results.extend(
-                self._failure_result(command, error_message)
+                self._failure_result(command, error_message, failure)
                 for command in command_list[len(results) :]
             )
             return results
@@ -653,15 +924,18 @@ class SSHProbe:
         try:
             client, reused = self._lease_client(_cancel)
         except Exception as exc:
-            logger.warning(
-                "SSH planned command session failed for %s@%s: %s",
-                self.config.user,
-                self.config.host,
+            error_message = str(exc) or exc.__class__.__name__
+            failure = classify_ssh_exception(exc)
+            _log_local_failure(
+                "SSH planned command session failed for %s@%s: {detail}",
+                (self.config.user, self.config.host),
+                failure,
                 exc,
             )
-            error_message = str(exc) or exc.__class__.__name__
             for index, first_commands, _seen in pending:
-                outcomes[index] = [self._failure_result(command, error_message) for command in first_commands]
+                outcomes[index] = [
+                    self._failure_result(command, error_message, failure) for command in first_commands
+                ]
             return outcomes
 
         batch_counts: list[int] = [0] * len(groups)
@@ -684,15 +958,15 @@ class SSHProbe:
                             gate.limit,
                         )
                         continue
-                    reason = str(exc) or exc.__class__.__name__
-                    logger.warning(
-                        "SSH command could not open an SSH channel on %s@%s: %s (%s)",
-                        self.config.user,
-                        self.config.host,
-                        redact_ssh_command(command),
-                        reason,
+                    error_message = str(exc) or exc.__class__.__name__
+                    failure = classify_ssh_exception(exc)
+                    _log_local_failure(
+                        "SSH command could not open an SSH channel on %s@%s: %s ({detail})",
+                        (self.config.user, self.config.host, redact_ssh_command(command)),
+                        failure,
+                        exc,
                     )
-                    return self._failure_result(command, reason)
+                    return self._failure_result(command, error_message, failure)
                 except BaseException:
                     # An exception escaping command cleanup is not proof of a
                     # closed channel. Keep its capacity charged and stop reuse.
@@ -728,14 +1002,17 @@ class SSHProbe:
                 if session_error is None:
                     session_error = exc
             if session_error is not None:
-                logger.warning(
-                    "SSH planned command session interrupted for %s@%s: %s",
-                    self.config.user,
-                    self.config.host,
+                error_message = str(session_error) or session_error.__class__.__name__
+                failure = classify_ssh_exception(session_error)
+                _log_local_failure(
+                    "SSH planned command session interrupted for %s@%s: {detail}",
+                    (self.config.user, self.config.host),
+                    failure,
                     session_error,
                 )
-                error_message = str(session_error) or session_error.__class__.__name__
-                results.extend(self._failure_result(command, error_message) for command in failed_pending_commands)
+                results.extend(
+                    self._failure_result(command, error_message, failure) for command in failed_pending_commands
+                )
 
         reusable = False
         try:
@@ -794,7 +1071,14 @@ class SSHProbe:
         if device_path is not None:
             SMARTCTL_STATUS_LOG.forget((self.config.host, self.config.port, device_path))
 
-    def _log_nonzero_exit(self, command: str, safe_command: str, exit_code: int) -> None:
+    def _log_nonzero_exit(
+        self,
+        command: str,
+        safe_command: str,
+        exit_code: int,
+        *,
+        stderr: str = "",
+    ) -> None:
         device_path = smartctl_device_path(command)
         if device_path is not None and not smartctl_exit_failed(exit_code):
             # smartctl read the device; the set bits are SMART data that the
@@ -814,7 +1098,14 @@ class SSHProbe:
             return
         summary = SSH_COMMAND_FAILURE_LOG.admit((self.config.host, self.config.port, safe_command), exit_code)
         if summary is not None:
-            logger.warning("SSH command failed: %s (exit=%s)%s", safe_command, exit_code, summary.suffix())
+            reason = classify_ssh_command_failure(exit_code=exit_code, stderr=stderr)
+            logger.warning(
+                "SSH command failed: %s (exit=%s reason=%s)%s",
+                safe_command,
+                exit_code,
+                reason,
+                summary.suffix(),
+            )
 
     def _run_command_sync(
         self,
@@ -835,14 +1126,15 @@ class SSHProbe:
                     _cancel=_cancel,
                 )
         except Exception as exc:
-            logger.warning(
-                "SSH command failed to start for %s@%s: %s",
-                self.config.user,
-                self.config.host,
+            error_message = str(exc) or exc.__class__.__name__
+            failure = classify_ssh_exception(exc)
+            _log_local_failure(
+                "SSH command failed to start for %s@%s: {detail}",
+                (self.config.user, self.config.host),
+                failure,
                 exc,
             )
-            error_message = str(exc) or exc.__class__.__name__
-            return self._failure_result(command, error_message)
+            return self._failure_result(command, error_message, failure)
 
     def _client(self, *, _cancel: _WorkerCancellation | None = None):
         client = paramiko.SSHClient()
@@ -957,6 +1249,7 @@ class SSHProbe:
             return self._failure_result(
                 command,
                 "SSH command input cannot be combined with sudo password input.",
+                SSHLocalFailure("input_not_supported"),
             )
         _cancel = _cancel or _WorkerCancellation()
         _cancel.check()
@@ -998,7 +1291,9 @@ class SSHProbe:
                         received = True
                         if len(output_bytes) + len(error_bytes) > output_limit:
                             return self._failure_result(
-                                command, f"SSH command output exceeded the {output_limit}-byte limit.",
+                                command,
+                                f"SSH command output exceeded the {output_limit}-byte limit.",
+                                SSHLocalFailure("output_limit_exceeded"),
                             )
                 # Exit status can precede the last data/EOF. Conversely, EOF
                 # without status must keep the original deadline, not wait().
@@ -1016,7 +1311,7 @@ class SSHProbe:
             if ok:
                 self._forget_logged_exit(command, safe_command)
             else:
-                self._log_nonzero_exit(command, safe_command, exit_code)
+                self._log_nonzero_exit(command, safe_command, exit_code, stderr=error)
             return SSHCommandResult(
                 command=command,
                 ok=ok,
@@ -1033,14 +1328,15 @@ class SSHProbe:
             )
             if raise_channel_refusal and isinstance(effective_error, paramiko.ChannelException):
                 raise
-            logger.warning(
-                "SSH command execution failed for %s@%s: %s",
-                self.config.user,
-                self.config.host,
+            error_message = str(effective_error) or effective_error.__class__.__name__
+            failure = classify_ssh_exception(effective_error)
+            _log_local_failure(
+                "SSH command execution failed for %s@%s: {detail}",
+                (self.config.user, self.config.host),
+                failure,
                 effective_error,
             )
-            error_message = str(effective_error) or effective_error.__class__.__name__
-            return self._failure_result(command, error_message)
+            return self._failure_result(command, error_message, failure)
         finally:
             # Cancel and join the watchdog before reuse: no late timer may
             # close the next command's connection. Channel closure precedes
@@ -1062,12 +1358,13 @@ class SSHProbe:
                 stdin = stdout = _stderr = stream = streams = effective_error = None
 
     @staticmethod
-    def _failure_result(command: str, error_message: str) -> SSHCommandResult:
+    def _failure_result(command: str, error_message: str, failure: SSHLocalFailure) -> SSHCommandResult:
         return SSHCommandResult(
             command=command,
             ok=False,
             stderr=error_message,
             exit_code=255,
+            local_failure=failure,
         )
 
     def _command_list(self, commands: Iterable[str] | None = None) -> list[str]:
@@ -1151,13 +1448,15 @@ class SSHSession:
             except Exception as exc:
                 if _cancel is not None:
                     _cancel.check()
-                logger.warning(
-                    "SSH command failed to start for %s@%s: %s",
-                    self._probe.config.user,
-                    self._probe.config.host,
+                error_message = str(exc) or exc.__class__.__name__
+                failure = classify_ssh_exception(exc)
+                _log_local_failure(
+                    "SSH command failed to start for %s@%s: {detail}",
+                    (self._probe.config.user, self._probe.config.host),
+                    failure,
                     exc,
                 )
-                return self._probe._failure_result(command, str(exc) or exc.__class__.__name__)
+                return self._probe._failure_result(command, error_message, failure)
             try:
                 if _cancel is not None:
                     _cancel.register(client)
