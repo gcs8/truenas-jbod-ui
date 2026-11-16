@@ -1423,6 +1423,10 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ plan_token: plan.token }),
             timeoutMs: LONG_TIMEOUT_MS,
+            // A run that stopped, or that a keeper check refused, answers 200
+            // with ok: false and its result; that is a result to show, not a
+            // failed request. Anything without the result shape stays a failure.
+            acceptPartialResult: (value) => typeof value?.state !== "string" && Array.isArray(value?.deleted),
           });
           state.cleanupPlan = null;
           // A result comes only from the scheduler's own answer. Anything else

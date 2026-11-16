@@ -1029,6 +1029,52 @@ async function applyThroughTransport(answer) {
   return { elements, banners, extraReads: lists - before, applies };
 }
 
+test("a stopped or refused clean-up answered with ok: false shows its result through the page's own transport (#1188)", async () => {
+  // The scheduler answers a run that stopped, or that a keeper check refused,
+  // with HTTP 200 and ok: false. The admin transport treats ok: false as a
+  // failed request unless the caller accepts the result.
+  const reason = "Kept copy could not be checked (keeper-check-budget-exhausted).";
+  const cases = {
+    "keeper check refused after three damaged copies": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: reason }, not_attempted: [],
+        downgraded: ["full-a", "full-b", "full-c"], kept_after_replan: [] },
+      `Clean up stopped after 0 of 1: ${reason} `
+        + "3 of the copies it kept failed the size and SHA-256 check and were marked unverified. "
+        + "Run Verify on the copies marked unverified, or back up again to replace them.",
+    ],
+    "a deletion failed": [
+      { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: "permission denied" }, not_attempted: [],
+        downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1: permission denied",
+    ],
+    "nothing attempted": [
+      { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: ["cfg-old"], downgraded: [], kept_after_replan: [] },
+      "Clean up stopped after 0 of 1.",
+    ],
+  };
+  for (const [name, [answer, text]] of Object.entries(cases)) {
+    const { elements, banners, applies } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.equal(applies, 1, name);
+    assert.equal(resultNode(elements).textContent, text, name);
+    assert.deepEqual(banners.at(-1), [text, "error"], name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up failed|Request failed with 200/, name);
+  }
+});
+
+test("an ok: false answer that is not a clean-up result is still a failed request (#1188)", async () => {
+  // Control: only the scheduler's own result shape is accepted.
+  const answers = {
+    "no result": { ok: false, detail: "synthetic refusal" },
+    "a result list that is not a list": { ok: false, deleted: "cfg-old" },
+    "a named state beside a result": { ok: false, state: "cleanup_state_unknown", deleted: [] },
+  };
+  for (const [name, answer] of Object.entries(answers)) {
+    const { elements } = await applyThroughTransport(() => jsonResponse(200, answer));
+    assert.match(resultNode(elements).textContent, /^Clean up failed: /, name);
+    assert.doesNotMatch(elements.dialog.textContent, /Clean up stopped|Deleted \d/, name);
+  }
+});
+
 test("a clean-up the admin service never sent says it did not start, and reads nothing more (#1188)", async () => {
   const { elements, banners, extraReads, applies } = await applyThroughTransport(() => jsonResponse(503, NOT_SENT_BODY));
   assert.equal(applies, 1);
