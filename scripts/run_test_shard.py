@@ -110,6 +110,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_history_smart_metric_failure",
         "test_jbod_runner_trial",
         "test_mapping_store",
+        "test_mapping_store_writer_lock",
         "test_metrics",
         "test_perf",
         "test_perf_harness",
@@ -129,6 +130,7 @@ SHARDS: dict[str, tuple[str, ...]] = {
         "test_system_backup",
         "test_system_setup_api_dialect",
         "test_system_setup_field_ownership",
+        "test_system_setup_legacy_add",
         "test_truenas_ws",
     ),
     "2": (

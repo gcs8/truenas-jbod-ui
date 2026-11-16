@@ -233,6 +233,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_storage_view_smart_batch",
             "tests.test_system_backup",
             "tests.test_system_setup_field_ownership",
+            "tests.test_system_setup_legacy_add",
         ),
     ),
     WindowsExclusion(
@@ -257,6 +258,7 @@ WINDOWS_EXCLUSIONS = (
             "tests.test_image_upgrade_contract",
             "tests.test_image_upgrade_smoke_safety",
             "tests.test_mapping_store",
+            "tests.test_mapping_store_writer_lock",
             "tests.test_nonroot_migration",
             "tests.test_perf_harness",
             "tests.test_private_qa_restore",
