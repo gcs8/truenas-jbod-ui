@@ -620,6 +620,32 @@ class HistoryBackupSourceReplacedError(RuntimeError):
     """The hot database changed identity during a backup copy; nothing was published."""
 
 
+# A timestamp this service writes is 32 characters, 64 bytes in a UTF-16
+# database. A restored database can hold text of any length in the same
+# column; retention deletes such a row like any other old text but does not
+# read its text back, so a batch holds at most this much for each row.
+_RETENTION_FLOOR_TEXT_MAX_BYTES = 256
+
+
+def _history_utc_instant(value: object) -> str | None:
+    """Exact UTC instant of an offset-aware ISO-8601 timestamp, or None.
+
+    Fixed-width text (microseconds, four-digit year), so text order is time
+    order. Retention uses it instead of julianday(), which rounds to the
+    millisecond and would merge distinct samples (#1204).
+    """
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="microseconds")
+    except (ValueError, OverflowError):
+        return None
+
+
 class HistoryStore:
     def __init__(
         self,
@@ -3223,6 +3249,9 @@ class HistoryStore:
             "interrupted": False,
         }
 
+        # In-memory scan state for this pass only (see _maintain_retention_batch).
+        scan_floors: dict[str, tuple[bytes | str, int]] = {}
+        finished_tables: set[str] = set()
         for _ in range(max_batches):
             if should_continue is not None and not should_continue():
                 summary["interrupted"] = True
@@ -3233,6 +3262,8 @@ class HistoryStore:
                         connection,
                         cutoffs=cutoffs,
                         batch_size=batch_size,
+                        scan_floors=scan_floors,
+                        finished_tables=frozenset(finished_tables),
                     ),
                     migration_lock_held=migration_lock_held,
                 )
@@ -3242,6 +3273,8 @@ class HistoryStore:
                 setattr(exc, "retention_summary", dict(summary))
                 raise
             summary["batches_completed"] += 1
+            scan_floors.update(batch["scan_floors"])
+            finished_tables.update(batch["finished_tables"])
             for key in (
                 "metric_samples_removed",
                 "events_removed",
@@ -3311,73 +3344,268 @@ class HistoryStore:
         *,
         cutoffs: dict[str, str | None],
         batch_size: int,
+        scan_floors: dict[str, tuple[bytes | str, int]] | None = None,
+        finished_tables: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         # The same ordered, bounded subquery selects the batch for both rollups and
         # the delete, so the rows aggregated are exactly the rows removed and the
         # batch size never turns into one SQL variable per row.
+        #
+        # Work: rows whose text sorts at or after the cutoff are never visited,
+        # and rows before the settled bound are taken in index order, so one
+        # batch visits at most batch_size rows plus the rows whose text lies in
+        # the day before the cutoff that the exact-time test rejects. Two pieces
+        # of in-memory state, kept for one pass only, stop later batches of the
+        # same pass reading those rejected rows again (#1204):
+        # - a scan floor per table (the last row a batch deleted, by text and
+        #   key): the next batch starts after it;
+        # - a finished set: a table whose batch deleted nothing has nothing
+        #   eligible from its floor, so it is not read again in this pass while
+        #   other tables keep the pass running.
+        # Both only narrow the scan. A row another writer adds behind the
+        # floor, or in a finished table, waits for the next pass: a deletion
+        # can be delayed, never advanced. A rollup this batch writes is known
+        # to the pass, so when its bucket is already past that table's cutoff
+        # the same batch deletes it by key, wherever it lies; has_more=false
+        # therefore never leaves a row the pass wrote and could delete. Rollups
+        # still cover exactly the raw rows deleted, because one subquery
+        # selects both. Each table's rejected window rows are therefore read a
+        # bounded number of times per pass, whatever the other tables hold.
+        cls._register_retention_functions(connection)
+        floors = dict(scan_floors or {})
+        finished = set(finished_tables)
+
+        def active(name: str, cutoff: str | None) -> bool:
+            return cutoff is not None and name not in finished
+
+        def record(name: str, removed: int) -> int:
+            if not removed:
+                finished.add(name)
+            return removed
+
         metric_samples_removed = 0
-        if cutoffs["metric"] is not None:
-            cls._roll_up_metric_rows(
-                connection,
-                cutoff=cutoffs["metric"],
-                batch_size=batch_size,
-                bucket_seconds=3600,
-            )
-            cls._roll_up_metric_rows(
-                connection,
-                cutoff=cutoffs["metric"],
-                batch_size=batch_size,
-                bucket_seconds=86400,
-            )
-            metric_samples_removed = cls._delete_expired_rows(
+        written_expired: dict[int, list[int]] = {3600: [], 86400: []}
+        if active("metric_samples", cutoffs["metric"]):
+            for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
+                written_expired[bucket_seconds] = cls._roll_up_metric_rows(
+                    connection,
+                    cutoff=cutoffs["metric"],
+                    batch_size=batch_size,
+                    bucket_seconds=bucket_seconds,
+                    floor=floors.get("metric_samples"),
+                    rollup_cutoff=cutoffs[kind],
+                )
+            metric_samples_removed = record("metric_samples", cls._delete_expired_rows(
                 connection,
                 table_name="metric_samples",
                 timestamp_column="observed_at",
                 cutoff=cutoffs["metric"],
                 batch_size=batch_size,
-            )
+                floors=floors,
+            ))
 
-        events_removed = cls._delete_expired_rows(
-            connection,
-            table_name="slot_events",
-            timestamp_column="observed_at",
-            cutoff=cutoffs["event"],
-            batch_size=batch_size,
+        events_removed = 0
+        if active("slot_events", cutoffs["event"]):
+            events_removed = record("slot_events", cls._delete_expired_rows(
+                connection,
+                table_name="slot_events",
+                timestamp_column="observed_at",
+                cutoff=cutoffs["event"],
+                batch_size=batch_size,
+                floors=floors,
+            ))
+        rollups_removed = {}
+        for bucket_seconds, kind in ((3600, "hourly"), (86400, "daily")):
+            name = f"rollups_{bucket_seconds}"
+            # At most one written rollup per raw row this batch selected, so
+            # these never exceed the batch size; they count against it.
+            removed = connection.executemany(
+                "DELETE FROM metric_rollups WHERE rowid = ? AND bucket_seconds = ?",
+                [(rowid, bucket_seconds) for rowid in written_expired[bucket_seconds]],
+            ).rowcount if written_expired[bucket_seconds] else 0
+            if active(name, cutoffs[kind]) and removed < batch_size:
+                removed += record(name, cls._delete_rollup_batch(
+                    connection,
+                    bucket_seconds=bucket_seconds,
+                    cutoff=cutoffs[kind],
+                    batch_size=batch_size - removed,
+                    floors=floors,
+                ))
+            rollups_removed[bucket_seconds] = removed
+        # A table that just deleted nothing has nothing eligible left in this
+        # transaction, so it is skipped here too; a table whose check finds
+        # nothing is finished as well.
+        remaining_checks = (
+            ("metric_samples", cutoffs["metric"], lambda floor: cls._retention_rows_exist(
+                connection, "metric_samples", "observed_at", cutoffs["metric"], floor=floor,
+            )),
+            ("slot_events", cutoffs["event"], lambda floor: cls._retention_rows_exist(
+                connection, "slot_events", "observed_at", cutoffs["event"], floor=floor,
+            )),
+            ("rollups_3600", cutoffs["hourly"], lambda floor: cls._rollups_exist(
+                connection, 3600, cutoffs["hourly"], floor=floor,
+            )),
+            ("rollups_86400", cutoffs["daily"], lambda floor: cls._rollups_exist(
+                connection, 86400, cutoffs["daily"], floor=floor,
+            )),
         )
-        hourly_rollups_removed = cls._delete_rollup_batch(
-            connection,
-            bucket_seconds=3600,
-            cutoff=cutoffs["hourly"],
-            batch_size=batch_size,
-        )
-        daily_rollups_removed = cls._delete_rollup_batch(
-            connection,
-            bucket_seconds=86400,
-            cutoff=cutoffs["daily"],
-            batch_size=batch_size,
-        )
-        has_more = any(
-            (
-                cls._retention_rows_exist(connection, "metric_samples", "observed_at", cutoffs["metric"]),
-                cls._retention_rows_exist(connection, "slot_events", "observed_at", cutoffs["event"]),
-                cls._rollups_exist(connection, 3600, cutoffs["hourly"]),
-                cls._rollups_exist(connection, 86400, cutoffs["daily"]),
-            )
-        )
+        has_more = False
+        for name, cutoff, exists in remaining_checks:
+            if active(name, cutoff):
+                if exists(floors.get(name)):
+                    has_more = True
+                else:
+                    finished.add(name)
         return {
             "metric_samples_removed": metric_samples_removed,
             "events_removed": events_removed,
-            "hourly_rollups_removed": hourly_rollups_removed,
-            "daily_rollups_removed": daily_rollups_removed,
+            "hourly_rollups_removed": rollups_removed[3600],
+            "daily_rollups_removed": rollups_removed[86400],
             "has_more": has_more,
+            "scan_floors": floors,
+            "finished_tables": frozenset(finished),
         }
 
     @staticmethod
-    def _expired_rows_subquery(table_name: str, timestamp_column: str) -> str:
+    def _register_retention_functions(connection: sqlite3.Connection) -> None:
+        # Retention passes stored text as a BLOB in the database's encoding,
+        # so text that does not decode reaches here instead of failing the
+        # statement; like any other text that is not a time, it has none.
+        encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+
+        def utc_instant(value: object) -> str | None:
+            try:
+                text = value.decode(encoding) if isinstance(value, bytes) else value
+            except UnicodeDecodeError:
+                return None
+            return _history_utc_instant(text)
+
+        connection.create_function("_history_utc_instant", 1, utc_instant, deterministic=True)
+
+    @staticmethod
+    def _newer_last_sample(new: str, old: str) -> str:
+        """SQL: whether the sample at time text `new` gives a bucket's last value over `old`.
+
+        One total order, the same as the raw-sample rank in
+        _roll_up_metric_rows: SQLite's own reading, which also names the
+        bucket, then the stored text as before #1204; a later arrival wins
+        where both are equal, as the higher row id does in the rank. So the
+        last value does not depend on how the samples were batched.
+
+        SQLite's reading rounds to about a millisecond, which can tie two
+        samples but never puts an earlier one after a later one. Inside one
+        such millisecond the text decides, even between two times that each
+        name an exact instant, so a sample a fraction of a millisecond older
+        can give the last value when its text sorts last. The service writes
+        one timestamp format, whose text sorts in time order, and never
+        samples one counter twice in a millisecond: only restored or imported
+        text can meet this.
+
+        Text SQLite does not read (a NULL reading) is older than any text it
+        reads, as NULL sorts in the rank; two such texts compare as text. A
+        raw sample with one has no bucket, so only the last time of a kept
+        or restored bucket can be one, and the first readable sample merged
+        into that bucket replaces it.
+        """
+
+        day_new, day_old = f"julianday({new})", f"julianday({old})"
         return (
-            f"SELECT id FROM {table_name} WHERE {timestamp_column} < ? "
+            f"CASE WHEN {day_new} > {day_old} THEN 1 WHEN {day_new} < {day_old} THEN 0 "
+            f"WHEN ({day_new} IS NULL) <> ({day_old} IS NULL) THEN {day_old} IS NULL "
+            f"ELSE {new} >= {old} END"
+        )
+
+    @staticmethod
+    def _retention_bounds(cutoff: str) -> tuple[str, str, str | None]:
+        """Return (cutoff, settled bound, cutoff instant) for a retention predicate.
+
+        Stored timestamps may carry any UTC offset, so their text order is not
+        their time order (#1204). A row is expired when its text sorts before
+        the cutoff AND either its text sorts before the settled bound or its
+        exact UTC instant is before the cutoff's.
+
+        The settled bound is the date one day before the cutoff. A UTC offset
+        is less than 24 hours, so a row whose text starts with an earlier date
+        is older than the cutoff whatever its offset; those rows need no parse,
+        exactly as before. Only rows in the last day or so before the cutoff
+        are parsed, so a batch never reads the rows newer than the cutoff, and
+        a row whose time cannot be read is kept only until it ages past the
+        settled bound. A row stored with a positive offset whose text still
+        sorts after the cutoff is expired on a later pass, never early.
+        """
+
+        settled = (datetime.fromisoformat(cutoff) - timedelta(days=1)).date().isoformat()
+        return cutoff, settled, _history_utc_instant(cutoff)
+
+    @staticmethod
+    def _expired_timestamp_predicate(
+        timestamp_column: str,
+        key_column: str = "id",
+        *,
+        floored: bool,
+    ) -> str:
+        # Parameters: _retention_parameters(cutoff, floor). The first comparison
+        # keeps the scan on the timestamp index and bounded by the cutoff. With
+        # a floor, the last one starts the scan after it. Without one there is
+        # no lower bound at all: no sentinel value, which a legal row could
+        # equal and so be skipped.
+        predicate = (
+            f"{timestamp_column} < ? AND ({timestamp_column} < ? "
+            f"OR _history_utc_instant(CAST({timestamp_column} AS BLOB)) < ?)"
+        )
+        if floored:
+            predicate += f" AND ({timestamp_column}, {key_column}) > (CAST(? AS TEXT), ?)"
+        return predicate
+
+    @classmethod
+    def _retention_parameters(
+        cls,
+        cutoff: str,
+        floor: tuple[bytes | str, int] | None,
+    ) -> tuple[Any, ...]:
+        return (*cls._retention_bounds(cutoff), *(floor or ()))
+
+    @classmethod
+    def _expired_rows_subquery(cls, table_name: str, timestamp_column: str, *, floored: bool) -> str:
+        # Parameters: _retention_parameters(cutoff, floor), then the batch size.
+        return (
+            f"SELECT id FROM {table_name} "
+            f"WHERE {cls._expired_timestamp_predicate(timestamp_column, floored=floored)} "
             f"ORDER BY {timestamp_column}, id LIMIT ?"
         )
+
+    @staticmethod
+    def _deleted_floor_text(timestamp_column: str) -> str:
+        """RETURNING expression: the deleted row's timestamp text, or NULL when too long."""
+
+        text = f"CAST({timestamp_column} AS BLOB)"
+        return f"CASE WHEN length({text}) <= {_RETENTION_FLOOR_TEXT_MAX_BYTES} THEN {text} END"
+
+    @staticmethod
+    def _advance_scan_floor(
+        connection: sqlite3.Connection,
+        floors: dict[str, tuple[bytes | str, int]],
+        name: str,
+        deleted: list[Any],
+    ) -> int:
+        # Every row before a deleted one (by text, then key) was read by this
+        # batch: deleted, or rejected by the exact-time test. The floor is the
+        # last deleted row whose text was short enough to be read back; leaving
+        # the others out can only keep the floor lower.
+        named = [(bytes(row[0]), int(row[1])) for row in deleted if row[0] is not None]
+        if named:
+            text, key = max(named)
+            encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+            if encoding != "UTF-8":
+                # CAST(? AS TEXT) reads bound bytes as UTF-8, so a UTF-16 floor
+                # is bound as its string. Bytes that do not decode cannot be
+                # named: keep the lower floor and read those rows again.
+                try:
+                    text = text.decode(encoding)
+                except UnicodeDecodeError:
+                    return len(deleted)
+            floors[name] = (text, key)
+        return len(deleted)
 
     @classmethod
     def _delete_expired_rows(
@@ -3388,16 +3616,18 @@ class HistoryStore:
         timestamp_column: str,
         cutoff: str | None,
         batch_size: int,
+        floors: dict[str, tuple[bytes | str, int]],
     ) -> int:
         if cutoff is None:
             return 0
-        subquery = cls._expired_rows_subquery(table_name, timestamp_column)
-        return int(
-            connection.execute(
-                f"DELETE FROM {table_name} WHERE id IN ({subquery})",
-                (cutoff, batch_size),
-            ).rowcount
-        )
+        floor = floors.get(table_name)
+        subquery = cls._expired_rows_subquery(table_name, timestamp_column, floored=floor is not None)
+        deleted = connection.execute(
+            f"DELETE FROM {table_name} WHERE id IN ({subquery}) "
+            f"RETURNING {cls._deleted_floor_text(timestamp_column)}, id",
+            (*cls._retention_parameters(cutoff, floor), batch_size),
+        ).fetchall()
+        return cls._advance_scan_floor(connection, floors, table_name, deleted)
 
     @classmethod
     def _roll_up_metric_rows(
@@ -3407,15 +3637,38 @@ class HistoryStore:
         cutoff: str,
         batch_size: int,
         bucket_seconds: int,
-    ) -> None:
+        floor: tuple[bytes | str, int] | None,
+        rollup_cutoff: str | None = None,
+    ) -> list[int]:
+        """Roll the selected raw rows up; return the written rollups already expired.
+
+        Expiry is the rollup table's own predicate, evaluated on each row the
+        statement inserted or updated.
+        """
+
+        if rollup_cutoff is None:
+            returning, returning_parameters = "RETURNING rowid, 0", ()
+        else:
+            returning = (
+                "RETURNING rowid, "
+                + cls._expired_timestamp_predicate("bucket_start", "rowid", floored=False)
+            )
+            returning_parameters = cls._retention_bounds(rollup_cutoff)
         if bucket_seconds == 3600:
             bucket_expression = "strftime('%Y-%m-%dT%H:00:00+00:00', observed_at)"
         elif bucket_seconds == 86400:
             bucket_expression = "strftime('%Y-%m-%dT00:00:00+00:00', observed_at)"
         else:
             raise ValueError("Unsupported history rollup interval.")
-        expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at")
-        connection.execute(
+        expired_rows = cls._expired_rows_subquery("metric_samples", "observed_at", floored=floor is not None)
+        # The last value's order (see _newer_last_sample): SQLite's reading,
+        # the text, then the row id. Rows without a value are not ranked.
+        partition = (
+            f"{bucket_expression}, system_id, enclosure_key, slot, "
+            "metric_name, COALESCE(disk_identity_key, '')"
+        )
+        newer = cls._newer_last_sample("excluded.last_observed_at", "metric_rollups.last_observed_at")
+        written = connection.execute(
             f"""
             INSERT INTO metric_rollups (
                 bucket_start, bucket_seconds, system_id, system_label,
@@ -3436,7 +3689,7 @@ class HistoryStore:
                     CASE WHEN rollup_rank = 1
                     THEN COALESCE(value_real, CAST(value_integer AS REAL)) END
                 ),
-                MAX(observed_at),
+                MAX(CASE WHEN rollup_rank = 1 THEN observed_at END),
                 MAX(device_name), MAX(serial), MAX(model), MAX(state),
                 MAX(gptid), MAX(persistent_id_label),
                 COALESCE(disk_identity_key, ''), MAX(logical_unit_id), MAX(sas_address)
@@ -3444,16 +3697,13 @@ class HistoryStore:
                 SELECT
                     metric_samples.*,
                     ROW_NUMBER() OVER (
-                        PARTITION BY
-                            {bucket_expression}, system_id, enclosure_key, slot,
-                            metric_name, COALESCE(disk_identity_key, '')
-                        ORDER BY observed_at DESC, id DESC
+                        PARTITION BY {partition}
+                        ORDER BY julianday(observed_at) DESC, observed_at DESC, id DESC
                     ) AS rollup_rank
                 FROM metric_samples
                 WHERE id IN ({expired_rows})
+                  AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
             ) selected_samples
-            WHERE 1 = 1
-              AND COALESCE(value_real, CAST(value_integer AS REAL)) IS NOT NULL
             GROUP BY
                 {bucket_expression}, system_id, enclosure_key, slot,
                 metric_name, COALESCE(disk_identity_key, '')
@@ -3469,15 +3719,10 @@ class HistoryStore:
                 value_sum = metric_rollups.value_sum + excluded.value_sum,
                 value_min = MIN(metric_rollups.value_min, excluded.value_min),
                 value_max = MAX(metric_rollups.value_max, excluded.value_max),
-                last_value = CASE
-                    WHEN excluded.last_observed_at >= metric_rollups.last_observed_at
-                    THEN excluded.last_value
-                    ELSE metric_rollups.last_value
-                END,
-                last_observed_at = MAX(
-                    metric_rollups.last_observed_at,
-                    excluded.last_observed_at
-                ),
+                last_value = CASE WHEN {newer}
+                    THEN excluded.last_value ELSE metric_rollups.last_value END,
+                last_observed_at = CASE WHEN {newer}
+                    THEN excluded.last_observed_at ELSE metric_rollups.last_observed_at END,
                 device_name = COALESCE(excluded.device_name, metric_rollups.device_name),
                 serial = COALESCE(excluded.serial, metric_rollups.serial),
                 model = COALESCE(excluded.model, metric_rollups.model),
@@ -3489,69 +3734,89 @@ class HistoryStore:
                 ),
                 logical_unit_id = COALESCE(excluded.logical_unit_id, metric_rollups.logical_unit_id),
                 sas_address = COALESCE(excluded.sas_address, metric_rollups.sas_address)
-            """,
-            (bucket_seconds, cutoff, batch_size),
-        )
+            """
+            + returning,
+            (
+                bucket_seconds,
+                *cls._retention_parameters(cutoff, floor),
+                batch_size,
+                *returning_parameters,
+            ),
+        ).fetchall()
+        return [int(row[0]) for row in written if row[1]]
 
-    @staticmethod
+    @classmethod
     def _delete_rollup_batch(
+        cls,
         connection: sqlite3.Connection,
         *,
         bucket_seconds: int,
         cutoff: str | None,
         batch_size: int,
+        floors: dict[str, tuple[bytes | str, int]],
     ) -> int:
         if cutoff is None:
             return 0
-        return int(
-            connection.execute(
-                """
-                DELETE FROM metric_rollups
-                WHERE rowid IN (
-                    SELECT rowid
-                    FROM metric_rollups
-                    WHERE bucket_seconds = ? AND bucket_start < ?
-                    ORDER BY bucket_start
-                    LIMIT ?
-                )
-                """,
-                (bucket_seconds, cutoff, batch_size),
-            ).rowcount
-        )
+        name = f"rollups_{bucket_seconds}"
+        floor = floors.get(name)
+        deleted = connection.execute(
+            f"""
+            DELETE FROM metric_rollups
+            WHERE rowid IN (
+                SELECT rowid
+                FROM metric_rollups
+                WHERE bucket_seconds = ?
+                  AND {cls._expired_timestamp_predicate('bucket_start', 'rowid', floored=floor is not None)}
+                ORDER BY bucket_start, rowid
+                LIMIT ?
+            )
+            RETURNING {cls._deleted_floor_text('bucket_start')}, rowid
+            """,
+            (bucket_seconds, *cls._retention_parameters(cutoff, floor), batch_size),
+        ).fetchall()
+        return cls._advance_scan_floor(connection, floors, name, deleted)
 
-    @staticmethod
+    @classmethod
     def _retention_rows_exist(
+        cls,
         connection: sqlite3.Connection,
         table_name: str,
         timestamp_column: str,
         cutoff: str | None,
+        *,
+        floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False
         row = connection.execute(
-            f"SELECT EXISTS(SELECT 1 FROM {table_name} WHERE {timestamp_column} < ? LIMIT 1)",
-            (cutoff,),
+            f"SELECT EXISTS(SELECT 1 FROM {table_name} "
+            f"WHERE {cls._expired_timestamp_predicate(timestamp_column, floored=floor is not None)} LIMIT 1)",
+            cls._retention_parameters(cutoff, floor),
         ).fetchone()
         return bool(row[0])
 
-    @staticmethod
+    @classmethod
     def _rollups_exist(
+        cls,
         connection: sqlite3.Connection,
         bucket_seconds: int,
         cutoff: str | None,
+        *,
+        floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False
         row = connection.execute(
-            """
+            f"""
             SELECT EXISTS(
                 SELECT 1
                 FROM metric_rollups
-                WHERE bucket_seconds = ? AND bucket_start < ?
+                WHERE bucket_seconds = ?
+                  AND {cls._expired_timestamp_predicate('bucket_start', 'rowid', floored=floor is not None)}
                 LIMIT 1
             )
             """,
-            (bucket_seconds, cutoff),
+            (bucket_seconds, *cls._retention_parameters(cutoff, floor)),
         ).fetchone()
         return bool(row[0])
 
