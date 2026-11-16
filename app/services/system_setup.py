@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -49,26 +51,42 @@ PRESERVE_SECRET_SENTINEL = "__TRUENAS_JBOD_KEEP_EXISTING_VALUE__"
 # `truenas` and `ssh` sections and their .env overrides, under this id.
 LEGACY_SYSTEM_ID = "default"
 _LEGACY_SYSTEM_SECTIONS = frozenset({"truenas", "ssh"})
-# A step that works when followed literally: a `systems` entry takes the same
-# `truenas` and `ssh` models, so every setting (including ones the setup form
-# does not show) moves with it. .env overrides apply only to the top level,
-# which is why their values must be copied in.
+# Secrets the loader can take from the environment for the implicit system.
+_LEGACY_SECRET_FIELDS = (
+    ("truenas", "api_key"),
+    ("truenas", "api_password"),
+    ("ssh", "password"),
+    ("ssh", "sudo_password"),
+)
+# A `systems` entry takes the same `truenas` and `ssh` models, but .env
+# overrides apply only to the top level, so moving the system means writing
+# the values in effect, secrets included, into config.yaml. The wiki section
+# carries the details (blank variables, `_FILE` variables).
 LEGACY_SYSTEM_MIGRATION_STEP = (
-    "Move it into config.yaml first: add a systems entry with id 'default', put the "
-    "top-level truenas and ssh sections under it, and copy any TRUENAS_ or SSH_ values "
-    "set in .env into the matching fields of that entry."
+    "Save 'default' in System Setup first, or move it into a systems entry with id "
+    "'default' in config.yaml with the values in effect; either way its API key and "
+    "passwords are then stored in config.yaml. See \"Moving a single system into "
+    "systems\" on the Advanced Configuration wiki page."
 )
 _LEGACY_SYSTEM_PREFIX = (
-    "This config still monitors a legacy system ('default') from its top-level "
-    "truenas and ssh settings in config.yaml or .env, and adding "
+    "This config monitors one system ('default') from its legacy top-level truenas "
+    "and ssh settings, and adding "
 )
 LEGACY_SYSTEM_MIGRATION_DETAIL = (
-    _LEGACY_SYSTEM_PREFIX + "another system now would stop monitoring it. "
+    _LEGACY_SYSTEM_PREFIX + "a system now would replace it. "
     + LEGACY_SYSTEM_MIGRATION_STEP + " Then add this one."
 )
 LEGACY_DEMO_MIGRATION_DETAIL = (
-    _LEGACY_SYSTEM_PREFIX + "a demo now would stop monitoring it. "
+    _LEGACY_SYSTEM_PREFIX + "a demo now would replace it. "
     + LEGACY_SYSTEM_MIGRATION_STEP + " Then add the demo."
+)
+LEGACY_SECRET_FROM_ENV_DETAIL = (
+    "The API key or a password of the 'default' system comes from .env, and saving it "
+    "here stores it in config.yaml. Type it in to save it there."
+)
+LEGACY_SECTIONS_INVALID_DETAIL = (
+    "The top-level truenas or ssh settings in config.yaml are not valid, so the "
+    "'default' system cannot be saved from them."
 )
 LINUX_NVME_LIST_SUBSYS_COMMAND = (
     "/usr/sbin/nvme list-subsys -o json 2>/dev/null || "
@@ -259,6 +277,39 @@ def _preserved_known_hosts_path(config_path: str | Path, raw_system: Any) -> str
     return str(configured)
 
 
+def _legacy_sections(config: dict[str, Any], *, with_environment: bool) -> dict[str, dict[str, Any]] | None:
+    """Copies of the top-level `truenas` and `ssh` sections, or None if not mappings.
+
+    With ``with_environment`` the .env overrides are applied by the loader's
+    own rules (a blank override is unset; a `_FILE` variable's content wins).
+    """
+    sections: dict[str, dict[str, Any]] = {}
+    for section in _LEGACY_SYSTEM_SECTIONS:
+        raw = config.get(section)
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            return None
+        sections[section] = copy.deepcopy(raw)
+    if with_environment:
+        apply_env_overrides(sections, sections=_LEGACY_SYSTEM_SECTIONS)
+    return sections
+
+
+def _validated_legacy_sections(
+    sections: dict[str, dict[str, Any]] | None,
+) -> tuple[TrueNASConfig, SSHConfig] | None:
+    if sections is None:
+        return None
+    try:
+        return (
+            TrueNASConfig.model_validate(sections["truenas"]),
+            SSHConfig.model_validate(sections["ssh"]),
+        )
+    except ValidationError:
+        return None
+
+
 def legacy_system_configured(config: dict[str, Any]) -> bool:
     """True when `config` monitors the implicit legacy system and no saved list.
 
@@ -273,25 +324,18 @@ def legacy_system_configured(config: dict[str, Any]) -> bool:
     """
     if config.get("systems"):
         return False
-    explicit: dict[str, Any] = {}
-    for section in _LEGACY_SYSTEM_SECTIONS:
-        raw = config.get(section)
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, dict):
-            return True
-        explicit[section] = dict(raw)
-    apply_env_overrides(explicit, sections=_LEGACY_SYSTEM_SECTIONS)
+    effective = _legacy_sections(config, with_environment=True)
+    if effective is None:
+        return True
     if any(
-        normalize_text(str(explicit[section].get("host") or ""))
+        normalize_text(str(effective[section].get("host") or ""))
         for section in _LEGACY_SYSTEM_SECTIONS
     ):
         return True
-    try:
-        truenas = TrueNASConfig.model_validate(explicit["truenas"])
-        ssh = SSHConfig.model_validate(explicit["ssh"])
-    except ValidationError:
+    validated = _validated_legacy_sections(effective)
+    if validated is None:
         return True
+    truenas, ssh = validated
     return bool(
         truenas.api_key
         or truenas.api_user
@@ -299,6 +343,39 @@ def legacy_system_configured(config: dict[str, Any]) -> bool:
         or ssh.enabled
         or ssh.password
         or ssh.sudo_password
+    )
+
+
+@dataclass(frozen=True)
+class _LegacySystem:
+    """The implicit system as the loader builds it, for an edit of `default`."""
+
+    system: SystemConfig
+    # The effective raw `ssh` mapping, for the operator's trust-file choice.
+    raw_system: dict[str, Any]
+    # Secret fields whose value in effect comes from the environment.
+    environment_secrets: frozenset[tuple[str, str]]
+
+
+def _effective_legacy_system(config: dict[str, Any]) -> _LegacySystem:
+    effective = _legacy_sections(config, with_environment=True)
+    validated = _validated_legacy_sections(effective)
+    if effective is None or validated is None:
+        # Never echo a validation error: it can quote a secret value.
+        raise ValueError(LEGACY_SECTIONS_INVALID_DETAIL)
+    truenas, ssh = validated
+    in_file = _validated_legacy_sections(_legacy_sections(config, with_environment=False))
+    environment_secrets = frozenset(
+        (section, field)
+        for section, field in _LEGACY_SECRET_FIELDS
+        if in_file is None
+        or getattr(in_file[0 if section == "truenas" else 1], field)
+        != getattr(truenas if section == "truenas" else ssh, field)
+    )
+    return _LegacySystem(
+        system=SystemConfig(id=LEGACY_SYSTEM_ID, label="Primary", truenas=truenas, ssh=ssh),
+        raw_system={"ssh": effective["ssh"]},
+        environment_secrets=environment_secrets,
     )
 
 
@@ -435,11 +512,17 @@ class SystemSetupService:
             raw_systems = list(config.get("systems") or [])
             next_index = len(raw_systems) + 1
             system_id = _normalize_system_id(payload.system_id or payload.label, next_index)
-            # Saving under the legacy id is an explicit edit of that system;
-            # any other id would leave it unmonitored, so refuse before
-            # writing instead of guessing a migration (#1227).
-            if system_id != LEGACY_SYSTEM_ID and legacy_system_configured(config):
-                raise ValueError(LEGACY_SYSTEM_MIGRATION_DETAIL)
+            # Without a saved list the config monitors one implicit system
+            # (#1227). Any add, under any id (`default` included), would
+            # replace it, so refuse before writing. An edit of `default`
+            # (replace_existing) starts from that system as the loader builds
+            # it, so the fields the form does not own keep their values.
+            legacy: _LegacySystem | None = None
+            if not config.get("systems"):
+                if system_id == LEGACY_SYSTEM_ID and payload.replace_existing:
+                    legacy = _effective_legacy_system(config)
+                elif legacy_system_configured(config):
+                    raise ValueError(LEGACY_SYSTEM_MIGRATION_DETAIL)
 
             existing_index = next(
                 (
@@ -456,6 +539,21 @@ class SystemSetupService:
             existing_system = None
             if existing_index is not None:
                 existing_system = SystemConfig.model_validate(raw_systems[existing_index])
+            elif legacy is not None:
+                existing_system = legacy.system
+                # Keeping a secret whose value comes from .env would copy it
+                # into config.yaml; that needs the operator to type it in.
+                kept = {
+                    ("truenas", "api_key"): payload.api_key,
+                    ("truenas", "api_password"): payload.api_password,
+                    ("ssh", "password"): payload.ssh_password,
+                    ("ssh", "sudo_password"): payload.ssh_sudo_password,
+                }
+                if any(
+                    kept[field] == PRESERVE_SECRET_SENTINEL
+                    for field in legacy.environment_secrets
+                ):
+                    raise ValueError(LEGACY_SECRET_FROM_ENV_DETAIL)
 
             # The setup form still has no dialect control, so a clone (a saved
             # system re-saved under a new id) has no `existing_system` to read.
@@ -589,10 +687,14 @@ class SystemSetupService:
                     ),
                     None,
                 )
-                if source_index is None:
+                if source_index is not None:
+                    source_system = SystemConfig.model_validate(raw_systems[source_index])
+                    ssh_commands = list(source_system.ssh.commands)
+                elif legacy is not None and source_system_id == LEGACY_SYSTEM_ID:
+                    # The loaded form keeps the implicit system's own list.
+                    ssh_commands = list(legacy.system.ssh.commands)
+                else:
                     raise ValueError("The saved SSH command list is unavailable.")
-                source_system = SystemConfig.model_validate(raw_systems[source_index])
-                ssh_commands = list(source_system.ssh.commands)
             elif payload.ssh_commands_action == "replace":
                 ssh_commands = list(payload.ssh_commands)
             else:
@@ -688,7 +790,9 @@ class SystemSetupService:
                 # operator set on this system in config.yaml is kept.
                 "known_hosts_path": _preserved_known_hosts_path(
                     self.config_path,
-                    raw_systems[existing_index] if existing_index is not None else None,
+                    raw_systems[existing_index]
+                    if existing_index is not None
+                    else (legacy.raw_system if legacy is not None else None),
                 ),
                 "strict_host_key_checking": payload.ssh_strict_host_key_checking,
                 "commands": list(ssh_commands),
@@ -744,7 +848,7 @@ class SystemSetupService:
 
             self._write_config(config)
             record_config_change("system.save", system_id)
-            return system, existing_index is not None
+            return system, existing_system is not None
 
     def _load_config(self) -> dict[str, Any]:
         if not self.config_path.exists():

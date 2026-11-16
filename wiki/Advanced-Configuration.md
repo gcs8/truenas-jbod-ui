@@ -181,6 +181,46 @@ systems:
         - /usr/bin/lsscsi -g
 ```
 
+## Moving a single system into systems
+
+A config without a `systems:` list monitors one system, with id `default`,
+built from the top-level `truenas` and `ssh` sections and the `TRUENAS_*` and
+`SSH_*` variables in `.env`. Saving a system under another id writes a
+`systems:` list, and from then on the top-level settings and those variables
+no longer apply. So while `default` has a host, a key or password, or SSH
+turned on, Admin refuses to add a system or a demo, under any id, until
+`default` is in the list. There are two ways to put it there.
+
+**In Admin.** Open `default` in **System Setup** and save it. The save keeps
+the settings the form does not show (API dialect, call limit, timeouts, extra
+SSH hosts, the known-hosts file and the command list). A key or password that
+comes from `.env` has to be typed in: Admin does not copy it into
+`config.yaml` on its own.
+
+**By hand.** In `config/config.yaml`:
+
+1. Add `systems:` with one entry, `id: default`, and put the top-level
+   `truenas` and `ssh` sections under it.
+2. For each `TRUENAS_*` or `SSH_*` variable that is set, write the value in
+   effect into the matching field of that entry (`TRUENAS_API_KEY` is
+   `truenas.api_key`, `SSH_KEY_PATH` is `ssh.key_path`; `SSH_COMMANDS_JSON`
+   and `SSH_EXTRA_HOSTS_JSON` hold JSON lists):
+   - A variable set to a blank value is ignored, so the value from
+     `config.yaml` stays in effect; do not copy the blank.
+   - A `_FILE` variable (for example `TRUENAS_API_KEY_FILE`) names a file,
+     and that file's content, without its final line break, is the value. It
+     wins over the same variable without `_FILE`. The entry has no `_FILE`
+     field, so write the content itself.
+   - Copy a user name, key or password exactly, spaces included.
+3. Restart or wait for the reload, check that `default` still connects, then
+   add the new system.
+
+Either way, the API key and passwords of `default` are then
+stored in `config.yaml` in plain text, and changing them in `.env` no longer
+has any effect. Keep the file readable by its owner only (Admin creates it with mode
+`0600` and keeps the mode of an existing file). A save from Admin rewrites
+`config.yaml` without its comments.
+
 ## Opening view order
 
 Each system can store a flat `view_order` containing both live enclosures and

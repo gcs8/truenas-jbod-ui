@@ -96,12 +96,31 @@ def load_secret_environment_value(env_name: str) -> str | None:
     return value
 
 
+def _remove_staged_file(temp_path: Path, staged: os.stat_result | None) -> None:
+    try:
+        if staged is None:
+            # Created by this call a moment ago and not yet identified.
+            temp_path.unlink(missing_ok=True)
+            return
+        current = temp_path.lstat()
+        if (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino):
+            temp_path.unlink()
+    except OSError:
+        # Never mask the original failure with a cleanup failure.
+        pass
+
+
 def write_text_atomically(path: Path, text: str) -> None:
     """Replace ``path`` with ``text`` through a fsynced temporary file.
 
     The temporary file is created with the existing file's mode, or 0o600
     for a new file, so a config file that holds credentials never passes
     through the umask default and a tighter mode set by the operator is kept.
+
+    Any failure or interruption before the rename leaves ``path`` as it was
+    and removes the temporary file this call created. A failure after the
+    rename (the directory sync) raises OSError: the new file is already in
+    place and its durability is uncertain.
     """
 
     try:
@@ -118,18 +137,32 @@ def write_text_atomically(path: Path, text: str) -> None:
         | getattr(os, "O_CLOEXEC", 0)
     )
     descriptor = os.open(temp_path, flags, mode)
+    staged: os.stat_result | None = None
+    handle = None
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            if hasattr(os, "fchmod"):
-                # os.open applies the umask; set the intended mode exactly.
-                os.fchmod(handle.fileno(), mode)
-            handle.write(text.encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
+        staged = os.fstat(descriptor)
+        handle = os.fdopen(descriptor, "wb")
+        if hasattr(os, "fchmod"):
+            # os.open applies the umask; set the intended mode exactly.
+            os.fchmod(handle.fileno(), mode)
+        handle.write(text.encode("utf-8"))
+        handle.flush()
+        os.fsync(handle.fileno())
+        if os.name != "posix":
+            # Windows cannot rename a file that is still open.
+            handle.close()
+        os.replace(temp_path, path)
     except BaseException:
-        temp_path.unlink(missing_ok=True)
+        # Nothing was published: remove the staging copy (it can hold
+        # credentials), but only while the name still holds this write's
+        # file. On POSIX the open handle keeps its inode from being reused.
+        _remove_staged_file(temp_path, staged)
         raise
-    os.replace(temp_path, path)
+    finally:
+        if handle is not None:
+            handle.close()
+        else:
+            os.close(descriptor)
     if os.name == "posix":
         # fsync the directory so the rename itself survives a power loss.
         try:
