@@ -285,6 +285,13 @@ QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
 # rows than this is a conflict, not a choice: membership stays unknown, and
 # per-disk admission work stays bounded by keys times this cap (#1211).
 QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX = 8
+# Hardware rows one disk's identity may gather (both inventory arrays, every
+# node and path). Reaching more, or a key filed under more, leaves the disk's
+# pool-device membership unknown and bounds per-disk work (#1211).
+QUANTASTOR_DISK_IDENTITY_ROWS_MAX = 16
+# Every hardware-row field a disk's identity can be reached by. Node-local
+# device paths are not among them.
+QUANTASTOR_HW_IDENTITY_FIELDS = ("physicalDiskId", "serialNum", "serialNumber", "serial", "scsiId", "sasAddress", "id")
 HCTL_NAME_REGEX = re.compile(r"^\d+:\d+:\d+:\d+$")
 BMC_SLOT_HINT_REGEX = re.compile(r"^bmc-slot:(\d+)$", re.IGNORECASE)
 SERIAL_LUNID_IDENTIFIER_REGEX = re.compile(r"^\{\$?serial_lunid\}\$?(?P<identifier>.+)$", re.IGNORECASE)
@@ -933,6 +940,18 @@ class _QuantastorPoolDeviceIndex:
             self.overloaded.add(key)
             return
         postings.append(position)
+
+
+@dataclass(slots=True)
+class _QuantastorHwIdentityIndex:
+    # Every hardware row of both arrays, with or without a slot, filed under
+    # every key in QUANTASTOR_HW_IDENTITY_FIELDS. A key maps to all rows that
+    # carry it and never overwrites; one carried by more rows than
+    # QUANTASTOR_DISK_IDENTITY_ROWS_MAX keeps no postings (#1211).
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    keys: list[frozenset[str]] = field(default_factory=list)
+    postings: dict[str, list[int]] = field(default_factory=dict)
+    overloaded: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True, slots=True)
@@ -10754,6 +10773,7 @@ class InventoryService:
             raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         )
         pool_device_index = self._build_quantastor_pool_device_index(raw_data)
+        hw_identity_index = self._build_quantastor_hw_identity_index(raw_data)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
@@ -10840,28 +10860,25 @@ class InventoryService:
             )
             if selected_enclosure_id and disk_enclosure_id and disk_enclosure_id != selected_enclosure_id:
                 continue
-            # Pool-device membership is decided once, after every key and every
-            # identity the service holds for this disk is gathered: the disk row,
-            # every hardware row its keys reach and the matched CLI row (identity
-            # only, never a lookup key). A node-local path admits only a row from
-            # the same node; a row that contradicts that identity never is; and
-            # identities that disagree among themselves leave it unknown (#1211).
+            # Pool-device membership is decided once, over every identity the
+            # service holds for this disk: every serial alias and ID on the disk
+            # row, each one on its own, then every hardware row those keys reach
+            # in the identity index, then those rows' keys, to a fixed point; and
+            # the matched CLI row (identity only, never a lookup key). The bay
+            # hint above is not an identity source. A node-local path admits only
+            # a row from the same node; a row that contradicts that identity
+            # never is; identities that disagree leave it unknown (#1211).
             disk_scope = owner_id or selected_system_id or pool_device_index.sole_system_id
-            reached_hw_rows, hw_overloaded = self._quantastor_reached_hw_rows(lookup_keys, hw_slot_hints)
+            reached_hw_rows, admission_keys, hw_overloaded = self._quantastor_disk_identity_rows(
+                hw_identity_index,
+                lookup_keys | self._quantastor_identity_keys(
+                    *(disk.get(name) for name in (
+                        "serialNumber", "serial", "id", "hwDiskId", "scsiId", "wwn", "wwid", "eui64")),
+                ),
+            )
             disk_identity = self._quantastor_pool_device_disk_identity(
                 disk, reached_hw_rows, disk_scope, cli_hint,
             )
-            admission_keys = set(lookup_keys)
-            for value in (
-                disk.get("serialNumber"),
-                disk.get("serial"),
-                *(
-                    row.get(name)
-                    for row in reached_hw_rows
-                    for name in ("physicalDiskId", "serialNum", "serialNumber", "scsiId", "sasAddress", "id")
-                ),
-            ):
-                admission_keys.update(normalize_lookup_keys(str(value) if value is not None else None))
             # Like an overloaded key: the identity cannot be gathered within the
             # bound, so the membership is unknown rather than decided on part of it.
             pool_device, pool_device_conflict = (None, True) if hw_overloaded else self._admit_quantastor_pool_device(
@@ -11142,8 +11159,6 @@ class InventoryService:
                     str(preferred_row.get("controllerId")) if preferred_row.get("controllerId") is not None else None
                 ),
                 "hw_raw": preferred_row,
-                # Every row of the group is an identity source for the disk (#1211).
-                "hw_rows": tuple(rows),
                 "source": row_source,
             }
             for row in rows:
@@ -11413,30 +11428,66 @@ class InventoryService:
         return index
 
     @staticmethod
-    def _quantastor_reached_hw_rows(
-        lookup_keys: set[str],
-        hw_slot_hints: dict[str, dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Every hardware row the disk's own keys reach, not only the one that places it.
+    def _quantastor_identity_keys(*values: Any) -> set[str]:
+        # Each value on its own: a blank alias is no key and hides no other.
+        keys: set[str] = set()
+        for value in values:
+            if text := normalize_value_text(value):
+                keys.update(key for key in normalize_lookup_keys(text) if key)
+        return keys
 
-        Returns (rows, overloaded). A hardware group with more rows than
-        QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX is not read row by row, which keeps
-        the work per disk bounded; its identity is then unknown.
+    @classmethod
+    def _build_quantastor_hw_identity_index(cls, raw_data: TrueNASRawData) -> _QuantastorHwIdentityIndex:
+        """Built once per pass: O(rows x fields) time and memory (#1211)."""
+        index = _QuantastorHwIdentityIndex()
+        for row in [*(raw_data.hw_disks or ()), *(raw_data.cli_hw_disks or ())]:
+            if not isinstance(row, dict):
+                continue
+            position = len(index.rows)
+            keys = frozenset(cls._quantastor_identity_keys(*(row.get(name) for name in QUANTASTOR_HW_IDENTITY_FIELDS)))
+            index.rows.append(row)
+            index.keys.append(keys)
+            for key in keys:
+                if key in index.overloaded:
+                    continue
+                postings = index.postings.setdefault(key, [])
+                if len(postings) >= QUANTASTOR_DISK_IDENTITY_ROWS_MAX:
+                    del index.postings[key]
+                    index.overloaded.add(key)
+                else:
+                    postings.append(position)
+        return index
+
+    @staticmethod
+    def _quantastor_disk_identity_rows(
+        index: _QuantastorHwIdentityIndex,
+        seeds: set[str],
+    ) -> tuple[list[dict[str, Any]], set[str], bool]:
+        """Every hardware row reachable from `seeds`, followed to a fixed point.
+
+        Returns (rows, keys, overloaded): the rows, every key seen (the seeds
+        included), and whether the walk met an overloaded key or more than
+        QUANTASTOR_DISK_IDENTITY_ROWS_MAX rows. Either way the identity is
+        unknown. Work per disk is at most (seeds + cap x keys per row) lookups
+        of at most cap postings each, whatever the order of the rows.
         """
-        hints: dict[int, dict[str, Any]] = {}
-        for key in lookup_keys:
-            hint = hw_slot_hints.get(key)
-            if hint is not None:
-                hints[id(hint)] = hint
-        rows: dict[int, dict[str, Any]] = {}
-        for hint in hints.values():
-            group = hint.get("hw_rows") or (hint.get("hw_raw"),)
-            if len(group) > QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX:
-                return [], True
-            for row in group:
-                if isinstance(row, dict):
-                    rows[id(row)] = row
-        return list(rows.values()), False
+        keys = set(seeds)
+        frontier = list(keys)
+        visited: set[int] = set()
+        while frontier:
+            key = frontier.pop()
+            if key in index.overloaded:
+                return [], keys, True
+            for position in index.postings.get(key, ()):
+                if position in visited:
+                    continue
+                visited.add(position)
+                if len(visited) > QUANTASTOR_DISK_IDENTITY_ROWS_MAX:
+                    return [], keys, True
+                new_keys = index.keys[position] - keys
+                keys |= new_keys
+                frontier.extend(new_keys)
+        return [index.rows[position] for position in sorted(visited)], keys, False
 
     @staticmethod
     def _quantastor_pool_device_disk_identity(
@@ -11447,9 +11498,10 @@ class InventoryService:
     ) -> dict[str, set[str]]:
         """Every serial, SCSI ID and same-node physical disk ID known for the disk.
 
-        Sources: every alias on the disk row, every hardware row its keys reach
-        and the CLI row matched to it (#1211). More than one value of a kind
-        means those sources disagree about which disk this is.
+        Sources: every alias on the disk row, every hardware row reached from
+        it in the identity index and the CLI row matched to it (#1211). More
+        than one value of a kind means those sources disagree about which disk
+        this is.
         """
         cli = cli_row if isinstance(cli_row, dict) else {}
 
@@ -11461,7 +11513,7 @@ class InventoryService:
         scsi = texts(disk.get("scsiId"), cli.get("scsiId"))
         physical = texts(disk.get("id"))
         for row in hw_rows:
-            serial |= texts(row.get("serialNum"), row.get("serialNumber"))
+            serial |= texts(row.get("serialNum"), row.get("serialNumber"), row.get("serial"))
             scsi |= texts(row.get("scsiId"))
             # A hardware row's physical disk ID is node-local: it names this
             # disk only when the hardware row comes from the disk's own node.

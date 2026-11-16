@@ -53,12 +53,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   (such as `/dev/sda`) no longer moves a disk to that node's bay or gives it
   that node's pool. A pool-device row must match the disk by stable identity,
   or by path on the disk's own node, and is chosen once over every identity
-  the disk row, its hardware rows and its CLI row report; a bay's pool
-  topology comes from that same row. If those identities disagree, or equally
-  ranked rows disagree on bay, pool, vdev, class or status, the disk's
-  pool-device membership and member status are withheld with a page warning,
-  whatever the row order, while the pool and health the disk reports for
-  itself still show (#1264).
+  the disk row, its CLI row and every hardware row linked to it report (from
+  either hardware list, with or without a slot, directly or through another
+  linked row); a bay's pool topology comes from that same row. If those
+  identities disagree, if more hardware rows are linked than a fixed cap, or
+  if equally ranked rows disagree on bay, pool, vdev, class or status, the
+  disk's pool-device membership and member status are withheld with a page
+  warning, whatever the row order, while the pool and health the disk
+  reports for itself still show (#1264).
 - A failed history collection pass now logs which stage failed, the source
   failure kind and scope, and SQLite's error code, name and coarse class
   (busy/locked, full, I/O, corrupt), still without exception messages, SQL,
