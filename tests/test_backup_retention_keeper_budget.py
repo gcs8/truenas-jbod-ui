@@ -10,6 +10,7 @@ remote target is the real filesystem transport over a temporary directory.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import threading
@@ -323,8 +324,9 @@ class SchedulerKeeperCheckTests(SchedulerTestBase):
 
         scheduler = self.make({"full": {"enabled": True}})
         for count, expected in (
-            (1, "1 kept backup copy failed the size and SHA-256 check and was marked unverified."),
-            (3, "3 kept backup copies failed the size and SHA-256 check and were marked unverified."),
+            # "N of the copies it kept", so the count cannot read as a tally of kept copies.
+            (1, "1 of the copies it kept failed the size and SHA-256 check and was marked unverified."),
+            (3, "3 of the copies it kept failed the size and SHA-256 check and were marked unverified."),
         ):
             with self.subTest(count=count):
                 result = SimpleNamespace(
@@ -395,13 +397,28 @@ class _LateScheduler:
         self.thread.join(HANG_TIMEOUT_SECONDS)
 
 
-class AdminCleanupApplyWaitTests(unittest.TestCase):
-    """A manual clean-up apply that outlasts the admin wait is reported as still running."""
+# What the admin apply route says when the clean-up's own answer did not arrive.
+# Each is chosen from one follow-up status read of the scheduler, never from
+# the timeout alone.
+CLEANUP_RUNNING = (
+    "A clean-up is running on the backup service and can still delete the copies in its plan. "
+    "The result of this request did not reach the admin service. This page checks again by itself; "
+    "when the clean-up finishes, the Last clean-up line shows the latest result the backup service recorded."
+)
+CLEANUP_NOT_RUNNING = (
+    "The result of this clean-up did not reach the admin service, and the backup service reports that "
+    "no clean-up is running now. The Last clean-up line shows the latest result the backup service recorded."
+)
+CLEANUP_STATE_UNKNOWN = (
+    "The result of this clean-up did not reach the admin service, and the backup service did not say "
+    "whether a clean-up is still running, so its state is not known. It may still be running and may "
+    "still delete the copies in its plan. This page checks again by itself; the Last clean-up line shows "
+    "the latest result the backup service recorded."
+)
 
-    STILL_RUNNING = (
-        "The clean-up is still running on the backup service and can still delete the copies in its plan. "
-        "Its result will show in the Last clean-up line when it finishes; reload this page to see it."
-    )
+
+class AdminCleanupApplyWaitTests(unittest.TestCase):
+    """A manual clean-up apply gets its own wait; a missing answer is never read as a state."""
 
     def setUp(self) -> None:
         import tempfile
@@ -436,7 +453,9 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
         self.assertGreater(apply_timeout, self.client_module.DEFAULT_TIMEOUT_SECONDS)
         self.assertLess(apply_timeout * 1000, browser_ms)
 
-    def test_late_scheduler_answer_reports_the_clean_up_as_still_running(self) -> None:
+    def test_late_answer_with_no_status_read_is_reported_as_not_known(self) -> None:
+        # This fake answers one connection only, so the follow-up status read
+        # gets no answer either: nothing was observed, so nothing is claimed.
         late = _LateScheduler(self.socket_path)
         self.addCleanup(late.close)
         client = self.client_module.BackupSchedulerClient(str(self.socket_path))
@@ -448,7 +467,7 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
         self.assertTrue(late.requests and late.requests[0].startswith(b"POST /internal/backups/lifecycle/apply"))
         self.assertEqual(status, 202, body)
         payload = json.loads(body)
-        self.assertEqual(payload, {"state": "still_running", "detail": self.STILL_RUNNING})
+        self.assertEqual(payload, {"state": "cleanup_state_unknown", "detail": CLEANUP_STATE_UNKNOWN})
 
     def test_scheduler_answer_inside_the_wait_is_forwarded(self) -> None:
         late = _LateScheduler(self.socket_path)
@@ -471,6 +490,360 @@ class AdminCleanupApplyWaitTests(unittest.TestCase):
 
         self.assertEqual(status, 503)
         self.assertEqual(json.loads(body)["detail"], "The backup scheduler service is not available.")
+
+    def test_page_uses_the_same_words_as_the_route_for_each_state(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "admin_service/static/admin_backups.js").read_text()
+        import re
+
+        # Join the page's "..." + "..." string pieces back into one string.
+        joined = re.sub(r'"\s*\+\s*"', "", " ".join(source.split()))
+        for text in (CLEANUP_RUNNING, CLEANUP_NOT_RUNNING, CLEANUP_STATE_UNKNOWN):
+            with self.subTest(text=text[:40]):
+                self.assertTrue(f'"{text}"' in joined, text)
+
+
+class _SchedulerBridge:
+    """Serves the real scheduler app over a Unix socket, one thread per connection.
+
+    It stands in for the scheduler's HTTP server so a test can hold one part of
+    one answer: the whole status read, or the body of an apply answer after the
+    scheduler has really finished (and released its job reservation).
+    """
+
+    def __init__(self, path: Path, app) -> None:
+        import socket
+
+        self.app = app
+        self.release = threading.Event()
+        self.hold_apply_body = False
+        self.hold_status_read = False
+        self.seen: list[tuple[str, str]] = []
+        self.apply_finished = threading.Event()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(path))
+        self.server.listen(8)
+        self.server.settimeout(0.05)  # so close() can stop the accept loop
+        self.closed = threading.Event()
+        self.workers: list[threading.Thread] = []
+        self.thread = threading.Thread(target=self._accept, daemon=True)
+        self.thread.start()
+
+    def _accept(self) -> None:
+        while not self.closed.is_set():
+            try:
+                connection, _ = self.server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            connection.settimeout(None)
+            worker = threading.Thread(target=self._serve, args=(connection,), daemon=True)
+            self.workers.append(worker)
+            worker.start()
+
+    def _serve(self, connection) -> None:
+        with connection:
+            connection.settimeout(HANG_TIMEOUT_SECONDS)
+            data = b""
+            try:
+                while b"\r\n\r\n" not in data:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        return
+                    data += chunk
+                head, _, rest = data.partition(b"\r\n\r\n")
+                lines = head.decode("latin-1").split("\r\n")
+                method, path, _version = lines[0].split(" ", 2)
+                length = 0
+                for line in lines[1:]:
+                    name, _, value = line.partition(":")
+                    if name.strip().lower() == "content-length":
+                        length = int(value.strip())
+                while len(rest) < length:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        return
+                    rest += chunk
+            except OSError:
+                return
+            self.seen.append((method, path))
+            if method == "GET" and path == "/internal/backups" and self.hold_status_read:
+                self.release.wait(HANG_TIMEOUT_SECONDS)
+                return
+            status, content = asgi_call(self.app, method, path, json.loads(rest) if rest else None)
+            is_apply = path == "/internal/backups/lifecycle/apply"
+            if is_apply:
+                self.apply_finished.set()
+            response = (
+                f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(content)}\r\nConnection: close\r\n\r\n"
+            ).encode()
+            try:
+                if is_apply and self.hold_apply_body:
+                    connection.sendall(response + content[:1])
+                    self.release.wait(HANG_TIMEOUT_SECONDS)
+                    return
+                connection.sendall(response + content)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.release.set()
+        self.closed.set()
+        self.thread.join(HANG_TIMEOUT_SECONDS)
+        self.server.close()
+        for worker in self.workers:
+            worker.join(HANG_TIMEOUT_SECONDS)
+
+
+class AdminCleanupNoAnswerTests(SchedulerTestBase):
+    """When the clean-up's answer does not arrive, the route says only what one status read shows.
+
+    The real admin route, the real Unix-socket client and the real scheduler app
+    and scheduler; only the socket server in between can hold part of an answer.
+    """
+
+    APPLY_WAIT = 0.4
+    STATUS_WAIT = 2.0
+
+    def setUp(self) -> None:
+        import tempfile
+
+        super().setUp()
+        from admin_service import main as admin_main
+        from admin_service import route_support
+        from admin_service import routes as admin_routes
+        from admin_service.services import backup_scheduler_client as client_module
+
+        self.admin_main = admin_main
+        self.admin_routes = admin_routes
+        self.client_module = client_module
+        route_support.get_backup_scheduler_client.cache_clear()
+        self.addCleanup(route_support.get_backup_scheduler_client.cache_clear)
+        sockets = tempfile.TemporaryDirectory(prefix="kb-")
+        self.addCleanup(sockets.cleanup)
+        self.socket_path = Path(sockets.name) / "s.sock"
+
+    def two_local_fulls(self):
+        """Two local FULLs and a scheduler that keeps one: the plan deletes the older."""
+
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2}})
+        older = scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        newest = scheduler.run_now("full")
+        scheduler.close()
+        return older, newest, self.make({"full": {"enabled": True, "local_keep": 1}})
+
+    def bridge(self, scheduler) -> _SchedulerBridge:
+        from history_service.backup_scheduler.api import build_app
+
+        bridge = _SchedulerBridge(self.socket_path, build_app(scheduler))
+        self.addCleanup(bridge.close)
+        return bridge
+
+    def plan_token(self, bridge: _SchedulerBridge) -> str:
+        return json.loads(asgi_call(bridge.app, "GET", "/internal/backups/lifecycle/plan")[1])["plan_token"]
+
+    def apply(self, token: str):
+        client = self.client_module.BackupSchedulerClient(str(self.socket_path), timeout=self.STATUS_WAIT)
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
+            self.client_module, "LIFECYCLE_APPLY_TIMEOUT_SECONDS", self.APPLY_WAIT
+        ), patch.object(self.admin_main, "_request_origin_allowed", return_value=True), patch.object(
+            self.admin_main, "_basic_auth_matches", return_value=True
+        ):
+            status, body = asgi_call(
+                self.admin_main.app, "POST", "/api/admin/backups/lifecycle/apply", {"plan_token": token},
+                {"origin": "http://test"},
+            )
+        return status, json.loads(body)
+
+    def hold_lifecycle_apply(self):
+        """Hold the real apply inside the scheduler's job reservation until released."""
+
+        gate = threading.Event()
+        entered = threading.Event()
+        real_apply = LifecycleManager.apply
+
+        def held(manager, *args, **kwargs):
+            entered.set()
+            gate.wait(HANG_TIMEOUT_SECONDS)
+            return real_apply(manager, *args, **kwargs)
+
+        holder = patch.object(LifecycleManager, "apply", held)
+        holder.start()
+        self.addCleanup(holder.stop)
+        self.addCleanup(gate.set)
+        return gate, entered
+
+    def test_answer_body_lost_after_a_finished_success_is_not_reported_as_running(self) -> None:
+        older, newest, scheduler = self.two_local_fulls()
+        bridge = self.bridge(scheduler)
+        bridge.hold_apply_body = True
+
+        status, payload = self.apply(self.plan_token(bridge))
+
+        self.assertTrue(bridge.apply_finished.is_set())
+        self.assertIsNone(scheduler.running)
+        grooming = scheduler.library()["grooming"]
+        self.assertTrue(grooming["ok"])
+        self.assertEqual(grooming["deleted"], 1)
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload, {"state": "cleanup_not_running", "detail": CLEANUP_NOT_RUNNING})
+        # One bounded follow-up question, after the apply.
+        self.assertEqual(bridge.seen[-1], ("GET", "/internal/backups"))
+        self.assertEqual([path for _method, path in bridge.seen].count("/internal/backups"), 1)
+
+    def test_answer_body_lost_after_a_finished_failure_is_not_reported_as_running(self) -> None:
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 2}, "targets": [TARGET]})
+        scheduler.run_now("full")
+        self.now += timedelta(hours=1)
+        scheduler.run_now("full")
+        scheduler.close()
+        scheduler = self.make({"full": {"enabled": True, "local_keep": 2, "remote_keep": 1}, "targets": [TARGET]})
+        bridge = self.bridge(scheduler)
+        bridge.hold_apply_body = True
+        token = self.plan_token(bridge)
+
+        with patch.object(scheduler_service, "_scratch_free_bytes", return_value=0):
+            status, payload = self.apply(token)
+
+        self.assertTrue(bridge.apply_finished.is_set())
+        self.assertIsNone(scheduler.running)
+        grooming = scheduler.library()["grooming"]
+        self.assertFalse(grooming["ok"])
+        self.assertIn("keeper-scratch-capacity", grooming["failed_locations"]["nas"])
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload, {"state": "cleanup_not_running", "detail": CLEANUP_NOT_RUNNING})
+
+    def test_answer_headers_late_while_the_scheduler_runs_the_clean_up(self) -> None:
+        older, newest, scheduler = self.two_local_fulls()
+        bridge = self.bridge(scheduler)
+        token = self.plan_token(bridge)
+        gate, entered = self.hold_lifecycle_apply()
+
+        status, payload = self.apply(token)
+
+        self.assertTrue(entered.is_set())
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload, {"state": "cleanup_running", "detail": CLEANUP_RUNNING})
+        self.assertEqual(scheduler.running["backup_class"], "lifecycle")
+        gate.set()
+        self.assertTrue(bridge.apply_finished.wait(HANG_TIMEOUT_SECONDS))
+        self.assertFalse((self._paths.local_dir / older.name).exists())
+
+    def test_answer_headers_late_and_no_status_read_is_not_known(self) -> None:
+        older, newest, scheduler = self.two_local_fulls()
+        bridge = self.bridge(scheduler)
+        bridge.hold_status_read = True
+        token = self.plan_token(bridge)
+        gate, _entered = self.hold_lifecycle_apply()
+
+        with patch.object(self, "STATUS_WAIT", 0.3):
+            status, payload = self.apply(token)
+
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload, {"state": "cleanup_state_unknown", "detail": CLEANUP_STATE_UNKNOWN})
+        self.assertEqual(bridge.seen[-1], ("GET", "/internal/backups"))
+        gate.set()
+
+    def test_status_reads_that_do_not_show_the_state_are_not_known(self) -> None:
+        from admin_service.services.backup_scheduler_client import SchedulerResponse
+
+        cases = {
+            "error status": SchedulerResponse(status=500, payload={"detail": "boom"}),
+            "not an object": SchedulerResponse(status=200, payload=["running"]),
+            "unavailable library": SchedulerResponse(status=200, payload={"available": False, "running": None}),
+            "no running field": SchedulerResponse(status=200, payload={"available": True}),
+            "running not an object": SchedulerResponse(status=200, payload={"available": True, "running": "yes"}),
+            "running without a class": SchedulerResponse(status=200, payload={"available": True, "running": {}}),
+        }
+        for name, answer in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.classify_after_lost_answer(answer)[0], "cleanup_state_unknown")
+        for name, running in {"nothing": None, "a backup": {"backup_class": "full", "started_at": "x"}}.items():
+            with self.subTest(name):
+                answer = SchedulerResponse(status=200, payload={"available": True, "running": running})
+                self.assertEqual(self.classify_after_lost_answer(answer)[0], "cleanup_not_running")
+        answer = SchedulerResponse(status=200, payload={"available": True, "running": {"backup_class": "lifecycle"}})
+        self.assertEqual(self.classify_after_lost_answer(answer)[0], "cleanup_running")
+
+    def classify_after_lost_answer(self, follow_up):
+        """Drive the route with a client whose apply answer is lost and whose status read returns ``follow_up``."""
+
+        module = self.client_module
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def request(self, method, path, **_kwargs):
+                self.calls.append((method, path))
+                if path == "/internal/backups/lifecycle/apply":
+                    raise module.SchedulerTimeoutError("no answer")
+                return follow_up
+
+        client = Client()
+        with patch.object(self.admin_routes, "get_backup_scheduler_client", return_value=client), patch.object(
+            self.admin_main, "_request_origin_allowed", return_value=True
+        ), patch.object(self.admin_main, "_basic_auth_matches", return_value=True):
+            status, body = asgi_call(
+                self.admin_main.app, "POST", "/api/admin/backups/lifecycle/apply", {"plan_token": "t"},
+                {"origin": "http://test"},
+            )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(client.calls, [("POST", "/internal/backups/lifecycle/apply"), ("GET", "/internal/backups")])
+        payload = json.loads(body)
+        return payload["state"], payload["detail"]
+
+    def test_connection_reset_after_sending_asks_the_scheduler_too(self) -> None:
+        older, newest, scheduler = self.two_local_fulls()
+        bridge = self.bridge(scheduler)
+        token = self.plan_token(bridge)
+        real_getresponse = http.client.HTTPConnection.getresponse
+
+        def reset_for_apply(connection):
+            if connection._method == "POST":
+                bridge.apply_finished.wait(HANG_TIMEOUT_SECONDS)
+                raise ConnectionResetError("reset")
+            return real_getresponse(connection)
+
+        with patch.object(http.client.HTTPConnection, "getresponse", reset_for_apply):
+            status, payload = self.apply(token)
+
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(payload, {"state": "cleanup_not_running", "detail": CLEANUP_NOT_RUNNING})
+
+    def test_timeout_before_the_request_is_sent_means_nothing_started(self) -> None:
+        older, newest, scheduler = self.two_local_fulls()
+        for stage in ("connect", "send"):
+            with self.subTest(stage=stage):
+                bridge_path = self.socket_path
+                if bridge_path.exists():
+                    bridge_path.unlink()
+                bridge = self.bridge(scheduler)
+                token = self.plan_token(bridge)
+
+                def send_times_out(connection, _data):
+                    if connection.sock is None:
+                        connection.connect()  # connected, then the request bytes time out
+                    raise TimeoutError("timed out")
+
+                stalled = (
+                    patch.object(self.client_module._UnixConnection, "connect", side_effect=TimeoutError("timed out"))
+                    if stage == "connect"
+                    else patch.object(self.client_module._UnixConnection, "send", send_times_out)
+                )
+                with stalled:
+                    status, payload = self.apply(token)
+
+                # The request never reached the scheduler in full: nothing ran,
+                # the plan is unused and no status read is needed.
+                self.assertEqual(status, 503, payload)
+                self.assertEqual(payload["detail"], "The backup scheduler service is not available.")
+                self.assertEqual(bridge.seen, [])
+                self.assertIn(token, scheduler._plans)
+                self.assertTrue((self._paths.local_dir / older.name).exists())
+                bridge.close()
 
 
 if __name__ == "__main__":

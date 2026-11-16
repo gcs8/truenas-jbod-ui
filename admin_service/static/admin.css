@@ -1956,6 +1956,11 @@ h3 {
   color: var(--danger);
 }
 
+/* A clean-up whose state is not known (#1188), as the banner's warning tone. */
+.backup-dialog-result.is-warning {
+  color: var(--warning);
+}
+
 .backup-change-list {
   margin: 8px 0 0;
   padding-left: 20px;

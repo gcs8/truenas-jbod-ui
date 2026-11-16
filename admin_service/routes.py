@@ -64,7 +64,7 @@ from admin_service.services.account_bootstrap import (
     saved_sudo_commands_for_system,
 )
 from admin_service.services import backup_scheduler_client
-from admin_service.services.backup_scheduler_client import SchedulerTimeoutError, SchedulerUnavailableError
+from admin_service.services.backup_scheduler_client import SchedulerNoAnswerError, SchedulerUnavailableError
 from admin_service.services.esxi_host_prep import (
     MAX_UPLOAD_BYTES as MAX_ESXI_HOST_PREP_UPLOAD_BYTES,
 )
@@ -1460,10 +1460,48 @@ def build_router(admin_settings: Any) -> APIRouter:
         return artifact_id
 
     scheduler_unavailable_detail = "The backup scheduler service is not available."
-    cleanup_still_running_detail = (
-        "The clean-up is still running on the backup service and can still delete the copies in its plan. "
-        "Its result will show in the Last clean-up line when it finishes; reload this page to see it."
-    )
+    # #1188: what the apply route says when the clean-up's own answer did not
+    # arrive. A missing answer shows only that; each state below comes from one
+    # status read made afterwards, and the page uses the same words.
+    cleanup_no_answer_details = {
+        "cleanup_running": (
+            "A clean-up is running on the backup service and can still delete the copies in its plan. "
+            "The result of this request did not reach the admin service. This page checks again by itself; "
+            "when the clean-up finishes, the Last clean-up line shows the latest result the backup service recorded."
+        ),
+        "cleanup_not_running": (
+            "The result of this clean-up did not reach the admin service, and the backup service reports that "
+            "no clean-up is running now. The Last clean-up line shows the latest result the backup service recorded."
+        ),
+        "cleanup_state_unknown": (
+            "The result of this clean-up did not reach the admin service, and the backup service did not say "
+            "whether a clean-up is still running, so its state is not known. It may still be running and may "
+            "still delete the copies in its plan. This page checks again by itself; the Last clean-up line shows "
+            "the latest result the backup service recorded."
+        ),
+    }
+
+    async def cleanup_state_after_lost_answer(client: Any) -> str:
+        """Ask the scheduler once whether a clean-up is running; anything unclear is not known."""
+
+        try:
+            response = await asyncio.to_thread(client.request, "GET", "/internal/backups")
+        except SchedulerUnavailableError:
+            return "cleanup_state_unknown"
+        payload = response.payload
+        if response.status != 200 or not isinstance(payload, dict) or payload.get("available") is not True:
+            return "cleanup_state_unknown"
+        if "running" not in payload:
+            return "cleanup_state_unknown"
+        running = payload["running"]
+        if running is None:
+            return "cleanup_not_running"
+        label = running.get("backup_class") if isinstance(running, dict) else None
+        if not isinstance(label, str) or not label:
+            return "cleanup_state_unknown"
+        # The scheduler runs one job at a time; a manual clean-up runs as
+        # "lifecycle". Any other job means no clean-up of this kind is running.
+        return "cleanup_running" if label == "lifecycle" else "cleanup_not_running"
 
     async def scheduler_call(method: str, path: str, body: dict[str, Any] | None = None) -> JSONResponse:
         client = get_backup_scheduler_client()
@@ -1544,9 +1582,11 @@ def build_router(admin_settings: Any) -> APIRouter:
         if not isinstance(token, str) or not token or len(token) > 128:
             raise HTTPException(status_code=400, detail="plan_token is required.")
         # #1188: apply reads kept copies back before deleting, so it gets its
-        # own wait. When even that runs out, the scheduler is still working on
-        # it (its job reservation refuses a second apply meanwhile), so say so
-        # instead of reporting the scheduler as unavailable.
+        # own wait. If the request was sent but no usable answer came back
+        # (that wait ran out, or the answer broke off), the clean-up may have
+        # finished, failed or still be running: ask the scheduler once and say
+        # only what that answer shows. A request that was never sent in full
+        # started nothing and stays "not available".
         client = get_backup_scheduler_client()
         try:
             response = await asyncio.to_thread(
@@ -1557,8 +1597,9 @@ def build_router(admin_settings: Any) -> APIRouter:
                 actor="admin",
                 timeout=backup_scheduler_client.LIFECYCLE_APPLY_TIMEOUT_SECONDS,
             )
-        except SchedulerTimeoutError:
-            return JSONResponse({"state": "still_running", "detail": cleanup_still_running_detail}, status_code=202)
+        except SchedulerNoAnswerError:
+            state = await cleanup_state_after_lost_answer(client)
+            return JSONResponse({"state": state, "detail": cleanup_no_answer_details[state]}, status_code=202)
         except SchedulerUnavailableError:
             raise HTTPException(status_code=503, detail=scheduler_unavailable_detail) from None
         result = response.payload if isinstance(response.payload, dict) else {"detail": "Unexpected answer."}

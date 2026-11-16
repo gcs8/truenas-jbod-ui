@@ -492,21 +492,40 @@ longer matches, it is marked unverified, the plan is worked out again (which
 can only remove deletions, never add one), and the next newest verified copy is
 read. The check stops as soon as nothing is left to delete. The clean-up result
 and the backup page's "Last clean-up" status line both say how many copies were
-marked unverified, even when the clean-up otherwise finished; the clean-up
-result also says how many planned deletions were not carried out because the
-copies that would have stayed could not be confirmed good, and what to do
-next: run Verify on the copies marked unverified, then clean up again if they
-pass, or back up again to replace them if they do not. In the clean-up dialog
-that result is shown in the problem colour, and the plan's introduction
-changes to say the copies were in the plan rather than that they will be
-deleted.
+marked unverified, even when the clean-up otherwise finished, in the same words
+("3 of the copies it kept failed the size and SHA-256 check and were marked
+unverified."). The clean-up result also says how many planned deletions were
+not carried out because the copies that would have stayed could not be
+confirmed good, and what to do next: run Verify on the copies marked
+unverified, then clean up again if they pass, or back up again to replace them
+if they do not. In the clean-up dialog that result is shown in the problem
+colour, directly under the plan's introduction, which changes to say the
+copies were in the plan rather than that they will be deleted.
 
 Because a clean-up reads kept copies back first, a manual clean-up can take
-minutes. The admin service waits up to 10 minutes for it. If it is still
-running after that, the clean-up dialog says so (it can still delete the copies
-in its plan) and its result appears in the "Last clean-up" line when it
-finishes. A clean-up started while a backup or another clean-up is running
-does not start; the dialog says so.
+minutes. The admin service waits up to 10 minutes for its answer. The page
+states only what the backup service reported:
+
+- If the answer arrives, the dialog shows the result the backup service sent.
+- If the request never reached the backup service, nothing started and the
+  dialog says the backup scheduler is not available.
+- If the request was sent but no answer came back (the wait ran out or the
+  answer broke off), the admin service asks the backup service once whether a
+  clean-up is running. If it says one is, the dialog says a clean-up is running
+  and can still delete the copies in its plan. If it says none is, the dialog
+  says so and points at the "Last clean-up" line, which shows the latest result
+  the backup service recorded. If that question gets no clear answer either,
+  the dialog says, in the warning colour, that the state is not known and the
+  clean-up may still be running and may still delete the copies in its plan.
+- After "running" or "not known", the page keeps re-reading the backup list.
+  Once the backup service reports no clean-up running, the dialog (if still
+  open) and the banner (if nothing else has replaced it) change to say so, and
+  the "Last clean-up" line shows the latest result. While a clean-up runs, the
+  status line says "A clean-up is running."
+
+A clean-up started while a backup or another clean-up is running does not
+start and deletes nothing; the dialog says so and asks you to open Clean up
+again after it finishes.
 
 Grooming refuses to delete anything more at that location for that run, and
 the status names the reason, when:

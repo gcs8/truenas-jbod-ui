@@ -53,8 +53,11 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   spent read budget or too little scratch space stops deletion at that
   location with a named reason, and a clean-up that marked copies unverified
   says so on the backup page. A manual clean-up gets up to 10 minutes for
-  those reads, and one still running after that is reported as still running,
-  not as an unavailable scheduler. History sidecar snapshots are replaced only by
+  those reads. If its answer does not come back, the admin service asks the
+  backup service once whether a clean-up is running and the page says only
+  what it reported: running, not running, or not known (in the warning
+  colour), until a later status read shows none running. History sidecar
+  snapshots are replaced only by
   FULLs that pass the same fresh check, at most 14 local FULL content checks per
   backup run including the kept-copy check (#1195).
 - Re-saving a system in System Setup no longer resets settings the form does

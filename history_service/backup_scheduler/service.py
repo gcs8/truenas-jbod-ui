@@ -1362,8 +1362,9 @@ class BackupScheduler:
             # #1188: a kept copy failed its payload check; say so even when the
             # replanned run otherwise completed.
             count = len(downgraded)
+            # "N of the copies it kept", so the count cannot read as a tally of kept copies.
             note = (
-                f"{count} kept backup {'copy' if count == 1 else 'copies'} failed the size and SHA-256 "
+                f"{count} of the copies it kept failed the size and SHA-256 "
                 f"check and {'was' if count == 1 else 'were'} marked unverified."
             )
             detail = note if detail is None else f"{detail} {note}"

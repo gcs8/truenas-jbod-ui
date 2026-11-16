@@ -34,12 +34,17 @@ class SchedulerUnavailableError(RuntimeError):
     """The scheduler socket is missing or not answering."""
 
 
-class SchedulerTimeoutError(SchedulerUnavailableError):
-    """The request reached the scheduler, but its answer did not arrive in time.
+class SchedulerNoAnswerError(SchedulerUnavailableError):
+    """The whole request was sent, but no usable answer came back.
 
-    The scheduler may still be doing the work. Callers that do not handle this
-    separately still see it as ``SchedulerUnavailableError``.
+    This says nothing about what the scheduler did with the request: it may
+    have finished, failed or still be working on it. Callers that do not
+    handle this separately still see it as ``SchedulerUnavailableError``.
     """
+
+
+class SchedulerTimeoutError(SchedulerNoAnswerError):
+    """The whole request was sent, but its answer did not arrive in time."""
 
 
 @dataclass
@@ -102,23 +107,23 @@ class BackupSchedulerClient:
                 connection.request(method, path, body=data, headers=headers)
             except OSError as exc:
                 raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
-            # The request was sent: a timeout from here on means the scheduler
-            # may still be working on it, which is not the same as being down.
+            # The whole request was sent: from here on a failure means only that
+            # no usable answer came back, not that the scheduler did nothing.
             try:
                 response = connection.getresponse()
                 raw = response.read(MAX_JSON_BYTES + 1)
             except TimeoutError as exc:
                 raise SchedulerTimeoutError("The backup scheduler did not answer in time.") from exc
-            except OSError as exc:
-                raise SchedulerUnavailableError("The backup scheduler service did not answer.") from exc
+            except (OSError, http.client.HTTPException) as exc:
+                raise SchedulerNoAnswerError("The backup scheduler service did not answer.") from exc
         finally:
             connection.close()
         if len(raw) > MAX_JSON_BYTES:
-            raise SchedulerUnavailableError("The backup scheduler answer was too large.")
+            raise SchedulerNoAnswerError("The backup scheduler answer was too large.")
         try:
             payload = json.loads(raw or b"{}")
         except ValueError as exc:
-            raise SchedulerUnavailableError("The backup scheduler returned an unreadable answer.") from exc
+            raise SchedulerNoAnswerError("The backup scheduler returned an unreadable answer.") from exc
         return SchedulerResponse(status=response.status, payload=payload)
 
     def download_to(self, artifact_id: str, destination: BinaryIO) -> SchedulerResponse:

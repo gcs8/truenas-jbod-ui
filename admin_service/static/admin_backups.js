@@ -47,12 +47,36 @@
     missing: "Missing",
   };
   const LONG_TIMEOUT_MS = 15 * 60 * 1000;
-  // #1188: a clean-up outlasted the admin service's wait, or another run held
-  // the scheduler. Neither is a failure of this page's request.
-  const CLEANUP_STILL_RUNNING = "The clean-up is still running on the backup service and can still delete the copies in its plan. "
-    + "Its result will show in the Last clean-up line when it finishes; reload this page to see it.";
-  const CLEANUP_BUSY = "A backup or clean-up is already running, so this clean-up did not start and deleted nothing. "
-    + "When the running one finishes, its result shows in the Last clean-up line; open Clean up again then.";
+  // #1188: the clean-up's own answer did not reach the admin service. The
+  // admin route then asks the scheduler once and names one of these states;
+  // the words match its detail. Nothing here is inferred from a timeout.
+  const CLEANUP_NO_ANSWER = {
+    cleanup_running: {
+      tone: "info",
+      watch: true,
+      text: "A clean-up is running on the backup service and can still delete the copies in its plan. "
+        + "The result of this request did not reach the admin service. This page checks again by itself; "
+        + "when the clean-up finishes, the Last clean-up line shows the latest result the backup service recorded.",
+    },
+    cleanup_not_running: {
+      tone: "info",
+      watch: false,
+      text: "The result of this clean-up did not reach the admin service, and the backup service reports that "
+        + "no clean-up is running now. The Last clean-up line shows the latest result the backup service recorded.",
+    },
+    cleanup_state_unknown: {
+      tone: "warning",
+      watch: true,
+      text: "The result of this clean-up did not reach the admin service, and the backup service did not say "
+        + "whether a clean-up is still running, so its state is not known. It may still be running and may "
+        + "still delete the copies in its plan. This page checks again by itself; the Last clean-up line shows "
+        + "the latest result the backup service recorded.",
+    },
+  };
+  // Another run held the scheduler. Its refusal does not say whether that run
+  // is a backup or a clean-up, so promise nothing about where its result shows.
+  const CLEANUP_BUSY = "A backup or clean-up is already running on the backup service, so this clean-up did not start "
+    + "and deleted nothing. Open Clean up again after it finishes.";
   const SENSITIVE_KEY = /path|file|dir|root|password|passphrase|secret|token|credential|key_id|access_key|private|username|user$|host|endpoint|url|share|bucket|export|mount/i;
 
   // ---------------------------------------------------------------- model --
@@ -502,6 +526,12 @@
             available: payload.available !== false,
             detail: typeof payload.detail === "string" ? payload.detail : "",
             running: payload.running && CLASSES.includes(payload.running.backup_class) ? payload.running : null,
+            // A manual clean-up runs as "lifecycle" (#1188).
+            cleanupRunning: payload.running?.backup_class === "lifecycle",
+            // Only a read the backup service answered can say that no clean-up runs.
+            noCleanupRunning: payload.available === true && Object.prototype.hasOwnProperty.call(payload, "running")
+              && (payload.running === null || (typeof payload.running?.backup_class === "string"
+                && payload.running.backup_class !== "lifecycle")),
           };
           state.loadError = "";
           const count = state.data.artifacts.length;
@@ -514,9 +544,11 @@
           if (state.data.running) {
             parts.push(`A ${CLASS_SHORT[state.data.running.backup_class].toLowerCase()} backup is running.`);
           }
+          if (state.data.cleanupRunning) parts.push("A clean-up is running.");
           setStatus(parts.join(" "));
           const cleanup = state.data.available ? cleanupSummary(payload.grooming, state.data.targets, fmtTime) : null;
           if (cleanup && els.status) els.status.append(" ", el("span", { className: `backup-run-status ${cleanup.tone}`, text: cleanup.text }));
+          if (state.data.noCleanupRunning) retireCleanupWatch();
           scheduleRunningPoll();
         } catch (error) {
           state.loadError = error?.status === 404
@@ -534,11 +566,25 @@
       return state.loadPromise;
     }
 
-    // While a backup runs, re-read the list now and then so the result shows
-    // without a manual reload. Stops once nothing is running.
+    // #1188: a running or not-known clean-up message must not stay beside a
+    // final Last clean-up line. Once a status read the backup service answered
+    // shows no clean-up running, say that instead, in the dialog if it is
+    // still the one that asked and in the banner if nothing has replaced it.
+    function retireCleanupWatch() {
+      const watch = state.cleanupWatch;
+      if (!watch) return;
+      state.cleanupWatch = null;
+      const { text, tone } = CLEANUP_NO_ANSWER.cleanup_not_running;
+      if (watch.scope.live()) watch.scope.result(text, "");
+      if (!deps.bannerRevision || deps.bannerRevision() === watch.bannerRevision) setBanner(text, tone);
+    }
+
+    // While a backup or clean-up runs, re-read the list now and then so the
+    // result shows without a manual reload. Stops once nothing is running.
     const POLL_MS = deps.pollMs || 5000;
     function scheduleRunningPoll() {
-      if (state.pollTimer || !state.data?.running || isStopped() || !deps.setTimeout) return;
+      const waiting = state.data?.running || state.data?.cleanupRunning || state.cleanupWatch;
+      if (state.pollTimer || !waiting || isStopped() || !deps.setTimeout) return;
       state.pollTimer = deps.setTimeout(() => {
         state.pollTimer = null;
         // A hidden tab skips the request but keeps polling, so returning to it shows the result.
@@ -1344,19 +1390,29 @@
       const plan = state.cleanupPlan;
       const scope = dialogScope();
       if (!plan || !plan.token) return Promise.resolve();
-      // Once a result is shown, the plan's introduction must not still promise deletions.
+      // Once an outcome is shown, the plan's introduction must not still promise deletions.
       const planned = plan.items.length;
+      const RESULT_TONES = { error: "is-bad", warning: "is-warning" };
       const showResult = (text, bannerTone) => {
         const intro = scope.body()?.querySelector(".backup-cleanup-intro");
         if (intro) {
           intro.textContent = planned === 1
-            ? "This copy was in the clean-up plan. The result is below."
-            : `These ${planned} copies were in the clean-up plan. The result is below.`;
+            ? "This copy was in the clean-up plan."
+            : `These ${planned} copies were in the clean-up plan.`;
         }
-        scope.result(text, bannerTone === "error" ? "is-bad" : "");
+        scope.result(text, RESULT_TONES[bannerTone] || "");
         setBanner(text, bannerTone);
       };
+      // The outcome goes directly under the introduction, above the long list.
+      const body = scope.body();
+      const intro = body?.querySelector(".backup-cleanup-intro");
+      const resultLine = els.dialog?.querySelector(".backup-dialog-result");
+      if (body && intro && resultLine) {
+        const rest = Array.from(body.children).filter((node) => node !== intro && node !== resultLine);
+        body.replaceChildren(intro, resultLine, ...rest);
+      }
       return once("cleanup", async () => {
+        state.cleanupWatch = null;
         scope.result("Deleting...");
         scope.actions(cancelButton("Close"));
         try {
@@ -1367,8 +1423,15 @@
             timeoutMs: LONG_TIMEOUT_MS,
           });
           state.cleanupPlan = null;
-          if (payload?.state === "still_running") {
-            showResult(CLEANUP_STILL_RUNNING, "info");
+          // A result comes only from the scheduler's own answer. Anything else
+          // (a named state, or an answer without a result) is said as such.
+          if (typeof payload?.state === "string" || !Array.isArray(payload?.deleted)) {
+            const known = Object.prototype.hasOwnProperty.call(CLEANUP_NO_ANSWER, String(payload?.state));
+            const outcome = known ? CLEANUP_NO_ANSWER[payload.state] : CLEANUP_NO_ANSWER.cleanup_state_unknown;
+            showResult(outcome.text, outcome.tone);
+            state.cleanupWatch = outcome.watch
+              ? { scope, bannerRevision: deps.bannerRevision ? deps.bannerRevision() : null }
+              : null;
             await load({ quiet: true });
             return;
           }
@@ -1385,7 +1448,8 @@
           const one = downgraded === 1;
           const notes = [];
           if (downgraded) {
-            notes.push(`${downgraded} kept ${one ? "copy" : "copies"} failed the size and SHA-256 check and ${one ? "was" : "were"} marked unverified.`);
+            // "N of the copies it kept", so the count cannot read as a tally of kept copies.
+            notes.push(`${downgraded} of the copies it kept failed the size and SHA-256 check and ${one ? "was" : "were"} marked unverified.`);
           }
           if (skipped) {
             notes.push(`${skipped} planned ${skipped === 1 ? "deletion was" : "deletions were"} not carried out, because the copies that would have stayed could not be confirmed good.`);
