@@ -12,7 +12,12 @@ from app.services.sas_diagnostics.common import (
     fault_family_severity,
     severity_rank,
 )
-from app.services.sas_diagnostics.lsi_loginfo import decode_lsi_loginfo, loginfo_is_rejected, malformed_loginfo_result
+from app.services.sas_diagnostics.lsi_loginfo import (
+    decode_lsi_loginfo,
+    loginfo_is_rejected,
+    malformed_controller_tail_result,
+    malformed_loginfo_result,
+)
 from app.services.sas_diagnostics.scsi import (
     decode_scsi_cdb_message,
     decode_scsi_sense_event,
@@ -89,6 +94,10 @@ def decode_mpr_dmesg_event(event: dict[str, Any]) -> dict[str, Any]:
             "description": "The OS is retrying a command after transport or sense data indicated failure.",
         }
     if event_type == "ioc_terminated":
+        if event.get("controller_tail_malformed"):
+            # The first tail is not in the kernel's form: no field of it, or
+            # of any later tail, is decoded.
+            return malformed_controller_tail_result(str(event.get("controller_tail_raw") or ""))
         loginfo = str(event.get("loginfo") or "").lower()
         decoded_loginfo = decode_lsi_loginfo(loginfo)
         if decoded_loginfo:
@@ -122,7 +131,7 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "raw_line": event.get("line"),
         "decoded": decoded,
     }
-    for key in ("bus", "lun", "smid", "loginfo", "asc", "reason", "timestamp_raw"):
+    for key in ("bus", "lun", "smid", "loginfo", "asc", "reason", "timestamp_raw", "controller_tail_malformed"):
         if event.get(key) is not None:
             record[key] = event.get(key)
     for key in (
@@ -138,6 +147,8 @@ def make_decoded_event_record(event: dict[str, Any], *, event_id: str, sequence:
         "byte_count",
         "cdb_malformed",
         "cdb_raw",
+        "controller_tail_malformed",
+        "controller_tail_raw",
         "lba",
         "transfer_blocks",
         "allocation_length",
@@ -240,7 +251,9 @@ def record_mpr_event_summary(summary: dict[str, Any], event: dict[str, Any], rec
         summary["devices"].add(event["device"])
     if event.get("target"):
         summary["targets"].add(event["target"])
-    if event.get("loginfo") is not None:
+    if event.get("controller_tail_malformed"):
+        summary["loginfo_rejected_count"] += 1
+    elif event.get("loginfo") is not None:
         # A loginfo that is not a 32-bit hex number is never decoded, so it is
         # counted as rejected instead of becoming a summary key.
         if loginfo_is_rejected(event["loginfo"]):

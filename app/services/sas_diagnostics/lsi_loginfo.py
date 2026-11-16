@@ -285,6 +285,19 @@ def malformed_loginfo_result(raw: str) -> dict[str, Any]:
     )
 
 
+def malformed_controller_tail_result(raw: str) -> dict[str, Any]:
+    """Result for a tgt/SMID/loginfo tail whose fields are not in the kernel's form."""
+    result = _undecoded_loginfo(
+        raw,
+        "The tgt/SMID/loginfo fields of this controller line are malformed (target and SMID must be "
+        "decimal, each field separated from its name), so they were not decoded and no later fields "
+        "on the line were read.",
+    )
+    result["controller_tail_raw"] = result.pop("loginfo")
+    result["controller_tail_malformed"] = True
+    return result
+
+
 def _undecoded_loginfo(raw: str, note: str) -> dict[str, Any]:
     bounded = raw
     if len(bounded) > MAX_REJECTED_LOGINFO_LENGTH:

@@ -182,6 +182,175 @@ class MalformedLoginfoTests(unittest.TestCase):
         self.assertLessEqual(len(row["loginfo"]), 384)
 
 
+CONTROLLER_PREFIX = "mpr0: Controller reported scsi ioc terminated"
+LATER_VALID_TAIL = " tgt 2 SMID 2 loginfo 30010000"
+
+# A first tgt/SMID/loginfo tail whose target, SMID or loginfo is not in the
+# kernel's form (non-decimal, signed, non-ASCII, glued to its marker, a marker
+# repeated or missing, or not in the kernel's case).
+REJECTED_FIRST_TAILS = (
+    " tgt x SMID 1 loginfo gg",
+    " tgt 1 SMID x loginfo gg",
+    " tgt 1 SMID 1 loginfogg",
+    " tgt x SMID 1 loginfo 30010000",
+    " tgt 1 SMID x loginfo 30010000",
+    " tgt 1 SMID 1 loginfo30010000",
+    " tgt1 SMID 1 loginfo 30010000",
+    " tgt 1 SMID1 loginfo 30010000",
+    " tgt +1 SMID 1 loginfo 30010000",
+    " tgt 1 SMID -1 loginfo 30010000",
+    " tgt 1_0 SMID 1 loginfo 30010000",
+    " tgt \u0663 SMID 1 loginfo 30010000",
+    " tgt SMID 1 loginfo 30010000",
+    " tgt 1 SMID 1 SMID 1 loginfo 30010000",
+    " tgt 1 tgt 1 SMID 1 loginfo 30010000",
+    " TGT 1 SMID 1 loginfo 30010000",
+    " tgt 1 smid 1 loginfo 30010000",
+    "tgt 1 SMID 1 loginfo 30010000",
+)
+
+
+class ControllerTailOwnershipTests(unittest.TestCase):
+    """The first tgt/SMID/loginfo tail of a controller line is the only one read."""
+
+    @staticmethod
+    def _parse(line: str) -> tuple[dict, dict]:
+        events = parse_mpr_dmesg_events(line)
+        summary = events["by_controller"]["mpr0"]
+        rows = summary["event_table"]["rows"]
+        if len(rows) != 1:
+            raise AssertionError(f"expected one event row, got {len(rows)}")
+        return events, rows[0]
+
+    def assert_rejected_tail(self, line: str, tail_text: str) -> None:
+        events, row = self._parse(line)
+        for source in (row, row["decoded"]):
+            self.assertNotEqual(source.get("label"), KNOWN_LABEL)
+            self.assertNotEqual(source.get("family"), "controller_configuration")
+            self.assertIs(source.get("controller_tail_malformed"), True)
+            self.assertEqual(source.get("decode_confidence"), "unconfirmed")
+            self.assertIn("not decoded", source.get("decoder_note", ""))
+            self.assertNotIn("vendor", source)
+            self.assertNotIn("lsi_loginfo", source)
+            self.assertNotIn("source_attribution", source)
+        # Only the message's own family and title remain.
+        self.assertEqual(row["label"], "Controller terminated SCSI IO")
+        self.assertEqual(row["family"], "controller_terminated_io")
+        # No field of any tail is read.
+        for key in ("target", "smid", "loginfo"):
+            self.assertNotIn(key, row)
+            self.assertNotIn(key, row["decoded"])
+        # The raw text from the first marker on is kept as bounded evidence.
+        raw = row.get("controller_tail_raw") or ""
+        self.assertTrue(raw)
+        self.assertTrue(tail_text.strip().startswith(raw.removesuffix("...")))
+        self.assertLessEqual(len(raw), 32)
+        self.assertEqual(row["message"], CONTROLLER_PREFIX.removeprefix("mpr0: "))
+
+        self.assertEqual(sorted(events["by_controller_target"]), [])
+        summary = events["by_controller"]["mpr0"]
+        for view in (summary, _diagnostic_metric_summary(summary)):
+            self.assertEqual(view["loginfo_counts"], {})
+            self.assertEqual(view["loginfo_rejected_count"], 1)
+        self.assertEqual(summary["targets"], [])
+        self.assertEqual(summary["fault_family_counts"], {"controller_terminated_io": 1})
+        self.assertEqual([finding["label"] for finding in summary["top_findings"]], ["Controller terminated SCSI IO"])
+        self.assertEqual(summary["primary_fault"]["label"], "Controller terminated SCSI IO")
+        self.assertEqual(summary["ioc_terminated_count"], 1)
+
+    def assert_valid_control(self) -> None:
+        events, row = self._parse(CONTROLLER_PREFIX + " tgt 1 SMID 1 loginfo 30010000")
+        self.assertEqual((row["target"], row["smid"], row["loginfo"]), ("1", "1", "30010000"))
+        self.assertEqual(row["label"], KNOWN_LABEL)
+        self.assertEqual(row["decode_confidence"], "vendor-reference")
+        self.assertNotIn("controller_tail_malformed", row)
+        for scope, key in (("by_controller", "mpr0"), ("by_controller_target", "mpr0:1")):
+            summary = events[scope][key]
+            self.assertEqual(summary["loginfo_counts"], {"30010000": 1})
+            self.assertEqual(summary["loginfo_rejected_count"], 0)
+            self.assertEqual(summary["fault_family_counts"], {"controller_configuration": 1})
+            self.assertEqual(summary["primary_fault"]["label"], KNOWN_LABEL)
+
+    def test_a_rejected_first_tail_is_marked_and_counted(self) -> None:
+        for first_tail in REJECTED_FIRST_TAILS:
+            with self.subTest(tail=first_tail):
+                self.assert_rejected_tail(CONTROLLER_PREFIX + first_tail, first_tail)
+                self.assert_valid_control()
+
+    def test_a_later_tail_is_never_read_after_a_rejected_first_tail(self) -> None:
+        for first_tail in REJECTED_FIRST_TAILS:
+            with self.subTest(tail=first_tail):
+                self.assert_rejected_tail(
+                    CONTROLLER_PREFIX + first_tail + LATER_VALID_TAIL, first_tail + LATER_VALID_TAIL
+                )
+                self.assert_valid_control()
+
+    def test_a_rejected_tail_is_marked_whatever_the_message(self) -> None:
+        line = "mpr0: Synthetic controller notice tgt x SMID 1 loginfo gg" + LATER_VALID_TAIL
+        events, row = self._parse(line)
+        self.assertIs(row.get("controller_tail_malformed"), True)
+        for key in ("target", "smid", "loginfo", "family"):
+            self.assertNotIn(key, row)
+        self.assertNotEqual(row["label"], KNOWN_LABEL)
+        summary = events["by_controller"]["mpr0"]
+        self.assertEqual(summary["loginfo_counts"], {})
+        self.assertEqual(summary["loginfo_rejected_count"], 1)
+        self.assertEqual(summary["fault_family_counts"], {})
+        self.assertEqual(summary["top_findings"], [])
+        self.assertEqual(sorted(events["by_controller_target"]), [])
+
+    def test_rejected_tail_evidence_is_bounded(self) -> None:
+        events, row = self._parse(CONTROLLER_PREFIX + " tgt " + "x" * 5000 + " SMID 1 loginfo 30010000")
+        raw = row.get("controller_tail_raw") or ""
+        self.assertIs(row.get("controller_tail_malformed"), True)
+        self.assertLessEqual(len(raw), 32)
+        self.assertTrue(raw.startswith("tgt xxx"))
+        self.assertTrue(raw.endswith("..."))
+        self.assertLessEqual(len(events["by_controller"]["mpr0"]["recent_events"][0]["message"]), 384)
+
+    def test_kernel_controller_formats_keep_their_result(self) -> None:
+        # Controller reported %s tgt %u SMID %u loginfo %x%s, the optional
+        # suffix being " departing"; also behind the dmesg and syslog prefixes.
+        for prefix in ("", "[  12.345] ", "Nov 15 01:02:03 host kernel: "):
+            for description in ("scsi ioc terminated", "scsi task terminated", "scsi data underrun"):
+                for loginfo in ("30010000", "31120302", "0", "ffffffff"):
+                    line = f"{prefix}mpr0: Controller reported {description} tgt 17 SMID 345 loginfo {loginfo}"
+                    with self.subTest(line=line):
+                        events, row = self._parse(line)
+                        self.assertEqual((row["target"], row["smid"], row["loginfo"]), ("17", "345", loginfo))
+                        self.assertEqual(row["message"], f"Controller reported {description}")
+                        self.assertNotIn("controller_tail_malformed", row)
+                        expected = decode_lsi_loginfo(loginfo)
+                        assert expected is not None
+                        self.assertEqual(row["label"], expected["label"])
+                        self.assertEqual(row.get("decode_confidence"), expected.get("decode_confidence"))
+                        for scope, key in (("by_controller", "mpr0"), ("by_controller_target", "mpr0:17")):
+                            self.assertEqual(events[scope][key]["loginfo_counts"], {loginfo: 1})
+                            self.assertEqual(events[scope][key]["loginfo_rejected_count"], 0)
+                departing = f"{prefix}mpr0: Controller reported {description} tgt 17 SMID 345 loginfo 30010000 departing"
+                with self.subTest(line=departing):
+                    events, row = self._parse(departing)
+                    # Unchanged: the whole value is read and refused, as before this change.
+                    self.assertEqual((row["target"], row["smid"], row["loginfo"]), ("17", "345", "30010000 departing"))
+                    self.assertNotIn("controller_tail_malformed", row)
+                    self.assertEqual(row["family"], "controller_terminated_io")
+                    self.assertEqual(row["decode_confidence"], "unconfirmed")
+                    self.assertEqual(events["by_controller"]["mpr0"]["loginfo_rejected_count"], 1)
+
+    def test_lines_without_a_complete_tail_are_unchanged(self) -> None:
+        for line, message in (
+            (CONTROLLER_PREFIX, "Controller reported scsi ioc terminated"),
+            (CONTROLLER_PREFIX + " tgt 1 SMID 1", "Controller reported scsi ioc terminated tgt 1 SMID 1"),
+            ("mpr0: Sending reset to tgt 5", "Sending reset to tgt 5"),
+        ):
+            with self.subTest(line=line):
+                events, row = self._parse(line)
+                self.assertEqual(row["message"], message)
+                for key in ("target", "smid", "loginfo", "controller_tail_malformed", "controller_tail_raw"):
+                    self.assertNotIn(key, row)
+                self.assertEqual(events["by_controller"]["mpr0"]["loginfo_rejected_count"], 0)
+
+
 class KernelTextSummaryKeyTests(unittest.TestCase):
     """Free kernel text is bounded like row text before it becomes a summary key."""
 

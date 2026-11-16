@@ -342,13 +342,7 @@ def parse_mpr_sysctl_locations(text: str) -> dict[str, dict[str, str]]:
 
 
 def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
-    controller_pattern = re.compile(
-        r"^(?P<controller>mpr\d+):\s+(?P<message>.+?)"
-        # The loginfo value is the whole rest of the line, whatever it holds:
-        # the decoder decides whether it is a number. A later tail is never
-        # read in place of the first one.
-        r"(?:\s+tgt\s+(?P<target>\d+)\s+SMID\s+(?P<smid>\d+)\s+loginfo(?:\s+(?P<loginfo>.*))?)?$"
-    )
+    controller_pattern = re.compile(r"^(?P<controller>mpr\d+):\s+(?P<body>.+)$")
     disk_pattern = re.compile(
         r"^\((?P<device>da\d+):(?P<controller>mpr\d+):(?P<bus>\d+):"
         r"(?P<target>\d+):(?P<lun>\d+)\):\s+(?P<message>.+)$"
@@ -389,20 +383,23 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
         else:
             controller_match = controller_pattern.match(source_line)
             if controller_match:
-                message = controller_match.group("message").strip()
-                target = _bounded_numeric_token(controller_match.group("target"))
+                message, tail_match, rejected_tail = _split_mpr_controller_tail(controller_match.group("body"))
+                target = _bounded_numeric_token(tail_match.group("target")) if tail_match else None
                 event = {
                     "source": "controller",
                     "controller": controller_match.group("controller"),
                     "target": target,
-                    "smid": controller_match.group("smid"),
+                    "smid": tail_match.group("smid") if tail_match else None,
                     # An empty loginfo field is present but malformed, not absent.
-                    "loginfo": (controller_match.group("loginfo") or "") if target is not None else None,
+                    "loginfo": (tail_match.group("loginfo") or "") if tail_match else None,
                     "message": message,
                     "event_type": _mpr_dmesg_event_type(message),
                     "severity": "error",
                     "line": stripped,
                 }
+                if rejected_tail is not None:
+                    event["controller_tail_malformed"] = True
+                    event["controller_tail_raw"] = rejected_tail
                 if source_timestamp:
                     event["timestamp_raw"] = source_timestamp
         if not event:
@@ -436,6 +433,36 @@ def parse_mpr_dmesg_events(text: str) -> dict[str, Any]:
             for key, summary in sorted(summaries["by_controller_target"].items())
         },
     }
+
+
+_CONTROLLER_TAIL_MARKERS = tuple(re.compile(marker, re.IGNORECASE) for marker in ("tgt", "SMID", "loginfo"))
+# The kernel prints "tgt %u SMID %u loginfo %x". The loginfo value is the whole
+# rest of the line, whatever it holds: the decoder decides whether it is a number.
+_CONTROLLER_TAIL = re.compile(r"tgt\s+(?P<target>[0-9]+)\s+SMID\s+(?P<smid>[0-9]+)\s+loginfo(?:\s+(?P<loginfo>.*))?")
+
+
+def _split_mpr_controller_tail(body: str) -> tuple[str, re.Match[str] | None, str | None]:
+    """Split a controller line into its message and its first tgt/SMID/loginfo tail.
+
+    The tail is found by its three markers, in order and in any case, before
+    any field is validated, so a later tail is never read in place of the
+    first. Returns the message, the tail match when every field is in the
+    kernel's form, and the raw tail text when it is present but rejected.
+    """
+    start = _CONTROLLER_TAIL_MARKERS[0].search(body)
+    if start is None:
+        return body.strip(), None, None
+    position = start.end()
+    for marker in _CONTROLLER_TAIL_MARKERS[1:]:
+        found = marker.search(body, position)
+        if found is None:
+            return body.strip(), None, None
+        position = found.end()
+    message, tail = body[: start.start()], body[start.start() :]
+    tail_match = _CONTROLLER_TAIL.fullmatch(tail) if message.strip() and message[-1].isspace() else None
+    if tail_match is None:
+        return message.strip() or body.strip(), None, tail
+    return message.strip(), tail_match, None
 
 
 def _bounded_numeric_token(value: str | None) -> str | None:
