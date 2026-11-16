@@ -1281,6 +1281,17 @@ class RejectedCopyStaysRejectedTests(backup_fixtures.SchedulerTestBase):
         self.assertIs(rejected_copy_error(cause), content)
         # Beyond the bound the walk stops and finds nothing.
         self.assertIsNone(rejected_copy_error(chain(10_000, size)))
+        # The bound is 32 exceptions examined, counting the one raised and the rejection.
+        self.assertIs(rejected_copy_error(chain(30, size)), size)
+        self.assertIsNone(rejected_copy_error(chain(31, size)))
+        # A later failure raised "from None" still has the rejection behind it.
+        hidden = OSError("close")
+        hidden.__context__, hidden.__suppress_context__ = size, True
+        self.assertIs(rejected_copy_error(hidden), size)
+        # Two rejections behind one failure: one of them is found (which one is not promised).
+        both = RuntimeError("wrapped")
+        both.__cause__, both.__context__ = content, size
+        self.assertIn(rejected_copy_error(both), (content, size))
         first, second = OSError("a"), OSError("b")
         first.__context__, second.__context__ = second, first
         second.__cause__ = first
