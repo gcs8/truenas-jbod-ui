@@ -328,6 +328,68 @@ async def stream_limited_request_body_to_file(
     )
     too_large_detail = f"{body_description} request body is too large."
 
+    # Staging file I/O (create, write, fsync, close, cleanup) runs in a worker
+    # thread so slow storage cannot stop the event loop (#1230). Only one
+    # write is in flight: the next chunk is read after the previous write
+    # settles, which bounds the buffered body to one chunk.
+    archive_path, descriptor = await _run_retained_staging_io(
+        _open_private_upload_file,
+        workspace_parent,
+        workspace_prefix,
+        discard_result=lambda opened: _discard_upload_file(*opened),
+    )
+    try:
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=413, detail=too_large_detail)
+            if chunk:
+                await _run_retained_staging_io(_write_all, descriptor, chunk)
+        # The worker closes the descriptor even when fsync fails, so cleanup
+        # must not close that number again.
+        closing, descriptor = descriptor, None
+        await _run_retained_staging_io(_fsync_and_close, closing)
+        return archive_path
+    except BaseException:
+        # Every earlier staging call has settled (each one is retained across
+        # cancellation), so nothing else uses the file when it is removed.
+        await _run_retained_staging_io(_discard_upload_file, archive_path, descriptor)
+        raise
+
+
+async def _run_retained_staging_io(
+    function: Callable[..., Any],
+    *args: Any,
+    discard_result: Callable[[Any], None] | None = None,
+) -> Any:
+    """Run blocking staging I/O in a worker and wait for it even if cancelled.
+
+    Cancelling the request must not let cleanup remove a file that the worker
+    is still writing, so a cancellation is re-raised only after the worker
+    has finished. ``discard_result`` releases a result that a cancelled
+    caller will never receive, such as a newly created staging file.
+    """
+    operation = asyncio.ensure_future(asyncio.to_thread(function, *args))
+    try:
+        await asyncio.wait((operation,))
+    except asyncio.CancelledError as cancellation:
+        while not operation.done():
+            try:
+                await asyncio.wait((operation,))
+            except asyncio.CancelledError:
+                continue
+        if (
+            not operation.cancelled()
+            and operation.exception() is None
+            and discard_result is not None
+        ):
+            await _run_retained_staging_io(discard_result, operation.result())
+        raise cancellation
+    return operation.result()
+
+
+def _open_private_upload_file(workspace_parent: Path | None, workspace_prefix: str) -> tuple[Path, int]:
     workspace = Path(
         tempfile.mkdtemp(
             prefix=workspace_prefix,
@@ -335,7 +397,6 @@ async def stream_limited_request_body_to_file(
         )
     )
     archive_path = workspace / "bundle.archive"
-    descriptor: int | None = None
     try:
         descriptor = os.open(
             archive_path,
@@ -346,23 +407,35 @@ async def stream_limited_request_body_to_file(
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
-        total = 0
-        with os.fdopen(descriptor, "wb") as output:
-            descriptor = None
-            async for chunk in request.stream():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise HTTPException(status_code=413, detail=too_large_detail)
-                output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
-        return archive_path
     except BaseException:
-        if descriptor is not None:
-            os.close(descriptor)
         archive_path.unlink(missing_ok=True)
         workspace.rmdir()
         raise
+    return archive_path, descriptor
+
+
+def _write_all(descriptor: int, chunk: bytes) -> None:
+    view = memoryview(chunk)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+
+
+def _fsync_and_close(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _discard_upload_file(archive_path: Path, descriptor: int | None) -> None:
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    archive_path.unlink(missing_ok=True)
+    archive_path.parent.rmdir()
 
 
 SERVICE_STARTED_AT = datetime.now(timezone.utc)

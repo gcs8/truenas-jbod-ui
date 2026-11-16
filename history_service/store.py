@@ -173,6 +173,30 @@ def describe_unsupported_schema_version(file_path: Path | str, found_version: in
     )
 
 
+def is_supported_schema_version(found_version: int) -> bool:
+    """True when this build may open a database stamped `found_version`."""
+    return MIN_SUPPORTED_SCHEMA_VERSION <= found_version <= CURRENT_SCHEMA_VERSION
+
+
+def require_restorable_schema_version(found_version: int) -> None:
+    """Refuse to restore a database outside the range startup admits (#1189).
+
+    Restore must apply the startup gate's range before it activates anything:
+    a database startup would refuse replaces live history and leaves the
+    service unable to start. Older supported versions are admitted and migrated
+    by the normal schema initialization, as at startup.
+    """
+    if is_supported_schema_version(found_version):
+        return
+    raise HistorySchemaVersionError(
+        f"The history database in this backup was written with schema version "
+        f"{found_version}, but this version of the application supports schema "
+        f"versions {MIN_SUPPORTED_SCHEMA_VERSION} to {CURRENT_SCHEMA_VERSION}. "
+        "Nothing was restored and the current history was not changed. Restore it "
+        "with the release that wrote it, or restore a backup taken with this release."
+    )
+
+
 def history_write_lock(file_path: Path, *, blocking: bool):
     from history_service.migration_lock import history_write_lock as posix_history_write_lock
 
@@ -661,7 +685,7 @@ class HistoryStore:
         version problems and stay with the existing corrupt/recovery handling.
         """
         found = self._read_on_disk_schema_version(self.file_path)
-        if found is None or MIN_SUPPORTED_SCHEMA_VERSION <= found <= CURRENT_SCHEMA_VERSION:
+        if found is None or is_supported_schema_version(found):
             return
         reason = describe_unsupported_schema_version(self.file_path, found)
         raise HistorySchemaVersionError(reason)
@@ -2837,6 +2861,12 @@ class HistoryStore:
                 ) as restore_connection:
                     restore_connection.execute("PRAGMA journal_mode=MEMORY")
                     source_connection.backup(restore_connection)
+                    # Gate the exact bytes about to be published (#1189); a
+                    # refusal leaves only the private temp copy, which the
+                    # finally below discards.
+                    require_restorable_schema_version(
+                        int(restore_connection.execute("PRAGMA user_version").fetchone()[0])
+                    )
                     # The backup's counters are outside input that sizes
                     # index builds; replace them with real counts (#1093).
                     self._recount_restored_table_counts(restore_connection)
