@@ -96,6 +96,9 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
 - Fixed Connections tracing the enclosure bay that shares a storage-view slot's
   number; it now traces only the backing bay, distinguishes unknown placement
   from known non-SAS devices, and labels empty slots neutrally (#1166, #1167).
+- With zero-based API slot numbering, a disk whose nested enclosure slot is
+  the integer 0 now stays bound to bay 0 instead of losing its bay, matching
+  the string "0"; a boolean slot value is no longer read as a bay (#1235).
 - On ESXi hosts where two RAID controllers report the same local slot (such
   as `13:0`), a placed disk no longer takes the other controller's pool,
   topology and fault state; a slot key shared by several disks is no longer
