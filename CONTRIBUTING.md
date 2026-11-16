@@ -776,7 +776,7 @@ that comment yet; the table below is the authoritative list either way.
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
 | `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
 | A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
-| A change an operator could notice | One new `changelog.d/<slug>.<section>.md` fragment, not an edit to `CHANGELOG.md` | The `Changelog entry` gate requires an added fragment; `scripts/changelog_fragments.py collect` writes `CHANGELOG.md` at release time, so pull requests never conflict there |
+| A change an operator could notice | One new `changelog.d/<N>.<section>.md` fragment named for the pull request number, not an edit to `CHANGELOG.md` | The `Changelog entry` gate requires an added fragment; `scripts/changelog_fragments.py collect` writes `CHANGELOG.md` at release time, so pull requests never conflict there |
 | A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard |
 | An added or generated Python unittest | Nothing else. There is no count file to update | The required gate discovers every test identity on the checked-out commit and fails unless each one completed exactly once across the shards |
 | A removed or renamed Python unittest | The `tests-removed-ok` label on the pull request, applied by a maintainer after reading the removal list in the `Python compile and unittest` job summary | The gate compares the pull request's test identities with its base and fails on any that disappeared, including a deletion paired with an addition that keeps the count the same. The label acknowledges the listed removals; it does not waive the completeness check |
@@ -916,29 +916,31 @@ fragment under `changelog.d/`, and the GitHub release body is generated from
 pull request labels plus `CHANGELOG.md`, which the release writes from those
 fragments. A pull request does not edit `CHANGELOG.md`. The rules:
 
-- **One fragment per entry**, named `changelog.d/<slug>.<section>.md`.
-  `<slug>` is 3 to 60 lowercase letters, digits and hyphens (the branch topic
-  works); `<section>` is one of `breaking`, `upgrade`, `security`, `added`,
-  `changed`, `fixed`, `performance`, `docs`, `internal`. The file holds the
-  text of one bullet as one inline paragraph: past tense, no leading `- `, no
-  heading, no HTML comment, no link reference definition, at most 4096 bytes,
+- **One fragment per entry**, named `changelog.d/<N>.<section>.md`, where
+  `<N>` is the pull request number and `<section>` is one of `breaking`,
+  `upgrade`, `security`, `added`, `changed`, `fixed`, `performance`, `docs`,
+  `internal`. A second and later entry in the same section is
+  `changelog.d/<N>.<section>.<k>.md`, with `k` from 2. The file holds the text
+  of one bullet as one inline paragraph: past tense, no leading `- `, no
+  heading, no HTML comment, no raw HTML outside backticks (`<` followed by a
+  letter, `/`, `!` or `?`), no link reference definition, at most 4096 bytes,
   wrapped at about 80 columns. `changelog.d/README.md` has the format and two
   examples. A pull request may add more than one fragment (for example `fixed`
   and `upgrade`).
-- **No `#N` inside parentheses.** Do not write your own pull request number;
-  the release adds it. Any `#N` inside parentheses is refused, because the
-  release tooling reads every `(#N)` as a pull request reference. A plain
-  mention of an issue or another pull request in the sentence is allowed, for
-  example `see #123`.
-- **Other pull requests' fragments stay.** A pull request may edit the text of
-  a fragment that is already on `main` (it must stay valid and does not count
-  as an entry), but deleting or renaming one is refused, even with
-  `no-changelog` or `dependencies`. A maintainer applies the
-  `changelog-removal-ok` label after reading, for example on a revert.
-- **The number comes from Git.** A fragment belongs to the commit that added it
-  on `main`; the release reads `(#N)` from that commit's squash subject and
-  appends it to the bullet. The author never needs the number, so the first CI
-  run of a new pull request can pass.
+- **Only your own number.** Every fragment a pull request adds is named for
+  that pull request's number; the gate refuses any other name and says the
+  name to use. A pull request that carries work from other pull requests (a
+  staging branch) names its fragments with its own number.
+- **No `#N` inside parentheses.** Do not write your own pull request number in
+  the text; the release appends `(#N)` from the file name. Any `#N` inside
+  parentheses is refused, because the release tooling reads every `(#N)` as a
+  pull request reference. A plain mention of an issue or another pull request
+  in the sentence is allowed, for example `see #123`.
+- **Other pull requests' fragments stay.** A fragment that is already on `main`
+  belongs to its pull request: deleting, renaming or editing it, or changing
+  its mode, is refused, even with `no-changelog` or `dependencies`. A
+  maintainer applies the `changelog-edit-ok` label after reading, for example
+  on a revert; it waives that protection and nothing else.
 - **Subsections**, in this order: `Highlights`, `Breaking changes`,
   `Upgrade notes`, `Security`, `Added`, `Changed`, `Fixed`, `Performance`,
   `Docs`, `Internal`, matching the fragment sections. There is no
@@ -969,64 +971,68 @@ fragments. A pull request does not edit `CHANGELOG.md`. The rules:
   The `dependencies` label (Dependabot) skips the entry gate the same way,
   but those pull requests still appear in the release body under
   Dependencies. A tests-only or tooling pull request may instead add an
-  `internal` fragment.
+  `internal` fragment. Advisory mode softens only a missing or invalid entry;
+  a fragment named for another number and a change to another pull request's
+  fragment fail in advisory mode too.
 
 ### How to satisfy the `Changelog entry` check
 
-1. Add one fragment in the same commit as the change, for example
-   `changelog.d/keep-last-inventory.fixed.md` containing
-   `Kept the last inventory visible when a refresh is superseded.`
-2. Check it locally: `python scripts/changelog_fragments.py check`, and the
-   gate itself with `python scripts/check_changelog_entry.py --base origin/main --pr <N>`
-   (any number works before the pull request exists).
-3. Open the pull request. The job passes on the first run.
+1. Open the pull request as a draft. The number does not exist before
+   `gh pr create`, so the first run of the job fails; that is expected.
+2. Read the number with `gh pr view --json number --jq .number` and add the
+   fragment named for it, for example `changelog.d/1234.fixed.md` containing
+   `Kept the last inventory visible when a refresh is superseded.` Check it
+   with `python scripts/changelog_fragments.py check` and
+   `python scripts/check_changelog_entry.py --base origin/main --pr <N>`.
+3. Push that as the next commit. The job re-runs and passes.
 4. If the change is invisible to operators (tests-only, CI-only, tooling),
    apply the `no-changelog` label instead and re-run the job; it reads labels
    live, so no new commit is needed.
 
 Outside contributors cannot apply labels, so the gate runs in advisory mode for
 them: `scripts/check_changelog_entry.py --advisory` prints the same guidance and
-exits 0, and a maintainer applies the label or adds the fragment before merge. The
+exits 0 for a missing or invalid entry, and a maintainer applies the label or
+adds the fragment before merge. The
 workflow selects the mode from the pull request's `author_association`; `OWNER`,
 `MEMBER`, and `COLLABORATOR` remain blocking.
 
 Three scripts enforce this:
 
 - `scripts/check_changelog_entry.py` runs as the `Changelog entry` job on
-  every pull request. Unless `no-changelog` or `dependencies` is set, it
-  requires the diff to add at least one valid fragment that did not exist at
-  the base, and a `breaking` or `upgrade` fragment when `breaking` is set. An
-  invalid fragment (bad name, unknown section, empty, longer than 4096 bytes,
-  a heading, an HTML comment, a link reference definition, a `#N` inside
-  parentheses) fails with the file and the reason. An edit to `CHANGELOG.md`
-  alone does not count; the failure names the fragment to add. The one
-  exception is a release cut: a pull request that introduces the first release
-  heading and adds a bullet naming itself in that new section passes as
-  before. Before any of that, and before the labels, it refuses a pull request
-  that deletes or renames a fragment already on the base, unless the pull
-  request is a release cut whose new section holds that fragment's text or
-  carries `changelog-removal-ok`.
+  every pull request. First, before the labels and in advisory mode too, it
+  refuses a fragment the diff adds (including a rename or copy target) that
+  is not named for this pull request, and any change to a fragment already on
+  the base (deleted, renamed, edited, mode or type changed) unless the pull
+  request carries `changelog-edit-ok` or is a release cut whose new section
+  holds, for each fragment it deletes, the bullet `collect` renders for it,
+  `(#N)` included, as a whole bullet under the matching subsection. Then,
+  unless `no-changelog` or `dependencies` is set, it requires the diff to add
+  at least one valid fragment named for this pull request, and a `breaking`
+  or `upgrade` fragment when `breaking` is set. An invalid fragment (bad name,
+  unknown section, empty, longer than 4096 bytes, a heading, an HTML comment,
+  raw HTML, a link reference definition, a `#N` inside parentheses) fails with
+  the file and the reason. An edit to `CHANGELOG.md` alone does not count;
+  the failure names the fragment to add. The one exception is a release cut: a
+  pull request that introduces the first release heading and adds a bullet
+  naming itself in that new section passes as before.
 - `scripts/changelog_fragments.py` validates fragments (`check`), prints
-  `## Unreleased` with the fragments merged in (`preview`; a fragment not yet
-  merged shows without a number) and, at release time, writes them into
-  `CHANGELOG.md` (`collect --version X.Y.Z --date YYYY-MM-DD`). A fragment is
-  numbered from history only in a full clone, when it is committed unchanged
-  and its adding commit added it as a new file; `collect` stops and names any
-  other one; check the pull request and pass `--pr <file>=<N>` (for every
-  fragment that commit added). `preview` takes the same `--pr`. `collect`
-  deletes only fragments whose bytes are still the ones it read and refuses
-  to collect the same version twice.
+  `## Unreleased` with the fragments merged in (`preview`) and, at release
+  time, writes them into `CHANGELOG.md` (`collect --version X.Y.Z --date
+  YYYY-MM-DD`), each ending in the `(#N)` of its file name. It reads no Git
+  history. `collect` deletes only fragments whose bytes are still the ones it
+  read; when a deletion fails after the write it goes on with the rest, exits
+  non-zero and lists the files still present. It refuses to collect the same
+  version twice.
 - `scripts/check_release_changelog_coverage.py <previous tag> "<section
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
   `--merged-prs-json <file>`, produced with
   `gh pr list --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository`
   (squash subjects lose the number when the merge title is edited). For
-  `"## Unreleased"` the target section includes the fragments, each numbered
-  from the commit that added it or by the same `--pr <file>=<N>` as
-  `collect`; a fragment bound to a pull request that merged a squashed
-  intermediate branch is reported as ambiguous until it is given `--pr`. A
-  released section is read as written. It removes
+  `"## Unreleased"` the target section includes the fragments, each with the
+  `(#N)` of its file name, and a fragment whose number is not a pull request
+  merged since the tag fails the gate. A released section is read as written.
+  It removes
   pull requests labelled `no-changelog` or `dependencies`, uses candidate and
   previous-tag ancestry to seed a timestamp-bounded walk through the pull
   request base/head branch graph, then fails when any remaining number is
@@ -1075,7 +1081,7 @@ Use this shape:
 - Files changed:
 - Behavior changed:
 - Docs/tests changed:
-- Changelog fragment: (the `changelog.d/<slug>.<section>.md` file added, or `no-changelog` and why)
+- Changelog fragment: (the `changelog.d/<N>.<section>.md` file added, or `no-changelog` and why)
 
 ## Verified
 - Commands run:

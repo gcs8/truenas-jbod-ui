@@ -11,8 +11,10 @@ becomes Highlights, Upgrade notes, then the categorized list. The target section
 must contain ``### Highlights``; ``### Upgrade notes`` is included when present.
 
 For ``## Unreleased`` the section is the combined view: the Unreleased text plus
-the fragments in ``changelog.d/`` next to ``--changelog``
-(``scripts/changelog_fragments.py``). A released section is printed as written.
+the fragments in ``changelog.d/`` next to ``--changelog``, each ending in the
+``(#N)`` of its file name (``scripts/changelog_fragments.py``); an invalid
+fragment is left out and named on stderr. A released section is printed as
+written.
 """
 
 from __future__ import annotations
@@ -85,7 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         text = args.changelog.read_text(encoding="utf-8")
         if args.section_header.strip() == fragments.UNRELEASED_HEADING:
-            text, _notes = fragments.combined_changelog(args.changelog.resolve().parent, text)
+            text, notes = fragments.combined_changelog(args.changelog.resolve().parent, text)
+            for note in notes:
+                print(f"note: {note}", file=sys.stderr)
         sys.stdout.write(render(text, args.section_header))
     except (RenderError, OSError, fragments.CollectError) as exc:
         print(str(exc), file=sys.stderr)

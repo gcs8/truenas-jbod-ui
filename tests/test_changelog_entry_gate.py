@@ -82,13 +82,13 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
         self.assertIn("No changelog fragment added for #42", joined)
-        self.assertIn("add changelog.d/<short-name>.fixed.md", joined)
+        self.assertIn("add changelog.d/42.fixed.md", joined)
         self.assertIn("fixed", joined)
         self.assertIn("no-changelog", joined)
 
     def test_code_change_with_entry_passes(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
+        self._add_fragment("42.fixed.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = self._evaluate()
@@ -131,18 +131,18 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertIn("v1.2.3-rc.1+build.5", result.messages[0])
 
     def test_entry_for_a_different_pr_number_fails(self) -> None:
-        # A fragment never names a pull request; the number comes from the
-        # merge commit, so any written number is refused.
+        # A fragment is named for the pull request that adds it; one named
+        # for another number is refused and the gate names the right file.
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.fixed.md", "Bumped the value (#41).\n")
+        self._add_fragment("41.fixed.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = self._evaluate(pr_number=42)
 
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
-        self.assertIn("changelog.d/bump-value.fixed.md", joined)
-        self.assertIn("pull request number", joined)
+        self.assertIn("changelog.d/41.fixed.md", joined)
+        self.assertIn("changelog.d/42.fixed.md", joined)
 
     def test_no_changelog_label_passes_without_entry(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
@@ -185,7 +185,7 @@ class ChangelogEntryGateTests(unittest.TestCase):
         joined = "\n".join(result.messages)
         self.assertIn("No changelog fragment added for #42", joined)
         self.assertIn("CHANGELOG.md", joined)
-        self.assertIn("add changelog.d/<short-name>.fixed.md", joined)
+        self.assertIn("add changelog.d/42.fixed.md", joined)
 
     def test_missing_entry_names_the_absent_unreleased_section(self) -> None:
         text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -227,20 +227,20 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
     def test_breaking_label_requires_breaking_or_upgrade_note_entry(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
+        self._add_fragment("42.fixed.md", "Bumped the value.\n")
         self._commit("fix!: bump value")
 
         result = self._evaluate(labels={"breaking", "bug"})
 
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
-        self.assertIn("changelog.d/<short-name>.breaking.md", joined)
-        self.assertIn("changelog.d/<short-name>.upgrade.md", joined)
+        self.assertIn("changelog.d/42.breaking.md", joined)
+        self.assertIn("changelog.d/42.upgrade.md", joined)
 
     def test_breaking_label_passes_with_upgrade_note(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
-        self._add_fragment("bump-value.upgrade.md", "`VALUE` now defaults to 2; set it explicitly.\n")
+        self._add_fragment("42.fixed.md", "Bumped the value.\n")
+        self._add_fragment("42.upgrade.md", "`VALUE` now defaults to 2; set it explicitly.\n")
         self._commit("fix!: bump value")
 
         result = self._evaluate(labels={"breaking", "bug"})
@@ -299,7 +299,7 @@ class ChangelogEntryGateTests(unittest.TestCase):
     def test_wrapped_fragment_text_passes(self) -> None:
         self._write("docker-compose.yml", "services: {}\n")
         self._add_fragment(
-            "compose-runtime.changed.md",
+            "42.changed.md",
             "Hardened the default Compose runtime with a long description that wraps\n"
             "past eighty columns onto a continuation line.\n",
         )
@@ -313,7 +313,7 @@ class ChangelogEntryGateTests(unittest.TestCase):
         # Highlights are written at release time, so there is no highlights
         # fragment section.
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.highlights.md", "Bumped the value.\n")
+        self._add_fragment("42.highlights.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = self._evaluate()
@@ -353,7 +353,7 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
     def test_advisory_mode_still_reports_a_satisfied_gate_as_a_plain_pass(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
+        self._add_fragment("42.fixed.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = gate.evaluate(

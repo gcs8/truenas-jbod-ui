@@ -1,16 +1,17 @@
 # Changelog fragments
 
-A pull request records its changelog entry here, in one small file, instead of
-editing `CHANGELOG.md`. Two pull requests that each add a fragment never
-conflict. `CHANGELOG.md` is written from these files when a release is
-prepared, and the files are deleted in that release commit.
+A pull request records its changelog entry here, in one small file named for
+its own pull request number, instead of editing `CHANGELOG.md`. Two pull
+requests that each add a fragment never conflict. `CHANGELOG.md` is written
+from these files when a release is prepared, and the files are deleted in that
+release commit.
 
 ## Name
 
-`changelog.d/<slug>.<section>.md`
+`changelog.d/<N>.<section>.md`
 
-- `<slug>`: 3 to 60 lowercase letters, digits and hyphens, starting with a
-  letter or digit. Pick something short and unique, such as the branch topic.
+- `<N>`: the number of the pull request that adds the file, without leading
+  zeros. The release appends `(#N)` to the bullet from this name.
 - `<section>`: one of the subsections of a release, in this order:
 
 | Section | Heading in `CHANGELOG.md` |
@@ -28,7 +29,19 @@ prepared, and the files are deleted in that release commit.
 There is no Highlights fragment. Highlights are written at release time.
 
 A pull request may add more than one fragment, for example a `fixed` entry and
-an `upgrade` note.
+an `upgrade` note. A second and later entry in the same section is
+`changelog.d/<N>.<section>.<k>.md`, with `k` counting from 2. A pull request
+adds only fragments named for its own number, including one that carries work
+from other pull requests.
+
+## Order of work
+
+The number exists only once the pull request does, so:
+
+1. Open the pull request as a draft. The first `Changelog entry` check is red
+   because no fragment exists yet.
+2. Read the number with `gh pr view --json number --jq .number`.
+3. Add `changelog.d/<N>.<section>.md` and push. The check re-runs and passes.
 
 ## Content
 
@@ -37,27 +50,34 @@ tense:
 
 - no leading `- `, no heading, no blank line, no code fence, no HTML comment,
   no link reference definition (`[label]: target`; use an inline link);
-- do not write your own pull request number. The release adds `(#N)` from the
-  commit that merged the fragment (its squash subject ends in `(#N)`). Any
-  `#N` inside parentheses is refused, because the release tooling reads every
-  `(#N)` as a pull request reference. A plain mention of an issue or another
-  pull request in the sentence is allowed, for example `see #123`;
+- no raw HTML: `<` followed by a letter, `/`, `!` or `?` is refused outside
+  backticks, so put a tag or a placeholder such as `<action>` in backticks;
+  `a < b` is fine;
+- do not write your own pull request number; the release appends `(#N)` from
+  the file name. Any `#N` inside parentheses is refused, because the release
+  tooling reads every `(#N)` as a pull request reference. A plain mention of
+  an issue or another pull request in the sentence is allowed, for example
+  `see #123`;
 - it may wrap over several lines; at most 4096 bytes.
 
-A pull request may edit another pull request's fragment, but not delete or
-rename it; the gate refuses that even with `no-changelog`. A maintainer
-applies the `changelog-removal-ok` label after reading, for example on a
-revert.
+A fragment that is already on `main` belongs to its pull request: another pull
+request may not delete, rename or edit it, or change its mode, even with
+`no-changelog`. A maintainer applies the `changelog-edit-ok` label after
+reading, for example on a revert; it waives that protection and nothing else.
+
+Advisory mode softens only a missing or invalid entry, for contributors who
+cannot apply labels. A fragment named for another number and a change to a
+fragment already on `main` fail in advisory mode too.
 
 ## Examples
 
-`changelog.d/keep-last-inventory.fixed.md`:
+`changelog.d/1234.fixed.md`:
 
 ```markdown
 Kept the last inventory visible when a refresh is superseded by a newer one.
 ```
 
-`changelog.d/example-setting.upgrade.md`:
+`changelog.d/1234.upgrade.md`:
 
 ```markdown
 `EXAMPLE_SETTING` now defaults to off. Set it to `on` before upgrading to
@@ -68,7 +88,7 @@ keep the previous behaviour.
 
 ```bash
 python scripts/changelog_fragments.py check     # validate every fragment
-python scripts/changelog_fragments.py preview   # Unreleased with fragments merged in, one line per commit
+python scripts/changelog_fragments.py preview   # Unreleased with the fragments merged in
 python scripts/check_changelog_entry.py --base origin/main --pr <N>  # the CI gate
 ```
 

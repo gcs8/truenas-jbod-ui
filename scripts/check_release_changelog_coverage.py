@@ -29,15 +29,10 @@ Every collected number must appear as ``(#N)`` (alone or inside a longer
 parenthetical such as ``(#12, #13, and #14)``) somewhere in the target
 ``CHANGELOG.md`` section. Missing numbers are printed and the gate exits 1.
 For ``## Unreleased`` the target is the combined view: the Unreleased text plus
-every fragment in ``changelog.d/``, each numbered by the commit on ``--head``
-that added it (``scripts/changelog_fragments.py``). A fragment whose adding
-commit carries no number covers nothing and is listed. ``--pr <file>=<N>``
-binds such a fragment, with the same rules as ``changelog_fragments.py collect``.
-A fragment bound by Git to a pull request that merged a branch holding other
-pull requests (an intermediate branch squashed into the candidate) is
-ambiguous: the gate fails and names the outer and inner numbers until every
-such fragment is bound with ``--pr``. A released section is read as written;
-pending fragments never count for it.
+every fragment in ``changelog.d/``, each ending in the ``(#N)`` of its file name
+(``scripts/changelog_fragments.py``). A fragment whose number is not a pull
+request merged into the candidate since the tag also fails the gate, named. A
+released section is read as written; fragments never count for it.
 
 When ``wiki/`` changed since the tag, the gate also requires ``--wiki-commit
 <sha>`` and confirms with ``git ls-remote`` that the sha is a branch tip of the
@@ -201,46 +196,6 @@ def _branch_scoped_indices(
     return included
 
 
-def _inner_pull_requests(
-    records: list[MergedPullRequest], candidate_rows: set[int], released_rows: set[int]
-) -> dict[int, set[int]]:
-    """Map each candidate pull request to the pull requests merged into its head branch.
-
-    Only rows the branch-scoped walk keeps are used, and only those merged
-    after the previous merge from the same head branch, so a reused branch name
-    does not inherit older inner pull requests.
-    """
-
-    inner: dict[int, set[int]] = {}
-    for index in candidate_rows - released_rows:
-        outer = records[index]
-        if not outer.head_ref_is_local or outer.head_ref is None or outer.merged_at is None:
-            continue
-        floor = max(
-            (
-                record.merged_at
-                for record in records
-                if record.head_ref == outer.head_ref
-                and record.head_ref_is_local
-                and record.merged_at is not None
-                and record.merged_at < outer.merged_at
-            ),
-            default=None,
-        )
-        members = {
-            records[row].number
-            for row in candidate_rows
-            if row != index
-            and records[row].base_ref == outer.head_ref
-            and records[row].merged_at is not None
-            and records[row].merged_at <= outer.merged_at
-            and (floor is None or records[row].merged_at > floor)
-        }
-        if members:
-            inner.setdefault(outer.number, set()).update(members)
-    return inner
-
-
 def pr_number_sets_from_json(
     path: Path,
     *,
@@ -248,14 +203,7 @@ def pr_number_sets_from_json(
     previous_tag: str | None = None,
     head: str = "HEAD",
     not_after: str | None = None,
-    inner: dict[int, set[int]] | None = None,
 ) -> tuple[set[int], set[int]]:
-    """Expected and excluded pull request numbers from the merged-PR records.
-
-    When ``inner`` is given it is filled with the pull requests each candidate
-    pull request carried in through its head branch.
-    """
-
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise CoverageError(f"{path} must hold a JSON list")
@@ -315,8 +263,6 @@ def pr_number_sets_from_json(
 
     candidate_rows = _branch_scoped_indices(records, {"candidate"})
     released_rows = _branch_scoped_indices(records, {"released"})
-    if inner is not None:
-        inner.update(_inner_pull_requests(records, candidate_rows, released_rows))
     for index, record in enumerate(records):
         if index in candidate_rows and index not in released_rows:
             if not record.skipped:
@@ -405,12 +351,11 @@ def evaluate(
     offline: bool = False,
     wiki_remote: str | None = None,
     changelog_path: Path | None = None,
-    pr_overrides: dict[str, int] | None = None,
 ) -> CoverageResult:
     result = CoverageResult(ok=True)
 
     expected = merged_pr_numbers_from_git(repo, previous_tag, head)
-    inner: dict[int, set[int]] = {}
+    excluded: set[int] = set()
     if merged_prs_json is not None:
         json_numbers, excluded = pr_number_sets_from_json(
             merged_prs_json,
@@ -418,7 +363,6 @@ def evaluate(
             previous_tag=previous_tag,
             head=head,
             not_after=tag_commit_time(repo, previous_tag),
-            inner=inner,
         )
         expected |= json_numbers
         expected -= excluded
@@ -426,18 +370,12 @@ def evaluate(
 
     changelog = (changelog_path or repo / CHANGELOG_PATH).read_text(encoding="utf-8")
     fragment_notes: list[str] = []
-    ambiguous: list[str] = []
+    stray: list[str] = []
     if section_header.strip() == fragments.UNRELEASED_HEADING:
         root = changelog_path.parent if changelog_path is not None else repo
-        changelog, fragment_notes, bindings = fragments.combined_view(
-            root, changelog, ref=head, pr_overrides=pr_overrides
-        )
-        for path, binding in sorted(bindings.items()):
-            if binding.number in inner and not binding.explicit:
-                carried = ", ".join(f"#{number}" for number in sorted(inner[binding.number]))
-                ambiguous.append(
-                    f"  {path}: bound by Git to #{binding.number}, which merged a branch holding {carried}"
-                )
+        changelog, fragment_notes, pending = fragments.combined_view(root, changelog)
+        merged = expected | excluded
+        stray = [f"  {item.path} (#{item.number})" for item in pending if item.number not in merged]
     present = pr_numbers_in_section(changelog_section(changelog, section_header))
     result.covered = expected & present
     result.missing = expected - present
@@ -453,16 +391,16 @@ def evaluate(
         )
     else:
         result.messages.append(f"Changelog coverage: pass ({len(expected)} PRs)")
-    if ambiguous:
+    if stray:
         result.ok = False
         result.messages.append(
-            "Changelog fragment binding: FAIL, ambiguous; these fragments arrived through an intermediate "
-            "branch that was squashed, so the number in the squash subject may not be theirs:"
+            f"Changelog fragments: FAIL, named for pull requests that did not merge into {head} since "
+            f"{previous_tag}:"
         )
-        result.messages.extend(ambiguous)
+        result.messages.extend(stray)
         result.messages.append(
-            "Confirm the pull request of each one and pass --pr <file>=<N> for it and for every other "
-            "fragment the same commit added."
+            "Rename or remove each one (a maintainer applies 'changelog-edit-ok'), or, when the pull request "
+            "did merge and its squash title lost the number, list it in --merged-prs-json."
         )
     result.messages.extend(f"Changelog fragment: {note}" for note in fragment_notes)
 
@@ -523,7 +461,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--wiki-remote", help="Wiki repository URL (default: origin URL with .wiki.git).")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Repository root (default: cwd).")
-    fragments.add_pr_option(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -536,7 +473,6 @@ def main(argv: list[str] | None = None) -> int:
             wiki_commit=args.wiki_commit,
             offline=args.offline,
             wiki_remote=args.wiki_remote,
-            pr_overrides=fragments.parse_pr_option(args.pr),
         )
     except (CoverageError, OSError, ValueError) as exc:
         print(str(exc))

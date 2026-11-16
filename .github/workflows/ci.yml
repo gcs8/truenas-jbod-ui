@@ -161,15 +161,19 @@ jobs:
           # job takes effect without a new push. `dependencies` (Dependabot)
           # skips the gate the same way; release.yml still lists those PRs
           # under Dependencies. Otherwise the pull request must add a valid
-          # changelog fragment, changelog.d/<slug>.<section>.md. Before the
-          # labels, the gate refuses deleting or renaming a fragment already
-          # on the base unless `changelog-removal-ok` is applied. The gate
-          # script itself only runs git; it never talks to the network.
+          # changelog fragment named for its own number,
+          # changelog.d/<N>.<section>.md. Before the labels, the gate refuses
+          # an added fragment named for another number, and any change to a
+          # fragment already on the base unless `changelog-edit-ok` is
+          # applied. The gate script itself only runs git; it never talks to
+          # the network.
           labels="$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name] | join(",")')"
 
           # Only a contributor with write access can apply `no-changelog`, so
           # for everyone else the gate reports what is missing and passes; a
           # maintainer adds the label or the fragment before merge (#TBD).
+          # Advisory mode softens only a missing or invalid entry; the two
+          # refusals above still fail.
           mode=()
           case "${PR_AUTHOR_ASSOCIATION:-NONE}" in
             OWNER|MEMBER|COLLABORATOR) ;;
