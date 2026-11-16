@@ -112,8 +112,8 @@ test("attention score context provides constant-time view comparisons", () => {
 // Load production functions, not stand-ins for nullable SMART conversion.
 function loadMetricFunctions(context = {}) {
   const names = [
-    "heatmapSmartNumber", "heatmapEntryOccupied", "heatmapSlotState",
-    "heatmapMetricNumber", "buildAttentionScoreContext", "attentionPeerWriteMedian",
+    "heatmapSmartNumber", "smartFieldNotRead", "heatmapEntryOccupied", "heatmapSlotState",
+    "heatmapMetricNumber", "attentionScoreInputState", "heatmapMissingText", "buildAttentionScoreContext", "attentionPeerWriteMedian",
     "heatmapTemperatureAverage", "computeTemperatureDelta", "countRisk",
     "computeAttentionScore", "roundHeatmapValue", "heatmapReadWriteRatio",
     "formatReadWriteRatioValue", "computeAnnualizedBytes", "heatmapAnnualizedBytes",

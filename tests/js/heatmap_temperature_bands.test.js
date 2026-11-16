@@ -291,8 +291,8 @@ test("temperature colours default to bands and keep relative min-max as an expli
 function contextApi(state, entries) {
   return loadFunctions([
     ...BAND_FUNCTIONS,
-    "heatmapSmartNumber", "heatmapEntryOccupied", "heatmapSlotState", "heatmapMetricNumber",
-    "buildAttentionScoreContext", "attentionPeerWriteMedian", "heatmapTemperatureAverage",
+    "heatmapSmartNumber", "smartFieldNotRead", "heatmapEntryOccupied", "heatmapSlotState", "heatmapMetricNumber",
+    "attentionScoreInputState", "heatmapMissingText", "buildAttentionScoreContext", "attentionPeerWriteMedian", "heatmapTemperatureAverage",
     "computeTemperatureDelta", "countRisk", "computeAttentionScore", "roundHeatmapValue",
     "heatmapReadWriteRatio", "formatReadWriteRatioValue", "computeAnnualizedBytes", "heatmapAnnualizedBytes",
     "heatmapAnnualizedRead", "heatmapAnnualizedWrite", "heatmapHistoryRate",

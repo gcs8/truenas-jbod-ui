@@ -15299,7 +15299,7 @@ Enclosure Status diagnostic page:
         self.assertEqual(
             set(getattr(inventory_module, "SMART_SUMMARY_VALUE_FIELDS", ())),
             set(SmartSummaryView.model_fields)
-            - {"available", "message", "smartctl_exit_status", "smartctl_status_flags"},
+            - {"available", "message", "smartctl_exit_status", "smartctl_status_flags", "unread_fields"},
         )
 
 
