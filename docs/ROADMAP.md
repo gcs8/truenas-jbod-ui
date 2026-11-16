@@ -20,8 +20,9 @@ stay practical and incremental:
 - keep weaker SAS/backplane/platform inferences visibly labeled instead of
   turning them into fake certainty
 
-Open work is tracked in the GitHub issue list, and every merged change lands
-under `## Unreleased` in `CHANGELOG.md` before the next release cut.
+Open work is tracked in the GitHub issue list. Every merged change adds a
+fragment under `changelog.d/`; the release cut writes those, together with the
+entries already under `## Unreleased`, into `CHANGELOG.md`.
 
 ## Guiding principle
 

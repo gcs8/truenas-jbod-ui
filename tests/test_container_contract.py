@@ -164,6 +164,7 @@ class DockerContextContractTests(unittest.TestCase):
             "app/.env", "app/.env.example", "app/secrets.env", "app/client.key",
             "app/client.pem", "app/.ssh/id_test", "app/id_rsa", "app/id_ed25519",
             "app/known_hosts", "app/nested/.git/objects/example",
+            "changelog.d", "changelog.d/README.md", "changelog.d/topic.fixed.md", "changelog.d/notes.txt",
         )
         for path in paths:
             with self.subTest(path=path):

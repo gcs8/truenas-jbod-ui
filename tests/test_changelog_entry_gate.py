@@ -70,14 +70,8 @@ class ChangelogEntryGateTests(unittest.TestCase):
             labels=labels or set(),
         )
 
-    def _add_entry(self, subsection: str, entry: str) -> None:
-        text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
-        marker = f"### {subsection}\n\n"
-        if marker in text:
-            text = text.replace(marker, marker + entry + "\n", 1)
-        else:
-            text = text.replace("## Unreleased\n\n", f"## Unreleased\n\n{marker}{entry}\n\n", 1)
-        self._write("CHANGELOG.md", text)
+    def _add_fragment(self, name: str, text: str) -> None:
+        self._write(f"changelog.d/{name}", text)
 
     def test_code_change_without_entry_fails_with_instructions(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
@@ -87,14 +81,14 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
-        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
-        self.assertIn("(#42)", joined)
-        self.assertIn("'### Fixed'", joined)
+        self.assertIn("No changelog fragment added for #42", joined)
+        self.assertIn("add changelog.d/<short-name>.fixed.md", joined)
+        self.assertIn("fixed", joined)
         self.assertIn("no-changelog", joined)
 
     def test_code_change_with_entry_passes(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Fixed", "- Bumped the value (#42).")
+        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = self._evaluate()
@@ -137,14 +131,18 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertIn("v1.2.3-rc.1+build.5", result.messages[0])
 
     def test_entry_for_a_different_pr_number_fails(self) -> None:
+        # A fragment never names a pull request; the number comes from the
+        # merge commit, so any written number is refused.
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Fixed", "- Bumped the value (#41).")
+        self._add_fragment("bump-value.fixed.md", "Bumped the value (#41).\n")
         self._commit("fix: bump value")
 
         result = self._evaluate(pr_number=42)
 
         self.assertFalse(result.ok)
-        self.assertIn("(#42)", "\n".join(result.messages))
+        joined = "\n".join(result.messages)
+        self.assertIn("changelog.d/bump-value.fixed.md", joined)
+        self.assertIn("pull request number", joined)
 
     def test_no_changelog_label_passes_without_entry(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
@@ -181,11 +179,13 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         result = self._evaluate()
 
+        # Editing CHANGELOG.md no longer admits a pull request, wherever the
+        # bullet lands; the failure names the fragment to add instead.
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
-        self.assertIn("has no '## Unreleased' section", joined)
-        self.assertIn("already shipped '## v0.2.0 - 2026-02-01' section", joined)
-        self.assertIn("Insert '## Unreleased'", joined)
+        self.assertIn("No changelog fragment added for #42", joined)
+        self.assertIn("CHANGELOG.md", joined)
+        self.assertIn("add changelog.d/<short-name>.fixed.md", joined)
 
     def test_missing_entry_names_the_absent_unreleased_section(self) -> None:
         text = (self.repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -198,10 +198,12 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
         result = self._evaluate()
 
+        # Fragments need no Unreleased heading, so the message no longer asks
+        # for one; it names the fragment to add.
         self.assertFalse(result.ok)
         joined = "\n".join(result.messages)
-        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
-        self.assertIn("has no '## Unreleased' section yet", joined)
+        self.assertIn("No changelog fragment added for #42", joined)
+        self.assertNotIn("Insert '## Unreleased'", joined)
 
     def test_change_outside_operator_visible_paths_requires_escape_label(self) -> None:
         self._write("tests/test_service.py", "def test_more() -> None:\n    pass\n")
@@ -225,18 +227,20 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
     def test_breaking_label_requires_breaking_or_upgrade_note_entry(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Fixed", "- Bumped the value (#42).")
+        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
         self._commit("fix!: bump value")
 
         result = self._evaluate(labels={"breaking", "bug"})
 
         self.assertFalse(result.ok)
-        self.assertIn("'### Breaking changes' or '### Upgrade notes'", "\n".join(result.messages))
+        joined = "\n".join(result.messages)
+        self.assertIn("changelog.d/<short-name>.breaking.md", joined)
+        self.assertIn("changelog.d/<short-name>.upgrade.md", joined)
 
     def test_breaking_label_passes_with_upgrade_note(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Fixed", "- Bumped the value (#42).")
-        self._add_entry("Upgrade notes", "- `VALUE` now defaults to 2; set it explicitly (#42).")
+        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
+        self._add_fragment("bump-value.upgrade.md", "`VALUE` now defaults to 2; set it explicitly.\n")
         self._commit("fix!: bump value")
 
         result = self._evaluate(labels={"breaking", "bug"})
@@ -245,10 +249,10 @@ class ChangelogEntryGateTests(unittest.TestCase):
 
     def test_wrapped_pr_reference_on_continuation_line_passes(self) -> None:
         self._write("docker-compose.yml", "services: {}\n")
-        self._add_entry(
-            "Changed",
-            "- Hardened the default Compose runtime with a long description that wraps\n"
-            "  past eighty columns before the reference (#42).",
+        self._add_fragment(
+            "compose-runtime.changed.md",
+            "Hardened the default Compose runtime with a long description that wraps\n"
+            "past eighty columns onto a continuation line.\n",
         )
         self._commit("fix: harden compose")
 
@@ -257,13 +261,16 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
 
     def test_entry_under_disallowed_subsection_does_not_count(self) -> None:
+        # Highlights are written at release time, so there is no highlights
+        # fragment section.
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Highlights", "- Bumped the value (#42).")
+        self._add_fragment("bump-value.highlights.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = self._evaluate()
 
         self.assertFalse(result.ok)
+        self.assertIn("unknown section 'highlights'", "\n".join(result.messages))
 
     def test_entry_added_below_unreleased_section_does_not_count(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
@@ -292,12 +299,12 @@ class ChangelogEntryGateTests(unittest.TestCase):
         self.assertTrue(result.ok, result.messages)
         joined = "\n".join(result.messages)
         self.assertIn("Advisory", joined)
-        self.assertIn("CHANGELOG.md needs an entry for #42", joined)
+        self.assertIn("No changelog fragment added for #42", joined)
         self.assertIn("a maintainer", joined)
 
     def test_advisory_mode_still_reports_a_satisfied_gate_as_a_plain_pass(self) -> None:
         self._write("app/service.py", "VALUE = 2\n")
-        self._add_entry("Fixed", "- Bumped the value (#42).")
+        self._add_fragment("bump-value.fixed.md", "Bumped the value.\n")
         self._commit("fix: bump value")
 
         result = gate.evaluate(

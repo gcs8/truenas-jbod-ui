@@ -3,8 +3,9 @@
 # category whose label it carries; `.github/workflows/pr-labels.yml` applies the
 # type labels from the conventional-commit title prefix. The Highlights and
 # Upgrade notes come from CHANGELOG.md via scripts/render_release_notes.py and
-# are passed with `--notes-file`; see CONTRIBUTING.md "Changelog And Release
-# Notes".
+# are passed with `--notes-file`; per-PR entries reach CHANGELOG.md from
+# changelog.d/ fragments when scripts/changelog_fragments.py collects a release.
+# See CONTRIBUTING.md "Changelog And Release Notes".
 changelog:
   exclude:
     labels:

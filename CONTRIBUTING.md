@@ -776,6 +776,7 @@ that comment yet; the table below is the authoritative list either way.
 | Any user-visible string the snapshot page shows | `qa/public-demo.spec.js` (Playwright assertions on the demo page) and the `tests/js` assertions that pin it | The CI job named `Checked-in public demo artifact` runs those specs, and only the first mismatch is reported per run |
 | `downsampling_label` and other values that look like copy but are compared in code (`"None"` is a sentinel read by two consumers in `app/static/app.js`) | Every consumer, or leave the value alone and change only the neighbouring note | A plain-language rename turns a sentinel into a false positive |
 | A warning or note that states where data came from (live data, cached topology, fallback geometry) | Only reword in a way that keeps the same claim; if the source is uncertain, say less, not more | Bay geometry is safety-relevant: an operator who believes a drawing came from live data may pull the wrong drive |
+| A change an operator could notice | One new `changelog.d/<slug>.<section>.md` fragment, not an edit to `CHANGELOG.md` | The `Changelog entry` gate requires an added fragment; `scripts/changelog_fragments.py collect` writes `CHANGELOG.md` at release time, so pull requests never conflict there |
 | A new `tests/test_*.py` module | `WINDOWS_PORTABLE_TEST_MODULES` or `WINDOWS_EXCLUSIONS` in `scripts/dev_check.py`, and one shard tuple in `SHARDS` in `scripts/run_test_shard.py` (keep it sorted) | `tests.test_dev_check` fails on an unclassified module; the shard runner rejects a module outside every shard |
 | An added or generated Python unittest | Nothing else. There is no count file to update | The required gate discovers every test identity on the checked-out commit and fails unless each one completed exactly once across the shards |
 | A removed or renamed Python unittest | The `tests-removed-ok` label on the pull request, applied by a maintainer after reading the removal list in the `Python compile and unittest` job summary | The gate compares the pull request's test identities with its base and fails on any that disappeared, including a deletion paired with an addition that keeps the count the same. The label acknowledges the listed removals; it does not waive the completeness check |
@@ -910,23 +911,34 @@ Platform-specific wording:
 
 ## Changelog And Release Notes
 
-Every pull request that operators could notice records itself in
-`CHANGELOG.md`, and the GitHub release body is generated from pull request
-labels plus that file. The rules:
+Every pull request that operators could notice records itself in one changelog
+fragment under `changelog.d/`, and the GitHub release body is generated from
+pull request labels plus `CHANGELOG.md`, which the release writes from those
+fragments. A pull request does not edit `CHANGELOG.md`. The rules:
 
-- **One line per merged pull request** under `## Unreleased`, past tense,
-  ending with the pull request number as `(#N)`. Several numbers may share a
-  line as `(#12, #13, and #14)`, and the `(#N)` may sit on a wrapped
-  continuation line. Wrap at about 80 columns like the rest of the file.
+- **One fragment per entry**, named `changelog.d/<slug>.<section>.md`.
+  `<slug>` is 3 to 60 lowercase letters, digits and hyphens (the branch topic
+  works); `<section>` is one of `breaking`, `upgrade`, `security`, `added`,
+  `changed`, `fixed`, `performance`, `docs`, `internal`. The file holds the
+  text of one bullet: past tense, no leading `- `, no heading, no pull request
+  number, at most 4096 bytes, wrapped at about 80 columns.
+  `changelog.d/README.md` has the format and two examples. A pull request may
+  add more than one fragment (for example `fixed` and `upgrade`).
+- **The number comes from Git.** A fragment belongs to the commit that added it
+  on `main`; the release reads `(#N)` from that commit's squash subject and
+  appends it to the bullet. The author never needs the number, so the first CI
+  run of a new pull request can pass.
 - **Subsections**, in this order: `Highlights`, `Breaking changes`,
   `Upgrade notes`, `Security`, `Added`, `Changed`, `Fixed`, `Performance`,
-  `Docs`, `Internal`. Omit empty ones. Per-PR lines go in any subsection except
-  `Highlights`, which holds three to five one-sentence release themes written
-  at release time.
+  `Docs`, `Internal`, matching the fragment sections. There is no
+  `highlights` fragment: Highlights hold three to five one-sentence release
+  themes written at release time.
 - **Upgrade notes rule.** A pull request labelled `breaking` must also add a
-  bullet under `### Breaking changes` or `### Upgrade notes` that starts with
-  the variable, file, or action the operator must handle, says what to do, and
-  ends with `(#N)`.
+  `breaking` or `upgrade` fragment that starts with the variable, file, or
+  action the operator must handle and says what to do.
+- **Existing entries.** The bullets already under `## Unreleased` in
+  `CHANGELOG.md` were written before fragments; they stay as they are until
+  the next release folds them in, and the fragments are added after them.
 - **Labels drive the release body.** `.github/workflows/pr-labels.yml` derives
   a label from the conventional title prefix, after stripping a leading
   `[tag]`: `feat` to `enhancement`, `fix` to `bug`, `perf` to `performance`,
@@ -945,46 +957,56 @@ labels plus that file. The rules:
   `Changelog entry` job after applying the label; it reads labels live.
   The `dependencies` label (Dependabot) skips the entry gate the same way,
   but those pull requests still appear in the release body under
-  Dependencies. Pull requests with no operator-visible paths must still carry
-  `no-changelog`; an unlabeled invisible pull request fails the entry gate so
-  release coverage cannot discover an implicit escape later.
+  Dependencies. A tests-only or tooling pull request may instead add an
+  `internal` fragment.
 
 ### How to satisfy the `Changelog entry` check
 
-1. Open the pull request. The number does not exist before `gh pr create`, so
-   the first run fails; that is expected.
-2. Add one bullet to `CHANGELOG.md` under `## Unreleased`, in the subsection
-   that matches the change, ending with your pull request number:
-   `- Fixed the thing an operator sees (#123).`
-3. Push that as the next commit. The job re-runs and passes.
+1. Add one fragment in the same commit as the change, for example
+   `changelog.d/keep-last-inventory.fixed.md` containing
+   `Kept the last inventory visible when a refresh is superseded.`
+2. Check it locally: `python scripts/changelog_fragments.py check`, and the
+   gate itself with `python scripts/check_changelog_entry.py --base origin/main --pr <N>`
+   (any number works before the pull request exists).
+3. Open the pull request. The job passes on the first run.
 4. If the change is invisible to operators (tests-only, CI-only, tooling),
-   apply the `no-changelog` label instead of a bullet and re-run the job; it
-   reads labels live, so no new commit is needed.
+   apply the `no-changelog` label instead and re-run the job; it reads labels
+   live, so no new commit is needed.
 
 Outside contributors cannot apply labels, so the gate runs in advisory mode for
 them: `scripts/check_changelog_entry.py --advisory` prints the same guidance and
-exits 0, and a maintainer applies the label or adds the bullet before merge. The
+exits 0, and a maintainer applies the label or adds the fragment before merge. The
 workflow selects the mode from the pull request's `author_association`; `OWNER`,
 `MEMBER`, and `COLLABORATOR` remain blocking.
 
-Two scripts enforce this:
+Three scripts enforce this:
 
 - `scripts/check_changelog_entry.py` runs as the `Changelog entry` job on
-  every pull request. When the diff touches `app/`, `admin_service/`,
-  `history_service/`, `scripts/`, `config/`, `wiki/`, `docs/` (excluding
-  release wrap and release notes files), `docker-compose*.yml`, `Dockerfile*`,
-  or `.env.example`, it requires an added `(#N)` bullet for this pull request
-  under `## Unreleased`, and the upgrade-note bullet when `breaking` is set.
-  The pull request number does not exist before `gh pr create`, so the first
-  run of a new pull request fails until the changelog line is pushed; add it
-  as the next commit. Locally:
-  `python scripts/check_changelog_entry.py --base origin/main --pr <N>`.
+  every pull request. Unless `no-changelog` or `dependencies` is set, it
+  requires the diff to add at least one valid fragment that did not exist at
+  the base, and a `breaking` or `upgrade` fragment when `breaking` is set. An
+  invalid fragment (bad name, unknown section, empty, longer than 4096 bytes,
+  a heading, a `(#N)` reference) fails with the file and the reason. An edit
+  to `CHANGELOG.md` alone does not count; the failure names the fragment to
+  add. The one exception is a release cut: a pull request that introduces the
+  first release heading and adds a bullet naming itself in that new section
+  passes as before.
+- `scripts/changelog_fragments.py` validates fragments (`check`), prints
+  `## Unreleased` with the fragments merged in (`preview`; a fragment not yet
+  merged shows without a number) and, at release time, writes them into
+  `CHANGELOG.md` (`collect --version X.Y.Z --date YYYY-MM-DD`). `collect`
+  stops and names the file when a fragment's adding commit has no `(#N)`
+  subject; check the pull request and pass `--pr <file>=<N>`. It deletes
+  exactly the fragments it read and refuses to collect the same version
+  twice.
 - `scripts/check_release_changelog_coverage.py <previous tag> "<section
   header>"` runs during release prep. It collects merged pull request numbers
   from `git log <tag>..HEAD` squash and merge subjects and from
   `--merged-prs-json <file>`, produced with
   `gh pr list --state merged --limit 1000 --json number,mergedAt,labels,mergeCommit,baseRefName,headRefName,isCrossRepository`
-  (squash subjects lose the number when the merge title is edited). It removes
+  (squash subjects lose the number when the merge title is edited). For
+  `"## Unreleased"` the target section includes the fragments, each numbered
+  from the commit that added it; a released section is read as written. It removes
   pull requests labelled `no-changelog` or `dependencies`, uses candidate and
   previous-tag ancestry to seed a timestamp-bounded walk through the pull
   request base/head branch graph, then fails when any remaining number is
@@ -1006,6 +1028,10 @@ header is final:
 python scripts/render_release_notes.py "## vX.Y.Z - YYYY-MM-DD" > release-notes.md
 gh release create vX.Y.Z --title "vX.Y.Z" --generate-notes --notes-file release-notes.md
 ```
+
+A release tree must hold no fragment other than `changelog.d/README.md`;
+`scripts/validate_release_wrap.py` refuses one that does (older tags have no
+`changelog.d/` and stay valid).
 
 `render_release_notes.py` prints the section's Highlights and Upgrade notes;
 GitHub appends the label-categorized pull request list from
@@ -1029,7 +1055,7 @@ Use this shape:
 - Files changed:
 - Behavior changed:
 - Docs/tests changed:
-- Changelog line: (the `(#N)` bullet added under `## Unreleased`, or `no-changelog` and why)
+- Changelog fragment: (the `changelog.d/<slug>.<section>.md` file added, or `no-changelog` and why)
 
 ## Verified
 - Commands run:

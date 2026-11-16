@@ -804,6 +804,7 @@ class NarrowBetaReleaseWrapTests(unittest.TestCase):
             "scripts/dev_check.py", "scripts/run_test_shard.py",
             "scripts/check_public_docs.py", "scripts/check_public_screenshots.py",
             "scripts/check_public_demo_artifact.py", "scripts/verify_wiki_drift.py",
+            "scripts/changelog_fragments.py",
         }
         self.assertTrue(required_tools <= NARROW_BETA_QA_TOOLING)
         repository = _narrow_repository(self.root, extra_changes={path: "# QA only\n" for path in required_tools})

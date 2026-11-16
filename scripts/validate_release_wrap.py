@@ -97,6 +97,7 @@ NARROW_BETA_QA_TOOLING = frozenset(
         "scripts/build_perf_baseline.py",
         "scripts/build_public_demo.py",
         "scripts/build_ui_crawl_fixture.py",
+        "scripts/changelog_fragments.py",
         "scripts/check_changelog_entry.py",
         "scripts/check_public_demo_artifact.py",
         "scripts/check_public_docs.py",
@@ -131,6 +132,11 @@ NARROW_BETA_VERSION_LINES = {
     ),
 }
 GIT_TIMEOUT_SECONDS = 60
+# A release tree must hold no unconsumed changelog fragment: only the README may
+# remain in changelog.d/. The rule reads the tree, not the version, so older tags
+# without changelog.d/ stay valid (scripts/changelog_fragments.py collect).
+FRAGMENT_DIRECTORY = "changelog.d"
+FRAGMENT_README = "changelog.d/README.md"
 
 
 @dataclass(frozen=True)
@@ -578,6 +584,44 @@ def narrow_beta_issues(
     return issues
 
 
+def unconsumed_fragment_issues(repository: Path, ref: str) -> list[ValidationIssue]:
+    """Refuse a release tree that still holds changelog fragments.
+
+    ``ref`` is the candidate (``HEAD`` before tagging, the release tag after).
+    A directory that is not the top of a Git checkout is read from disk.
+    """
+
+    try:
+        top = _git(repository, "rev-parse", "--show-toplevel")
+        is_checkout = top.returncode == 0 and Path(top.stdout.strip()).resolve() == repository.resolve()
+        if is_checkout:
+            resolved = _git(repository, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+            if resolved.returncode != 0:
+                return [ValidationIssue(f"cannot check {FRAGMENT_DIRECTORY}/: git cannot resolve {ref}")]
+            listed = _git(repository, "ls-tree", "-r", "-z", "--name-only", ref, "--", f"{FRAGMENT_DIRECTORY}/")
+            if listed.returncode != 0:
+                return [ValidationIssue(f"cannot list {FRAGMENT_DIRECTORY}/ at {ref}: {_git_error(listed)}")]
+            paths = [path for path in listed.stdout.split("\0") if path]
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [ValidationIssue(f"cannot check {FRAGMENT_DIRECTORY}/: git is unavailable: {exc}")]
+    if not is_checkout:
+        directory = repository / FRAGMENT_DIRECTORY
+        paths = (
+            sorted(f"{FRAGMENT_DIRECTORY}/{entry.name}" for entry in directory.iterdir())
+            if directory.is_dir()
+            else []
+        )
+    leftover = sorted(path for path in paths if path != FRAGMENT_README)
+    if not leftover:
+        return []
+    return [
+        ValidationIssue(
+            f"{ref} still holds unconsumed changelog fragments; run scripts/changelog_fragments.py "
+            "collect for this release and commit the result: " + ", ".join(leftover)
+        )
+    ]
+
+
 def release_wrap_path(repository: Path, version: str) -> Path:
     """Return the release wrap for ``version``: current under docs/, older under docs/archive/."""
 
@@ -796,6 +840,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if public_demo_freshness_required(version):
         issues.extend(public_demo_release_issues(args.repository, version))
+    candidate_ref = "HEAD" if args.phase == "pre-tag" else f"refs/tags/v{version}"
+    issues.extend(unconsumed_fragment_issues(args.repository, candidate_ref))
     if issues:
         for issue in issues:
             print(f"- {issue.message}")

@@ -5,6 +5,7 @@
 worktrees/
 docs/
 wiki/
+changelog.d/
 public-demo/
 *.md
 

@@ -28,6 +28,11 @@ entered the previous release.
 Every collected number must appear as ``(#N)`` (alone or inside a longer
 parenthetical such as ``(#12, #13, and #14)``) somewhere in the target
 ``CHANGELOG.md`` section. Missing numbers are printed and the gate exits 1.
+For ``## Unreleased`` the target is the combined view: the Unreleased text plus
+every fragment in ``changelog.d/``, each numbered by the commit on ``--head``
+that added it (``scripts/changelog_fragments.py``). A fragment whose adding
+commit carries no number covers nothing and is listed. A released section is
+read as written; pending fragments never count for it.
 
 When ``wiki/`` changed since the tag, the gate also requires ``--wiki-commit
 <sha>`` and confirms with ``git ls-remote`` that the sha is a branch tip of the
@@ -44,6 +49,11 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if __package__:
+    from scripts import changelog_fragments as fragments
+else:
+    import changelog_fragments as fragments  # type: ignore[no-redef]
 
 CHANGELOG_PATH = "CHANGELOG.md"
 WIKI_DIRECTORY = "wiki/"
@@ -358,6 +368,10 @@ def evaluate(
     expected -= released_pr_numbers(repo, previous_tag)
 
     changelog = (changelog_path or repo / CHANGELOG_PATH).read_text(encoding="utf-8")
+    fragment_notes: list[str] = []
+    if section_header.strip() == fragments.UNRELEASED_HEADING:
+        root = changelog_path.parent if changelog_path is not None else repo
+        changelog, fragment_notes = fragments.combined_changelog(root, changelog, ref=head)
     present = pr_numbers_in_section(changelog_section(changelog, section_header))
     result.covered = expected & present
     result.missing = expected - present
@@ -373,6 +387,7 @@ def evaluate(
         )
     else:
         result.messages.append(f"Changelog coverage: pass ({len(expected)} PRs)")
+    result.messages.extend(f"Changelog fragment: {note}" for note in fragment_notes)
 
     result.wiki_changed = wiki_changed_since(repo, previous_tag, head)
     if result.wiki_changed:

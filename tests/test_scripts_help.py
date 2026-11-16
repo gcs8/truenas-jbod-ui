@@ -27,6 +27,7 @@ REQUIRED_ARGUMENT_HELP = {
     "check_public_demo_artifact.py": ("--max-raw-bytes", "--max-gzip-bytes"),
     "check_public_screenshots.py": ("--root",),
     "render_release_notes.py": ("--changelog",),
+    "changelog_fragments.py": ("check", "preview", "collect"),
 }
 
 # Scripts whose POSIX-only imports must not run before argparse handles --help.

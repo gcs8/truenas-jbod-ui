@@ -9,6 +9,10 @@ GitHub appends its generated, label-categorized pull request list (configured
 in ``.github/release.yml``) after the ``--notes-file`` text, so the release body
 becomes Highlights, Upgrade notes, then the categorized list. The target section
 must contain ``### Highlights``; ``### Upgrade notes`` is included when present.
+
+For ``## Unreleased`` the section is the combined view: the Unreleased text plus
+the fragments in ``changelog.d/`` next to ``--changelog``
+(``scripts/changelog_fragments.py``). A released section is printed as written.
 """
 
 from __future__ import annotations
@@ -16,6 +20,11 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+if __package__:
+    from scripts import changelog_fragments as fragments
+else:
+    import changelog_fragments as fragments  # type: ignore[no-redef]
 
 CHANGELOG_PATH = Path("CHANGELOG.md")
 HIGHLIGHTS = "### Highlights"
@@ -74,8 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--changelog", type=Path, default=CHANGELOG_PATH, help="Path to CHANGELOG.md.")
     args = parser.parse_args(argv)
     try:
-        sys.stdout.write(render(args.changelog.read_text(encoding="utf-8"), args.section_header))
-    except (RenderError, OSError) as exc:
+        text = args.changelog.read_text(encoding="utf-8")
+        if args.section_header.strip() == fragments.UNRELEASED_HEADING:
+            text, _notes = fragments.combined_changelog(args.changelog.resolve().parent, text)
+        sys.stdout.write(render(text, args.section_header))
+    except (RenderError, OSError, fragments.CollectError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     return 0

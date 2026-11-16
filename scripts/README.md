@@ -80,10 +80,11 @@ explicitly approved target; they are not part of ordinary offline source checks.
 | `check_public_demo_deployment.py` | Network readback of an explicitly selected published demo against expected artifact bytes. |
 | `check_public_screenshots.py` | Validate public screenshot bytes and fixture provenance in a maintainer checkout. |
 | `check_public_docs.py` | Check README/wiki navigation, examples and screenshot inventory in a checkout. |
-| `check_changelog_entry.py` | PR changelog admission check in CI or a maintainer checkout with explicit PR/change inputs. |
-| `check_release_changelog_coverage.py` | Reconcile release changelog coverage in a maintainer checkout with release/PR evidence. |
-| `render_release_notes.py` | Render release notes from the changelog in a maintainer checkout. |
-| `validate_release_wrap.py` | Validate release-wrap evidence in a maintainer checkout; does not execute missing release gates. |
+| `changelog_fragments.py` | Changelog fragments under `changelog.d/` in a development checkout: `check` validates them, `preview` prints `## Unreleased` with them merged in (a fragment not yet merged shows without `(#N)`), `collect --version --date` writes them into `CHANGELOG.md` at release time and deletes exactly the files it read. |
+| `check_changelog_entry.py` | PR changelog admission check in CI or a maintainer checkout with explicit PR/change inputs: requires an added valid fragment. |
+| `check_release_changelog_coverage.py` | Reconcile release changelog coverage in a maintainer checkout with release/PR evidence; for `## Unreleased` it reads the bullets plus the fragments. |
+| `render_release_notes.py` | Render release notes from the changelog in a maintainer checkout; for `## Unreleased` it includes fragments, a released section is printed as written. |
+| `validate_release_wrap.py` | Validate release-wrap evidence in a maintainer checkout; does not execute missing release gates. Refuses a release tree that still holds changelog fragments. |
 | `verify_wiki_drift.py` | Compare committed repository wiki content with an external wiki commit using Git from a maintainer checkout. |
 
 ## Import-only modules
