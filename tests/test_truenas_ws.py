@@ -1256,8 +1256,12 @@ class NormalOperationDeadlineChecks:
                                 task.result()
                             self.assertIs(caught.exception, peer.reader_error)
                         else:
-                            with self.assertRaisesRegex(TrueNASAPIError, "synthetic primary rejection"):
+                            with self.assertRaisesRegex(TrueNASAPIError, "remote error") as caught:  # type: ignore[attr-defined]
                                 task.result()
+                            self.assertEqual(  # type: ignore[attr-defined]
+                                caught.exception.reason,
+                                None if self.dialect == "ddp" else "synthetic primary rejection",  # type: ignore[attr-defined]
+                            )
 
     async def test_cancellation_after_method_error_retains_reader_cleanup(self):
         self.client.config.timeout_seconds = 2
@@ -1548,8 +1552,12 @@ class RealWebsocketCloseChecks:
                         transport.acknowledge_close()
                         await self.assert_finished_closed(task, connection, transport, aborted=False)
                         if rejection:
-                            with self.assertRaisesRegex(TrueNASAPIError, "synthetic close-test rejection"):
+                            with self.assertRaisesRegex(TrueNASAPIError, "remote error") as caught:  # type: ignore[attr-defined]
                                 task.result()
+                            self.assertEqual(  # type: ignore[attr-defined]
+                                caught.exception.reason,
+                                None if self.dialect == "ddp" else "synthetic close-test rejection",  # type: ignore[attr-defined]
+                            )
                         elif late_error:
                             with self.assertRaises(RuntimeError) as caught:
                                 task.result()
@@ -1756,8 +1764,12 @@ class CompletedReplyChecks:
                                 with self.assertRaises(ConnectionClosed):
                                     task.result()
                             elif outcome == "application_error":
-                                with self.assertRaisesRegex(TrueNASAPIError, "synthetic primary rejection"):
+                                with self.assertRaisesRegex(TrueNASAPIError, "remote error") as caught:  # type: ignore[attr-defined]
                                     task.result()
+                                self.assertEqual(  # type: ignore[attr-defined]
+                                    caught.exception.reason,
+                                    None if self.dialect == "ddp" else "synthetic primary rejection",  # type: ignore[attr-defined]
+                                )
                             elif outcome == "reader_error":
                                 with self.assertRaises(RuntimeError) as caught:
                                     task.result()

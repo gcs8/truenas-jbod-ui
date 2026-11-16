@@ -38,7 +38,7 @@ from app.services.mapping_store import (
 from app.services.profile_registry import ProfileRegistry
 from app.services.sas_fabric_alias_store import SasFabricAliasStorageUnwritable
 from app.services.slot_detail_store import SlotDetailStore
-from app.services.truenas_ws import TrueNASAPIError
+from app.services.truenas_ws import LocalServiceError, TrueNASAPIError
 
 
 PRIVATE_EXCEPTION_DETAIL = "Traceback: /srv/private/mappings.json contained operator data"
@@ -238,8 +238,9 @@ class MappingImportRouteTests(unittest.TestCase):
         for route, arguments in cases:
             with self.subTest(path=route.path):
                 service = Mock()
-                service.preview_mapping_bundle = AsyncMock(side_effect=TrueNASAPIError(reason))
-                service.import_mapping_bundle = AsyncMock(side_effect=TrueNASAPIError(reason))
+                # The service raises this refusal as its own fixed sentence.
+                service.preview_mapping_bundle = AsyncMock(side_effect=LocalServiceError(reason))
+                service.import_mapping_bundle = AsyncMock(side_effect=LocalServiceError(reason))
                 service.get_snapshot = AsyncMock()
                 registry = Mock()
                 registry.get_service.return_value = service
