@@ -1848,13 +1848,14 @@ class WrappedLocalFaultTests(_InventoryFixture):
 
 
 # A value an appliance or a caller could choose: a marker, terminal and line
-# controls, a NUL and a long run, so a record that kept it would be obvious.
-LONG_HOSTILE_VALUE = PRIVATE_MARKER + "\x1b[31m\r\n\x00" + "x" * 5000
+# controls, a NUL, DEL, a C1 control and a long run, so a record that kept it
+# would be obvious.
+LONG_HOSTILE_VALUE = PRIVATE_MARKER + "\x1b[31m\r\n\x00\x7f\x9b" + "x" * 5000
 
 
 def _assert_record_value_free(test: unittest.TestCase, record: logging.LogRecord) -> None:
     rendered = record.getMessage() + "\n" + _formatted(record)
-    for fragment in (PRIVATE_MARKER, "\x1b", "\x00", "\r", "x" * 100):
+    for fragment in (PRIVATE_MARKER, "\x1b", "\x00", "\x7f", "\x9b", "\r", "x" * 100):
         test.assertNotIn(fragment, rendered, rendered[:400])
     test.assertFalse(record.exc_info)
 
@@ -2343,6 +2344,31 @@ class ErrorBodyReadOriginTests(unittest.TestCase):
                     self.assertIsNone(error.reason)
                     self.assertIs(error.__cause__, cause)
 
+    def test_error_body_read_origin_is_decided_by_type_and_errno(self) -> None:
+        # The base OSError type carrying a local errno (a library that sets
+        # errno itself raises this shape rather than PermissionError).
+        base_eacces = OSError(PRIVATE_MARKER)
+        base_eacces.errno = errno.EACCES
+        self.assertIs(type(base_eacces), OSError)
+        cases = (
+            (base_eacces, ("internal_error", None)),
+            (OSError(errno.ENOSPC, "connection reset by peer"), ("internal_error", None)),
+            (OSError(errno.EIO, PRIVATE_MARKER), ("internal_error", None)),
+            (FileNotFoundError(errno.ENOENT, PRIVATE_MARKER), ("internal_error", None)),
+            (PermissionError(errno.EACCES, "connection reset by peer"), ("internal_error", None)),
+            # Control: a transport fault stays the reported error, whatever its message says.
+            (ConnectionResetError(errno.ECONNRESET, "permission denied"), ("remote_error", 500)),
+        )
+        for cause, expected in cases:
+            for name, call, message in self._adapters(cause):
+                with self.subTest(adapter=name, cause=type(cause).__name__, errno=cause.errno):
+                    error = _raised_by(call)
+                    self.assertIsInstance(error, TrueNASAPIError)
+                    self.assertEqual(str(error), message)
+                    self.assertEqual(classify_remote_failure(error), expected)
+                    self.assertIsNone(error.reason)
+                    self.assertIs(error.__cause__, cause)
+
 
 def _outermost_caller() -> None:
     _deep_local_fault(40)
@@ -2420,6 +2446,18 @@ class FailureRecordContractTests(unittest.TestCase):
         self.assertTrue(detail.startswith("enclosure.set_slot_status failed (remote error): "), detail[:80])
         self.assertLessEqual(len(detail), len("enclosure.set_slot_status failed (remote error): ") + 300)
         self.assertTrue(all(character.isprintable() for character in detail))
+
+    def test_action_reason_replaces_every_control_character(self) -> None:
+        message = "enclosure.set_slot_status failed (remote error)."
+        for code in (*range(0x20), 0x7F, *range(0x80, 0xA0)):
+            with self.subTest(code=f"U+{code:04X}"):
+                error = TrueNASAPIError(message, category="remote_error", reason=f"slot{chr(code)}busy")
+                self.assertEqual(error.reason, "slot busy")
+                detail = app_routes._authorized_action_failure_detail(error, operation="Locate light action")
+                self.assertEqual(detail, "enclosure.set_slot_status failed (remote error): slot busy")
+        # Control: printable text, non-ASCII letters included, is kept as reported.
+        error = TrueNASAPIError(message, category="remote_error", reason="Slot 3 \u2013 caf\u00e9 busy")
+        self.assertEqual(error.reason, "Slot 3 \u2013 caf\u00e9 busy")
 
 
 class DdpReplyMarkerTests(unittest.IsolatedAsyncioTestCase):

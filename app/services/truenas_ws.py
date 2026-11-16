@@ -428,7 +428,8 @@ def log_failure(
 
 MethodCaller = Callable[[str, list[Any]], Awaitable[Any]]
 
-# Origin is decided by structure, and remote text is never shown or logged.
+# Origin is decided by structure. Outside the two authorized action details
+# (the bounded ``.reason``), remote text is never shown or logged.
 # Sorting a remote failure into one of the fixed categories is different: the
 # older (DDP) dialect gives no structured field for these two conditions, so
 # each is recognised by a known marker in the appliance's own reply (``busy``:
