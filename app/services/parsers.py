@@ -6,7 +6,7 @@ import shlex
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from typing import Any
 
 from app.config import normalize_text  # noqa: F401 - re-exported for parser callers
@@ -386,12 +386,68 @@ def _format_scaled_size(size_bytes: int, base: int, suffixes: list[str]) -> str:
 
 
 def _coerce_non_negative_int(value: Any) -> int | None:
-    if isinstance(value, int) and value >= 0:
+    # Exact type: a JSON boolean is not a reading, and bool subclasses int.
+    if type(value) is int and value >= 0:
         return value
     return None
 
 
+def _json_text(value: Any) -> str | None:
+    """Reported JSON text, or None when the field is not a string."""
+    return normalize_text(value) if isinstance(value, str) else None
+
+
+# SMART summary fields are tri-state: a reading, absent (the source key was not
+# reported), or not read (the key was reported but not in its documented
+# shape). The readers below return the reading or None and add the summary
+# field names they could not read to ``unread``; a fallback source is consulted
+# only while its field is absent, never in place of one that was not read.
+def _reported_object(container: dict[str, Any], key: str, unread: set[str], *fields: str) -> dict[str, Any]:
+    """The object at ``key``; a reported non-object marks ``fields`` not read."""
+    if key not in container:
+        return {}
+    value = container[key]
+    if isinstance(value, dict):
+        return value
+    unread.update(fields)
+    return {}
+
+
+def _reported(container: dict[str, Any], key: str, admit: Any, unread: set[str], field: str) -> Any:
+    """``admit(value)`` for a reported key; a refused value marks ``field`` not read."""
+    if key not in container:
+        return None
+    value = admit(container[key])
+    if value is None:
+        unread.add(field)
+    return value
+
+
+def _reported_text(container: dict[str, Any], key: str, unread: set[str], field: str) -> str | None:
+    """Reported text; a non-string or blank value is not read."""
+    return _reported(container, key, _json_text, unread, field)
+
+
+def _positive_int(value: Any) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _load_json_object(output: str) -> dict[str, Any] | None:
+    """Decode a JSON object, or None for any other root or undecodable input.
+
+    ``ValueError`` covers ``JSONDecodeError`` and an integer literal past the
+    interpreter's digit limit; deep nesting raises ``RecursionError``.
+    """
+    try:
+        payload = json.loads(output)
+    except (ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _coerce_int_like(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -410,28 +466,48 @@ def _coerce_int_like(value: Any) -> int | None:
         return None
 
 
+# A byte total at or above 2**64 is not a plausible drive counter. Refusing it
+# keeps the annualised and endurance estimates (float division) from
+# overflowing, and Decimal-to-int conversion from building an unbounded integer.
+_BYTE_COUNTER_LIMIT = 2**64
+# Largest gigabytes_processed value whose byte total stays under the limit.
+_SCSI_GIGABYTES_LIMIT = Decimal(_BYTE_COUNTER_LIMIT) / Decimal(1_000_000_000)
+
+
+def _bounded_byte_count(byte_count: int | None) -> int | None:
+    if byte_count is None or not 0 <= byte_count < _BYTE_COUNTER_LIMIT:
+        return None
+    return byte_count
+
+
 def _nvme_data_units_to_bytes(value: Any) -> int | None:
     units = _coerce_non_negative_int(value)
     if units is None:
         return None
     # NVMe SMART "data units" are reported in units of 1000 * 512 bytes.
-    return units * 512_000
+    return _bounded_byte_count(units * 512_000)
 
 
 def _scsi_gigabytes_processed_to_bytes(value: Any) -> int | None:
-    if isinstance(value, (int, float)):
-        try:
-            return int(Decimal(str(value)) * Decimal(1_000_000_000))
-        except (InvalidOperation, ValueError):
-            return None
-    if not isinstance(value, str):
+    if isinstance(value, bool):
         return None
-    text = value.strip()
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
     if not text:
         return None
     try:
-        return int(Decimal(text) * Decimal(1_000_000_000))
-    except (InvalidOperation, ValueError):
+        gigabytes = Decimal(text)
+        # Validate before arithmetic: an exponent past the Decimal context
+        # overflows on multiplication, and a tiny negative value rounds to -0.
+        # Non-finite, signed (including -0) or implausibly large counters stay unknown.
+        if not gigabytes.is_finite() or gigabytes.is_signed() or gigabytes >= _SCSI_GIGABYTES_LIMIT:
+            return None
+        return _bounded_byte_count(int(gigabytes * Decimal(1_000_000_000)))
+    except (DecimalException, ValueError, OverflowError):
         return None
 
 
@@ -446,15 +522,37 @@ def _annualize_bytes(
     return int(byte_count * 24 * 365 / power_on_hours)
 
 
+# NVMe reports composite temperature and its thresholds as 16-bit Kelvin words.
+_NVME_KELVIN_LIMIT = 0xFFFF
+
+
+# A drive temperature reading in Celsius is an integer in this range; any other
+# value is not read. The bound also keeps every consumer's float conversion safe.
+_CELSIUS_MIN, _CELSIUS_MAX = -100, 1000
+
+
+def _json_celsius(value: Any) -> int | None:
+    return value if type(value) is int and _CELSIUS_MIN <= value <= _CELSIUS_MAX else None
+
+
 def _kelvin_to_celsius(value: Any) -> int | None:
     kelvin = _coerce_non_negative_int(value)
-    if kelvin is None or kelvin == 0:
+    # Bounded before float arithmetic: an oversized integer cannot become a float.
+    if kelvin is None or kelvin == 0 or kelvin > _NVME_KELVIN_LIMIT:
         return None
-    return int(round(kelvin - 273.15))
+    return _json_celsius(int(round(kelvin - 273.15)))
+
+
+def _reported_kelvin(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
+    """An NVMe Kelvin word in Celsius; 0 K means "not reported" (absent)."""
+    if container.get(key) == 0 and type(container.get(key)) is int:
+        return None
+    return _reported(container, key, _kelvin_to_celsius, unread, field)
 
 
 def _format_nvme_version(value: Any) -> str | None:
-    if not isinstance(value, int) or value < 0:
+    # The version word is 32 bits wide; a wider value is not a version.
+    if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
         return None
     major = (value >> 16) & 0xFFFF
     minor = (value >> 8) & 0xFF
@@ -464,17 +562,70 @@ def _format_nvme_version(value: Any) -> str | None:
     return f"{major}.{minor}"
 
 
+# nvme-cli reports a namespace EUI-64 as 16 hex digits and an NGUID as 32; the
+# optional "eui." prefix is the form this formatter publishes.
+_NVME_EUI64_REGEX = re.compile(r"(?:[eE][uU][iI]\.)?([0-9a-fA-F]{16})")
+_NVME_NGUID_REGEX = re.compile(r"[0-9a-fA-F]{32}")
+
+
 def _format_nvme_eui64(value: Any) -> str | None:
-    text = normalize_value_text(value)
-    if not text:
-        return None
-    lowered = text.lower()
-    return lowered if lowered.startswith("eui.") else f"eui.{lowered}"
+    match = _NVME_EUI64_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return f"eui.{match.group(1).lower()}" if match else None
 
 
 def _format_nvme_nguid(value: Any) -> str | None:
-    text = normalize_value_text(value)
-    return text.lower() if text else None
+    match = _NVME_NGUID_REGEX.fullmatch(value.strip()) if isinstance(value, str) else None
+    return match.group(0).lower() if match else None
+
+
+def _ata_attributes_unreadable(payload: dict[str, Any]) -> bool:
+    """True when the attribute table was reported but a row in it cannot be read.
+
+    Such a row may be any attribute, so an attribute the table does not
+    otherwise report is not read rather than absent.
+    """
+    block = payload.get("ata_smart_attributes")
+    if block is None and "ata_smart_attributes" not in payload:
+        return False
+    if not isinstance(block, dict):
+        return True
+    if "table" not in block:
+        return False
+    table = block["table"]
+    if not isinstance(table, list):
+        return True
+    # ATA attribute numbers are 1 to 255; any other id is not an identity.
+    return any(
+        not isinstance(entry, dict) or type(entry.get("id")) is not int or not 1 <= entry["id"] <= 255
+        for entry in table
+    )
+
+
+# smartctl's raw string for these attributes is the decimal count, optionally
+# followed by a parenthesised detail such as "(Min/Max 20/45)". ASCII digits
+# only, at most 20 of them (a 64-bit count), so conversion cannot fail.
+_ATA_RAW_STRING_REGEX = re.compile(r"([0-9]{1,20})(?: \(.*\))?")
+
+
+def _ata_raw_count(raw: Any) -> int | None:
+    """An attribute's raw count in a documented form, or None.
+
+    smartctl reports ``raw`` as ``{"value": <int>, "string": <text>}``; a bare
+    integer or string is the older compatibility form. When ``value`` is
+    reported it decides: a malformed ``value`` is not replaced by the string.
+    """
+    if isinstance(raw, dict):
+        if "value" in raw:
+            return _coerce_non_negative_int(raw["value"])
+        # ``string`` is text; the bare-integer compatibility form is not a member.
+        string = raw.get("string")
+        raw = string if isinstance(string, str) else None
+    if type(raw) is int:
+        return raw if raw >= 0 else None
+    if isinstance(raw, str):
+        match = _ATA_RAW_STRING_REGEX.fullmatch(raw.strip())
+        return int(match.group(1)) if match else None
+    return None
 
 
 def _iter_ata_attribute_entries(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -485,25 +636,30 @@ def _iter_ata_attribute_entries(payload: dict[str, Any]) -> Iterator[dict[str, A
     )
     if not isinstance(table, list):
         return
-    yield from (entry for entry in table if isinstance(entry, dict))
+    # Only rows with an exact integer id are attributes: a list or object id
+    # cannot be looked up, and a float or boolean id is not an attribute number.
+    yield from (
+        entry for entry in table if isinstance(entry, dict) and type(entry.get("id")) is int
+    )
 
 
-def _extract_ata_attribute_raw_value(payload: dict[str, Any], *attribute_ids: int) -> int | None:
-    attribute_id_set = set(attribute_ids)
-    for entry in _iter_ata_attribute_entries(payload):
-        if entry.get("id") not in attribute_id_set:
-            continue
-
-        raw_value = entry.get("raw")
-        if isinstance(raw_value, dict):
-            for candidate in (raw_value.get("value"), raw_value.get("string")):
-                parsed = _coerce_int_like(candidate)
-                if parsed is not None and parsed >= 0:
-                    return parsed
-        parsed = _coerce_int_like(raw_value)
-        if parsed is not None and parsed >= 0:
-            return parsed
-    return None
+def _extract_ata_attribute_raw_value(
+    payload: dict[str, Any],
+    *attribute_ids: int,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    """The first matching attribute's raw count; a malformed one is not read."""
+    unread = unread if unread is not None else set()
+    entry = _extract_ata_attribute_entry(payload, *attribute_ids)
+    if entry is None:
+        if _ata_attributes_unreadable(payload):
+            unread.add(field)
+        return None
+    value = _ata_raw_count(entry["raw"]) if "raw" in entry else None
+    if value is None:
+        unread.add(field)
+    return value
 
 
 def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -> dict[str, Any] | None:
@@ -514,35 +670,48 @@ def _extract_ata_attribute_entry(payload: dict[str, Any], *attribute_ids: int) -
     return None
 
 
-def _ata_attribute_raw_value_to_bytes(entry: dict[str, Any], sector_size: int) -> int | None:
-    raw_value = entry.get("raw")
-    parsed_raw_value = None
-    if isinstance(raw_value, dict):
-        for candidate in (raw_value.get("value"), raw_value.get("string")):
-            parsed_raw_value = _coerce_int_like(candidate)
-            if parsed_raw_value is not None and parsed_raw_value >= 0:
-                break
-    else:
-        parsed_raw_value = _coerce_int_like(raw_value)
+_ATA_UNIT_SCALES = {"KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+# The unit in a drive-database attribute name such as Host_Writes_32MiB or
+# Lifetime_Writes_GiB: an optional ASCII multiplier (no leading zero, at most
+# six digits) and a binary unit. Any other unit-like ending is not read.
+_ATA_UNIT_NAME_REGEX = re.compile(r"([1-9][0-9]{0,5})?(KiB|MiB|GiB|TiB)")
+_ATA_UNIT_LIKE_REGEX = re.compile(r".*[kmgtpe]i?b", re.IGNORECASE)
+_ATA_SECTOR_UNIT = 0
 
-    if parsed_raw_value is None or parsed_raw_value < 0:
+
+def _ata_attribute_unit_bytes(name: str) -> int | None:
+    """Bytes per raw count named by the attribute, ``_ATA_SECTOR_UNIT`` for a
+    sector count (no unit in the name), or None for an unreadable unit."""
+    head, separator, tail = name.rpartition("_")
+    if not _ATA_UNIT_LIKE_REGEX.fullmatch(tail):
+        return _ATA_SECTOR_UNIT
+    match = _ATA_UNIT_NAME_REGEX.fullmatch(tail) if separator and head else None
+    if match is None:
         return None
+    return int(match.group(1) or 1) * _ATA_UNIT_SCALES[match.group(2)]
 
-    attribute_name = normalize_text(entry.get("name")) or ""
-    name_match = re.search(r"_(\d+)(KiB|MiB|GiB|TiB)$", attribute_name)
-    if name_match:
-        unit_value = int(name_match.group(1))
-        unit_name = name_match.group(2)
-        unit_scale = {
-            "KiB": 1024,
-            "MiB": 1024**2,
-            "GiB": 1024**3,
-            "TiB": 1024**4,
-        }.get(unit_name)
-        if unit_scale is not None:
-            return parsed_raw_value * unit_value * unit_scale
 
-    return parsed_raw_value * sector_size
+def _ata_attribute_raw_value_to_bytes(
+    entry: dict[str, Any],
+    sector_size: int | None,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    unread = unread if unread is not None else set()
+    count = _ata_raw_count(entry["raw"]) if "raw" in entry else None
+    unit_bytes: int | None = _ATA_SECTOR_UNIT
+    if "name" in entry:
+        # A reported name decides the unit; one that cannot be read is not
+        # replaced by the sector reading an absent name keeps.
+        name = _json_text(entry["name"])
+        unit_bytes = _ata_attribute_unit_bytes(name) if name else None
+    if unit_bytes == _ATA_SECTOR_UNIT:
+        # A sector count without an admitted sector size has no byte total.
+        unit_bytes = sector_size
+    total = _bounded_byte_count(count * unit_bytes) if count is not None and unit_bytes is not None else None
+    if total is None:
+        unread.add(field)
+    return total
 
 
 def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -560,19 +729,66 @@ def _iter_ata_device_stat_entries(payload: dict[str, Any]) -> Iterator[dict[str,
         yield from (entry for entry in table if isinstance(entry, dict))
 
 
-def _extract_ata_device_stat_int(payload: dict[str, Any], stat_name: str) -> int | None:
-    for entry in _iter_ata_device_stat_entries(payload):
-        if normalize_text(entry.get("name")) != stat_name:
+def _ata_device_stats_unreadable(payload: dict[str, Any]) -> bool:
+    """True when device statistics were reported but part of them cannot be read."""
+    block = payload.get("ata_device_statistics")
+    if block is None and "ata_device_statistics" not in payload:
+        return False
+    if not isinstance(block, dict):
+        return True
+    if "pages" not in block:
+        return False
+    pages = block["pages"]
+    if not isinstance(pages, list):
+        return True
+    for page in pages:
+        if not isinstance(page, dict):
+            return True
+        if "table" not in page:
             continue
-        value = _coerce_int_like(entry.get("value"))
-        if value is not None and value >= 0:
-            return value
+        table = page["table"]
+        # A row without a non-blank name may be any statistic.
+        if not isinstance(table, list) or any(
+            not isinstance(entry, dict) or _json_text(entry.get("name")) is None for entry in table
+        ):
+            return True
+    return False
+
+
+def _extract_ata_device_stat_int(
+    payload: dict[str, Any],
+    stat_name: str,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    """The named statistic's count; smartctl omits ``value`` for one the drive
+    marks invalid (absent), and a reported malformed value is not read."""
+    unread = unread if unread is not None else set()
+    for entry in _iter_ata_device_stat_entries(payload):
+        if _json_text(entry.get("name")) != stat_name:
+            continue
+        return _reported(entry, "value", _coerce_non_negative_int, unread, field)
+    if _ata_device_stats_unreadable(payload):
+        unread.add(field)
     return None
 
 
-def _extract_ata_device_stat_bytes(payload: dict[str, Any], stat_name: str, sector_size: int) -> int | None:
-    value = _extract_ata_device_stat_int(payload, stat_name)
-    return value * sector_size if value is not None else None
+def _extract_ata_device_stat_bytes(
+    payload: dict[str, Any],
+    stat_name: str,
+    sector_size: int | None,
+    unread: set[str] | None = None,
+    field: str = "",
+) -> int | None:
+    unread = unread if unread is not None else set()
+    value = _extract_ata_device_stat_int(payload, stat_name, unread, field)
+    if value is None:
+        return None
+    # A sector count without an admitted sector size has no byte total.
+    total = _bounded_byte_count(value * sector_size) if sector_size is not None else None
+    if total is None:
+        unread.add(field)
+    return total
 
 
 def _parse_enabled_disabled(value: str | None) -> bool | None:
@@ -3545,80 +3761,109 @@ def parse_smart_test_results(results: list[dict[str, Any]]) -> dict[str, dict[st
     return parsed
 
 
+# The summary message when every reported field was refused: the source did
+# return fields, so "no fields were returned" would describe an absence.
+SMART_SUMMARY_UNREAD_MESSAGE = "SMART summary fields were returned for this disk but could not be read."
+
+
 def _finalize_summary(
     data: dict[str, Any],
     unavailable_message: str,
     *,
     availability_values: tuple[Any, ...] | None = None,
     available_message: str | None = None,
+    unread: set[str] | None = None,
 ) -> dict[str, Any]:
     values = availability_values if availability_values is not None else tuple(data.values())
     available = any(value is not None for value in values)
+    if unread is None:
+        # Readers that do not track refused fields keep their output shape.
+        return {"available": available, **data, "message": available_message if available else unavailable_message}
+    # Only fields left without a reading are "not read"; a later source that
+    # read the field supersedes the refusal of an earlier one.
+    unread_fields = sorted(name for name in unread if name in data and data[name] is None)
+    if not available and unread_fields:
+        unavailable_message = SMART_SUMMARY_UNREAD_MESSAGE
     return {
         "available": available,
         **data,
+        "unread_fields": unread_fields,
         "message": available_message if available else unavailable_message,
     }
+
+
+_NVME_HEALTH_FIELDS = (
+    "available_spare_percent", "available_spare_threshold_percent", "endurance_used_percent",
+    "bytes_read", "bytes_written", "media_errors", "unsafe_shutdowns",
+)
+
+
+def _derived_unread(unread: set[str], field: str, value: Any, inputs: dict[str, Any]) -> None:
+    """A derived value is not read when it is missing because an input was not
+    read; with any input simply absent it is absent too."""
+    if (
+        value is None
+        and any(name in unread for name in inputs)
+        and all(input_value is not None or name in unread for name, input_value in inputs.items())
+    ):
+        unread.add(field)
 
 
 def _extract_smartctl_traffic_and_wear(
     payload: dict[str, Any],
     power_on_hours: int | None,
-    sector_size_for_ata: int,
+    sector_size_for_ata: int | None,
+    unread: set[str] | None = None,
 ) -> dict[str, int | None]:
-    nvme_health = (
-        payload.get("nvme_smart_health_information_log")
-        if isinstance(payload.get("nvme_smart_health_information_log"), dict)
-        else {}
+    unread = unread if unread is not None else set()
+    nvme_health = _reported_object(payload, "nvme_smart_health_information_log", unread, *_NVME_HEALTH_FIELDS)
+    available_spare_percent = _reported(
+        nvme_health, "available_spare", _coerce_non_negative_int, unread, "available_spare_percent",
     )
-    available_spare_percent = _coerce_non_negative_int(nvme_health.get("available_spare"))
-    available_spare_threshold_percent = _coerce_non_negative_int(nvme_health.get("available_spare_threshold"))
-    endurance_used_percent = _coerce_non_negative_int(nvme_health.get("percentage_used"))
+    available_spare_threshold_percent = _reported(
+        nvme_health, "available_spare_threshold", _coerce_non_negative_int, unread, "available_spare_threshold_percent",
+    )
+    endurance_used_percent = _reported(
+        nvme_health, "percentage_used", _coerce_non_negative_int, unread, "endurance_used_percent",
+    )
+    bytes_read = _reported(nvme_health, "data_units_read", _nvme_data_units_to_bytes, unread, "bytes_read")
+    bytes_written = _reported(nvme_health, "data_units_written", _nvme_data_units_to_bytes, unread, "bytes_written")
+    media_errors = _reported(nvme_health, "media_errors", _coerce_non_negative_int, unread, "media_errors")
+    unsafe_shutdowns = _reported(nvme_health, "unsafe_shutdowns", _coerce_non_negative_int, unread, "unsafe_shutdowns")
+
+    # Each lower source is read only while the field is still absent: a
+    # source that reported the field in an unreadable shape stops the chain.
+    scsi_error_counter_log = _reported_object(payload, "scsi_error_counter_log", unread, "bytes_read", "bytes_written")
+
+    def lower_byte_sources(
+        value: int | None, byte_field: str, direction: str, stat_name: str, attribute_id: int,
+    ) -> int | None:
+        if value is None and byte_field not in unread:
+            log = _reported_object(scsi_error_counter_log, direction, unread, byte_field)
+            value = _reported(log, "gigabytes_processed", _scsi_gigabytes_processed_to_bytes, unread, byte_field)
+        if value is None and byte_field not in unread:
+            value = _extract_ata_device_stat_bytes(payload, stat_name, sector_size_for_ata, unread, byte_field)
+        if value is None and byte_field not in unread:
+            entry = _extract_ata_attribute_entry(payload, attribute_id)
+            if entry is not None:
+                value = _ata_attribute_raw_value_to_bytes(entry, sector_size_for_ata, unread, byte_field)
+            elif _ata_attributes_unreadable(payload):
+                unread.add(byte_field)
+        return value
+
+    bytes_read = lower_byte_sources(bytes_read, "bytes_read", "read", "Logical Sectors Read", 242)
+    bytes_written = lower_byte_sources(bytes_written, "bytes_written", "write", "Logical Sectors Written", 241)
+    if available_spare_percent is None and "available_spare_percent" not in unread:
+        available_spare_percent = _extract_ata_attribute_raw_value(
+            payload, 232, 169, unread=unread, field="available_spare_percent",
+        )
+    if endurance_used_percent is None and "endurance_used_percent" not in unread:
+        endurance_used_percent = _extract_ata_device_stat_int(
+            payload, "Percentage Used Endurance Indicator", unread, "endurance_used_percent",
+        )
     endurance_remaining_percent = (
         max(0, 100 - endurance_used_percent) if endurance_used_percent is not None else None
     )
-    bytes_read = _nvme_data_units_to_bytes(nvme_health.get("data_units_read"))
-    bytes_written = _nvme_data_units_to_bytes(nvme_health.get("data_units_written"))
-    media_errors = _coerce_non_negative_int(nvme_health.get("media_errors"))
-    unsafe_shutdowns = _coerce_non_negative_int(nvme_health.get("unsafe_shutdowns"))
-
-    scsi_error_counter_log = (
-        payload.get("scsi_error_counter_log")
-        if isinstance(payload.get("scsi_error_counter_log"), dict)
-        else {}
-    )
-    scsi_read_error_log = (
-        scsi_error_counter_log.get("read")
-        if isinstance(scsi_error_counter_log.get("read"), dict)
-        else {}
-    )
-    scsi_write_error_log = (
-        scsi_error_counter_log.get("write")
-        if isinstance(scsi_error_counter_log.get("write"), dict)
-        else {}
-    )
-    if bytes_read is None:
-        bytes_read = _scsi_gigabytes_processed_to_bytes(scsi_read_error_log.get("gigabytes_processed"))
-    if bytes_written is None:
-        bytes_written = _scsi_gigabytes_processed_to_bytes(scsi_write_error_log.get("gigabytes_processed"))
-    if bytes_read is None:
-        bytes_read = _extract_ata_device_stat_bytes(payload, "Logical Sectors Read", sector_size_for_ata)
-    if bytes_written is None:
-        bytes_written = _extract_ata_device_stat_bytes(payload, "Logical Sectors Written", sector_size_for_ata)
-    if bytes_read is None:
-        ata_read_entry = _extract_ata_attribute_entry(payload, 242)
-        if ata_read_entry is not None:
-            bytes_read = _ata_attribute_raw_value_to_bytes(ata_read_entry, sector_size_for_ata)
-    if bytes_written is None:
-        ata_write_entry = _extract_ata_attribute_entry(payload, 241)
-        if ata_write_entry is not None:
-            bytes_written = _ata_attribute_raw_value_to_bytes(ata_write_entry, sector_size_for_ata)
-    if available_spare_percent is None:
-        available_spare_percent = _extract_ata_attribute_raw_value(payload, 232, 169)
-    if endurance_used_percent is None:
-        endurance_used_percent = _extract_ata_device_stat_int(payload, "Percentage Used Endurance Indicator")
-    if endurance_remaining_percent is None and endurance_used_percent is not None:
-        endurance_remaining_percent = max(0, 100 - endurance_used_percent)
 
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
@@ -3633,6 +3878,26 @@ def _extract_smartctl_traffic_and_wear(
         max(estimated_lifetime_bytes_written - bytes_written, 0)
         if estimated_lifetime_bytes_written is not None and bytes_written is not None
         else None
+    )
+    _derived_unread(
+        unread, "endurance_remaining_percent", endurance_remaining_percent,
+        {"endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_read", annualized_bytes_read,
+        {"bytes_read": bytes_read, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_written", annualized_bytes_written,
+        {"bytes_written": bytes_written, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "estimated_lifetime_bytes_written", estimated_lifetime_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "estimated_remaining_bytes_written", estimated_remaining_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
     )
     return {
         "available_spare_percent": available_spare_percent,
@@ -3650,68 +3915,123 @@ def _extract_smartctl_traffic_and_wear(
     }
 
 
-def _extract_smartctl_latest_test(payload: dict[str, Any]) -> tuple[str | None, str | None, int | None]:
+_SMART_LATEST_TEST_FIELDS = ("last_test_type", "last_test_status", "last_test_lifetime_hours")
+# smartctl numbers the SCSI self-test log entries scsi_self_test_0 to _19,
+# newest first. Canonical ASCII decimal only, bounded before conversion.
+_SCSI_SELF_TEST_INDEX_REGEX = re.compile(r"0|[1-9][0-9]{0,5}")
+
+
+def _reported_test_text(
+    container: dict[str, Any], key: str, unread: set[str], field: str, *, allow_text: bool,
+) -> str | None:
+    """A self-test type or status: an object's ``string`` (else ``name``), or
+    plain text where that older form is accepted."""
+    if key not in container:
+        return None
+    value = container[key]
+    if isinstance(value, dict):
+        text = _reported_text(value, "string", unread, field)
+        if text is None and field not in unread:
+            text = _reported_text(value, "name", unread, field)
+        if text is None:
+            # An object without its text is a reported value that was not read.
+            unread.add(field)
+        return text
+    if allow_text:
+        return _reported_text(container, key, unread, field)
+    unread.add(field)
+    return None
+
+
+def _extract_smartctl_latest_test(
+    payload: dict[str, Any],
+    unread: set[str] | None = None,
+) -> tuple[str | None, str | None, int | None]:
+    unread = unread if unread is not None else set()
     latest_test_type: str | None = None
     latest_test_status: str | None = None
     latest_test_lifetime_hours: int | None = None
     scsi_tests: list[tuple[int, dict[str, Any]]] = []
     for key, value in payload.items():
-        if not (key.startswith("scsi_self_test_") and isinstance(value, dict)):
+        if not key.startswith("scsi_self_test_"):
             continue
         suffix = key.removeprefix("scsi_self_test_")
-        if suffix.isdigit():
-            scsi_tests.append((int(suffix), value))
+        if not (_SCSI_SELF_TEST_INDEX_REGEX.fullmatch(suffix) and isinstance(value, dict)):
+            # An entry that cannot be ordered may be the newest one, so no
+            # entry can be reported as the latest test.
+            unread.update(_SMART_LATEST_TEST_FIELDS)
+            return None, None, None
+        scsi_tests.append((int(suffix), value))
 
     if scsi_tests:
         _, latest_test = min(scsi_tests, key=lambda item: item[0])
-        code = latest_test.get("code") if isinstance(latest_test.get("code"), dict) else {}
-        result = latest_test.get("result") if isinstance(latest_test.get("result"), dict) else {}
-        lifetime = latest_test.get("power_on_time") if isinstance(latest_test.get("power_on_time"), dict) else {}
-        latest_test_type = normalize_text(code.get("string")) or normalize_text(code.get("name"))
-        latest_test_status = normalize_text(result.get("string")) or normalize_text(result.get("name"))
-        latest_test_lifetime_hours = lifetime.get("hours") if isinstance(lifetime.get("hours"), int) else None
+        latest_test_type = _reported_test_text(latest_test, "code", unread, "last_test_type", allow_text=False)
+        latest_test_status = _reported_test_text(latest_test, "result", unread, "last_test_status", allow_text=False)
+        lifetime = _reported_object(latest_test, "power_on_time", unread, "last_test_lifetime_hours")
+        latest_test_lifetime_hours = _reported(
+            lifetime, "hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+        )
     else:
-        ata_log = payload.get("ata_smart_self_test_log") if isinstance(payload.get("ata_smart_self_test_log"), dict) else {}
-        standard = ata_log.get("standard") if isinstance(ata_log.get("standard"), dict) else {}
-        table = standard.get("table") if isinstance(standard.get("table"), list) else []
-        if table and isinstance(table[0], dict):
+        ata_log = _reported_object(payload, "ata_smart_self_test_log", unread, *_SMART_LATEST_TEST_FIELDS)
+        standard = _reported_object(ata_log, "standard", unread, *_SMART_LATEST_TEST_FIELDS)
+        table = standard.get("table", [])
+        if not isinstance(table, list) or (table and not isinstance(table[0], dict)):
+            unread.update(_SMART_LATEST_TEST_FIELDS)
+        elif table:
             latest_test = table[0]
-            latest_test_type = normalize_text(latest_test.get("type", {}).get("string")) if isinstance(latest_test.get("type"), dict) else normalize_text(latest_test.get("type"))
-            latest_test_status = normalize_text(latest_test.get("status", {}).get("string")) if isinstance(latest_test.get("status"), dict) else normalize_text(latest_test.get("status"))
-            raw_lifetime = latest_test.get("lifetime_hours")
-            if isinstance(raw_lifetime, dict):
-                raw_lifetime = raw_lifetime.get("hours")
-            latest_test_lifetime_hours = raw_lifetime if isinstance(raw_lifetime, int) else None
+            latest_test_type = _reported_test_text(latest_test, "type", unread, "last_test_type", allow_text=True)
+            latest_test_status = _reported_test_text(latest_test, "status", unread, "last_test_status", allow_text=True)
+            if isinstance(latest_test.get("lifetime_hours"), dict):
+                # The object form carries its value in ``hours``; without it the
+                # reported lifetime was not read.
+                lifetime = {"hours": None, **latest_test["lifetime_hours"]}
+                latest_test_lifetime_hours = _reported(
+                    lifetime, "hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+                )
+            else:
+                latest_test_lifetime_hours = _reported(
+                    latest_test, "lifetime_hours", _coerce_non_negative_int, unread, "last_test_lifetime_hours",
+                )
 
     return latest_test_type, latest_test_status, latest_test_lifetime_hours
 
 
+def _reported_sas_address(container: dict[str, Any], key: str, unread: set[str], field: str) -> str | None:
+    return _reported(container, key, lambda value: format_hex_identifier(_json_text(value)), unread, field)
+
+
 def _extract_smartctl_sas_phy(
     payload: dict[str, Any],
+    unread: set[str] | None = None,
 ) -> tuple[str | None, str | None, str | None] | None:
+    unread = unread if unread is not None else set()
     sas_port_phys: list[dict[str, Any]] = []
     for key, value in payload.items():
-        if not (key.startswith("scsi_sas_port_") and isinstance(value, dict)):
+        if not key.startswith("scsi_sas_port_"):
             continue
-        for subkey, phy in value.items():
-            if subkey.startswith("phy_") and isinstance(phy, dict):
-                sas_port_phys.append(phy)
+        phys = [phy for subkey, phy in value.items() if subkey.startswith("phy_")] if isinstance(value, dict) else None
+        if phys is None or not all(isinstance(phy, dict) for phy in phys):
+            # A port or PHY that cannot be read may be the attached one, so no
+            # PHY is reported as the disk's, and no other source stands in.
+            unread.update(("sas_address", "attached_sas_address", "negotiated_link_rate"))
+            return None, None, None
+        sas_port_phys.extend(phys)
 
     selected_phy = next(
         (
             phy
             for phy in sas_port_phys
-            if format_hex_identifier(phy.get("attached_sas_address")) not in {None, "0x0"}
-            or normalize_text(phy.get("attached_device_type")) not in {None, "no device attached"}
+            if format_hex_identifier(_json_text(phy.get("attached_sas_address"))) not in {None, "0x0"}
+            or _json_text(phy.get("attached_device_type")) not in {None, "no device attached"}
         ),
         sas_port_phys[0] if sas_port_phys else None,
     )
     if not selected_phy:
         return None
     return (
-        format_hex_identifier(selected_phy.get("sas_address")),
-        format_hex_identifier(selected_phy.get("attached_sas_address")),
-        normalize_text(selected_phy.get("negotiated_logical_link_rate")),
+        _reported_sas_address(selected_phy, "sas_address", unread, "sas_address"),
+        _reported_sas_address(selected_phy, "attached_sas_address", unread, "attached_sas_address"),
+        _reported_text(selected_phy, "negotiated_logical_link_rate", unread, "negotiated_link_rate"),
     )
 
 
@@ -3980,9 +4300,28 @@ def _smartctl_threshold_celsius(value: Any) -> int | None:
     return value if 20 <= value <= 150 else None
 
 
+# The documented "not available" limit values (see _smartctl_threshold_celsius).
+_SMARTCTL_THRESHOLD_NOT_AVAILABLE = frozenset({0, 255, -128})
+
+
+def _reported_threshold(container: dict[str, Any], key: str, unread: set[str], field: str) -> int | None:
+    """A reported limit; a documented "not available" value is absent, and any
+    other value that is not a plausible rating is not read."""
+    if key not in container:
+        return None
+    value = container[key]
+    if type(value) is int and value in _SMARTCTL_THRESHOLD_NOT_AVAILABLE:
+        return None
+    rating = _smartctl_threshold_celsius(value)
+    if rating is None:
+        unread.add(field)
+    return rating
+
+
 def _extract_smartctl_temperature_thresholds(
     payload: dict[str, Any],
     temperature: dict[str, Any],
+    unread: set[str] | None = None,
 ) -> tuple[int | None, int | None]:
     """Return the drive's own (warning, critical) temperature ratings.
 
@@ -3991,86 +4330,103 @@ def _extract_smartctl_temperature_thresholds(
     ``critical_limit_max``), ATA SCT/device statistics as the recommended
     ``op_limit_max`` and absolute ``limit_max``, and SCSI as ``drive_trip``.
     """
-    nvme_thresholds = payload.get("nvme_composite_temperature_threshold")
-    if not isinstance(nvme_thresholds, dict):
-        nvme_thresholds = {}
-    warning = _smartctl_threshold_celsius(nvme_thresholds.get("warning"))
-    if warning is None:
-        warning = _smartctl_threshold_celsius(temperature.get("op_limit_max"))
-    critical = _smartctl_threshold_celsius(nvme_thresholds.get("critical"))
+    unread = unread if unread is not None else set()
+    nvme_thresholds = _reported_object(
+        payload, "nvme_composite_temperature_threshold", unread, "warning_temperature_c", "critical_temperature_c",
+    )
+    warning = _reported_threshold(nvme_thresholds, "warning", unread, "warning_temperature_c")
+    if warning is None and "warning_temperature_c" not in unread:
+        warning = _reported_threshold(temperature, "op_limit_max", unread, "warning_temperature_c")
+    critical = _reported_threshold(nvme_thresholds, "critical", unread, "critical_temperature_c")
     for field_name in ("critical_limit_max", "limit_max", "drive_trip"):
-        if critical is None:
-            critical = _smartctl_threshold_celsius(temperature.get(field_name))
+        if critical is None and "critical_temperature_c" not in unread:
+            critical = _reported_threshold(temperature, field_name, unread, "critical_temperature_c")
     return warning, critical
 
 
+_SMARTCTL_TEMPERATURE_FIELDS = ("temperature_c", "warning_temperature_c", "critical_temperature_c")
+
+
+def _reported_namespace_eui64(payload: dict[str, Any], unread: set[str]) -> str | None:
+    """The first namespace's EUI-64 from its 24-bit OUI and 40-bit extension."""
+    if "nvme_namespaces" not in payload:
+        return None
+    namespaces = payload["nvme_namespaces"]
+    if not isinstance(namespaces, list) or (namespaces and not isinstance(namespaces[0], dict)):
+        unread.add("namespace_eui64")
+        return None
+    if not namespaces:
+        return None
+    eui64 = _reported_object(namespaces[0], "eui64", unread, "namespace_eui64")
+    if not eui64:
+        return None
+    oui, ext_id = eui64.get("oui"), eui64.get("ext_id")
+    if type(oui) is not int or type(ext_id) is not int or not 0 <= oui < 1 << 24 or not 0 <= ext_id < 1 << 40:
+        unread.add("namespace_eui64")
+        return None
+    return _format_nvme_eui64(f"{oui:06x}{ext_id:010x}")
+
+
+def _reported_cache_flag(payload: dict[str, Any], key: str, unread: set[str], field: str) -> bool | None:
+    block = _reported_object(payload, key, unread, field)
+    return _reported(block, "enabled", lambda value: value if isinstance(value, bool) else None, unread, field)
+
+
 def parse_smartctl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
+        # The SSH reader tries its next candidate on exactly this message.
         return {"available": False, "message": "SMART JSON parsing failed."}
 
-    temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
-    environmental_reports = (
-        payload.get("scsi_environmental_reports")
-        if isinstance(payload.get("scsi_environmental_reports"), dict)
-        else {}
+    unread: set[str] = set()
+    temperature = _reported_object(payload, "temperature", unread, *_SMARTCTL_TEMPERATURE_FIELDS)
+    current_temperature = _reported(temperature, "current", _json_celsius, unread, "temperature_c")
+    if current_temperature is None and "temperature_c" not in unread:
+        environmental_reports = _reported_object(payload, "scsi_environmental_reports", unread, "temperature_c")
+        environmental_temperature = _reported_object(environmental_reports, "temperature_1", unread, "temperature_c")
+        current_temperature = _reported(environmental_temperature, "current", _json_celsius, unread, "temperature_c")
+    power_on_time = _reported_object(payload, "power_on_time", unread, "power_on_hours")
+    firmware_version = _reported_text(payload, "firmware_version", unread, "firmware_version")
+    nvme_version = _reported_object(payload, "nvme_version", unread, "protocol_version")
+    protocol_version = _reported_text(nvme_version, "string", unread, "protocol_version")
+    if protocol_version is None and "protocol_version" not in unread:
+        sata_version = _reported_object(payload, "sata_version", unread, "protocol_version")
+        protocol_version = _reported_text(sata_version, "string", unread, "protocol_version")
+    smart_status = _reported_object(payload, "smart_status", unread, "smart_health_status")
+    passed = _reported(
+        smart_status, "passed", lambda value: value if isinstance(value, bool) else None,
+        unread, "smart_health_status",
     )
-    environmental_temperature = (
-        environmental_reports.get("temperature_1")
-        if isinstance(environmental_reports.get("temperature_1"), dict)
-        else {}
+    smart_health_status = None if passed is None else ("PASSED" if passed else "FAILED")
+    rotation_rate = _reported(payload, "rotation_rate", _coerce_non_negative_int, unread, "rotation_rate_rpm")
+    form_factor = _reported_text(
+        _reported_object(payload, "form_factor", unread, "form_factor"), "name", unread, "form_factor",
     )
-    power_on_time = payload.get("power_on_time") if isinstance(payload.get("power_on_time"), dict) else {}
-    logical_block_size = payload.get("logical_block_size")
-    physical_block_size = payload.get("physical_block_size")
-    firmware_version = normalize_text(payload.get("firmware_version"))
-    protocol_version = (
-        normalize_text(payload.get("nvme_version", {}).get("string"))
-        if isinstance(payload.get("nvme_version"), dict)
-        else None
+    scsi_transport_protocol = _reported_object(payload, "scsi_transport_protocol", unread, "transport_protocol")
+    transport_protocol = _reported_text(scsi_transport_protocol, "name", unread, "transport_protocol")
+    if transport_protocol is None and "transport_protocol" not in unread:
+        device = _reported_object(payload, "device", unread, "transport_protocol")
+        transport_protocol = _reported_text(device, "protocol", unread, "transport_protocol")
+    logical_unit_id = _reported_sas_address(payload, "logical_unit_id", unread, "logical_unit_id")
+    power_on_hours = _reported(power_on_time, "hours", _coerce_non_negative_int, unread, "power_on_hours")
+    _derived_unread(unread, "power_on_days", power_on_hours, {"power_on_hours": power_on_hours})
+    power_cycle_count = _extract_ata_attribute_raw_value(payload, 12, unread=unread, field="power_cycle_count")
+    power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets", unread, "power_on_resets")
+    warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(
+        payload, temperature, unread,
     )
-    if not protocol_version:
-        protocol_version = (
-            normalize_text(payload.get("sata_version", {}).get("string"))
-            if isinstance(payload.get("sata_version"), dict)
-            else None
-        )
-    smart_status = payload.get("smart_status") if isinstance(payload.get("smart_status"), dict) else {}
-    rotation_rate = payload.get("rotation_rate") if isinstance(payload.get("rotation_rate"), int) else None
-    form_factor = (
-        normalize_text(payload.get("form_factor", {}).get("name"))
-        if isinstance(payload.get("form_factor"), dict)
-        else None
-    )
-    transport_protocol = (
-        normalize_text(payload.get("scsi_transport_protocol", {}).get("name"))
-        if isinstance(payload.get("scsi_transport_protocol"), dict)
-        else None
-    )
-    if not transport_protocol:
-        transport_protocol = (
-            normalize_text(payload.get("device", {}).get("protocol"))
-            if isinstance(payload.get("device"), dict)
-            else None
-    )
-    logical_unit_id = format_hex_identifier(payload.get("logical_unit_id"))
-    smart_health_status = None
-    if smart_status:
-        passed = smart_status.get("passed")
-        if passed is True:
-            smart_health_status = "PASSED"
-        elif passed is False:
-            smart_health_status = "FAILED"
-    power_on_hours = power_on_time.get("hours") if isinstance(power_on_time.get("hours"), int) else None
-    power_cycle_count = _extract_ata_attribute_raw_value(payload, 12)
-    power_on_resets = _extract_ata_device_stat_int(payload, "Lifetime Power-On Resets")
-    warning_temperature_c, critical_temperature_c = _extract_smartctl_temperature_thresholds(payload, temperature)
-    sector_size_for_ata = logical_block_size if isinstance(logical_block_size, int) and logical_block_size > 0 else 512
+    logical_block_size_reported = "logical_block_size" in payload
+    logical_block_size = _reported(payload, "logical_block_size", _positive_int, unread, "logical_block_size")
+    physical_block_size = _reported(payload, "physical_block_size", _positive_int, unread, "physical_block_size")
+    # An absent size keeps the long-standing 512-byte sector default. A reported
+    # size that is not a positive integer is rejected, and is never replaced by
+    # that default: sector-valued counters then have no byte total.
+    sector_size_for_ata = logical_block_size if logical_block_size_reported else 512
     traffic_and_wear = _extract_smartctl_traffic_and_wear(
         payload,
         power_on_hours,
         sector_size_for_ata,
+        unread,
     )
     available_spare_percent = traffic_and_wear["available_spare_percent"]
     available_spare_threshold_percent = traffic_and_wear["available_spare_threshold_percent"]
@@ -4084,56 +4440,56 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
     estimated_remaining_bytes_written = traffic_and_wear["estimated_remaining_bytes_written"]
     media_errors = traffic_and_wear["media_errors"]
     unsafe_shutdowns = traffic_and_wear["unsafe_shutdowns"]
-    read_commands = _extract_ata_device_stat_int(payload, "Number of Read Commands")
-    write_commands = _extract_ata_device_stat_int(payload, "Number of Write Commands")
-    hardware_resets = _extract_ata_device_stat_int(payload, "Number of Hardware Resets")
-    interface_crc_errors = _extract_ata_device_stat_int(payload, "Number of Interface CRC Errors")
-    if interface_crc_errors is None:
-        interface_crc_errors = _extract_ata_attribute_raw_value(payload, 199)
-    read_cache_enabled = (
-        payload.get("read_lookahead", {}).get("enabled")
-        if isinstance(payload.get("read_lookahead"), dict)
-        and isinstance(payload.get("read_lookahead", {}).get("enabled"), bool)
-        else None
+    read_commands = _extract_ata_device_stat_int(payload, "Number of Read Commands", unread, "read_commands")
+    write_commands = _extract_ata_device_stat_int(payload, "Number of Write Commands", unread, "write_commands")
+    hardware_resets = _extract_ata_device_stat_int(payload, "Number of Hardware Resets", unread, "hardware_resets")
+    interface_crc_errors = _extract_ata_device_stat_int(
+        payload, "Number of Interface CRC Errors", unread, "interface_crc_errors",
     )
-    writeback_cache_enabled = (
-        payload.get("write_cache", {}).get("enabled")
-        if isinstance(payload.get("write_cache"), dict)
-        and isinstance(payload.get("write_cache", {}).get("enabled"), bool)
-        else None
-    )
-    interface_speed = payload.get("interface_speed") if isinstance(payload.get("interface_speed"), dict) else {}
-    interface_speed_current = interface_speed.get("current") if isinstance(interface_speed.get("current"), dict) else {}
-    negotiated_link_rate = normalize_text(interface_speed_current.get("string"))
+    if interface_crc_errors is None and "interface_crc_errors" not in unread:
+        interface_crc_errors = _extract_ata_attribute_raw_value(
+            payload, 199, unread=unread, field="interface_crc_errors",
+        )
+    read_cache_enabled = _reported_cache_flag(payload, "read_lookahead", unread, "read_cache_enabled")
+    writeback_cache_enabled = _reported_cache_flag(payload, "write_cache", unread, "writeback_cache_enabled")
+    interface_speed = _reported_object(payload, "interface_speed", unread, "negotiated_link_rate")
+    interface_speed_current = _reported_object(interface_speed, "current", unread, "negotiated_link_rate")
+    negotiated_link_rate = _reported_text(interface_speed_current, "string", unread, "negotiated_link_rate")
 
-    if rotation_rate is None and transport_protocol and transport_protocol.upper() == "NVME":
+    # NVMe drives do not rotate; infer 0 only when no rotation rate was
+    # reported, never in place of a reported value that could not be read.
+    if (
+        rotation_rate is None
+        and "rotation_rate" not in payload
+        and transport_protocol
+        and transport_protocol.upper() == "NVME"
+    ):
         rotation_rate = 0
 
-    nvme_namespaces = payload.get("nvme_namespaces") if isinstance(payload.get("nvme_namespaces"), list) else []
-    namespace_eui64 = None
-    if nvme_namespaces and isinstance(nvme_namespaces[0], dict):
-        eui64_payload = nvme_namespaces[0].get("eui64")
-        if isinstance(eui64_payload, dict):
-            oui = eui64_payload.get("oui")
-            ext_id = eui64_payload.get("ext_id")
-            if isinstance(oui, int) and isinstance(ext_id, int):
-                namespace_eui64 = _format_nvme_eui64(f"{oui:06x}{ext_id:010x}")
+    namespace_eui64 = _reported_namespace_eui64(payload, unread)
 
-    sas_phy = _extract_smartctl_sas_phy(payload)
+    phy_unread: set[str] = set()
+    sas_phy = _extract_smartctl_sas_phy(payload, phy_unread)
     if sas_phy is None:
         sas_address = None
         attached_sas_address = None
     else:
+        # The selected PHY's link rate replaces the interface-speed one.
+        unread.discard("negotiated_link_rate")
+        unread.update(phy_unread)
         sas_address, attached_sas_address, negotiated_link_rate = sas_phy
 
-    latest_test_type, latest_test_status, latest_test_lifetime_hours = _extract_smartctl_latest_test(payload)
-
-    current_temperature = (
-        temperature.get("current")
-        if isinstance(temperature.get("current"), int)
-        else environmental_temperature.get("current")
-        if isinstance(environmental_temperature.get("current"), int)
+    latest_test_type, latest_test_status, latest_test_lifetime_hours = _extract_smartctl_latest_test(payload, unread)
+    last_test_age_hours = (
+        power_on_hours - latest_test_lifetime_hours
+        if isinstance(power_on_hours, int)
+        and isinstance(latest_test_lifetime_hours, int)
+        and power_on_hours >= latest_test_lifetime_hours
         else None
+    )
+    _derived_unread(
+        unread, "last_test_age_hours", last_test_age_hours,
+        {"power_on_hours": power_on_hours, "last_test_lifetime_hours": latest_test_lifetime_hours},
     )
 
     return _finalize_summary(
@@ -4149,15 +4505,9 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "last_test_type": latest_test_type,
             "last_test_status": latest_test_status,
             "last_test_lifetime_hours": latest_test_lifetime_hours,
-            "last_test_age_hours": (
-                power_on_hours - latest_test_lifetime_hours
-                if isinstance(power_on_hours, int)
-                and isinstance(latest_test_lifetime_hours, int)
-                and power_on_hours >= latest_test_lifetime_hours
-                else None
-            ),
-            "logical_block_size": logical_block_size if isinstance(logical_block_size, int) else None,
-            "physical_block_size": physical_block_size if isinstance(physical_block_size, int) else None,
+            "last_test_age_hours": last_test_age_hours,
+            "logical_block_size": logical_block_size,
+            "physical_block_size": physical_block_size,
             "available_spare_percent": available_spare_percent,
             "available_spare_threshold_percent": available_spare_threshold_percent,
             "endurance_used_percent": endurance_used_percent,
@@ -4191,27 +4541,34 @@ def parse_smartctl_summary(output: str) -> dict[str, Any]:
             "sata_phy_events": _extract_smartctl_sata_phy_events(payload),
         },
         "No SMART summary fields were returned for this disk.",
+        unread=unread,
     )
 
 
 def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe smart-log JSON parsing failed."}
 
-    temperature_c = _kelvin_to_celsius(payload.get("temperature"))
-    power_on_hours = _coerce_non_negative_int(payload.get("power_on_hours"))
-    available_spare_percent = _coerce_non_negative_int(payload.get("avail_spare"))
-    available_spare_threshold_percent = _coerce_non_negative_int(payload.get("spare_thresh"))
-    endurance_used_percent = _coerce_non_negative_int(payload.get("percent_used"))
+    unread: set[str] = set()
+    temperature_c = _reported_kelvin(payload, "temperature", unread, "temperature_c")
+    power_on_hours = _reported(payload, "power_on_hours", _coerce_non_negative_int, unread, "power_on_hours")
+    available_spare_percent = _reported(
+        payload, "avail_spare", _coerce_non_negative_int, unread, "available_spare_percent",
+    )
+    available_spare_threshold_percent = _reported(
+        payload, "spare_thresh", _coerce_non_negative_int, unread, "available_spare_threshold_percent",
+    )
+    endurance_used_percent = _reported(
+        payload, "percent_used", _coerce_non_negative_int, unread, "endurance_used_percent",
+    )
     endurance_remaining_percent = (
         max(0, 100 - endurance_used_percent) if endurance_used_percent is not None else None
     )
-    bytes_read = _nvme_data_units_to_bytes(payload.get("data_units_read"))
-    bytes_written = _nvme_data_units_to_bytes(payload.get("data_units_written"))
-    media_errors = _coerce_non_negative_int(payload.get("media_errors"))
-    unsafe_shutdowns = _coerce_non_negative_int(payload.get("unsafe_shutdowns"))
+    bytes_read = _reported(payload, "data_units_read", _nvme_data_units_to_bytes, unread, "bytes_read")
+    bytes_written = _reported(payload, "data_units_written", _nvme_data_units_to_bytes, unread, "bytes_written")
+    media_errors = _reported(payload, "media_errors", _coerce_non_negative_int, unread, "media_errors")
+    unsafe_shutdowns = _reported(payload, "unsafe_shutdowns", _coerce_non_negative_int, unread, "unsafe_shutdowns")
     annualized_bytes_read = _annualize_bytes(bytes_read, power_on_hours)
     annualized_bytes_written = _annualize_bytes(bytes_written, power_on_hours)
     estimated_lifetime_bytes_written = (
@@ -4225,6 +4582,27 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
         max(estimated_lifetime_bytes_written - bytes_written, 0)
         if estimated_lifetime_bytes_written is not None and bytes_written is not None
         else None
+    )
+    _derived_unread(unread, "power_on_days", power_on_hours, {"power_on_hours": power_on_hours})
+    _derived_unread(
+        unread, "endurance_remaining_percent", endurance_remaining_percent,
+        {"endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_read", annualized_bytes_read,
+        {"bytes_read": bytes_read, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "annualized_bytes_written", annualized_bytes_written,
+        {"bytes_written": bytes_written, "power_on_hours": power_on_hours},
+    )
+    _derived_unread(
+        unread, "estimated_lifetime_bytes_written", estimated_lifetime_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
+    )
+    _derived_unread(
+        unread, "estimated_remaining_bytes_written", estimated_remaining_bytes_written,
+        {"bytes_written": bytes_written, "endurance_used_percent": endurance_used_percent},
     )
 
     return _finalize_summary(
@@ -4263,19 +4641,20 @@ def parse_nvme_smart_log_summary(output: str) -> dict[str, Any]:
             media_errors,
             unsafe_shutdowns,
         ),
+        unread=unread,
     )
 
 
 def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ctrl JSON parsing failed."}
 
-    firmware_version = normalize_text(payload.get("fr"))
-    protocol_version = _format_nvme_version(payload.get("ver"))
-    warning_temperature_c = _kelvin_to_celsius(payload.get("wctemp"))
-    critical_temperature_c = _kelvin_to_celsius(payload.get("cctemp"))
+    unread: set[str] = set()
+    firmware_version = _reported_text(payload, "fr", unread, "firmware_version")
+    protocol_version = _reported(payload, "ver", _format_nvme_version, unread, "protocol_version")
+    warning_temperature_c = _reported_kelvin(payload, "wctemp", unread, "warning_temperature_c")
+    critical_temperature_c = _reported_kelvin(payload, "cctemp", unread, "critical_temperature_c")
 
     return _finalize_summary(
         {
@@ -4285,21 +4664,23 @@ def parse_nvme_id_ctrl_summary(output: str) -> dict[str, Any]:
             "critical_temperature_c": critical_temperature_c,
         },
         "No NVMe controller identity fields were returned for this disk.",
+        unread=unread,
     )
 
 
 def parse_nvme_id_ns_summary(output: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(output)
-    except json.JSONDecodeError:
+    payload = _load_json_object(output)
+    if payload is None:
         return {"available": False, "message": "NVMe id-ns JSON parsing failed."}
 
+    unread: set[str] = set()
     return _finalize_summary(
         {
-            "namespace_eui64": _format_nvme_eui64(payload.get("eui64")),
-            "namespace_nguid": _format_nvme_nguid(payload.get("nguid")),
+            "namespace_eui64": _reported(payload, "eui64", _format_nvme_eui64, unread, "namespace_eui64"),
+            "namespace_nguid": _reported(payload, "nguid", _format_nvme_nguid, unread, "namespace_nguid"),
         },
         "No NVMe namespace identity fields were returned for this disk.",
+        unread=unread,
     )
 
 

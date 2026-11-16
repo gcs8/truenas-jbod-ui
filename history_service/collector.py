@@ -2249,10 +2249,11 @@ class HistoryCollector:
         if normalize_text(summary.get("smart_health_status")):
             return True
         predictive_errors = summary.get("predictive_errors")
-        return (
-            isinstance(predictive_errors, int | float)
-            and not isinstance(predictive_errors, bool)
-            and math.isfinite(float(predictive_errors))
+        if isinstance(predictive_errors, bool):
+            return False
+        # An integer is always finite; converting a huge one to float would raise.
+        return isinstance(predictive_errors, int) or (
+            isinstance(predictive_errors, float) and math.isfinite(predictive_errors)
         )
 
     @staticmethod
@@ -2271,7 +2272,11 @@ class HistoryCollector:
         value = summary.get("temperature_c")
         if not isinstance(value, int | float) or isinstance(value, bool):
             return None
-        temperature = float(value)
+        try:
+            temperature = float(value)
+        except OverflowError:
+            # One value too large for a float is no reading, not a failed pass.
+            return None
         return temperature if math.isfinite(temperature) else None
 
     def _build_metric_samples(
@@ -2290,6 +2295,10 @@ class HistoryCollector:
                 value_integer = int(value)
                 value_real = None
             elif isinstance(value, int):
+                if not -(2**63) <= value < 2**63:
+                    # The store's integer column is signed 64-bit: a sample it
+                    # cannot hold is skipped so the other samples are written.
+                    continue
                 value_integer = value
                 value_real = None
             elif isinstance(value, float):

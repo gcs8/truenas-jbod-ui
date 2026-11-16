@@ -263,6 +263,10 @@ class SmartSummaryView(BaseModel):
     # SMART command or checksum problem with output still read (#1171).
     smartctl_exit_status: int | None = None
     smartctl_status_flags: list[str] | None = None
+    # Names of fields above that the source reported in a shape that could not
+    # be read. Such a field is "not read": its value is None, but unlike an
+    # absent field the source did report it, and it is never a zero.
+    unread_fields: list[str] = Field(default_factory=list)
     message: str | None = None
 
 
