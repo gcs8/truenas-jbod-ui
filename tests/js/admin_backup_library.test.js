@@ -1121,7 +1121,7 @@ test("a long clean-up plan scrolls inside its list, so the introduction, result 
   };
   assert.match(rule(".backup-dialog[open]:has(.backup-cleanup-list)"), /display:\s*flex;[\s\S]*flex-direction:\s*column;/);
   assert.match(rule(".backup-dialog-body:has(> .backup-cleanup-list)"), /display:\s*flex;[\s\S]*min-height:\s*0;/);
-  assert.match(rule(".backup-cleanup-list"), /overflow-y:\s*auto;/);
+  assert.match(rule(".backup-cleanup-list"), /overflow-y:[ ]*auto;/);
 });
 
 test("a clean-up applied while another run holds the scheduler says why nothing happened (#1188)", async () => {
