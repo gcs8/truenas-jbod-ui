@@ -80,11 +80,14 @@ Format (see CONTRIBUTING.md, "Changelog And Release Notes"):
   configuration (#1196): recovery now returns configuration and history to the
   same generation, or refuses with a named reason and keeps its evidence,
   instead of reporting the prior generation restored while candidate
-  configuration stayed active. While a configuration folder still holds a
-  restore record that recovery did not settle, it reports
-  `configuration-recovery-incomplete`, changes nothing and exits with status 3.
-  Run such a recovery through the admin service, which mounts the
-  configuration volume (#1265).
+  configuration stayed active. While a configuration folder that the
+  application's settings name still holds a restore record that recovery did
+  not settle, it reports `configuration-recovery-incomplete`, changes nothing
+  and exits with status 3; a folder it lists past its scan bound gives
+  `recovery-scan-limit-reached` the same way. Run such a recovery through the
+  admin service, which mounts the configuration volume; a receipt printed by
+  the history container says the configuration folders were not checked there
+  (#1265).
 
 ### Performance
 

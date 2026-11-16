@@ -1607,8 +1607,9 @@ rotation.recover_pending_rotation(source=source, segments_directory=segments, ap
 
             self.assertEqual(
                 str(raised.exception),
-                "Segment rotation found unreferenced segment temporary artifact: "
-                + json.dumps(str(orphan_path))
+                "Segment rotation found 1 unreferenced segment temporary artifact "
+                "in the segments folder: "
+                + json.dumps(orphan_path.name)
                 + ".",
             )
             self.assertEqual(marker_path.read_bytes(), marker_bytes)
@@ -1689,10 +1690,15 @@ rotation.recover_pending_rotation(source=source, segments_directory=segments, ap
                         apply=True,
                     )
                 message = str(raised.exception)
+                # Names outside the printable set are replaced, not escaped.
+                names = sorted(path.name for path in unexpected_paths)
                 self.assertEqual(
                     message,
-                    "Segment rotation found unauthenticated staging artifacts: "
-                    + ", ".join(json.dumps(str(path)) for path in unexpected_paths)
+                    f"Segment rotation found {len(names)} unauthenticated staging artifacts: "
+                    + ", ".join(
+                        json.dumps("<name not shown>" if "hostile" in name else name)
+                        for name in names
+                    )
                     + ".",
                 )
                 self.assertNotIn("\n", message)

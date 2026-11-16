@@ -13,11 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from history_service import segment_catalog
 from history_service.segment_catalog import (
     MIGRATION_PENDING_MARKER,
     SEGMENT_ID_PATTERN,
     activation_pending_path,
+    open_regular_file,
     path_entry_exists,
+    read_descriptor,
+    require_unchanged,
 )
 from history_service.hot_summary_counts import SUMMARY_TABLE_KEYS, HotSystemSummaryCounts, sqlite_order
 from history_service.operation_bounds import validate_store_scope_request
@@ -195,13 +199,24 @@ class SegmentedHistoryReader:
         catalog_path = cls._require_regular_file(Path(catalog_path), label="segment catalog")
         if not allow_pending_recovery and path_entry_exists(catalog_path.parent / MIGRATION_PENDING_MARKER):
             raise ValueError("Segmented history migration recovery is pending.")
+        invalid = "Segmented history catalog is invalid."
         try:
+            # One bounded, non-blocking open, read through its descriptor: a
+            # FIFO or other file swapped in after the check above is refused.
+            with open_regular_file(catalog_path, invalid=invalid) as (descriptor, opened):
+                content = read_descriptor(
+                    descriptor,
+                    opened,
+                    limit=segment_catalog.MAX_CATALOG_BYTES,
+                    invalid=invalid,
+                )
+                require_unchanged(catalog_path, descriptor, opened, changed=invalid)
             catalog = json.loads(
-                catalog_path.read_text(encoding="utf-8"),
+                content.decode("utf-8"),
                 object_pairs_hook=_reject_duplicate_catalog_keys,
             )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Segmented history catalog is invalid.") from exc
+            raise ValueError(invalid) from exc
         if (
             not isinstance(catalog, dict)
             or catalog.get("catalog_version") != 1

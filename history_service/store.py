@@ -795,6 +795,7 @@ class HistoryStore:
                     script="scripts/rotate_segmented_history.py",
                     mode="--recover",
                     marker_path=activation_marker,
+                    admin_for_restore=True,
                 )
             )
         if self.segment_catalog_path is None:
@@ -818,6 +819,7 @@ class HistoryStore:
         script: str,
         mode: str,
         marker_path: Path,
+        admin_for_restore: bool = False,
     ) -> str:
         if self.segment_catalog_path is not None:
             segments_option = f"--segments-dir {shlex.quote(str(self.segment_catalog_path.parent))}"
@@ -828,11 +830,22 @@ class HistoryStore:
                 " HISTORY_SEGMENT_CATALOG_PATH is not set on this deployment, so give the "
                 "segments folder that the interrupted run used."
             )
+        arguments = f"{script} --source {shlex.quote(str(self.file_path))} {segments_option} {mode}"
+        # Only the admin service mounts the configuration folders a restore
+        # can also change; the history container cannot check them (#1196).
+        restore_note = (
+            " If the interrupted run was a backup restore that also restored "
+            "configuration, run the same command through the admin service instead, "
+            "which also checks the configuration folders: docker compose --profile admin "
+            f"run --rm --no-deps --entrypoint python enclosure-admin {arguments}."
+            if admin_for_restore
+            else ""
+        )
         return (
             f"{summary} Inspect it with: docker compose run --rm --entrypoint python "
-            f"enclosure-history {script} --source {shlex.quote(str(self.file_path))} {segments_option} {mode}"
-            f" (add --apply to carry it out), then start the history service again.{catalog_note}"
-            f" Marker file: {marker_path}."
+            f"enclosure-history {arguments}"
+            f" (add --apply to carry it out), then start the history service again.{restore_note}"
+            f"{catalog_note} Marker file: {marker_path}."
         )
 
     def _segmented_reader(self) -> SegmentedHistoryReader | None:

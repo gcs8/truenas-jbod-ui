@@ -10,7 +10,15 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from history_service.segment_catalog import path_entry_exists
+from history_service.segment_catalog import (
+    hash_descriptor,
+    open_regular_file,
+    path_entry_exists,
+    printed_names,
+    read_descriptor,
+    require_unchanged,
+    scan_folder,
+)
 from history_service.segment_reader import SegmentedHistoryReader
 
 ACTIVATION_JOURNAL_VERSION = 1
@@ -23,6 +31,9 @@ IMPORT_SEAL_PURPOSE = "restore-import-seal"
 # Recovery returns this state, changing nothing, while a configuration folder
 # the application knows about holds a restore record it did not settle.
 CONFIGURATION_RECOVERY_INCOMPLETE = "configuration-recovery-incomplete"
+# Recovery returns this state, changing nothing, when a folder it lists under
+# the history lock holds more than its scan bounds.
+RECOVERY_SCAN_LIMIT_REACHED = "recovery-scan-limit-reached"
 MAX_ACTIVATION_JOURNAL_BYTES = 1024 * 1024
 RESTORE_PHASES = frozenset(
     {
@@ -70,61 +81,20 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def record_file(path: Path) -> dict[str, Any]:
-    descriptor = os.open(
+def record_file(path: Path, *, expected_size: int | None = None) -> dict[str, Any]:
+    changed = "Segmented restore artifact changed while it was being recorded."
+    with open_regular_file(
         path,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-    )
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ValueError("Segmented restore artifact must be a single-link regular file.")
-        digest = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        path_metadata = os.stat(path, follow_symlinks=False)
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_uid,
-            before.st_gid,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        if (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_uid,
-            after.st_gid,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) != identity or (
-            path_metadata.st_dev,
-            path_metadata.st_ino,
-            path_metadata.st_mode,
-            path_metadata.st_nlink,
-            path_metadata.st_uid,
-            path_metadata.st_gid,
-            path_metadata.st_size,
-            path_metadata.st_mtime_ns,
-            path_metadata.st_ctime_ns,
-        ) != identity:
-            raise ValueError("Segmented restore artifact changed while it was being recorded.")
-    finally:
-        os.close(descriptor)
+        invalid="Segmented restore artifact must be a single-link regular file.",
+    ) as (descriptor, before):
+        if expected_size is not None and before.st_size != expected_size:
+            # A file of another size cannot match; it is not read at all.
+            raise ValueError("Segmented restore artifact does not match its record.")
+        sha256 = hash_descriptor(descriptor, before, changed=changed)
+        require_unchanged(path, descriptor, before, changed=changed)
     return {
         "kind": "file",
-        "sha256": digest.hexdigest(),
+        "sha256": sha256,
         "size_bytes": before.st_size,
         "device": before.st_dev,
         "inode": before.st_ino,
@@ -149,13 +119,29 @@ def _relative_path(value: Any, *, label: str) -> Path:
     return path
 
 
-def record_tree(root: Path) -> dict[str, Any]:
+def _tree_paths(root: Path, max_entries: int | None) -> list[Path]:
+    """Every entry below ``root``, sorted; more than ``max_entries`` is refused."""
+    paths: list[Path] = []
+    pending = [root]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                paths.append(path)
+                if max_entries is not None and len(paths) > max_entries:
+                    raise ValueError("Segmented restore tree holds more entries than its record.")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+    return sorted(paths)
+
+
+def record_tree(root: Path, *, max_entries: int | None = None) -> dict[str, Any]:
     root_metadata = os.stat(root, follow_symlinks=False)
     if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError("Segmented restore tree must be a directory.")
     directories: list[dict[str, Any]] = []
     files: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
+    for path in _tree_paths(root, max_entries):
         relative = path.relative_to(root).as_posix()
         metadata = os.stat(path, follow_symlinks=False)
         if stat.S_ISLNK(metadata.st_mode):
@@ -245,7 +231,7 @@ def file_matches(path: Path, record: Any) -> bool:
     if not _valid_file_record(record):
         return False
     try:
-        return record_file(path) == record
+        return record_file(path, expected_size=record["size_bytes"]) == record
     except (OSError, ValueError):
         return False
 
@@ -297,7 +283,10 @@ def tree_matches(path: Path, record: Any) -> bool:
     if not _valid_tree_record(record):
         return False
     try:
-        return record_tree(path) == record
+        # A tree with more entries than its record cannot match, so the walk
+        # stops there instead of listing whatever else the folder holds.
+        entries = len(record["directories"]) + len(record["files"])
+        return record_tree(path, max_entries=entries) == record
     except (OSError, ValueError):
         return False
 
@@ -305,55 +294,17 @@ def tree_matches(path: Path, record: Any) -> bool:
 def _read_private_json(path: Path, *, invalid: str, changed: str) -> tuple[Any, dict[str, Any]]:
     """Read a bounded private single-link JSON file and its exact record.
 
-    A FIFO, device or folder put in its place is refused without waiting: the
-    entry type is checked before the open, the open never blocks, and the
-    opened file is checked again (#1196).
+    A FIFO, device or folder put in its place is refused without waiting: it
+    goes through the one bounded, non-blocking reader recovery uses (#1196).
     """
-    entry = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISREG(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
-        # A symlink still reaches the O_NOFOLLOW open below and fails there.
-        raise ValueError(invalid)
-    descriptor = os.open(
-        path,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-    )
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) & 0o077
-            or before.st_size > MAX_ACTIVATION_JOURNAL_BYTES
-        ):
-            raise ValueError(invalid)
-        content = os.read(descriptor, MAX_ACTIVATION_JOURNAL_BYTES + 1)
-        if len(content) > MAX_ACTIVATION_JOURNAL_BYTES or os.read(descriptor, 1):
-            raise ValueError(invalid)
-        after = os.fstat(descriptor)
-        path_metadata = os.stat(path, follow_symlinks=False)
-        if (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) or (path_metadata.st_dev, path_metadata.st_ino) != (before.st_dev, before.st_ino):
-            raise ValueError(changed)
-    finally:
-        os.close(descriptor)
+    with open_regular_file(path, invalid=invalid, private=True) as (descriptor, before):
+        content = read_descriptor(
+            descriptor,
+            before,
+            limit=MAX_ACTIVATION_JOURNAL_BYTES,
+            invalid=invalid,
+        )
+        require_unchanged(path, descriptor, before, changed=changed)
     try:
         payload = json.loads(content, object_pairs_hook=_reject_duplicate_json_keys)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -450,33 +401,37 @@ def find_import_seals(folders: Iterable[Path]) -> list[dict[str, Any]]:
     """Name the restore folder records present in ``folders``, opening none.
 
     ``folders`` must come from the application's own settings, never from the
-    history volume. Only those folders are listed, one level deep. A record
-    is matched by its exact name; a folder that exists but cannot be listed
-    is reported as unreadable, because its records are unknown (#1196).
+    history volume. Only those folders are listed, one level deep and within
+    the scan bounds (``RecoveryScanLimitReached`` past them). A record is
+    matched by its exact name; a folder that exists but cannot be listed is
+    reported as unreadable, because its records are unknown (#1196).
     """
     found: list[dict[str, Any]] = []
     for folder in folders:
         try:
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    if _IMPORT_SEAL_NAME.fullmatch(entry.name) is None:
-                        continue
-                    try:
-                        metadata = entry.stat(follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    found.append(
-                        {
-                            "folder": str(folder),
-                            "device": metadata.st_dev,
-                            "inode": metadata.st_ino,
-                            "unreadable": False,
-                        }
-                    )
+            names = scan_folder(
+                folder,
+                role="configuration folder",
+                matches=lambda name: _IMPORT_SEAL_NAME.fullmatch(name) is not None,
+            )
         except (FileNotFoundError, NotADirectoryError):
             continue
         except OSError:
             found.append({"folder": str(folder), "device": None, "inode": None, "unreadable": True})
+            continue
+        for name in names:
+            try:
+                metadata = os.stat(Path(folder) / name, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            found.append(
+                {
+                    "folder": str(folder),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "unreadable": False,
+                }
+            )
     return found
 
 
@@ -485,21 +440,37 @@ def configuration_recovery_incomplete(
     *,
     apply: bool,
 ) -> dict[str, Any]:
-    """The receipt for records recovery found but did not settle; nothing changed."""
+    """The receipt for records recovery found but did not settle; nothing changed.
+
+    A folder that could not be listed is reported apart from the folders
+    where records were seen: its contents are unknown, not evidence.
+    """
+    held = sorted({item["folder"] for item in unsettled if not item["unreadable"]})
+    unreadable = sorted({item["folder"] for item in unsettled if item["unreadable"]})
+    sentences: list[str] = []
+    if held:
+        sentences.append(
+            "Configuration recovery is incomplete: the configuration folders listed "
+            "under folders hold restore records that this recovery did not settle, so "
+            "an interrupted restore may have left configuration and history from "
+            "different generations. Review those folders before removing the records."
+        )
+    if unreadable:
+        sentences.append(
+            "The configuration folders listed under unreadable_folders could not be "
+            "read, so it is not known whether they contain restore records. Make each one "
+            "readable and searchable by the user that runs recovery (for example "
+            "chmod u+rx on the folder, as its owner) and run recovery again."
+        )
+    sentences.append("Recovery changed nothing.")
     return {
         "apply": apply,
         "recovery_state": CONFIGURATION_RECOVERY_INCOMPLETE,
-        "folders": sorted({item["folder"] for item in unsettled}),
-        "unreadable_folders": sorted(
-            {item["folder"] for item in unsettled if item["unreadable"]}
-        ),
-        "message": (
-            "Configuration recovery is incomplete: the listed configuration folders "
-            "hold restore records that this recovery did not settle, so an "
-            "interrupted restore may have left configuration and history from "
-            "different generations. Recovery changed nothing. Review those folders "
-            "before removing the records."
-        ),
+        "folders": printed_names(held),
+        "folder_count": len(held),
+        "unreadable_folders": printed_names(unreadable),
+        "unreadable_folder_count": len(unreadable),
+        "message": " ".join(sentences),
     }
 
 

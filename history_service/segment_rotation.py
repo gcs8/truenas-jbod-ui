@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -11,12 +12,22 @@ import tempfile
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable
 
 from history_service.migration_lock import history_write_lock
 from history_service.scheduled_backup import read_scheduled_backup_status
-from history_service.segment_catalog import activation_pending_path, path_entry_exists
+from history_service.segment_catalog import (
+    RecoveryScanLimitReached,
+    activation_pending_path,
+    describe_names,
+    hash_descriptor,
+    open_regular_file,
+    path_entry_exists,
+    require_unchanged,
+    scan_folder,
+)
 from history_service.segment_migration import (
     _fsync_directory,
     _raise_for_unreferenced_segment_temporaries,
@@ -28,6 +39,8 @@ from history_service.segment_migration import (
 )
 from history_service.segment_reader import MAX_SEGMENTS_PER_QUERY, SegmentedHistoryReader
 from history_service.segmented_restore import (
+    CONFIGURATION_RECOVERY_INCOMPLETE,
+    RECOVERY_SCAN_LIMIT_REACHED,
     configuration_recovery_incomplete,
     find_import_seals,
     read_activation_journal,
@@ -65,55 +78,25 @@ def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _record_file(path: Path, *, final_name: str | None = None) -> dict[str, Any]:
-    descriptor = os.open(
+def _record_file(
+    path: Path,
+    *,
+    final_name: str | None = None,
+    expected_size: int | None = None,
+) -> dict[str, Any]:
+    changed = "Segment rotation artifact changed while it was being hashed."
+    with open_regular_file(
         path,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-    )
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            raise ValueError("Segment rotation artifact must be a single-link regular file.")
-        digest = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        path_metadata = os.stat(path, follow_symlinks=False)
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        )
-        if (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) != before_identity or (
-            path_metadata.st_dev,
-            path_metadata.st_ino,
-            path_metadata.st_mode,
-            path_metadata.st_nlink,
-            path_metadata.st_size,
-            path_metadata.st_mtime_ns,
-            path_metadata.st_ctime_ns,
-        ) != before_identity:
-            raise ValueError("Segment rotation artifact changed while it was being hashed.")
-    finally:
-        os.close(descriptor)
+        invalid="Segment rotation artifact must be a single-link regular file.",
+    ) as (descriptor, before):
+        if expected_size is not None and before.st_size != expected_size:
+            # A file of another size cannot match; it is not read at all.
+            raise ValueError("Segment rotation artifact does not match its record.")
+        sha256 = hash_descriptor(descriptor, before, changed=changed)
+        require_unchanged(path, descriptor, before, changed=changed)
     record: dict[str, Any] = {
         "file_name": path.name,
-        "sha256": digest.hexdigest(),
+        "sha256": sha256,
         "size_bytes": before.st_size,
     }
     if final_name is not None:
@@ -149,7 +132,7 @@ def _file_matches(path: Path, record: Any) -> bool:
     ):
         return False
     try:
-        actual = _record_file(path)
+        actual = _record_file(path, expected_size=size_bytes)
     except (OSError, ValueError):
         return False
     return actual["size_bytes"] == size_bytes and actual["sha256"] == expected_sha256
@@ -202,55 +185,75 @@ def _remove_created_file(path: Path, expected: os.stat_result, *, label: str) ->
     _retire_authenticated_path(path, authenticate=authenticate)
 
 
-def _copy_file_no_replace(source: Path, destination: Path) -> dict[str, Any]:
-    source_descriptor = os.open(
-        source,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
+def _copy_file_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    expected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Copy ``source`` through one non-blocking descriptor to a new ``destination``.
+
+    The bytes copied are hashed as they are read, and the source descriptor
+    must still name the file it opened, so a file swapped in after a caller's
+    check is never copied; ``expected`` must then match those bytes (#1196).
+    """
+    copy_failed = "Segment rotation copy integrity check failed."
     destination_descriptor = -1
-    created = False
     created_metadata: os.stat_result | None = None
+    digest = hashlib.sha256()
     try:
-        source_metadata = os.fstat(source_descriptor)
-        if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
-            raise ValueError("Segment rotation source artifact is invalid.")
-        destination_descriptor = os.open(
-            destination,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        created = True
-        os.fchmod(destination_descriptor, 0o600)
-        created_metadata = os.fstat(destination_descriptor)
-        while chunk := os.read(source_descriptor, 1024 * 1024):
-            view = memoryview(chunk)
-            while view:
-                written = os.write(destination_descriptor, view)
-                if written <= 0:
-                    raise OSError("Segment rotation copy was incomplete.")
-                view = view[written:]
-        os.fsync(destination_descriptor)
+        with open_regular_file(
+            source,
+            invalid="Segment rotation source artifact is invalid.",
+        ) as (source_descriptor, source_metadata):
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(destination_descriptor, 0o600)
+            created_metadata = os.fstat(destination_descriptor)
+            remaining = source_metadata.st_size
+            while remaining > 0 and (
+                chunk := os.read(source_descriptor, min(1024 * 1024, remaining))
+            ):
+                remaining -= len(chunk)
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    if written <= 0:
+                        raise OSError("Segment rotation copy was incomplete.")
+                    view = view[written:]
+            if remaining or os.read(source_descriptor, 1):
+                raise ValueError(copy_failed)
+            os.fsync(destination_descriptor)
+            require_unchanged(source, source_descriptor, source_metadata, changed=copy_failed)
     except BaseException:
-        if created and created_metadata is not None and path_entry_exists(destination):
+        if created_metadata is not None and path_entry_exists(destination):
             _remove_created_file(destination, created_metadata, label="partial copy")
         raise
     finally:
-        os.close(source_descriptor)
         if destination_descriptor >= 0:
             os.close(destination_descriptor)
+    copied = {"sha256": digest.hexdigest(), "size_bytes": source_metadata.st_size}
     try:
         _fsync_directory(destination.parent)
-        source_record = _record_file(source)
         destination_record = _record_file(destination)
         if (
-            source_record["sha256"] != destination_record["sha256"]
-            or source_record["size_bytes"] != destination_record["size_bytes"]
+            destination_record["sha256"] != copied["sha256"]
+            or destination_record["size_bytes"] != copied["size_bytes"]
+            or (
+                expected is not None
+                and (expected.get("sha256"), expected.get("size_bytes"))
+                != (copied["sha256"], copied["size_bytes"])
+            )
         ):
-            raise ValueError("Segment rotation copy integrity check failed.")
+            raise ValueError(copy_failed)
     except BaseException:
         if created_metadata is not None and path_entry_exists(destination):
             _remove_created_file(destination, created_metadata, label="unverified copy")
@@ -382,7 +385,11 @@ def _restore_hot(source: Path, rollback_record: dict[str, Any], *, mode: int) ->
     _remove_created_file(temporary_path, reservation_metadata, label="restore reservation")
     restored_record: dict[str, Any] | None = None
     try:
-        restored_record = _copy_file_no_replace(rollback_path, temporary_path)
+        restored_record = _copy_file_no_replace(
+            rollback_path,
+            temporary_path,
+            expected=rollback_record,
+        )
         if (
             restored_record["sha256"] != rollback_record["sha256"]
             or restored_record["size_bytes"] != rollback_record["size_bytes"]
@@ -872,8 +879,9 @@ def _recover_pending_rotation_locked(
     segments_directory = _require_output_directory(segments_directory)
     source_metadata = _require_regular_source(source)
     _require_source_owner(source_metadata)
-    if apply:
-        segments_directory = _prepare_output_directory(segments_directory, source_metadata)
+    # The segments folder's owner and mode are repaired only just before the
+    # first change, after every check that can refuse, so a refused recovery
+    # leaves the folder as it found it.
     if not path_entry_exists(journal_path):
         _raise_for_unreferenced_segment_temporaries(
             segments_directory,
@@ -925,6 +933,7 @@ def _recover_pending_rotation_locked(
                     for root, record, label in orphan_records
                 ],
             }
+        _prepare_output_directory(segments_directory, source_metadata)
         _cleanup_unjournaled_artifacts(orphan_records)
         return {
             "apply": True,
@@ -977,23 +986,32 @@ def _recover_pending_rotation_locked(
         if isinstance(candidate_catalog_record, dict)
         else None
     )
-    unexpected_staging_paths = sorted(
+    hot_staging_pattern = f".{source.name}.segmented-*.sqlite3"
+    unexpected_staging_names = sorted(
         [
-            path
-            for path in source.parent.glob(f".{source.name}.segmented-*.sqlite3")
-            if path != expected_staged_hot
+            name
+            for name in scan_folder(
+                source.parent,
+                role="history folder",
+                matches=lambda name: fnmatchcase(name, hot_staging_pattern),
+            )
+            if source.parent / name != expected_staged_hot
         ]
         + [
-            path
-            for path in segments_directory.glob(".rotation-catalog-*.json")
-            if path != expected_staged_catalog
-        ],
-        key=str,
+            name
+            for name in scan_folder(
+                segments_directory,
+                role="segments folder",
+                matches=lambda name: fnmatchcase(name, ".rotation-catalog-*.json"),
+            )
+            if segments_directory / name != expected_staged_catalog
+        ]
     )
-    if unexpected_staging_paths:
+    if unexpected_staging_names:
         raise ValueError(
-            "Segment rotation found unauthenticated staging artifacts: "
-            + ", ".join(json.dumps(str(path)) for path in unexpected_staging_paths)
+            f"Segment rotation found {len(unexpected_staging_names)} unauthenticated "
+            "staging artifacts: "
+            + describe_names(unexpected_staging_names)
             + "."
         )
     rollback_hot_path = _record_path(
@@ -1077,6 +1095,7 @@ def _recover_pending_rotation_locked(
                 "recovery_state": "candidate-ready-to-finalize",
                 "phase": phase,
             }
+        _prepare_output_directory(segments_directory, source_metadata)
         # Refresh even on replay: a prior journal replace may have succeeded
         # while its directory fsync failed. No evidence is retired until this
         # selected decision has completed both durability barriers.
@@ -1134,6 +1153,7 @@ def _recover_pending_rotation_locked(
             "recovery_state": "prior-generation-ready-to-restore",
             "phase": phase,
         }
+    _prepare_output_directory(segments_directory, source_metadata)
     if not live_hot_is_prior:
         _restore_hot(source, rollback_hot_record, mode=int(source_record["mode"]))
     _require_file_matches(source, source_record, label="restored hot")
@@ -1194,8 +1214,42 @@ def recover_pending_rotation(
     apply: bool = False,
 ) -> dict[str, Any]:
     with history_write_lock(source, blocking=False):
-        return _recover_pending_rotation_locked(
-            source=source,
-            segments_directory=segments_directory,
-            apply=apply,
+        try:
+            receipt = _recover_pending_rotation_locked(
+                source=source,
+                segments_directory=segments_directory,
+                apply=apply,
+            )
+        except RecoveryScanLimitReached as exc:
+            # Every bounded folder scan runs before recovery's first change.
+            return {
+                "apply": apply,
+                "recovery_state": RECOVERY_SCAN_LIMIT_REACHED,
+                "folder_role": exc.role,
+                "entries_examined": exc.entries,
+                "matching_names": exc.matches,
+                "message": str(exc),
+            }
+    if receipt.get("recovery_state") == CONFIGURATION_RECOVERY_INCOMPLETE:
+        return receipt
+    if os.environ.get("APP_SERVICE_ROLE", "").strip() == "history":
+        # The history container mounts no configuration volume, so a receipt
+        # printed there must not read as if configuration had been checked.
+        command = (
+            "docker compose --profile admin run --rm --no-deps --entrypoint python "
+            "enclosure-admin scripts/rotate_segmented_history.py --source "
+            f"{shlex.quote(str(source))} --segments-dir "
+            f"{shlex.quote(str(segments_directory))} --recover"
         )
+        receipt = {
+            **receipt,
+            "configuration_folders_checked": False,
+            "message": (
+                "History only: this container does not mount the configuration "
+                "folders, so they were not checked for restore records. If the "
+                "interrupted run was a backup restore that also restored "
+                "configuration, run this check through the admin service before "
+                f"starting the services: {command}"
+            ),
+        }
+    return receipt

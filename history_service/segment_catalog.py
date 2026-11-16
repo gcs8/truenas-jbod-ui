@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import stat
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +19,19 @@ ACTIVATION_PENDING_SUFFIX = ".segmented-activation-pending.json"
 MAX_HISTORY_SEGMENT_BYTES = 1536 * 1024 * 1024
 SEGMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
+# Recovery reads what the history volume holds as untrusted input (#1196).
+# A catalog entry is well under 1 KiB, so this is far above any real catalog.
+MAX_CATALOG_BYTES = 128 * 1024 * 1024
+# A folder listed while the history lock is held: entries visited and names
+# kept. Real history, segment and settings folders hold a few thousand
+# entries at most and one or two matching names.
+MAX_RECOVERY_SCAN_ENTRIES = 1_000_000
+MAX_RECOVERY_SCAN_MATCHES = 1_000
+MAX_PRINTED_NAMES = 10
+UNPRINTABLE_NAME = "<name not shown>"
+_PRINTABLE_NAME = re.compile(r"[A-Za-z0-9._/-]{1,255}\Z")
+_HASH_CHUNK_BYTES = 1024 * 1024
+
 
 def path_entry_exists(path: str | os.PathLike[str]) -> bool:
     try:
@@ -21,6 +39,154 @@ def path_entry_exists(path: str | os.PathLike[str]) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
+@contextmanager
+def open_regular_file(
+    path: str | os.PathLike[str],
+    *,
+    invalid: str,
+    private: bool = False,
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Open ``path`` once for reading: no link followed, never blocking.
+
+    A FIFO, socket, device or folder is refused before it is opened. The
+    opened descriptor must be a single-link regular file (with ``private``,
+    one that only its owner can read); callers read through it and check it
+    with ``require_unchanged`` instead of opening the path again (#1196).
+    """
+    entry = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(entry.st_mode) and not stat.S_ISLNK(entry.st_mode):
+        raise ValueError(invalid)
+    # A symlink fails here, at the O_NOFOLLOW open.
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (private and stat.S_IMODE(metadata.st_mode) & 0o077)
+        ):
+            raise ValueError(invalid)
+        yield descriptor, metadata
+    finally:
+        os.close(descriptor)
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def require_unchanged(
+    path: str | os.PathLike[str],
+    descriptor: int,
+    opened: os.stat_result,
+    *,
+    changed: str,
+) -> None:
+    """The descriptor and the path still name the file as it was opened."""
+    identity = _file_identity(opened)
+    if (
+        _file_identity(os.fstat(descriptor)) != identity
+        or _file_identity(os.stat(path, follow_symlinks=False)) != identity
+    ):
+        raise ValueError(changed)
+
+
+def read_descriptor(descriptor: int, opened: os.stat_result, *, limit: int, invalid: str) -> bytes:
+    """Read the whole file, refusing one larger than ``limit`` bytes."""
+    if opened.st_size > limit:
+        raise ValueError(invalid)
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := os.read(descriptor, min(_HASH_CHUNK_BYTES, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(invalid)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def hash_descriptor(descriptor: int, opened: os.stat_result, *, changed: str) -> str:
+    """SHA-256 of the file, reading no more than its size when it was opened."""
+    digest = hashlib.sha256()
+    remaining = opened.st_size
+    while remaining > 0 and (chunk := os.read(descriptor, min(_HASH_CHUNK_BYTES, remaining))):
+        remaining -= len(chunk)
+        digest.update(chunk)
+    if remaining or os.read(descriptor, 1):
+        raise ValueError(changed)
+    return digest.hexdigest()
+
+
+class RecoveryScanLimitReached(ValueError):
+    """A folder held more than recovery lists under the history lock."""
+
+    def __init__(self, role: str, entries: int, matches: int) -> None:
+        self.role = role
+        self.entries = entries
+        self.matches = matches
+        super().__init__(
+            f"Recovery changed nothing: the {role} holds more than recovery examines "
+            f"while it holds the history lock (at most {MAX_RECOVERY_SCAN_ENTRIES} entries "
+            f"and {MAX_RECOVERY_SCAN_MATCHES} matching names); it stopped after {entries} "
+            f"entries with {matches} matching names. Remove what does not belong there and "
+            "run recovery again."
+        )
+
+
+def scan_folder(
+    folder: str | os.PathLike[str],
+    *,
+    role: str,
+    matches: Callable[[str], bool],
+) -> list[str]:
+    """The sorted names in ``folder`` that ``matches`` accepts, within the scan bounds."""
+    entries_seen = 0
+    names: list[str] = []
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > MAX_RECOVERY_SCAN_ENTRIES:
+                raise RecoveryScanLimitReached(role, entries_seen - 1, len(names))
+            if matches(entry.name):
+                if len(names) >= MAX_RECOVERY_SCAN_MATCHES:
+                    raise RecoveryScanLimitReached(role, entries_seen, len(names) + 1)
+                names.append(entry.name)
+    return sorted(names)
+
+
+def printable_name(value: str) -> str:
+    """``value`` when it is short printable ASCII from a small set, else a fixed token."""
+    return value if _PRINTABLE_NAME.fullmatch(value) else UNPRINTABLE_NAME
+
+
+def printed_names(values: Sequence[str]) -> list[str]:
+    """At most ``MAX_PRINTED_NAMES`` of ``values``, each through ``printable_name``."""
+    return [printable_name(value) for value in values[:MAX_PRINTED_NAMES]]
+
+
+def describe_names(values: Sequence[str]) -> str:
+    """Quoted printable names, at most ten, then how many more were found."""
+    text = ", ".join(json.dumps(name) for name in printed_names(values))
+    hidden = len(values) - MAX_PRINTED_NAMES
+    return f"{text} and {hidden} more" if hidden > 0 else text
 
 
 def activation_pending_path(hot_path: str | os.PathLike[str]) -> Path:

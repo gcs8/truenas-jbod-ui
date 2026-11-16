@@ -792,12 +792,21 @@ recovery does not settle (the journal was removed, broken, rewritten as a
 history-only journal or replaced by one that does not name that record, the
 record belongs to another restore, or a crash came after the journal was removed
 and before the records were), recovery changes nothing and returns
-`configuration-recovery-incomplete` with the folders that hold such records; a
-folder that cannot be listed is reported the same way. The recovery command
-prints that receipt and exits with status 3; it exits 0 for every other receipt
-and 1 for a refusal. Each record lists the files the interrupted restore
-changed, with their prior and restored records: compare them, put back what is
-needed by hand, then remove the records and run recovery again. It refuses,
+`configuration-recovery-incomplete` with the folders that hold such records
+under `folders`. A folder that exists but cannot be listed is reported under
+`unreadable_folders` as not read, never as holding records: make it readable
+and searchable by the user that runs recovery and run recovery again. Every
+folder recovery lists while it holds the history lock (these settings folders,
+the history folder and the segments folder) is listed with a bound of 1,000,000
+entries and 1,000 names that match what recovery looks for; past either bound
+recovery changes nothing and returns `recovery-scan-limit-reached` with the
+folder's role and the counts. A receipt or refusal names at most ten files or
+folders, each as printable ASCII or as `<name not shown>`, and gives the total.
+The recovery command prints both receipts and exits with status 3; it exits 0
+for every other receipt and 1 for a refusal, and it runs its SQLite
+temporary-file maintenance only after a recovery that completed with `--apply`.
+Records left after the journal is gone are cleaned up as described in "Clean up
+restore records left after an interrupted restore" below. It refuses,
 changes nothing and keeps the journal with a named `reason`
 when the journal is malformed or overlaps history (`journal-invalid`), was
 written by another user (`journal-owner-mismatch`), a folder is missing or is
@@ -826,9 +835,13 @@ directly; recovery gives it no more than that.
 
 Limits: a configuration destination outside the folders the settings name is not
 checked, and a recovery run where the configuration folders are not mounted
-(the history container) cannot see their records, so there a success receipt
-says only that history converged. When an interrupted import may have restored
-configuration, run recovery through the admin service as described below.
+(the history container) cannot see their records. A receipt printed by the
+history container (`APP_SERVICE_ROLE=history`) therefore carries
+`configuration_folders_checked: false` and a message that says the folders were
+not checked there and gives the admin-service command that checks them; the
+history service's startup message for a pending activation names the same
+command. When an interrupted import may have restored configuration, run
+recovery through the admin service as described below.
 
 The history container does not mount the configuration volume, and in the base
 Compose file the admin service that ran the restore writes the journal as root.
@@ -842,6 +855,123 @@ configuration, data and history as the identity that ran the restore. Add
 `--apply` only after reviewing the reported state. A history-only restore keeps
 the version 1 journal and the history-container command unchanged; only a
 recovery run through the admin service also checks the configuration folders.
+
+Clean up restore records left after an interrupted restore. A crash after the
+restore, or its recovery, removed the journal and before it removed the folder
+records leaves configuration and history in one generation and the records in
+place. Recovery then reports `configuration-recovery-incomplete` on every run
+and changes nothing, because without the journal it cannot tell these records
+from ones an edited journal left behind. To settle that case by hand:
+
+1. Stop the services: `docker compose stop`. Keep them stopped until step 6.
+2. Run the recovery dry run through the admin service (the command above,
+   without `--apply`). It must exit with status 3, report
+   `configuration-recovery-incomplete` and list folders under `folders`. If it
+   reports anything else, or lists `unreadable_folders`, resolve that first;
+   this procedure does not apply.
+3. Confirm that no journal remains: `./history/.history.db.segmented-activation-pending.json`
+   must not exist. If it exists, the restore is still pending: remove nothing
+   and recover it with the journal.
+4. Save the check below as `check-restore-records.py` and run it through the
+   admin service, which takes the folders from the application's settings:
+   `docker compose --profile admin run --rm --no-deps -T --entrypoint python
+   enclosure-admin - < check-restore-records.py`. It reads only. For each restore
+   transaction it prints the decision held by the first folder's record and,
+   for every file the records list, whether it holds the prior copy, the
+   restored copy (`candidate`) or neither.
+5. If it prints `STALE`, every listed file holds the generation that decision
+   selects (`commit`: the restored copy; `pending` or `rollback`: the prior
+   copy), so the restore or its recovery had finished. Remove exactly the files
+   it prints after `remove`, in that order; the first folder's record comes
+   last because it names the others. If it prints `KEEP`, remove nothing: a
+   listed file holds neither copy, a record cannot be read, the first folder's
+   record is missing or a journal exists. Compare the listed files by hand with
+   the `prior` and `candidate` records (size and sha256) in each record and put
+   back what is needed from a backup before you remove the records.
+6. Run the dry run again. With no record left it ends with
+   `Segment rotation recovery is not pending.` and status 1, the normal answer
+   when nothing is pending. Then start the services; the history service no
+   longer reports a pending activation.
+
+The check judges history only indirectly: the journal is removed only after
+history has reached the generation the decision selects, and the check never
+calls records stale while a journal exists. Lines starting `leftover` name a
+staging or prior copy beside a listed file (`.<name>.restore-<transaction>` or
+`.<name>.previous-<transaction>`); a crash just before a record listed such a
+copy can leave one, and a crash during a record update can leave an unreadable
+`<record>.next-<transaction>`. Neither is live configuration and recovery
+leaves both for review; remove them by hand after step 6.
+
+```python
+# check-restore-records: list the restore records left in the configuration
+# folders and say whether they are stale. It reads only; it changes nothing.
+import json
+import os
+from pathlib import Path
+
+from history_service.segment_catalog import activation_pending_path
+from history_service.segmented_restore import file_matches, tree_matches
+from history_service.system_backup import restore_configuration_folders
+
+PREFIX = ".truenas-jbod-ui-import-seal-"
+journal = activation_pending_path(os.environ.get("HISTORY_SQLITE_PATH", "/app/history/history.db"))
+transactions = {}
+for folder in restore_configuration_folders():
+    if folder.is_dir():
+        for path in sorted(folder.iterdir()):
+            if path.name.startswith(PREFIX):
+                transaction = path.name[len(PREFIX):].split(".next-", 1)[0]
+                transactions.setdefault(transaction, []).append(path)
+if not transactions:
+    print("No restore records found.")
+for transaction, paths in sorted(transactions.items()):
+    records, updates, problems = {}, [], []
+    for path in paths:
+        if ".next-" in path.name:
+            updates.append(path)
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or not isinstance(payload.get("targets"), list):
+                raise ValueError(path)
+            records[path] = payload
+        except (OSError, ValueError):
+            problems.append(f"record {path} cannot be read")
+    anchors = [path for path, payload in records.items() if payload.get("anchor") == payload.get("folder")]
+    decision = records[anchors[0]].get("decision") if len(anchors) == 1 else None
+    print(f"transaction {transaction} decision {decision}")
+    expected = "candidate" if decision == "commit" else "prior"
+    if journal.exists():
+        problems.append(f"the journal {journal} exists")
+    if decision is None:
+        problems.append("the first folder's record is missing or cannot be read")
+    for payload in records.values():
+        for target in payload["targets"]:
+            try:
+                path = Path(target["path"])
+                match = file_matches if target["kind"] == "file" else tree_matches
+                prior = target["prior"]
+                if match(path, target["candidate"]):
+                    state = "candidate"
+                elif match(path, prior) or (prior.get("kind") == "missing" and not os.path.lexists(path)):
+                    state = "prior"
+                else:
+                    state = "neither"
+                print(f"target {path} holds {state}")
+                if state != expected:
+                    problems.append(f"{path} does not hold the {expected} copy")
+                for name in (target["staged_name"], target["previous_name"]):
+                    if os.path.lexists(path.parent / name):
+                        print(f"leftover {path.parent / name}")
+            except (KeyError, TypeError, AttributeError):
+                problems.append("a record lists a file it does not describe")
+    if problems:
+        print("KEEP: " + "; ".join(problems))
+        continue
+    print("STALE: every listed file holds the generation the decision selects")
+    for path in [*updates, *[path for path in records if path not in anchors], *anchors]:
+        print(f"remove {path}")
+```
 
 Schema 1 imports remain supported for hot-only deployments. Schema 2 import
 requires `HISTORY_SEGMENT_CATALOG_PATH` on the target. Multi-gigabyte schema 2

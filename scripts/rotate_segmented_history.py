@@ -15,7 +15,8 @@ PLATFORM_HINT = (
     "--segments-dir /history/segments --recover --apply"
 )
 # Recovery found a restore record it did not settle in a configuration folder
-# the application knows about, and changed nothing (#1196).
+# the application knows about, or a folder past its scan bounds, and changed
+# nothing (#1196).
 INCOMPLETE_EXIT = 3
 
 
@@ -36,8 +37,9 @@ def parse_args() -> argparse.Namespace:
         description="Append or recover one later segmented-history generation.",
         epilog=(
             f"Exit status: {INCOMPLETE_EXIT} when recovery reports "
-            "configuration-recovery-incomplete (it changed nothing), 0 for any other "
-            "printed receipt, 2 for a usage error, 1 for a refusal or any other error."
+            "configuration-recovery-incomplete or recovery-scan-limit-reached (it "
+            "changed nothing), 0 for any other printed receipt, 2 for a usage error, "
+            "1 for a refusal or any other error."
         ),
     )
     parser.add_argument(
@@ -104,43 +106,56 @@ def _history_volume_temporary_files(args: argparse.Namespace):
 def main() -> int:
     args = parse_args()
     recover_pending_rotation, rotate_segmented_history = _load_rotation_api()
-    with _history_volume_temporary_files(args):
-        if args.recover:
-            receipt = recover_pending_rotation(
-                source=args.source,
-                segments_directory=args.segments_dir,
-                apply=args.apply,
-            )
-            from history_service.segmented_restore import CONFIGURATION_RECOVERY_INCOMPLETE
+    if args.recover:
+        # Recovery only reads with SQLite, so it needs no spill directory.
+        # Temporary-file maintenance changes the history volume, so it runs
+        # only after a recovery that completed with --apply: a refusal or an
+        # exit-3 receipt leaves both volumes as they were (#1196).
+        receipt = recover_pending_rotation(
+            source=args.source,
+            segments_directory=args.segments_dir,
+            apply=args.apply,
+        )
+        from history_service.segmented_restore import (
+            CONFIGURATION_RECOVERY_INCOMPLETE,
+            RECOVERY_SCAN_LIMIT_REACHED,
+        )
 
-            if receipt.get("recovery_state") == CONFIGURATION_RECOVERY_INCOMPLETE:
-                print(json.dumps(receipt, sort_keys=True))
-                # Raised inside the temporary-directory context, which then
-                # removes a directory it created, so this run changes nothing.
-                raise SystemExit(INCOMPLETE_EXIT)
-        else:
-            if any(
-                value is None
-                for value in (
-                    args.cutoff,
-                    args.key_id,
-                    args.scheduled_backup_dir,
-                    args.scheduled_backup_status,
-                )
-            ):
-                raise SystemExit(
-                    "--cutoff, --key-id, --scheduled-backup-dir, and "
-                    "--scheduled-backup-status are required unless --recover is used."
-                )
-            receipt = rotate_segmented_history(
-                source=args.source,
-                segments_directory=args.segments_dir,
-                cutoff=args.cutoff,
-                key_id=args.key_id,
-                scheduled_backup_directory=args.scheduled_backup_dir,
-                scheduled_backup_status_path=args.scheduled_backup_status,
-                apply=args.apply,
+        if receipt.get("recovery_state") in {
+            CONFIGURATION_RECOVERY_INCOMPLETE,
+            RECOVERY_SCAN_LIMIT_REACHED,
+        }:
+            print(json.dumps(receipt, sort_keys=True))
+            return INCOMPLETE_EXIT
+        if args.apply:
+            from history_service.sqlite_temp import configure_sqlite_temporary_directory
+
+            configure_sqlite_temporary_directory(args.source.absolute().parent)
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    with _history_volume_temporary_files(args):
+        if any(
+            value is None
+            for value in (
+                args.cutoff,
+                args.key_id,
+                args.scheduled_backup_dir,
+                args.scheduled_backup_status,
             )
+        ):
+            raise SystemExit(
+                "--cutoff, --key-id, --scheduled-backup-dir, and "
+                "--scheduled-backup-status are required unless --recover is used."
+            )
+        receipt = rotate_segmented_history(
+            source=args.source,
+            segments_directory=args.segments_dir,
+            cutoff=args.cutoff,
+            key_id=args.key_id,
+            scheduled_backup_directory=args.scheduled_backup_dir,
+            scheduled_backup_status_path=args.scheduled_backup_status,
+            apply=args.apply,
+        )
     print(json.dumps(receipt, sort_keys=True))
     return 0
 

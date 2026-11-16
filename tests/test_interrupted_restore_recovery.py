@@ -9,9 +9,11 @@ temporary directory.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -27,17 +29,22 @@ from typing import Any, Callable
 from unittest.mock import patch
 
 from app.config import Settings
-from history_service import segment_migration
+from history_service import segment_catalog, segment_migration, segment_rotation
 from history_service.config import HistorySettings
 from history_service.segment_catalog import activation_pending_path
+from history_service.segment_reader import HistoryStorageUnavailableError, SegmentedHistoryReader
 from history_service.segment_rotation import recover_pending_rotation
 from history_service.segmented_restore import (
     IMPORT_SEAL_PURPOSE,
+    configuration_recovery_incomplete,
+    file_matches,
     import_seal_path,
     read_activation_journal,
+    tree_matches,
     write_restore_journal,
 )
 from history_service.segmented_restore import record_file as record_restore_file
+from history_service.segmented_restore import record_tree as record_restore_tree
 from history_service.store import SCHEMA, HistoryStore
 from history_service.system_backup import (
     HISTORY_DB_KEY,
@@ -339,10 +346,17 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
     def _config_path(target: _Deployment) -> str:
         return str(target.runtime.parent / "config.yaml")
 
-    def _recover(self, target: _Deployment, *, apply: bool = True) -> dict[str, Any]:
+    def _recover(
+        self,
+        target: _Deployment,
+        *,
+        apply: bool = True,
+        environment: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         # Recovery finds the configuration folders from the application's own
         # settings, as the admin service would, never from the history volume.
-        with patch.dict(os.environ, {"APP_CONFIG_PATH": self._config_path(target)}):
+        values = {"APP_CONFIG_PATH": self._config_path(target), **(environment or {})}
+        with patch.dict(os.environ, values):
             return recover_pending_rotation(
                 source=target.hot,
                 segments_directory=target.segments,
@@ -354,13 +368,23 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
         target: _Deployment,
         *,
         apply: bool,
-    ) -> tuple[int, dict[str, Any] | None, str]:
-        """Run the documented recovery command; return exit code, receipt, stderr."""
-        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment_overrides: dict[str, str] | None = None,
+        raw: bool = False,
+    ) -> tuple[int, Any, str]:
+        """Run the documented recovery command; return exit code, receipt, stderr.
+
+        With ``raw`` the receipt slot carries the unparsed standard output.
+        """
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONPATH", "APP_SERVICE_ROLE"}
+        }
         environment.update(
             PYTHONDONTWRITEBYTECODE="1",
             APP_CONFIG_PATH=self._config_path(target),
         )
+        environment.update(environment_overrides or {})
         command = [
             sys.executable,
             str(RECOVERY_COMMAND),
@@ -382,6 +406,8 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             timeout=120,
             check=False,
         )
+        if raw:
+            return completed.returncode, completed.stdout, completed.stderr
         receipt = json.loads(completed.stdout) if completed.stdout.strip() else None
         return completed.returncode, receipt, completed.stderr
 
@@ -559,10 +585,25 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             self.assertEqual(exit_code, CRASH_EXIT, f"rename {crash_after}")
             with self.subTest(crash_after_rename=crash_after):
                 if not activation_pending_path(target.hot).exists():
-                    # The journal was already retired: the import finished
-                    # its last durable step and there is nothing to recover.
+                    # The journal was already retired, so both sides hold the
+                    # committed generation. Records still left in the folders
+                    # are stale: the command reports them and changes nothing
+                    # until they are cleaned up by hand; with none left, the
+                    # usual refusal says nothing is pending.
                     self.assertEqual(self._config_generation(target), "candidate")
                     self.assertEqual(self._history_generation(target), "candidate")
+                    before = _tree_snapshot(target.root)
+                    exit_code, receipt, stderr = self._recover_with_command(target, apply=True)
+                    if self._record_folders(target):
+                        self.assertEqual(
+                            (exit_code, (receipt or {}).get("recovery_state")),
+                            (INCOMPLETE_EXIT, INCOMPLETE_STATE),
+                            stderr[-400:],
+                        )
+                    else:
+                        self.assertEqual((exit_code, receipt), (1, None))
+                        self.assertIn("Segment rotation recovery is not pending.", stderr)
+                    self.assertEqual(_tree_snapshot(target.root), before)
                     outcomes[crash_after] = "candidate"
                     continue
                 result = self._recover(target)
@@ -1267,11 +1308,14 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
 
     @staticmethod
     def _record_folders(target: _Deployment) -> list[str]:
+        # A record that a crash left inside a private retirement folder is
+        # already out of its configuration folder; recovery does not see it.
         return sorted(
             {
                 str(path.parent)
                 for path in target.root.rglob(".truenas-jbod-ui-import-seal-*")
                 if ".next-" not in path.name
+                and not path.parent.name.startswith(".segmented-restore-retired-")
             }
         )
 
@@ -1394,6 +1438,601 @@ class InterruptedRestoreRecoveryTests(unittest.TestCase):
             self._assert_one_generation(target, result, label="control"),
             "prior",
         )
+
+    # Inputs read from the history volume -----------------------------------
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
+    def test_catalog_swapped_for_a_fifo_after_its_check_does_not_block_recovery(self) -> None:
+        target = self._target()
+        exit_code = self._import_in_child(
+            target,
+            lambda: [
+                patch.object(_ImportActivationTransaction, "_finalize_commit", self._hard_exit)
+            ],
+        )
+        self.assertEqual(exit_code, CRASH_EXIT)
+        catalog = target.segments / "catalog.json"
+        parked = target.root / "catalog.parked"
+        original_check = SegmentedHistoryReader._require_regular_file
+
+        def check_then_swap(path: Path, *, label: str) -> Path:
+            checked = original_check(path, label=label)
+            if label == "segment catalog" and not parked.exists():
+                # The catalog passed its type check; a writer of the history
+                # volume now puts a FIFO with no writer in its place.
+                os.replace(path, parked)
+                os.mkfifo(path, 0o600)
+            return checked
+
+        def recover_with_swap(apply: bool) -> dict[str, Any]:
+            with patch.object(
+                SegmentedHistoryReader, "_require_regular_file", staticmethod(check_then_swap)
+            ):
+                return self._recover(target, apply=apply)
+
+        journal_before = activation_pending_path(target.hot).read_bytes()
+        def put_the_catalog_back() -> None:
+            if parked.exists():
+                catalog.unlink()
+                os.replace(parked, catalog)
+
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                try:
+                    outcome = self._run_in_bounded_child(
+                        lambda apply=apply: recover_with_swap(apply)
+                    )
+                finally:
+                    put_the_catalog_back()
+                self.assertIn("error", outcome, outcome)
+                self.assertEqual(
+                    outcome["error"],
+                    "Segmented restore candidate generation integrity check failed.",
+                )
+                self.assertEqual(activation_pending_path(target.hot).read_bytes(), journal_before)
+                self.assertEqual(self._config_generation(target), "candidate")
+
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="catalog control"),
+            "candidate",
+        )
+
+    def test_catalog_is_read_once_with_a_size_bound(self) -> None:
+        hot, segments = _create_history(Path(self._directory.name) / "history", "catalog")
+        catalog = segments / "catalog.json"
+        # Control: the published catalog of an ordinary deployment reads.
+        reader = SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+        self.assertEqual(reader.catalog_payload()["catalog_version"], 1)
+        with self.subTest(bound="size"):
+            with patch.object(segment_catalog, "MAX_CATALOG_BYTES", 16, create=True):
+                with self.assertRaises(HistoryStorageUnavailableError) as refused:
+                    SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+            self.assertEqual(str(refused.exception), "Segmented history catalog is invalid.")
+        with self.subTest(bound="single link"):
+            alias = segments.parent / "catalog-alias.json"
+            os.link(catalog, alias)
+            try:
+                with self.assertRaises(HistoryStorageUnavailableError) as refused:
+                    SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+                self.assertEqual(str(refused.exception), "Segmented history catalog is invalid.")
+            finally:
+                alias.unlink()
+        # Control again, after the alias is gone.
+        SegmentedHistoryReader.from_catalog(hot_path=hot, catalog_path=catalog)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
+    def test_rollback_swapped_for_a_fifo_after_its_check_does_not_block_rotation_recovery(
+        self,
+    ) -> None:
+        root = Path(self._directory.name)
+        source = root / "history.db"
+        source.write_bytes(b"candidate hot database")
+        source.chmod(0o600)
+        rollback = root / ".history.db.generation-0002.rollback.sqlite3"
+        rollback.write_bytes(b"prior hot database")
+        rollback.chmod(0o600)
+        rollback_record = segment_rotation._record_file(rollback)
+        original_check = segment_rotation._require_file_matches
+        parked = root / "rollback.parked"
+
+        def check_then_swap(path: Path, record: Any, *, label: str) -> None:
+            original_check(path, record, label=label)
+            if label == "prior hot rollback" and not parked.exists():
+                os.replace(path, parked)
+                os.mkfifo(path, 0o600)
+
+        def restore_with_swap() -> None:
+            with patch.object(segment_rotation, "_require_file_matches", check_then_swap):
+                segment_rotation._restore_hot(source, rollback_record, mode=0o600)
+
+        outcome = self._run_in_bounded_child(restore_with_swap)
+        self.assertIn("error", outcome, outcome)
+        self.assertEqual(source.read_bytes(), b"candidate hot database")
+        self.assertEqual(sorted(path.name for path in root.iterdir()), sorted(
+            [source.name, rollback.name, parked.name]
+        ))
+
+        # Control: the authenticated rollback copy restores the prior bytes.
+        rollback.unlink()
+        os.replace(parked, rollback)
+        segment_rotation._restore_hot(source, rollback_record, mode=0o600)
+        self.assertEqual(source.read_bytes(), b"prior hot database")
+
+    def test_tree_comparison_stops_after_the_recorded_number_of_entries(self) -> None:
+        root = Path(self._directory.name) / "tree"
+        root.mkdir()
+        (root / "only.pem").write_bytes(b"recorded\n")
+        record = record_restore_tree(root)
+        self.assertTrue(tree_matches(root, record))
+        for index in range(2000):
+            (root / f"extra-{index:04d}").write_bytes(b"")
+        original_stat = os.stat
+        calls = 0
+
+        def counting_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+            nonlocal calls
+            calls += 1
+            return original_stat(*args, **kwargs)
+
+        with patch("os.stat", counting_stat):
+            matched = tree_matches(root, record)
+        self.assertFalse(matched)
+        self.assertLess(calls, 50, "the comparison examined every extra entry")
+
+    def test_file_comparison_reads_nothing_when_the_size_differs(self) -> None:
+        path = Path(self._directory.name) / "large.sqlite3"
+        path.write_bytes(b"recorded")
+        path.chmod(0o600)
+        restore_record = record_restore_file(path)
+        rotation_record = segment_rotation._record_file(path)
+        with path.open("r+b") as stream:
+            stream.truncate(64 * 1024 * 1024)
+        original_read = os.read
+        reads = 0
+
+        def counting_read(*args: Any, **kwargs: Any) -> bytes:
+            nonlocal reads
+            reads += 1
+            return original_read(*args, **kwargs)
+
+        with patch("os.read", counting_read):
+            self.assertFalse(file_matches(path, restore_record))
+            self.assertFalse(segment_rotation._file_matches(path, rotation_record))
+        self.assertEqual(reads, 0)
+        # Control: a file of the recorded size is read and compared.
+        path.write_bytes(b"recorded")
+        self.assertTrue(segment_rotation._file_matches(path, rotation_record))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_configuration_folder_scan_is_bounded_and_changes_nothing(self) -> None:
+        target = self._target()
+        self._crash_before_history(target)
+        data = target.mapping.parent
+        for case in ("matching names", "entries"):
+            with self.subTest(case=case):
+                created: list[Path] = []
+                if case == "matching names":
+                    # More restore-record names than a settings folder can
+                    # really hold: the matches kept are bounded.
+                    for index in range(1001):
+                        path = data / f".truenas-jbod-ui-import-seal-planted{index:04d}"
+                        path.write_bytes(b"")
+                        created.append(path)
+                    entry_limit = None
+                else:
+                    for index in range(60):
+                        path = data / f"ordinary-{index:02d}"
+                        path.write_bytes(b"")
+                        created.append(path)
+                    entry_limit = 50
+                before = _tree_snapshot(target.root)
+                try:
+                    for apply in (False, True):
+                        limit = (
+                            patch.object(
+                                segment_catalog,
+                                "MAX_RECOVERY_SCAN_ENTRIES",
+                                entry_limit,
+                                create=True,
+                            )
+                            if entry_limit is not None
+                            else contextlib.nullcontext()
+                        )
+                        with limit:
+                            result = self._recover(target, apply=apply)
+                        self.assertEqual(result["recovery_state"], "recovery-scan-limit-reached")
+                        self.assertEqual(result["folder_role"], "configuration folder")
+                        self.assertIn("configuration folder", result["message"])
+                        self.assertIn(str(result["entries_examined"]), result["message"])
+                        self.assertNotIn(str(data), json.dumps(result))
+                        self.assertEqual(_tree_snapshot(target.root), before)
+                    if case == "matching names":
+                        code, receipt, stderr = self._recover_with_command(target, apply=True)
+                        self.assertEqual(code, INCOMPLETE_EXIT, stderr[-400:])
+                        self.assertEqual(receipt["recovery_state"], "recovery-scan-limit-reached")
+                        self.assertEqual(_tree_snapshot(target.root), before)
+                finally:
+                    for path in created:
+                        path.unlink()
+        result = self._recover(target)
+        self.assertEqual(
+            self._assert_one_generation(target, result, label="scan control"),
+            "prior",
+        )
+
+    def test_segment_temporary_refusal_prints_ten_names_and_the_count(self) -> None:
+        target = self._target()
+        names = [f".segment-{index:02d}.sqlite3" for index in range(25)]
+        # Sorts first, so it is among the ten names printed.
+        hostile = ".segment-\x1b[31m\nbad.sqlite3"
+        for name in [*names, hostile]:
+            (target.segments / name).write_bytes(b"unauthenticated")
+        before = _tree_snapshot(target.root)
+        with self.assertRaises(ValueError) as refused:
+            self._recover(target, apply=True)
+        message = str(refused.exception)
+        self.assertIn("26", message)
+        self.assertEqual(message.count('".segment-'), 9, message)
+        self.assertEqual(message.count('"'), 20, message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertLess(len(message), 1000)
+        self.assertEqual(_tree_snapshot(target.root), before)
+
+        # Far more names than any real folder holds: a bounded receipt, exit 3.
+        for index in range(25, 1101):
+            (target.segments / f".segment-{index:04d}.sqlite3").write_bytes(b"")
+        before = _tree_snapshot(target.root)
+        code, stdout, stderr = self._recover_with_command(target, apply=True, raw=True)
+        self.assertEqual(code, INCOMPLETE_EXIT, stderr[-400:])
+        self.assertLess(len(stdout) + len(stderr), 4096)
+        receipt = json.loads(stdout)
+        self.assertEqual(receipt["recovery_state"], "recovery-scan-limit-reached")
+        self.assertEqual(receipt["folder_role"], "segments folder")
+        self.assertEqual(_tree_snapshot(target.root), before)
+
+    def test_incomplete_receipt_prints_ten_folders_and_the_count(self) -> None:
+        found = [
+            {"folder": f"/srv/config-{index:02d}", "device": 1, "inode": index + 2, "unreadable": False}
+            for index in range(14)
+        ]
+        found.append({"folder": "/srv/bad\nfolder\x1b[0m", "device": 1, "inode": 99, "unreadable": False})
+        receipt = configuration_recovery_incomplete(found, apply=False)
+        self.assertEqual(len(receipt["folders"]), 10)
+        self.assertEqual(receipt["folder_count"], 15)
+        encoded = json.dumps(receipt)
+        self.assertNotIn("\\n", encoded)
+        self.assertNotIn("\\u001b", encoded)
+
+    # What the operator is told ----------------------------------------------
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_history_container_success_says_configuration_was_not_checked(self) -> None:
+        target = self._target()
+        self._crash_mid_configuration(target)
+        self._edit_journal(target, "version 1", decision="pending")
+        # The history container has the image's own empty configuration
+        # folders, not the configuration volume.
+        image_config = target.root / "image" / "config"
+        image_config.mkdir(parents=True)
+        (target.root / "image" / "data").mkdir()
+        history_container = {
+            "APP_SERVICE_ROLE": "history",
+            "APP_CONFIG_PATH": str(image_config / "config.yaml"),
+        }
+        for apply in (False, True):
+            code, receipt, stderr = self._recover_with_command(
+                target, apply=apply, environment_overrides=history_container
+            )
+            self.assertEqual(code, 0, stderr[-400:])
+            self.assertIs(receipt["configuration_folders_checked"], False)
+            self.assertIn("not checked", receipt["message"])
+            self.assertIn("enclosure-admin", receipt["message"])
+            self.assertIn("--recover", receipt["message"])
+        # Where the configuration volume is mounted, the records left by the
+        # interrupted import are found and nothing changes.
+        before = _tree_snapshot(target.root)
+        code, receipt, stderr = self._recover_with_command(
+            target, apply=True, environment_overrides={"APP_SERVICE_ROLE": "admin"}
+        )
+        self.assertEqual((code, receipt["recovery_state"]), (INCOMPLETE_EXIT, INCOMPLETE_STATE))
+        self.assertEqual(_tree_snapshot(target.root), before)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_admin_success_receipt_is_unchanged(self) -> None:
+        target = self._target()
+        self._crash_before_history(target)
+        code, receipt, stderr = self._recover_with_command(
+            target, apply=True, environment_overrides={"APP_SERVICE_ROLE": "admin"}
+        )
+        self.assertEqual(code, 0, stderr[-400:])
+        self.assertEqual(set(receipt), {"apply", "phase", "recovery_state"})
+        self._assert_one_generation(target, receipt, label="admin control")
+
+    def test_startup_message_names_the_admin_service_for_an_interrupted_restore(self) -> None:
+        hot, segments = _create_history(Path(self._directory.name) / "history", "startup")
+        marker = activation_pending_path(hot)
+        marker.write_text("{}", encoding="utf-8")
+        with self.assertLogs("history_service.store", level="ERROR"):
+            with self.assertRaises(sqlite3.OperationalError) as refused:
+                HistoryStore(
+                    str(hot),
+                    recover_unreadable_database=False,
+                    segment_catalog_path=segments / "catalog.json",
+                )
+        message = str(refused.exception)
+        self.assertIn("enclosure-history scripts/rotate_segmented_history.py", message)
+        self.assertIn("enclosure-admin", message)
+        self.assertIn("restore", message)
+
+    def test_unreadable_folder_is_reported_as_unread_not_as_holding_records(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root can list a folder without read permission")
+        target = self._target()
+        data = target.mapping.parent
+        data.chmod(0)
+        self.addCleanup(data.chmod, 0o755)
+        for apply in (False, True):
+            result = self._recover(target, apply=apply)
+            self.assertEqual(result["recovery_state"], INCOMPLETE_STATE)
+            self.assertEqual(result["folders"], [])
+            self.assertEqual(result["unreadable_folders"], [str(data)])
+            self.assertIn("could not be read", result["message"])
+            self.assertIn("chmod", result["message"])
+            self.assertNotIn("hold restore records", result["message"])
+        data.chmod(0o755)
+        # Control: once readable, the ordinary answer for nothing pending.
+        with self.assertRaises(ValueError) as refused:
+            self._recover(target, apply=True)
+        self.assertEqual(str(refused.exception), "Segment rotation recovery is not pending.")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_refused_recovery_leaves_temporary_folder_and_permissions_as_found(self) -> None:
+        def prepare(target: _Deployment, *, segments_mode: bool = True) -> tuple[Path, Path]:
+            temporary = target.hot.parent / ".sqlite-tmp"
+            temporary.mkdir(mode=0o750)
+            temporary.chmod(0o750)
+            stale = temporary / "etilqs_stale"
+            stale.write_bytes(b"left by an earlier run")
+            if segments_mode:
+                target.segments.chmod(0o755)
+            return temporary, stale
+
+        for case in ("not pending", "incomplete"):
+            with self.subTest(case=case):
+                target = self._target(f"target-{case.replace(' ', '-')}")
+                if case == "incomplete":
+                    self._crash_mid_configuration(target)
+                    self._edit_journal(target, "version 1", decision="pending")
+                temporary, stale = prepare(target)
+                code, _, stderr = self._recover_with_command(target, apply=True)
+                self.assertEqual(code, 1 if case == "not pending" else INCOMPLETE_EXIT, stderr[-400:])
+                self.assertTrue(stale.exists(), "temporary-file maintenance ran before a refusal")
+                self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o750)
+                self.assertEqual(stat.S_IMODE(target.segments.stat().st_mode), 0o755)
+
+        # Control: maintenance still runs after a recovery that completed.
+        target = self._target("target-completed")
+        self._crash_before_history(target)
+        # The segment tree's mode is part of its record, so it stays as is.
+        temporary, stale = prepare(target, segments_mode=False)
+        code, receipt, stderr = self._recover_with_command(target, apply=True)
+        self.assertEqual(code, 0, stderr[-400:])
+        self._assert_one_generation(target, receipt, label="maintenance control")
+        self.assertFalse(stale.exists())
+        self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+
+    # The documented clean-up of stale records ----------------------------------
+
+    @staticmethod
+    def _documented_record_check() -> str:
+        guide = (REPOSITORY / "docs" / "SEGMENTED_HISTORY_V2.md").read_text(encoding="utf-8")
+        blocks = [
+            block
+            for block in re.findall(r"```python\n(.*?)\n```", guide, re.DOTALL)
+            if "check-restore-records" in block
+        ]
+        if len(blocks) != 1:
+            raise AssertionError("the guide does not carry exactly one restore-record check")
+        return blocks[0]
+
+    def _run_record_check(self, target: _Deployment) -> list[str]:
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONPATH", "APP_SERVICE_ROLE"}
+        }
+        environment.update(
+            PYTHONDONTWRITEBYTECODE="1",
+            APP_CONFIG_PATH=self._config_path(target),
+            HISTORY_SQLITE_PATH=str(target.hot),
+        )
+        completed = subprocess.run(
+            [sys.executable, "-"],
+            input=self._documented_record_check(),
+            cwd=REPOSITORY,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-400:])
+        return completed.stdout.splitlines()
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_documented_clean_up_settles_records_left_after_the_journal(self) -> None:
+        for case in ("stale", "changed since"):
+            with self.subTest(case=case):
+                target = self._target(f"target-{case.replace(' ', '-')}")
+                exit_code = self._import_in_child(
+                    target,
+                    lambda: [
+                        patch.object(
+                            _ImportActivationTransaction, "remove_import_seals", self._hard_exit
+                        )
+                    ],
+                )
+                self.assertEqual(exit_code, CRASH_EXIT)
+                self.assertFalse(activation_pending_path(target.hot).exists())
+                self.assertEqual(self._config_generation(target), "candidate")
+                self.assertEqual(self._history_generation(target), "candidate")
+                code, receipt, stderr = self._recover_with_command(target, apply=False)
+                self.assertEqual((code, receipt["recovery_state"]), (INCOMPLETE_EXIT, INCOMPLETE_STATE))
+                if case == "changed since":
+                    target.runtime.write_bytes(b"app: {edited: true}\n")
+                before = _tree_snapshot(target.root)
+                lines = self._run_record_check(target)
+                self.assertEqual(_tree_snapshot(target.root), before)
+                removals = [line.split(" ", 1)[1] for line in lines if line.startswith("remove ")]
+                if case == "changed since":
+                    self.assertIn("KEEP", "\n".join(lines))
+                    self.assertEqual(removals, [])
+                    continue
+                self.assertIn("STALE", "\n".join(lines))
+                self.assertEqual(
+                    sorted(str(Path(path).parent) for path in removals),
+                    sorted(
+                        str(path.parent)
+                        for path in target.root.rglob(".truenas-jbod-ui-import-seal-*")
+                    ),
+                )
+                # The first folder's record names the others, so it is last.
+                self.assertEqual(Path(removals[-1]).parent, target.runtime.parent)
+                for path in removals:
+                    Path(path).unlink()
+                code, receipt, stderr = self._recover_with_command(target, apply=False)
+                self.assertEqual((code, receipt), (1, None))
+                self.assertIn("Segment rotation recovery is not pending.", stderr)
+                self.assertEqual(self._config_generation(target), "candidate")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_process_loss_after_every_fsync_converges_or_changes_nothing(self) -> None:
+        # Every durable write of the import (stages, journal and record
+        # creation, rewrites and the directory syncs between them): recovery
+        # either reports one generation, or refuses and changes nothing.
+        outcomes: dict[int, tuple[int, str | None]] = {}
+        crash_after = 0
+        while True:
+            crash_after += 1
+            self.assertLess(crash_after, 200, "the import never finished")
+            target = self._target(f"target-fsync-{crash_after:03d}")
+
+            def install_fault(limit: int = crash_after) -> list[Any]:
+                original_fsync = os.fsync
+                count = 0
+
+                def fsync_then_maybe_exit(*args: Any, **kwargs: Any) -> None:
+                    nonlocal count
+                    original_fsync(*args, **kwargs)
+                    count += 1
+                    if count == limit:
+                        os._exit(CRASH_EXIT)
+
+                return [patch("os.fsync", fsync_then_maybe_exit)]
+
+            exit_code = self._import_in_child(target, install_fault)
+            if exit_code == FINISHED_EXIT:
+                self.assertEqual(self._config_generation(target), "candidate")
+                break
+            self.assertEqual(exit_code, CRASH_EXIT, f"fsync {crash_after}")
+            with self.subTest(crash_after_fsync=crash_after):
+                before = _tree_snapshot(target.root)
+                # In process for speed; the command maps these outcomes to
+                # exit status 0, 3 and 1 (see the command tests above).
+                try:
+                    receipt: dict[str, Any] | None = self._recover(target, apply=True)
+                    state = receipt["recovery_state"]
+                    code = INCOMPLETE_EXIT if state == INCOMPLETE_STATE else 0
+                    stderr = ""
+                except ValueError as exc:
+                    receipt, state, code, stderr = None, None, 1, str(exc)
+                outcomes[crash_after] = (code, state)
+                if code == 0:
+                    side = self._config_generation(target)
+                    self.assertEqual(side, self._history_generation(target))
+                    self.assertEqual(
+                        state,
+                        {"prior": "prior-generation-restored", "candidate": "candidate-finalized"}[side],
+                    )
+                    self.assertFalse(activation_pending_path(target.hot).exists())
+                    # A crash just before a record lists a staged copy, or
+                    # during a record update, can leave that copy or the torn
+                    # update; neither is live, and the guide says to remove
+                    # them by hand. Nothing else may be left.
+                    leftovers = self._leftover_restore_artifacts(target)
+                    self.assertTrue(
+                        all(
+                            not name.startswith("history/")
+                            and (".restore-" in name or ".next-" in name)
+                            for name in leftovers
+                        ),
+                        leftovers,
+                    )
+                else:
+                    self.assertIn(code, {1, INCOMPLETE_EXIT}, stderr[-400:])
+                    self.assertEqual(_tree_snapshot(target.root), before)
+        self.assertIn(0, {code for code, _ in outcomes.values()})
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs fork to model process loss")
+    def test_process_loss_during_recovery_converges_or_reports_the_stale_records(self) -> None:
+        crash_after = 0
+        while True:
+            crash_after += 1
+            self.assertLess(crash_after, 40, "recovery never finished")
+            target = self._target(f"target-recovery-{crash_after:02d}")
+            self._crash_before_history(target)
+
+            def recover_then_maybe_exit(limit: int = crash_after) -> dict[str, Any]:
+                original_replace = os.replace
+                count = 0
+
+                def replace_then_maybe_exit(*args: Any, **kwargs: Any) -> None:
+                    nonlocal count
+                    original_replace(*args, **kwargs)
+                    count += 1
+                    if count == limit:
+                        os._exit(CRASH_EXIT)
+
+                with patch("os.replace", replace_then_maybe_exit):
+                    return self._recover(target, apply=True)
+
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - runs only in the child
+                code = UNEXPECTED_EXIT
+                try:
+                    recover_then_maybe_exit()
+                    code = FINISHED_EXIT
+                finally:
+                    os._exit(code)
+            _, status = os.waitpid(pid, 0)
+            exit_code = os.waitstatus_to_exitcode(status)
+            if exit_code == FINISHED_EXIT:
+                self.assertEqual(self._config_generation(target), "prior")
+                break
+            self.assertEqual(exit_code, CRASH_EXIT, f"recovery rename {crash_after}")
+            with self.subTest(crash_after_recovery_rename=crash_after):
+                if activation_pending_path(target.hot).exists():
+                    result = self._recover(target)
+                    self.assertEqual(
+                        self._assert_one_generation(
+                            target, result, label=f"recovery rename {crash_after}"
+                        ),
+                        "prior",
+                    )
+                    continue
+                # The journal is gone: history and configuration already agree
+                # and the records left behind are reported, not acted on.
+                self.assertEqual(self._config_generation(target), "prior")
+                self.assertEqual(self._history_generation(target), "prior")
+                code, receipt, stderr = self._recover_with_command(target, apply=True)
+                if self._record_folders(target):
+                    self.assertEqual(
+                        (code, receipt["recovery_state"]), (INCOMPLETE_EXIT, INCOMPLETE_STATE)
+                    )
+                else:
+                    self.assertEqual((code, receipt), (1, None), stderr[-400:])
 
 
 if __name__ == "__main__":
