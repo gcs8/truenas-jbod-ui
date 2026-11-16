@@ -1069,7 +1069,7 @@ test("an ok: false answer that is not a clean-up result is still a failed reques
     "no result": { ok: false, detail: "synthetic refusal" },
     "a result list that is not a list": { ok: false, deleted: "cfg-old" },
     "a named state beside a result": { ok: false, state: "cleanup_state_unknown", deleted: [] },
-    // One list is not the result: every list and the failed entry must be there and well formed.
+    // One list is not the result: every list must be there and well formed, and so must a failed entry when one is given.
     "only the deleted list": { ok: false, deleted: [] },
     "a deleted entry that is not an id": { ...EMPTY_RESULT, ok: false, deleted: [null] },
     "a missing list": { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [] },

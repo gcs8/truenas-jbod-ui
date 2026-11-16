@@ -58,8 +58,11 @@
     + "and deleted nothing. Open Clean up again after it finishes.";
   // The admin service never reached the scheduler, so nothing was sent.
   const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
-  // The whole result the admin apply route forwards (its own check, in step):
-  // five lists of ids and a failed entry that is null or names an id and an error.
+  // A whole result, by the lists and failed entry the admin apply route checks
+  // before forwarding one: five lists of ids, and failed absent, null, or naming
+  // an id and an error. Two differences from the route: an answer naming a state
+  // is never a result here (the route does not look at state), and ok is not
+  // checked here (the transport has already settled it as false).
   const CLEANUP_RESULT_LISTS = ["deleted", "already_missing", "not_attempted", "downgraded", "kept_after_replan"];
   function isCleanupResult(value) {
     const failed = value?.failed;
