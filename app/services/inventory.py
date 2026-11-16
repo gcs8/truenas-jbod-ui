@@ -56,6 +56,7 @@ from app.models.domain import (
     SourceStatus,
     SystemOption,
     SystemLocatorStatusView,
+    slot_occupancy,
 )
 from app.metrics import (
     observe_inventory_background_snapshot_refresh,
@@ -84,6 +85,8 @@ from app.services.mapping_store import (
     MappingRevisionConflict,
     MappingSlotDiskChanged,
     MappingSlotDiskChangedBeforeClear,
+    MappingSlotDiskUnverifiable,
+    MappingSlotDiskUnverifiableBeforeClear,
     MappingStore,
     bind_mapping_revision,
     resolve_physical_mapping_scope,
@@ -1141,8 +1144,10 @@ class _ManualOnlyStorageViewSlots:
             "slot_size": slot_size,
         }
         if mapping is None:
+            # No saved assignment and no live bay behind it: nothing says
+            # whether this bay holds a disk (#1218).
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state="unknown", source="placeholder",
+                **common, occupied=False, presence_known=False, state="unknown", source="placeholder",
                 placement_key="assigned by hand only",
             )
         live = next(
@@ -1156,7 +1161,8 @@ class _ManualOnlyStorageViewSlots:
         )
         if live is None:
             return StorageViewRuntimeSlot(
-                **common, occupied=False, state=SlotState.unmapped.value, source="manual_mapping",
+                **common, occupied=False, presence_known=False, state=SlotState.unmapped.value,
+                source="manual_mapping",
                 match_reasons=["saved bay assignment"], placement_key="saved bay assignment",
                 device_name=mapping.device_name, serial=mapping.serial, gptid=mapping.gptid,
                 description=mapping.notes,
@@ -3874,7 +3880,9 @@ class InventoryService:
                             known_snapshots[option.id] = snapshot
                         if not inputs_are_current():
                             return fallback_order("current correlation inputs are unavailable")
-                        enclosure_counts.append((option.id, sum(1 for slot in snapshot.slots if slot.present)))
+                        enclosure_counts.append(
+                            (option.id, sum(1 for slot in snapshot.slots if slot_occupancy(slot) == "present"))
+                        )
 
                     order = effective_main_view_order(
                         enclosure_counts=enclosure_counts,
@@ -4208,7 +4216,7 @@ class InventoryService:
             if not in_pair(view_node):
                 continue
             for runtime_slot in view.slots:
-                if runtime_slot.occupied:
+                if slot_occupancy(runtime_slot) == "present":
                     rendered.setdefault(
                         (f"storage-view:{view.id}", runtime_slot.slot_index), (runtime_slot, view_node),
                     )
@@ -4428,8 +4436,9 @@ class InventoryService:
     def _storage_view_runtime_slot_state(
         cls, runtime_slot: StorageViewRuntimeSlot, *, include_identify: bool = True,
     ) -> SlotState:
-        if not runtime_slot.occupied:
-            return SlotState.empty
+        occupancy = slot_occupancy(runtime_slot)
+        if occupancy != "present":
+            return SlotState.empty if occupancy == "empty" else SlotState.unknown
         if include_identify and runtime_slot.state == SlotState.identify.value:
             return SlotState.identify
         if runtime_slot.state == SlotState.fault.value or cls._health_is_bad(runtime_slot.health):
@@ -4465,7 +4474,8 @@ class InventoryService:
             enclosure_id=f"storage-view:{runtime_view.id}",
             enclosure_label=runtime_view.label,
             enclosure_name=runtime_view.label,
-            present=runtime_slot.occupied,
+            present=slot_occupancy(runtime_slot) == "present",
+            presence_known=slot_occupancy(runtime_slot) != "unknown",
             state=self._storage_view_runtime_slot_state(runtime_slot),
             non_identify_state=self._storage_view_runtime_slot_state(runtime_slot, include_identify=False).value,
             device_name=runtime_slot.device_name,
@@ -4567,7 +4577,9 @@ class InventoryService:
                 mappings[slot_value] = mapping
         live_slots_by_key: dict[str, SlotView] = {}
         for live_slot in snapshot.slots:
-            if live_slot.identity_state == "unknown":
+            # Only a bay read as holding a disk can stand for a saved identity:
+            # an unread or empty row naming it is no live disk (#1218).
+            if live_slot.identity_state == "unknown" or slot_occupancy(live_slot) != "present":
                 continue
             for value in (live_slot.serial, live_slot.gptid, live_slot.device_name):
                 for key in normalize_lookup_keys(value):
@@ -4604,12 +4616,20 @@ class InventoryService:
                 if slot
                 else storage_view_slot_label(storage_view, slot_value, selected_profile=storage_view_profile)
             )
+            # A layout bay the backing snapshot has no row for was not read: the
+            # snapshot lists the live layout's bays, so this one is unknown, not
+            # empty (#1218).
+            occupancy = slot_occupancy(slot)
             runtime_slots.append(
                 StorageViewRuntimeSlot(
                     slot_index=slot_value,
                     slot_label=label,
-                    occupied=bool(slot and slot.present),
-                    state=(slot.state.value if slot and isinstance(slot.state, SlotState) else str(slot.state) if slot else "empty"),
+                    occupied=occupancy == "present",
+                    presence_known=occupancy != "unknown",
+                    state=(
+                        slot.state.value if slot and isinstance(slot.state, SlotState)
+                        else str(slot.state) if slot else SlotState.unknown.value
+                    ),
                     source="snapshot_slot",
                     match_reasons=["selected enclosure snapshot"],
                     placement_key="live enclosure slot",
@@ -4685,7 +4705,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=visible_slot_count,
             slots=runtime_slots,
         )
@@ -4766,7 +4786,7 @@ class InventoryService:
             backing_enclosure_id=snapshot.selected_enclosure_id,
             backing_enclosure_label=snapshot.selected_enclosure_label,
             notes=notes,
-            matched_count=sum(1 for slot in runtime_slots if slot.occupied),
+            matched_count=sum(1 for slot in runtime_slots if slot_occupancy(slot) == "present"),
             slot_count=len(visible_slots),
             slots=runtime_slots,
         )
@@ -7575,11 +7595,15 @@ class InventoryService:
         logical unit id, then persistent id), the same set that decides whether
         an occupied bay's disk is known. An empty or missing bay binds as empty;
         an occupied bay without a strong identifier binds as unknown, so a swap
-        between two such disks cannot be told apart. The reusable device name
-        and the bay's SAS address are not part of it.
+        between two such disks cannot be told apart. A bay whose occupancy was
+        not read binds as unread, never as empty (#1218). The reusable device
+        name and the bay's SAS address are not part of it.
         """
-        if slot_view is None or not slot_view.present or slot_view.state == SlotState.empty:
-            identity: list[str | None] = ["empty"]
+        occupancy = "empty" if slot_view is None else slot_occupancy(slot_view)
+        if occupancy == "unknown":
+            identity: list[str | None] = ["unread"]
+        elif occupancy == "empty" or slot_view.state == SlotState.empty:
+            identity = ["empty"]
         else:
             identity = ["occupied", None, None]
             for field_name in STRONG_SLOT_IDENTITY_FIELDS:
@@ -7613,6 +7637,19 @@ class InventoryService:
             and expected_revision[split:] != binding
         ):
             raise changed(conflict.current_revision) from conflict
+
+    @staticmethod
+    def _refuse_if_slot_unread(
+        slot_view: SlotView | None, revision: Callable[[], str], binding: str,
+        refusal: type[MappingSlotDiskUnverifiable],
+    ) -> None:
+        """Refuse any write to a bay whose occupancy the pre-write read did not read (#1218).
+
+        Nothing can be checked against such a bay, so no editor revision lets
+        the write through, and the refusal does not claim the disk changed.
+        """
+        if slot_view is not None and slot_occupancy(slot_view) == "unknown":
+            raise refusal(bind_mapping_revision(revision(), binding))
 
     async def _get_pre_write_snapshot(self, selected_enclosure_id: str | None) -> InventorySnapshot:
         """Read the current view a bay-assignment write is checked against.
@@ -7656,6 +7693,10 @@ class InventoryService:
         # as the pre-write read found it is bound here, so a write prepared
         # against another disk is refused before anything is stored (#1141).
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.save_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiable,
+        )
 
         def invalidate_after_save(_saved: ManualMapping) -> None:
             self.invalidate_physical_enclosure_snapshot_cache(
@@ -7699,6 +7740,10 @@ class InventoryService:
             slot_view.enclosure_id if slot_view else selected_enclosure_id
         )
         binding = self._slot_disk_binding(slot_view)
+        self._refuse_if_slot_unread(
+            slot_view, lambda: self.mapping_store.clear_revision(self.system.id, enclosure_id, slot), binding,
+            MappingSlotDiskUnverifiableBeforeClear,
+        )
 
         def invalidate_after_clear(cleared: bool) -> None:
             if cleared:
@@ -9106,13 +9151,17 @@ class InventoryService:
             return None
         if slot_view is None:
             return None
-        if not slot_view.present or slot_view.state == SlotState.empty:
+        # An unread bay's current disk cannot be compared; say that, never
+        # that the bay is empty (#1218).
+        occupancy = slot_occupancy(slot_view)
+        if occupancy != "present" or slot_view.state == SlotState.empty:
             current = None
         else:
             current = normalize_text(getattr(slot_view, field_name))
             if not current or current.casefold() == backup.casefold():
                 return None
-        return {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        warning = {"enclosure_id": bay[0], "slot": bay[1], "field": field_name, "backup": backup, "current": current}
+        return {**warning, "occupancy": "unknown"} if occupancy == "unknown" else warning
 
     async def preview_mapping_bundle(
         self,
@@ -10642,6 +10691,21 @@ class InventoryService:
         if len(disks_by_bmc_slot) < len({disk.slot for disk in disk_records if disk.slot is not None}):
             warnings.append("ESXi controller/enclosure coordinates overlap; ambiguous disks remain unplaced.")
 
+        # The RAID card's drive list is taken as its census only when every
+        # listing configured and run passed the parser's census check; a card
+        # bay it lists no drive in is then empty, as before #1218. A listing
+        # that failed that check or did not answer, or another layout, proves
+        # no absence.
+        drive_lists = ssh_data.esxi_storcli_drive_lists
+        configured_lists = {
+            command for command in map(canonicalize_ssh_command, self.system.ssh.commands)
+            if re.fullmatch(r"storcli /(?:c\d+|call)/eall/sall show all J", command)
+        }
+        storcli_census_complete = (
+            selected_profile.id == ESXI_AOC_SLG4_2H8M2_PROFILE_ID
+            and bool(drive_lists) and all(drive_lists.values()) and configured_lists <= drive_lists.keys()
+        )
+        listed_slots = {disk.slot for disk in disk_records if disk.slot is not None}
         esxi_topology_members = self._build_esxi_topology_members(disk_records)
         slot_hints = selected_profile.slot_hints or {}
         bmc_slot_hints = self._profile_bmc_slot_numbers(selected_profile)
@@ -10786,6 +10850,8 @@ class InventoryService:
                     }
             raw_slot_status["mapping_resolution_source"] = resolution.source
             raw_slot_status["stale_manual_mapping"] = resolution.stale_manual_mapping
+            if storcli_census_complete and disk is None and slot not in listed_slots and raw_slot_status["present"] is None:
+                raw_slot_status["present"] = False
             slot_view = self._build_slot_view(
                 slot=slot,
                 row_index=row_index,
@@ -11145,8 +11211,10 @@ class InventoryService:
                 loaded_entries=loaded_mappings,
             )
             ses_candidate = quantastor_ses_candidates.get(slot, {})
+            # Occupancy is unknown until the SES candidate decides it; a
+            # default False here was read as live empty evidence (#1214).
             slot_hints = {
-                "present": False,
+                "present": None,
                 "enclosure_id": selected_option.id,
                 "enclosure_label": selected_option.label,
                 "enclosure_name": selected_option.name,
@@ -11166,9 +11234,18 @@ class InventoryService:
             disk = resolution.disk
             slot_hints["mapping_resolution_source"] = resolution.source
             slot_hints["stale_manual_mapping"] = resolution.stale_manual_mapping
+            # A failed disk match is not an empty report when SES reached this
+            # bay and left occupancy undecided: the final status keeps it
+            # unknown. Without SES, the appliance disk list decides (#1218).
+            occupancy_undecided = (
+                disk is None
+                and bool(ses_candidate)
+                and not isinstance(ses_candidate.get("present"), bool)
+                and not self._slot_has_live_empty_evidence(slot_hints)
+            )
             raw_slot_status = {
-                "present": disk is not None,
-                "status": disk.health if disk else "Empty",
+                "present": None if occupancy_undecided else disk is not None,
+                "status": disk.health if disk else (None if occupancy_undecided else "Empty"),
                 "device_hint": disk.path_device_name if disk else None,
                 "device_names": list(dict.fromkeys(disk.smart_devices if disk else [])),
                 "serial_hint": disk.serial if disk else None,
@@ -14425,6 +14502,9 @@ class InventoryService:
                 target[field_name] = ses_candidate[field_name]
         if ses_candidate.get("sas_address_hint"):
             target["sas_address_hint"] = ses_candidate.get("sas_address_hint")
+            target["sas_address_source"] = ses_candidate.get("sas_address_source")
+        if ses_candidate.get("sas_address_conflict") is True:
+            target["sas_address_conflict"] = True
         if ses_candidate.get("sas_device_type"):
             target["sas_device_type"] = ses_candidate.get("sas_device_type")
         if ses_candidate.get("attached_sas_address"):
@@ -14449,7 +14529,12 @@ class InventoryService:
         if isinstance(ses_candidate.get("identify_active"), bool):
             target["identify_active"] = bool(target.get("identify_active")) or ses_candidate.get("identify_active")
         if isinstance(ses_candidate.get("present"), bool):
+            # Occupancy moves as one decision: the value, its source and any
+            # equal-strength conflict. Without the source and conflict a weaker
+            # zero SAS hint is re-read as live empty evidence (#1214).
             target["present"] = ses_candidate.get("present")
+            target["presence_source"] = ses_candidate.get("presence_source")
+            target["presence_conflict"] = ses_candidate.get("presence_conflict") is True
 
     @staticmethod
     def _build_sg_ses_discovery_command() -> str:
@@ -17225,20 +17310,41 @@ class InventoryService:
         # Critical onto every empty slot), and used to fabricate a present
         # drive out of them.
         ses_says_empty_without_disk = raw_present is False and disk is None
+        # SES evidence that leaves occupancy undecided (a truncated AES
+        # descriptor, a condition-only Enclosure Status record) and no resolved
+        # disk: neither occupancy nor a drive is known. A condition code alone
+        # is not a drive fault either, so the bay stays unknown (#1218).
+        ses_presence_unknown_without_disk = (
+            raw_present is None
+            and disk is None
+            and not empty
+            and bool(
+                normalize_text(raw_slot_status.get("ses_device"))
+                or (isinstance(raw_slot_status.get("ses_targets"), list) and raw_slot_status.get("ses_targets"))
+            )
+        )
         # `_status_contains` is a substring scan, so the positive presence
         # keywords must not fire on a negated status: "Not installed" contains
         # "installed" and used to mark an API-only empty bay present=True while
         # its state was already empty.
-        status_says_populated = self._haystack_contains(
-            status_haystack, "ok", "installed", "ready", "present"
-        ) and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        # A status keyword is no occupancy evidence where SES reached the bay
+        # and its parser left occupancy undecided: `sesutil show` prints `OK`
+        # for a row with no device name.
+        status_says_populated = (
+            not ses_presence_unknown_without_disk
+            and self._haystack_contains(status_haystack, "ok", "installed", "ready", "present")
+            and not self._haystack_contains(status_haystack, "not installed", "empty", "absent")
+        )
         present = False if quantastor_ses_empty else (
             raw_present is True
             or disk is not None
             or (not ses_says_empty_without_disk and status_says_populated)
         )
+        # Occupancy is known when evidence said occupied or said empty. A
+        # False `present` without empty evidence only means nothing was read.
+        presence_known = present or empty
 
-        if faulty and not ses_says_empty_without_disk:
+        if faulty and not ses_says_empty_without_disk and not ses_presence_unknown_without_disk:
             non_identify_state = SlotState.fault
         elif quantastor_ses_empty or empty:
             non_identify_state = SlotState.empty
@@ -17475,6 +17581,7 @@ class InventoryService:
             enclosure_label=enclosure_meta.get("label") or normalize_text(raw_slot_status.get("enclosure_label")),
             enclosure_name=normalize_text(raw_slot_status.get("enclosure_name")) or enclosure_meta.get("name"),
             present=present,
+            presence_known=presence_known,
             state=state,
             non_identify_state=non_identify_state.value,
             identify_active=identify_active,
