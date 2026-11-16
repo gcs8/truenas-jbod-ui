@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import stat
 from pathlib import Path
 
@@ -96,39 +97,12 @@ def load_secret_environment_value(env_name: str) -> str | None:
     return value
 
 
-def _remove_staged_file(temp_path: Path, staged: os.stat_result | None) -> None:
-    try:
-        if staged is None:
-            # Created by this call a moment ago and not yet identified.
-            temp_path.unlink(missing_ok=True)
-            return
-        current = temp_path.lstat()
-        if (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino):
-            temp_path.unlink()
-    except OSError:
-        # Never mask the original failure with a cleanup failure.
-        pass
+_STAGING_MODE = 0o600
+_STAGING_ATTEMPTS = 16
 
 
-def write_text_atomically(path: Path, text: str) -> None:
-    """Replace ``path`` with ``text`` through a fsynced temporary file.
-
-    The temporary file is created with the existing file's mode, or 0o600
-    for a new file, so a config file that holds credentials never passes
-    through the umask default and a tighter mode set by the operator is kept.
-
-    Any failure or interruption before the rename leaves ``path`` as it was
-    and removes the temporary file this call created. A failure after the
-    rename (the directory sync) raises OSError: the new file is already in
-    place and its durability is uncertain.
-    """
-
-    try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except FileNotFoundError:
-        mode = 0o600
-    temp_path = path.with_suffix(".tmp")
-    temp_path.unlink(missing_ok=True)
+def _create_staging_file(path: Path) -> tuple[Path, int]:
+    """A new staging file beside ``path`` under a name only this call uses."""
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -136,27 +110,59 @@ def write_text_atomically(path: Path, text: str) -> None:
         | getattr(os, "O_BINARY", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
-    descriptor = os.open(temp_path, flags, mode)
-    staged: os.stat_result | None = None
+    for _attempt in range(_STAGING_ATTEMPTS):
+        candidate = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
+        try:
+            return candidate, os.open(candidate, flags, _STAGING_MODE)
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Could not create a staging file beside {path.name}.")
+
+
+def write_text_atomically(path: Path, text: str) -> int:
+    """Replace ``path`` with ``text`` through a fsynced staging file.
+
+    Each call stages under its own unpredictable name, created exclusively
+    with mode 0o600, so a config file that holds credentials never passes
+    through the umask default and two writers never share a staging file.
+    Once the content is written the staging file takes the existing file's
+    mode (0o600 for a new file) and is renamed into place. Returns that mode.
+
+    Any failure or interruption before the rename leaves ``path`` as it was
+    and removes this call's staging name, and no other file. A failure after
+    the rename (the directory sync) raises OSError: the new file is already
+    in place and its durability is uncertain.
+    """
+
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = _STAGING_MODE
+    temp_path, descriptor = _create_staging_file(path)
     handle = None
     try:
-        staged = os.fstat(descriptor)
         handle = os.fdopen(descriptor, "wb")
         if hasattr(os, "fchmod"):
-            # os.open applies the umask; set the intended mode exactly.
-            os.fchmod(handle.fileno(), mode)
+            # os.open applies the umask; keep the staging file exactly 0600.
+            os.fchmod(handle.fileno(), _STAGING_MODE)
         handle.write(text.encode("utf-8"))
         handle.flush()
+        if hasattr(os, "fchmod"):
+            # Complete: now take the destination's mode for publication.
+            os.fchmod(handle.fileno(), mode)
         os.fsync(handle.fileno())
         if os.name != "posix":
             # Windows cannot rename a file that is still open.
             handle.close()
         os.replace(temp_path, path)
     except BaseException:
-        # Nothing was published: remove the staging copy (it can hold
-        # credentials), but only while the name still holds this write's
-        # file. On POSIX the open handle keeps its inode from being reused.
-        _remove_staged_file(temp_path, staged)
+        # Nothing was published: remove this call's staging copy (it can
+        # hold credentials). Best effort: a failed unlink is not reported
+        # over the original failure.
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     finally:
         if handle is not None:
@@ -175,3 +181,4 @@ def write_text_atomically(path: Path, text: str) -> None:
             # Replacement has already happened. Do not claim either success
             # or that the old bytes survived a failed durability barrier.
             raise OSError(exc.errno, "File replaced; directory durability is uncertain.") from exc
+    return mode
