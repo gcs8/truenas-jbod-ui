@@ -720,6 +720,334 @@ test("a size-only copy that passed an explicit Verify shows Yes", async () => {
   assert.doesNotMatch(elements.dialog.textContent, /Size only at upload/);
 });
 
+// #1202: the list's Verified column and the details' Verified fact must make
+// the same claim. The list row carries the upload check and the outcome of the
+// last explicit Verify (without its text); the details carry the full result.
+const SIZE_ONLY_TEXT = "Size only at upload; Verify re-reads and hashes it";
+
+function verifiedColumn(elements, id) {
+  const headers = elements.artifacts.querySelectorAll("th").map((cell) => cell.textContent);
+  const row = rowFor(elements, id);
+  const columns = row.children.filter((cell) => cell.tagName === "TD");
+  return columns[headers.indexOf("Verified")].textContent;
+}
+
+function verifiedFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Verified");
+  assert.notEqual(index, -1, "details dialog has a Verified fact");
+  return facts[index + 1].textContent;
+}
+
+async function listAndDetails(listFields, detailFields = listFields) {
+  const api = fakeApi();
+  Object.assign(api.data.artifacts[4], listFields);
+  const detail = { ...api.data.artifacts[4], ...detailFields };
+  const { elements, library } = mount({
+    api: { ...api, fetchJson: (url, options) => (url === "/api/admin/backups/full-odd" ? Promise.resolve(detail) : api.fetchJson(url, options)) },
+  });
+  await library.load();
+  const column = verifiedColumn(elements, "full-odd");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  return { column, fact: verifiedFact(elements) };
+}
+
+test("a size-only copy reads as size only in the list and the details until Verify (#1202)", async () => {
+  const before = await listAndDetails(
+    { upload_check: "size", last_verify: null },
+  );
+  assert.deepEqual(before, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // A failed or unreachable explicit Verify does not upgrade the claim either.
+  const failed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false } },
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: false, detail: "target unreachable" } },
+  );
+  assert.deepEqual(failed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+
+  // Only a boolean true counts as a passed Verify, in both views.
+  const malformed = await listAndDetails(
+    { upload_check: "size", last_verify: { at: "2026-09-21T10:05:00Z", ok: "true" } },
+  );
+  assert.deepEqual(malformed, { column: SIZE_ONLY_TEXT, fact: SIZE_ONLY_TEXT });
+});
+
+test("a successful explicit Verify turns the list and the details to Yes together (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/full-odd/verify": () => {
+      api.data.artifacts[4].last_verify = { at: "2026-09-21T10:05:00Z", ok: true };
+      return { ok: true, artifact: api.data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." };
+    },
+    "GET /api/admin/backups/full-odd": () => ({ ...api.data.artifacts[4], last_verify: { ...api.data.artifacts[4].last_verify, detail: "" } }),
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  assert.equal(verifiedColumn(elements, "full-odd"), SIZE_ONLY_TEXT);
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup verified.", "success"]);
+  assert.equal(verifiedColumn(elements, "full-odd"), "Yes");
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(verifiedFact(elements), "Yes");
+});
+
+test("the Verify banner follows the operation's own result, not the copy's catalogue flag (#1202)", async () => {
+  // What the scheduler returns when the target cannot be reached: the
+  // operation failed and nothing was read, but the catalogue keeps the copy's flag.
+  const unreachable = {
+    ok: false,
+    artifact: { ...syntheticLibrary().artifacts[4], verified: true, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } },
+    detail: "ConnectionRefusedError: connection refused",
+  };
+  const responses = [
+    [unreachable, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ ...unreachable, verified: true }, ["Backup did not verify: ConnectionRefusedError: connection refused", "error"]],
+    [{ artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    [{ ok: "true", artifact: unreachable.artifact }, ["Backup did not verify.", "error"]],
+    // Control: a Verify that read the copy back and matched.
+    [{ ok: true, artifact: { ...unreachable.artifact, last_verify: { at: "2026-09-24T12:00:00+00:00", ok: true } }, detail: "Readback matched the catalogued size and SHA-256." }, ["Backup verified.", "success"]],
+  ];
+  for (const [response, banner] of responses) {
+    const api = fakeApi({
+      "POST /api/admin/backups/full-odd/verify": () => {
+        Object.assign(api.data.artifacts[4], response.artifact);
+        return response;
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, JSON.stringify(response));
+    assert.equal(verifiedColumn(elements, "full-odd"), banner[1] === "success" ? "Yes" : SIZE_ONLY_TEXT);
+  }
+});
+
+test("Last check says Worked only for a Verify whose result is boolean true (#1202)", async () => {
+  async function lastCheck(lastVerify) {
+    const api = fakeApi({
+      "GET /api/admin/backups/full-odd": () => ({ ...syntheticLibrary().artifacts[4], upload_check: "size", last_verify: lastVerify }),
+    });
+    const { elements, library } = mount({ api });
+    await library.load();
+    await library.actions.showDetails("full-odd");
+    await settle();
+    const facts = elements.dialog.querySelector("dl").children;
+    const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+    return { verified: verifiedFact(elements), lastCheck: index === -1 ? null : facts[index + 1].textContent };
+  }
+  for (const ok of ["true", 1, "yes", {}]) {
+    const result = await lastCheck({ at: "2026-09-21T10:05:00Z", ok, detail: "" });
+    assert.equal(result.verified, SIZE_ONLY_TEXT, JSON.stringify(ok));
+    assert.doesNotMatch(result.lastCheck, /Worked/, JSON.stringify(ok));
+    assert.match(result.lastCheck, /^Failed/, JSON.stringify(ok));
+  }
+  // Controls: a passed and a failed Verify of this copy.
+  assert.deepEqual(await lastCheck({ at: "2026-09-21T10:05:00Z", ok: true, detail: "" }), { verified: "Yes", lastCheck: "Worked (T(2026-09-21T10:05:00Z))" });
+  assert.deepEqual(
+    await lastCheck({ at: "2026-09-21T10:05:00Z", ok: false, detail: "Readback does not match" }),
+    { verified: SIZE_ONLY_TEXT, lastCheck: "Failed: Readback does not match (T(2026-09-21T10:05:00Z))" },
+  );
+  // No Verify of this copy recorded: no Last check line.
+  assert.deepEqual(await lastCheck(null), { verified: SIZE_ONLY_TEXT, lastCheck: null });
+});
+
+const NOT_RECORDED_TEXT = "Upload check not recorded; Verify re-reads and hashes it";
+
+test("rows without upload-check provenance say so, the same way in both views (#1202)", async () => {
+  // A remote copy catalogued before #722 has no recorded upload check: unknown,
+  // not Yes, until an explicit Verify reads it back.
+  assert.deepEqual(await listAndDetails({}), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(await listAndDetails({ upload_check: null, last_verify: null }), { column: NOT_RECORDED_TEXT, fact: NOT_RECORDED_TEXT });
+  assert.deepEqual(
+    await listAndDetails({ upload_check: null, last_verify: { at: "2026-09-21T10:05:00Z", ok: true } }),
+    { column: "Yes", fact: "Yes" },
+  );
+  // A remote copy read back at upload, and a local copy, are plainly verified.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+  assert.deepEqual(await listAndDetails({ location: "local", upload_check: null, last_verify: null }), { column: "Yes", fact: "Yes" });
+  // A copy that is not verified stays "Not yet", whatever the upload check was.
+  assert.deepEqual(await listAndDetails({ verified: false }), { column: "Not yet", fact: "Not yet" });
+  assert.deepEqual(await listAndDetails({ verified: false, upload_check: "size", last_verify: null }), { column: "Not yet", fact: "Not yet" });
+});
+
+// A checksum the storage provider reports at upload is not this application
+// reading the copy back (#1202).
+const PROVIDER_CHECKSUM_TEXT = "Checked by the provider's checksum at upload; Verify re-reads and hashes it";
+const EITHER_TEXT = "Checked at upload by the provider's checksum or by read-back; Verify re-reads and hashes it";
+
+test("a provider-checksum copy says so in both views until its own Verify passes (#1202)", async () => {
+  const own = { at: "2026-09-21T10:05:00Z", ok: true };
+  for (const [uploadCheck, text] of [["provider_checksum", PROVIDER_CHECKSUM_TEXT], ["provider_checksum_or_readback", EITHER_TEXT]]) {
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: null }), { column: text, fact: text }, uploadCheck);
+    // A failed, unreachable or malformed Verify does not upgrade it.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: false } }), { column: text, fact: text }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: { ...own, ok: "true" } }), { column: text, fact: text }, uploadCheck);
+    // Its own passed Verify read it back.
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, last_verify: own }), { column: "Yes", fact: "Yes" }, uploadCheck);
+    assert.deepEqual(await listAndDetails({ upload_check: uploadCheck, verified: false }), { column: "Not yet", fact: "Not yet" }, uploadCheck);
+  }
+  // Control: a copy this application read back at upload.
+  assert.deepEqual(await listAndDetails({ upload_check: "readback", last_verify: null }), { column: "Yes", fact: "Yes" });
+});
+
+test("a provider-checksum target test does not read as a readback (#1202)", async () => {
+  const api = fakeApi({
+    "POST /api/admin/backups/targets/legacy-ftp/test": () => ({ ok: true, detail: "s3 archive destination is writable; the provider's checksum matched the bytes sent (the content was not read back).", duration_ms: 42, provider: "s3", transport_encrypted: true, upload_check: "provider_checksum" }),
+  });
+  const { elements, library } = mount({ api });
+  await library.load();
+  await library.actions.testTarget("legacy-ftp");
+  const row = elements.targets.querySelector('tr[data-target-id="legacy-ftp"]').textContent;
+  assert.match(row, /Works \(42 ms\)\. Provider checksum checked only; Verify re-reads a backup\./);
+});
+
+// The page's real shared transport over a synthetic fetch, so a body with
+// ok:false reaches the library exactly as the browser delivers it.
+function realTransportApi(replies) {
+  const base = fakeApi();
+  const transport = loadAdminFunctions(transportNames, {
+    navigator: { onLine: true },
+    fetch: async (url, options = {}) => {
+      const key = `${String(options.method || "GET").toUpperCase()} ${url.split("?")[0]}`;
+      if (replies[key]) return jsonResponse(...replies[key](base.data));
+      return jsonResponse(200, await base.fetchJson(url, options));
+    },
+  });
+  return { ...base, fetchJson: transport.fetchJson };
+}
+
+test("a failed Verify shows its own result through the page's real transport (#1202)", async () => {
+  // Exactly what the scheduler and the admin route return (HTTP 200).
+  const artifact = (data, verified) => ({ ...data.artifacts[4], verified, upload_check: "size", last_verify: { at: "2026-09-24T12:00:00+00:00", ok: false } });
+  const cases = [
+    ["unreachable", (data) => [200, { ok: false, artifact: artifact(data, true), detail: "ConnectionRefusedError" }],
+      ["Backup did not verify: ConnectionRefusedError", "error"], SIZE_ONLY_TEXT],
+    ["mismatch", (data) => [200, { ok: false, artifact: artifact(data, false), detail: "Readback does not match the catalogued size and SHA-256." }],
+      ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet"],
+  ];
+  for (const [name, reply, banner, column] of cases) {
+    const api = realTransportApi({
+      "POST /api/admin/backups/full-odd/verify": (data) => {
+        const [status, body] = reply(data);
+        Object.assign(data.artifacts[4], body.artifact);
+        return [status, body];
+      },
+    });
+    Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: null });
+    const { elements, library, banners } = mount({ api });
+    await library.load();
+    await library.actions.verify("full-odd");
+    assert.deepEqual(banners.at(-1), banner, name);
+    assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+  }
+  // Controls: a passed Verify, and a refusal status, through the same transport.
+  const passed = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: true, artifact: data.artifacts[4], detail: "Readback matched the catalogued size and SHA-256." }],
+  });
+  let mounted = mount({ api: passed });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.deepEqual(mounted.banners.at(-1), ["Backup verified.", "success"]);
+  const missing = realTransportApi({ "POST /api/admin/backups/full-odd/verify": () => [404, { detail: "Artifact not found." }] });
+  mounted = mount({ api: missing });
+  await mounted.library.load();
+  await mounted.library.actions.verify("full-odd");
+  assert.equal(mounted.banners.at(-1)[1], "error");
+  assert.match(mounted.banners.at(-1)[0], /^Verify failed: Artifact not found\./);
+});
+
+function lastCheckFact(elements) {
+  const facts = elements.dialog.querySelector("dl").children;
+  const index = facts.findIndex((node) => node.tagName === "DT" && node.textContent === "Last check");
+  return index === -1 ? null : facts[index + 1].textContent;
+}
+
+// #1202: a Verify has three outcomes and the page says which one happened.
+// These are the scheduler's real response shapes (VerifyOutcomeTests in
+// tests/test_backup_list_assurance.py), delivered through the real transport.
+const NOT_READ_BANNER = "This Verify could not read the copy, so nothing was checked: ConnectionRefusedError. Its earlier status is unchanged.";
+
+test("a Verify says whether the copy was read and matched, read and did not match, or could not be read (#1202)", async () => {
+  const at = "2026-09-24T12:00:00+00:00";
+  const notReadLastCheck = `Could not read the copy, nothing checked: ConnectionRefusedError; earlier status unchanged (T(${at}))`;
+  const kinds = [["readback", "Yes"], ["size", SIZE_ONLY_TEXT], ["provider_checksum", PROVIDER_CHECKSUM_TEXT]];
+  for (const [uploadCheck, uploadText] of kinds) {
+    const outcomes = [
+      ["matched", true, true, "Readback matched the catalogued size and SHA-256.",
+        ["Backup verified.", "success"], "Yes", `Worked (T(${at}))`],
+      ["not_read", false, true, "ConnectionRefusedError",
+        [NOT_READ_BANNER, "error"], uploadText, notReadLastCheck],
+      ["mismatch", false, false, "Readback does not match the catalogued size and SHA-256.",
+        ["Backup did not verify: Readback does not match the catalogued size and SHA-256.", "error"], "Not yet",
+        `Failed: Readback does not match the catalogued size and SHA-256. (T(${at}))`],
+    ];
+    for (const [outcome, ok, verified, detail, banner, column, lastCheck] of outcomes) {
+      const name = `${uploadCheck}/${outcome}`;
+      const api = realTransportApi({
+        "POST /api/admin/backups/full-odd/verify": (data) => {
+          Object.assign(data.artifacts[4], { verified, upload_check: uploadCheck, last_verify: { at, ok } });
+          return [200, { ok, outcome, artifact: data.artifacts[4], detail }];
+        },
+        "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok, outcome, detail } }],
+      });
+      Object.assign(api.data.artifacts[4], { upload_check: uploadCheck, last_verify: null });
+      const { elements, library, banners } = mount({ api });
+      await library.load();
+      await library.actions.verify("full-odd");
+      assert.deepEqual(banners.at(-1), banner, name);
+      assert.equal(verifiedColumn(elements, "full-odd"), column, name);
+      await library.actions.showDetails("full-odd");
+      await settle();
+      assert.equal(verifiedFact(elements), column, name);
+      assert.equal(lastCheckFact(elements), lastCheck, name);
+    }
+  }
+  // Control: a result from an earlier release carries no outcome and keeps today's wording.
+  const api = realTransportApi({
+    "POST /api/admin/backups/full-odd/verify": (data) => [200, { ok: false, artifact: data.artifacts[4], detail: "ConnectionRefusedError" }],
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: false, detail: "ConnectionRefusedError" } }],
+  });
+  Object.assign(api.data.artifacts[4], { upload_check: "size", last_verify: { at, ok: false } });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.verify("full-odd");
+  assert.deepEqual(banners.at(-1), ["Backup did not verify: ConnectionRefusedError", "error"]);
+  await library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(elements), `Failed: ConnectionRefusedError (T(${at}))`);
+  // A not-read outcome beside a passed result is malformed and never reads as unread.
+  const odd = realTransportApi({
+    "GET /api/admin/backups/full-odd": (data) => [200, { ...data.artifacts[4], last_verify: { at, ok: true, outcome: "not_read", detail: "" } }],
+  });
+  const mounted = mount({ api: odd });
+  await mounted.library.load();
+  await mounted.library.actions.showDetails("full-odd");
+  await settle();
+  assert.equal(lastCheckFact(mounted.elements), `Worked (T(${at}))`);
+});
+
+test("a clean-up refused by its guard shows the refusal through the page's real transport (#1202)", async () => {
+  const refusal = "CatalogError: Artifact is the newest copy of its class at this location that passed its last completed check (the upload check or a later Verify), so it is kept.";
+  const api = realTransportApi({
+    "POST /api/admin/backups/lifecycle/apply": () => [200, { ok: false, deleted: [], already_missing: [], failed: { id: "cfg-old", error: refusal }, not_attempted: [], downgraded: [], kept_after_replan: [] }],
+  });
+  const { elements, library, banners } = mount({ api });
+  await library.load();
+  await library.actions.openCleanup();
+  await library.actions.applyCleanup();
+  assert.deepEqual(banners.at(-1), [`Clean up stopped after 0 of 1: ${refusal}`, "error"]);
+  assert.match(elements.dialog.textContent, /Clean up stopped after 0 of 1: CatalogError: Artifact is the newest copy/);
+  assert.doesNotMatch(banners.at(-1)[0], /verified copy|Request failed|may already be gone/);
+});
+
+test("a long unbroken value wraps inside the details dialog (#1202)", () => {
+  const rule = STYLES.match(/\.backup-policy-list dd \{[^}]*\}/)?.[0] || "";
+  assert.match(rule, /overflow-wrap:\s*anywhere/);
+});
+
 test("restore from the server inspects, shows the existing confirmation, then imports with the receipt", async () => {
   const { elements, library, api, banners, refreshes } = mount();
   await library.load();
@@ -777,7 +1105,11 @@ test("clean up shows the dry-run plan and applies exactly its token", async () =
   assert.match(text, /These 2 copies will be deleted/);
   assert.match(text, /only 1 copies are kept and this is number 2/);
   assert.match(text, /never verified, and older than 1 day \(it is 2 days old\)/);
-  assert.match(text, /1 more is over a limit but kept, because it is the newest verified copy in its place/);
+  // The plan knows only the catalogue's check result, which can be a size
+  // check at upload, so it promises no more than that (#1202).
+  assert.match(text, /These 2 copies will be deleted\. Kept copies and the newest copy in each place that passed its last completed check are never deleted\./);
+  assert.match(text, /1 more is over a limit but kept, because it is the newest copy in its place that passed its last completed check\. That check may have been by size only; the Verified column says which\./);
+  assert.doesNotMatch(text, /newest verified copy/);
   assert.equal(action(elements.dialog, "cleanup-apply").textContent, "Delete 2");
   await library.actions.applyCleanup();
   const apply = api.calls.find((call) => call.url.endsWith("/lifecycle/apply"));

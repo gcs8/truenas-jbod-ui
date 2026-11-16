@@ -296,11 +296,25 @@
 
   // #722: an FTP copy was checked by size only at upload. Until an explicit
   // Verify downloads it and matches size and SHA-256, say exactly that.
+  // #1202: the list's Verified column uses this too, so both views agree. A
+  // copy on a target whose upload check was never recorded (catalogued before
+  // #722) says so rather than claiming a readback nobody saw.
   function verifiedDetailText(item) {
     if (!item?.verified) return "Not yet";
-    const explicitlyVerified = Boolean(item.last_verify && typeof item.last_verify === "object" && item.last_verify.ok);
-    if (item.upload_check === "size" && !explicitlyVerified) {
+    const explicitlyVerified = Boolean(item.last_verify && typeof item.last_verify === "object" && item.last_verify.ok === true);
+    if (explicitlyVerified) return "Yes";
+    if (item.upload_check === "size") {
       return "Size only at upload; Verify re-reads and hashes it";
+    }
+    // A checksum the storage provider reported is not a read-back by this app.
+    if (item.upload_check === "provider_checksum") {
+      return "Checked by the provider's checksum at upload; Verify re-reads and hashes it";
+    }
+    if (item.upload_check === "provider_checksum_or_readback") {
+      return "Checked at upload by the provider's checksum or by read-back; Verify re-reads and hashes it";
+    }
+    if (item.location !== "local" && item.upload_check !== "readback") {
+      return "Upload check not recorded; Verify re-reads and hashes it";
     }
     return "Yes";
   }
@@ -309,11 +323,24 @@
     if (!lastRun || typeof lastRun !== "object") {
       return { tone: "", text: "Not used yet" };
     }
+    // Only a boolean true is a pass; a malformed result never reads as Worked.
+    const worked = lastRun.ok === true;
     return {
-      tone: lastRun.ok ? "is-ok" : "is-bad",
-      text: lastRun.ok ? "Worked" : `Failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
+      tone: worked ? "is-ok" : "is-bad",
+      text: worked ? "Worked" : `Failed${lastRun.detail ? `: ${scrubText(lastRun.detail)}` : ""}`,
       at: lastRun.at || "",
     };
+  }
+
+  // #1202: a Verify that could not open or read the copy checked nothing and
+  // changed nothing; it is not a failed check. A result with no outcome (from
+  // an earlier release) keeps the Worked/Failed wording.
+  function lastCheckSummary(lastVerify) {
+    if (lastVerify.outcome === "not_read" && lastVerify.ok !== true) {
+      const reason = lastVerify.detail ? `: ${scrubText(lastVerify.detail)}` : "";
+      return { tone: "", text: `Could not read the copy, nothing checked${reason}; earlier status unchanged`, at: lastVerify.at || "" };
+    }
+    return lastRunSummary(lastVerify);
   }
 
   // The last scheduled clean-up, for the status line: a summary when it
@@ -736,7 +763,7 @@
         el("td", { text: fmtTime(artifact.created_at) }),
         el("td", { text: fmtBytes(artifact.size) }),
         el("td", { text: locationLabel(artifact.location, targets()) }),
-        el("td", { text: artifact.verified ? "Yes" : "Not yet" }),
+        el("td", { text: verifiedDetailText(artifact) }),
         el("td", { className: `backup-state is-${STATE_LABELS[artifact.state] ? artifact.state : "unknown"}`, text: stateLabel(artifact) }),
         el("td", {}, kept, keptReason),
         el("td", {}, actions));
@@ -1095,7 +1122,7 @@
           if (groups.length) facts.push(["Contains", groups.map((group) => scrubText(typeof group === "object" ? group.label || group.key : group)).join(", ")]);
         }
         if (item.last_verify && typeof item.last_verify === "object") {
-          const verify = lastRunSummary(item.last_verify);
+          const verify = lastCheckSummary(item.last_verify);
           facts.push(["Last check", verify.at ? `${verify.text} (${fmtTime(verify.at)})` : verify.text]);
         }
         const body = [
@@ -1127,10 +1154,18 @@
             headers: { "Content-Type": "application/json" },
             body: "{}",
             timeoutMs: LONG_TIMEOUT_MS,
+            // A Verify that ran answers HTTP 200 with ok:false; show that result here.
+            acceptPartialResult: (result) => Boolean(result?.artifact && typeof result.artifact === "object"),
           });
-          const item = payload.artifact || payload;
-          const ok = item.verified !== false && payload.verified !== false;
-          setBanner(ok ? "Backup verified." : `Backup did not verify${payload.detail ? `: ${scrubText(payload.detail)}` : "."}`, ok ? "success" : "error");
+          // The operation's own result: a copy the catalogue still counts as
+          // verified was not read back when the Verify could not reach it.
+          const ok = payload?.ok === true;
+          const detail = payload?.detail ? `: ${scrubText(payload.detail)}` : "";
+          if (!ok && payload?.outcome === "not_read") {
+            setBanner(`This Verify could not read the copy, so nothing was checked${detail}. Its earlier status is unchanged.`, "error");
+          } else {
+            setBanner(ok ? "Backup verified." : `Backup did not verify${detail || "."}`, ok ? "success" : "error");
+          }
         } catch (error) {
           setBanner(`Verify failed: ${errorText(error)}`, "error");
         }
@@ -1227,7 +1262,9 @@
           });
           const ms = Number(result.duration_ms);
           // #722: FTP compares only the remote size at upload; say so.
-          const sizeOnly = result.upload_check === "size" ? " Size checked only; Verify re-reads a backup." : "";
+          const sizeOnly = result.upload_check === "size"
+            ? " Size checked only; Verify re-reads a backup."
+            : result.upload_check === "provider_checksum" ? " Provider checksum checked only; Verify re-reads a backup." : "";
           state.targetResults.set(id, result.ok === false
             ? { ok: false, text: `Failed: ${scrubText(result.detail || "no detail")}` }
             : { ok: true, text: `Works${Number.isFinite(ms) ? ` (${ms} ms)` : ""}.${sizeOnly}` });
@@ -1372,7 +1409,7 @@
           state.cleanupPlan = plan;
           const body = scope.body();
           const guardedNote = plan.guarded
-            ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest verified copy in its place.` })
+            ? el("p", { className: "subtle", text: `${plan.guarded} more ${plan.guarded === 1 ? "is" : "are"} over a limit but kept, because ${plan.guarded === 1 ? "it is" : "each is"} the newest copy in its place that passed its last completed check. That check may have been by size only; the Verified column says which.` })
             : null;
           if (!plan.items.length) {
             body?.replaceChildren(el("p", { text: "Nothing to clean up. Every copy is within its limits." }), guardedNote || "");
@@ -1383,7 +1420,7 @@
             throw new Error("The plan came back without a token, so it can't be applied safely.");
           }
           body?.replaceChildren(
-            el("p", { className: "backup-cleanup-intro", text: `${plan.items.length === 1 ? "This copy" : `These ${plan.items.length} copies`} will be deleted. Kept copies and the newest verified copy in each place are never deleted.` }),
+            el("p", { className: "backup-cleanup-intro", text: `${plan.items.length === 1 ? "This copy" : `These ${plan.items.length} copies`} will be deleted. Kept copies and the newest copy in each place that passed its last completed check are never deleted.` }),
             el("ul", { className: "backup-change-list backup-cleanup-list" }, plan.items.map((item) => {
               const artifact = findArtifact(item.id);
               const what = artifact

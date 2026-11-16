@@ -1700,7 +1700,8 @@ class S3TargetTests(_TempCase):
             client.objects["jbod-ui/archive/config/c1.tar.partial"] = {"data": b"x", "meta": {}, "etag": "e"}
             listed = target.list()
             target.delete("config/c1.tar")
-        self.assertEqual(stored, StoredObject("config/c1.tar", len(data), _sha(data), True))
+        # The matching ETag is the provider's checksum; nothing was read back (#1202).
+        self.assertEqual(stored, StoredObject("config/c1.tar", len(data), _sha(data), True, upload_check="provider_checksum"))
         self.assertEqual(client.get_calls, 0)
         self.assertLessEqual(max(client.read_sizes), transport.CHUNK_SIZE)
         self.assertEqual(listed, [RemoteObject("config/c1.tar", len(data), datetime(2026, 9, 24, tzinfo=timezone.utc))])
@@ -1712,6 +1713,7 @@ class S3TargetTests(_TempCase):
             stored = target.put(self.source(b"payload"), "a.bin")
         self.assertTrue(stored.verified)
         self.assertEqual(self.clients[0].get_calls, 1)
+        self.assertEqual(stored.upload_check, "readback")
 
     def test_corrupt_re_read_deletes_object_and_raises(self) -> None:
         with open_target(self.settings()) as target:
@@ -1740,6 +1742,7 @@ class S3TargetTests(_TempCase):
             stored = target.put(src, "full/big.bin")
         self.assertTrue(stored.verified)
         self.assertEqual(self.clients[0].get_calls, 0)
+        self.assertEqual(stored.upload_check, "provider_checksum")
         self.assertTrue(self.clients[0].objects["jbod-ui/archive/full/big.bin"]["etag"].endswith("-2"))
 
     def test_single_part_multipart_upload_at_threshold_verifies(self) -> None:
@@ -1806,6 +1809,7 @@ class S3TargetTests(_TempCase):
             stored = target.put(src, "full/large.bin")
         self.assertTrue(stored.verified)
         self.assertEqual(self.clients[0].get_calls, 1)
+        self.assertEqual(stored.upload_check, "readback")
 
     def test_get_stops_once_download_exceeds_limit(self) -> None:
         data = b"x" * (transport.CHUNK_SIZE * 3)
