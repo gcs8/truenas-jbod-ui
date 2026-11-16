@@ -1029,6 +1029,8 @@ async function applyThroughTransport(answer) {
   return { elements, banners, extraReads: lists - before, applies };
 }
 
+const EMPTY_RESULT = { deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [], kept_after_replan: [] };
+
 test("a stopped or refused clean-up answered with ok: false shows its result through the page's own transport (#1188)", async () => {
   // The scheduler answers a run that stopped, or that a keeper check refused,
   // with HTTP 200 and ok: false. The admin transport treats ok: false as a
@@ -1067,12 +1069,33 @@ test("an ok: false answer that is not a clean-up result is still a failed reques
     "no result": { ok: false, detail: "synthetic refusal" },
     "a result list that is not a list": { ok: false, deleted: "cfg-old" },
     "a named state beside a result": { ok: false, state: "cleanup_state_unknown", deleted: [] },
+    // One list is not the result: every list and the failed entry must be there and well formed.
+    "only the deleted list": { ok: false, deleted: [] },
+    "a deleted entry that is not an id": { ...EMPTY_RESULT, ok: false, deleted: [null] },
+    "a missing list": { ok: false, deleted: [], already_missing: [], failed: null, not_attempted: [], downgraded: [] },
+    "a list entry that is not an id": { ...EMPTY_RESULT, ok: false, not_attempted: [{ id: "cfg-old" }] },
+    "a failed entry without its error": { ...EMPTY_RESULT, ok: false, failed: { id: "cfg-old" } },
+    "a failed entry that is text": { ...EMPTY_RESULT, ok: false, failed: "cfg-old" },
+    "a named state beside a whole result": { ...EMPTY_RESULT, ok: false, state: "cleanup_state_unknown" },
   };
   for (const [name, answer] of Object.entries(answers)) {
-    const { elements } = await applyThroughTransport(() => jsonResponse(200, answer));
+    const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, answer));
     assert.match(resultNode(elements).textContent, /^Clean up failed: /, name);
     assert.doesNotMatch(elements.dialog.textContent, /Clean up stopped|Deleted \d/, name);
+    assert.equal(banners.at(-1)[1], "error", name);
   }
+});
+
+test("a clean-up that reports itself incomplete never reads as a plain success (#1188)", async () => {
+  // The scheduler does not send this (incomplete means a failed or unattempted
+  // deletion), but the page must not turn "not complete" into "Deleted 0 copies."
+  const { elements, banners } = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: false }));
+  assert.equal(resultNode(elements).textContent, "Clean up stopped after 0 of 0.");
+  assert.deepEqual(banners.at(-1), ["Clean up stopped after 0 of 0.", "error"]);
+  // Control: the same lists with ok: true are a finished clean-up.
+  const done = await applyThroughTransport(() => jsonResponse(200, { ...EMPTY_RESULT, ok: true }));
+  assert.equal(resultNode(done.elements).textContent, "Deleted 0 copies.");
+  assert.deepEqual(done.banners.at(-1), ["Deleted 0 copies.", "success"]);
 });
 
 test("a clean-up the admin service never sent says it did not start, and reads nothing more (#1188)", async () => {

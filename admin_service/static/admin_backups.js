@@ -58,6 +58,15 @@
     + "and deleted nothing. Open Clean up again after it finishes.";
   // The admin service never reached the scheduler, so nothing was sent.
   const CLEANUP_NOT_STARTED = "Clean up did not start: The backup scheduler service is not available.";
+  // The whole result the admin apply route forwards (its own check, in step):
+  // five lists of ids and a failed entry that is null or names an id and an error.
+  const CLEANUP_RESULT_LISTS = ["deleted", "already_missing", "not_attempted", "downgraded", "kept_after_replan"];
+  function isCleanupResult(value) {
+    const failed = value?.failed;
+    return typeof value?.state !== "string"
+      && CLEANUP_RESULT_LISTS.every((key) => Array.isArray(value?.[key]) && value[key].every((item) => typeof item === "string"))
+      && (failed === null || failed === undefined || (typeof failed?.id === "string" && typeof failed?.error === "string"));
+  }
   const SENSITIVE_KEY = /path|file|dir|root|password|passphrase|secret|token|credential|key_id|access_key|private|username|user$|host|endpoint|url|share|bucket|export|mount/i;
 
   // ---------------------------------------------------------------- model --
@@ -1425,8 +1434,8 @@
             timeoutMs: LONG_TIMEOUT_MS,
             // A run that stopped, or that a keeper check refused, answers 200
             // with ok: false and its result; that is a result to show, not a
-            // failed request. Anything without the result shape stays a failure.
-            acceptPartialResult: (value) => typeof value?.state !== "string" && Array.isArray(value?.deleted),
+            // failed request. Anything short of the whole result stays a failure.
+            acceptPartialResult: isCleanupResult,
           });
           state.cleanupPlan = null;
           // A result comes only from the scheduler's own answer. Anything else
@@ -1437,7 +1446,8 @@
           }
           const count = (value) => (Array.isArray(value) ? value.length : 0);
           const deleted = count(payload.deleted) + count(payload.already_missing);
-          const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false;
+          // ok: false is the scheduler saying the run did not complete, whatever the lists hold.
+          const stopped = Boolean(payload.failed) || count(payload.not_attempted) > 0 || payload.complete === false || payload.ok === false;
           const failedDetail = payload.failed?.error || payload.error;
           const summary = stopped
             ? `Clean up stopped after ${deleted} of ${deleted + count(payload.not_attempted) + (payload.failed ? 1 : 0)}${failedDetail ? `: ${scrubText(failedDetail)}` : "."}`
