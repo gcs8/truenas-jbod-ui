@@ -3229,7 +3229,7 @@ class HistoryStore:
         }
 
         # In-memory scan state for this pass only (see _maintain_retention_batch).
-        scan_floors: dict[str, tuple[bytes, int]] = {}
+        scan_floors: dict[str, tuple[bytes | str, int]] = {}
         finished_tables: set[str] = set()
         for _ in range(max_batches):
             if should_continue is not None and not should_continue():
@@ -3323,7 +3323,7 @@ class HistoryStore:
         *,
         cutoffs: dict[str, str | None],
         batch_size: int,
-        scan_floors: dict[str, tuple[bytes, int]] | None = None,
+        scan_floors: dict[str, tuple[bytes | str, int]] | None = None,
         finished_tables: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         # The same ordered, bounded subquery selects the batch for both rollups and
@@ -3507,7 +3507,7 @@ class HistoryStore:
     def _retention_parameters(
         cls,
         cutoff: str,
-        floor: tuple[bytes, int] | None,
+        floor: tuple[bytes | str, int] | None,
     ) -> tuple[Any, ...]:
         return (*cls._retention_bounds(cutoff), *(floor or ()))
 
@@ -3522,14 +3522,25 @@ class HistoryStore:
 
     @staticmethod
     def _advance_scan_floor(
-        floors: dict[str, tuple[bytes, int]],
+        connection: sqlite3.Connection,
+        floors: dict[str, tuple[bytes | str, int]],
         name: str,
         deleted: list[Any],
     ) -> int:
         # Every row before the last deleted one (by text, then key) was read by
         # this batch: deleted, or rejected by the exact-time test.
         if deleted:
-            floors[name] = max((bytes(row[0]), int(row[1])) for row in deleted)
+            text, key = max((bytes(row[0]), int(row[1])) for row in deleted)
+            encoding = connection.execute("PRAGMA encoding").fetchone()[0]
+            if encoding != "UTF-8":
+                # CAST(? AS TEXT) reads bound bytes as UTF-8, so a UTF-16 floor
+                # is bound as its string. Bytes that do not decode cannot be
+                # named: keep the lower floor and read those rows again.
+                try:
+                    text = text.decode(encoding)
+                except UnicodeDecodeError:
+                    return len(deleted)
+            floors[name] = (text, key)
         return len(deleted)
 
     @classmethod
@@ -3541,7 +3552,7 @@ class HistoryStore:
         timestamp_column: str,
         cutoff: str | None,
         batch_size: int,
-        floors: dict[str, tuple[bytes, int]],
+        floors: dict[str, tuple[bytes | str, int]],
     ) -> int:
         if cutoff is None:
             return 0
@@ -3552,7 +3563,7 @@ class HistoryStore:
             f"RETURNING CAST({timestamp_column} AS BLOB), id",
             (*cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()
-        return cls._advance_scan_floor(floors, table_name, deleted)
+        return cls._advance_scan_floor(connection, floors, table_name, deleted)
 
     @classmethod
     def _roll_up_metric_rows(
@@ -3562,7 +3573,7 @@ class HistoryStore:
         cutoff: str,
         batch_size: int,
         bucket_seconds: int,
-        floor: tuple[bytes, int] | None,
+        floor: tuple[bytes | str, int] | None,
         rollup_cutoff: str | None = None,
     ) -> list[int]:
         """Roll the selected raw rows up; return the written rollups already expired.
@@ -3682,7 +3693,7 @@ class HistoryStore:
         bucket_seconds: int,
         cutoff: str | None,
         batch_size: int,
-        floors: dict[str, tuple[bytes, int]],
+        floors: dict[str, tuple[bytes | str, int]],
     ) -> int:
         if cutoff is None:
             return 0
@@ -3703,7 +3714,7 @@ class HistoryStore:
             """,
             (bucket_seconds, *cls._retention_parameters(cutoff, floor), batch_size),
         ).fetchall()
-        return cls._advance_scan_floor(floors, name, deleted)
+        return cls._advance_scan_floor(connection, floors, name, deleted)
 
     @classmethod
     def _retention_rows_exist(
@@ -3713,7 +3724,7 @@ class HistoryStore:
         timestamp_column: str,
         cutoff: str | None,
         *,
-        floor: tuple[bytes, int] | None = None,
+        floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False
@@ -3731,7 +3742,7 @@ class HistoryStore:
         bucket_seconds: int,
         cutoff: str | None,
         *,
-        floor: tuple[bytes, int] | None = None,
+        floor: tuple[bytes | str, int] | None = None,
     ) -> bool:
         if cutoff is None:
             return False

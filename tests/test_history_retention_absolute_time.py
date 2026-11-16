@@ -158,6 +158,8 @@ class SegmentedRetentionAbsoluteTimeTests(unittest.TestCase):
 
 
 class HotRetentionAbsoluteTimeTests(unittest.TestCase):
+    ENCODING = "UTF-8"
+
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(prefix="retention-offset-")
         self.addCleanup(self._temporary.cleanup)
@@ -362,6 +364,133 @@ class HotRetentionAbsoluteTimeTests(unittest.TestCase):
                         )
                         self.assertIn(f"INDEX {index_name} {index_range}", plan)
                         self.assertNotIn("USE TEMP B-TREE", plan)
+
+    def _insert_native(self, rows: list[object]) -> None:
+        # bytes are the database's own text bytes, written as a BLOB literal
+        # cast to TEXT, which SQLite reads in the database's encoding.
+        with closing(sqlite3.connect(self.path)) as connection:
+            for slot, observed_at in enumerate(rows):
+                value = f"CAST(x'{observed_at.hex()}' AS TEXT)" if isinstance(observed_at, bytes) else "?"
+                connection.execute(
+                    "INSERT INTO slot_events (observed_at, system_id, enclosure_key, slot, slot_label, "
+                    f"event_type, details_json) VALUES ({value}, ?, '', ?, '0', 'slot_state_changed', '{{}}')",
+                    (*(() if isinstance(observed_at, bytes) else (observed_at,)), SYSTEM_ID, slot),
+                )
+            connection.commit()
+
+    def _event_batches(self, connection: sqlite3.Connection) -> list[tuple[int, int | None]]:
+        # (rows removed, key of the scan floor) for each batch of one row.
+        floors: dict = {}
+        finished: set[str] = set()
+        batches: list[tuple[int, int | None]] = []
+        for _ in range(20):
+            result = HistoryStore._maintain_retention_batch(
+                connection,
+                cutoffs={"metric": None, "event": CUTOFF, "hourly": None, "daily": None},
+                batch_size=1,
+                scan_floors=floors,
+                finished_tables=frozenset(finished),
+            )
+            connection.commit()
+            floors = result["scan_floors"]
+            finished.update(result["finished_tables"])
+            batches.append((result["events_removed"], floors.get("slot_events", (None, None))[1]))
+            if not result["has_more"]:
+                return batches
+        self.fail(f"the pass did not end: {batches}")
+
+    def test_the_scan_floor_names_the_stored_text_of_the_row_it_came_from(self) -> None:
+        # The floor a batch keeps, bound into the statement the next batch
+        # runs, must equal its own row's stored text: that row is not after
+        # its floor, and the next row with the same text and a larger key is.
+        values: list[object] = [
+            "2026-10-01T00:00:00+00:00",
+            "2026-10-01T00:00:00+00:00\u0100",
+            "2026-10-01T00:00:00+00:00\U00010000",
+            "2026-10-01T00:00:00+00:00\x00z",
+        ]
+        if self.ENCODING == "UTF-8":
+            values.append(b"2026-10-01T00:00:00+00:0\xff")
+        for value in values:
+            with self.subTest(value=value), closing(sqlite3.connect(self.path)) as connection:
+                connection.execute("DELETE FROM slot_events")
+                connection.commit()
+                self._insert_native([value, value, "2026-10-02T00:00:00+00:00"])
+                first = connection.execute("SELECT min(id) FROM slot_events").fetchone()[0]
+                result = HistoryStore._maintain_retention_batch(
+                    connection,
+                    cutoffs={"metric": None, "event": CUTOFF, "hourly": None, "daily": None},
+                    batch_size=1,
+                )
+                connection.rollback()
+                floor = result["scan_floors"].get("slot_events", (None, None))
+                self.assertEqual(floor[1], first)
+                after = connection.execute(
+                    HistoryStore._expired_rows_subquery("slot_events", "observed_at", floored=True),
+                    (*HistoryStore._retention_parameters(CUTOFF, floor), 10),
+                ).fetchall()
+                self.assertEqual([row[0] for row in after], [first + 1, first + 2])
+
+    def test_a_full_pass_reads_rejected_window_rows_as_often_in_every_encoding(self) -> None:
+        # Rows in the day before the cutoff whose exact time is not expired,
+        # with mixed offsets, between expired rows; one row per batch. The
+        # floor starts each batch after the last row deleted, so each rejected
+        # row is parsed the same small number of times in every encoding.
+        from history_service import store as store_module
+
+        rejected = [
+            text for minute in range(10) for text in (
+                f"2026-11-13T23:{minute:02d}:00-14:00",  # 13:xx UTC on the 14th
+                f"2026-11-14T08:{minute:02d}:00-05:00",  # 13:xx UTC
+                f"2026-11-14T11:{minute:02d}:00-01:00",  # 12:xx UTC, at or after the cutoff
+            )
+        ]
+        expired = [
+            text for minute in range(10) for text in (
+                f"2026-11-14T06:{minute:02d}:00-05:00",  # 11:xx UTC
+                f"2026-11-14T10:{minute:02d}:00+00:00",
+            )
+        ]
+        _insert_events(self.path, [(text, "kept") for text in rejected] + [(text, "expired") for text in expired])
+        original = store_module._history_utc_instant
+        parsed = [0]
+
+        def counting(value: object) -> str | None:
+            if value in rejected:
+                parsed[0] += 1
+            return original(value)
+
+        with mock.patch.object(store_module, "_history_utc_instant", counting):
+            result = _retain(self.store, event_retention_days=1, batch_size=1, max_batches=100)
+
+        self.assertEqual(result["events_removed"], len(expired))
+        self.assertFalse(result["has_more"])
+        self.assertEqual(_event_labels(self.path), ["kept"] * len(rejected))
+        self.assertEqual(parsed[0], 40)
+
+    def test_a_floor_that_cannot_be_named_stays_lower_and_the_pass_still_ends(self) -> None:
+        # Text bytes the database's encoding cannot decode (a lone surrogate
+        # in UTF-16) cannot be bound back as the same text there, so a batch
+        # that deletes such a row keeps the previous floor and the next batch
+        # reads from it again. In UTF-8 the bytes themselves name the text.
+        bad = {"UTF-8": b"\xff", "UTF-16le": b"\x00\xd8", "UTF-16be": b"\xd8\x00"}[self.ENCODING]
+        rows: list[object] = [
+            "2026-10-01T00:00:00+00:00",
+            *((f"2026-10-03{letter}".encode(self.ENCODING) + bad) for letter in "abc"),
+            "2026-10-05T00:00:00+00:00",
+            "2026-11-14T00:00:00".encode(self.ENCODING) + bad,  # in the window: kept
+            "2026-11-14T08:00:00-05:00",  # 13:00 UTC: kept
+            "2026-11-14T10:00:00+00:00",
+        ]
+        self._insert_native(rows)
+        with closing(sqlite3.connect(self.path)) as connection:
+            first = connection.execute("SELECT min(id) FROM slot_events").fetchone()[0]
+            batches = self._event_batches(connection)
+            left = [row[0] - first for row in connection.execute("SELECT id FROM slot_events ORDER BY id")]
+        named = self.ENCODING == "UTF-8"
+        floor_keys = [0, 1 if named else 0, 2 if named else 0, 3 if named else 0, 4, 7]
+        self.assertEqual(batches, [(1, first + key) for key in floor_keys])
+        self.assertEqual(left, [5, 6])
 
 
 NEWER_MICROSECOND = "2026-11-14T10:00:00.000200+00:00"
@@ -1382,10 +1511,15 @@ class RetentionQueryPlanTests(unittest.TestCase):
     """Every retention statement reads the tables through the timestamp index."""
 
     TABLES = ("metric_samples", "slot_events", "metric_rollups")
+    ENCODING = "UTF-8"
 
     def test_every_retention_statement_searches_the_timestamp_index(self) -> None:
         with tempfile.TemporaryDirectory(prefix="retention-plan-") as temporary:
             path = Path(temporary) / "history.db"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(f"PRAGMA encoding = '{self.ENCODING}'")
+                connection.execute("CREATE TABLE encoding_marker (value)")
+                connection.commit()
             store = HistoryStore(str(path))
             _insert_events(path, _interleaved_window_events(12))
             store.insert_metric_samples(
@@ -1436,6 +1570,16 @@ class RetentionQueryPlanTests(unittest.TestCase):
                         if not sql.lstrip().upper().startswith("INSERT"):
                             # The rollup insert sorts only the selected batch.
                             self.assertFalse(any("TEMP B-TREE" in line for line in plan), plan)
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute("PRAGMA encoding").fetchone()[0], self.ENCODING)
+
+
+class RetentionQueryPlanUtf16Tests(RetentionQueryPlanTests):
+    ENCODING = "UTF-16le"
+
+
+class RetentionQueryPlanUtf16BigEndianTests(RetentionQueryPlanTests):
+    ENCODING = "UTF-16be"
 
 
 if __name__ == "__main__":
