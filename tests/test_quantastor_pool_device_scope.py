@@ -321,15 +321,24 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
         raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=[self.PEER_ROW])
         self.assertIs(service._build_quantastor_disk_records(raw, "node-a")[0].raw["quantastor_pool_device"],
                       self.PEER_ROW)
+        # Literal boundary (not read from the constant, so a changed cap is
+        # caught): 64 agreeing rows under one serial admit one row, 65 do not.
+        for count, admitted in ((64, True), (65, False)):
+            with self.subTest(pool_rows_per_key=count):
+                rows = [{**self.PEER_ROW, "id": f"member-{n}", "physicalDiskId": f"peer-{n}"} for n in range(count)]
+                raw = _raw(disks=[DISK_A], pools=[POOL_B], pool_devices=rows)
+                record = service._build_quantastor_disk_records(raw, "node-a")[0]
+                self.assertEqual("quantastor_pool_device" in record.raw, admitted)
+                self.assertEqual(bool(record.raw.get("quantastor_pool_device_conflict")), not admitted)
 
     def test_a_hardware_group_shared_by_many_rows_is_not_read_row_by_row(self) -> None:
         # Every hardware row a disk reaches is an identity source, but rows
         # sharing one key must not be read in full for every disk: past the cap
         # the identity is unknown, and so is the membership. Work is counted in
         # hardware-row field reads, so it does not depend on helper names.
-        from app.services import inventory
-
-        cap = inventory.QUANTASTOR_DISK_IDENTITY_ROWS_MAX
+        # The cap is written as a literal here, not read from the constant, so
+        # a changed cap fails this test.
+        cap = 256
         service = _service()
 
         def shared(count):
@@ -343,13 +352,13 @@ class QuantastorPoolDeviceScopeTests(unittest.TestCase):
             raw.hw_disks = _counted_rows(shared(count), reads)
             return service._build_quantastor_disk_records(raw, "node-a"), reads[0]
 
-        records, reads = run(200)
-        self.assertEqual(len(records), 200)
+        records, reads = run(2 * cap)
+        self.assertEqual(len(records), 2 * cap)
         self.assertEqual(sum("quantastor_pool_device" in record.raw for record in records), 0)
-        self.assertEqual(sum(bool(record.raw.get("quantastor_pool_device_conflict")) for record in records), 200)
+        self.assertEqual(sum(bool(record.raw.get("quantastor_pool_device_conflict")) for record in records), 2 * cap)
         # Twice the disks and rows cost about twice the reads; reading the
         # shared rows for every disk would cost about four times as many.
-        _records, reads_doubled = run(400)
+        _records, reads_doubled = run(4 * cap)
         self.assertLess(reads_doubled, 3 * reads)
 
         # Boundary controls: at the cap the rows are read and the coherent row
@@ -655,13 +664,17 @@ def _hw(row_id, **fields):
     return {"id": row_id, "storageSystemId": "node-a", "enclosureId": "shelf-a", "slot": 0, **fields}
 
 
-def _membership(disk, *, hw=(), cli_hw=(), pool_devices=(PATH_ROW,)):
+def _membership(disk, *, hw=(), cli_hw=(), pool_devices=(PATH_ROW,), cli=(), expect_cli=None):
     """(admitted row id, conflict flag, conflict warnings) through the shipping builder and page path."""
     service = _service()
     raw = _raw(disks=[disk], pools=[HOME_POOL], pool_devices=list(pool_devices))
     raw.hw_disks = list(hw)
     raw.cli_hw_disks = list(cli_hw)
+    raw.cli_disks = list(cli)
     record = service._build_quantastor_disk_records(raw, "node-a")[0]
+    if expect_cli is not None:
+        # Fixture self-check: the CLI disk row really was matched to the disk.
+        assert record.raw.get("quantastor_cli_disk") == expect_cli, record.raw.get("quantastor_cli_disk")
     warnings: list[str] = []
     service._correlate(raw, ParsedSSHData(), warnings, selected_enclosure_id="node-a")
     admitted = record.raw.get("quantastor_pool_device")
@@ -765,6 +778,229 @@ class QuantastorDiskIdentityIndexTests(unittest.TestCase):
                          UNKNOWN)
         self.assertEqual(_membership(disk, hw=[_hw("hw-1", serialNumber=None, physicalDiskId="disk-c",
                                                    scsiId="scsi-synthetic-a")]), UNKNOWN)
+
+    def test_an_identity_set_without_any_serial_and_two_scsi_or_physical_ids_is_unknown(self) -> None:
+        # Maintainer decision: no serial anywhere is absence, not disagreement,
+        # but each other identity kind must still hold at most one value.
+        two_scsi = [_hw("hw-1", physicalDiskId="disk-a", scsiId="scsi-synthetic-a"),
+                    _hw("hw-2", physicalDiskId="disk-a", scsiId="scsi-synthetic-c")]
+        for row in two_scsi:
+            with self.subTest(single=row["id"]):
+                self.assertEqual(_membership(IDENTITY_DISK, hw=[row]), ADMITTED)
+        for order in (two_scsi, two_scsi[::-1]):
+            with self.subTest(two_scsi=[row["id"] for row in order]):
+                self.assertEqual(_membership(IDENTITY_DISK, hw=order), UNKNOWN)
+        # Two physical disk IDs on the disk's own node: its REST id and a
+        # hardware row reached by SCSI ID. On the peer node the ID is that
+        # node's own name for the disk, so it is no disagreement.
+        disk = {**IDENTITY_DISK, "scsiId": "scsi-synthetic-a"}
+        other_id = _hw("hw-1", physicalDiskId="disk-c", scsiId="scsi-synthetic-a")
+        self.assertEqual(_membership(disk, hw=[other_id]), UNKNOWN)
+        self.assertEqual(_membership(disk, hw=[{**other_id, "storageSystemId": "node-b"}]), ADMITTED)
+        self.assertEqual(_membership(disk, hw=[{**other_id, "physicalDiskId": "disk-a"}]), ADMITTED)
+
+
+class QuantastorDiskIdentityDiscoveryTests(unittest.TestCase):
+    """Every identity already accepted for a disk seeds the hardware walk (#1211)."""
+
+    # No serial on the REST row; the matched CLI disk row reports one.
+    CLI_ROW = {**IDENTITY_DISK, "serialNumber": SERIAL_A}
+
+    def test_the_matched_cli_rows_serial_reaches_hardware_rows(self) -> None:
+        # Reachable only by the CLI serial, and reporting a second serial.
+        slotless = {"id": "hw-cli-key-only", "storageSystemId": "node-a", "enclosureId": "shelf-a"}
+        differ = {**slotless, "serialNum": SERIAL_A, "serialNumber": SERIAL_C}
+        agree = {**slotless, "serialNum": SERIAL_A}
+        cli = [self.CLI_ROW]
+        self.assertEqual(_membership(IDENTITY_DISK, cli=cli, expect_cli=self.CLI_ROW), ADMITTED)
+        self.assertEqual(_membership(IDENTITY_DISK, hw=[agree], cli=cli, expect_cli=self.CLI_ROW), ADMITTED)
+        for lists in ({"hw": [differ]}, {"cli_hw": [differ]}):
+            with self.subTest(list=next(iter(lists))):
+                self.assertEqual(_membership(IDENTITY_DISK, cli=cli, expect_cli=self.CLI_ROW, **lists), UNKNOWN)
+        # The same rows with the serial on the REST row: already refused.
+        self.assertEqual(_membership({**IDENTITY_DISK, "serialNumber": SERIAL_A}, hw=[differ]), UNKNOWN)
+
+    def test_the_matched_cli_rows_scsi_id_reaches_hardware_rows(self) -> None:
+        disk = {**IDENTITY_DISK, "serialNumber": SERIAL_A}
+        cli_row = {**disk, "scsiId": "scsi-synthetic-cli"}
+        reached = {"id": "hw-cli-scsi", "storageSystemId": "node-a", "enclosureId": "shelf-a",
+                   "scsiId": "scsi-synthetic-cli"}
+        self.assertEqual(_membership(disk, hw=[{**reached, "serialNumber": SERIAL_A}], cli=[cli_row],
+                                     expect_cli=cli_row), ADMITTED)
+        self.assertEqual(_membership(disk, hw=[{**reached, "serialNumber": SERIAL_C}], cli=[cli_row],
+                                     expect_cli=cli_row), UNKNOWN)
+
+    def test_cli_only_identities_are_not_pool_device_lookup_keys(self) -> None:
+        # Discovery only: a pool-device row that only the CLI serial (or a
+        # hardware row reached only through it) would find is not a candidate.
+        by_serial = {**PATH_ROW, "id": "member-by-serial", "devicePath": "/dev/sdz",
+                     "physicalDiskSerialNumber": SERIAL_A}
+        by_hw_id = {**PATH_ROW, "id": "member-by-hw", "devicePath": "/dev/sdz",
+                    "physicalDiskId": "hw-reached-by-cli"}
+        reached = {"id": "hw-reached-by-cli", "storageSystemId": "node-a", "enclosureId": "shelf-a",
+                   "serialNum": SERIAL_A}
+        for pool_devices in ([by_serial], [by_hw_id]):
+            for hw in ([], [reached]):
+                with self.subTest(row=pool_devices[0]["id"], hw=len(hw)):
+                    self.assertEqual(_membership(IDENTITY_DISK, hw=hw, cli=[self.CLI_ROW], expect_cli=self.CLI_ROW,
+                                                 pool_devices=pool_devices), (None, False, []))
+        # Control: the same serial on the REST row is a lookup key.
+        self.assertEqual(_membership({**IDENTITY_DISK, "serialNumber": SERIAL_A}, pool_devices=[by_serial]),
+                         ("member-by-serial", False, []))
+
+
+def _fan_out(paths, disk_id="disk-a", serial=SERIAL_A):
+    """One coherent disk seen by both HA nodes over `paths` paths each."""
+    rows = []
+    for node in ("node-a", "node-b"):
+        for path in range(paths):
+            rows.append({"id": f"hw-{disk_id}-{node}-{path}", "storageSystemId": node, "enclosureId": "shelf-a",
+                         "physicalDiskId": disk_id if node == "node-a" else f"peer-{disk_id}",
+                         "serialNum": serial, "sasAddress": f"sas-synthetic-{disk_id}-{node}-{path}", "slot": 0})
+    return rows
+
+
+class QuantastorDiskIdentityCapTests(unittest.TestCase):
+    def test_healthy_multipath_fan_out_on_both_nodes_and_both_lists_is_admitted(self) -> None:
+        # Both hardware lists report every path of both nodes: 4 x paths rows.
+        disk = {**IDENTITY_DISK, "serialNumber": SERIAL_A}
+        for paths in (1, 2, 4, 5, 8):
+            rows = _fan_out(paths)
+            with self.subTest(paths_per_node=paths, rows=2 * len(rows)):
+                self.assertEqual(_membership(disk, hw=rows, cli_hw=[dict(row) for row in rows]), ADMITTED)
+        # The same shape with one path reporting another serial is refused.
+        rows = _fan_out(8)
+        rows[-1] = {**rows[-1], "serialNum": SERIAL_C}
+        self.assertEqual(_membership(disk, hw=rows, cli_hw=[dict(row) for row in rows]), UNKNOWN)
+
+    def test_identity_work_stays_linear_in_rows_with_disks_at_the_cap(self) -> None:
+        # Each group is one key carried by exactly the cap of rows (256, so not
+        # overloaded) and reached by several disks: each disk reads at most the
+        # cap, so twice the groups cost about twice the reads.
+        service = _service()
+
+        def run(groups, disks_per_group=8):
+            reads = [0]
+            disks, pool_rows, hw = [], [], []
+            for group in range(groups):
+                serial = f"SANITIZED-QS-G{group}"
+                hw += [{"id": f"hw-{group}-{n}", "storageSystemId": "node-a", "enclosureId": "shelf-a",
+                        "serialNum": serial, "slot": 0} for n in range(256)]
+                for n in range(disks_per_group):
+                    path = f"/dev/synthetic-{group}-{n}"
+                    disks.append({**IDENTITY_DISK, "id": f"disk-{group}-{n}", "devicePath": path,
+                                  "serialNumber": serial})
+                    pool_rows.append({**PATH_ROW, "id": f"member-{group}-{n}", "devicePath": path})
+            raw = _raw(disks=disks, pools=[HOME_POOL], pool_devices=pool_rows)
+            raw.hw_disks = _counted_rows(hw, reads)
+            records = service._build_quantastor_disk_records(raw, "node-a")
+            self.assertEqual([record.raw.get("quantastor_pool_device") for record in records], pool_rows)
+            return reads[0]
+
+        reads = run(2)
+        self.assertLess(run(4), 3 * reads)
+
+
+def _snapshot_service(temp_dir, fetch):
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from app.config import SSHConfig
+    from app.services.mapping_store import MappingStore
+    from app.services.slot_detail_store import SlotDetailStore
+
+    class Client:
+        async def fetch_all(self):
+            return fetch()
+
+    settings = Settings()
+    system = SystemConfig(
+        id="synthetic-qs", label="Synthetic QuantaStor",
+        default_profile_id="supermicro-ssg-2028r-shared-front-24",
+        truenas=TrueNASConfig(platform="quantastor", api_user="synthetic", api_password="synthetic"),
+        ssh=SSHConfig(enabled=False),
+    )
+    return InventoryService(
+        settings, system, Client(), AsyncMock(), None,
+        MappingStore(str(Path(temp_dir) / "slot_mappings.json")), ProfileRegistry(settings),
+        SlotDetailStore(str(Path(temp_dir) / "slot_detail_cache.json")),
+    )
+
+
+def _snapshot_raw():
+    systems = [
+        {"id": "cluster", "name": "Cluster", "storageSystemClusterId": "cluster-1", "type": 9},
+        {"id": "node-a", "name": "Node A", "storageSystemClusterId": "cluster-1", "isMaster": False},
+        {"id": "node-b", "name": "Node B", "storageSystemClusterId": "cluster-1", "isMaster": True},
+    ]
+    disks = [{"id": f"pdisk-{n}", "storageSystemId": "node-a", "storagePoolId": "pool-1",
+              "devicePath": f"/dev/synthetic-{n}", "serialNumber": f"SANITIZED-QS-{n}", "healthStatus": "ONLINE"}
+             for n in range(3)]
+    hw = []
+    for n in range(3):
+        for node in ("node-a", "node-b"):
+            hw.append({"id": f"hw-{node}-{n}", "storageSystemId": node, "slot": f"{n:02d}",
+                       "physicalDiskId": f"pdisk-{n}" if node == "node-a" else f"peer-pdisk-{n}",
+                       "serialNum": f"SANITIZED-QS-{n}", "sasAddress": f"sas-synthetic-{n}",
+                       "enclosureId": "enc-a" if node == "node-a" else "enc-b"})
+    return TrueNASRawData(
+        enclosures=systems, systems=systems, disks=disks,
+        pools=[{"id": "pool-1", "name": "archive", "primaryStorageSystemId": "node-b", "status": "ONLINE"}],
+        pool_devices=[{"physicalDiskId": f"pdisk-{n}", "storagePoolId": "pool-1", "number": n, "slot": str(n),
+                       "status": "ONLINE", "devicePath": f"/dev/synthetic-{n}"} for n in range(3)],
+        ha_groups=[], hw_disks=hw,
+        hw_enclosures=[{"id": "enc-a", "storageSystemId": "node-a"}, {"id": "enc-b", "storageSystemId": "node-b"}],
+        disk_temperatures={}, smart_test_results=[],
+    )
+
+
+class QuantastorHwIdentityIndexLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_index_per_collected_snapshot(self) -> None:
+        import tempfile
+        from unittest import mock
+
+        built = mock.Mock(wraps=InventoryService._build_quantastor_hw_identity_index)
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                mock.patch.object(InventoryService, "_build_quantastor_hw_identity_index", built):
+            service = _snapshot_service(temp_dir, _snapshot_raw)
+            snapshot = await service.get_snapshot(selected_enclosure_id="node-a")
+            # The snapshot really used the pool-device rows (healthy control).
+            self.assertEqual([slot.pool_name for slot in snapshot.slots if slot.present], ["archive"] * 3)
+            self.assertEqual(built.call_count, 1)
+            # New collected data gets its own index; nothing outlives it.
+            await service.get_snapshot(force_refresh=True, selected_enclosure_id="node-a")
+            self.assertEqual(built.call_count, 2)
+            # Each collected snapshot keeps its own index, so going back to an
+            # earlier one does not rebuild it (a single shared slot would).
+            first, second = _snapshot_raw(), _snapshot_raw()
+            for raw in (first, second, first, second):
+                service._build_quantastor_disk_records(raw, "node-a")
+            self.assertEqual(built.call_count, 4)
+
+    def test_the_index_follows_the_hardware_lists_it_was_built_from(self) -> None:
+        # Reuse is tied to the exact lists and their length: a replaced or
+        # extended list is indexed again, so a later row is never missed.
+        disk = {**IDENTITY_DISK, "serialNumber": SERIAL_A}
+        agree = _hw("hw-1", physicalDiskId="disk-a", serialNumber=SERIAL_A)
+        differ = _hw("hw-2", physicalDiskId="disk-a", serialNumber=SERIAL_C)
+        service = _service()
+        for change in ("replace-api", "append-api", "replace-cli", "append-cli",
+                       "same-length-api", "same-length-cli"):
+            with self.subTest(change=change):
+                raw = _raw(disks=[disk], pools=[HOME_POOL], pool_devices=[PATH_ROW])
+                raw.hw_disks, raw.cli_hw_disks = [agree], [agree]
+                first = service._build_quantastor_disk_records(raw, "node-a")[0]
+                self.assertEqual(first.raw["quantastor_pool_device"]["id"], "member-a")
+                name = "hw_disks" if change.endswith("api") else "cli_hw_disks"
+                if change.startswith("replace"):
+                    setattr(raw, name, [agree, differ])
+                elif change.startswith("same-length"):
+                    setattr(raw, name, [differ])
+                else:
+                    getattr(raw, name).append(differ)
+                again = service._build_quantastor_disk_records(raw, "node-a")[0]
+                self.assertNotIn("quantastor_pool_device", again.raw)
+                self.assertIs(again.raw.get("quantastor_pool_device_conflict"), True)
 
 
 # Whole-set generator, cut down from an independent review. The oracle below is

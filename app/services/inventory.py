@@ -281,14 +281,16 @@ def effective_main_view_order(
         return [preferred, *(entry for entry in automatic if entry != preferred)]
     return automatic
 QUANTASTOR_CLI_CORRELATION_WORK_LIMIT = 1_000_000
-# A disk normally matches one pool-device row per node. A key that names more
-# rows than this is a conflict, not a choice: membership stays unknown, and
-# per-disk admission work stays bounded by keys times this cap (#1211).
-QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX = 8
+# A disk normally matches one pool-device row per node (two on an HA pair). A
+# key that names more rows than this is runaway input, not a choice: the
+# membership is unknown with the page warning, and per-disk admission work
+# stays bounded by keys times this cap (#1211).
+QUANTASTOR_POOL_DEVICE_KEY_ROWS_MAX = 64
 # Hardware rows one disk's identity may gather (both inventory arrays, every
-# node and path). Reaching more, or a key filed under more, leaves the disk's
-# pool-device membership unknown and bounds per-disk work (#1211).
-QUANTASTOR_DISK_IDENTITY_ROWS_MAX = 16
+# node and path: 32 for eight paths on each node of an HA pair). Reaching
+# more, or a key filed under more, leaves the disk's pool-device membership
+# unknown with the page warning and bounds per-disk work (#1211).
+QUANTASTOR_DISK_IDENTITY_ROWS_MAX = 256
 # Every hardware-row field a disk's identity can be reached by. Node-local
 # device paths are not among them.
 QUANTASTOR_HW_IDENTITY_FIELDS = ("physicalDiskId", "serialNum", "serialNumber", "serial", "scsiId", "sasAddress", "id")
@@ -10773,7 +10775,7 @@ class InventoryService:
             raw_data.disks, self._build_quantastor_cli_disk_hints(raw_data.cli_disks)
         )
         pool_device_index = self._build_quantastor_pool_device_index(raw_data)
-        hw_identity_index = self._build_quantastor_hw_identity_index(raw_data)
+        hw_identity_index = self._quantastor_hw_identity_index(raw_data)
         pool_names = {
             normalize_value_text(pool.get("id")): normalize_text(
                 str(pool.get("name") or pool.get("description") or pool.get("id"))
@@ -10864,7 +10866,9 @@ class InventoryService:
             # service holds for this disk: every serial alias and ID on the disk
             # row, each one on its own, then every hardware row those keys reach
             # in the identity index, then those rows' keys, to a fixed point; and
-            # the matched CLI row (identity only, never a lookup key). The bay
+            # the matched CLI row. The CLI row's serial and SCSI keys also seed
+            # the walk, for discovery only: they and the rows reached only
+            # through them never become pool-device lookup keys. The bay
             # hint above is not an identity source. A node-local path admits only
             # a row from the same node; a row that contradicts that identity
             # never is; identities that disagree leave it unknown (#1211).
@@ -10876,6 +10880,13 @@ class InventoryService:
                         "serialNumber", "serial", "id", "hwDiskId", "scsiId", "wwn", "wwid", "eui64")),
                 ),
             )
+            cli_seeds = self._quantastor_identity_keys(*(
+                cli_hint.get(name) for name in ("serialNumber", "serial", "serialNum", "scsiId")
+            )) if isinstance(cli_hint, dict) else set()
+            if not hw_overloaded and cli_seeds - admission_keys:
+                reached_hw_rows, _discovery_keys, hw_overloaded = self._quantastor_disk_identity_rows(
+                    hw_identity_index, admission_keys | cli_seeds,
+                )
             disk_identity = self._quantastor_pool_device_disk_identity(
                 disk, reached_hw_rows, disk_scope, cli_hint,
             )
@@ -11437,8 +11448,25 @@ class InventoryService:
         return keys
 
     @classmethod
+    def _quantastor_hw_identity_index(cls, raw_data: TrueNASRawData) -> _QuantastorHwIdentityIndex:
+        """One index per collected snapshot, kept with that snapshot's data.
+
+        Every builder call over the same data (node, candidate, storage-view
+        and retention passes) reuses it. It is rebuilt when either hardware
+        list is replaced or changes length (#1211).
+        """
+        sources = (raw_data.hw_disks, raw_data.cli_hw_disks)
+        shape = tuple(len(source or ()) for source in sources)
+        cached = raw_data.derived.get("quantastor_hw_identity_index")
+        if cached is not None and all(a is b for a, b in zip(cached[0], sources)) and cached[1] == shape:
+            return cached[2]
+        index = cls._build_quantastor_hw_identity_index(raw_data)
+        raw_data.derived["quantastor_hw_identity_index"] = (sources, shape, index)
+        return index
+
+    @classmethod
     def _build_quantastor_hw_identity_index(cls, raw_data: TrueNASRawData) -> _QuantastorHwIdentityIndex:
-        """Built once per pass: O(rows x fields) time and memory (#1211)."""
+        """O(rows x fields) time and memory; see _quantastor_hw_identity_index (#1211)."""
         index = _QuantastorHwIdentityIndex()
         for row in [*(raw_data.hw_disks or ()), *(raw_data.cli_hw_disks or ())]:
             if not isinstance(row, dict):
